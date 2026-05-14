@@ -2044,6 +2044,35 @@ def _bind_prompt_submit_keys(kb, handler) -> None:
         kb.add("c-j")(handler)
 
 
+def _bind_terminal_focus_report_ignores(kb, cli_ref=None) -> None:
+    """Consume DECSET 1004 focus reports without repainting.
+
+    We intentionally track focus in the classic CLI so resize events that are
+    really tab/window hide-show notifications can be ignored. The bindings must
+    not invalidate: focus restore itself should not repaint the screen.
+    """
+
+    def _record_focus(event, focused: bool) -> None:
+        try:
+            target = cli_ref
+            if target is not None:
+                target._terminal_focused = focused
+                target._terminal_focus_transition_at = time.monotonic()
+        except Exception:
+            pass
+        return
+
+    @kb.add('escape', '[', 'I', eager=True)
+    def _(event):
+        _record_focus(event, True)
+        return
+
+    @kb.add('escape', '[', 'O', eager=True)
+    def _(event):
+        _record_focus(event, False)
+        return
+
+
 def _disable_prompt_toolkit_cpr_warning(app) -> None:
     """Let prompt_toolkit fall back from CPR without printing into the prompt."""
     try:
@@ -2706,6 +2735,8 @@ class HermesCLI:
         self._tool_start_time: float = 0.0  # monotonic timestamp when current tool started (for live elapsed)
         self._pending_tool_info: dict = {}  # function_name -> list of (preview, args) for stacked scrollback
         self._last_scrollback_tool: str = ""  # last tool name printed to scrollback (for "new" dedup)
+        self._terminal_focused = True
+        self._terminal_focus_transition_at = 0.0
         self._command_running = False
         self._command_status = ""
         self._attached_images: list[Path] = []
@@ -2746,6 +2777,8 @@ class HermesCLI:
     def _invalidate(self, min_interval: float = 0.25) -> None:
         """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
         if getattr(self, "_resize_recovery_pending", False):
+            return
+        if not getattr(self, "_terminal_focused", True):
             return
         now = time.monotonic()
         if hasattr(self, "_app") and self._app and (now - self._last_invalidate) >= min_interval:
@@ -2873,6 +2906,24 @@ class HermesCLI:
         except Exception:
             self._resize_recovery_pending = False
             self._recover_after_resize(app, original_on_resize)
+
+    def _make_classic_resize_handler(self, app, original_on_resize):
+        """Return a resize handler that ignores terminal focus transitions."""
+
+        def _resize_clear_ghosts():
+            if not getattr(self, "_terminal_focused", True):
+                return
+            try:
+                focus_age = time.monotonic() - float(
+                    getattr(self, "_terminal_focus_transition_at", 0.0) or 0.0
+                )
+            except Exception:
+                focus_age = 999.0
+            if focus_age < 0.75:
+                return
+            self._schedule_resize_recovery(app, original_on_resize)
+
+        return _resize_clear_ghosts
 
     def _status_bar_context_style(self, percent_used: Optional[int]) -> str:
         if percent_used is None:
@@ -11889,6 +11940,7 @@ class HermesCLI:
         
         # Key bindings for the input area
         kb = KeyBindings()
+        _bind_terminal_focus_report_ignores(kb, self)
         
         def handle_enter(event):
             """Handle Enter key - submit input.
@@ -13506,29 +13558,38 @@ class HermesCLI:
             **({'cursor': _STEADY_CURSOR} if _STEADY_CURSOR is not None else {}),
         )
         _disable_prompt_toolkit_cpr_warning(app)
+        try:
+            # Track terminal focus so tab/window hide-show resize noise can be
+            # ignored without repainting. The matching key bindings consume
+            # ESC[I/ESC[O and never invalidate the app; cleanup disables the
+            # mode before returning to the user's shell.
+            app.output.write_raw("\x1b[?1004h")
+            app.output.flush()
+        except Exception:
+            pass
         self._app = app  # Store reference for clarify_callback
 
-        # ── Fix ghost status-bar lines on terminal resize ──────────────
+        # ── Fix ghost status-bar lines on real terminal resize ─────────
         # When the terminal shrinks (e.g. un-maximize), the emulator reflows
         # the previously-rendered full-width rows (status bar, input rules)
         # into multiple narrower rows.  prompt_toolkit's _on_resize handler
         # only cursor_up()s by the stored layout height, missing the extra
         # rows created by reflow — leaving ghost duplicates visible.
         #
-        # It's not just column-shrink: widening, row-shrinking, and
-        # multiplexer-driven SIGWINCH-less redraws (cmux / tmux tab switch)
-        # all produce the same class of drift, where the renderer's tracked
-        # _cursor_pos.y no longer matches terminal reality. The only reliable
-        # recovery is a full screen-clear (\x1b[2J\x1b[H) before the next
-        # redraw, so we force one on every resize rather than trying to
-        # compute the exact drift.
+        # It's not just column-shrink: widening and row-shrinking can produce
+        # the same class of drift, where the renderer's tracked _cursor_pos.y
+        # no longer matches terminal reality. The reliable recovery for a
+        # *real size change* is a full screen-clear (\x1b[2J\x1b[H) before
+        # the next redraw.
+        #
+        # Some terminals and multiplexers also deliver a resize notification
+        # when a tab/pane merely regains focus, with identical dimensions. Do
+        # not run the full-clear path for those focus restores: it causes the
+        # exact whole-screen repaint/flicker users see when switching away and
+        # back to an otherwise unchanged Hermes session.
         if getattr(self, "classic_resize_full_clear", True):
             _original_on_resize = app._on_resize
-
-            def _resize_clear_ghosts():
-                self._schedule_resize_recovery(app, _original_on_resize)
-
-            app._on_resize = _resize_clear_ghosts
+            app._on_resize = self._make_classic_resize_handler(app, _original_on_resize)
 
         def spinner_loop():
             while not self._should_exit:
@@ -13847,6 +13908,12 @@ class HermesCLI:
                 raise
         finally:
             self._should_exit = True
+            try:
+                if app and getattr(app, "output", None):
+                    app.output.write_raw("\x1b[?1004l")
+                    app.output.flush()
+            except Exception:
+                pass
             # Interrupt the agent immediately so its daemon thread stops making
             # API calls and exits promptly (agent_thread is daemon, so the
             # process will exit once the main thread finishes, but interrupting
