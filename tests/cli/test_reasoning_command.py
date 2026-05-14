@@ -155,6 +155,47 @@ class TestHandleReasoningCommand(unittest.TestCase):
         level = rc.get("effort", "medium")
         self.assertEqual(level, "xhigh")
 
+    def test_parse_reasoning_command_args_handles_global_flag_positions(self):
+        from cli import _parse_reasoning_command_args
+
+        self.assertEqual(_parse_reasoning_command_args("high --global"), ("high", True))
+        self.assertEqual(_parse_reasoning_command_args("--global xhigh"), ("xhigh", True))
+        self.assertEqual(_parse_reasoning_command_args("—global low"), ("low", True))
+        self.assertEqual(_parse_reasoning_command_args("low —global"), ("low", True))
+
+    def test_effort_level_defaults_to_session_only(self):
+        import cli as cli_mod
+        from cli import HermesCLI
+
+        cli_obj = object.__new__(HermesCLI)
+        cli_obj.reasoning_config = None
+        cli_obj.show_reasoning = False
+        cli_obj.agent = MagicMock()
+
+        with patch.object(cli_mod, "save_config_value") as save_config, \
+             patch.object(cli_mod, "_cprint"):
+            cli_obj._handle_reasoning_command("/reasoning high")
+
+        self.assertEqual(cli_obj.reasoning_config, {"enabled": True, "effort": "high"})
+        self.assertIsNone(cli_obj.agent)
+        save_config.assert_not_called()
+
+    def test_effort_level_global_persists_config(self):
+        import cli as cli_mod
+        from cli import HermesCLI
+
+        cli_obj = object.__new__(HermesCLI)
+        cli_obj.reasoning_config = None
+        cli_obj.show_reasoning = False
+        cli_obj.agent = MagicMock()
+
+        with patch.object(cli_mod, "save_config_value", return_value=True) as save_config, \
+             patch.object(cli_mod, "_cprint"):
+            cli_obj._handle_reasoning_command("/reasoning --global low")
+
+        self.assertEqual(cli_obj.reasoning_config, {"enabled": True, "effort": "low"})
+        save_config.assert_called_once_with("agent.reasoning_effort", "low")
+
 
 # ---------------------------------------------------------------------------
 # Reasoning extraction and result dict

@@ -106,6 +106,19 @@ class TestForceFullRedraw:
         # Status bar / input rules must be suppressed until the next prompt.
         assert bare_cli._status_bar_suppressed_after_resize is True
 
+    def test_resize_recovery_can_use_prompt_toolkit_native_resize_only(self, bare_cli, monkeypatch):
+        app = MagicMock()
+        events = []
+        bare_cli.classic_resize_full_clear = False
+        monkeypatch.setattr(cli_mod, "_replay_output_history", lambda: events.append("replay"))
+        original_on_resize = lambda: events.append("original_resize")
+
+        bare_cli._recover_after_resize(app, original_on_resize)
+
+        assert events == ["original_resize"]
+        app.renderer.output.erase_screen.assert_not_called()
+        app.renderer.output.write_raw.assert_not_called()
+
     def test_force_redraw_uses_full_screen_clear_without_scrollback_clear(self, bare_cli):
         app = MagicMock()
         bare_cli._app = app
