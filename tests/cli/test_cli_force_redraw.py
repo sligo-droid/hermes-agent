@@ -204,3 +204,64 @@ class TestForceFullRedraw:
         bare_cli._app = app
 
         bare_cli._force_full_redraw()  # must not raise
+
+    def test_resize_handler_ignores_events_while_terminal_unfocused(self, bare_cli, monkeypatch):
+        app = MagicMock()
+        bare_cli._terminal_focused = False
+        bare_cli._terminal_focus_transition_at = 0.0
+        events = []
+        monkeypatch.setattr(
+            bare_cli,
+            "_schedule_resize_recovery",
+            lambda *_args, **_kwargs: events.append("scheduled"),
+        )
+        handler = bare_cli._make_classic_resize_handler(app, lambda: events.append("original_resize"))
+
+        handler()
+
+        assert events == []
+
+    def test_resize_handler_ignores_focus_restore_grace_window(self, bare_cli, monkeypatch):
+        app = MagicMock()
+        bare_cli._terminal_focused = True
+        bare_cli._terminal_focus_transition_at = 100.0
+        events = []
+        monkeypatch.setattr(cli_mod.time, "monotonic", lambda: 100.25)
+        monkeypatch.setattr(
+            bare_cli,
+            "_schedule_resize_recovery",
+            lambda *_args, **_kwargs: events.append("scheduled"),
+        )
+        handler = bare_cli._make_classic_resize_handler(app, lambda: events.append("original_resize"))
+
+        handler()
+
+        assert events == []
+
+    def test_resize_handler_schedules_after_focus_restore_grace_window(self, bare_cli, monkeypatch):
+        app = MagicMock()
+        bare_cli._terminal_focused = True
+        bare_cli._terminal_focus_transition_at = 100.0
+        events = []
+        monkeypatch.setattr(cli_mod.time, "monotonic", lambda: 101.0)
+        monkeypatch.setattr(
+            bare_cli,
+            "_schedule_resize_recovery",
+            lambda *_args, **_kwargs: events.append("scheduled"),
+        )
+        handler = bare_cli._make_classic_resize_handler(app, lambda: events.append("original_resize"))
+
+        handler()
+
+        assert events == ["scheduled"]
+
+    def test_invalidate_is_suppressed_while_terminal_unfocused(self, bare_cli):
+        app = MagicMock()
+        bare_cli._app = app
+        bare_cli._last_invalidate = 0.0
+        bare_cli._resize_recovery_pending = False
+        bare_cli._terminal_focused = False
+
+        bare_cli._invalidate(min_interval=0)
+
+        app.invalidate.assert_not_called()

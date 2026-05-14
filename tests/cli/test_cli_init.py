@@ -222,6 +222,43 @@ class TestPromptToolkitTerminalCompatibility:
 
         assert renderer.cpr_not_supported_callback is None
 
+    def test_focus_reports_are_consumed_without_invalidate(self):
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.keys import Keys
+
+        from cli import _bind_terminal_focus_report_ignores
+
+        cli_ref = SimpleNamespace(_terminal_focused=True, _terminal_focus_transition_at=0.0)
+        kb = KeyBindings()
+        _bind_terminal_focus_report_ignores(kb, cli_ref)
+
+        bindings = {tuple(binding.keys): binding for binding in kb.bindings}
+        assert (Keys.Escape, "[", "I") in bindings
+        assert (Keys.Escape, "[", "O") in bindings
+        assert bindings[(Keys.Escape, "[", "I")].eager()
+        assert bindings[(Keys.Escape, "[", "O")].eager()
+
+        out = SimpleNamespace(write_raw=MagicMock(), flush=MagicMock())
+        event = SimpleNamespace(app=SimpleNamespace(output=out, invalidate=MagicMock()))
+
+        bindings[(Keys.Escape, "[", "O")].handler(event)
+        assert cli_ref._terminal_focused is False
+        assert cli_ref._terminal_focus_transition_at > 0
+        event.app.invalidate.assert_not_called()
+        out.write_raw.assert_not_called()
+        out.flush.assert_not_called()
+
+        bindings[(Keys.Escape, "[", "I")].handler(event)
+        assert cli_ref._terminal_focused is True
+        event.app.invalidate.assert_not_called()
+
+    def test_classic_app_enables_focus_tracking(self):
+        from pathlib import Path
+
+        source = Path("cli.py").read_text()
+        assert "\\x1b[?1004h" in source
+        assert "\\x1b[?1004l" in source
+
 
 class TestSingleQueryState:
     def test_voice_and_interrupt_state_initialized_before_run(self):
