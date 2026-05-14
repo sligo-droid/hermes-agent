@@ -90,7 +90,8 @@ import {
   ENABLE_KITTY_KEYBOARD,
   ENABLE_MODIFY_OTHER_KEYS,
   ERASE_SCREEN,
-  ERASE_SCROLLBACK
+  ERASE_SCROLLBACK,
+  RESET_SCROLL_REGION
 } from './termio/csi.js'
 import {
   DBP,
@@ -612,6 +613,8 @@ export default class Ink {
         // disable mouse (no-op if off)
         (this.altScreenActive ? '' : '\x1b[?1049h') +
         // enter alt (already in alt if fullscreen)
+        RESET_SCROLL_REGION +
+        // reset inherited/private scroll margins
         '\x1b[?1004l' +
         // disable focus reporting
         '\x1b[0m' +
@@ -640,6 +643,8 @@ export default class Ink {
     this.options.stdout.write(
       (this.altScreenActive ? ENTER_ALT_SCREEN : '') +
         // re-enter alt — vim's rmcup dropped us to main
+        RESET_SCROLL_REGION +
+        // reset scroll margins before clearing/repainting Ink
         '\x1b[2J' +
         // clear screen (now alt if fullscreen)
         '\x1b[H' +
@@ -2285,7 +2290,7 @@ export default class Ink {
       if (this.altScreenActive) {
         // <AlternateScreen>'s unmount effect won't run during signal-exit.
         // Exit alt screen FIRST so other cleanup sequences go to the main screen.
-        writeSync(1, EXIT_ALT_SCREEN)
+        writeSync(1, EXIT_ALT_SCREEN + RESET_SCROLL_REGION)
       }
 
       // Disable mouse tracking — unconditional because altScreenActive can be
