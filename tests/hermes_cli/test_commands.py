@@ -82,6 +82,11 @@ class TestCommandRegistry:
             "xhigh",
         )
 
+    def test_opencode_is_cli_only_builtin(self):
+        opencode = next(cmd for cmd in COMMAND_REGISTRY if cmd.name == "opencode")
+        assert opencode.cli_only is True
+        assert "status" in opencode.subcommands
+
     def test_cli_only_and_gateway_only_are_mutually_exclusive(self):
         for cmd in COMMAND_REGISTRY:
             assert not (cmd.cli_only and cmd.gateway_only), \
@@ -538,6 +543,18 @@ class TestSlashCommandCompleter:
         assert completions[0].text == "gif-search"
         assert completions[0].display_text == "/gif-search"
         assert completions[0].display_meta_text == "⚡ Search for GIFs across providers"
+
+    def test_builtin_command_wins_over_same_named_skill_completion(self):
+        completer = SlashCommandCompleter(
+            skill_commands_provider=lambda: {
+                "/opencode": {"description": "Skill command named opencode"},
+            }
+        )
+
+        completions = _completions(completer, "/opencode")
+
+        assert [item.display_text for item in completions] == ["/opencode"]
+        assert completions[0].display_meta_text.startswith("Toggle OpenCode")
 
     def test_skill_exact_match_adds_trailing_space(self):
         completer = SlashCommandCompleter(

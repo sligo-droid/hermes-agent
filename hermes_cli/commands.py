@@ -140,11 +140,14 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("yolo", "Toggle YOLO mode (skip all dangerous command approvals)",
                "Configuration"),
     CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
-               args_hint="[level|show|hide]",
+               args_hint="[level|show|hide] [--global]",
                subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "show", "hide", "on", "off")),
     CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
                args_hint="[normal|fast|status]",
                subcommands=("normal", "fast", "status", "on", "off")),
+    CommandDef("opencode", "Toggle OpenCode coding worker guidance", "Configuration",
+               cli_only=True, args_hint="[on|off|status]",
+               subcommands=("on", "off", "status")),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
                cli_only=True, args_hint="[name]"),
     CommandDef("indicator", "Pick the TUI busy-indicator style", "Configuration",
@@ -1137,7 +1140,8 @@ class SlashCommandCompleter(Completer):
         if self._skill_commands_provider is None:
             return {}
         try:
-            return self._skill_commands_provider() or {}
+            commands = self._skill_commands_provider() or {}
+            return {cmd: info for cmd, info in commands.items() if cmd not in COMMANDS}
         except Exception:
             return {}
 

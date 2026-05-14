@@ -467,6 +467,9 @@ DEFAULT_CONFIG = {
         # provider hiccups on a single provider.
         "api_max_retries": 3,
         "service_tier": "",
+        # Optional replay budget for oversized tool outputs. Empty means
+        # provider-aware defaults apply (Codex backends default to 10k tokens).
+        "tool_output_token_limit": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
         # Values: "auto" (default — applies to gpt/codex models), true/false
@@ -920,6 +923,12 @@ DEFAULT_CONFIG = {
         "bell_on_complete": False,
         "show_reasoning": False,
         "streaming": False,
+        # Background process notification mode for CLI and gateway.
+        # all | result | error | off
+        "background_process_notifications": "all",
+        # Classic prompt-toolkit CLI resize recovery. True preserves the custom
+        # full repaint path while keeping terminal scrollback intact.
+        "classic_resize_full_clear": True,
         "timestamps": False,      # Show [HH:MM] on user and assistant labels
         "final_response_markdown": "strip",  # render | strip | raw
         # Preserve recent classic CLI output across Ctrl+L, /redraw, and
