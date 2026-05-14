@@ -49,7 +49,15 @@ const viewportIsMounted = (items: readonly Item[], virtualHistory: ReturnType<ty
   return top >= span.top && bottom <= span.bottom
 }
 
-function Harness({ expose, items }: { expose: React.MutableRefObject<Exposed | null>; items: readonly Item[] }) {
+function Harness({
+  expose,
+  items,
+  stickyScroll = true
+}: {
+  expose: React.MutableRefObject<Exposed | null>
+  items: readonly Item[]
+  stickyScroll?: boolean
+}) {
   const scrollRef = useRef<ScrollBoxHandle | null>(null)
 
   const virtualHistory = useVirtualHistory(scrollRef, items, 80, {
@@ -65,7 +73,7 @@ function Harness({ expose, items }: { expose: React.MutableRefObject<Exposed | n
 
   return React.createElement(
     ScrollBox,
-    { flexDirection: 'column', height: 10, ref: scrollRef, stickyScroll: true },
+    { flexDirection: 'column', height: 10, ref: scrollRef, stickyScroll },
     React.createElement(
       Box,
       { flexDirection: 'column', width: '100%' },
@@ -85,6 +93,33 @@ function Harness({ expose, items }: { expose: React.MutableRefObject<Exposed | n
 }
 
 describe('useVirtualHistory offset cache reuse', () => {
+  it('can keep tall intro-only content at the top when startup stickiness is disabled', async () => {
+    const introOnly = [{ height: 24, key: 'intro' }]
+    const expose = { current: null as Exposed | null }
+    const streams = makeStreams()
+
+    const instance = renderSync(React.createElement(Harness, { expose, items: introOnly, stickyScroll: false }), {
+      patchConsole: false,
+      stderr: streams.stderr as NodeJS.WriteStream,
+      stdin: streams.stdin as NodeJS.ReadStream,
+      stdout: streams.stdout as NodeJS.WriteStream
+    })
+
+    try {
+      await delay(20)
+
+      const scroll = expose.current!.scroll!
+
+      expect(expose.current!.virtualHistory.offsets[introOnly.length]).toBe(24)
+      expect(scroll.getViewportHeight()).toBe(10)
+      expect(scroll.getScrollTop()).toBe(0)
+      expect(scroll.isSticky()).toBe(false)
+    } finally {
+      instance.unmount()
+      instance.cleanup()
+    }
+  })
+
   it('recomputes offsets after a mounted row height changes', async () => {
     const tall = [
       { height: 6, key: 'a' },
