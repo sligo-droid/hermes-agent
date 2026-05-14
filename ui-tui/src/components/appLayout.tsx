@@ -53,6 +53,8 @@ const PromptPrefix = memo(function PromptPrefix({
   )
 })
 
+export const shouldStickTranscriptToBottom = ({ empty }: Pick<AppLayoutProps['composer'], 'empty'>) => !empty
+
 const TranscriptPane = memo(function TranscriptPane({
   actions,
   composer,
@@ -97,7 +99,7 @@ const TranscriptPane = memo(function TranscriptPane({
           }
         }}
         ref={transcript.scrollRef}
-        stickyScroll
+        stickyScroll={shouldStickTranscriptToBottom(composer)}
       >
         <Box flexDirection="column" paddingX={1}>
           {transcript.virtualHistory.topSpacer > 0 ? <Box height={transcript.virtualHistory.topSpacer} /> : null}
