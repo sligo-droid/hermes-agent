@@ -55,12 +55,25 @@ const PromptPrefix = memo(function PromptPrefix({
 
 export const shouldStickTranscriptToBottom = ({ empty }: Pick<AppLayoutProps['composer'], 'empty'>) => !empty
 
-const TranscriptPane = memo(function TranscriptPane({
-  actions,
+export const shouldRenderTranscriptScrollBox = (inlineMode: boolean) => !inlineMode
+
+export const transcriptRowsForMode = (
+  transcript: Pick<AppLayoutProps['transcript'], 'virtualHistory' | 'virtualRows'>,
+  inlineMode: boolean
+) =>
+  inlineMode
+    ? transcript.virtualRows
+    : transcript.virtualRows.slice(transcript.virtualHistory.start, transcript.virtualHistory.end)
+
+const TranscriptRows = memo(function TranscriptRows({
   composer,
-  progress,
+  measureRows,
+  rows,
   transcript
-}: Pick<AppLayoutProps, 'actions' | 'composer' | 'progress' | 'transcript'>) {
+}: Pick<AppLayoutProps, 'composer' | 'transcript'> & {
+  measureRows: boolean
+  rows: AppLayoutProps['transcript']['virtualRows']
+}) {
   const ui = useStore($uiState)
 
   // LiveTodoPanel rides as a child of the latest user-message row so it
@@ -89,6 +102,103 @@ const TranscriptPane = memo(function TranscriptPane({
 
   return (
     <>
+      {rows.map(row => (
+        <Box
+          flexDirection="column"
+          key={row.key}
+          ref={measureRows ? transcript.virtualHistory.measureRef(row.key) : undefined}
+        >
+          {row.msg.role === 'user' && firstUserIdx >= 0 && row.index > firstUserIdx && (
+            <Box marginTop={1}>
+              <Text color={ui.theme.color.border}>───</Text>
+            </Box>
+          )}
+
+          {row.msg.kind === 'intro' ? (
+            <Box flexDirection="column" paddingTop={1}>
+              <Banner t={ui.theme} />
+
+              {row.msg.info && <SessionPanel info={row.msg.info} sid={ui.sid} t={ui.theme} />}
+            </Box>
+          ) : row.msg.kind === 'panel' && row.msg.panelData ? (
+            <Panel sections={row.msg.panelData.sections} t={ui.theme} title={row.msg.panelData.title} />
+          ) : (
+            <MessageLine
+              cols={composer.cols}
+              compact={ui.compact}
+              detailsMode={ui.detailsMode}
+              detailsModeCommandOverride={ui.detailsModeCommandOverride}
+              limitHistoryRender={row.index < transcript.historyItems.length - FULL_RENDER_TAIL_ITEMS}
+              msg={row.msg}
+              sections={ui.sections}
+              t={ui.theme}
+            />
+          )}
+
+          {row.index === lastUserIdx && <LiveTodoPanel />}
+        </Box>
+      ))}
+    </>
+  )
+})
+
+const TranscriptStreaming = memo(function TranscriptStreaming({
+  composer,
+  progress
+}: Pick<AppLayoutProps, 'composer' | 'progress'>) {
+  const ui = useStore($uiState)
+
+  return (
+    <Box flexDirection="column" paddingX={1}>
+      <StreamingAssistant
+        cols={composer.cols}
+        compact={ui.compact}
+        detailsMode={ui.detailsMode}
+        detailsModeCommandOverride={ui.detailsModeCommandOverride}
+        progress={progress}
+        sections={ui.sections}
+      />
+    </Box>
+  )
+})
+
+const TranscriptPane = memo(function TranscriptPane({
+  actions,
+  composer,
+  progress,
+  transcript
+}: Pick<AppLayoutProps, 'actions' | 'composer' | 'progress' | 'transcript'>) {
+  const ui = useStore($uiState)
+  const useScrollBox = shouldRenderTranscriptScrollBox(INLINE_MODE)
+
+  if (!useScrollBox) {
+    return (
+      <Box
+        flexDirection="column"
+        flexGrow={1}
+        flexShrink={1}
+        onClick={(e: { cellIsBlank?: boolean }) => {
+          if (e.cellIsBlank) {
+            actions.clearSelection()
+          }
+        }}
+      >
+        <Box flexDirection="column" paddingX={1}>
+          <TranscriptRows
+            composer={composer}
+            measureRows={false}
+            rows={transcriptRowsForMode(transcript, true)}
+            transcript={transcript}
+          />
+        </Box>
+
+        <TranscriptStreaming composer={composer} progress={progress} />
+      </Box>
+    )
+  }
+
+  return (
+    <>
       <ScrollBox
         flexDirection="column"
         flexGrow={1}
@@ -104,50 +214,17 @@ const TranscriptPane = memo(function TranscriptPane({
         <Box flexDirection="column" paddingX={1}>
           {transcript.virtualHistory.topSpacer > 0 ? <Box height={transcript.virtualHistory.topSpacer} /> : null}
 
-          {transcript.virtualRows.slice(transcript.virtualHistory.start, transcript.virtualHistory.end).map(row => (
-            <Box flexDirection="column" key={row.key} ref={transcript.virtualHistory.measureRef(row.key)}>
-              {row.msg.role === 'user' && firstUserIdx >= 0 && row.index > firstUserIdx && (
-                <Box marginTop={1}>
-                  <Text color={ui.theme.color.border}>───</Text>
-                </Box>
-              )}
-
-              {row.msg.kind === 'intro' ? (
-                <Box flexDirection="column" paddingTop={1}>
-                  <Banner t={ui.theme} />
-
-                  {row.msg.info && <SessionPanel info={row.msg.info} sid={ui.sid} t={ui.theme} />}
-                </Box>
-              ) : row.msg.kind === 'panel' && row.msg.panelData ? (
-                <Panel sections={row.msg.panelData.sections} t={ui.theme} title={row.msg.panelData.title} />
-              ) : (
-                <MessageLine
-                  cols={composer.cols}
-                  compact={ui.compact}
-                  detailsMode={ui.detailsMode}
-                  detailsModeCommandOverride={ui.detailsModeCommandOverride}
-                  limitHistoryRender={row.index < transcript.historyItems.length - FULL_RENDER_TAIL_ITEMS}
-                  msg={row.msg}
-                  sections={ui.sections}
-                  t={ui.theme}
-                />
-              )}
-
-              {row.index === lastUserIdx && <LiveTodoPanel />}
-            </Box>
-          ))}
+          <TranscriptRows
+            composer={composer}
+            measureRows
+            rows={transcriptRowsForMode(transcript, false)}
+            transcript={transcript}
+          />
 
           {transcript.virtualHistory.bottomSpacer > 0 ? <Box height={transcript.virtualHistory.bottomSpacer} /> : null}
-
-          <StreamingAssistant
-            cols={composer.cols}
-            compact={ui.compact}
-            detailsMode={ui.detailsMode}
-            detailsModeCommandOverride={ui.detailsModeCommandOverride}
-            progress={progress}
-            sections={ui.sections}
-          />
         </Box>
+
+        <TranscriptStreaming composer={composer} progress={progress} />
       </ScrollBox>
 
       <NoSelect flexShrink={0} marginLeft={1}>

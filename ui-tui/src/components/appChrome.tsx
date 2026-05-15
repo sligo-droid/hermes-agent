@@ -1,4 +1,4 @@
-import { Box, type ScrollBoxHandle, Text } from '@hermes/ink'
+import { Box, type ScrollBoxHandle, stringWidth, Text } from '@hermes/ink'
 import { useStore } from '@nanostores/react'
 import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react'
 import unicodeSpinners from 'unicode-animations'
@@ -150,6 +150,52 @@ function ctxBar(pct: number | undefined, w = 10) {
   return '█'.repeat(filled) + '░'.repeat(w - filled)
 }
 
+const truncateStart = (value: string, maxWidth: number) => {
+  if (maxWidth <= 0) {
+    return ''
+  }
+
+  if (stringWidth(value) <= maxWidth) {
+    return value
+  }
+
+  if (maxWidth <= 1) {
+    return '…'
+  }
+
+  const chars = Array.from(value)
+  let out = ''
+
+  for (let i = chars.length - 1; i >= 0; i -= 1) {
+    const next = chars[i]! + out
+
+    if (stringWidth(`…${next}`) > maxWidth) {
+      break
+    }
+
+    out = next
+  }
+
+  return `…${out}`
+}
+
+export function statusRuleLayout(cols: number, cwdLabel: string) {
+  if (cols < 36) {
+    return { cwdLabel: '', leftWidth: Math.max(1, cols) }
+  }
+
+  const maxCwdWidth = Math.min(stringWidth(cwdLabel), Math.max(0, cols - 24), Math.max(0, Math.floor(cols * 0.35)))
+
+  if (maxCwdWidth < 8) {
+    return { cwdLabel: '', leftWidth: Math.max(1, cols) }
+  }
+
+  const visibleCwd = truncateStart(cwdLabel, maxCwdWidth)
+  const rightWidth = visibleCwd ? stringWidth(visibleCwd) + 3 : 0
+
+  return { cwdLabel: visibleCwd, leftWidth: Math.max(1, cols - rightWidth) }
+}
+
 function SpawnHud({ t }: { t: Theme }) {
   // Tight HUD that only appears when the session is actually fanning out.
   // Colour escalates to warn/error as depth or concurrency approaches the cap.
@@ -297,11 +343,11 @@ export function StatusRule({
       : ''
 
   const bar = usage.context_max ? ctxBar(pct) : ''
-  const leftWidth = Math.max(12, cols - cwdLabel.length - 3)
+  const layout = statusRuleLayout(cols, cwdLabel)
 
   return (
     <Box height={1}>
-      <Box flexShrink={1} width={leftWidth}>
+      <Box flexShrink={1} width={layout.leftWidth}>
         <Text color={t.color.border} wrap="truncate-end">
           {'─ '}
           {busy ? (
@@ -349,8 +395,12 @@ export function StatusRule({
         </Text>
       </Box>
 
-      <Text color={t.color.border}> ─ </Text>
-      <Text color={t.color.label}>{cwdLabel}</Text>
+      {layout.cwdLabel ? (
+        <>
+          <Text color={t.color.border}> ─ </Text>
+          <Text color={t.color.label}>{layout.cwdLabel}</Text>
+        </>
+      ) : null}
     </Box>
   )
 }

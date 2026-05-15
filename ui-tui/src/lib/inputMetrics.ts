@@ -1,4 +1,4 @@
-import { stringWidth } from '@hermes/ink'
+import { stringWidth, wrapAnsi } from '@hermes/ink'
 
 import type { Role } from '../types.js'
 
@@ -11,8 +11,6 @@ interface VisualLine {
   end: number
   start: number
 }
-
-const isWhitespace = (value: string) => /\s/.test(value)
 
 const graphemes = (value: string) =>
   [...seg().segment(value)].map(({ segment, index }) => ({
@@ -28,67 +26,23 @@ function visualLines(value: string, cols: number): VisualLine[] {
   let sourceLineStart = 0
 
   for (const sourceLine of value.split('\n')) {
-    const parts = graphemes(sourceLine)
-
-    if (!parts.length) {
+    if (!sourceLine.length) {
       lines.push({ start: sourceLineStart, end: sourceLineStart })
       sourceLineStart += 1
       continue
     }
 
-    let lineStartPart = 0
-    let lineStartOffset = sourceLineStart
-    let column = 0
-    let breakPart: null | number = null
-    let i = 0
+    let searchFrom = 0
 
-    while (i < parts.length) {
-      const part = parts[i]!
-      const partStart = sourceLineStart + part.index
+    for (const wrapped of wrapAnsi(sourceLine, width, { hard: true, trim: false }).split('\n')) {
+      const start = sourceLine.indexOf(wrapped, searchFrom)
+      const lineStart = start >= 0 ? start : searchFrom
+      const lineEnd = lineStart + wrapped.length
 
-      if (column + part.width > width && i > lineStartPart) {
-        if (breakPart !== null && breakPart > lineStartPart) {
-          const breakOffset = sourceLineStart + parts[breakPart - 1]!.end
-          lines.push({ start: lineStartOffset, end: breakOffset })
-          lineStartPart = breakPart
-          lineStartOffset = breakOffset
-        } else {
-          lines.push({ start: lineStartOffset, end: partStart })
-          lineStartPart = i
-          lineStartOffset = partStart
-        }
-
-        column = 0
-        breakPart = null
-        i = lineStartPart
-        continue
-      }
-
-      column += part.width
-
-      if (isWhitespace(part.segment)) {
-        breakPart = i + 1
-      }
-
-      i += 1
-
-      if (column >= width && i < parts.length) {
-        const next = parts[i]!
-        const nextStartsWord = !isWhitespace(next.segment)
-
-        if (breakPart !== null && breakPart > lineStartPart && nextStartsWord) {
-          const breakOffset = sourceLineStart + parts[breakPart - 1]!.end
-          lines.push({ start: lineStartOffset, end: breakOffset })
-          lineStartPart = breakPart
-          lineStartOffset = breakOffset
-          column = 0
-          breakPart = null
-          i = lineStartPart
-        }
-      }
+      lines.push({ start: sourceLineStart + lineStart, end: sourceLineStart + lineEnd })
+      searchFrom = lineEnd
     }
 
-    lines.push({ start: lineStartOffset, end: sourceLineStart + sourceLine.length })
     sourceLineStart += sourceLine.length + 1
   }
 

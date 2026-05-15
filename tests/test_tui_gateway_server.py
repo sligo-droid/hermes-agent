@@ -520,7 +520,7 @@ def test_history_to_messages_preserves_tool_calls_for_resume_display():
 
     assert server._history_to_messages(history) == [
         {"role": "user", "text": "first prompt"},
-        {"context": "resume", "name": "search_files", "role": "tool"},
+        {"context": "resume", "name": "search_files", "role": "tool", "text": "{}"},
         {"role": "assistant", "text": "first answer"},
         {"role": "user", "text": "second prompt"},
     ]
@@ -550,6 +550,14 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
     class FakeDB:
         def get_session(self, target):
             return {"id": target}
+
+        def get_compression_tip(self, target):
+            captured.setdefault("resolve_calls", []).append(("compression", target))
+            return target
+
+        def resolve_resume_session_id(self, target):
+            captured.setdefault("resolve_calls", []).append(("resume", target))
+            return target
 
         def reopen_session(self, target):
             captured["reopened"] = target
@@ -591,7 +599,48 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
         {"role": "user", "text": "root prompt"},
         {"role": "assistant", "text": "root answer"},
     ]
-    assert captured["history_calls"] == [("tip", False), ("tip", True)]
+    assert captured["resolve_calls"] == [("compression", "tip"), ("resume", "tip")]
+    assert captured["history_calls"] == [("tip", True)]
+
+
+def test_session_resume_reopens_compression_tip(monkeypatch):
+    captured = {}
+
+    class FakeDB:
+        def get_session(self, target):
+            return {"id": target}
+
+        def get_compression_tip(self, target):
+            captured.setdefault("resolve_calls", []).append(("compression", target))
+            return "compressed-tip"
+
+        def resolve_resume_session_id(self, target):
+            captured.setdefault("resolve_calls", []).append(("resume", target))
+            return target
+
+        def reopen_session(self, target):
+            captured["reopened"] = target
+
+        def get_messages_as_conversation(self, target, include_ancestors=False):
+            captured.setdefault("history_calls", []).append((target, include_ancestors))
+            return [{"role": "user", "content": "root prompt"}]
+
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
+    monkeypatch.setattr(server, "_make_agent", lambda *args, **kwargs: types.SimpleNamespace(model="test"))
+    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": "test", "tools": {}, "skills": {}})
+    monkeypatch.setattr(server, "_init_session", lambda sid, key, agent, history, cols=80: None)
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.resume", "params": {"session_id": "root"}}
+    )
+
+    assert "error" not in resp
+    assert captured["resolve_calls"] == [("compression", "root")]
+    assert captured["reopened"] == "compressed-tip"
+    assert captured["history_calls"] == [("compressed-tip", True)]
 
 
 def test_status_callback_emits_kind_and_text():

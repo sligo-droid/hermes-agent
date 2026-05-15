@@ -106,6 +106,11 @@ declare module '@hermes/ink' {
   export const Text: React.ComponentType<any>
   export const TextInput: React.ComponentType<any>
   export const stringWidth: (s: string) => number
+  export const wrapAnsi: (
+    input: string,
+    columns: number,
+    options?: { hard?: boolean; trim?: boolean; wordWrap?: boolean }
+  ) => string
   export function isXtermJs(): boolean
 
   export type ScrollFastPathStats = {
