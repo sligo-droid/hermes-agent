@@ -326,7 +326,7 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
     assert resp["result"]["messages"] == [
         {"role": "user", "text": "hello"},
         {"role": "assistant", "text": "yo"},
-        {"role": "tool", "name": "tool", "context": ""},
+        {"role": "tool", "name": "tool", "context": "", "text": "searched"},
     ]
 
 

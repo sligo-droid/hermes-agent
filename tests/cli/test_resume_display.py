@@ -1,12 +1,13 @@
 """Tests for session resume history display — _display_resumed_history() and
 _preload_resumed_session().
 
-Verifies that resuming a session shows a compact recap of the previous
-conversation with correct formatting, truncation, and config behavior.
+Verifies that resuming a session shows the previous conversation with correct
+formatting and config behavior.
 """
 
 import os
 import sys
+import json
 from io import StringIO
 from unittest.mock import MagicMock, patch
 
@@ -118,7 +119,7 @@ def _multimodal_history():
 
 
 class TestDisplayResumedHistory:
-    """_display_resumed_history() renders a Rich panel with conversation recap."""
+    """_display_resumed_history() renders a Rich panel with conversation history."""
 
     def _capture_display(self, cli_obj):
         """Run _display_resumed_history and capture the Rich console output."""
@@ -163,7 +164,7 @@ class TestDisplayResumedHistory:
         assert "web_search" in output
         assert "web_extract" in output
 
-    def test_long_user_message_truncated(self):
+    def test_long_user_message_shown_in_full(self):
         cli = _make_cli()
         long_text = "A" * 500
         cli.conversation_history = [
@@ -172,16 +173,10 @@ class TestDisplayResumedHistory:
         ]
         output = self._capture_display(cli)
 
-        # Should have truncation indicator and NOT contain the full 500 chars
-        assert "..." in output
-        assert "A" * 500 not in output
-        # The 300-char truncated text is present but may be line-wrapped by
-        # Rich's panel renderer, so check the total A count in the output
-        a_count = output.count("A")
-        assert 200 <= a_count <= 310  # roughly 300 chars (±panel padding)
+        assert output.count("A") >= 490
 
-    def test_long_assistant_message_truncated(self):
-        """Non-last assistant messages are still truncated."""
+    def test_long_assistant_message_shown_in_full(self):
+        """Non-last assistant messages are shown in full on resume."""
         cli = _make_cli()
         long_text = "B" * 400
         cli.conversation_history = [
@@ -192,13 +187,11 @@ class TestDisplayResumedHistory:
         ]
         output = self._capture_display(cli)
 
-        # The non-last assistant message should be truncated
-        assert "B" * 400 not in output
-        # The last assistant message shown in full
+        assert output.count("B") >= 390
         assert "Short final reply." in output
 
-    def test_multiline_assistant_truncated(self):
-        """Non-last multiline assistant messages are truncated to 3 lines."""
+    def test_multiline_assistant_shown_in_full(self):
+        """Non-last multiline assistant messages are shown in full."""
         cli = _make_cli()
         multi = "\n".join([f"Line {i}" for i in range(20)])
         cli.conversation_history = [
@@ -209,12 +202,9 @@ class TestDisplayResumedHistory:
         ]
         output = self._capture_display(cli)
 
-        # First 3 lines of non-last assistant should be there
         assert "Line 0" in output
-        assert "Line 1" in output
-        assert "Line 2" in output
-        # Line 19 should NOT be in the truncated message
-        assert "Line 19" not in output
+        assert "Line 10" in output
+        assert "Line 19" in output
 
     def test_last_assistant_response_shown_in_full(self):
         """The last assistant response is shown un-truncated so the user
@@ -246,15 +236,45 @@ class TestDisplayResumedHistory:
         assert "Line 10" in output
         assert "Line 19" in output
 
-    def test_large_history_shows_truncation_indicator(self):
+    def test_large_history_shows_all_user_turns(self):
         cli = _make_cli()
         cli.conversation_history = _large_history(n_exchanges=15)
         output = self._capture_display(cli)
 
-        # Should show "earlier messages" indicator
-        assert "earlier messages" in output
-        # Last question should still be visible
+        assert "earlier messages" not in output
+        assert "Question #1" in output
         assert "Question #15" in output
+
+    def test_tool_heavy_history_keeps_all_user_turns_with_tool_summaries(self):
+        cli = _make_cli()
+        history = [{"role": "system", "content": "system prompt"}]
+        for i in range(12):
+            history.append({"role": "user", "content": f"Important request #{i + 1}"})
+            for j in range(15):
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": f"call_{i}_{j}",
+                                "type": "function",
+                                "function": {"name": "exec_command", "arguments": "{}"},
+                            }
+                        ],
+                    }
+                )
+                history.append({"role": "tool", "tool_call_id": f"call_{i}_{j}", "content": "hidden"})
+            history.append({"role": "assistant", "content": f"Finished request #{i + 1}."})
+        cli.conversation_history = history
+
+        output = self._capture_display(cli)
+
+        assert "Important request #1" in output
+        assert "Important request #12" in output
+        assert "[15 tool calls: exec_command]" in output
+        assert output.count("[1 tool call: exec_command]") < 180
+        assert "hidden" not in output
 
     def test_multimodal_content_handled(self):
         cli = _make_cli()
@@ -548,6 +568,33 @@ class TestPreloadResumedSession:
         assert result is False
         output = buf.getvalue()
         assert "no messages" in output
+
+    def test_loads_session_log_when_db_has_no_messages(self, tmp_path, monkeypatch):
+        cli = _make_cli(resume="json_session")
+        messages = _simple_history()
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        (sessions_dir / "session_20260515_002910_427ec2.json").write_text(
+            json.dumps({"session_id": "json_session", "messages": messages}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(cli_mod, "get_hermes_home", lambda: tmp_path)
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {"id": "json_session", "title": "JSON Session"}
+        mock_db.get_messages_as_conversation.return_value = []
+        mock_db._conn = MagicMock()
+        cli._session_db = mock_db
+
+        buf = StringIO()
+        cli.console.file = buf
+        result = cli._preload_resumed_session()
+
+        assert result is True
+        assert cli.conversation_history == messages
+        mock_db.replace_messages.assert_called_once_with("json_session", messages)
+        output = buf.getvalue()
+        assert "Resumed session" in output
+        assert "JSON Session" in output
 
     def test_loads_session_successfully(self):
         cli = _make_cli(resume="good_session")

@@ -2049,6 +2049,24 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
     messages = []
     tool_call_args = {}
 
+    def _reasoning_text(m: dict) -> str:
+        parts: list[str] = []
+        for key in ("reasoning", "reasoning_content"):
+            value = m.get(key)
+            if isinstance(value, str) and value.strip() and value not in parts:
+                parts.append(value.strip())
+
+        details = m.get("reasoning_details")
+        if isinstance(details, list):
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                value = detail.get("summary") or detail.get("text") or detail.get("content")
+                if isinstance(value, str) and value.strip() and value not in parts:
+                    parts.append(value.strip())
+
+        return "\n\n".join(parts)
+
     for m in history:
         if not isinstance(m, dict):
             continue
@@ -2056,6 +2074,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if role not in {"user", "assistant", "tool", "system"}:
             continue
         content_text = _content_display_text(m.get("content"))
+        reasoning_text = _reasoning_text(m) if role == "assistant" else ""
         if role == "assistant" and m.get("tool_calls"):
             for tc in m["tool_calls"]:
                 fn = tc.get("function", {})
@@ -2066,7 +2085,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                     except (json.JSONDecodeError, TypeError):
                         args = {}
                     tool_call_args[tc_id] = (fn["name"], args)
-            if not content_text.strip():
+            if not content_text.strip() and not reasoning_text.strip():
                 continue
         if role == "tool":
             tc_id = m.get("tool_call_id", "")
@@ -2074,12 +2093,20 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             name = (tc_info[0] if tc_info else None) or m.get("tool_name") or "tool"
             args = (tc_info[1] if tc_info else None) or {}
             messages.append(
-                {"role": "tool", "name": name, "context": _tool_ctx(name, args)}
+                {
+                    "role": "tool",
+                    "name": name,
+                    "context": _tool_ctx(name, args),
+                    "text": content_text,
+                }
             )
             continue
-        if not content_text.strip():
+        if not content_text.strip() and not reasoning_text.strip():
             continue
-        messages.append({"role": role, "text": content_text})
+        row = {"role": role, "text": content_text}
+        if reasoning_text:
+            row["thinking"] = reasoning_text
+        messages.append(row)
 
     return messages
 
