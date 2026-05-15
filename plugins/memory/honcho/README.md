@@ -7,20 +7,88 @@ AI-native cross-session user modeling with multi-pass dialectic reasoning, sessi
 ## Requirements
 
 - `pip install honcho-ai`
-- Honcho API key from [app.honcho.dev](https://app.honcho.dev), or a self-hosted instance
+- Local-first: self-hosted Honcho with Postgres + pgvector
+- Expected local backend: `http://127.0.0.1:8000`
 
 ## Setup
 
 ```bash
-hermes honcho setup    # full interactive wizard (cloud or local)
+hermes honcho setup    # local-first interactive wizard
 hermes memory setup    # generic picker, also works
+hermes honcho env      # print local-first Honcho server env template
+hermes honcho embeddings status
+hermes honcho embeddings start
+hermes honcho embeddings start --docker
+hermes honcho embeddings tune
 ```
 
 Or manually:
 ```bash
 hermes config set memory.provider honcho
-echo "HONCHO_API_KEY=***" >> ~/.hermes/.env
+cat > ~/.hermes/honcho.json <<'JSON'
+{"baseUrl":"http://127.0.0.1:8000","hosts":{"hermes":{"enabled":true,"workspace":"hermes","aiPeer":"hermes","peerName":"your-name"}}}
+JSON
 ```
+
+## Local-First Self-Hosted Profile
+
+Hermes talks to local Honcho through `baseUrl`:
+
+```json
+{
+  "baseUrl": "http://127.0.0.1:8000",
+  "hosts": {
+    "hermes": {
+      "enabled": true,
+      "aiPeer": "hermes",
+      "peerName": "your-name",
+      "workspace": "hermes"
+    }
+  }
+}
+```
+
+Recommended local embeddings use llama.cpp's OpenAI-compatible `/v1/embeddings` endpoint. The default is `Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0` with 1024 dimensions for read-path speed:
+
+```bash
+llama-server --embedding \
+  --host 127.0.0.1 \
+  --port 8080 \
+  -c 32768 \
+  -hf Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0
+```
+
+Use these Honcho server env vars before first data is written:
+
+```bash
+EMBEDDING_VECTOR_DIMENSIONS=1024
+EMBEDDING_MAX_INPUT_TOKENS=32768
+EMBEDDING_MODEL_CONFIG__TRANSPORT=openai
+EMBEDDING_MODEL_CONFIG__MODEL=Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0
+EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL=http://127.0.0.1:8080/v1
+EMBEDDING_MODEL_CONFIG__OVERRIDES__API_KEY_ENV=EMBEDDING_OPENAI_API_KEY
+EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE=always
+EMBEDDING_OPENAI_API_KEY=not-needed
+```
+
+Honcho pins pgvector dimensions at bootstrap. `Qwen/Qwen3-Embedding-8B-GGUF` is 4096 dim and higher quality, but too heavy for the default memory read-path latency/resource budget. If you switch to it, run Honcho's embedding bootstrap/configure step on an empty database before storing messages.
+
+For Honcho's LLM features, use the OpenAI-compatible Honcho env path:
+
+```bash
+LLM_OPENAI_API_KEY=<set-hermes-proxy-api-key>
+DERIVER_MODEL_CONFIG__TRANSPORT=openai
+DERIVER_MODEL_CONFIG__MODEL=gpt-5.5
+DERIVER_MODEL_CONFIG__OVERRIDES__BASE_URL=http://127.0.0.1:8645/v1
+SUMMARY_MODEL_CONFIG__TRANSPORT=openai
+SUMMARY_MODEL_CONFIG__MODEL=gpt-5.5
+SUMMARY_MODEL_CONFIG__OVERRIDES__BASE_URL=http://127.0.0.1:8645/v1
+DIALECTIC_LEVELS__low__MODEL_CONFIG__TRANSPORT=openai
+DIALECTIC_LEVELS__low__MODEL_CONFIG__MODEL=gpt-5.5
+DIALECTIC_LEVELS__low__MODEL_CONFIG__OVERRIDES__BASE_URL=http://127.0.0.1:8645/v1
+```
+
+Start the GPT-5.5 proxy with `hermes proxy start --provider openai-codex`. Hermes OAuth is not itself a Honcho credential; expose it to Honcho only through this local OpenAI-compatible proxy. Do not hardcode secrets in `honcho.json` or docs.
 
 ## Architecture Overview
 
@@ -272,7 +340,7 @@ Presets:
 
 | Command | Description |
 |---------|-------------|
-| `hermes honcho setup` | Full interactive setup wizard |
+| `hermes honcho setup` | Local-first interactive setup wizard |
 | `hermes honcho status` | Show resolved config for active profile |
 | `hermes honcho enable` / `disable` | Toggle Honcho for active profile |
 | `hermes honcho mode <mode>` | Change recall or observation mode |
@@ -282,6 +350,12 @@ Presets:
 | `hermes honcho tokens --dialectic <N>` | Set dialectic max chars |
 | `hermes honcho map <name>` | Map current directory to a session name |
 | `hermes honcho sync` | Create host blocks for all Hermes profiles |
+| `hermes honcho env` | Print local Honcho server env template |
+| `hermes honcho embeddings status` | Check local llama.cpp health, models, and dimensions |
+| `hermes honcho embeddings config` | Print expected model, ctx, dimensions, port |
+| `hermes honcho embeddings start` | Start llama.cpp embeddings in the background |
+| `hermes honcho embeddings start --docker` | Start llama.cpp embeddings with Docker |
+| `hermes honcho embeddings tune` | Show safe llama.cpp resource knobs |
 
 ## Example Config
 

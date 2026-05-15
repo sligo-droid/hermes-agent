@@ -7,12 +7,127 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import sys
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
 from plugins.memory.honcho.client import resolve_active_host, resolve_config_path, HOST
 from hermes_cli.config import cfg_get
+
+
+LOCAL_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0"
+LOCAL_EMBEDDING_DIMENSIONS = 1024
+LOCAL_EMBEDDING_CONTEXT = 32768
+LOCAL_EMBEDDING_PORT = 8080
+LOCAL_EMBEDDING_BASE_URL = f"http://127.0.0.1:{LOCAL_EMBEDDING_PORT}/v1"
+LOCAL_EMBEDDING_CONTAINER = "hermes-honcho-embeddings"
+LOCAL_LLAMACPP_DOCKER_IMAGE = "ghcr.io/ggml-org/llama.cpp:server"
+LOCAL_HONCHO_BASE_URL = "http://127.0.0.1:8000"
+LOCAL_LLM_BASE_URL = "http://127.0.0.1:8645/v1"
+LOCAL_LLM_MODEL = "gpt-5.5"
+
+
+LOCAL_FIRST_HONCHO_ENV = {
+    "AUTH_USE_AUTH": "false",
+    "EMBEDDING_VECTOR_DIMENSIONS": str(LOCAL_EMBEDDING_DIMENSIONS),
+    "EMBEDDING_MAX_INPUT_TOKENS": str(LOCAL_EMBEDDING_CONTEXT),
+    "EMBEDDING_MODEL_CONFIG__TRANSPORT": "openai",
+    "EMBEDDING_MODEL_CONFIG__MODEL": LOCAL_EMBEDDING_MODEL,
+    "EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL": LOCAL_EMBEDDING_BASE_URL,
+    "EMBEDDING_MODEL_CONFIG__OVERRIDES__API_KEY_ENV": "EMBEDDING_OPENAI_API_KEY",
+    "EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE": "always",
+    "EMBEDDING_OPENAI_API_KEY": "not-needed",
+    "LLM_OPENAI_API_KEY": "<set-hermes-proxy-api-key>",
+    "DERIVER_MODEL_CONFIG__TRANSPORT": "openai",
+    "DERIVER_MODEL_CONFIG__MODEL": LOCAL_LLM_MODEL,
+    "DERIVER_MODEL_CONFIG__OVERRIDES__BASE_URL": LOCAL_LLM_BASE_URL,
+    "DERIVER_MODEL_CONFIG__OVERRIDES__API_KEY_ENV": "LLM_OPENAI_API_KEY",
+    "SUMMARY_MODEL_CONFIG__TRANSPORT": "openai",
+    "SUMMARY_MODEL_CONFIG__MODEL": LOCAL_LLM_MODEL,
+    "SUMMARY_MODEL_CONFIG__OVERRIDES__BASE_URL": LOCAL_LLM_BASE_URL,
+    "SUMMARY_MODEL_CONFIG__OVERRIDES__API_KEY_ENV": "LLM_OPENAI_API_KEY",
+    "DIALECTIC_LEVELS__minimal__MODEL_CONFIG__TRANSPORT": "openai",
+    "DIALECTIC_LEVELS__minimal__MODEL_CONFIG__MODEL": LOCAL_LLM_MODEL,
+    "DIALECTIC_LEVELS__minimal__MODEL_CONFIG__OVERRIDES__BASE_URL": LOCAL_LLM_BASE_URL,
+    "DIALECTIC_LEVELS__minimal__MODEL_CONFIG__OVERRIDES__API_KEY_ENV": "LLM_OPENAI_API_KEY",
+    "DIALECTIC_LEVELS__low__MODEL_CONFIG__TRANSPORT": "openai",
+    "DIALECTIC_LEVELS__low__MODEL_CONFIG__MODEL": LOCAL_LLM_MODEL,
+    "DIALECTIC_LEVELS__low__MODEL_CONFIG__OVERRIDES__BASE_URL": LOCAL_LLM_BASE_URL,
+    "DIALECTIC_LEVELS__low__MODEL_CONFIG__OVERRIDES__API_KEY_ENV": "LLM_OPENAI_API_KEY",
+    "DIALECTIC_LEVELS__medium__MODEL_CONFIG__TRANSPORT": "openai",
+    "DIALECTIC_LEVELS__medium__MODEL_CONFIG__MODEL": LOCAL_LLM_MODEL,
+    "DIALECTIC_LEVELS__medium__MODEL_CONFIG__OVERRIDES__BASE_URL": LOCAL_LLM_BASE_URL,
+    "DIALECTIC_LEVELS__medium__MODEL_CONFIG__OVERRIDES__API_KEY_ENV": "LLM_OPENAI_API_KEY",
+    "DIALECTIC_LEVELS__high__MODEL_CONFIG__TRANSPORT": "openai",
+    "DIALECTIC_LEVELS__high__MODEL_CONFIG__MODEL": LOCAL_LLM_MODEL,
+    "DIALECTIC_LEVELS__high__MODEL_CONFIG__OVERRIDES__BASE_URL": LOCAL_LLM_BASE_URL,
+    "DIALECTIC_LEVELS__high__MODEL_CONFIG__OVERRIDES__API_KEY_ENV": "LLM_OPENAI_API_KEY",
+    "DIALECTIC_LEVELS__max__MODEL_CONFIG__TRANSPORT": "openai",
+    "DIALECTIC_LEVELS__max__MODEL_CONFIG__MODEL": LOCAL_LLM_MODEL,
+    "DIALECTIC_LEVELS__max__MODEL_CONFIG__OVERRIDES__BASE_URL": LOCAL_LLM_BASE_URL,
+    "DIALECTIC_LEVELS__max__MODEL_CONFIG__OVERRIDES__API_KEY_ENV": "LLM_OPENAI_API_KEY",
+}
+
+
+def build_llamacpp_embedding_command(
+    model: str = LOCAL_EMBEDDING_MODEL,
+    ctx: int = LOCAL_EMBEDDING_CONTEXT,
+    port: int = LOCAL_EMBEDDING_PORT,
+    host: str = "127.0.0.1",
+    threads: int | None = None,
+    gpu_layers: int | None = None,
+    batch_size: int | None = None,
+    ubatch_size: int | None = None,
+) -> list[str]:
+    """Return the llama.cpp embedding server command."""
+    cmd = [
+        "llama-server",
+        "--embedding",
+        "--host", host,
+        "--port", str(port),
+        "-c", str(ctx),
+    ]
+    model_path = Path(model).expanduser()
+    if model_path.exists() or model.endswith(".gguf") or model.startswith("/"):
+        cmd.extend(["-m", model])
+    else:
+        cmd.extend(["-hf", model])
+    if threads:
+        cmd.extend(["--threads", str(threads)])
+    if gpu_layers is not None:
+        cmd.extend(["--n-gpu-layers", str(gpu_layers)])
+    if batch_size:
+        cmd.extend(["--batch-size", str(batch_size)])
+    if ubatch_size:
+        cmd.extend(["--ubatch-size", str(ubatch_size)])
+    return cmd
+
+
+def _quote_cmd(cmd: list[str]) -> str:
+    return " ".join(shlex.quote(part) for part in cmd)
+
+
+def build_llamacpp_embedding_docker_command(
+    model: str = LOCAL_EMBEDDING_MODEL,
+    ctx: int = LOCAL_EMBEDDING_CONTEXT,
+    port: int = LOCAL_EMBEDDING_PORT,
+    container_name: str = LOCAL_EMBEDDING_CONTAINER,
+) -> list[str]:
+    """Return a Docker-backed llama.cpp embedding server command."""
+    return [
+        "docker",
+        "run",
+        "--detach",
+        "--name", container_name,
+        "--publish", f"127.0.0.1:{port}:8080",
+        LOCAL_LLAMACPP_DOCKER_IMAGE,
+        "--embedding",
+        "--host", "0.0.0.0",
+        "--port", "8080",
+        "-c", str(ctx),
+        "-hf", model,
+    ]
 
 
 def clone_honcho_for_profile(profile_name: str) -> bool:
@@ -273,6 +388,396 @@ def _write_config(cfg: dict, path: Path | None = None) -> None:
     )
 
 
+def build_local_first_env_lines(cfg: dict | None = None) -> list[str]:
+    """Return a Honcho self-hosted .env template for local-first Hermes use."""
+    lines = [
+        "# Honcho self-hosted env for Hermes local-first memory",
+        "# Requires Postgres with pgvector and a local Honcho checkout/container.",
+        "# Expected Honcho backend: http://127.0.0.1:8000",
+        "# llama.cpp embeddings:",
+        f"#   {_quote_cmd(build_llamacpp_embedding_command())}",
+        "# Default embedding is Qwen3-Embedding-0.6B Q8_0: 1024 dim, fast read path.",
+        "# Qwen3-Embedding-8B is 4096 dim and higher quality, but too heavy",
+        "# for the default memory read-path latency/resource budget.",
+        "# Set DB_CONNECTION_URI for your Postgres deployment before starting Honcho.",
+        "DB_CONNECTION_URI=<postgresql+psycopg://user:pass@localhost:5432/postgres>",
+    ]
+    for key, value in LOCAL_FIRST_HONCHO_ENV.items():
+        lines.append(f"{key}={value}")
+
+    if cfg:
+        base_url = (cfg.get("baseUrl") or cfg.get("base_url") or "").strip()
+        if base_url:
+            lines.extend([
+                "",
+                f"# Hermes is configured to call Honcho at {base_url}",
+                "# This is Hermes-side config, not a Honcho server env var:",
+                f"# HONCHO_BASE_URL={base_url}",
+            ])
+
+    lines.extend([
+        "",
+        "# GPT-5.5 LLM calls are routed through the local Hermes proxy above.",
+        "# Start it with: hermes proxy start --provider openai-codex",
+        "# Hermes OAuth is not a Honcho credential; expose it only through",
+        "# this OpenAI-compatible local proxy. Do not paste OAuth tokens here.",
+    ])
+    return lines
+
+
+def cmd_env(args) -> None:
+    """Print a local-first Honcho self-hosted environment template."""
+    cfg = _read_config()
+    print("\n".join(build_local_first_env_lines(cfg)))
+
+
+def _embedding_url(port: int = LOCAL_EMBEDDING_PORT, path: str = "") -> str:
+    base = f"http://127.0.0.1:{port}"
+    return f"{base}{path}"
+
+
+def _http_get_json(url: str, timeout: float = 2.0) -> tuple[bool, object | str]:
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        if not raw:
+            return True, {}
+        return True, json.loads(raw)
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.reason}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _http_post_json(
+    url: str,
+    payload: dict,
+    timeout: float = 5.0,
+) -> tuple[bool, object | str]:
+    import urllib.error
+    import urllib.request
+
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        if not raw:
+            return True, {}
+        return True, json.loads(raw)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:300]
+        return False, f"HTTP {e.code}: {detail or e.reason}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _embedding_dimension_report(
+    port: int = LOCAL_EMBEDDING_PORT,
+    expected_dimensions: int = LOCAL_EMBEDDING_DIMENSIONS,
+    model: str = LOCAL_EMBEDDING_MODEL,
+) -> tuple[bool, str]:
+    ok, result = _http_post_json(
+        _embedding_url(port, "/v1/embeddings"),
+        {"model": model, "input": "Hermes local Honcho embedding dimension check"},
+    )
+    if not ok:
+        return False, str(result)
+
+    embedding = None
+    if isinstance(result, dict):
+        data = result.get("data")
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            embedding = data[0].get("embedding")
+    if not isinstance(embedding, list):
+        return False, "no embedding vector in /v1/embeddings response"
+
+    actual = len(embedding)
+    if actual != expected_dimensions:
+        return (
+            False,
+            f"{actual} != {expected_dimensions}; Honcho pgvector must be bootstrapped with matching dimensions",
+        )
+    return True, f"OK ({actual})"
+
+
+def _embedding_endpoint_report(
+    port: int = LOCAL_EMBEDDING_PORT,
+    expected_dimensions: int = LOCAL_EMBEDDING_DIMENSIONS,
+    model: str = LOCAL_EMBEDDING_MODEL,
+) -> tuple[bool, list[str]]:
+    lines = []
+    try:
+        import shutil
+        llama_server = shutil.which("llama-server")
+        docker = shutil.which("docker")
+    except Exception:
+        llama_server = None
+        docker = None
+    lines.append(f"  llama-server: {'OK (' + llama_server + ')' if llama_server else 'MISSING'}")
+    lines.append(f"  Docker:      {'OK (' + docker + ')' if docker else 'MISSING'}")
+
+    ok_health, health = _http_get_json(_embedding_url(port, "/health"))
+    lines.append(f"  Health:     {'OK' if ok_health else 'FAILED'} ({health})")
+
+    ok_models, models = _http_get_json(_embedding_url(port, "/v1/models"))
+    if ok_models:
+        model_ids = []
+        if isinstance(models, dict):
+            for item in models.get("data", []):
+                if isinstance(item, dict) and item.get("id"):
+                    model_ids.append(str(item["id"]))
+        model_text = ", ".join(model_ids) if model_ids else "available"
+        lines.append(f"  Models:     OK ({model_text})")
+    else:
+        lines.append(f"  Models:     FAILED ({models})")
+
+    ok_dims = False
+    if ok_health:
+        ok_dims, dim_detail = _embedding_dimension_report(
+            port=port,
+            expected_dimensions=expected_dimensions,
+            model=model,
+        )
+        lines.append(f"  Dimensions: {'OK' if ok_dims else 'FAILED'} ({dim_detail})")
+    else:
+        lines.append("  Dimensions: SKIPPED (embedding endpoint is not healthy)")
+
+    return bool(llama_server) and ok_health and ok_models and ok_dims, lines
+
+
+def _honcho_base_url_health(base_url: str) -> tuple[bool, str]:
+    url = base_url.rstrip("/") + "/health"
+    ok, detail = _http_get_json(url)
+    if ok:
+        return True, str(detail)
+    return False, f"{url} unavailable: {detail}"
+
+
+def _embedding_pid_path() -> Path:
+    return get_hermes_home() / "honcho-embeddings.pid"
+
+
+def _embedding_log_path() -> Path:
+    return get_hermes_home() / "logs" / "honcho-embeddings.log"
+
+
+def _pid_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def cmd_embeddings(args) -> None:
+    """Manage the local llama.cpp embedding endpoint for Honcho."""
+    action = getattr(args, "action", None) or "status"
+    model = getattr(args, "model", None) or LOCAL_EMBEDDING_MODEL
+    ctx = getattr(args, "ctx", None) or LOCAL_EMBEDDING_CONTEXT
+    port = getattr(args, "port", None) or LOCAL_EMBEDDING_PORT
+    threads = getattr(args, "threads", None)
+    gpu_layers = getattr(args, "gpu_layers", None)
+    batch_size = getattr(args, "batch_size", None)
+    ubatch_size = getattr(args, "ubatch_size", None)
+    use_docker = bool(getattr(args, "docker", False))
+
+    if action == "config":
+        print("\nHoncho llama.cpp embeddings config\n" + "-" * 40)
+        print(f"  Model:      {LOCAL_EMBEDDING_MODEL}")
+        print(f"  Dimensions: {LOCAL_EMBEDDING_DIMENSIONS}")
+        print(f"  Context:    {LOCAL_EMBEDDING_CONTEXT}")
+        print(f"  Port:       {LOCAL_EMBEDDING_PORT}")
+        print(f"  Base URL:   {LOCAL_EMBEDDING_BASE_URL}")
+        print(f"  Command:    {_quote_cmd(build_llamacpp_embedding_command())}")
+        print(f"  Docker:     {_quote_cmd(build_llamacpp_embedding_docker_command())}")
+        print("  Heavy opt:  Qwen/Qwen3-Embedding-8B-GGUF is 4096 dim, higher quality,")
+        print("              but too slow/heavy for default read-path use.\n")
+        return
+
+    if action == "tune":
+        print("\nHoncho llama.cpp embeddings tuning\n" + "-" * 40)
+        print("  Keep the model/dimensions fixed after Honcho has data.")
+        print("  Safe knobs before restart:")
+        print("    --threads N        CPU worker threads")
+        print("    --gpu-layers N     GPU offload layers, 0 for CPU-only")
+        print("    --batch-size N     prompt processing batch size")
+        print("    --ubatch-size N    physical micro-batch size")
+        print("    --docker           run the official llama.cpp server image")
+        print("  Example:")
+        print(
+            "    hermes honcho embeddings start "
+            "--threads 8 --gpu-layers 99 --batch-size 2048 --ubatch-size 512"
+        )
+        print("    hermes honcho embeddings start --docker")
+        print("  Re-check after changes: hermes honcho embeddings status\n")
+        return
+
+    if action == "install":
+        import shutil
+        found = shutil.which("llama-server")
+        docker = shutil.which("docker")
+        print("\nllama.cpp install check\n" + "-" * 40)
+        if found:
+            print(f"  llama-server: {found}")
+            print("  Status:       installed\n")
+            return
+        print("  llama-server: not found")
+        if docker:
+            print(f"  Docker:       {docker}")
+            print("  Status:       Docker fallback available")
+            print("  Start with:   hermes honcho embeddings start --docker\n")
+            return
+        print("  Install llama.cpp so `llama-server` is on PATH.")
+        print("  Common options:")
+        print("    brew install llama.cpp")
+        print("    or build from https://github.com/ggml-org/llama.cpp")
+        print(f"    or install Docker and run: {_quote_cmd(build_llamacpp_embedding_docker_command())}")
+        print("  Then verify with: hermes honcho embeddings status\n")
+        return
+
+    if action in ("status", "check"):
+        print("\nHoncho llama.cpp embeddings status\n" + "-" * 40)
+        print(f"  Expected:   {LOCAL_EMBEDDING_BASE_URL}")
+        print(f"  Model:      {LOCAL_EMBEDDING_MODEL}")
+        print(f"  Dimensions: {LOCAL_EMBEDDING_DIMENSIONS}")
+        ok, lines = _embedding_endpoint_report(port=port, model=model)
+        for line in lines:
+            print(line)
+        if ok:
+            print("  Status:     ready\n")
+        else:
+            print("  Status:     not ready")
+            print("  Start:      hermes honcho embeddings start")
+            print("  Docker:     hermes honcho embeddings start --docker")
+            print("  Fix dims:   restart llama.cpp with the configured model before bootstrapping Honcho")
+            print(f"  Command:    {_quote_cmd(build_llamacpp_embedding_command(model=model, ctx=ctx, port=port))}\n")
+        return
+
+    if action == "start":
+        import shutil
+        import subprocess
+        cmd = build_llamacpp_embedding_command(
+            model=model,
+            ctx=ctx,
+            port=port,
+            threads=threads,
+            gpu_layers=gpu_layers,
+            batch_size=batch_size,
+            ubatch_size=ubatch_size,
+        )
+        found = shutil.which("llama-server")
+        docker = shutil.which("docker")
+        if use_docker:
+            if not docker:
+                print("\nCannot start Docker llama.cpp embeddings")
+                print("-" * 40)
+                print("  docker: not found")
+                print("  Fix:    install Docker or install llama.cpp so `llama-server` is on PATH\n")
+                return
+
+            container_cmd = [
+                docker,
+                "ps",
+                "--filter", f"name=^{LOCAL_EMBEDDING_CONTAINER}$",
+                "--filter", "status=running",
+                "--format", "{{.Names}}",
+            ]
+            existing = subprocess.run(
+                container_cmd,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if LOCAL_EMBEDDING_CONTAINER in existing.stdout.splitlines():
+                print("\nDocker llama.cpp embeddings already running")
+                print("-" * 40)
+                print(f"  Container: {LOCAL_EMBEDDING_CONTAINER}")
+                print("  Status:    hermes honcho embeddings status\n")
+                return
+
+            remove_cmd = [docker, "rm", "-f", LOCAL_EMBEDDING_CONTAINER]
+            subprocess.run(remove_cmd, capture_output=True, text=True, timeout=30)
+            cmd = build_llamacpp_embedding_docker_command(model=model, ctx=ctx, port=port)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if proc.returncode != 0:
+                print("\nCannot start Docker llama.cpp embeddings")
+                print("-" * 40)
+                print(f"  Command: {_quote_cmd(cmd)}")
+                print(f"  Error:   {(proc.stderr or proc.stdout).strip()[:500]}")
+                print("  Fix:     check Docker is running and can pull ghcr.io/ggml-org/llama.cpp:server\n")
+                return
+            container_id = proc.stdout.strip()
+            print("\nStarted Docker llama.cpp embeddings")
+            print("-" * 40)
+            print(f"  Container: {LOCAL_EMBEDDING_CONTAINER}")
+            print(f"  ID:        {container_id[:12]}")
+            print(f"  Model:     {model}")
+            print(f"  Port:      {port}")
+            print(f"  Command:   {_quote_cmd(cmd)}")
+            print("  Verify:    hermes honcho embeddings status\n")
+            return
+
+        if not found:
+            print("\nCannot start llama.cpp embeddings")
+            print("-" * 40)
+            print("  llama-server: not found")
+            print("  Fix:          install llama.cpp so `llama-server` is on PATH")
+            if docker:
+                print("  Docker:       available")
+                print("  Fallback:     hermes honcho embeddings start --docker")
+            print("  Check:        hermes honcho embeddings install\n")
+            return
+
+        pid_path = _embedding_pid_path()
+        if pid_path.exists():
+            try:
+                pid = int(pid_path.read_text(encoding="utf-8").strip())
+            except ValueError:
+                pid = 0
+            if pid and _pid_running(pid):
+                print("\nllama.cpp embeddings already running")
+                print("-" * 40)
+                print(f"  PID:     {pid}")
+                print(f"  Status:  hermes honcho embeddings status\n")
+                return
+
+        log_path = _embedding_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file = log_path.open("ab")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        pid_path.write_text(f"{proc.pid}\n", encoding="utf-8")
+        log_file.close()
+
+        print("\nStarted llama.cpp embeddings")
+        print("-" * 40)
+        print(f"  PID:        {proc.pid}")
+        print(f"  Model:      {model}")
+        print(f"  Dimensions: {LOCAL_EMBEDDING_DIMENSIONS if model == LOCAL_EMBEDDING_MODEL else 'verify before Honcho bootstrap'}")
+        print(f"  Context:    {ctx}")
+        print(f"  Port:       {port}")
+        print(f"  Log:        {log_path}")
+        print(f"  Command:    {_quote_cmd(cmd)}")
+        print("  Verify:     hermes honcho embeddings status\n")
+        return
+
+    print(f"  Unknown embeddings action: {action}")
+    print("  Available: install, config, status, check, start, tune\n")
+
+
 def _resolve_api_key(cfg: dict) -> str:
     """Resolve API key with host -> root -> env fallback.
 
@@ -390,7 +895,7 @@ def cmd_setup(args) -> None:
     if is_local:
         # --- Local: ask for base URL, skip or clear API key ---
         current_url = cfg.get("baseUrl") or ""
-        new_url = _prompt("Base URL", default=current_url or "http://localhost:8000")
+        new_url = _prompt("Base URL", default=current_url or LOCAL_HONCHO_BASE_URL)
         if new_url:
             cfg["baseUrl"] = new_url
 
@@ -667,6 +1172,12 @@ def cmd_status(args) -> None:
     print(f"  Host:           {hcfg.host}")
     print(f"  Enabled:        {hcfg.enabled}")
     print(f"  API key:        {masked}")
+    print(f"  Base URL:       {hcfg.base_url or '(cloud/default)'}")
+    if hcfg.base_url:
+        print(f"  Local target:   {LOCAL_HONCHO_BASE_URL} expected for this setup")
+        print("  Env template:   hermes honcho env")
+        print("  Embeddings:     hermes honcho embeddings status")
+        print("  GPT-5.5 proxy:  hermes proxy start --provider openai-codex")
     print(f"  Workspace:      {hcfg.workspace_id}")
 
     # Config paths — show where config was read from and where writes go
@@ -686,7 +1197,8 @@ def cmd_status(args) -> None:
     print(f"  Recall mode:    {hcfg.recall_mode}")
     print(f"  Context budget: {hcfg.context_tokens or '(uncapped)'} tokens")
     raw = getattr(hcfg, "raw", None) or {}
-    dialectic_cadence = raw.get("dialecticCadence") or 1
+    host_raw = (raw.get("hosts") or {}).get(hcfg.host) or {}
+    dialectic_cadence = host_raw.get("dialecticCadence") or raw.get("dialecticCadence") or 1
     print(f"  Dialectic cad:  every {dialectic_cadence} turn{'s' if dialectic_cadence != 1 else ''}")
     reasoning_cap = raw.get("reasoningLevelCap") or hcfg.reasoning_level_cap
     heuristic_on = "on" if hcfg.reasoning_heuristic else "off"
@@ -695,6 +1207,12 @@ def cmd_status(args) -> None:
     print(f"  Write freq:     {hcfg.write_frequency}")
 
     if hcfg.enabled and (hcfg.api_key or hcfg.base_url):
+        if hcfg.base_url:
+            ok, detail = _honcho_base_url_health(hcfg.base_url)
+            if not ok:
+                print(f"\n  Connection... FAILED ({detail})")
+                print("  Fix: start local Honcho at the configured Base URL before using recall/search.\n")
+                return
         print("\n  Connection... ", end="", flush=True)
         try:
             client = get_honcho_client(hcfg)
@@ -1346,9 +1864,13 @@ def honcho_command(args) -> None:
         cmd_disable(args)
     elif sub == "sync":
         cmd_sync(args)
+    elif sub == "env":
+        cmd_env(args)
+    elif sub == "embeddings":
+        cmd_embeddings(args)
     else:
         print(f"  Unknown honcho command: {sub}")
-        print("  Available: status, sessions, map, peer, mode, strategy, tokens, identity, migrate, enable, disable, sync\n")
+        print("  Available: status, sessions, map, peer, mode, strategy, tokens, identity, migrate, enable, disable, sync, env, embeddings\n")
 
 
 def register_cli(subparser) -> None:
@@ -1447,5 +1969,48 @@ def register_cli(subparser) -> None:
     subs.add_parser("enable", help="Enable Honcho for the active profile")
     subs.add_parser("disable", help="Disable Honcho for the active profile")
     subs.add_parser("sync", help="Sync Honcho config to all existing profiles")
+    subs.add_parser("env", help="Print local-first self-hosted Honcho env vars")
+
+    embeddings_parser = subs.add_parser(
+        "embeddings",
+        help="Manage local llama.cpp embeddings for self-hosted Honcho",
+    )
+    embeddings_parser.add_argument(
+        "action", nargs="?", default="status",
+        choices=("install", "config", "status", "check", "start", "tune"),
+        help="Action to run. Defaults to status.",
+    )
+    embeddings_parser.add_argument(
+        "--model", default=LOCAL_EMBEDDING_MODEL,
+        help="Model/path for llama-server start",
+    )
+    embeddings_parser.add_argument(
+        "--ctx", type=int, default=LOCAL_EMBEDDING_CONTEXT,
+        help="Context length for llama-server start/check",
+    )
+    embeddings_parser.add_argument(
+        "--port", type=int, default=LOCAL_EMBEDDING_PORT,
+        help="Local llama-server port",
+    )
+    embeddings_parser.add_argument(
+        "--threads", type=int,
+        help="CPU worker threads for llama-server start",
+    )
+    embeddings_parser.add_argument(
+        "--gpu-layers", type=int,
+        help="GPU offload layers for llama-server start",
+    )
+    embeddings_parser.add_argument(
+        "--batch-size", type=int,
+        help="Prompt processing batch size for llama-server start",
+    )
+    embeddings_parser.add_argument(
+        "--ubatch-size", type=int,
+        help="Physical micro-batch size for llama-server start",
+    )
+    embeddings_parser.add_argument(
+        "--docker", action="store_true",
+        help="Start embeddings with the official llama.cpp Docker image",
+    )
 
     subparser.set_defaults(func=honcho_command)

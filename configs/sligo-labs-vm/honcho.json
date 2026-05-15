@@ -1,0 +1,27 @@
+{
+  "baseUrl": "http://127.0.0.1:8000",
+  "hosts": {
+    "hermes": {
+      "enabled": true,
+      "aiPeer": "hermes",
+      "peerName": "sligo",
+      "workspace": "hermes",
+      "recallMode": "hybrid",
+      "writeFrequency": "async",
+      "sessionStrategy": "per-directory",
+      "dialecticReasoningLevel": "low",
+      "dialecticCadence": 2,
+      "saveMessages": true,
+      "observation": {
+        "user": {
+          "observeMe": true,
+          "observeOthers": true
+        },
+        "ai": {
+          "observeMe": true,
+          "observeOthers": true
+        }
+      }
+    }
+  }
+}
