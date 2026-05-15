@@ -1,22 +1,19 @@
 import { describe, expect, it } from 'vitest'
 
-import { shouldPassThroughToGlobalHandler } from '../components/textInput.js'
+import {
+  shouldBufferInputAsPaste,
+  shouldInsertPlainBurst,
+  shouldPassThroughToGlobalHandler
+} from '../components/textInput.js'
 import { DEFAULT_VOICE_RECORD_KEY, parseVoiceRecordKey } from '../lib/platform.js'
 
-const key = (overrides: Record<string, unknown> = {}) =>
-  ({ ctrl: false, meta: false, ...overrides }) as any
+const key = (overrides: Record<string, unknown> = {}) => ({ ctrl: false, meta: false, ...overrides }) as any
 
 describe('shouldPassThroughToGlobalHandler', () => {
   it('passes through the configured voice shortcut while composer is focused', () => {
-    expect(
-      shouldPassThroughToGlobalHandler('o', key({ ctrl: true }), parseVoiceRecordKey('ctrl+o'))
-    ).toBe(true)
-    expect(
-      shouldPassThroughToGlobalHandler('r', key({ meta: true }), parseVoiceRecordKey('alt+r'))
-    ).toBe(true)
-    expect(
-      shouldPassThroughToGlobalHandler(' ', key({ ctrl: true }), parseVoiceRecordKey('ctrl+space'))
-    ).toBe(true)
+    expect(shouldPassThroughToGlobalHandler('o', key({ ctrl: true }), parseVoiceRecordKey('ctrl+o'))).toBe(true)
+    expect(shouldPassThroughToGlobalHandler('r', key({ meta: true }), parseVoiceRecordKey('alt+r'))).toBe(true)
+    expect(shouldPassThroughToGlobalHandler(' ', key({ ctrl: true }), parseVoiceRecordKey('ctrl+space'))).toBe(true)
     expect(
       shouldPassThroughToGlobalHandler('', key({ ctrl: true, return: true }), parseVoiceRecordKey('ctrl+enter'))
     ).toBe(true)
@@ -41,5 +38,25 @@ describe('shouldPassThroughToGlobalHandler', () => {
     expect(shouldPassThroughToGlobalHandler('', key({ pageDown: true }))).toBe(true)
     expect(shouldPassThroughToGlobalHandler('', key({ meta: true, upArrow: true }))).toBe(true)
     expect(shouldPassThroughToGlobalHandler('', key({ alt: true, downArrow: true }))).toBe(true)
+  })
+})
+
+describe('shouldBufferInputAsPaste', () => {
+  it('does not buffer coalesced printable typing bursts', () => {
+    expect(shouldBufferInputAsPaste('ab', false)).toBe(false)
+  })
+
+  it('buffers actual paste input', () => {
+    expect(shouldBufferInputAsPaste('ab', true)).toBe(true)
+    expect(shouldBufferInputAsPaste('a\nb', false)).toBe(true)
+  })
+})
+
+describe('shouldInsertPlainBurst', () => {
+  it('accepts same-line printable typing bursts only', () => {
+    expect(shouldInsertPlainBurst('ab', false)).toBe(true)
+    expect(shouldInsertPlainBurst('a', false)).toBe(false)
+    expect(shouldInsertPlainBurst('a\nb', false)).toBe(false)
+    expect(shouldInsertPlainBurst('ab', true)).toBe(false)
   })
 })

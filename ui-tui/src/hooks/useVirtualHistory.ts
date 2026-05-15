@@ -65,16 +65,18 @@ const upperBound = (arr: ArrayLike<number>, target: number, length = arr.length)
 }
 
 export const shouldSetVirtualClamp = ({
+  enabled = true,
   itemCount,
   liveTailActive = false,
   sticky,
   viewportHeight
 }: {
+  enabled?: boolean
   itemCount: number
   liveTailActive?: boolean
   sticky: boolean
   viewportHeight: number
-}) => itemCount > 0 && viewportHeight > 0 && !sticky && !liveTailActive
+}) => enabled && itemCount > 0 && viewportHeight > 0 && !sticky && !liveTailActive
 
 export const ensureVirtualItemHeight = (
   heights: Map<string, number>,
@@ -107,7 +109,10 @@ export function useVirtualHistory(
     onHeightsChange,
     overscan = OVERSCAN,
     maxMounted = MAX_MOUNTED,
-    coldStartCount = COLD_START
+    coldStartCount = COLD_START,
+    deferRangeGrowth = true,
+    throttleRangeGrowth = true,
+    virtualClamp = true
   }: VirtualHistoryOptions = {}
 ) {
   const nodes = useRef(new Map<string, unknown>())
@@ -330,7 +335,7 @@ export function useVirtualHistory(
   // PageUp skips this; the clamp holds the viewport at the mounted edge
   // during catch-up so there's no blank screen. Only caps range GROWTH;
   // shrinking is unbounded.
-  if (!frozenRange && prevRange.current && vp > 0) {
+  if (throttleRangeGrowth && !frozenRange && prevRange.current && vp > 0) {
     const velocity = Math.abs(top - lastScrollTopRef.current) + Math.abs(pendingDelta)
 
     if (velocity > vp * 2) {
@@ -363,8 +368,10 @@ export function useVirtualHistory(
   // viewport to the mounted edge so there's no visual artifact from the
   // deferred range lagging briefly. Only deferral range GROWTH — shrinking
   // is cheap (unmount = remove fiber, no parse).
-  const dStart = useDeferredValue(start)
-  const dEnd = useDeferredValue(end)
+  const deferredStart = useDeferredValue(start)
+  const deferredEnd = useDeferredValue(end)
+  const dStart = deferRangeGrowth ? deferredStart : start
+  const dEnd = deferRangeGrowth ? deferredEnd : end
   let effStart = start < dStart ? dStart : start
   let effEnd = end > dEnd ? dEnd : end
 
@@ -446,7 +453,10 @@ export function useVirtualHistory(
     // If clamp used immediate bounds, render-node-to-output's drain-gate
     // would drain past the deferred children's span → viewport lands in
     // spacer → white flash.
-    if (s && shouldSetVirtualClamp({ itemCount: n, liveTailActive, sticky, viewportHeight: vp })) {
+    if (
+      s &&
+      shouldSetVirtualClamp({ enabled: virtualClamp, itemCount: n, liveTailActive, sticky, viewportHeight: vp })
+    ) {
       const effTopSpacer = offsets[effStart] ?? 0
       const effBottom = offsets[effEnd] ?? total
       // At effEnd=n there's no bottomSpacer — use Infinity so render-node-
@@ -508,7 +518,20 @@ export function useVirtualHistory(
     if (heightDirty) {
       bumpMeasuredHeightVersion(n => n + 1)
     }
-  }, [effEnd, effStart, items, liveTailActive, measuredHeightVersion, n, offsets, scrollRef, sticky, total, vp])
+  }, [
+    effEnd,
+    effStart,
+    items,
+    liveTailActive,
+    measuredHeightVersion,
+    n,
+    offsets,
+    scrollRef,
+    sticky,
+    total,
+    virtualClamp,
+    vp
+  ])
 
   return {
     bottomSpacer: Math.max(0, total - (offsets[effEnd] ?? total)),
@@ -526,6 +549,7 @@ interface MeasuredNode {
 
 interface VirtualHistoryOptions {
   coldStartCount?: number
+  deferRangeGrowth?: boolean
   estimate?: number
   estimateHeight?: (index: number, key: string) => number
   initialHeights?: ReadonlyMap<string, number>
@@ -533,4 +557,6 @@ interface VirtualHistoryOptions {
   maxMounted?: number
   onHeightsChange?: (heights: ReadonlyMap<string, number>) => void
   overscan?: number
+  throttleRangeGrowth?: boolean
+  virtualClamp?: boolean
 }

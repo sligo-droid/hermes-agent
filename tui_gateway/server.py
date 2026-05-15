@@ -2280,12 +2280,16 @@ def _(rid, params: dict) -> dict:
     sid = uuid.uuid4().hex[:8]
     _enable_gateway_prompts()
     try:
+        compression_tip = db.get_compression_tip(target)
+        if compression_tip and compression_tip != target:
+            target = compression_tip
+        else:
+            resolved = db.resolve_resume_session_id(target)
+            if resolved:
+                target = resolved
         db.reopen_session(target)
-        history = db.get_messages_as_conversation(target)
-        display_history = db.get_messages_as_conversation(
-            target, include_ancestors=True
-        )
-        messages = _history_to_messages(display_history)
+        history = db.get_messages_as_conversation(target, include_ancestors=True)
+        messages = _history_to_messages(history)
         tokens = _set_session_context(target)
         try:
             agent = _make_agent(sid, target, session_id=target)

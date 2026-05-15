@@ -238,6 +238,14 @@ const isPasteResultPromise = (
   value: PasteResult | Promise<PasteResult> | null | undefined
 ): value is Promise<PasteResult> => !!value && typeof (value as PromiseLike<PasteResult>).then === 'function'
 
+export function shouldBufferInputAsPaste(text: string, bracketed: boolean) {
+  return bracketed || text.includes('\n')
+}
+
+export function shouldInsertPlainBurst(text: string, bracketed: boolean) {
+  return !bracketed && text.length > 1 && !text.includes('\n') && PRINTABLE.test(text)
+}
+
 export function TextInput({
   columns = 80,
   value,
@@ -290,7 +298,8 @@ export function TextInput({
     [sel]
   )
 
-  const layout = useMemo(() => cursorLayout(display, cur, columns), [columns, cur, display])
+  const cursorForRender = curRef.current === cur ? cur : curRef.current
+  const layout = useMemo(() => cursorLayout(display, cursorForRender, columns), [columns, cursorForRender, display])
 
   const boxRef = useDeclaredCursor({
     line: layout.line,
@@ -335,8 +344,8 @@ export function TextInput({
       return renderWithSelection(display, selected.start, selected.end)
     }
 
-    return nativeCursor ? display || ' ' : renderWithCursor(display, cur)
-  }, [cur, display, focus, nativeCursor, placeholder, selected])
+    return nativeCursor ? display || ' ' : renderWithCursor(display, cursorForRender)
+  }, [cursorForRender, display, focus, nativeCursor, placeholder, selected])
 
   useEffect(() => {
     if (self.current) {
@@ -380,7 +389,7 @@ export function TextInput({
     })
 
     return () => setInputSelection(null)
-  }, [cur, focus, selected])
+  }, [cursorForRender, focus, selected])
 
   useEffect(
     () => () => {
@@ -442,7 +451,7 @@ export function TextInput({
     }, 16)
   }
 
-  const canFastEchoBase = () => focus && termFocus && !selected && !mask && !!stdout?.isTTY
+  const canFastEchoBase = () => false && focus && termFocus && !selected && !mask && !!stdout?.isTTY
 
   const canFastAppend = (current: string, cursor: number, text: string) => {
     const sw = stringWidth(text)
@@ -906,7 +915,15 @@ export function TextInput({
           return commit(ins(v, c, '\n'), c + 1)
         }
 
-        if (text.length > 1 || text.includes('\n')) {
+        if (shouldInsertPlainBurst(text, bracketed)) {
+          if (range) {
+            v = v.slice(0, range.start) + text + v.slice(range.end)
+            c = range.start + text.length
+          } else {
+            v = v.slice(0, c) + text + v.slice(c)
+            c += text.length
+          }
+        } else if (shouldBufferInputAsPaste(text, bracketed)) {
           if (!pasteBuf.current) {
             pastePos.current = range ? range.start : c
             pasteEnd.current = range ? range.end : pastePos.current

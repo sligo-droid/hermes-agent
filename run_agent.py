@@ -15810,15 +15810,19 @@ class AIAgent:
         if turn.projected_messages:
             messages.extend(turn.projected_messages)
 
+        final_response = turn.final_text
+        if turn.error and not final_response:
+            final_response = f"Codex app-server turn failed: {turn.error}"
+
         if (
-            turn.final_text
+            final_response
             and not (
                 messages
                 and messages[-1].get("role") == "assistant"
-                and messages[-1].get("content") == turn.final_text
+                and messages[-1].get("content") == final_response
             )
         ):
-            messages.append({"role": "assistant", "content": turn.final_text})
+            messages.append({"role": "assistant", "content": final_response})
 
         # Counter ticks for the self-improvement loop.
         # _turns_since_memory and _user_turn_count are ALREADY incremented
@@ -15848,7 +15852,7 @@ class AIAgent:
             try:
                 self._sync_external_memory_for_turn(
                     original_user_message=original_user_message,
-                    final_response=turn.final_text,
+                    final_response=final_response,
                     interrupted=False,
                 )
             except Exception:
@@ -15858,8 +15862,9 @@ class AIAgent:
         # path (line ~15449). Only fires when a trigger actually tripped AND
         # we have a real final response.
         if (
-            turn.final_text
+            final_response
             and not turn.interrupted
+            and turn.error is None
             and (should_review_memory or should_review_skills)
         ):
             try:
@@ -15881,7 +15886,7 @@ class AIAgent:
         self._persist_session(messages, conversation_history)
 
         return {
-            "final_response": turn.final_text,
+            "final_response": final_response,
             "messages": messages,
             "api_calls": 1,  # one app-server "turn" maps to one logical API call
             "completed": completed,

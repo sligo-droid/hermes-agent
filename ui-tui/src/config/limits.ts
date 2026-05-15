@@ -13,7 +13,6 @@ export const HISTORY_RENDER_MAX_LINES = 16
 export const FULL_RENDER_TAIL_ITEMS = 8
 
 export const LONG_MSG = 300
-export const MAX_HISTORY = 800
 export const THINKING_COT_MAX = 160
 
 // Rows per wheel event (pre-accel). 1 keeps Ink's DECSTBM fast path live

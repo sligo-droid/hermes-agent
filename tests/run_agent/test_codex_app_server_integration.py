@@ -397,6 +397,34 @@ class TestErrorHandling:
         assert result["partial"] is True
         assert result["error"] == "user interrupted"
 
+    def test_turn_error_without_final_text_persists_failure_message(self, monkeypatch):
+        def failed_turn(self, user_input, **kwargs):
+            return TurnResult(
+                final_text="",
+                projected_messages=[],
+                tool_iterations=0,
+                interrupted=False,
+                error="turn/start failed",
+                turn_id="t",
+                thread_id="th",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "ensure_started",
+                            lambda self: "th")
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", failed_turn)
+
+        agent = _make_codex_agent()
+        db = RecordingSessionDB()
+        agent._session_db = db
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("persist turn failure")
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert "turn/start failed" in result["final_response"]
+        assert [m["role"] for m in db.messages] == ["user", "assistant"]
+        assert "turn/start failed" in db.messages[1]["content"]
+
 
 class TestSessionRetirementOnRunAgent:
     """run_agent.py side: when run_turn returns should_retire=True, the
