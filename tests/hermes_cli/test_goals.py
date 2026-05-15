@@ -93,6 +93,26 @@ class TestParseJudgeResponse:
         assert done is False
         assert reason
 
+    def test_blocked_status_is_not_done_for_legacy_bool_parser(self):
+        from hermes_cli.goals import _parse_judge_response
+
+        done, reason, parse_failed = _parse_judge_response(
+            '{"status": "blocked", "reason": "needs credentials"}'
+        )
+        assert done is False
+        assert reason == "needs credentials"
+        assert parse_failed is False
+
+    def test_parse_verdict_supports_blocked_status(self):
+        from hermes_cli.goals import _parse_judge_verdict
+
+        verdict, reason, parse_failed = _parse_judge_verdict(
+            '{"status": "blocked", "reason": "goal text is truncated"}'
+        )
+        assert verdict == "blocked"
+        assert reason == "goal text is truncated"
+        assert parse_failed is False
+
 
 # ──────────────────────────────────────────────────────────────────────
 # judge_goal — fail-open semantics
@@ -285,6 +305,23 @@ class TestGoalManager:
         assert "a long goal" in decision["continuation_prompt"]
         assert mgr.state.status == "active"
         assert mgr.state.turns_used == 1
+
+    def test_evaluate_after_turn_blocked_pauses(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="eval-sid-blocked", default_max_turns=5)
+        mgr.set("finish the task")
+
+        with patch.object(goals, "judge_goal", return_value=("blocked", "needs user input", False)):
+            decision = mgr.evaluate_after_turn("I need your API key to continue.")
+
+        assert decision["verdict"] == "blocked"
+        assert decision["should_continue"] is False
+        assert decision["continuation_prompt"] is None
+        assert mgr.state.status == "paused"
+        assert mgr.state.paused_reason == "blocked: needs user input"
+        assert "blocked" in decision["message"].lower()
 
     def test_evaluate_after_turn_budget_exhausted(self, hermes_home):
         """When turn budget hits ceiling, auto-pause instead of continuing."""

@@ -15806,9 +15806,15 @@ class AIAgent:
 
         # Splice projected messages into the conversation. The projector emits
         # standard {role, content, tool_calls, tool_call_id} entries, which
-        # is exactly what curator.py / sessions DB expect.
+        # is exactly what curator.py / sessions DB expect. Codex also echoes
+        # userMessage events; drop those because run_conversation already
+        # appended the canonical user turn before entering this path.
         if turn.projected_messages:
-            messages.extend(turn.projected_messages)
+            messages.extend(
+                msg
+                for msg in turn.projected_messages
+                if msg.get("role") != "user"
+            )
 
         final_response = turn.final_text
         if turn.error and not final_response:

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -4660,6 +4661,13 @@ def _(rid, params: dict) -> dict:
             )
 
         # Otherwise — treat the remaining text as the new goal.
+        if _is_unresolved_paste_placeholder_arg(arg):
+            return _err(
+                rid,
+                4004,
+                "invalid goal: large paste placeholder was not expanded; retry after updating the TUI",
+            )
+
         try:
             state = mgr.set(arg)
         except ValueError as exc:
@@ -4700,6 +4708,11 @@ def _(rid, params: dict) -> dict:
 # ── Methods: paste ────────────────────────────────────────────────────
 
 _paste_counter = 0
+_UNRESOLVED_PASTE_ARG_RE = re.compile(r"^\s*(?:\[\[[^\n]*?\]\]\s*)+$")
+
+
+def _is_unresolved_paste_placeholder_arg(arg: str) -> bool:
+    return bool(_UNRESOLVED_PASTE_ARG_RE.fullmatch(arg or ""))
 
 
 @method("paste.collapse")

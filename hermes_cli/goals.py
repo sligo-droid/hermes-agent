@@ -88,12 +88,14 @@ JUDGE_SYSTEM_PROMPT = (
     "the goal is fully satisfied based on that response.\n\n"
     "A goal is DONE only when:\n"
     "- The response explicitly confirms the goal was completed, OR\n"
-    "- The response clearly shows the final deliverable was produced, OR\n"
-    "- The response explains the goal is unachievable / blocked / needs "
-    "user input (treat this as DONE with reason describing the block).\n\n"
+    "- The response clearly shows the final deliverable was produced.\n\n"
+    "Return BLOCKED when the agent cannot continue without user input, "
+    "credentials, external access, or when the response says the active "
+    "goal text/state is missing, truncated, or unavailable. BLOCKED is "
+    "not DONE.\n\n"
     "Otherwise the goal is NOT done — CONTINUE.\n\n"
     "Reply ONLY with a single JSON object on one line:\n"
-    '{\"done\": <true|false>, \"reason\": \"<one-sentence rationale>\"}'
+    '{\"status\": \"<done|continue|blocked>\", \"reason\": \"<one-sentence rationale>\"}'
 )
 
 
@@ -282,17 +284,9 @@ def _truncate(text: str, limit: int) -> str:
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
 
 
-def _parse_judge_response(raw: str) -> Tuple[bool, str, bool]:
-    """Parse the judge's reply. Fail-open to ``(False, "<reason>", parse_failed)``.
-
-    Returns ``(done, reason, parse_failed)``. ``parse_failed`` is True when the
-    judge returned output that couldn't be interpreted as the expected JSON
-    verdict (empty body, prose, malformed JSON). Callers use that flag to
-    auto-pause after N consecutive parse failures so a weak judge model
-    doesn't silently burn the turn budget.
-    """
+def _extract_judge_json(raw: str) -> Optional[Dict[str, Any]]:
     if not raw:
-        return False, "judge returned empty response", True
+        return None
 
     text = raw.strip()
 
@@ -305,30 +299,84 @@ def _parse_judge_response(raw: str) -> Tuple[bool, str, bool]:
             text = text[nl + 1:]
 
     # First try: parse the whole blob.
-    data: Optional[Dict[str, Any]] = None
     try:
         data = json.loads(text)
     except Exception:
         # Second try: pull the first JSON object out.
         match = _JSON_OBJECT_RE.search(text)
-        if match:
-            try:
-                data = json.loads(match.group(0))
-            except Exception:
-                data = None
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(0))
+        except Exception:
+            return None
 
-    if not isinstance(data, dict):
+    return data if isinstance(data, dict) else None
+
+
+def _parse_judge_response(raw: str) -> Tuple[bool, str, bool]:
+    """Parse the judge's reply. Fail-open to ``(False, "<reason>", parse_failed)``.
+
+    Returns ``(done, reason, parse_failed)``. ``parse_failed`` is True when the
+    judge returned output that couldn't be interpreted as the expected JSON
+    verdict (empty body, prose, malformed JSON). Callers use that flag to
+    auto-pause after N consecutive parse failures so a weak judge model
+    doesn't silently burn the turn budget.
+    """
+    if not raw:
+        return False, "judge returned empty response", True
+
+    data = _extract_judge_json(raw)
+    if data is None:
         return False, f"judge reply was not JSON: {_truncate(raw, 200)!r}", True
+
+    status = str(data.get("status") or "").strip().lower()
+    if status in {"done", "complete", "completed"}:
+        done = True
+    elif status in {"continue", "not_done", "not done", "blocked", "paused"}:
+        done = False
+    elif data.get("blocked") is True:
+        done = False
+    else:
+        done_val = data.get("done")
+        if isinstance(done_val, str):
+            done = done_val.strip().lower() in {"true", "yes", "1", "done"}
+        else:
+            done = bool(done_val)
+    reason = str(data.get("reason") or "").strip()
+    if not reason:
+        reason = "no reason provided"
+    return done, reason, False
+
+
+def _parse_judge_verdict(raw: str) -> Tuple[str, str, bool]:
+    """Parse the judge reply into a goal-loop verdict.
+
+    Supports the new ``status`` contract while preserving the old
+    ``{"done": true|false}`` shape for older prompts/models.
+    """
+    if not raw:
+        return "continue", "judge returned empty response", True
+
+    data = _extract_judge_json(raw)
+    if data is None:
+        return "continue", f"judge reply was not JSON: {_truncate(raw, 200)!r}", True
+
+    reason = str(data.get("reason") or "").strip() or "no reason provided"
+    status = str(data.get("status") or "").strip().lower()
+    if status in {"done", "complete", "completed"}:
+        return "done", reason, False
+    if status in {"blocked", "paused", "pause"} or data.get("blocked") is True:
+        return "blocked", reason, False
+    if status in {"continue", "not_done", "not done", "incomplete"}:
+        return "continue", reason, False
 
     done_val = data.get("done")
     if isinstance(done_val, str):
         done = done_val.strip().lower() in {"true", "yes", "1", "done"}
     else:
         done = bool(done_val)
-    reason = str(data.get("reason") or "").strip()
-    if not reason:
-        reason = "no reason provided"
-    return done, reason, False
+    return ("done" if done else "continue"), reason, False
 
 
 def judge_goal(
@@ -341,7 +389,8 @@ def judge_goal(
     """Ask the auxiliary model whether the goal is satisfied.
 
     Returns ``(verdict, reason, parse_failed)`` where verdict is ``"done"``,
-    ``"continue"``, or ``"skipped"`` (when the judge couldn't be reached).
+    ``"continue"``, ``"blocked"``, or ``"skipped"`` (when the judge couldn't
+    be reached).
 
     ``parse_failed`` is True only when the judge call succeeded but its output
     was unusable (empty or non-JSON). API/transport errors return False — they
@@ -417,8 +466,7 @@ def judge_goal(
     except Exception:
         raw = ""
 
-    done, reason, parse_failed = _parse_judge_response(raw)
-    verdict = "done" if done else "continue"
+    verdict, reason, parse_failed = _parse_judge_verdict(raw)
     logger.info("goal judge: verdict=%s reason=%s", verdict, _truncate(reason, 120))
     return verdict, reason, parse_failed
 
@@ -636,6 +684,19 @@ class GoalManager:
                 "verdict": "done",
                 "reason": reason,
                 "message": f"✓ Goal achieved: {reason}",
+            }
+
+        if verdict == "blocked":
+            state.status = "paused"
+            state.paused_reason = f"blocked: {reason}"
+            save_goal(self.session_id, state)
+            return {
+                "status": "paused",
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "blocked",
+                "reason": reason,
+                "message": f"⏸ Goal paused — blocked: {reason}",
             }
 
         # Auto-pause when the judge model can't produce the expected JSON
