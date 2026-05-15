@@ -39,31 +39,55 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
   const out: Msg[] = []
   let pending: string[] = []
 
+  const flushPending = () => {
+    if (!pending.length) {
+      return
+    }
+
+    out.push({ kind: 'trail', role: 'system', text: '', tools: pending })
+    pending = []
+  }
+
   for (const row of rows) {
     if (!row || typeof row !== 'object') {
       continue
     }
 
-    const { context, name, role, text } = row as TranscriptRow
+    const { context, name, role, text, thinking } = row as TranscriptRow
 
     if (role === 'tool') {
-      pending.push(buildToolTrailLine(name ?? 'tool', context ?? ''))
+      pending.push(buildToolTrailLine(name ?? 'tool', context ?? '', false, text))
+
+      if (typeof text === 'string' && text.trim()) {
+        out.push({ role, text: text.trim() })
+      }
 
       continue
     }
 
-    if (typeof text !== 'string' || !text.trim()) {
+    const cleanText = typeof text === 'string' ? text.trim() : ''
+    const cleanThinking = typeof thinking === 'string' ? thinking.trim() : ''
+
+    if (!cleanText && !cleanThinking) {
       continue
     }
 
     if (role === 'assistant') {
-      out.push({ role, text, ...(pending.length && { tools: pending }) })
+      out.push({
+        role,
+        text: cleanText,
+        detailsCollapsedByDefault: true,
+        ...(cleanThinking && { thinking: cleanThinking }),
+        ...(pending.length && { tools: pending })
+      })
       pending = []
     } else if (role === 'user' || role === 'system') {
-      out.push({ role, text })
-      pending = []
+      flushPending()
+      out.push({ role, text: cleanText })
     }
   }
+
+  flushPending()
 
   return out
 }
@@ -88,4 +112,5 @@ interface TranscriptRow {
   name?: string
   role?: string
   text?: string
+  thinking?: string
 }

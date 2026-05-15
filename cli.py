@@ -3114,25 +3114,13 @@ class HermesCLI:
 
     @staticmethod
     def _scrollback_box_width(width: Optional[int] = None) -> int:
-        """Return a resize-safe width for printed scrollback box rules.
-
-        Lines already printed to terminal scrollback are reflowed by the
-        terminal emulator when the column count shrinks. A full-width response
-        border drawn at, say, 200 columns will wrap into two or three rows of
-        dashes after the user resizes to 80 columns, looking like duplicated
-        separator lines (the family of bugs tracked by #18449, #19280, #22976).
-
-        Keep decorative scrollback boxes intentionally narrower than the
-        viewport so a moderate resize never triggers reflow. The live TUI
-        footer (status bar, input rule) still uses the full width — only
-        content that is *stamped into scrollback* needs this clamp.
-        """
+        """Return the current width for printed scrollback box rules."""
         if width is None:
             try:
                 width = shutil.get_terminal_size((80, 24)).columns
             except Exception:
                 width = 80
-        return max(32, min(int(width or 80), 56))
+        return max(32, int(width or 80))
 
     def _tui_input_rule_height(self, position: str, width: Optional[int] = None) -> int:
         """Return the visible height for the top/bottom input separator rules."""
@@ -4282,7 +4270,7 @@ class HermesCLI:
                 resolved_id = self._session_db.resolve_resume_session_id(self.session_id)
             except Exception:
                 resolved_id = self.session_id
-            if resolved_id and resolved_id != self.session_id:
+            if isinstance(resolved_id, str) and resolved_id and resolved_id != self.session_id:
                 ChatConsole().print(
                     f"[{_DIM}]Session {_escape(self.session_id)} was compressed into "
                     f"{_escape(resolved_id)}; resuming the descendant with your "
@@ -4292,7 +4280,7 @@ class HermesCLI:
                 resolved_meta = self._session_db.get_session(self.session_id)
                 if resolved_meta:
                     session_meta = resolved_meta
-            restored = self._session_db.get_messages_as_conversation(self.session_id)
+            restored = self._load_resumed_conversation(self.session_id)
             if restored:
                 restored = [m for m in restored if m.get("role") != "session_meta"]
                 self.conversation_history = restored
@@ -4546,7 +4534,7 @@ class HermesCLI:
             resolved_id = self._session_db.resolve_resume_session_id(self.session_id)
         except Exception:
             resolved_id = self.session_id
-        if resolved_id and resolved_id != self.session_id:
+        if isinstance(resolved_id, str) and resolved_id and resolved_id != self.session_id:
             self._console_print(
                 f"[dim]Session {self.session_id} was compressed into "
                 f"{resolved_id}; resuming the descendant with your transcript.[/]"
@@ -4556,7 +4544,7 @@ class HermesCLI:
             if resolved_meta:
                 session_meta = resolved_meta
 
-        restored = self._session_db.get_messages_as_conversation(self.session_id)
+        restored = self._load_resumed_conversation(self.session_id)
         if restored:
             restored = [m for m in restored if m.get("role") != "session_meta"]
             self.conversation_history = restored
@@ -4592,13 +4580,62 @@ class HermesCLI:
 
         return True
 
+    def _load_resumed_conversation(self, session_id: str) -> List[Dict[str, Any]]:
+        """Load resume history from SQLite, falling back to session JSON logs."""
+        restored = self._session_db.get_messages_as_conversation(session_id)
+        if restored:
+            return restored
+
+        restored = self._load_session_log_messages(session_id)
+        if restored:
+            try:
+                self._session_db.replace_messages(session_id, restored)
+            except Exception:
+                pass
+        return restored
+
+    def _load_session_log_messages(self, session_id: str) -> List[Dict[str, Any]]:
+        sessions_dir = get_hermes_home() / "sessions"
+        if not session_id or not sessions_dir.exists():
+            return []
+
+        candidates = []
+        exact = sessions_dir / f"session_{session_id}.json"
+        if exact.exists():
+            candidates.append(exact)
+        try:
+            candidates.extend(
+                sorted(
+                    (
+                        p
+                        for p in sessions_dir.glob("session_*.json")
+                        if p != exact and p.is_file()
+                    ),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+            )
+        except OSError:
+            return []
+
+        for path in candidates:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if data.get("session_id") != session_id:
+                continue
+            messages = data.get("messages")
+            if isinstance(messages, list):
+                return [m for m in messages if isinstance(m, dict)]
+        return []
+
     def _display_resumed_history(self):
-        """Render a compact recap of previous conversation messages.
+        """Render the previous conversation messages after resume.
 
         Uses Rich markup with dim/muted styling so the recap is visually
-        distinct from the active conversation.  Caps the display at the
-        last ``MAX_DISPLAY_EXCHANGES`` user/assistant exchanges and shows
-        an indicator for earlier hidden messages.
+        distinct from the active conversation.  Tool result bodies are omitted
+        from the scrollback display, but assistant tool calls are summarized.
         """
         if not self.conversation_history:
             return
@@ -4607,15 +4644,28 @@ class HermesCLI:
         if self.resume_display == "minimal":
             return
 
-        MAX_DISPLAY_EXCHANGES = 10   # max user+assistant pairs to show
-        MAX_USER_LEN = 300           # truncate user messages
-        MAX_ASST_LEN = 200           # truncate assistant text
-        MAX_ASST_LINES = 3           # max lines of assistant text
-
         # Collect displayable entries (skip system, tool-result messages)
         entries = []  # list of (role, display_text)
         _last_asst_idx = None       # index of last assistant entry
         _last_asst_full = None      # un-truncated display text for last assistant
+
+        def _format_tool_call_summary(tc_count, names):
+            names_str = ", ".join(names[:4])
+            if len(names) > 4:
+                names_str += ", ..."
+            noun = "call" if tc_count == 1 else "calls"
+            return f"[{tc_count} tool {noun}: {names_str}]"
+
+        def _tool_call_summary(tool_calls):
+            tc_count = len(tool_calls)
+            names = []
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                name = fn.get("name", "unknown") if isinstance(fn, dict) else "unknown"
+                if name not in names:
+                    names.append(name)
+            return _format_tool_call_summary(tc_count, names), tc_count, names
+
         for msg in self.conversation_history:
             role = msg.get("role", "")
             content = msg.get("content")
@@ -4637,8 +4687,6 @@ class HermesCLI:
                         elif isinstance(part, dict) and part.get("type") == "image_url":
                             parts.append("[image]")
                     text = " ".join(parts)
-                if len(text) > MAX_USER_LEN:
-                    text = text[:MAX_USER_LEN] + "..."
                 entries.append(("user", text))
 
             elif role == "assistant":
@@ -4648,48 +4696,46 @@ class HermesCLI:
                 full_parts = []  # un-truncated version
                 if text:
                     full_parts.append(text)
-                    lines = text.splitlines()
-                    if len(lines) > MAX_ASST_LINES:
-                        text = "\n".join(lines[:MAX_ASST_LINES]) + " ..."
-                    if len(text) > MAX_ASST_LEN:
-                        text = text[:MAX_ASST_LEN] + "..."
                     parts.append(text)
                 if tool_calls:
-                    tc_count = len(tool_calls)
-                    # Extract tool names
-                    names = []
-                    for tc in tool_calls:
-                        fn = tc.get("function", {})
-                        name = fn.get("name", "unknown") if isinstance(fn, dict) else "unknown"
-                        if name not in names:
-                            names.append(name)
-                    names_str = ", ".join(names[:4])
-                    if len(names) > 4:
-                        names_str += ", ..."
-                    noun = "call" if tc_count == 1 else "calls"
-                    tc_summary = f"[{tc_count} tool {noun}: {names_str}]"
+                    tc_summary, tc_count, tc_names = _tool_call_summary(tool_calls)
                     parts.append(tc_summary)
                     full_parts.append(tc_summary)
                 if not parts:
                     # Skip pure-reasoning messages that have no visible output
                     continue
-                entries.append(("assistant", " ".join(parts)))
+                entry_role = "assistant_tool" if tool_calls and not text else "assistant"
+                entry_text = " ".join(parts)
+                if entry_role == "assistant_tool" and entries and entries[-1][0] == "assistant_tool":
+                    prev_count = entries[-1][2] if len(entries[-1]) > 2 else 0
+                    prev_names = entries[-1][3] if len(entries[-1]) > 3 else []
+                    merged_names = list(prev_names)
+                    for name in tc_names:
+                        if name not in merged_names:
+                            merged_names.append(name)
+                    merged_count = prev_count + tc_count
+                    entries[-1] = (
+                        "assistant_tool",
+                        _format_tool_call_summary(merged_count, merged_names),
+                        merged_count,
+                        merged_names,
+                    )
+                    _last_asst_idx = len(entries) - 1
+                    _last_asst_full = entries[-1][1]
+                    continue
+                if entry_role == "assistant_tool":
+                    entries.append((entry_role, entry_text, tc_count, tc_names))
+                else:
+                    entries.append((entry_role, entry_text))
                 _last_asst_idx = len(entries) - 1
                 _last_asst_full = " ".join(full_parts)
 
         if not entries:
             return
 
-        # Determine if we need to truncate
-        skipped = 0
-        if len(entries) > MAX_DISPLAY_EXCHANGES * 2:
-            skipped = len(entries) - MAX_DISPLAY_EXCHANGES * 2
-            entries = entries[skipped:]
-
-        # Replace last assistant entry with full (un-truncated) text
-        # so the user can see where they left off without wasting tokens.
+        # Keep the last assistant entry highlighted as the point of continuation.
         if _last_asst_idx is not None and _last_asst_full:
-            adj_idx = _last_asst_idx - skipped
+            adj_idx = _last_asst_idx
             if 0 <= adj_idx < len(entries):
                 entries[adj_idx] = ("assistant_last", _last_asst_full)
 
@@ -4711,13 +4757,8 @@ class HermesCLI:
             _assistant_label_c = "#8FBC8F"
 
         lines = Text()
-        if skipped:
-            lines.append(
-                f"  ... {skipped} earlier messages ...\n\n",
-                style="dim italic",
-            )
-
-        for i, (role, text) in enumerate(entries):
+        for i, entry in enumerate(entries):
+            role, text = entry[:2]
             if role == "user":
                 lines.append("  ● You: ", style=f"dim bold {_session_label_c}")
                 # Show first line inline, indent rest
@@ -6021,7 +6062,7 @@ class HermesCLI:
             resolved_id = self._session_db.resolve_resume_session_id(target_id)
         except Exception:
             resolved_id = target_id
-        if resolved_id and resolved_id != target_id:
+        if isinstance(resolved_id, str) and resolved_id and resolved_id != target_id:
             _cprint(
                 f"  Session {target_id} was compressed into {resolved_id}; "
                 f"resuming the descendant with your transcript."
@@ -6049,7 +6090,7 @@ class HermesCLI:
         self._opencode_mode = True
 
         # Load conversation history (strip transcript-only metadata entries)
-        restored = self._session_db.get_messages_as_conversation(target_id)
+        restored = self._load_resumed_conversation(target_id)
         restored = [m for m in (restored or []) if m.get("role") != "session_meta"]
         self.conversation_history = restored
 
@@ -11733,18 +11774,7 @@ class HermesCLI:
         ]
 
     def run(self):
-        """Run the interactive CLI loop with persistent input at bottom."""
-        # Push the entire TUI to the bottom of the terminal so the banner,
-        # responses, and prompt all appear pinned to the bottom — empty
-        # space stays above, not below.  This prints enough blank lines to
-        # scroll the cursor to the last row before any content is rendered.
-        try:
-            _term_lines = shutil.get_terminal_size().lines
-            if _term_lines > 2:
-                print("\n" * (_term_lines - 1), end="", flush=True)
-        except Exception:
-            pass
-
+        """Run the interactive CLI loop with a persistent input area."""
         self.show_banner()
         # Surface any active supply-chain security advisories right after the
         # welcome banner. Quiet/single-query paths call this themselves.

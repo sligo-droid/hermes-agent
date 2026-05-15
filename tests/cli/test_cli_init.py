@@ -3,6 +3,7 @@ that only manifest at runtime (not in mocked unit tests)."""
 
 import os
 import sys
+import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -163,6 +164,14 @@ class TestBusyInputMode:
 
 
 class TestPromptToolkitTerminalCompatibility:
+    def test_classic_run_does_not_prefill_blank_scrollback(self):
+        """Classic CLI startup should not push a page of blank rows into scrollback."""
+        from cli import HermesCLI
+
+        source = inspect.getsource(HermesCLI.run)
+        assert "get_terminal_size().lines" not in source
+        assert 'print("\\n" *' not in source
+
     def test_lf_enter_binds_to_submit_handler_posix(self):
         """Some thin PTYs deliver Enter as LF/c-j instead of CR/enter.
 

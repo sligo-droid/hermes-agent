@@ -7,7 +7,6 @@ import throttle from 'lodash-es/throttle.js'
 import React, { type ReactNode } from 'react'
 import type { FiberRoot } from 'react-reconciler'
 import { ConcurrentRoot } from 'react-reconciler/constants.js'
-import { onExit } from 'signal-exit'
 
 import { flushInteractionTime } from '../bootstrap/state.js'
 import { getYogaCounters } from '../native-ts/yoga-layout/index.js'
@@ -372,10 +371,10 @@ export default class Ink {
     // Ignore last render after unmounting a tree to prevent empty output before exit
     this.isUnmounted = false
 
-    // Unmount when process exits
-    this.unsubscribeExit = onExit(this.unmount, {
-      alwaysLast: false
-    })
+    // Unmount when process exits. Avoid signal-exit here: the CommonJS
+    // package has hung during TUI startup under some Node/bundler
+    // combinations, leaving the alternate screen blank before first render.
+    this.unsubscribeExit = this.registerExitHandlers()
 
     if (options.stdout.isTTY) {
       options.stdout.on('resize', this.handleResize)
@@ -593,6 +592,32 @@ export default class Ink {
   resolveExitPromise: () => void = () => {}
   rejectExitPromise: (reason?: Error) => void = () => {}
   unsubscribeExit: () => void = () => {}
+  private readonly exitSignalHandlers: Array<[NodeJS.Signals, () => void]> = []
+
+  private registerExitHandlers(): () => void {
+    const onProcessExit = () => this.unmount()
+    process.once('exit', onProcessExit)
+
+    const signals: NodeJS.Signals[] = ['SIGHUP', 'SIGINT', 'SIGTERM']
+
+    for (const signal of signals) {
+      const handler = () => {
+        this.unmount()
+        process.kill(process.pid, signal)
+      }
+
+      this.exitSignalHandlers.push([signal, handler])
+      process.once(signal, handler)
+    }
+
+    return () => {
+      process.off('exit', onProcessExit)
+
+      for (const [signal, handler] of this.exitSignalHandlers.splice(0)) {
+        process.off(signal, handler)
+      }
+    }
+  }
 
   /**
    * Pause Ink and hand the terminal over to an external TUI (e.g. git

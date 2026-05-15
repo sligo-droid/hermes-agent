@@ -44,14 +44,16 @@ export const MessageLine = memo(function MessageLine({
   // feeds Thinking + Tool calls.  Gating on every section would let
   // `thinking` (expanded by default) keep an empty wrapper alive when only
   // `tools` is hidden — exactly the empty-Box bug Copilot caught.
-  const thinkingMode = sectionMode('thinking', detailsMode, sections, detailsModeCommandOverride)
-  const toolsMode = sectionMode('tools', detailsMode, sections, detailsModeCommandOverride)
-  const activityMode = sectionMode('activity', detailsMode, sections, detailsModeCommandOverride)
+  const commandOverride = detailsModeCommandOverride || msg.detailsCollapsedByDefault === true
+  const thinkingMode = sectionMode('thinking', detailsMode, sections, commandOverride)
+  const toolsMode = sectionMode('tools', detailsMode, sections, commandOverride)
+  const activityMode = sectionMode('activity', detailsMode, sections, commandOverride)
   const thinking = msg.thinking?.trim() ?? ''
 
   // Collapse toggle for long system messages
   const systemIsLong = msg.role === 'system' && msg.text.length > SYSTEM_COLLAPSE_CHARS
   const [systemOpen, setSystemOpen] = useState(false)
+  const [toolOpen, setToolOpen] = useState(false)
 
   if (msg.kind === 'trail' && msg.todos?.length) {
     return (
@@ -68,7 +70,7 @@ export const MessageLine = memo(function MessageLine({
     return thinkingMode !== 'hidden' || toolsMode !== 'hidden' || activityMode !== 'hidden' ? (
       <Box flexDirection="column">
         <ToolTrail
-          commandOverride={detailsModeCommandOverride}
+          commandOverride={commandOverride}
           detailsMode={detailsMode}
           reasoning={thinking}
           reasoningTokens={msg.thinkingTokens}
@@ -86,18 +88,29 @@ export const MessageLine = memo(function MessageLine({
     const maxChars = Math.max(24, cols - 14)
     const stripped = hasAnsi(msg.text) ? stripAnsi(msg.text) : msg.text
     const preview = compactPreview(stripped, maxChars) || '(empty tool result)'
-
     return (
-      <Box alignSelf="flex-start" borderColor={t.color.muted} borderStyle="round" marginLeft={3} paddingX={1}>
-        {hasAnsi(msg.text) ? (
-          <Text wrap="truncate-end">
+      <Box
+        alignSelf="flex-start"
+        borderColor={t.color.muted}
+        borderStyle="round"
+        flexDirection="column"
+        marginLeft={3}
+        onClick={() => setToolOpen(v => !v)}
+        paddingX={1}
+      >
+        <Text color={t.color.muted} wrap="truncate-end">
+          <Text color={t.color.accent}>{toolOpen ? '▾ ' : '▸ '}</Text>
+          {toolOpen ? 'Tool result' : preview}
+        </Text>
+        {toolOpen ? (
+          hasAnsi(msg.text) ? (
             <Ansi>{msg.text}</Ansi>
-          </Text>
-        ) : (
-          <Text color={t.color.muted} wrap="truncate-end">
-            {preview}
-          </Text>
-        )}
+          ) : (
+            <Text color={t.color.muted} wrap="wrap">
+              {msg.text}
+            </Text>
+          )
+        ) : null}
       </Box>
     )
   }
@@ -180,7 +193,7 @@ export const MessageLine = memo(function MessageLine({
       {showDetails && (
         <Box flexDirection="column" marginBottom={1}>
           <ToolTrail
-            commandOverride={detailsModeCommandOverride}
+            commandOverride={commandOverride}
             detailsMode={detailsMode}
             reasoning={thinking}
             reasoningTokens={msg.thinkingTokens}

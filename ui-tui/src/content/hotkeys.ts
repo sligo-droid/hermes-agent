@@ -31,6 +31,7 @@ export const HOTKEYS: [string, string][] = [
   [action + '+←/→', 'jump word'],
   ['Home/End', 'start / end of line'],
   ['Shift+Enter / Alt+Enter', 'insert newline'],
+  ['Shift+↑/↓ / Alt+↑/↓', 'scroll transcript one line'],
   ['\\+Enter', 'multi-line continuation (fallback)'],
   ['!<cmd>', 'run a shell command (e.g. !ls, !git status)'],
   ['{!<cmd>}', 'interpolate shell output inline (e.g. "branch is {!git branch --show-current}")']

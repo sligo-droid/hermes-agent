@@ -22,6 +22,8 @@ import { patchTurnState } from './turnStore.js'
 import { getUiState } from './uiStore.js'
 
 const isCtrl = (key: { ctrl: boolean }, ch: string, target: string) => key.ctrl && ch.toLowerCase() === target
+const isAltArrow = (key: { alt?: boolean; downArrow: boolean; meta?: boolean; upArrow: boolean }) =>
+  Boolean((key.alt || key.meta) && (key.upArrow || key.downArrow))
 
 export function applyVoiceRecordResponse(
   response: null | VoiceRecordResponse,
@@ -344,6 +346,10 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
 
     if (key.shift && key.downArrow) {
       return scrollTranscript(1)
+    }
+
+    if (isAltArrow(key)) {
+      return scrollTranscript(key.upArrow ? -1 : 1)
     }
 
     if (key.pageUp || key.pageDown) {
