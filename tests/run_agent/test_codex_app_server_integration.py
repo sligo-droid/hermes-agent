@@ -53,7 +53,7 @@ def _make_codex_agent():
     """Construct an AIAgent in codex_app_server mode without contacting any
     real provider. We pass api_mode explicitly so the constructor takes the
     fast path for direct credentials."""
-    return run_agent.AIAgent(
+    agent = run_agent.AIAgent(
         api_key="stub",
         base_url="https://stub.invalid",
         provider="openai",
@@ -62,6 +62,22 @@ def _make_codex_agent():
         skip_context_files=True,
         skip_memory=True,
     )
+    agent._session_db = None
+    agent._session_db_created = False
+    agent._save_session_log = lambda *args, **kwargs: None
+    return agent
+
+
+class RecordingSessionDB:
+    def __init__(self):
+        self.created_sessions = []
+        self.messages = []
+
+    def create_session(self, **kwargs):
+        self.created_sessions.append(kwargs)
+
+    def append_message(self, **kwargs):
+        self.messages.append(kwargs)
 
 
 class TestApiModeAccepted:
@@ -97,6 +113,25 @@ class TestRunConversationCodexPath:
         final = [m for m in msgs if m.get("role") == "assistant"
                  and m.get("content") == "echo: hello"]
         assert final, f"expected final assistant message in {msgs}"
+
+    def test_codex_app_server_turn_persists_projected_messages(self, fake_session):
+        agent = _make_codex_agent()
+        db = RecordingSessionDB()
+        agent._session_db = db
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("persist this")
+
+        assert result["completed"] is True
+        assert db.created_sessions
+        assert [m["role"] for m in db.messages] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+        ]
+        assert db.messages[0]["content"] == "persist this"
+        assert db.messages[-1]["content"] == "echo: persist this"
 
     def test_nudge_counters_tick(self, fake_session):
         """The skill nudge counter must accumulate tool_iterations across
@@ -320,6 +355,25 @@ class TestErrorHandling:
         assert result["partial"] is True
         assert "subprocess died" in result["error"]
         assert "codex-runtime auto" in result["final_response"]
+
+    def test_session_exception_persists_error_turn(self, monkeypatch):
+        def boom_run_turn(self, user_input, **kwargs):
+            raise RuntimeError("subprocess died")
+
+        monkeypatch.setattr(CodexAppServerSession, "ensure_started",
+                            lambda self: "t1")
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", boom_run_turn)
+
+        agent = _make_codex_agent()
+        db = RecordingSessionDB()
+        agent._session_db = db
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("persist crash")
+
+        assert result["completed"] is False
+        assert [m["role"] for m in db.messages] == ["user", "assistant"]
+        assert db.messages[0]["content"] == "persist crash"
+        assert "subprocess died" in db.messages[1]["content"]
 
     def test_interrupted_turn_marked_partial(self, monkeypatch):
         def interrupted_turn(self, user_input, **kwargs):
