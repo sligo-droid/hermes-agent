@@ -2,7 +2,7 @@ name: Lint (ruff + ty)
 
 # Two things here:
 #   1. Advisory diff — ruff + ty diagnostics as a diff vs the target branch.
-#      Posts a Markdown summary and a PR comment. Exit zero always.
+#      Writes a Markdown summary to the workflow output. Exit zero always.
 #   2. Blocking ``ruff check .`` — enforces the explicit rules in
 #      ``[tool.ruff.lint.select]`` (currently PLW1514). Failure blocks merge.
 #      Separate job so the advisory diff still runs and posts even when
@@ -24,7 +24,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write # needed to post/update PR comments
 
 concurrency:
   group: lint-${{ github.ref }}
@@ -121,47 +120,13 @@ jobs:
           path: .lint-reports/
           retention-days: 14
 
-      - name: Post / update PR comment
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-        continue-on-error: true
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
-        with:
-          script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('.lint-reports/summary.md', 'utf8');
-            const marker = '<!-- lint-diff-summary -->';
-            const fullBody = marker + '\n' + body;
-
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo:  context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            const existing = comments.find(c => c.body && c.body.includes(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo:  context.repo.repo,
-                comment_id: existing.id,
-                body: fullBody,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo:  context.repo.repo,
-                issue_number: context.issue.number,
-                body: fullBody,
-              });
-            }
-
-
   ruff-blocking:
     # Enforce the rules in pyproject.toml [tool.ruff.lint.select]. Currently
     # PLW1514 (unspecified-encoding) — catches bare ``open()`` /
     # ``read_text()`` / ``write_text()`` calls that default to locale
     # encoding on Windows. Failure here blocks merge; the advisory
     # ``lint-diff`` job above runs independently so reviewers still get
-    # the diff comment even when enforcement fails.
+    # the workflow summary even when enforcement fails.
     name: ruff enforcement (blocking)
     runs-on: ubuntu-latest
     timeout-minutes: 5

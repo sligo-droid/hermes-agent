@@ -14,12 +14,10 @@ on:
         description: 'PR number to fix (leave empty to run on the selected branch)'
         required: false
         type: string
-  issue_comment:
-    types: [edited]
 
 permissions:
   contents: write
-  pull-requests: write
+  pull-requests: read
 
 concurrency:
   group: nix-lockfile-fix-${{ github.event.issue.number || github.event.inputs.pr_number || github.ref }}
@@ -121,16 +119,9 @@ jobs:
           echo "::error::Failed to push after 3 rebase attempts"
           exit 1
 
-  # ── PR fix (manual / checkbox) ─────────────────────────────────────
-  # Existing behavior: run on manual dispatch OR when a task-list
-  # checkbox in the sticky lockfile-check comment flips from [ ] to [x].
+  # ── PR fix (manual) ────────────────────────────────────────────────
   fix:
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'issue_comment'
-       && github.event.issue.pull_request != null
-       && contains(github.event.comment.body, '[x] **Apply lockfile fix**')
-       && !contains(github.event.changes.body.from, '[x] **Apply lockfile fix**'))
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -139,8 +130,7 @@ jobs:
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
         with:
           script: |
-            // 1. Verify the actor has write access — applies to both checkbox
-            //    clicks and manual dispatch.
+            // 1. Verify the actor has write access.
             const { data: perm } =
               await github.rest.repos.getCollaboratorPermissionLevel({
                 owner: context.repo.owner,
@@ -155,12 +145,7 @@ jobs:
             }
 
             // 2. Resolve which ref to check out.
-            let prNumber = '';
-            if (context.eventName === 'issue_comment') {
-              prNumber = String(context.payload.issue.number);
-            } else if (context.eventName === 'workflow_dispatch') {
-              prNumber = context.payload.inputs.pr_number || '';
-            }
+            const prNumber = context.payload.inputs.pr_number || '';
 
             if (!prNumber) {
               core.setOutput('ref', context.ref.replace(/^refs\/heads\//, ''));
@@ -179,20 +164,6 @@ jobs:
             core.setOutput('repo', pr.head.repo.name);
             core.setOutput('owner', pr.head.repo.owner.login);
             core.setOutput('pr', String(pr.number));
-
-      # Wipe the sticky lockfile-check comment to a "running" state as soon
-      # as the job is authorized, so the user sees their click was picked up
-      # before the ~minute of nix build work.
-      - name: Mark sticky as running
-        if: steps.resolve.outputs.pr != ''
-        uses: marocchino/sticky-pull-request-comment@52423e01640425a022ef5fd42c6fb5f633a02728  # v2.9.1
-        with:
-          header: nix-lockfile-check
-          number: ${{ steps.resolve.outputs.pr }}
-          message: |
-            ### 🔄 Applying lockfile fix…
-
-            Triggered by @${{ github.actor }} — [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
@@ -219,36 +190,3 @@ jobs:
           git add nix/tui.nix nix/web.nix
           git commit -m "fix(nix): refresh npm lockfile hashes"
           git push
-
-      - name: Update sticky (applied)
-        if: steps.apply.outputs.changed == 'true' && steps.resolve.outputs.pr != ''
-        uses: marocchino/sticky-pull-request-comment@52423e01640425a022ef5fd42c6fb5f633a02728  # v2.9.1
-        with:
-          header: nix-lockfile-check
-          number: ${{ steps.resolve.outputs.pr }}
-          message: |
-            ### ✅ Lockfile fix applied
-
-            Pushed a commit refreshing the npm lockfile hashes — [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
-
-      - name: Update sticky (already current)
-        if: steps.apply.outputs.changed == 'false' && steps.resolve.outputs.pr != ''
-        uses: marocchino/sticky-pull-request-comment@52423e01640425a022ef5fd42c6fb5f633a02728  # v2.9.1
-        with:
-          header: nix-lockfile-check
-          number: ${{ steps.resolve.outputs.pr }}
-          message: |
-            ### ✅ Lockfile hashes already current
-
-            Nothing to commit — [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
-
-      - name: Update sticky (failed)
-        if: failure() && steps.resolve.outputs.pr != ''
-        uses: marocchino/sticky-pull-request-comment@52423e01640425a022ef5fd42c6fb5f633a02728  # v2.9.1
-        with:
-          header: nix-lockfile-check
-          number: ${{ steps.resolve.outputs.pr }}
-          message: |
-            ### ❌ Lockfile fix failed
-
-            See the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for logs.

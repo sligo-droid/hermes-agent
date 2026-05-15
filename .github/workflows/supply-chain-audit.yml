@@ -13,7 +13,6 @@ on:
       - '**/__init__.pth'
 
 permissions:
-  pull-requests: write
   contents: read
 
 # Narrow, high-signal scanner. Only fires on critical indicators of supply
@@ -116,24 +115,9 @@ jobs:
             echo "found=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Post critical finding comment
-        if: steps.scan.outputs.found == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          BODY="## 🚨 CRITICAL Supply Chain Risk Detected
-
-          This PR contains a pattern that has been used in real supply chain attacks. A maintainer must review the flagged code carefully before merging.
-
-          $(cat /tmp/findings.md)
-
-          ---
-          *Scanner only fires on high-signal indicators: .pth files, base64+exec/eval combos, subprocess with encoded commands, or install-hook files. Low-signal warnings were removed intentionally — if you're seeing this comment, the finding is worth inspecting.*"
-
-          gh pr comment "${{ github.event.pull_request.number }}" --body "$BODY" || echo "::warning::Could not post PR comment (expected for fork PRs — GITHUB_TOKEN is read-only)"
-
       - name: Fail on critical findings
         if: steps.scan.outputs.found == 'true'
         run: |
-          echo "::error::CRITICAL supply chain risk patterns detected in this PR. See the PR comment for details."
+          echo "::error::CRITICAL supply chain risk patterns detected in this PR."
+          cat /tmp/findings.md
           exit 1
