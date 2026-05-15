@@ -12266,6 +12266,7 @@ class AIAgent:
                 user_message=user_message,
                 original_user_message=original_user_message,
                 messages=messages,
+                conversation_history=conversation_history,
                 effective_task_id=effective_task_id,
                 should_review_memory=_should_review_memory,
             )
@@ -15720,6 +15721,7 @@ class AIAgent:
         user_message: str,
         original_user_message: Any,
         messages: List[Dict[str, Any]],
+        conversation_history: Optional[List[Dict[str, Any]]],
         effective_task_id: str,
         should_review_memory: bool = False,
     ) -> Dict[str, Any]:
@@ -15765,11 +15767,20 @@ class AIAgent:
             except Exception:
                 pass
             self._codex_session = None
+            final_response = (
+                f"Codex app-server turn failed: {exc}. "
+                f"Fall back to default runtime with `/codex-runtime auto`."
+            )
+            messages.append({"role": "assistant", "content": final_response})
+            self._save_trajectory(
+                messages,
+                _summarize_user_message_for_log(user_message),
+                completed=False,
+            )
+            self._cleanup_task_resources(effective_task_id)
+            self._persist_session(messages, conversation_history)
             return {
-                "final_response": (
-                    f"Codex app-server turn failed: {exc}. "
-                    f"Fall back to default runtime with `/codex-runtime auto`."
-                ),
+                "final_response": final_response,
                 "messages": messages,
                 "api_calls": 0,
                 "completed": False,
@@ -15798,6 +15809,16 @@ class AIAgent:
         # is exactly what curator.py / sessions DB expect.
         if turn.projected_messages:
             messages.extend(turn.projected_messages)
+
+        if (
+            turn.final_text
+            and not (
+                messages
+                and messages[-1].get("role") == "assistant"
+                and messages[-1].get("content") == turn.final_text
+            )
+        ):
+            messages.append({"role": "assistant", "content": turn.final_text})
 
         # Counter ticks for the self-improvement loop.
         # _turns_since_memory and _user_turn_count are ALREADY incremented
@@ -15850,11 +15871,20 @@ class AIAgent:
             except Exception:
                 logger.debug("background review spawn raised", exc_info=True)
 
+        completed = not turn.interrupted and turn.error is None
+        self._save_trajectory(
+            messages,
+            _summarize_user_message_for_log(user_message),
+            completed=completed,
+        )
+        self._cleanup_task_resources(effective_task_id)
+        self._persist_session(messages, conversation_history)
+
         return {
             "final_response": turn.final_text,
             "messages": messages,
             "api_calls": 1,  # one app-server "turn" maps to one logical API call
-            "completed": not turn.interrupted and turn.error is None,
+            "completed": completed,
             "partial": turn.interrupted or turn.error is not None,
             "error": turn.error,
             "codex_thread_id": turn.thread_id,
