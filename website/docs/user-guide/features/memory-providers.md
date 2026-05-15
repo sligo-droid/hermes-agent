@@ -1,12 +1,12 @@
 ---
 sidebar_position: 4
 title: "Memory Providers"
-description: "External memory provider plugins — Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, ByteRover, Supermemory"
+description: "External memory provider plugins — Honcho, OpenViking, Mem0, Holographic, RetainDB, ByteRover, Supermemory"
 ---
 
 # Memory Providers
 
-Hermes Agent ships with 8 external memory provider plugins that give the agent persistent, cross-session knowledge beyond the built-in MEMORY.md and USER.md. Only **one** external provider can be active at a time — the built-in memory is always active alongside it.
+Hermes Agent ships with external memory provider plugins that give the agent persistent, cross-session knowledge beyond the built-in MEMORY.md and USER.md. **Honcho is the recommended provider**, especially for local-first/self-hosted user modeling. Only **one** external provider can be active at a time — the built-in memory is always active alongside it.
 
 ## Quick Start
 
@@ -22,7 +22,7 @@ Or set manually in `~/.hermes/config.yaml`:
 
 ```yaml
 memory:
-  provider: openviking   # or honcho, mem0, hindsight, holographic, retaindb, byterover, supermemory
+  provider: honcho
 ```
 
 ## How It Works
@@ -46,10 +46,10 @@ AI-native cross-session user modeling with dialectic reasoning, session-scoped c
 
 | | |
 |---|---|
-| **Best for** | Multi-agent systems with cross-session context, user-agent alignment |
-| **Requires** | `pip install honcho-ai` + [API key](https://app.honcho.dev) or self-hosted instance |
-| **Data storage** | Honcho Cloud or self-hosted |
-| **Cost** | Honcho pricing (cloud) / free (self-hosted) |
+| **Best for** | Local-first user modeling, multi-agent systems with cross-session context, user-agent alignment |
+| **Requires** | `pip install honcho-ai` + self-hosted Honcho, or [API key](https://app.honcho.dev) |
+| **Data storage** | Self-hosted or Honcho Cloud |
+| **Cost** | Free infrastructure cost when self-hosted / Honcho pricing for cloud |
 
 **Tools (5):** `honcho_profile` (read/update peer card), `honcho_search` (semantic search), `honcho_context` (session context — summary, representation, card, messages), `honcho_reasoning` (LLM-synthesized), `honcho_conclude` (create/delete conclusions)
 
@@ -64,6 +64,11 @@ AI-native cross-session user modeling with dialectic reasoning, session-scoped c
 **Setup Wizard:**
 ```bash
 hermes memory setup        # select "honcho" — runs the Honcho-specific post-setup
+hermes honcho env          # print local-first self-hosted Honcho env vars
+hermes honcho embeddings status
+hermes honcho embeddings start
+hermes honcho embeddings start --docker
+hermes honcho embeddings tune
 ```
 
 The legacy `hermes honcho setup` command still works (it now redirects to `hermes memory setup`), but is only registered after Honcho is selected as the active memory provider.
@@ -99,6 +104,48 @@ The legacy `hermes honcho setup` command still works (it now redirects to `herme
 </details>
 
 <details>
+<summary>Local-first Honcho server env</summary>
+
+Use llama.cpp for OpenAI-compatible embeddings. The local default is `Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0`, 1024 dimensions, ctx 32768, port 8080:
+
+```bash
+llama-server --embedding \
+  --host 127.0.0.1 \
+  --port 8080 \
+  -c 32768 \
+  -hf Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0
+```
+
+Set Honcho server env before first data is written:
+
+```bash
+DB_CONNECTION_URI=<postgresql+psycopg://user:pass@localhost:5432/postgres>
+AUTH_USE_AUTH=false
+EMBEDDING_VECTOR_DIMENSIONS=1024
+EMBEDDING_MAX_INPUT_TOKENS=32768
+EMBEDDING_MODEL_CONFIG__TRANSPORT=openai
+EMBEDDING_MODEL_CONFIG__MODEL=Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0
+EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL=http://127.0.0.1:8080/v1
+EMBEDDING_MODEL_CONFIG__OVERRIDES__API_KEY_ENV=EMBEDDING_OPENAI_API_KEY
+EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE=always
+EMBEDDING_OPENAI_API_KEY=not-needed
+LLM_OPENAI_API_KEY=<set-hermes-proxy-api-key>
+DERIVER_MODEL_CONFIG__TRANSPORT=openai
+DERIVER_MODEL_CONFIG__MODEL=gpt-5.5
+DERIVER_MODEL_CONFIG__OVERRIDES__BASE_URL=http://127.0.0.1:8645/v1
+SUMMARY_MODEL_CONFIG__TRANSPORT=openai
+SUMMARY_MODEL_CONFIG__MODEL=gpt-5.5
+SUMMARY_MODEL_CONFIG__OVERRIDES__BASE_URL=http://127.0.0.1:8645/v1
+DIALECTIC_LEVELS__low__MODEL_CONFIG__TRANSPORT=openai
+DIALECTIC_LEVELS__low__MODEL_CONFIG__MODEL=gpt-5.5
+DIALECTIC_LEVELS__low__MODEL_CONFIG__OVERRIDES__BASE_URL=http://127.0.0.1:8645/v1
+```
+
+Honcho pins pgvector dimensions at bootstrap. `hermes honcho embeddings status` probes `/v1/embeddings` and fails if the returned vector length does not match the configured 1024 dimensions. `Qwen/Qwen3-Embedding-8B-GGUF` is 4096 dim and higher quality, but too heavy for the default memory read-path latency/resource budget. If you switch to it, run Honcho's embedding bootstrap/configure step on an empty database before storing messages. GPT-5.5 routes through the local Hermes OpenAI-compatible proxy at `http://127.0.0.1:8645/v1`; start it with `hermes proxy start --provider openai-codex`. Hermes OAuth is not itself a Honcho credential; expose it to Honcho only through that local proxy.
+
+</details>
+
+<details>
 <summary>Minimal honcho.json (cloud)</summary>
 
 ```json
@@ -122,7 +169,7 @@ The legacy `hermes honcho setup` command still works (it now redirects to `herme
 
 ```json
 {
-  "baseUrl": "http://localhost:8000",
+  "baseUrl": "http://127.0.0.1:8000",
   "hosts": {
     "hermes": {
       "enabled": true,
@@ -323,53 +370,6 @@ echo "MEM0_API_KEY=your-key" >> ~/.hermes/.env
 
 ---
 
-### Hindsight
-
-Long-term memory with knowledge graph, entity resolution, and multi-strategy retrieval. The `hindsight_reflect` tool provides cross-memory synthesis that no other provider offers. Automatically retains full conversation turns (including tool calls) with session-level document tracking.
-
-| | |
-|---|---|
-| **Best for** | Knowledge graph-based recall with entity relationships |
-| **Requires** | Cloud: API key from [ui.hindsight.vectorize.io](https://ui.hindsight.vectorize.io). Local: LLM API key (OpenAI, Groq, OpenRouter, etc.) |
-| **Data storage** | Hindsight Cloud or local embedded PostgreSQL |
-| **Cost** | Hindsight pricing (cloud) or free (local) |
-
-**Tools:** `hindsight_retain` (store with entity extraction), `hindsight_recall` (multi-strategy search), `hindsight_reflect` (cross-memory synthesis)
-
-**Setup:**
-```bash
-hermes memory setup    # select "hindsight"
-# Or manually:
-hermes config set memory.provider hindsight
-echo "HINDSIGHT_API_KEY=your-key" >> ~/.hermes/.env
-```
-
-The setup wizard installs dependencies automatically and only installs what's needed for the selected mode (`hindsight-client` for cloud, `hindsight-all` for local). Requires `hindsight-client >= 0.4.22` (auto-upgraded on session start if outdated).
-
-**Local mode UI:** `hindsight-embed -p hermes ui start`
-
-**Config:** `$HERMES_HOME/hindsight/config.json`
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `mode` | `cloud` | `cloud` or `local` |
-| `bank_id` | `hermes` | Memory bank identifier |
-| `recall_budget` | `mid` | Recall thoroughness: `low` / `mid` / `high` |
-| `memory_mode` | `hybrid` | `hybrid` (context + tools), `context` (auto-inject only), `tools` (tools only) |
-| `auto_retain` | `true` | Automatically retain conversation turns |
-| `auto_recall` | `true` | Automatically recall memories before each turn |
-| `retain_async` | `true` | Process retain asynchronously on the server |
-| `retain_context` | `conversation between Hermes Agent and the User` | Context label for retained memories |
-| `retain_tags` | — | Default tags applied to retained memories; merged with per-call tool tags |
-| `retain_source` | — | Optional `metadata.source` attached to retained memories |
-| `retain_user_prefix` | `User` | Label used before user turns in auto-retained transcripts |
-| `retain_assistant_prefix` | `Assistant` | Label used before assistant turns in auto-retained transcripts |
-| `recall_tags` | — | Tags to filter on recall |
-
-See [plugin README](https://github.com/NousResearch/hermes-agent/blob/main/plugins/memory/hindsight/README.md) for the full configuration reference.
-
----
-
 ### Holographic
 
 Local SQLite fact store with FTS5 full-text search, trust scoring, and HRR (Holographic Reduced Representations) for compositional algebraic queries.
@@ -526,10 +526,9 @@ echo 'SUPERMEMORY_API_KEY=***' >> ~/.hermes/.env
 
 | Provider | Storage | Cost | Tools | Dependencies | Unique Feature |
 |----------|---------|------|-------|-------------|----------------|
-| **Honcho** | Cloud | Paid | 5 | `honcho-ai` | Dialectic user modeling + session-scoped context |
+| **Honcho** | Local/Cloud | Free/Paid | 5 | `honcho-ai` + self-hosted server or API key | Dialectic user modeling + session-scoped context |
 | **OpenViking** | Self-hosted | Free | 5 | `openviking` + server | Filesystem hierarchy + tiered loading |
 | **Mem0** | Cloud | Paid | 3 | `mem0ai` | Server-side LLM extraction |
-| **Hindsight** | Cloud/Local | Free/Paid | 3 | `hindsight-client` | Knowledge graph + reflect synthesis |
 | **Holographic** | Local | Free | 2 | None | HRR algebra + trust scoring |
 | **RetainDB** | Cloud | $20/mo | 5 | `requests` | Delta compression |
 | **ByteRover** | Local/Cloud | Free/Paid | 3 | `brv` CLI | Pre-compression extraction |
@@ -540,7 +539,7 @@ echo 'SUPERMEMORY_API_KEY=***' >> ~/.hermes/.env
 Each provider's data is isolated per [profile](/docs/user-guide/profiles):
 
 - **Local storage providers** (Holographic, ByteRover) use `$HERMES_HOME/` paths which differ per profile
-- **Config file providers** (Honcho, Mem0, Hindsight, Supermemory) store config in `$HERMES_HOME/` so each profile has its own credentials
+- **Config file providers** (Honcho, Mem0, Supermemory) store config in `$HERMES_HOME/` so each profile has its own credentials
 - **Cloud providers** (RetainDB) auto-derive profile-scoped project names
 - **Env var providers** (OpenViking) are configured via each profile's `.env` file
 

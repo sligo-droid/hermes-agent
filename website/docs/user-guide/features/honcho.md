@@ -34,6 +34,10 @@ Honcho is integrated into the [Memory Providers](./memory-providers.md) system. 
 
 ```bash
 hermes memory setup    # select "honcho" from the provider list
+hermes honcho env      # generate local self-hosted Honcho env
+hermes honcho embeddings start
+hermes honcho embeddings start --docker  # fallback when llama-server is absent
+hermes honcho embeddings status
 ```
 
 Or configure manually:
@@ -45,10 +49,14 @@ memory:
 ```
 
 ```bash
-echo 'HONCHO_API_KEY=***' >> ~/.hermes/.env
+cat > ~/.hermes/honcho.json <<'JSON'
+{"baseUrl":"http://127.0.0.1:8000","hosts":{"hermes":{"enabled":true,"workspace":"hermes","aiPeer":"hermes","peerName":"your-name"}}}
+JSON
 ```
 
-Get an API key at [honcho.dev](https://honcho.dev).
+This local-first setup expects self-hosted Honcho at `http://127.0.0.1:8000`.
+Use `hermes honcho env` for the Honcho server-side environment, including the
+local llama.cpp embedding endpoint and GPT-5.5 proxy settings.
 
 ## Architecture
 

@@ -154,3 +154,245 @@ class TestCmdStatus:
         out = capsys.readouterr().out
         assert "FAILED (Invalid API key)" in out
         assert "Connection... OK" not in out
+
+    def test_status_shows_base_url_for_local_config(self, monkeypatch, capsys, tmp_path):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        cfg_path = tmp_path / "honcho.json"
+        cfg_path.write_text("{}")
+
+        class FakeConfig:
+            enabled = False
+            api_key = None
+            base_url = "http://localhost:8000"
+            workspace_id = "hermes"
+            host = "hermes"
+            ai_peer = "hermes"
+            peer_name = "eri"
+            recall_mode = "hybrid"
+            user_observe_me = True
+            user_observe_others = True
+            ai_observe_me = True
+            ai_observe_others = True
+            write_frequency = "async"
+            session_strategy = "per-directory"
+            context_tokens = None
+            dialectic_reasoning_level = "low"
+            reasoning_level_cap = "high"
+            reasoning_heuristic = True
+            raw = {}
+
+            def resolve_session_name(self):
+                return "hermes"
+
+        monkeypatch.setattr(honcho_cli, "_read_config", lambda: {"baseUrl": "http://localhost:8000"})
+        monkeypatch.setattr(honcho_cli, "_config_path", lambda: cfg_path)
+        monkeypatch.setattr(honcho_cli, "_local_config_path", lambda: cfg_path)
+        monkeypatch.setattr(honcho_cli, "_active_profile_name", lambda: "default")
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: FakeConfig(),
+        )
+        monkeypatch.setattr(
+            honcho_cli,
+            "_honcho_base_url_health",
+            lambda base_url: (True, "{}"),
+        )
+        monkeypatch.setitem(__import__("sys").modules, "honcho", SimpleNamespace())
+
+        honcho_cli.cmd_status(SimpleNamespace(all=False))
+
+        out = capsys.readouterr().out
+        assert "Base URL:       http://localhost:8000" in out
+        assert "Local target:   http://127.0.0.1:8000 expected for this setup" in out
+        assert "Embeddings:     hermes honcho embeddings status" in out
+
+    def test_status_fails_loudly_when_local_honcho_is_dead(self, monkeypatch, capsys, tmp_path):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        cfg_path = tmp_path / "honcho.json"
+        cfg_path.write_text("{}")
+
+        class FakeConfig:
+            enabled = True
+            api_key = None
+            base_url = "http://127.0.0.1:8000"
+            workspace_id = "hermes"
+            host = "hermes"
+            ai_peer = "hermes"
+            peer_name = "sligo"
+            recall_mode = "hybrid"
+            user_observe_me = True
+            user_observe_others = True
+            ai_observe_me = True
+            ai_observe_others = True
+            write_frequency = "async"
+            session_strategy = "per-directory"
+            context_tokens = None
+            dialectic_reasoning_level = "low"
+            reasoning_level_cap = "high"
+            reasoning_heuristic = True
+            raw = {}
+
+            def resolve_session_name(self):
+                return "hermes"
+
+        monkeypatch.setattr(honcho_cli, "_read_config", lambda: {"baseUrl": "http://127.0.0.1:8000"})
+        monkeypatch.setattr(honcho_cli, "_config_path", lambda: cfg_path)
+        monkeypatch.setattr(honcho_cli, "_local_config_path", lambda: cfg_path)
+        monkeypatch.setattr(honcho_cli, "_active_profile_name", lambda: "default")
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: FakeConfig(),
+        )
+        monkeypatch.setattr(
+            honcho_cli,
+            "_honcho_base_url_health",
+            lambda base_url: (False, "connection refused"),
+        )
+        monkeypatch.setitem(__import__("sys").modules, "honcho", SimpleNamespace())
+
+        honcho_cli.cmd_status(SimpleNamespace(all=False))
+
+        out = capsys.readouterr().out
+        assert "Connection... FAILED (connection refused)" in out
+        assert "Fix: start local Honcho" in out
+        assert "Connection... OK" not in out
+
+
+class TestLocalFirstEnv:
+    def test_env_template_includes_qwen_llamacpp_and_gpt55(self):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        lines = honcho_cli.build_local_first_env_lines({"baseUrl": "http://localhost:8000"})
+        text = "\n".join(lines)
+
+        assert "EMBEDDING_VECTOR_DIMENSIONS=1024" in text
+        assert "EMBEDDING_MAX_INPUT_TOKENS=32768" in text
+        assert "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0" in text
+        assert "EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL=http://127.0.0.1:8080/v1" in text
+        assert "DERIVER_MODEL_CONFIG__MODEL=gpt-5.5" in text
+        assert "DERIVER_MODEL_CONFIG__OVERRIDES__BASE_URL=http://127.0.0.1:8645/v1" in text
+        assert "HONCHO_BASE_URL=http://localhost:8000" in text
+        assert "hermes proxy start --provider openai-codex" in text
+        assert "<set-hermes-proxy-api-key>" in text
+
+
+class TestEmbeddingsCommand:
+    def test_build_llamacpp_command_uses_local_defaults(self):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        cmd = honcho_cli.build_llamacpp_embedding_command()
+
+        assert cmd == [
+            "llama-server",
+            "--embedding",
+            "--host", "127.0.0.1",
+            "--port", "8080",
+            "-c", "32768",
+            "-hf", "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0",
+        ]
+
+    def test_build_llamacpp_command_includes_tuning_knobs(self):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        cmd = honcho_cli.build_llamacpp_embedding_command(
+            threads=8,
+            gpu_layers=99,
+            batch_size=2048,
+            ubatch_size=512,
+        )
+
+        assert "--threads" in cmd
+        assert "8" in cmd
+        assert "--n-gpu-layers" in cmd
+        assert "99" in cmd
+        assert "--batch-size" in cmd
+        assert "2048" in cmd
+        assert "--ubatch-size" in cmd
+        assert "512" in cmd
+
+    def test_build_llamacpp_docker_command_uses_local_defaults(self):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        cmd = honcho_cli.build_llamacpp_embedding_docker_command()
+
+        assert cmd[:4] == ["docker", "run", "--detach", "--name"]
+        assert "hermes-honcho-embeddings" in cmd
+        assert "127.0.0.1:8080:8080" in cmd
+        assert "ghcr.io/ggml-org/llama.cpp:server" in cmd
+        assert "--embedding" in cmd
+        assert "-hf" in cmd
+        assert "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0" in cmd
+
+    def test_embedding_dimension_report_accepts_expected_vector(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        monkeypatch.setattr(
+            honcho_cli,
+            "_http_post_json",
+            lambda url, payload: (
+                True,
+                {"data": [{"embedding": [0.0] * honcho_cli.LOCAL_EMBEDDING_DIMENSIONS}]},
+            ),
+        )
+
+        ok, detail = honcho_cli._embedding_dimension_report()
+
+        assert ok is True
+        assert detail == "OK (1024)"
+
+    def test_embedding_dimension_report_fails_on_mismatch(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        monkeypatch.setattr(
+            honcho_cli,
+            "_http_post_json",
+            lambda url, payload: (True, {"data": [{"embedding": [0.0] * 4096}]}),
+        )
+
+        ok, detail = honcho_cli._embedding_dimension_report()
+
+        assert ok is False
+        assert "4096 != 1024" in detail
+        assert "pgvector" in detail
+
+    def test_embeddings_config_prints_heavy_model_warning(self, capsys):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        honcho_cli.cmd_embeddings(SimpleNamespace(action="config"))
+
+        out = capsys.readouterr().out
+        assert "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0" in out
+        assert "Dimensions: 1024" in out
+        assert "Qwen/Qwen3-Embedding-8B-GGUF" in out
+        assert "4096 dim" in out
+
+    def test_embeddings_status_reports_endpoint_failure(self, monkeypatch, capsys):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        monkeypatch.setattr(
+            honcho_cli,
+            "_embedding_endpoint_report",
+            lambda **kwargs: (False, ["  Health:     FAILED (connection refused)"]),
+        )
+
+        honcho_cli.cmd_embeddings(SimpleNamespace(action="status", model=None, ctx=None, port=None))
+
+        out = capsys.readouterr().out
+        assert "Status:     not ready" in out
+        assert "hermes honcho embeddings start" in out
+        assert "hermes honcho embeddings start --docker" in out
+        assert "llama-server --embedding" in out
+        assert "Fix dims:" in out
+
+    def test_embeddings_tune_prints_resource_knobs(self, capsys):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        honcho_cli.cmd_embeddings(SimpleNamespace(action="tune"))
+
+        out = capsys.readouterr().out
+        assert "--threads" in out
+        assert "--gpu-layers" in out
+        assert "--batch-size" in out
+        assert "--docker" in out

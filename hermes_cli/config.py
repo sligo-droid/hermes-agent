@@ -1106,8 +1106,8 @@ DEFAULT_CONFIG = {
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # External memory provider plugin (empty = built-in only).
-        # Set to a provider name to activate: "openviking", "mem0",
-        # "hindsight", "holographic", "retaindb", "byterover".
+        # Set to a provider name to activate. Honcho is the recommended
+        # external provider for local-first/self-hosted user modeling.
         # Only ONE external provider is allowed at a time.
         "provider": "",
     },
@@ -1236,9 +1236,9 @@ DEFAULT_CONFIG = {
         },
     },
 
-    # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
-    # This section is only needed for hermes-specific overrides; everything else
-    # (apiKey, workspace, peerName, sessions, enabled) comes from the global config.
+    # Honcho AI-native memory -- recommended external provider for this setup.
+    # Prefer profile-local $HERMES_HOME/honcho.json with baseUrl
+    # http://127.0.0.1:8000 for self-hosted local Honcho.
     "honcho": {},
 
     # IANA timezone (e.g. "Asia/Kolkata", "America/New_York").
@@ -2239,8 +2239,8 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
     },
     "HONCHO_BASE_URL": {
-        "description": "Base URL for self-hosted Honcho instances (no API key needed)",
-        "prompt": "Honcho base URL (e.g. http://localhost:8000)",
+        "description": "Base URL for self-hosted Honcho instances (default: http://127.0.0.1:8000)",
+        "prompt": "Honcho base URL (default: http://127.0.0.1:8000)",
         "category": "tool",
     },
 

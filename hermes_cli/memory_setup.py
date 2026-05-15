@@ -156,6 +156,9 @@ def _get_available_providers() -> list:
 
     results = []
     for name, desc, available in raw:
+        # This machine's setup path is Honcho-only for new external memory.
+        if name == "hindsight":
+            continue
         try:
             provider = load_memory_provider(name)
             if not provider:
@@ -176,7 +179,13 @@ def _get_available_providers() -> list:
             setup_hint = "local"
 
         results.append((name, setup_hint, provider))
-    return results
+    def _provider_sort_key(item):
+        name = item[0]
+        if name == "honcho":
+            return (0, name)
+        return (1, name)
+
+    return sorted(results, key=_provider_sort_key)
 
 
 # ---------------------------------------------------------------------------
