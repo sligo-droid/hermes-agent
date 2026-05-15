@@ -29,6 +29,7 @@ def fake_session(monkeypatch):
         return TurnResult(
             final_text=f"echo: {user_input}",
             projected_messages=[
+                {"role": "user", "content": user_input},
                 {"role": "assistant", "content": None,
                  "tool_calls": [{"id": "exec_1", "type": "function",
                                  "function": {"name": "exec_command",
@@ -105,7 +106,7 @@ class TestRunConversationCodexPath:
         with patch.object(agent, "_spawn_background_review", return_value=None):
             result = agent.run_conversation("hello")
         msgs = result["messages"]
-        # User message + 3 projected (assistant tool_call + tool + assistant text)
+        # User message + 3 projected non-user messages. Codex user echoes are filtered.
         assert len(msgs) >= 4
         assert msgs[0]["role"] == "user"
         assert msgs[0]["content"] == "hello"
