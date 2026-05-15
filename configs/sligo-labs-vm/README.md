@@ -11,6 +11,7 @@ Restore steps:
 mkdir -p ~/.hermes
 cp configs/sligo-labs-vm/honcho.json ~/.hermes/honcho.json
 hermes config set memory.provider honcho
+hermes config set skills.external_dirs '["/home/droid/hermes/configs/sligo-labs-vm/skills"]'
 hermes honcho env > /path/to/local-honcho/.env
 # Edit DB_CONNECTION_URI in that file for local Postgres with pgvector.
 hermes honcho embeddings install
@@ -43,3 +44,7 @@ Honcho LLM inference should use the local Hermes proxy at
 `http://127.0.0.1:8645/v1`, not raw OAuth tokens in Honcho config files.
 Use `hermes honcho embeddings tune` for llama.cpp resource knobs; keep the
 model and dimensions fixed after Honcho has stored data.
+
+The `skills/` directory contains local Hermes operating procedures for this
+machine. Configure it with `skills.external_dirs` so Hermes can load those
+skills without copying them into `~/.hermes/skills`.
