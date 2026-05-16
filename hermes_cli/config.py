@@ -441,7 +441,11 @@ DEFAULT_CONFIG = {
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     "agent": {
-        "max_turns": 90,
+        "max_turns": 25,
+        # Per Codex app-server turn deadline (seconds). A timeout here is
+        # treated as a retryable Codex turn boundary, not a stop signal for
+        # the overall Hermes effort.
+        "codex_app_server_turn_timeout": 600,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -1161,7 +1165,7 @@ DEFAULT_CONFIG = {
         # asks the user to /goal resume. Protects against judge false
         # negatives (goal actually done but judge says continue) and
         # unbounded model spend on fuzzy / unachievable goals.
-        "max_turns": 20,
+        "max_turns": 10,
     },
 
     # Skills — external skill directories for sharing skills across tools/agents.
@@ -2632,7 +2636,7 @@ OPTIONAL_ENV_VARS = {
         "category": "setting",
     },
     "HERMES_MAX_ITERATIONS": {
-        "description": "Maximum tool-calling iterations per conversation (default: 90)",
+        "description": "Maximum tool-calling iterations per conversation (default: 25)",
         "prompt": "Max iterations",
         "url": None,
         "password": False,

@@ -66,6 +66,9 @@ class TestLoadConfigDefaults:
             config = load_config()
             assert config["model"] == DEFAULT_CONFIG["model"]
             assert config["agent"]["max_turns"] == DEFAULT_CONFIG["agent"]["max_turns"]
+            assert config["agent"]["max_turns"] == 25
+            assert config["agent"]["codex_app_server_turn_timeout"] == 600
+            assert config["goals"]["max_turns"] == 10
             assert "max_turns" not in config
             assert "terminal" in config
             assert config["terminal"]["backend"] == "local"

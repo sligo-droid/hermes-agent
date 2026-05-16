@@ -288,7 +288,7 @@ class IterationBudget:
     """Thread-safe iteration counter for an agent.
 
     Each agent (parent or subagent) gets its own ``IterationBudget``.
-    The parent's budget is capped at ``max_iterations`` (default 90).
+    The parent's budget is capped at ``max_iterations`` (default 25).
     Each subagent gets an independent budget capped at
     ``delegation.max_iterations`` (default 50) — this means total
     iterations across parent + subagents can exceed the parent's cap.
@@ -1129,7 +1129,7 @@ class AIAgent:
         command: str = None,
         args: list[str] | None = None,
         model: str = "",
-        max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
+        max_iterations: int = 25,  # Default tool-calling iterations
         tool_delay: float = 1.0,
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
@@ -1194,7 +1194,7 @@ class AIAgent:
             provider (str): Provider identifier (optional; used for telemetry/routing hints)
             api_mode (str): API mode override: "chat_completions" or "codex_responses"
             model (str): Model name to use (default: "anthropic/claude-opus-4.6")
-            max_iterations (int): Maximum number of tool calling iterations (default: 90)
+            max_iterations (int): Maximum number of tool calling iterations (default: 25)
             tool_delay (float): Delay between tool calls in seconds (default: 1.0)
             enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
             disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
@@ -15714,6 +15714,50 @@ class AIAgent:
         result = self.run_conversation(message, stream_callback=stream_callback)
         return result["final_response"]
 
+    def _resolved_codex_app_server_turn_timeout(self) -> float:
+        """Resolve the per-turn Codex app-server deadline in seconds."""
+        try:
+            from hermes_cli.config import load_config
+
+            agent_cfg = (load_config() or {}).get("agent") or {}
+            timeout = float(agent_cfg.get("codex_app_server_turn_timeout") or 600.0)
+            if timeout > 0:
+                return timeout
+        except Exception:
+            pass
+        return 600.0
+
+    def _codex_timeout_continuation_prompt(
+        self,
+        *,
+        original_user_message: Any,
+        timeout_seconds: float,
+        attempt: int,
+        max_attempts: int,
+        error: Optional[str],
+    ) -> str:
+        if isinstance(original_user_message, str):
+            original = original_user_message
+        else:
+            original = _summarize_user_message_for_log(original_user_message)
+        detail = f"\nLast timeout: {error}" if error else ""
+        return (
+            "[Hermes internal continuation after Codex app-server timeout]\n"
+            f"The previous Codex app-server turn timed out after {timeout_seconds:.0f}s "
+            f"({attempt}/{max_attempts}). This timeout is not a signal that the "
+            f"overall effort should stop.{detail}\n\n"
+            "Continue the same task from the next concrete step. If useful, "
+            "briefly account for any completed work before proceeding.\n\n"
+            f"Original user request:\n{original}"
+        )
+
+    def _close_codex_app_server_session(self) -> None:
+        try:
+            self._codex_session.close()
+        except Exception:
+            pass
+        self._codex_session = None
+
     def _run_codex_app_server_turn(
         self,
         *,
@@ -15732,83 +15776,131 @@ class AIAgent:
         """
         from agent.transports.codex_app_server_session import CodexAppServerSession
 
-        # Lazy session: one CodexAppServerSession per AIAgent instance.
-        # Spawned on first turn, reused across turns, closed at AIAgent
-        # shutdown (see _cleanup hook).
-        if not hasattr(self, "_codex_session") or self._codex_session is None:
-            cwd = getattr(self, "session_cwd", None) or os.getcwd()
-            # Approval callback: defer to Hermes' standard prompt flow if a
-            # CLI thread has installed one. Gateway / cron contexts get the
-            # codex-side fail-closed default.
-            try:
-                from tools.terminal_tool import _get_approval_callback
-                approval_callback = _get_approval_callback()
-            except Exception:
-                approval_callback = None
-            self._codex_session = CodexAppServerSession(
-                cwd=cwd,
-                approval_callback=approval_callback,
-            )
-
         # NOTE: the user message is ALREADY appended to messages by the
         # standard run_conversation() flow (line ~11823) before the early
         # return reaches us. Do NOT append again — that would duplicate.
+        codex_input = user_message
+        turn_timeout = self._resolved_codex_app_server_turn_timeout()
+        api_call_count = 0
+        last_timeout_error: Optional[str] = None
+        turn = None
 
-        try:
-            turn = self._codex_session.run_turn(user_input=user_message)
-        except Exception as exc:
-            logger.exception("codex app-server turn failed")
-            # Crash → unconditionally drop the session so the next turn
-            # respawns from scratch instead of reusing a dead client.
+        while api_call_count < self.max_iterations and self.iteration_budget.remaining > 0:
+            if self._interrupt_requested:
+                return {
+                    "final_response": "",
+                    "messages": messages,
+                    "api_calls": api_call_count,
+                    "completed": False,
+                    "partial": True,
+                    "interrupted": True,
+                    "interrupt_message": self._interrupt_message,
+                    "error": self._interrupt_message or "interrupted",
+                }
+
+            api_call_count += 1
+            self._api_call_count = api_call_count
+            self._touch_activity(f"running Codex app-server turn #{api_call_count}")
+            if not self.iteration_budget.consume():
+                break
+
+            # Lazy session: one CodexAppServerSession per live codex process.
+            # Timed-out sessions are retired below so the next loop iteration
+            # starts a clean subprocess.
+            if not hasattr(self, "_codex_session") or self._codex_session is None:
+                cwd = getattr(self, "session_cwd", None) or os.getcwd()
+                try:
+                    from tools.terminal_tool import _get_approval_callback
+                    approval_callback = _get_approval_callback()
+                except Exception:
+                    approval_callback = None
+                self._codex_session = CodexAppServerSession(
+                    cwd=cwd,
+                    approval_callback=approval_callback,
+                )
+
             try:
-                self._codex_session.close()
-            except Exception:
-                pass
-            self._codex_session = None
+                turn = self._codex_session.run_turn(
+                    user_input=codex_input,
+                    turn_timeout=turn_timeout,
+                )
+            except Exception as exc:
+                logger.exception("codex app-server turn failed")
+                # Crash -> unconditionally drop the session so the next turn
+                # respawns from scratch instead of reusing a dead client.
+                self._close_codex_app_server_session()
+                return {
+                    "final_response": (
+                        f"Codex app-server turn failed: {exc}. "
+                        f"Fall back to default runtime with `/codex-runtime auto`."
+                    ),
+                    "messages": messages,
+                    "api_calls": api_call_count,
+                    "completed": False,
+                    "partial": True,
+                    "error": str(exc),
+                }
+
+            # Splice projected messages into the conversation. The projector
+            # emits standard {role, content, tool_calls, tool_call_id} entries,
+            # which is exactly what curator.py / sessions DB expect.
+            if turn.projected_messages:
+                messages.extend(turn.projected_messages)
+
+            self._iters_since_skill = (
+                getattr(self, "_iters_since_skill", 0) + turn.tool_iterations
+            )
+
+            # If the turn signalled the underlying client is wedged (deadline
+            # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
+            # exited), retire the session so the next turn respawns codex
+            # rather than riding the broken process.
+            if getattr(turn, "should_retire", False):
+                logger.warning(
+                    "codex app-server session retired (turn error: %s)",
+                    turn.error,
+                )
+                self._close_codex_app_server_session()
+
+            if getattr(turn, "timed_out", False):
+                last_timeout_error = turn.error or "Codex app-server turn timed out"
+                logger.warning(
+                    "codex app-server turn timed out after %.0fs; continuing "
+                    "within Hermes turn budget (%d/%d)",
+                    turn_timeout, api_call_count, self.max_iterations,
+                )
+                if (
+                    api_call_count >= self.max_iterations
+                    or self.iteration_budget.remaining <= 0
+                ):
+                    break
+                codex_input = self._codex_timeout_continuation_prompt(
+                    original_user_message=original_user_message,
+                    timeout_seconds=turn_timeout,
+                    attempt=api_call_count,
+                    max_attempts=self.max_iterations,
+                    error=last_timeout_error,
+                )
+                continue
+
+            break
+
+        if turn is None or getattr(turn, "timed_out", False):
+            final_response = (
+                "Codex app-server timed out and Hermes reached the configured "
+                f"turn budget ({api_call_count}/{self.max_iterations})."
+            )
+            if last_timeout_error:
+                final_response = f"{final_response} Last timeout: {last_timeout_error}"
+            messages.append({"role": "assistant", "content": final_response})
             return {
-                "final_response": (
-                    f"Codex app-server turn failed: {exc}. "
-                    f"Fall back to default runtime with `/codex-runtime auto`."
-                ),
+                "final_response": final_response,
                 "messages": messages,
-                "api_calls": 0,
+                "api_calls": api_call_count,
                 "completed": False,
                 "partial": True,
-                "error": str(exc),
+                "error": last_timeout_error or "Codex app-server turn timed out",
             }
-
-        # If the turn signalled the underlying client is wedged (deadline
-        # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
-        # exited), retire the session so the next turn respawns codex
-        # rather than riding the broken process. Mirrors openclaw beta.8's
-        # "retire timed-out app-server clients" fix.
-        if getattr(turn, "should_retire", False):
-            logger.warning(
-                "codex app-server session retired (turn error: %s)",
-                turn.error,
-            )
-            try:
-                self._codex_session.close()
-            except Exception:
-                pass
-            self._codex_session = None
-
-        # Splice projected messages into the conversation. The projector emits
-        # standard {role, content, tool_calls, tool_call_id} entries, which
-        # is exactly what curator.py / sessions DB expect.
-        if turn.projected_messages:
-            messages.extend(turn.projected_messages)
-
-        # Counter ticks for the self-improvement loop.
-        # _turns_since_memory and _user_turn_count are ALREADY incremented
-        # in the run_conversation() pre-loop block (lines ~11793-11817) so we
-        # do NOT touch them here — that would double-count.
-        # Only _iters_since_skill needs explicit increment, since the
-        # chat_completions loop bumps it per tool iteration (line ~12110)
-        # and that loop is bypassed on this path.
-        self._iters_since_skill = (
-            getattr(self, "_iters_since_skill", 0) + turn.tool_iterations
-        )
 
         # Now check the skill nudge AFTER iters were incremented — same
         # pattern the chat_completions path uses (line ~15432).
@@ -15839,6 +15931,7 @@ class AIAgent:
         if (
             turn.final_text
             and not turn.interrupted
+            and turn.error is None
             and (should_review_memory or should_review_skills)
         ):
             try:
@@ -15853,7 +15946,7 @@ class AIAgent:
         return {
             "final_response": turn.final_text,
             "messages": messages,
-            "api_calls": 1,  # one app-server "turn" maps to one logical API call
+            "api_calls": api_call_count,
             "completed": not turn.interrupted and turn.error is None,
             "partial": turn.interrupted or turn.error is not None,
             "error": turn.error,

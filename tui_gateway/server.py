@@ -1882,7 +1882,7 @@ def _make_agent(sid: str, key: str, session_id: str | None = None):
     )
     return AIAgent(
         model=model,
-        max_iterations=_cfg_max_turns(cfg, 90),
+        max_iterations=_cfg_max_turns(cfg, 25),
         provider=runtime.get("provider"),
         base_url=runtime.get("base_url"),
         api_key=runtime.get("api_key"),
@@ -3240,9 +3240,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     if sid_key:
                         try:
                             goals_cfg = _load_cfg().get("goals") or {}
-                            goal_max_turns = int(goals_cfg.get("max_turns", 20) or 20)
+                            goal_max_turns = int(goals_cfg.get("max_turns", 10) or 10)
                         except Exception:
-                            goal_max_turns = 20
+                            goal_max_turns = 10
                         goal_mgr = GoalManager(
                             session_id=sid_key,
                             default_max_turns=goal_max_turns,
@@ -4591,9 +4591,9 @@ def _(rid, params: dict) -> dict:
 
         try:
             goals_cfg = _load_cfg().get("goals") or {}
-            max_turns = int(goals_cfg.get("max_turns", 20) or 20)
+            max_turns = int(goals_cfg.get("max_turns", 10) or 10)
         except Exception:
-            max_turns = 20
+            max_turns = 10
         mgr = GoalManager(session_id=sid_key, default_max_turns=max_turns)
 
         lower = arg.strip().lower()
@@ -6129,7 +6129,7 @@ def _(rid, params: dict) -> dict:
             {
                 "title": "Agent",
                 "rows": [
-                    ["Max Turns", str(_cfg_max_turns(cfg, 90))],
+                    ["Max Turns", str(_cfg_max_turns(cfg, 25))],
                     ["Toolsets", ", ".join(cfg.get("enabled_toolsets", [])) or "all"],
                     ["Verbose", str(cfg.get("verbose", False))],
                 ],
