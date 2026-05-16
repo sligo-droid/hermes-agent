@@ -185,8 +185,9 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
     assert "Existing channel note" in parent.topic
     assert len(thread.sent) == 1
     sent_embed = thread.sent[0][0]["embed"]
-    assert sent_embed.title == "Feature Summary"
+    assert sent_embed.title == "Generating..."
     assert sent_embed.description == "Build a deploy dashboard"
+    assert all(field.name != "Generated Title" for field in sent_embed.fields)
 
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
@@ -228,7 +229,8 @@ async def test_feature_summary_update_edits_initial_message(adapter):
     message.edit.assert_awaited_once()
     edited_embed = message.edit.await_args.kwargs["embed"]
     fields = {field.name: field.value for field in edited_embed.fields}
-    assert fields["Generated Title"] == "Project Links"
+    assert edited_embed.title == "Project Links"
+    assert "Generated Title" not in fields
     assert fields["Concise Outcome"].startswith("Done.")
     assert fields["Branch"] == "feature/summary"
 
