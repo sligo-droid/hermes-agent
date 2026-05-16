@@ -15860,16 +15860,6 @@ class AIAgent:
         ):
             messages.append({"role": "assistant", "content": final_response})
 
-        last_reasoning = None
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                break
-            if msg.get("role") == "assistant":
-                reasoning = msg.get("reasoning") or msg.get("reasoning_content")
-                if reasoning:
-                    last_reasoning = reasoning
-                    break
-
         # Counter ticks for the self-improvement loop.
         # _turns_since_memory and _user_turn_count are ALREADY incremented
         # in the run_conversation() pre-loop block (lines ~11793-11817) so we
@@ -15938,7 +15928,6 @@ class AIAgent:
             "completed": completed,
             "partial": turn.interrupted or turn.error is not None,
             "error": turn.error,
-            "last_reasoning": last_reasoning,
             "codex_thread_id": turn.thread_id,
             "codex_turn_id": turn.turn_id,
         }

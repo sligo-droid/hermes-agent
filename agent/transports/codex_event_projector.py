@@ -52,23 +52,6 @@ def _format_tool_args(d: dict) -> str:
     return json.dumps(d, ensure_ascii=False, sort_keys=True)
 
 
-def _reasoning_fragments(value: Any) -> list[str]:
-    """Normalize Codex reasoning summary/content payloads to text fragments."""
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value] if value else []
-    if isinstance(value, dict):
-        text = value.get("text") or value.get("summary") or value.get("content")
-        return [str(text)] if text else []
-    if isinstance(value, list):
-        fragments: list[str] = []
-        for item in value:
-            fragments.extend(_reasoning_fragments(item))
-        return fragments
-    return [str(value)]
-
-
 @dataclass
 class ProjectionResult:
     """Output of projecting one Codex item.
@@ -112,8 +95,8 @@ class CodexEventProjector:
         if item_type == "agentMessage":
             return self._project_agent_message(item)
         if item_type == "reasoning":
-            self._pending_reasoning.extend(_reasoning_fragments(item.get("summary")))
-            self._pending_reasoning.extend(_reasoning_fragments(item.get("content")))
+            self._pending_reasoning.extend(item.get("summary") or [])
+            self._pending_reasoning.extend(item.get("content") or [])
             return ProjectionResult()
         if item_type == "commandExecution":
             return self._project_command(item, item_id)
