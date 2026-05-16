@@ -101,6 +101,42 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_activity_summary_tracks_codex_runtime(self, monkeypatch):
+        """Gateway long-running notices use get_activity_summary().
+
+        The codex_app_server path bypasses the normal API loop, so it must
+        update the live activity fields itself instead of reporting
+        "iteration 0/N, initializing" for the whole turn.
+        """
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            self._on_event({
+                "method": "item/completed",
+                "params": {"item": {"type": "commandExecution"}},
+            })
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                tool_iterations=1,
+                turn_id="turn-stub-1",
+                thread_id="thread-stub-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-stub-1"
+        )
+
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("status")
+
+        summary = agent.get_activity_summary()
+        assert summary["api_call_count"] == 1
+        assert summary["last_activity_desc"] == (
+            "Codex app-server event: item/completed: commandExecution"
+        )
+
     def test_projected_messages_are_spliced(self, fake_session):
         agent = _make_codex_agent()
         with patch.object(agent, "_spawn_background_review", return_value=None):
