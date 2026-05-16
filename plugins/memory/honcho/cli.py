@@ -551,7 +551,7 @@ def _embedding_endpoint_report(
     else:
         lines.append("  Dimensions: SKIPPED (embedding endpoint is not healthy)")
 
-    return bool(llama_server) and ok_health and ok_models and ok_dims, lines
+    return ok_health and ok_models and ok_dims, lines
 
 
 def _honcho_base_url_health(base_url: str) -> tuple[bool, str]:
@@ -583,6 +583,7 @@ def cmd_embeddings(args) -> None:
     action = getattr(args, "action", None) or "status"
     model = getattr(args, "model", None) or LOCAL_EMBEDDING_MODEL
     ctx = getattr(args, "ctx", None) or LOCAL_EMBEDDING_CONTEXT
+    dimensions = getattr(args, "dimensions", None) or LOCAL_EMBEDDING_DIMENSIONS
     port = getattr(args, "port", None) or LOCAL_EMBEDDING_PORT
     threads = getattr(args, "threads", None)
     gpu_layers = getattr(args, "gpu_layers", None)
@@ -647,9 +648,13 @@ def cmd_embeddings(args) -> None:
     if action in ("status", "check"):
         print("\nHoncho llama.cpp embeddings status\n" + "-" * 40)
         print(f"  Expected:   {LOCAL_EMBEDDING_BASE_URL}")
-        print(f"  Model:      {LOCAL_EMBEDDING_MODEL}")
-        print(f"  Dimensions: {LOCAL_EMBEDDING_DIMENSIONS}")
-        ok, lines = _embedding_endpoint_report(port=port, model=model)
+        print(f"  Model:      {model}")
+        print(f"  Dimensions: {dimensions}")
+        ok, lines = _embedding_endpoint_report(
+            port=port,
+            expected_dimensions=dimensions,
+            model=model,
+        )
         for line in lines:
             print(line)
         if ok:
@@ -1987,6 +1992,10 @@ def register_cli(subparser) -> None:
     embeddings_parser.add_argument(
         "--ctx", type=int, default=LOCAL_EMBEDDING_CONTEXT,
         help="Context length for llama-server start/check",
+    )
+    embeddings_parser.add_argument(
+        "--dimensions", type=int, default=LOCAL_EMBEDDING_DIMENSIONS,
+        help="Expected embedding vector dimensions for status/check",
     )
     embeddings_parser.add_argument(
         "--port", type=int, default=LOCAL_EMBEDDING_PORT,

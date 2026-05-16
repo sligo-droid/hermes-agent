@@ -357,6 +357,37 @@ class TestEmbeddingsCommand:
         assert "4096 != 1024" in detail
         assert "pgvector" in detail
 
+    def test_embedding_endpoint_report_accepts_docker_backed_endpoint(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        def fake_which(name):
+            if name == "docker":
+                return "/usr/bin/docker"
+            return None
+
+        def fake_get(url):
+            if url.endswith("/health"):
+                return True, {"status": "ok"}
+            if url.endswith("/v1/models"):
+                return True, {
+                    "data": [{"id": honcho_cli.LOCAL_EMBEDDING_MODEL}],
+                }
+            return False, "unexpected URL"
+
+        monkeypatch.setattr("shutil.which", fake_which)
+        monkeypatch.setattr(honcho_cli, "_http_get_json", fake_get)
+        monkeypatch.setattr(
+            honcho_cli,
+            "_embedding_dimension_report",
+            lambda **kwargs: (True, "OK (1024)"),
+        )
+
+        ok, lines = honcho_cli._embedding_endpoint_report()
+
+        assert ok is True
+        assert "  llama-server: MISSING" in lines
+        assert "  Docker:      OK (/usr/bin/docker)" in lines
+
     def test_embeddings_config_prints_heavy_model_warning(self, capsys):
         import plugins.memory.honcho.cli as honcho_cli
 
