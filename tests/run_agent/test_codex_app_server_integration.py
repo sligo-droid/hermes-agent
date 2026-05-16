@@ -49,7 +49,7 @@ def fake_session(monkeypatch):
     )
 
 
-def _make_codex_agent():
+def _make_codex_agent(max_iterations: int = 1000):
     """Construct an AIAgent in codex_app_server mode without contacting any
     real provider. We pass api_mode explicitly so the constructor takes the
     fast path for direct credentials."""
@@ -58,6 +58,7 @@ def _make_codex_agent():
         base_url="https://stub.invalid",
         provider="openai",
         api_mode="codex_app_server",
+        max_iterations=max_iterations,
         quiet_mode=True,
         skip_context_files=True,
         skip_memory=True,
@@ -231,6 +232,89 @@ class TestRunConversationCodexPath:
         ):
             agent.run_conversation("hi")
         assert not client_mock.chat.completions.create.called
+
+    def test_timeout_turn_continues_to_next_codex_turn(self, monkeypatch):
+        calls = []
+        closes = {"count": 0}
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            calls.append((user_input, kwargs))
+            if len(calls) == 1:
+                return TurnResult(
+                    final_text="",
+                    projected_messages=[],
+                    tool_iterations=0,
+                    interrupted=True,
+                    error="turn timed out after 12.0s",
+                    turn_id="turn-timeout",
+                    thread_id="thread-timeout",
+                    timed_out=True,
+                    should_retire=True,
+                )
+            return TurnResult(
+                final_text="done after retry",
+                projected_messages=[
+                    {"role": "assistant", "content": "done after retry"},
+                ],
+                tool_iterations=0,
+                interrupted=False,
+                error=None,
+                turn_id="turn-ok",
+                thread_id="thread-ok",
+            )
+
+        def fake_close(self):
+            closes["count"] += 1
+
+        monkeypatch.setattr(CodexAppServerSession, "ensure_started",
+                            lambda self: "th")
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(CodexAppServerSession, "close", fake_close)
+
+        agent = _make_codex_agent(max_iterations=2)
+        with patch("hermes_cli.config.load_config",
+                   return_value={"agent": {"codex_app_server_turn_timeout": 12}}), \
+             patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("finish the task")
+
+        assert result["completed"] is True
+        assert result["partial"] is False
+        assert result["final_response"] == "done after retry"
+        assert result["api_calls"] == 2
+        assert closes["count"] == 1
+        assert calls[0][1]["turn_timeout"] == 12.0
+        assert "timeout is not a signal" in calls[1][0]
+        assert "finish the task" in calls[1][0]
+
+    def test_repeated_timeout_stops_at_iteration_budget(self, monkeypatch):
+        def timed_out_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="",
+                projected_messages=[],
+                tool_iterations=0,
+                interrupted=True,
+                error="turn timed out after 12.0s",
+                turn_id="turn-timeout",
+                thread_id="thread-timeout",
+                timed_out=True,
+                should_retire=True,
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "ensure_started",
+                            lambda self: "th")
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", timed_out_turn)
+        monkeypatch.setattr(CodexAppServerSession, "close", lambda self: None)
+
+        agent = _make_codex_agent(max_iterations=1)
+        with patch("hermes_cli.config.load_config",
+                   return_value={"agent": {"codex_app_server_turn_timeout": 12}}), \
+             patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("finish the task")
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["api_calls"] == 1
+        assert "turn budget (1/1)" in result["final_response"]
 
 
 class TestReviewForkApiModeDowngrade:

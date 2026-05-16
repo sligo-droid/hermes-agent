@@ -15,6 +15,7 @@ import pytest
 
 from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
+    DEFAULT_TURN_TIMEOUT_SECONDS,
     TurnResult,
     _ServerRequestRouting,
     _approval_choice_to_codex_decision,
@@ -163,6 +164,9 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    def test_default_turn_timeout_is_10_minutes(self):
+        assert DEFAULT_TURN_TIMEOUT_SECONDS == 600.0
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
@@ -343,6 +347,7 @@ class TestRunTurn:
                        notification_poll_timeout=0.01)
         assert r.interrupted is True
         assert r.error and "timed out" in r.error
+        assert r.timed_out is True
 
     def test_failed_turn_records_error_from_turn_completed(self):
         client = FakeClient()
@@ -618,6 +623,7 @@ class TestSessionRetirement:
         )
         assert r.interrupted is True
         assert r.error and "timed out" in r.error
+        assert r.timed_out is True
         assert r.should_retire is True, (
             "Deadline exhaustion must signal retirement so the next turn "
             "respawns codex instead of riding a wedged subprocess."

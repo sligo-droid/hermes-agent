@@ -47,6 +47,8 @@ logger = logging.getLogger(__name__)
 # enough to surface a config/provider/auth diagnostic.
 _STDERR_TAIL_LINES = 12
 
+DEFAULT_TURN_TIMEOUT_SECONDS = 600.0
+
 
 # Permission profile mapping mirrors the docstring in PR proposal:
 # Hermes' tools.terminal.security_mode → Codex's permissions profile id.
@@ -71,6 +73,7 @@ class TurnResult:
     error: Optional[str] = None  # Set if turn ended in a non-recoverable error
     turn_id: Optional[str] = None
     thread_id: Optional[str] = None
+    timed_out: bool = False
     # Hint to the caller that the underlying codex subprocess is likely
     # wedged (turn-level timeout fired, post-tool watchdog tripped, or
     # token-refresh failure killed the child). The caller should retire
@@ -329,7 +332,7 @@ class CodexAppServerSession:
         self,
         user_input: str,
         *,
-        turn_timeout: float = 600.0,
+        turn_timeout: float = DEFAULT_TURN_TIMEOUT_SECONDS,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
     ) -> TurnResult:
@@ -573,6 +576,7 @@ class CodexAppServerSession:
                 result.error = self._format_error_with_stderr(
                     f"turn timed out after {turn_timeout}s"
                 )
+            result.timed_out = True
             result.should_retire = True
 
         return result

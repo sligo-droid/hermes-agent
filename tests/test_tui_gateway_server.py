@@ -4562,13 +4562,13 @@ def test_make_agent_nested_max_turns_takes_priority(monkeypatch):
     assert mock_agent.call_args.kwargs["max_iterations"] == 500
 
 
-def test_make_agent_defaults_to_90(monkeypatch):
+def test_make_agent_defaults_to_25(monkeypatch):
     _setup_make_agent_mocks(monkeypatch, {})
 
     with patch("run_agent.AIAgent") as mock_agent:
         server._make_agent("sid1", "key1")
 
-    assert mock_agent.call_args.kwargs["max_iterations"] == 90
+    assert mock_agent.call_args.kwargs["max_iterations"] == 25
 
 
 def test_make_agent_handles_null_agent_config(monkeypatch):
