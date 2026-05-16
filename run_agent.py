@@ -15763,9 +15763,18 @@ class AIAgent:
                 approval_callback = _get_approval_callback()
             except Exception:
                 approval_callback = None
+
+            def _codex_event_activity(note: dict) -> None:
+                method = note.get("method", "")
+                item = ((note.get("params") or {}).get("item") or {})
+                item_type = item.get("type") or ""
+                suffix = f": {item_type}" if item_type else ""
+                self._touch_activity(f"Codex app-server event: {method}{suffix}")
+
             self._codex_session = CodexAppServerSession(
                 cwd=cwd,
                 approval_callback=approval_callback,
+                on_event=_codex_event_activity,
             )
 
         # NOTE: the user message is ALREADY appended to messages by the
@@ -15773,6 +15782,8 @@ class AIAgent:
         # return reaches us. Do NOT append again — that would duplicate.
 
         try:
+            self._api_call_count = 1
+            self._touch_activity("running Codex app-server turn")
             turn = self._codex_session.run_turn(user_input=user_message)
         except Exception as exc:
             logger.exception("codex app-server turn failed")
