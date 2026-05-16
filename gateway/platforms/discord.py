@@ -21,6 +21,7 @@ import threading
 import time
 from collections import defaultdict
 from typing import Callable, Dict, List, Optional, Any, Tuple
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,11 @@ def _discord_live_voice_enabled() -> bool:
         in _TRUTHY_ENV_VALUES
     )
 
+
+_DISCORD_PROJECT_SUMMARY_STATE_FILENAME = "discord_project_summaries.json"
+_DISCORD_PROJECT_SUMMARY_PREFIX = "Project Summary:"
+_DISCORD_TOPIC_LIMIT = 1024
+
 try:
     import discord
     from discord import Message as DiscordMessage, Intents
@@ -78,7 +84,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 from gateway.config import Platform, PlatformConfig
 import re
 
-from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker
+from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker, strip_markdown
 from utils import atomic_json_write
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -617,6 +623,400 @@ class DiscordAdapter(BasePlatformAdapter):
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
+
+    # ------------------------------------------------------------------
+    # Project / feature summary surfaces
+    # ------------------------------------------------------------------
+
+    def _project_summary_state_path(self) -> _Path:
+        from hermes_constants import get_hermes_home
+
+        directory = get_hermes_home() / "gateway"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return directory / _DISCORD_PROJECT_SUMMARY_STATE_FILENAME
+
+    def _read_project_summary_state(self) -> dict:
+        try:
+            path = self._project_summary_state_path()
+            if not path.exists():
+                return {}
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write_project_summary_state(self, state: dict) -> None:
+        atomic_json_write(
+            self._project_summary_state_path(),
+            state,
+            indent=None,
+            separators=(",", ":"),
+        )
+
+    def _project_summary_state_key(self, channel: Any) -> str:
+        guild = getattr(channel, "guild", None)
+        guild_id = getattr(guild, "id", None)
+        channel_id = getattr(channel, "id", "")
+        return f"{guild_id or 'dm'}:{channel_id}"
+
+    def _summary_workdir(self) -> str:
+        raw = (os.getenv("TERMINAL_CWD") or os.getcwd() or "").strip()
+        if raw and os.path.isdir(raw):
+            return raw
+        return os.getcwd()
+
+    def _run_summary_cmd(self, args: list[str], *, cwd: Optional[str] = None, timeout: float = 1.5) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                args,
+                cwd=cwd or self._summary_workdir(),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+        text = (result.stdout or "").strip()
+        return text or None
+
+    def _normalize_github_remote_url(self, raw: Optional[str]) -> Optional[str]:
+        url = (raw or "").strip()
+        if not url:
+            return None
+        if url.startswith("git@github.com:"):
+            url = "https://github.com/" + url[len("git@github.com:"):]
+        elif url.startswith("ssh://git@github.com/"):
+            url = "https://github.com/" + url[len("ssh://git@github.com/"):]
+        if url.endswith(".git"):
+            url = url[:-4]
+        if url.startswith("https://github.com/"):
+            return url.rstrip("/")
+        return url.rstrip("/") or None
+
+    def _read_project_name_from_files(self, root: str) -> Optional[str]:
+        try:
+            import tomllib
+            pyproject = _Path(root) / "pyproject.toml"
+            if pyproject.exists():
+                data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+                name = ((data.get("project") or {}).get("name") or "").strip()
+                if name:
+                    return self._humanize_project_name(name)
+        except Exception:
+            pass
+        try:
+            package_json = _Path(root) / "package.json"
+            if package_json.exists():
+                data = json.loads(package_json.read_text(encoding="utf-8"))
+                name = str(data.get("name") or "").strip()
+                if name:
+                    return self._humanize_project_name(name)
+        except Exception:
+            pass
+        return None
+
+    def _humanize_project_name(self, value: str) -> str:
+        value = re.sub(r"^@[^/]+/", "", str(value or "").strip())
+        value = re.sub(r"[-_]+", " ", value).strip()
+        return value.title() if value else ""
+
+    def _normalize_public_url(self, raw: Optional[str]) -> Optional[str]:
+        url = str(raw or "").strip()
+        if not url:
+            return None
+        if url.startswith(("http://", "https://")):
+            return url.rstrip("/")
+        if "." in url and " " not in url:
+            return f"https://{url.rstrip('/')}"
+        return url
+
+    def _collect_discord_project_metadata(self) -> Dict[str, Optional[str]]:
+        cwd = self._summary_workdir()
+        root = self._run_summary_cmd(["git", "rev-parse", "--show-toplevel"], cwd=cwd) or cwd
+        remote = self._run_summary_cmd(["git", "remote", "get-url", "origin"], cwd=root)
+        repo_url = self._normalize_github_remote_url(remote)
+        branch = self._run_summary_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
+        if branch == "HEAD":
+            branch = None
+
+        project_name = self._read_project_name_from_files(root)
+        if not project_name and repo_url:
+            project_name = self._humanize_project_name(repo_url.rstrip("/").rsplit("/", 1)[-1])
+        if not project_name:
+            project_name = self._humanize_project_name(_Path(root).name)
+
+        production_url = None
+        for key in (
+            "PRODUCTION_URL",
+            "NEXT_PUBLIC_SITE_URL",
+            "NEXT_PUBLIC_APP_URL",
+            "PUBLIC_URL",
+            "SITE_URL",
+            "APP_URL",
+            "DEPLOYMENT_URL",
+            "VERCEL_PROJECT_PRODUCTION_URL",
+            "VERCEL_URL",
+        ):
+            production_url = self._normalize_public_url(os.getenv(key))
+            if production_url:
+                break
+
+        branch_url = None
+        if repo_url and branch and branch not in {"main", "master"}:
+            branch_url = f"{repo_url}/tree/{quote(branch, safe='/._-')}"
+
+        pr_url = None
+        if branch:
+            pr_url = self._run_summary_cmd(
+                ["gh", "pr", "view", "--json", "url", "--jq", ".url"],
+                cwd=root,
+                timeout=2.0,
+            )
+            pr_url = self._normalize_public_url(pr_url)
+
+        return {
+            "project_name": project_name or None,
+            "repo_url": repo_url,
+            "production_url": production_url,
+            "branch": branch,
+            "branch_url": branch_url,
+            "pr_url": pr_url,
+        }
+
+    def _truncate_summary_value(self, value: Optional[str], *, limit: int = 220, default: str = "pending") -> str:
+        text = str(value or default).strip() or default
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3] + "..."
+
+    def _render_project_summary_line(self, metadata: Dict[str, Optional[str]]) -> str:
+        project = self._truncate_summary_value(metadata.get("project_name"), limit=80)
+        repo = self._truncate_summary_value(metadata.get("repo_url"), limit=260)
+        prod = self._truncate_summary_value(metadata.get("production_url"), limit=260)
+        line = f"{_DISCORD_PROJECT_SUMMARY_PREFIX} Project: {project} | Repo: {repo} | Prod: {prod}"
+        if len(line) <= _DISCORD_TOPIC_LIMIT:
+            return line
+        return line[: _DISCORD_TOPIC_LIMIT - 3] + "..."
+
+    def _merge_project_summary_topic(self, existing: Optional[str], summary_line: str) -> str:
+        lines = str(existing or "").splitlines()
+        if lines and lines[0].startswith(_DISCORD_PROJECT_SUMMARY_PREFIX):
+            lines = lines[1:]
+            if lines and not lines[0].strip():
+                lines = lines[1:]
+        rest = "\n".join(lines).strip()
+        if not rest:
+            return summary_line[:_DISCORD_TOPIC_LIMIT]
+        budget = _DISCORD_TOPIC_LIMIT - len(summary_line) - 1
+        if budget <= 0:
+            return summary_line[:_DISCORD_TOPIC_LIMIT]
+        if len(rest) > budget:
+            rest = rest[: max(0, budget - 3)] + "..."
+        return f"{summary_line}\n{rest}"
+
+    async def _resolve_summary_channel(self, channel_id: Optional[str], fallback: Any = None) -> Optional[Any]:
+        if fallback is not None:
+            return fallback
+        if not self._client or not channel_id:
+            return None
+        try:
+            channel = self._client.get_channel(int(channel_id))
+            if channel is None:
+                channel = await self._client.fetch_channel(int(channel_id))
+            return channel
+        except Exception:
+            return None
+
+    async def _edit_project_summary_topic(self, channel: Any, metadata: Dict[str, Optional[str]]) -> bool:
+        edit = getattr(channel, "edit", None)
+        if edit is None:
+            return False
+        summary_line = self._render_project_summary_line(metadata)
+        new_topic = self._merge_project_summary_topic(getattr(channel, "topic", None), summary_line)
+        try:
+            await edit(topic=new_topic, reason="Initialize Hermes project summary")
+            try:
+                channel.topic = new_topic
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            logger.warning("[%s] Failed to update Discord project summary topic: %s", self.name, exc)
+            return False
+
+    async def initialize_project_summary(self, channel: Any) -> Optional[Dict[str, Any]]:
+        if channel is None or isinstance(channel, discord.DMChannel):
+            return None
+        channel_id = str(getattr(channel, "id", "") or "")
+        if not channel_id:
+            return None
+        key = self._project_summary_state_key(channel)
+        state = self._read_project_summary_state()
+        if key in state:
+            return None
+
+        metadata = self._collect_discord_project_metadata()
+        ok = await self._edit_project_summary_topic(channel, metadata)
+        state[key] = {
+            "channel_id": channel_id,
+            "guild_id": str(getattr(getattr(channel, "guild", None), "id", "") or ""),
+            "attempted_at": time.time(),
+            "success": bool(ok),
+        }
+        try:
+            self._write_project_summary_state(state)
+        except Exception:
+            logger.debug("[%s] Failed to persist Discord project summary state", self.name, exc_info=True)
+        if not ok:
+            return None
+        return {
+            "channel_id": channel_id,
+            "state_key": key,
+            "metadata": metadata,
+            "_channel_obj": channel,
+        }
+
+    async def update_project_summary(self, handle: Optional[Dict[str, Any]]) -> bool:
+        if not handle:
+            return False
+        channel = await self._resolve_summary_channel(
+            str(handle.get("channel_id") or ""),
+            fallback=handle.get("_channel_obj"),
+        )
+        if channel is None:
+            return False
+        metadata = self._collect_discord_project_metadata()
+        return await self._edit_project_summary_topic(channel, metadata)
+
+    def _clean_summary_text(self, text: Optional[str], *, limit: int = 900, default: str = "Pending") -> str:
+        cleaned = re.sub(r"MEDIA:\s*\S+", "", str(text or "")).strip()
+        cleaned = cleaned.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "").strip()
+        cleaned = strip_markdown(cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip() or default
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[: limit - 3] + "..."
+
+    def _summary_color(self, status: str):
+        try:
+            lower = status.lower()
+            if lower == "complete":
+                return discord.Color.green()
+            if lower in {"failed", "interrupted"}:
+                return discord.Color.red()
+            return discord.Color.blue()
+        except Exception:
+            return None
+
+    def _build_feature_summary_embed(
+        self,
+        *,
+        initial_request: str,
+        status: str,
+        outcome: str = "Pending",
+        title: Optional[str] = None,
+        metadata: Optional[Dict[str, Optional[str]]] = None,
+    ):
+        metadata = metadata or self._collect_discord_project_metadata()
+        embed_kwargs = {
+            "title": "Feature Summary",
+            "description": self._clean_summary_text(initial_request, limit=350, default="No initial request text"),
+        }
+        color = self._summary_color(status)
+        if color is not None:
+            embed_kwargs["color"] = color
+        embed = discord.Embed(**embed_kwargs)
+        fields = [
+            ("Status", status, True),
+            ("Generated Title", title or "Generating...", True),
+            ("Concise Outcome", self._clean_summary_text(outcome, limit=900, default="Pending"), False),
+        ]
+        if metadata.get("branch"):
+            fields.append(("Branch", metadata["branch"], True))
+        if metadata.get("pr_url"):
+            fields.append(("GitHub PR", metadata["pr_url"], False))
+        if metadata.get("branch_url"):
+            fields.append(("Feature Branch URL", metadata["branch_url"], False))
+        for name, value, inline in fields:
+            try:
+                embed.add_field(
+                    name=name,
+                    value=self._truncate_summary_value(value, limit=1024, default="pending"),
+                    inline=inline,
+                )
+            except Exception:
+                pass
+        return embed
+
+    async def initialize_feature_summary(
+        self,
+        thread_channel: Any,
+        *,
+        parent_channel: Any = None,
+        initial_request: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        if thread_channel is None or not hasattr(thread_channel, "send"):
+            return None
+        try:
+            embed = self._build_feature_summary_embed(
+                initial_request=initial_request,
+                status="Running",
+            )
+            msg = await thread_channel.send(embed=embed)
+        except Exception as exc:
+            logger.warning("[%s] Failed to send Discord feature summary: %s", self.name, exc)
+            return None
+        return {
+            "thread_id": str(getattr(thread_channel, "id", "") or ""),
+            "message_id": str(getattr(msg, "id", "") or ""),
+            "parent_channel_id": str(getattr(parent_channel, "id", "") or ""),
+            "initial_request": initial_request,
+            "_thread_obj": thread_channel,
+            "_message_obj": msg,
+        }
+
+    async def update_feature_summary(
+        self,
+        handle: Optional[Dict[str, Any]],
+        *,
+        final_response: str = "",
+        status: str = "Complete",
+        title: Optional[str] = None,
+    ) -> bool:
+        if not handle:
+            return False
+        thread = await self._resolve_summary_channel(
+            str(handle.get("thread_id") or ""),
+            fallback=handle.get("_thread_obj"),
+        )
+        if thread is None:
+            return False
+        msg = handle.get("_message_obj")
+        if msg is None:
+            fetch = getattr(thread, "fetch_message", None)
+            if fetch is None:
+                return False
+            try:
+                msg = await fetch(int(handle.get("message_id")))
+            except Exception:
+                return False
+        try:
+            embed = self._build_feature_summary_embed(
+                initial_request=str(handle.get("initial_request") or ""),
+                status=status,
+                outcome=final_response,
+                title=title,
+            )
+            await msg.edit(embed=embed)
+            return True
+        except Exception as exc:
+            logger.warning("[%s] Failed to update Discord feature summary: %s", self.name, exc)
+            return False
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -4426,6 +4826,7 @@ class DiscordAdapter(BasePlatformAdapter):
         thread_id = None
         parent_channel_id = None
         is_thread = isinstance(message.channel, discord.Thread)
+        is_parent_channel_message = not is_thread and not isinstance(message.channel, discord.DMChannel)
         if is_thread:
             thread_id = str(message.channel.id)
             parent_channel_id = self._get_parent_channel_id(message.channel)
@@ -4527,6 +4928,17 @@ class DiscordAdapter(BasePlatformAdapter):
                     thread_id = str(thread.id)
                     auto_threaded_channel = thread
                     self._threads.mark(thread_id)
+
+        project_summary_handle = None
+        feature_summary_handle = None
+        if is_parent_channel_message and mention_prefix:
+            project_summary_handle = await self.initialize_project_summary(message.channel)
+        if auto_threaded_channel is not None:
+            feature_summary_handle = await self.initialize_feature_summary(
+                auto_threaded_channel,
+                parent_channel=message.channel,
+                initial_request=normalized_content,
+            )
 
         all_attachments = list(message.attachments) + snapshot_attachments
 
@@ -4713,6 +5125,8 @@ class DiscordAdapter(BasePlatformAdapter):
             timestamp=message.created_at,
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
+            feature_summary=feature_summary_handle,
+            project_summary=project_summary_handle,
         )
 
         # Track thread participation so the bot won't require @mention for
