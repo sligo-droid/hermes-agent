@@ -1033,6 +1033,43 @@ class TestSessionStoreEntriesAttribute:
         assert not hasattr(store, "_sessions")
 
 
+class TestSessionStoreIndexIntegrity:
+    """Regression coverage for persisted session-key drift."""
+
+    def test_load_repairs_mismatched_entry_session_key(self, tmp_path):
+        config = GatewayConfig()
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1505303874267779243",
+            chat_name="PID setup",
+            chat_type="thread",
+            user_id="alice",
+            thread_id="1505303874267779243",
+        )
+
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = None
+        entry = store.get_or_create_session(source)
+        expected_key = entry.session_key
+
+        sessions_file = tmp_path / "sessions.json"
+        data = json.loads(sessions_file.read_text(encoding="utf-8"))
+        data[expected_key]["session_key"] = (
+            "agent:main:discord:thread:1505303875559751802:1505303875559751802"
+        )
+        sessions_file.write_text(json.dumps(data), encoding="utf-8")
+
+        reloaded = SessionStore(sessions_dir=tmp_path, config=config)
+        reloaded._db = None
+        repaired = reloaded.get_or_create_session(source)
+
+        assert repaired.session_key == expected_key
+        assert repaired.session_id == entry.session_id
+
+        saved = json.loads(sessions_file.read_text(encoding="utf-8"))
+        assert saved[expected_key]["session_key"] == expected_key
+
+
 class TestHasAnySessions:
     """Tests for has_any_sessions() fix (issue #351)."""
 
