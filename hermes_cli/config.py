@@ -442,6 +442,10 @@ DEFAULT_CONFIG = {
     "toolsets": ["hermes-cli"],
     "agent": {
         "max_turns": 1000,
+        # Per Codex app-server turn deadline (seconds). A timeout here is
+        # treated as a retryable Codex turn boundary, not a stop signal for
+        # the overall Hermes effort.
+        "codex_app_server_turn_timeout": 1800,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has

@@ -353,6 +353,7 @@ def load_cli_config() -> Dict[str, Any]:
         },
         "agent": {
             "max_turns": 1000,  # Default max tool-calling iterations (shared with subagents)
+            "codex_app_server_turn_timeout": 1800,  # Seconds per Codex app-server turn
             "verbose": False,
             "system_prompt": "",
             "prefill_messages_file": "",
