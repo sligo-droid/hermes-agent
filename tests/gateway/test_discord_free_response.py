@@ -56,11 +56,18 @@ class FakeDMChannel:
 
 
 class FakeTextChannel:
-    def __init__(self, channel_id: int = 1, name: str = "general", guild_name: str = "Hermes Server"):
+    def __init__(
+        self,
+        channel_id: int = 1,
+        name: str = "general",
+        guild_name: str = "Hermes Server",
+        category=None,
+    ):
         self.id = channel_id
         self.name = name
         self.guild = SimpleNamespace(name=guild_name)
         self.topic = None
+        self.category = category
 
 
 class FakeForumChannel:
@@ -199,6 +206,47 @@ async def test_discord_can_still_require_mentions_when_enabled(adapter, monkeypa
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
 
     message = make_message(channel=FakeTextChannel(channel_id=789), content="ignored without mention")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_hard_ignores_admin_channel_before_processing(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=789, name="admin"),
+        content="should never reach Hermes",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_hard_ignores_human_substring_channel_before_processing(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=789, name="human-review"),
+        content="should never reach Hermes",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_hard_ignores_thread_under_human_parent(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+
+    parent = FakeTextChannel(channel_id=789, name="human-ops")
+    thread = FakeThread(channel_id=790, name="feature-thread", parent=parent)
+    message = make_message(channel=thread, content="should never reach Hermes")
 
     await adapter._handle_message(message)
 

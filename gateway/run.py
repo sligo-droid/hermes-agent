@@ -613,11 +613,11 @@ os.environ["HERMES_EXEC_ASK"] = "1"
 # Set terminal working directory for messaging platforms.
 # config.yaml terminal.cwd is the canonical source (bridged to TERMINAL_CWD
 # by the config bridge above).  When it's unset or a placeholder, default
-# to home directory.  MESSAGING_CWD is accepted as a backward-compat
+# to the active Hermes home.  MESSAGING_CWD is accepted as a backward-compat
 # fallback (deprecated — the warning above tells users to migrate).
 _configured_cwd = os.environ.get("TERMINAL_CWD", "")
 if not _configured_cwd or _configured_cwd in {".", "auto", "cwd"}:
-    _fallback = os.getenv("MESSAGING_CWD") or str(Path.home())
+    _fallback = os.getenv("MESSAGING_CWD") or str(get_hermes_home())
     os.environ["TERMINAL_CWD"] = _fallback
 
 from gateway.config import (

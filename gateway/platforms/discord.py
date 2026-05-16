@@ -735,6 +735,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
                     return
 
+                _hard_ignore_reason = adapter_self._discord_hard_ignore_reason(message.channel)
+                if _hard_ignore_reason:
+                    logger.debug(
+                        "[%s] Ignoring Discord message before inference: %s",
+                        adapter_self.name,
+                        _hard_ignore_reason,
+                    )
+                    return
+
                 # Bot message filtering (DISCORD_ALLOW_BOTS):
                 #   "none"     — ignore all other bots (default)
                 #   "mentions" — accept bot messages only when they @mention us
@@ -2307,6 +2316,10 @@ class DiscordAdapter(BasePlatformAdapter):
         # DMs aren't channel-gated — DMs follow on_message's DM lockdown
         # path which has its own user-allowlist enforcement.
         if not in_dm:
+            hard_ignore_reason = self._discord_hard_ignore_reason(chan_obj)
+            if hard_ignore_reason:
+                return (False, hard_ignore_reason)
+
             chan_id_raw = getattr(interaction, "channel_id", None) or getattr(
                 chan_obj, "id", None,
             )
@@ -3596,6 +3609,31 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in ("true", "1", "yes", "on")
 
+    def _discord_hard_ignore_reason(self, channel: Any) -> Optional[str]:
+        """Return a reason when a Discord channel must never reach inference.
+
+        This is intentionally name-based and content-free so it can run before
+        message text is normalized, logged, batched, or handed to the agent.
+        """
+        if channel is None:
+            return None
+        if isinstance(channel, discord.DMChannel):
+            return None
+
+        candidates = [channel]
+        parent = getattr(channel, "parent", None)
+        if parent is not None:
+            candidates.append(parent)
+
+        for candidate in candidates:
+            raw_name = str(getattr(candidate, "name", "") or "").strip()
+            name = raw_name.lower().lstrip("#")
+            if name == "admin":
+                return "channel #admin is hard-ignored"
+            if "human" in name:
+                return f"channel {raw_name!r} contains hard-ignored substring 'human'"
+        return None
+
     def _thread_parent_channel(self, channel: Any) -> Any:
         """Return the parent text channel when invoked from a thread."""
         return getattr(channel, "parent", None) or channel
@@ -4249,6 +4287,15 @@ class DiscordAdapter(BasePlatformAdapter):
         #   discord.allowed_channels: If set, bot ONLY responds in these channels (whitelist)
         #   discord.no_thread_channels: Channel IDs where bot responds directly without creating thread
         #   discord.auto_thread: Auto-create thread on @mention in channels (default: true)
+
+        hard_ignore_reason = self._discord_hard_ignore_reason(message.channel)
+        if hard_ignore_reason:
+            logger.debug(
+                "[%s] Ignoring Discord message before processing: %s",
+                self.name,
+                hard_ignore_reason,
+            )
+            return
 
         thread_id = None
         parent_channel_id = None
