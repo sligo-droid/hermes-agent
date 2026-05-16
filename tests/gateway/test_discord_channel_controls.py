@@ -7,7 +7,8 @@ import sys
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import GatewayConfig, PlatformConfig
+from gateway.session import SessionStore, build_session_key
 
 
 def _ensure_discord_mock():
@@ -98,6 +99,12 @@ def make_message(*, channel, content: str, mentions=None):
         channel=channel,
         author=author,
     )
+
+
+def _session_store(tmp_path):
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    store._db = None
+    return store
 
 
 # ── ignored_channels ─────────────────────────────────────────────────
@@ -279,6 +286,122 @@ async def test_no_thread_with_auto_thread_disabled_is_noop(adapter, monkeypatch)
 
     adapter._auto_create_thread.assert_not_awaited()
     adapter.handle_message.assert_awaited_once()
+
+
+# ── thread session silos ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_thread_messages_use_thread_scoped_sessions(adapter, monkeypatch, tmp_path):
+    """Different Discord threads under one channel must not share transcripts."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    parent = FakeTextChannel(channel_id=100, name="projects")
+    thread_a = FakeThread(channel_id=201, name="feature-a", parent=parent)
+    thread_b = FakeThread(channel_id=202, name="feature-b", parent=parent)
+
+    await adapter._handle_message(make_message(channel=thread_a, content="build feature A"))
+    await adapter._handle_message(make_message(channel=thread_b, content="continue"))
+
+    event_a = adapter.handle_message.await_args_list[0].args[0]
+    event_b = adapter.handle_message.await_args_list[1].args[0]
+
+    assert event_a.source.chat_type == "thread"
+    assert event_a.source.chat_id == "201"
+    assert event_a.source.thread_id == "201"
+    assert event_a.source.parent_chat_id == "100"
+    assert event_b.source.chat_type == "thread"
+    assert event_b.source.chat_id == "202"
+    assert event_b.source.thread_id == "202"
+    assert event_b.source.parent_chat_id == "100"
+
+    key_a = build_session_key(event_a.source)
+    key_b = build_session_key(event_b.source)
+    assert key_a != key_b
+
+    store = _session_store(tmp_path)
+    entry_a = store.get_or_create_session(event_a.source)
+    entry_b = store.get_or_create_session(event_b.source)
+    assert entry_a.session_id != entry_b.session_id
+
+
+@pytest.mark.asyncio
+async def test_thread_messages_share_session_across_participants_by_default(
+    adapter,
+    monkeypatch,
+    tmp_path,
+):
+    """A Discord thread is one shared work lane unless per-user thread isolation is enabled."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    parent = FakeTextChannel(channel_id=100, name="projects")
+    thread = FakeThread(channel_id=201, name="feature-a", parent=parent)
+    alice_message = make_message(channel=thread, content="start feature A")
+    bob_message = make_message(channel=thread, content="continue")
+    bob_message.author = SimpleNamespace(id=84, display_name="Bob", name="Bob")
+
+    await adapter._handle_message(alice_message)
+    await adapter._handle_message(bob_message)
+
+    event_alice = adapter.handle_message.await_args_list[0].args[0]
+    event_bob = adapter.handle_message.await_args_list[1].args[0]
+    assert event_alice.source.user_id == "42"
+    assert event_bob.source.user_id == "84"
+
+    key_alice = build_session_key(event_alice.source)
+    key_bob = build_session_key(event_bob.source)
+    assert key_alice == key_bob
+
+    store = _session_store(tmp_path)
+    entry_alice = store.get_or_create_session(event_alice.source)
+    entry_bob = store.get_or_create_session(event_bob.source)
+    assert entry_alice.session_id == entry_bob.session_id
+
+
+def test_slash_event_in_thread_includes_parent_and_guild_metadata(adapter):
+    """Slash commands inside a thread should carry the same routing metadata as messages."""
+    parent = FakeTextChannel(channel_id=100, name="projects")
+    parent.guild.id = 55
+    thread = FakeThread(channel_id=201, name="feature-a", parent=parent)
+    interaction = SimpleNamespace(
+        channel_id=201,
+        channel=thread,
+        guild=parent.guild,
+        user=SimpleNamespace(id=42, display_name="TestUser"),
+    )
+
+    event = adapter._build_slash_event(interaction, "/status")
+
+    assert event.source.chat_type == "thread"
+    assert event.source.chat_id == "201"
+    assert event.source.thread_id == "201"
+    assert event.source.parent_chat_id == "100"
+    assert event.source.guild_id == "55"
+
+
+@pytest.mark.asyncio
+async def test_dispatched_thread_session_includes_parent_and_guild_metadata(adapter):
+    """Starter prompts from /thread should get the created thread's session lane."""
+    parent = FakeTextChannel(channel_id=100, name="projects")
+    parent.guild.id = 55
+    interaction = SimpleNamespace(
+        channel=parent,
+        guild=parent.guild,
+        user=SimpleNamespace(id=42, display_name="TestUser"),
+    )
+
+    await adapter._dispatch_thread_session(interaction, "201", "feature-a", "start here")
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+    assert event.source.chat_id == "201"
+    assert event.source.thread_id == "201"
+    assert event.source.parent_chat_id == "100"
+    assert event.source.guild_id == "55"
 
 
 # ── config.py bridging ───────────────────────────────────────────────
