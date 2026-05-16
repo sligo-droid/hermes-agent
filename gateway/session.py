@@ -703,7 +703,15 @@ class SessionStore:
                     data = json.load(f)
                     for key, entry_data in data.items():
                         try:
-                            self._entries[key] = SessionEntry.from_dict(entry_data)
+                            entry = SessionEntry.from_dict(entry_data)
+                            if entry.session_key != key:
+                                logger.warning(
+                                    "Repairing mismatched gateway session key in index: %s != %s",
+                                    entry.session_key,
+                                    key,
+                                )
+                                entry.session_key = key
+                            self._entries[key] = entry
                         except (ValueError, KeyError):
                             # Skip entries with unknown/removed platform values
                             continue
@@ -718,7 +726,16 @@ class SessionStore:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         sessions_file = self.sessions_dir / "sessions.json"
 
-        data = {key: entry.to_dict() for key, entry in self._entries.items()}
+        data = {}
+        for key, entry in self._entries.items():
+            if entry.session_key != key:
+                logger.warning(
+                    "Repairing mismatched gateway session key before save: %s != %s",
+                    entry.session_key,
+                    key,
+                )
+                entry.session_key = key
+            data[key] = entry.to_dict()
         fd, tmp_path = tempfile.mkstemp(
             dir=str(self.sessions_dir), suffix=".tmp", prefix=".sessions_"
         )
