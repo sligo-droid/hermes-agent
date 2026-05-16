@@ -73,6 +73,7 @@ class TurnResult:
     error: Optional[str] = None  # Set if turn ended in a non-recoverable error
     turn_id: Optional[str] = None
     thread_id: Optional[str] = None
+    timed_out: bool = False
     # Hint to the caller that the underlying codex subprocess is likely
     # wedged (turn-level timeout fired, post-tool watchdog tripped, or
     # token-refresh failure killed the child). The caller should retire
@@ -575,6 +576,7 @@ class CodexAppServerSession:
                 result.error = self._format_error_with_stderr(
                     f"turn timed out after {turn_timeout}s"
                 )
+            result.timed_out = True
             result.should_retire = True
 
         return result

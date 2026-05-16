@@ -346,6 +346,7 @@ class TestRunTurn:
         r = s.run_turn("never finishes", turn_timeout=0.05,
                        notification_poll_timeout=0.01)
         assert r.interrupted is True
+        assert r.timed_out is True
         assert r.error and "timed out" in r.error
 
     def test_failed_turn_records_error_from_turn_completed(self):
