@@ -707,6 +707,37 @@ class TestNormalizeCodexResponse:
         assert "math" in msg.reasoning
         assert reason == "stop"
 
+    def test_dict_reasoning_summary_extracted(self, monkeypatch):
+        agent = self._make_codex_agent(monkeypatch)
+        response = SimpleNamespace(
+            output=[
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "gAAAA_blob",
+                    "summary": [{"type": "summary_text", "text": "Dict-shaped thinking"}],
+                    "id": "rs_dict",
+                    "status": None,
+                },
+                {
+                    "type": "message",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "done"}],
+                    "phase": "final_answer",
+                },
+            ],
+            status="completed",
+        )
+        msg, reason = _normalize_codex_response(response)
+        assert msg.content == "done"
+        assert msg.reasoning == "Dict-shaped thinking"
+        assert msg.codex_reasoning_items == [{
+            "type": "reasoning",
+            "encrypted_content": "gAAAA_blob",
+            "id": "rs_dict",
+            "summary": [{"type": "summary_text", "text": "Dict-shaped thinking"}],
+        }]
+        assert reason == "stop"
+
     def test_encrypted_content_captured(self, monkeypatch):
         agent = self._make_codex_agent(monkeypatch)
         response = SimpleNamespace(
