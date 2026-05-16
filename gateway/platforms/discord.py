@@ -742,12 +742,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Must run BEFORE the user allowlist check so that bots
                 # permitted by DISCORD_ALLOW_BOTS are not rejected for
                 # not being in DISCORD_ALLOWED_USERS (fixes #4466).
+                replies_to_self = adapter_self._message_replies_to_self(message)
+
                 if getattr(message.author, "bot", False):
                     allow_bots = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
                     if allow_bots == "none":
                         return
                     elif allow_bots == "mentions":
-                        if not self._client.user or self._client.user not in message.mentions:
+                        if (
+                            not self._client.user
+                            or (
+                                self._client.user not in message.mentions
+                                and not replies_to_self
+                            )
+                        ):
                             return
                     # "all" falls through; bot is permitted — skip the
                     # human-user allowlist below (bots aren't in it).
@@ -778,7 +786,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 if not isinstance(message.channel, discord.DMChannel) and message.mentions:
                     _self_mentioned = (
                         self._client.user is not None
-                        and self._client.user in message.mentions
+                        and (self._client.user in message.mentions or replies_to_self)
                     )
                     _other_bots_mentioned = any(
                         m.bot and m != self._client.user
@@ -3596,6 +3604,23 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in ("true", "1", "yes", "on")
 
+    def _message_replies_to_self(self, message: DiscordMessage) -> bool:
+        """Return True when a Discord message is a reply to this bot."""
+        bot_user = getattr(self._client, "user", None) if self._client else None
+        if bot_user is None:
+            return False
+        reference = getattr(message, "reference", None)
+        if reference is None:
+            return False
+        resolved = getattr(reference, "resolved", None)
+        author = getattr(resolved, "author", None) if resolved is not None else None
+        if author is not None:
+            return (
+                author == bot_user
+                or getattr(author, "id", None) == getattr(bot_user, "id", None)
+            )
+        return getattr(reference, "author_id", None) == getattr(bot_user, "id", None)
+
     def _thread_parent_channel(self, channel: Any) -> Any:
         """Return the parent text channel when invoked from a thread."""
         return getattr(channel, "parent", None) or channel
@@ -4326,9 +4351,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 and thread_id in self._threads
                 and not self._discord_thread_require_mention()
             )
+            replies_to_self = self._message_replies_to_self(message)
 
             if require_mention and not is_free_channel and not in_bot_thread:
-                if self._client.user not in message.mentions and not mention_prefix:
+                if (
+                    self._client.user not in message.mentions
+                    and not mention_prefix
+                    and not replies_to_self
+                ):
                     return
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
