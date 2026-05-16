@@ -3667,8 +3667,8 @@ class DiscordAdapter(BasePlatformAdapter):
         """Create a thread in the current Discord channel.
 
         Tries ``parent_channel.create_thread()`` first.  If Discord rejects
-        that (e.g. permission issues), falls back to sending a seed message
-        and creating the thread from it.
+        that (e.g. permission issues), falls back to creating the thread from
+        the provided starter message.
         """
         name = (name or "").strip()
         if not name:
@@ -3706,9 +3706,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 "thread_name": getattr(thread, "name", None) or name,
             }
         except Exception as direct_error:
+            if not starter_message:
+                return {
+                    "error": (
+                        "Discord rejected direct thread creation and no starter message was provided "
+                        f"for the fallback. Direct error: {direct_error}."
+                    )
+                }
             try:
-                seed_content = starter_message or f"\U0001f9f5 Thread created by Hermes: **{name}**"
-                seed_msg = await parent_channel.send(seed_content)
+                seed_msg = await parent_channel.send(starter_message)
                 thread = await seed_msg.create_thread(
                     name=name,
                     auto_archive_duration=auto_archive_duration,
