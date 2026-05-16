@@ -2,8 +2,9 @@ import React, { type PropsWithChildren, useContext, useInsertionEffect } from 'r
 import { c as _c } from 'react/compiler-runtime'
 
 import instances from '../instances.js'
+import { SYNC_OUTPUT_SUPPORTED } from '../terminal.js'
 import { CURSOR_HOME, ERASE_SCREEN, ERASE_SCROLLBACK, RESET_SCROLL_REGION } from '../termio/csi.js'
-import { DISABLE_MOUSE_TRACKING, ENABLE_MOUSE_TRACKING, ENTER_ALT_SCREEN, EXIT_ALT_SCREEN } from '../termio/dec.js'
+import { BSU, DISABLE_MOUSE_TRACKING, ENABLE_MOUSE_TRACKING, ENTER_ALT_SCREEN, ESU, EXIT_ALT_SCREEN } from '../termio/dec.js'
 import { TerminalWriteContext } from '../useTerminalNotification.js'
 
 import Box from './Box.js'
@@ -52,20 +53,21 @@ export function AlternateScreen(t0: Props) {
         return
       }
 
-      writeRaw(
+      const enter =
         ENTER_ALT_SCREEN +
           RESET_SCROLL_REGION +
           ERASE_SCROLLBACK +
           ERASE_SCREEN +
           CURSOR_HOME +
           (mouseTracking ? ENABLE_MOUSE_TRACKING : DISABLE_MOUSE_TRACKING)
-      )
+      writeRaw(SYNC_OUTPUT_SUPPORTED ? BSU + enter + ESU : enter)
       ink?.setAltScreenActive(true, mouseTracking)
 
       return () => {
         ink?.setAltScreenActive(false)
         ink?.clearTextSelection()
-        writeRaw((mouseTracking ? DISABLE_MOUSE_TRACKING : '') + RESET_SCROLL_REGION + EXIT_ALT_SCREEN)
+        const exit = (mouseTracking ? DISABLE_MOUSE_TRACKING : '') + RESET_SCROLL_REGION + EXIT_ALT_SCREEN
+        writeRaw(SYNC_OUTPUT_SUPPORTED ? BSU + exit + ESU : exit)
       }
     }
 
