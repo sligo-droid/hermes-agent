@@ -1,6 +1,11 @@
+import { PassThrough } from 'stream'
+
+import { renderSync } from '@hermes/ink'
+import React from 'react'
 import { describe, expect, it } from 'vitest'
 
 import {
+  TextInput,
   shouldBufferInputAsPaste,
   shouldInsertPlainBurst,
   shouldPassThroughToGlobalHandler
@@ -8,6 +13,33 @@ import {
 import { DEFAULT_VOICE_RECORD_KEY, parseVoiceRecordKey } from '../lib/platform.js'
 
 const key = (overrides: Record<string, unknown> = {}) => ({ ctrl: false, meta: false, ...overrides }) as any
+const tick = () => new Promise<void>(resolve => setTimeout(resolve, 0))
+
+function ttyStream() {
+  const stream = new PassThrough() as PassThrough & {
+    columns: number
+    isRaw: boolean
+    isTTY: boolean
+    ref: () => typeof stream
+    rows: number
+    setRawMode: (mode: boolean) => typeof stream
+    unref: () => typeof stream
+  }
+
+  stream.columns = 80
+  stream.rows = 24
+  stream.isTTY = true
+  stream.isRaw = false
+  stream.setRawMode = (mode: boolean) => {
+    stream.isRaw = mode
+
+    return stream
+  }
+  stream.ref = () => stream
+  stream.unref = () => stream
+
+  return stream
+}
 
 describe('shouldPassThroughToGlobalHandler', () => {
   it('passes through the configured voice shortcut while composer is focused', () => {
@@ -58,5 +90,36 @@ describe('shouldInsertPlainBurst', () => {
     expect(shouldInsertPlainBurst('a', false)).toBe(false)
     expect(shouldInsertPlainBurst('a\nb', false)).toBe(false)
     expect(shouldInsertPlainBurst('ab', true)).toBe(false)
+  })
+})
+
+describe('TextInput coalesced typing bursts', () => {
+  it('inserts a printable burst once', async () => {
+    const stdin = ttyStream()
+    const stdout = ttyStream()
+    const stderr = ttyStream()
+    const changes: string[] = []
+
+    const app = renderSync(
+      React.createElement(TextInput, {
+        onChange: (value: string) => changes.push(value),
+        value: ''
+      }),
+      {
+        exitOnCtrlC: false,
+        patchConsole: false,
+        stderr: stderr as unknown as NodeJS.WriteStream,
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        stdout: stdout as unknown as NodeJS.WriteStream
+      }
+    )
+
+    stdin.write('ab')
+    await tick()
+    app.unmount()
+
+    expect(changes).toContain('ab')
+    expect(changes).not.toContain('abab')
+    expect(changes.at(-1)).toBe('ab')
   })
 })

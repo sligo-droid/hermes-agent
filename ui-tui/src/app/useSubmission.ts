@@ -103,7 +103,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
             composerActions.enqueue(submitText)
             patchUiState({ busy: true, status: 'queued for next turn' })
 
-            return sys(`queued: "${submitText.slice(0, 50)}${submitText.length > 50 ? '…' : ''}"`)
+            return
           }
 
           sys(`error: ${e.message}`)
