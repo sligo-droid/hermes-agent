@@ -7610,6 +7610,8 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                feature_summary=getattr(event, "feature_summary", None),
+                project_summary=getattr(event, "project_summary", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -7922,6 +7924,26 @@ class GatewayRunner:
             _already_sent = bool(agent_result.get("already_sent"))
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
+
+            if _already_sent and not agent_result.get("failed"):
+                await self._update_discord_summaries(
+                    source=source,
+                    feature_summary=getattr(event, "feature_summary", None),
+                    project_summary=getattr(event, "project_summary", None),
+                    final_response=response,
+                    status=self._discord_summary_status(agent_result),
+                    session_id=session_entry.session_id,
+                )
+            else:
+                self._register_discord_summary_post_delivery(
+                    event=event,
+                    source=source,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    session_id=session_entry.session_id,
+                    final_response=response,
+                    agent_result=agent_result,
+                )
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -9645,6 +9667,92 @@ class GatewayRunner:
                 logger.debug("goal continuation: post-delivery callback registration failed: %s", exc)
 
         await _deliver()
+
+    def _discord_summary_status(self, agent_result: Optional[Dict[str, Any]]) -> str:
+        agent_result = agent_result or {}
+        if agent_result.get("interrupted"):
+            return "Interrupted"
+        if agent_result.get("failed") or agent_result.get("error"):
+            return "Failed"
+        return "Complete"
+
+    async def _update_discord_summaries(
+        self,
+        *,
+        source: SessionSource,
+        feature_summary: Optional[Dict[str, Any]] = None,
+        project_summary: Optional[Dict[str, Any]] = None,
+        final_response: str = "",
+        status: str = "Complete",
+        session_id: Optional[str] = None,
+        title: Optional[str] = None,
+    ) -> None:
+        if source.platform != Platform.DISCORD:
+            return
+        if not feature_summary and not project_summary:
+            return
+        adapter = self.adapters.get(Platform.DISCORD)
+        if not adapter:
+            return
+        if not title and session_id and self._session_db:
+            try:
+                title = self._session_db.get_session_title(session_id)
+            except Exception:
+                title = None
+        if project_summary and hasattr(adapter, "update_project_summary"):
+            try:
+                await adapter.update_project_summary(project_summary)
+            except Exception:
+                logger.debug("Discord project summary update failed", exc_info=True)
+        if feature_summary and hasattr(adapter, "update_feature_summary"):
+            try:
+                await adapter.update_feature_summary(
+                    feature_summary,
+                    final_response=final_response,
+                    status=status,
+                    title=title,
+                )
+            except Exception:
+                logger.debug("Discord feature summary update failed", exc_info=True)
+
+    def _register_discord_summary_post_delivery(
+        self,
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+        session_key: str,
+        run_generation: Optional[int],
+        session_id: str,
+        final_response: str,
+        agent_result: Optional[Dict[str, Any]],
+    ) -> None:
+        feature_summary = getattr(event, "feature_summary", None)
+        project_summary = getattr(event, "project_summary", None)
+        if source.platform != Platform.DISCORD or (not feature_summary and not project_summary):
+            return
+        adapter = self.adapters.get(Platform.DISCORD)
+        if not adapter or not hasattr(adapter, "register_post_delivery_callback"):
+            return
+        status = self._discord_summary_status(agent_result)
+
+        def _deliver():
+            return self._update_discord_summaries(
+                source=source,
+                feature_summary=feature_summary,
+                project_summary=project_summary,
+                final_response=final_response,
+                status=status,
+                session_id=session_id,
+            )
+
+        try:
+            adapter.register_post_delivery_callback(
+                session_key,
+                _deliver,
+                generation=run_generation,
+            )
+        except Exception:
+            logger.debug("Discord summary post-delivery registration failed", exc_info=True)
 
     async def _post_turn_goal_continuation(
         self,
@@ -14326,6 +14434,8 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        feature_summary: Optional[Dict[str, Any]] = None,
+        project_summary: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -15640,12 +15750,43 @@ class GatewayRunner:
                             "api_mode": getattr(agent, "api_mode", None),
                         } if agent else None,
                     }
+                    title_callbacks = []
                     if self._is_telegram_topic_lane(source):
-                        maybe_auto_title_kwargs["title_callback"] = lambda title: self._schedule_telegram_topic_title_rename(
-                            source,
-                            effective_session_id,
-                            title,
+                        title_callbacks.append(
+                            lambda title: self._schedule_telegram_topic_title_rename(
+                                source,
+                                effective_session_id,
+                                title,
+                            )
                         )
+                    if source.platform == Platform.DISCORD and (feature_summary or project_summary):
+                        def _update_discord_title(title: str) -> None:
+                            try:
+                                asyncio.run_coroutine_threadsafe(
+                                    self._update_discord_summaries(
+                                        source=source,
+                                        feature_summary=feature_summary,
+                                        project_summary=project_summary,
+                                        final_response=final_response,
+                                        status="Complete",
+                                        session_id=effective_session_id,
+                                        title=title,
+                                    ),
+                                    _loop_for_step,
+                                )
+                            except Exception:
+                                logger.debug("Discord summary title update failed", exc_info=True)
+
+                        title_callbacks.append(_update_discord_title)
+                    if title_callbacks:
+                        def _run_title_callbacks(title: str) -> None:
+                            for callback in title_callbacks:
+                                try:
+                                    callback(title)
+                                except Exception:
+                                    logger.debug("Gateway title callback failed", exc_info=True)
+
+                        maybe_auto_title_kwargs["title_callback"] = _run_title_callbacks
                     maybe_auto_title(
                         self._session_db,
                         effective_session_id,
@@ -16186,6 +16327,8 @@ class GatewayRunner:
                 next_message = pending
                 next_message_id = None
                 next_channel_prompt = None
+                next_feature_summary = None
+                next_project_summary = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
@@ -16203,6 +16346,8 @@ class GatewayRunner:
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+                    next_feature_summary = getattr(pending_event, "feature_summary", None)
+                    next_project_summary = getattr(pending_event, "project_summary", None)
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
@@ -16228,6 +16373,8 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    feature_summary=next_feature_summary,
+                    project_summary=next_project_summary,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
