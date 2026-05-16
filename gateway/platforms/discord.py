@@ -924,7 +924,7 @@ class DiscordAdapter(BasePlatformAdapter):
     ):
         metadata = metadata or self._collect_discord_project_metadata()
         embed_kwargs = {
-            "title": "Feature Summary",
+            "title": self._clean_summary_text(title, limit=240, default="Generating..."),
             "description": self._clean_summary_text(initial_request, limit=350, default="No initial request text"),
         }
         color = self._summary_color(status)
@@ -933,7 +933,6 @@ class DiscordAdapter(BasePlatformAdapter):
         embed = discord.Embed(**embed_kwargs)
         fields = [
             ("Status", status, True),
-            ("Generated Title", title or "Generating...", True),
             ("Concise Outcome", self._clean_summary_text(outcome, limit=900, default="Pending"), False),
         ]
         if metadata.get("branch"):
