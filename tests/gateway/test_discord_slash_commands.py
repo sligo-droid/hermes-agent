@@ -417,7 +417,8 @@ async def test_handle_thread_create_slash_reports_failure(adapter):
     interaction.followup.send.assert_awaited_once()
     args, kwargs = interaction.followup.send.await_args
     assert "Failed to create thread:" in args[0]
-    assert "nope" in args[0]
+    assert "no starter message was provided" in args[0]
+    channel.send.assert_not_awaited()
     assert kwargs["ephemeral"] is True
 
 
@@ -591,6 +592,57 @@ async def test_auto_create_thread_falls_back_to_seed_message(adapter):
         name="Hello",
         auto_archive_duration=1440,
         reason="Auto-threaded from mention by Jezza",
+    )
+
+
+@pytest.mark.asyncio
+async def test_thread_create_slash_without_message_does_not_post_seed_message(adapter):
+    channel = SimpleNamespace(
+        create_thread=AsyncMock(side_effect=RuntimeError("direct failed")),
+        send=AsyncMock(),
+    )
+    interaction = SimpleNamespace(
+        channel=channel,
+        channel_id=123,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+        guild=SimpleNamespace(name="TestGuild"),
+        followup=SimpleNamespace(send=AsyncMock()),
+        response=SimpleNamespace(defer=AsyncMock()),
+    )
+
+    await adapter._handle_thread_create_slash(interaction, "Planning", "", 1440)
+
+    channel.send.assert_not_awaited()
+    interaction.followup.send.assert_awaited_once()
+    args, kwargs = interaction.followup.send.await_args
+    assert "Failed to create thread:" in args[0]
+    assert kwargs["ephemeral"] is True
+
+
+@pytest.mark.asyncio
+async def test_thread_create_slash_with_message_can_still_use_message_as_seed(adapter):
+    thread = SimpleNamespace(id=555, name="Planning")
+    seed_message = SimpleNamespace(create_thread=AsyncMock(return_value=thread))
+    channel = SimpleNamespace(
+        create_thread=AsyncMock(side_effect=RuntimeError("direct failed")),
+        send=AsyncMock(return_value=seed_message),
+    )
+    interaction = SimpleNamespace(
+        channel=channel,
+        channel_id=123,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+        guild=SimpleNamespace(name="TestGuild"),
+        followup=SimpleNamespace(send=AsyncMock()),
+        response=SimpleNamespace(defer=AsyncMock()),
+    )
+
+    await adapter._handle_thread_create_slash(interaction, "Planning", "Kickoff", 1440)
+
+    channel.send.assert_awaited_once_with("Kickoff")
+    seed_message.create_thread.assert_awaited_once_with(
+        name="Planning",
+        auto_archive_duration=1440,
+        reason="Requested by Jezza via /thread",
     )
 
 
