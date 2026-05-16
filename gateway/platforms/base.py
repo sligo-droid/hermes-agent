@@ -1287,6 +1287,10 @@ class BasePlatformAdapter(ABC):
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
+        self._deferred_processing_completions: Dict[
+            str,
+            List[Tuple[MessageEvent, ProcessingOutcome]],
+        ] = {}
         # Background message-processing tasks spawned by handle_message().
         # Gateway shutdown cancels these so an old gateway instance doesn't keep
         # working on a task after --replace or manual restarts.
@@ -2416,6 +2420,31 @@ class BasePlatformAdapter(ABC):
         except Exception as e:
             logger.warning("[%s] %s hook failed: %s", self.name, hook_name, e)
 
+    def _defer_processing_complete(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        outcome: ProcessingOutcome,
+    ) -> None:
+        self._deferred_processing_completions.setdefault(session_key, []).append(
+            (event, outcome)
+        )
+
+    async def _flush_processing_completions(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        outcome: ProcessingOutcome,
+    ) -> None:
+        completions = self._deferred_processing_completions.pop(session_key, [])
+        completions.append((event, outcome))
+        for complete_event, complete_outcome in completions:
+            await self._run_processing_hook(
+                "on_processing_complete",
+                complete_event,
+                complete_outcome,
+            )
+
     @staticmethod
     def _is_retryable_error(error: Optional[str]) -> bool:
         """Return True if the error string looks like a transient network failure."""
@@ -3003,6 +3032,9 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        processing_outcome: Optional[ProcessingOutcome] = None
+        completion_deferred = False
+        handoff_spawned = False
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -3291,16 +3323,16 @@ class BasePlatformAdapter(ABC):
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 
-            # Determine overall success for the processing hook
+            # Determine overall success for the processing hook.  The hook is
+            # flushed after the pending-message checks so status reactions stay
+            # in-progress while this session is handed off to queued work.
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
-            await self._run_processing_hook(
-                "on_processing_complete",
-                event,
-                ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
-            )
+            processing_outcome = ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE
 
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:
+                self._defer_processing_complete(session_key, event, processing_outcome)
+                completion_deferred = True
                 pending_event = self._pending_messages.pop(session_key)
                 logger.debug("[%s] Processing queued message from interrupt", self.name)
                 # Keep the _active_sessions entry live across the turn chain
@@ -3327,6 +3359,7 @@ class BasePlatformAdapter(ABC):
                 drain_task = asyncio.create_task(
                     self._process_message_background(pending_event, session_key)
                 )
+                handoff_spawned = True
                 # Hand ownership of the session to the drain task so
                 # stale-lock detection keeps working while it runs.
                 self._session_tasks[session_key] = drain_task
@@ -3343,10 +3376,10 @@ class BasePlatformAdapter(ABC):
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
                 outcome = ProcessingOutcome.FAILURE
-            await self._run_processing_hook("on_processing_complete", event, outcome)
+            processing_outcome = outcome
             raise
         except Exception as e:
-            await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
+            processing_outcome = ProcessingOutcome.FAILURE
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:
@@ -3413,6 +3446,9 @@ class BasePlatformAdapter(ABC):
             # dropped (user never gets a reply).
             late_pending = self._pending_messages.pop(session_key, None)
             if late_pending is not None:
+                if processing_outcome is not None and not completion_deferred:
+                    self._defer_processing_complete(session_key, event, processing_outcome)
+                    completion_deferred = True
                 current_task = asyncio.current_task()
                 existing_task = self._session_tasks.get(session_key)
                 if (
@@ -3439,6 +3475,7 @@ class BasePlatformAdapter(ABC):
                     drain_task = asyncio.create_task(
                         self._process_message_background(late_pending, session_key)
                     )
+                    handoff_spawned = True
                     # Hand ownership of the session to the drain task so stale-lock
                     # detection keeps working while it runs.
                     self._session_tasks[session_key] = drain_task
@@ -3451,6 +3488,12 @@ class BasePlatformAdapter(ABC):
                 # Leave _active_sessions[session_key] populated — the drain
                 # task's own lifecycle will clean it up.
             else:
+                if processing_outcome is not None and not handoff_spawned:
+                    await self._flush_processing_completions(
+                        session_key,
+                        event,
+                        processing_outcome,
+                    )
                 # Clean up session tracking.  Guard-match both deletes so a
                 # reset-like command that already swapped in its own
                 # command_guard (and cancelled us) can't be accidentally
@@ -3522,6 +3565,7 @@ class BasePlatformAdapter(ABC):
         self._expected_cancelled_tasks.clear()
         self._session_tasks.clear()
         self._pending_messages.clear()
+        self._deferred_processing_completions.clear()
         self._active_sessions.clear()
 
     def has_pending_interrupt(self, session_key: str) -> bool:
