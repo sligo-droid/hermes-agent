@@ -1366,7 +1366,7 @@ def setup_terminal_backend(config: dict):
         print_info("  Used by Telegram/Discord/cron sessions.")
         print_info("  CLI/TUI always uses your launch directory instead.")
         current_cwd = cfg_get(config, "terminal", "cwd", default="")
-        cwd = prompt("  Gateway working directory", current_cwd or str(Path.home()))
+        cwd = prompt("  Gateway working directory", current_cwd or str(get_hermes_home()))
         if cwd:
             config["terminal"]["cwd"] = cwd
 

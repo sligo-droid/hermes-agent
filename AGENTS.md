@@ -13,6 +13,13 @@ source .venv/bin/activate   # or: source venv/bin/activate
 `$HOME/.hermes/hermes-agent/venv` (for worktrees that share a venv with the
 main checkout).
 
+## Hermes Code Changes
+
+When developing Hermes itself, work in a git worktree based on `main` and keep
+the main checkout clean. Commit completed Hermes code changes to this private
+Hermes repo before handing work back; do not leave dirty changes around unless
+the user explicitly asks to pause before committing.
+
 ## Project Structure
 
 File counts shift constantly — don't treat the tree below as exhaustive.

@@ -128,7 +128,8 @@ _SENTINEL = object()
 
 def _make_interaction(
     user_id, *, channel_id=12345, guild_id=42, in_dm=False, in_thread=False,
-    parent_channel_id=None, user=_SENTINEL,
+    parent_channel_id=None, channel_name="general", parent_channel_name=None,
+    user=_SENTINEL,
 ):
     """Build a mock Discord Interaction with a still-unresponded response.
 
@@ -145,11 +146,14 @@ def _make_interaction(
     elif in_thread:
         channel = discord.Thread()
         channel.id = channel_id
+        channel.name = channel_name
         channel.parent_id = parent_channel_id
+        if parent_channel_id is not None:
+            channel.parent = SimpleNamespace(id=parent_channel_id, name=parent_channel_name or "parent")
     elif channel_id is None:
         channel = None
     else:
-        channel = SimpleNamespace(id=channel_id)
+        channel = SimpleNamespace(id=channel_id, name=channel_name)
 
     if user is _SENTINEL:
         user_obj = SimpleNamespace(id=int(user_id), name=f"user_{user_id}")
@@ -191,6 +195,37 @@ async def test_no_allowlist_dm_also_allowed(adapter):
     """Same for DMs — no allowlist means no restriction, matching on_message."""
     interaction = _make_interaction("999999999", in_dm=True)
     assert await adapter._check_slash_authorization(interaction, "/help") is True
+
+
+@pytest.mark.asyncio
+async def test_admin_channel_rejected_before_slash_handling(adapter):
+    interaction = _make_interaction("999999999", channel_name="admin")
+
+    assert await adapter._check_slash_authorization(interaction, "/help") is False
+    interaction.response.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_human_channel_rejected_before_slash_handling(adapter):
+    interaction = _make_interaction("999999999", channel_name="human-review")
+
+    assert await adapter._check_slash_authorization(interaction, "/help") is False
+    interaction.response.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_thread_under_human_parent_rejected_before_slash_handling(adapter):
+    interaction = _make_interaction(
+        "999999999",
+        channel_id=456,
+        in_thread=True,
+        parent_channel_id=12345,
+        channel_name="feature-work",
+        parent_channel_name="human-ops",
+    )
+
+    assert await adapter._check_slash_authorization(interaction, "/help") is False
+    interaction.response.send_message.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

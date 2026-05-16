@@ -14,7 +14,11 @@ import json
 import pytest
 
 
-def _simulate_config_bridge(cfg: dict, initial_env: dict | None = None):
+def _simulate_config_bridge(
+    cfg: dict,
+    initial_env: dict | None = None,
+    hermes_home: str = "/root/.hermes",
+):
     """Simulate the gateway config bridge logic from gateway/run.py.
 
     Returns the resulting env dict (only TERMINAL_* and MESSAGING_CWD keys).
@@ -68,10 +72,10 @@ def _simulate_config_bridge(cfg: dict, initial_env: dict | None = None):
                     alias_val = os.path.expanduser(alias_val)
                 env[alias_env] = alias_val.strip()
 
-    # --- Replicate lines 144-147: MESSAGING_CWD fallback ---
+    # --- Replicate gateway cwd fallback ---
     configured_cwd = env.get("TERMINAL_CWD", "")
     if not configured_cwd or configured_cwd in (".", "auto", "cwd"):
-        messaging_cwd = env.get("MESSAGING_CWD") or "/root"  # Path.home() for root
+        messaging_cwd = env.get("MESSAGING_CWD") or hermes_home
         env["TERMINAL_CWD"] = messaging_cwd
 
     return env
@@ -118,10 +122,10 @@ class TestTopLevelCwdAlias:
         result = _simulate_config_bridge(cfg, {"MESSAGING_CWD": "/home/hermes/projects"})
         assert result["TERMINAL_CWD"] == "/home/hermes/projects"
 
-    def test_no_cwd_no_messaging_cwd_falls_back_to_home(self):
+    def test_no_cwd_no_messaging_cwd_falls_back_to_hermes_home(self):
         cfg = {}
         result = _simulate_config_bridge(cfg)
-        assert result["TERMINAL_CWD"] == "/root"  # Path.home() for root user
+        assert result["TERMINAL_CWD"] == "/root/.hermes"
 
     def test_dot_cwd_triggers_messaging_fallback(self):
         """cwd: '.' should trigger MESSAGING_CWD fallback."""
