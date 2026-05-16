@@ -441,7 +441,7 @@ DEFAULT_CONFIG = {
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     "agent": {
-        "max_turns": 90,
+        "max_turns": 1000,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -2632,7 +2632,7 @@ OPTIONAL_ENV_VARS = {
         "category": "setting",
     },
     "HERMES_MAX_ITERATIONS": {
-        "description": "Maximum tool-calling iterations per conversation (default: 90)",
+        "description": "Maximum tool-calling iterations per conversation (default: 1000)",
         "prompt": "Max iterations",
         "url": None,
         "password": False,

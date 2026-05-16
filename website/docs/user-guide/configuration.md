@@ -687,18 +687,18 @@ See [Memory Providers](/docs/user-guide/features/memory-providers) for the analo
 
 ## Iteration Budget Pressure
 
-When the agent is working on a complex task with many tool calls, it can burn through its iteration budget (default: 90 turns) without realizing it's running low. Budget pressure automatically warns the model as it approaches the limit:
+When the agent is working on a complex task with many tool calls, it can burn through its iteration budget (default: 1000 turns) without realizing it's running low. Budget pressure automatically warns the model as it approaches the limit:
 
 | Threshold | Level | What the model sees |
 |-----------|-------|---------------------|
-| **70%** | Caution | `[BUDGET: 63/90. 27 iterations left. Start consolidating.]` |
-| **90%** | Warning | `[BUDGET WARNING: 81/90. Only 9 left. Respond NOW.]` |
+| **70%** | Caution | `[BUDGET: 700/1000. 300 iterations left. Start consolidating.]` |
+| **90%** | Warning | `[BUDGET WARNING: 900/1000. Only 100 left. Respond NOW.]` |
 
 Warnings are injected into the last tool result's JSON (as a `_budget_warning` field) rather than as separate messages — this preserves prompt caching and doesn't disrupt the conversation structure.
 
 ```yaml
 agent:
-  max_turns: 90                # Max iterations per conversation turn (default: 90)
+  max_turns: 1000              # Max iterations per conversation turn (default: 1000)
   api_max_retries: 3           # Retries per provider before fallback engages (default: 3)
 ```
 

@@ -1619,7 +1619,7 @@ _servers: Dict[str, MCPServerTask] = {}
 # Circuit breaker: consecutive error counts per server.  After
 # _CIRCUIT_BREAKER_THRESHOLD consecutive failures, the handler returns
 # a "server unreachable" message that tells the model to stop retrying,
-# preventing the 90-iteration burn loop described in #10447.
+# preventing the iteration burn loop described in #10447.
 #
 # State machine:
 #   closed    — error count below threshold; all calls go through.
