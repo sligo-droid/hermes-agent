@@ -6845,9 +6845,19 @@ class GatewayRunner:
                     )
 
             if audio_paths:
+                audio_context_note = None
+                if (
+                    source.platform == Platform.DISCORD
+                    and event.message_type in {MessageType.VOICE, MessageType.AUDIO}
+                ):
+                    audio_context_note = (
+                        "Treat this transcript as a Discord voice note from "
+                        "the sender/intermediary, not as a client document."
+                    )
                 message_text = await self._enrich_message_with_transcription(
                     message_text,
                     audio_paths,
+                    context_note=audio_context_note,
                 )
                 _stt_fail_markers = (
                     "No STT provider",
@@ -13201,6 +13211,7 @@ class GatewayRunner:
         self,
         user_text: str,
         audio_paths: List[str],
+        context_note: Optional[str] = None,
     ) -> str:
         """
         Auto-transcribe user voice/audio messages using the configured STT provider
@@ -13209,6 +13220,7 @@ class GatewayRunner:
         Args:
             user_text:   The user's original caption / message text.
             audio_paths: List of local file paths to cached audio files.
+            context_note: Optional agent-facing provenance note for the audio.
 
         Returns:
             The enriched message string with transcriptions prepended.
@@ -13234,9 +13246,10 @@ class GatewayRunner:
                 result = await asyncio.to_thread(transcribe_audio, path)
                 if result["success"]:
                     transcript = result["transcript"]
+                    context_sentence = f"{context_note} " if context_note else ""
                     enriched_parts.append(
                         f'[The user sent a voice message~ '
-                        f'Here\'s what they said: "{transcript}"]'
+                        f'{context_sentence}Here\'s what they said: "{transcript}"]'
                     )
                 else:
                     error = result.get("error", "unknown error")
