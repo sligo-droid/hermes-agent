@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms.base import MessageType
 
 
 def _ensure_discord_mock():
@@ -358,3 +359,74 @@ class TestHandleMessageUsesAuthenticatedRead:
         event = adapter.handle_message.call_args[0][0]
         assert event.media_urls == ["/tmp/img_from_read.png"]
         assert event.media_types == ["image/png"]
+
+    @pytest.mark.asyncio
+    async def test_mentioned_discord_voice_message_is_cached_for_stt(self, monkeypatch):
+        """A tagged Discord voice message should reach the gateway as voice audio."""
+        adapter = _make_adapter()
+        bot_user = SimpleNamespace(id=999, bot=True)
+        adapter._client = SimpleNamespace(user=bot_user)
+        adapter.handle_message = AsyncMock()
+        monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+        class _FakeDMChannel:
+            pass
+
+        class _FakeThread:
+            pass
+
+        monkeypatch.setattr(
+            "gateway.platforms.discord.discord.DMChannel",
+            _FakeDMChannel,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.discord.discord.Thread",
+            _FakeThread,
+        )
+
+        channel = SimpleNamespace(
+            id=100,
+            name="general",
+            guild=SimpleNamespace(id=10, name="Test Guild"),
+            topic=None,
+        )
+        att = SimpleNamespace(
+            url="https://cdn.discordapp.com/attachments/fake/voice-message.ogg",
+            filename="voice-message.ogg",
+            content_type=None,
+            size=len(_OGG_BYTES),
+            read=AsyncMock(return_value=_OGG_BYTES),
+            duration_secs=2.0,
+            waveform=b"fake",
+        )
+
+        from datetime import datetime, timezone
+
+        msg = SimpleNamespace(
+            id=2,
+            content="<@999>",
+            attachments=[att],
+            mentions=[bot_user],
+            reference=None,
+            created_at=datetime.now(timezone.utc),
+            channel=channel,
+            guild=channel.guild,
+            author=SimpleNamespace(id=42, display_name="U", name="U", bot=False),
+            flags=SimpleNamespace(voice=True),
+        )
+
+        with patch(
+            "gateway.platforms.discord.cache_audio_from_bytes",
+            return_value="/tmp/voice_from_read.ogg",
+        ) as mock_bytes, patch(
+            "gateway.platforms.discord.cache_audio_from_url",
+            new_callable=AsyncMock,
+        ) as mock_url_download:
+            await adapter._handle_message(msg)
+
+        mock_bytes.assert_called_once_with(_OGG_BYTES, ext=".ogg")
+        mock_url_download.assert_not_called()
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.VOICE
+        assert event.media_urls == ["/tmp/voice_from_read.ogg"]
+        assert event.media_types == ["audio/ogg"]
