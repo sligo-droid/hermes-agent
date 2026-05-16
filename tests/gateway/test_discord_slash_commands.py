@@ -76,6 +76,7 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from gateway.platforms.discord import DiscordAdapter  # noqa: E402
+from gateway.platforms.discord import discord as discord_module  # noqa: E402
 
 
 class FakeTree:
@@ -575,24 +576,42 @@ async def test_auto_create_thread_truncates_long_names(adapter):
 
 
 @pytest.mark.asyncio
-async def test_auto_create_thread_falls_back_to_seed_message(adapter):
+async def test_auto_create_thread_falls_back_to_quiet_channel_thread(adapter):
     thread = SimpleNamespace(id=555, name="Hello")
-    seed_message = SimpleNamespace(create_thread=AsyncMock(return_value=thread))
+    channel = SimpleNamespace(
+        create_thread=AsyncMock(return_value=thread),
+        send=AsyncMock(),
+    )
     message = SimpleNamespace(
         content="Hello",
         create_thread=AsyncMock(side_effect=RuntimeError("no perms")),
-        channel=SimpleNamespace(send=AsyncMock(return_value=seed_message)),
+        channel=channel,
         author=SimpleNamespace(display_name="Jezza"),
     )
 
     result = await adapter._auto_create_thread(message)
     assert result is thread
-    message.channel.send.assert_awaited_once_with("🧵 Thread created by Hermes: **Hello**")
-    seed_message.create_thread.assert_awaited_once_with(
-        name="Hello",
-        auto_archive_duration=1440,
-        reason="Auto-threaded from mention by Jezza",
+    channel.send.assert_not_awaited()
+    channel.create_thread.assert_awaited_once()
+    call_kwargs = channel.create_thread.await_args[1]
+    assert call_kwargs["name"] == "Hello"
+    assert call_kwargs["auto_archive_duration"] == 1440
+    assert call_kwargs["type"] is discord_module.ChannelType.public_thread
+    assert call_kwargs["reason"] == "Auto-threaded from mention by Jezza"
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_does_not_post_seed_message_when_quiet_fallback_unavailable(adapter):
+    message = SimpleNamespace(
+        content="Hello",
+        create_thread=AsyncMock(side_effect=RuntimeError("no perms")),
+        channel=SimpleNamespace(send=AsyncMock()),
+        author=SimpleNamespace(display_name="Jezza"),
     )
+
+    result = await adapter._auto_create_thread(message)
+    assert result is None
+    message.channel.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -657,6 +676,7 @@ async def test_auto_create_thread_returns_none_when_direct_and_fallback_fail(ada
 
     result = await adapter._auto_create_thread(message)
     assert result is None
+    message.channel.send.assert_not_awaited()
 
 
 # ------------------------------------------------------------------
@@ -1032,4 +1052,3 @@ def test_register_skill_command_autocomplete_filters_by_name_and_description(ada
     # (covered in other tests). The autocomplete filter itself is exercised
     # via direct function call in the real-discord integration path.
     assert skill_cmd.callback is not None
-
