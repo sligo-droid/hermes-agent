@@ -63,6 +63,15 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_TRUTHY_ENV_VALUES = {"true", "1", "yes", "on"}
+
+
+def _discord_live_voice_enabled() -> bool:
+    """Return whether Discord voice-channel join/listen support is enabled."""
+    return (
+        os.getenv("HERMES_DISCORD_LIVE_VOICE_ENABLED", "").strip().lower()
+        in _TRUTHY_ENV_VALUES
+    )
 
 
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
@@ -6845,9 +6854,19 @@ class GatewayRunner:
                     )
 
             if audio_paths:
+                audio_context_note = None
+                if (
+                    source.platform == Platform.DISCORD
+                    and event.message_type in {MessageType.VOICE, MessageType.AUDIO}
+                ):
+                    audio_context_note = (
+                        "Treat this transcript as a Discord voice note from "
+                        "the sender/intermediary, not as a client document."
+                    )
                 message_text = await self._enrich_message_with_transcription(
                     message_text,
                     audio_paths,
+                    context_note=audio_context_note,
                 )
                 _stt_fail_markers = (
                     "No STT provider",
@@ -9819,6 +9838,11 @@ class GatewayRunner:
                 self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
             return t("gateway.voice.tts_enabled")
         elif args in {"channel", "join"}:
+            if not _discord_live_voice_enabled():
+                return (
+                    "Live Discord voice-channel listening is disabled. "
+                    "Send a recorded Discord voice message or audio attachment instead."
+                )
             return await self._handle_voice_channel_join(event)
         elif args == "leave":
             return await self._handle_voice_channel_leave(event)
@@ -9863,6 +9887,12 @@ class GatewayRunner:
 
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""
+        if not _discord_live_voice_enabled():
+            return (
+                "Live Discord voice-channel listening is disabled. "
+                "Send a recorded Discord voice message or audio attachment instead."
+            )
+
         adapter = self.adapters.get(event.source.platform)
         if not hasattr(adapter, "join_voice_channel"):
             return "Voice channels are not supported on this platform."
@@ -13201,6 +13231,7 @@ class GatewayRunner:
         self,
         user_text: str,
         audio_paths: List[str],
+        context_note: Optional[str] = None,
     ) -> str:
         """
         Auto-transcribe user voice/audio messages using the configured STT provider
@@ -13209,6 +13240,7 @@ class GatewayRunner:
         Args:
             user_text:   The user's original caption / message text.
             audio_paths: List of local file paths to cached audio files.
+            context_note: Optional agent-facing provenance note for the audio.
 
         Returns:
             The enriched message string with transcriptions prepended.
@@ -13234,9 +13266,10 @@ class GatewayRunner:
                 result = await asyncio.to_thread(transcribe_audio, path)
                 if result["success"]:
                     transcript = result["transcript"]
+                    context_sentence = f"{context_note} " if context_note else ""
                     enriched_parts.append(
                         f'[The user sent a voice message~ '
-                        f'Here\'s what they said: "{transcript}"]'
+                        f'{context_sentence}Here\'s what they said: "{transcript}"]'
                     )
                 else:
                     error = result.get("error", "unknown error")

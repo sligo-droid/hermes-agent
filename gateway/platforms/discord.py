@@ -30,6 +30,34 @@ _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
+_DISCORD_AUDIO_EXTENSIONS = frozenset({
+    ".aac", ".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga",
+    ".oga", ".ogg", ".opus", ".wav", ".webm",
+})
+_DISCORD_AUDIO_CONTENT_TYPES = {
+    ".aac": "audio/aac",
+    ".flac": "audio/flac",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".mp4": "audio/mp4",
+    ".mpeg": "audio/mpeg",
+    ".mpga": "audio/mpeg",
+    ".oga": "audio/ogg",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+}
+_DISCORD_VOICE_MESSAGE_FLAG = 1 << 13
+_TRUTHY_ENV_VALUES = {"true", "1", "yes", "on"}
+
+
+def _discord_live_voice_enabled() -> bool:
+    """Return whether Discord voice-channel join/listen support is enabled."""
+    return (
+        os.getenv("HERMES_DISCORD_LIVE_VOICE_ENABLED", "").strip().lower()
+        in _TRUTHY_ENV_VALUES
+    )
 
 try:
     import discord
@@ -596,8 +624,11 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] discord.py not installed. Run: pip install discord.py", self.name)
             return False
 
-        # Load opus codec for voice channel support
-        if not discord.opus.is_loaded():
+        live_voice_enabled = _discord_live_voice_enabled()
+
+        # Load opus codec only when live Discord voice-channel support is
+        # explicitly enabled. Recorded voice/audio attachments do not need this.
+        if live_voice_enabled and not discord.opus.is_loaded():
             import ctypes.util
             opus_path = ctypes.util.find_library("opus")
             # ctypes.util.find_library fails on macOS with Homebrew-installed libs,
@@ -660,7 +691,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 any(not entry.isdigit() for entry in self._allowed_user_ids)
                 or bool(self._allowed_role_ids)  # Need members intent for role lookup
             )
-            intents.voice_states = True
+            intents.voice_states = live_voice_enabled
 
             # Resolve proxy (DISCORD_PROXY > generic env vars > macOS system proxy)
             from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_bot
@@ -1897,6 +1928,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def join_voice_channel(self, channel) -> bool:
         """Join a Discord voice channel. Returns True on success."""
+        if not _discord_live_voice_enabled():
+            logger.info("[%s] Discord live voice-channel support is disabled", self.name)
+            return False
         if not self._client or not DISCORD_AVAILABLE:
             return False
         guild_id = channel.guild.id
@@ -1954,6 +1988,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
         """Play an audio file in the connected voice channel."""
+        if not _discord_live_voice_enabled():
+            return False
         vc = self._voice_clients.get(guild_id)
         if not vc or not vc.is_connected():
             return False
@@ -3007,15 +3043,8 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._run_simple_slash(interaction, "/reload-skills")
 
         @tree.command(name="voice", description="Toggle voice reply mode")
-        @discord.app_commands.describe(mode="Voice mode: join, channel, leave, on, tts, off, or status")
+        @discord.app_commands.describe(mode="Voice mode: on, tts, off, or status")
         @discord.app_commands.choices(mode=[
-            # `join` and `channel` both route to _handle_voice_channel_join in
-            # gateway/run.py — expose both in the slash UI so autocomplete
-            # matches what the docs advertise and what the runner accepts when
-            # the command is typed as plain text.
-            discord.app_commands.Choice(name="join — join your voice channel", value="join"),
-            discord.app_commands.Choice(name="channel — join your voice channel (alias)", value="channel"),
-            discord.app_commands.Choice(name="leave — leave voice channel", value="leave"),
             discord.app_commands.Choice(name="on — voice reply to voice messages", value="on"),
             discord.app_commands.Choice(name="tts — voice reply to all messages", value="tts"),
             discord.app_commands.Choice(name="off — text only", value="off"),
@@ -4282,6 +4311,61 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
         return await cache_audio_from_url(att.url, ext=ext)
 
+    @staticmethod
+    def _attachment_ext(att) -> str:
+        filename = getattr(att, "filename", None) or ""
+        if not filename:
+            return ""
+        _, ext = os.path.splitext(filename)
+        return ext.lower()
+
+    @staticmethod
+    def _message_has_voice_flag(message: DiscordMessage) -> bool:
+        flags = getattr(message, "flags", None)
+        if flags is None:
+            return False
+        if bool(getattr(flags, "voice", False)):
+            return True
+        raw_value = getattr(flags, "value", flags)
+        try:
+            return bool(int(raw_value) & _DISCORD_VOICE_MESSAGE_FLAG)
+        except (TypeError, ValueError):
+            return False
+
+    @classmethod
+    def _is_audio_attachment(cls, att, *, message_is_voice: bool = False) -> bool:
+        content_type = (getattr(att, "content_type", None) or "").lower()
+        if content_type.startswith("audio/"):
+            return True
+        if cls._attachment_ext(att) in _DISCORD_AUDIO_EXTENSIONS:
+            return True
+        if message_is_voice:
+            return True
+        return any(
+            getattr(att, attr, None) is not None
+            for attr in ("duration", "duration_secs", "waveform")
+        )
+
+    @classmethod
+    def _audio_attachment_details(cls, att) -> tuple[str, str]:
+        content_type = (getattr(att, "content_type", None) or "").lower()
+        filename_ext = cls._attachment_ext(att)
+
+        if content_type.startswith("audio/"):
+            ext = "." + content_type.split("/")[-1].split(";")[0]
+        else:
+            ext = filename_ext
+
+        if ext not in _DISCORD_AUDIO_EXTENSIONS:
+            ext = ".ogg"
+        if ext in {".oga", ".opus"}:
+            ext = ".ogg"
+
+        media_type = content_type if content_type.startswith("audio/") else ""
+        if not media_type:
+            media_type = _DISCORD_AUDIO_CONTENT_TYPES.get(filename_ext, "audio/ogg")
+        return ext, media_type
+
     async def _cache_discord_document(self, att, ext: str) -> bytes:
         """Download a Discord document attachment and return the raw bytes.
 
@@ -4446,6 +4530,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
         all_attachments = list(message.attachments) + snapshot_attachments
 
+        message_is_voice = self._message_has_voice_flag(message)
+
         # Determine message type
         msg_type = MessageType.TEXT
         if normalized_content.startswith("/"):
@@ -4453,20 +4539,19 @@ class DiscordAdapter(BasePlatformAdapter):
         elif all_attachments:
             # Check attachment types
             for att in all_attachments:
-                if att.content_type:
-                    if att.content_type.startswith("image/"):
-                        msg_type = MessageType.PHOTO
-                    elif att.content_type.startswith("video/"):
-                        msg_type = MessageType.VIDEO
-                    elif att.content_type.startswith("audio/"):
-                        msg_type = MessageType.AUDIO
-                    else:
-                        doc_ext = ""
-                        if att.filename:
-                            _, doc_ext = os.path.splitext(att.filename)
-                            doc_ext = doc_ext.lower()
-                        if doc_ext in SUPPORTED_DOCUMENT_TYPES:
-                            msg_type = MessageType.DOCUMENT
+                content_type = (getattr(att, "content_type", None) or "").lower()
+                if content_type.startswith("image/"):
+                    msg_type = MessageType.PHOTO
+                    break
+                if content_type.startswith("video/"):
+                    msg_type = MessageType.VIDEO
+                    break
+                if self._is_audio_attachment(att, message_is_voice=message_is_voice):
+                    msg_type = MessageType.VOICE if message_is_voice else MessageType.AUDIO
+                    break
+                doc_ext = self._attachment_ext(att)
+                if doc_ext in SUPPORTED_DOCUMENT_TYPES:
+                    msg_type = MessageType.DOCUMENT
                     break
 
         # When auto-threading kicked in, route responses to the new thread
@@ -4512,7 +4597,7 @@ class DiscordAdapter(BasePlatformAdapter):
         media_types = []
         pending_text_injection: Optional[str] = None
         for att in all_attachments:
-            content_type = att.content_type or "unknown"
+            content_type = getattr(att, "content_type", None) or "unknown"
             if content_type.startswith("image/"):
                 try:
                     # Determine extension from content type (image/png -> .png)
@@ -4528,19 +4613,18 @@ class DiscordAdapter(BasePlatformAdapter):
                     # Fall back to the CDN URL if caching fails
                     media_urls.append(att.url)
                     media_types.append(content_type)
-            elif content_type.startswith("audio/"):
+            elif self._is_audio_attachment(att, message_is_voice=message_is_voice):
                 try:
-                    ext = "." + content_type.split("/")[-1].split(";")[0]
-                    if ext not in {".ogg", ".mp3", ".wav", ".webm", ".m4a"}:
-                        ext = ".ogg"
+                    ext, media_type = self._audio_attachment_details(att)
                     cached_path = await self._cache_discord_audio(att, ext)
                     media_urls.append(cached_path)
-                    media_types.append(content_type)
+                    media_types.append(media_type)
                     print(f"[Discord] Cached user audio: {cached_path}", flush=True)
                 except Exception as e:
                     print(f"[Discord] Failed to cache audio attachment: {e}", flush=True)
                     media_urls.append(att.url)
-                    media_types.append(content_type)
+                    _, media_type = self._audio_attachment_details(att)
+                    media_types.append(media_type)
             else:
                 # Document attachments: download, cache, and optionally inject text
                 ext = ""

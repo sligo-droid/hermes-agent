@@ -743,7 +743,8 @@ class TestVoiceChannelCommands:
     _handle_voice_channel_input on the GatewayRunner."""
 
     @pytest.fixture
-    def runner(self, tmp_path):
+    def runner(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_DISCORD_LIVE_VOICE_ENABLED", "true")
         return _make_runner(tmp_path)
 
     def _make_discord_event(self, text="/voice channel", chat_id="123",
@@ -762,6 +763,22 @@ class TestVoiceChannelCommands:
         return event
 
     # -- _handle_voice_channel_join --
+
+    @pytest.mark.asyncio
+    async def test_join_disabled_by_default(self, tmp_path, monkeypatch):
+        """Live Discord voice-channel listening is disabled unless opted in."""
+        monkeypatch.delenv("HERMES_DISCORD_LIVE_VOICE_ENABLED", raising=False)
+        runner = _make_runner(tmp_path)
+        mock_adapter = AsyncMock()
+        mock_adapter.join_voice_channel = AsyncMock()
+        event = self._make_discord_event()
+        runner.adapters[event.source.platform] = mock_adapter
+
+        result = await runner._handle_voice_channel_join(event)
+
+        assert "disabled" in result.lower()
+        assert "recorded discord voice message" in result.lower()
+        mock_adapter.join_voice_channel.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_join_unsupported_platform(self, runner):
@@ -1371,8 +1388,9 @@ class TestCallbackWiringOrder:
         )
 
     @pytest.mark.asyncio
-    async def test_join_failure_clears_callback(self, tmp_path):
+    async def test_join_failure_clears_callback(self, tmp_path, monkeypatch):
         """If join fails with exception, callback is cleaned up."""
+        monkeypatch.setenv("HERMES_DISCORD_LIVE_VOICE_ENABLED", "true")
         runner = _make_runner(tmp_path)
 
         mock_channel = MagicMock()
@@ -1393,8 +1411,9 @@ class TestCallbackWiringOrder:
         assert mock_adapter._voice_input_callback is None
 
     @pytest.mark.asyncio
-    async def test_join_returns_false_clears_callback(self, tmp_path):
+    async def test_join_returns_false_clears_callback(self, tmp_path, monkeypatch):
         """If join returns False, callback is cleaned up."""
+        monkeypatch.setenv("HERMES_DISCORD_LIVE_VOICE_ENABLED", "true")
         runner = _make_runner(tmp_path)
 
         mock_channel = MagicMock()
@@ -1974,8 +1993,9 @@ class TestPlaybackTimeout:
         assert DiscordAdapter.PLAYBACK_TIMEOUT > 0
 
     @pytest.mark.asyncio
-    async def test_playback_timeout_fires(self):
+    async def test_playback_timeout_fires(self, monkeypatch):
         """When done event is never set, playback times out gracefully."""
+        monkeypatch.setenv("HERMES_DISCORD_LIVE_VOICE_ENABLED", "true")
         from gateway.platforms.discord import DiscordAdapter
         adapter = self._make_discord_adapter()
 
@@ -2002,8 +2022,9 @@ class TestPlaybackTimeout:
             DiscordAdapter.PLAYBACK_TIMEOUT = original_timeout
 
     @pytest.mark.asyncio
-    async def test_is_playing_wait_has_timeout(self):
+    async def test_is_playing_wait_has_timeout(self, monkeypatch):
         """While loop waiting for previous playback has a timeout."""
+        monkeypatch.setenv("HERMES_DISCORD_LIVE_VOICE_ENABLED", "true")
         from gateway.platforms.discord import DiscordAdapter
         adapter = self._make_discord_adapter()
 
