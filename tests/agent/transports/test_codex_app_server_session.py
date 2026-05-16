@@ -15,6 +15,7 @@ import pytest
 
 from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
+    DEFAULT_TURN_TIMEOUT_SECONDS,
     TurnResult,
     _ServerRequestRouting,
     _approval_choice_to_codex_decision,
@@ -163,6 +164,9 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    def test_default_turn_timeout_is_30_minutes(self):
+        assert DEFAULT_TURN_TIMEOUT_SECONDS == 1800.0
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})

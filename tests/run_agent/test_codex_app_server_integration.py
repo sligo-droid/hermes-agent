@@ -476,7 +476,7 @@ class TestSessionRetirementOnRunAgent:
                 projected_messages=[],
                 tool_iterations=0,
                 interrupted=True,
-                error="turn timed out after 600.0s",
+                error="turn timed out after 1800.0s",
                 turn_id="tu1",
                 thread_id="th1",
                 should_retire=True,
@@ -499,7 +499,7 @@ class TestSessionRetirementOnRunAgent:
         assert getattr(agent, "_codex_session", "MISSING") is None
         # Partial result was still returned (caller still sees the error)
         assert result["partial"] is True
-        assert result["error"] == "turn timed out after 600.0s"
+        assert result["error"] == "turn timed out after 1800.0s"
 
     def test_normal_turn_keeps_session(self, fake_session):
         """fake_session fixture returns should_retire=False (default).
