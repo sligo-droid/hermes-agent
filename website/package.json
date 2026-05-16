@@ -2,6 +2,7 @@
   "name": "website",
   "version": "0.0.0",
   "private": true,
+  "packageManager": "npm@11.14.1",
   "scripts": {
     "docusaurus": "docusaurus",
     "prestart": "node scripts/prebuild.mjs",
@@ -47,6 +48,7 @@
     ]
   },
   "engines": {
-    "node": ">=20.0"
+    "node": ">=20.0",
+    "npm": ">=11.14.1"
   }
 }
