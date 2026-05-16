@@ -11,6 +11,7 @@ import type {
 } from '../gatewayTypes.js'
 import { rpcErrorMessage } from '../lib/rpc.js'
 import { topLevelSubagents } from '../lib/subagentTree.js'
+import { writeCompletionNotification } from '../lib/terminalNotification.js'
 import { formatToolCall, stripAnsi } from '../lib/text.js'
 import { fromSkin } from '../theme.js'
 import type { Msg, SubagentProgress } from '../types.js'
@@ -57,7 +58,7 @@ const pushTool = pushUnique(8)
 export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev: GatewayEvent) => void {
   const { rpc } = ctx.gateway
   const { STARTUP_RESUME_ID, newSession, resumeById, setCatalog } = ctx.session
-  const { bellOnComplete, stdout, sys } = ctx.system
+  const { bellOnComplete, stdout, sys, terminalNotifyOnComplete } = ctx.system
   const { appendMessage, panel, setHistoryItems } = ctx.transcript
   const { setInput } = ctx.composer
   const { submitRef } = ctx.submission
@@ -670,6 +671,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           if (bellOnComplete && stdout?.isTTY) {
             stdout.write('\x07')
           }
+          writeCompletionNotification(stdout, terminalNotifyOnComplete)
         }
 
         setStatus('ready')

@@ -29,6 +29,7 @@ describe('applyDisplay', () => {
             show_cost: true,
             show_reasoning: true,
             streaming: false,
+            terminal_notify_on_complete: false,
             tui_compact: true,
             tui_statusbar: false
           }
@@ -46,6 +47,7 @@ describe('applyDisplay', () => {
     expect(s.showReasoning).toBe(true)
     expect(s.statusBar).toBe('off')
     expect(s.streaming).toBe(false)
+    expect(s.terminalNotifyOnComplete).toBe(false)
   })
 
   it('coerces legacy true + "on" alias to top', () => {
@@ -70,6 +72,7 @@ describe('applyDisplay', () => {
     expect(s.showReasoning).toBe(false)
     expect(s.statusBar).toBe('top')
     expect(s.streaming).toBe(true)
+    expect(s.terminalNotifyOnComplete).toBe(true)
     expect(s.sections).toEqual({})
   })
 
