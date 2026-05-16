@@ -1264,6 +1264,7 @@ _ACCENT_ANSI_DEFAULT = "\033[1;38;2;255;215;0m"  # True-color #FFD700 bold — f
 _BOLD = "\033[1m"
 _RST = "\033[0m"
 _STREAM_PAD = "    "  # 4-space indent for streamed response text (matches Panel padding)
+_OPENCODE_WORKER_INTEGRATION_ENABLED = False
 
 
 def _hex_to_ansi(hex_color: str, *, bold: bool = False) -> str:
@@ -2743,7 +2744,7 @@ class HermesCLI:
         self._image_counter = 0
         self.preloaded_skills: list[str] = []
         self._startup_skills_line_shown = False
-        self._opencode_mode = True
+        self._opencode_mode = False
         self._opencode_env_cache: Optional[dict] = None
         self._opencode_env_cache_at = 0.0
 
@@ -5800,7 +5801,7 @@ class HermesCLI:
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
-        self._opencode_mode = True
+        self._opencode_mode = False
 
         if self.agent:
             self.agent.session_id = self.session_id
@@ -6087,7 +6088,7 @@ class HermesCLI:
         self.session_id = target_id
         self._resumed = True
         self._pending_title = None
-        self._opencode_mode = True
+        self._opencode_mode = False
 
         # Load conversation history (strip transcript-only metadata entries)
         restored = self._load_resumed_conversation(target_id)
@@ -9073,7 +9074,9 @@ class HermesCLI:
 
     def _build_opencode_prefix(self, message: str) -> str:
         """Build an API-local OpenCode worker instruction prefix when appropriate."""
-        if not getattr(self, "_opencode_mode", True):
+        if not _OPENCODE_WORKER_INTEGRATION_ENABLED:
+            return ""
+        if not getattr(self, "_opencode_mode", False):
             return ""
         if not isinstance(message, str) or not self._looks_like_coding_request(message):
             return ""
@@ -9125,6 +9128,12 @@ class HermesCLI:
             _cprint(f"  {_DIM}Usage: /opencode [on|off|status]{_RST}")
             return
 
+        if not _OPENCODE_WORKER_INTEGRATION_ENABLED:
+            self._opencode_mode = False
+            _cprint(f"  {_ACCENT}OpenCode worker mode: disabled{_RST}")
+            _cprint(f"  {_DIM}OpenCode worker integration is temporarily disabled in Hermes.{_RST}")
+            return
+
         if arg == "off":
             self._opencode_mode = False
             _cprint(f"  {_ACCENT}OpenCode worker mode: off (session only){_RST}")
@@ -9138,7 +9147,7 @@ class HermesCLI:
                 self._opencode_mode = False
 
         ready = bool(status.get("available") and status.get("credentials_configured"))
-        mode = "ON" if getattr(self, "_opencode_mode", True) else "OFF"
+        mode = "ON" if getattr(self, "_opencode_mode", False) else "OFF"
         readiness = "ready" if ready else "blocked"
         _cprint(f"  {_ACCENT}OpenCode worker mode: {mode} (session only){_RST}")
         _cprint(f"  {_ACCENT}Readiness: {readiness}{_RST}")
