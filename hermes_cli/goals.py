@@ -281,6 +281,39 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + "… [truncated]"
 
 
+def agent_goal_context(session_id: str) -> str:
+    """Return API-only context for the live /goal state.
+
+    The /goal loop is control-plane state, not a normal transcript message.
+    Supplying this short prefix lets the model answer status questions like
+    "did the goal finish?" from the same state that /goal status uses.
+    """
+    state = load_goal(session_id)
+    if state is None or state.status == "cleared":
+        return ""
+
+    lines = [
+        "[Hermes /goal state]",
+        "This is live control-plane state for the current session, not a new user request.",
+        f"Status: {state.status}",
+        f"Turns: {state.turns_used}/{state.max_turns}",
+        f"Goal: {_truncate(state.goal, 2000)}",
+    ]
+    if state.paused_reason:
+        lines.append(f"Paused reason: {_truncate(state.paused_reason, 500)}")
+    if state.last_verdict:
+        lines.append(f"Last verdict: {state.last_verdict}")
+    if state.last_reason:
+        lines.append(f"Last reason: {_truncate(state.last_reason, 1000)}")
+    if state.subgoals:
+        lines.append("Subgoals:")
+        lines.append(_truncate(state.render_subgoals_block(), 2000))
+    lines.append(
+        "If the user asks about /goal status or whether the goal finished, answer from this state."
+    )
+    return "\n".join(lines)
+
+
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
 
 
@@ -779,5 +812,6 @@ __all__ = [
     "load_goal",
     "save_goal",
     "clear_goal",
+    "agent_goal_context",
     "judge_goal",
 ]

@@ -12032,6 +12032,22 @@ class AIAgent:
         # Preserve the original user message (no nudge injection).
         original_user_message = persist_user_message if persist_user_message is not None else user_message
 
+        # /goal is tracked outside the transcript by hermes_cli.goals. Add a
+        # small API-only prefix so the model can answer status questions from
+        # the same state that `/goal status` uses, then strip it before
+        # persistence/returned history via _persist_user_message_override.
+        if isinstance(user_message, str):
+            try:
+                from hermes_cli.goals import agent_goal_context
+
+                _goal_context = agent_goal_context(getattr(self, "session_id", "") or "")
+            except Exception:
+                _goal_context = ""
+            if _goal_context:
+                if self._persist_user_message_override is None:
+                    self._persist_user_message_override = original_user_message
+                user_message = f"{_goal_context}\n\n{user_message}"
+
         # Track memory nudge trigger (turn-based, checked here).
         # Skill trigger is checked AFTER the agent loop completes, based on
         # how many tool iterations THIS turn used.
