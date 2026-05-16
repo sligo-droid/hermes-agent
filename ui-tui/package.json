@@ -3,6 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
+  "packageManager": "npm@11.14.1",
   "scripts": {
     "dev": "npm run build --prefix packages/hermes-ink && tsx --watch src/entry.tsx",
     "start": "tsx src/entry.tsx",
@@ -46,5 +47,8 @@
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.3"
+  },
+  "engines": {
+    "npm": ">=11.14.1"
   }
 }

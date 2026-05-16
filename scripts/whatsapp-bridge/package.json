@@ -4,6 +4,7 @@
   "description": "WhatsApp bridge for Hermes Agent using Baileys",
   "private": true,
   "type": "module",
+  "packageManager": "npm@11.14.1",
   "scripts": {
     "start": "node bridge.js"
   },
@@ -15,5 +16,8 @@
   },
   "overrides": {
     "protobufjs": "^7.5.5"
+  },
+  "engines": {
+    "npm": ">=11.14.1"
   }
 }
