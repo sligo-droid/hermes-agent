@@ -100,6 +100,13 @@ def make_message(*, channel, content: str, mentions=None):
     )
 
 
+def _reply_reference_to(author, message_id: int = 321):
+    return SimpleNamespace(
+        message_id=message_id,
+        resolved=SimpleNamespace(author=author, content="previous bot reply"),
+    )
+
+
 # ── ignored_channels ─────────────────────────────────────────────────
 
 
@@ -144,6 +151,24 @@ async def test_non_ignored_channel_processes_normally(adapter, monkeypatch):
     await adapter._handle_message(message)
 
     adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reply_to_bot_counts_as_mention(adapter, monkeypatch):
+    """Replying to the bot should pass the same gate as tagging it."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    message = make_message(channel=FakeTextChannel(channel_id=700), content="follow up")
+    message.reference = _reply_reference_to(adapter._client.user)
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.reply_to_message_id == "321"
+    assert event.reply_to_text == "previous bot reply"
 
 
 @pytest.mark.asyncio
