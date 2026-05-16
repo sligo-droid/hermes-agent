@@ -19,9 +19,11 @@ def _extract_last_reasoning(messages):
     for msg in reversed(messages):
         if msg.get("role") == "user":
             break
-        if msg.get("role") == "assistant" and msg.get("reasoning"):
-            last_reasoning = msg["reasoning"]
-            break
+        if msg.get("role") == "assistant":
+            reasoning = msg.get("reasoning") or msg.get("reasoning_content")
+            if reasoning:
+                last_reasoning = reasoning
+                break
     return last_reasoning
 
 
@@ -105,3 +107,16 @@ def test_empty_string_reasoning_treated_as_missing():
         {"role": "assistant", "content": "hello", "reasoning": ""},
     ]
     assert _extract_last_reasoning(messages) is None
+
+
+def test_reasoning_content_fallback_when_reasoning_missing():
+    messages = [
+        {"role": "user", "content": "hello"},
+        {
+            "role": "assistant",
+            "content": "hi",
+            "reasoning": None,
+            "reasoning_content": "provider stored this under reasoning_content",
+        },
+    ]
+    assert _extract_last_reasoning(messages) == "provider stored this under reasoning_content"

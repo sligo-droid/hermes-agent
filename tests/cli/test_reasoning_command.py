@@ -487,6 +487,28 @@ class TestExtractReasoningFormats(unittest.TestCase):
         result = extract(None, msg)
         self.assertIn("async/await", result)
 
+    def test_model_extra_reasoning_content(self):
+        extract = self._get_extractor()
+        msg = SimpleNamespace(
+            content="Done.",
+            model_extra={"reasoning_content": "Stored in provider extras."},
+        )
+        result = extract(None, msg)
+        self.assertEqual(result, "Stored in provider extras.")
+
+    def test_model_extra_reasoning_details(self):
+        extract = self._get_extractor()
+        msg = SimpleNamespace(
+            content="Done.",
+            model_extra={
+                "reasoning_details": [
+                    {"type": "reasoning.summary", "summary": "Extra detail summary."},
+                ],
+            },
+        )
+        result = extract(None, msg)
+        self.assertEqual(result, "Extra detail summary.")
+
     def test_no_reasoning_returns_none(self):
         extract = self._get_extractor()
         msg = SimpleNamespace(content="Hello!")
