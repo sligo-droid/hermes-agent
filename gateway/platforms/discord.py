@@ -49,6 +49,15 @@ _DISCORD_AUDIO_CONTENT_TYPES = {
     ".webm": "audio/webm",
 }
 _DISCORD_VOICE_MESSAGE_FLAG = 1 << 13
+_TRUTHY_ENV_VALUES = {"true", "1", "yes", "on"}
+
+
+def _discord_live_voice_enabled() -> bool:
+    """Return whether Discord voice-channel join/listen support is enabled."""
+    return (
+        os.getenv("HERMES_DISCORD_LIVE_VOICE_ENABLED", "").strip().lower()
+        in _TRUTHY_ENV_VALUES
+    )
 
 try:
     import discord
@@ -615,8 +624,11 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] discord.py not installed. Run: pip install discord.py", self.name)
             return False
 
-        # Load opus codec for voice channel support
-        if not discord.opus.is_loaded():
+        live_voice_enabled = _discord_live_voice_enabled()
+
+        # Load opus codec only when live Discord voice-channel support is
+        # explicitly enabled. Recorded voice/audio attachments do not need this.
+        if live_voice_enabled and not discord.opus.is_loaded():
             import ctypes.util
             opus_path = ctypes.util.find_library("opus")
             # ctypes.util.find_library fails on macOS with Homebrew-installed libs,
@@ -679,7 +691,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 any(not entry.isdigit() for entry in self._allowed_user_ids)
                 or bool(self._allowed_role_ids)  # Need members intent for role lookup
             )
-            intents.voice_states = True
+            intents.voice_states = live_voice_enabled
 
             # Resolve proxy (DISCORD_PROXY > generic env vars > macOS system proxy)
             from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_bot
@@ -1899,6 +1911,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def join_voice_channel(self, channel) -> bool:
         """Join a Discord voice channel. Returns True on success."""
+        if not _discord_live_voice_enabled():
+            logger.info("[%s] Discord live voice-channel support is disabled", self.name)
+            return False
         if not self._client or not DISCORD_AVAILABLE:
             return False
         guild_id = channel.guild.id
@@ -1956,6 +1971,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
         """Play an audio file in the connected voice channel."""
+        if not _discord_live_voice_enabled():
+            return False
         vc = self._voice_clients.get(guild_id)
         if not vc or not vc.is_connected():
             return False
@@ -3005,15 +3022,8 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._run_simple_slash(interaction, "/reload-skills")
 
         @tree.command(name="voice", description="Toggle voice reply mode")
-        @discord.app_commands.describe(mode="Voice mode: join, channel, leave, on, tts, off, or status")
+        @discord.app_commands.describe(mode="Voice mode: on, tts, off, or status")
         @discord.app_commands.choices(mode=[
-            # `join` and `channel` both route to _handle_voice_channel_join in
-            # gateway/run.py — expose both in the slash UI so autocomplete
-            # matches what the docs advertise and what the runner accepts when
-            # the command is typed as plain text.
-            discord.app_commands.Choice(name="join — join your voice channel", value="join"),
-            discord.app_commands.Choice(name="channel — join your voice channel (alias)", value="channel"),
-            discord.app_commands.Choice(name="leave — leave voice channel", value="leave"),
             discord.app_commands.Choice(name="on — voice reply to voice messages", value="on"),
             discord.app_commands.Choice(name="tts — voice reply to all messages", value="tts"),
             discord.app_commands.Choice(name="off — text only", value="off"),

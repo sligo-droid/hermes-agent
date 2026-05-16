@@ -63,6 +63,15 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_TRUTHY_ENV_VALUES = {"true", "1", "yes", "on"}
+
+
+def _discord_live_voice_enabled() -> bool:
+    """Return whether Discord voice-channel join/listen support is enabled."""
+    return (
+        os.getenv("HERMES_DISCORD_LIVE_VOICE_ENABLED", "").strip().lower()
+        in _TRUTHY_ENV_VALUES
+    )
 
 
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
@@ -9829,6 +9838,11 @@ class GatewayRunner:
                 self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
             return t("gateway.voice.tts_enabled")
         elif args in {"channel", "join"}:
+            if not _discord_live_voice_enabled():
+                return (
+                    "Live Discord voice-channel listening is disabled. "
+                    "Send a recorded Discord voice message or audio attachment instead."
+                )
             return await self._handle_voice_channel_join(event)
         elif args == "leave":
             return await self._handle_voice_channel_leave(event)
@@ -9873,6 +9887,12 @@ class GatewayRunner:
 
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""
+        if not _discord_live_voice_enabled():
+            return (
+                "Live Discord voice-channel listening is disabled. "
+                "Send a recorded Discord voice message or audio attachment instead."
+            )
+
         adapter = self.adapters.get(event.source.platform)
         if not hasattr(adapter, "join_voice_channel"):
             return "Voice channels are not supported on this platform."
