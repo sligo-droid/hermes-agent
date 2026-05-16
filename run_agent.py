@@ -3884,21 +3884,33 @@ class AIAgent:
             Combined reasoning text, or None if no reasoning found
         """
         reasoning_parts = []
+
+        def _message_field(name: str):
+            value = getattr(assistant_message, name, None)
+            if value:
+                return value
+            model_extra = getattr(assistant_message, "model_extra", None)
+            if isinstance(model_extra, dict):
+                return model_extra.get(name)
+            return None
         
         # Check direct reasoning field
-        if hasattr(assistant_message, 'reasoning') and assistant_message.reasoning:
-            reasoning_parts.append(assistant_message.reasoning)
+        reasoning = _message_field('reasoning')
+        if reasoning:
+            reasoning_parts.append(reasoning)
         
         # Check reasoning_content field (alternative name used by some providers)
-        if hasattr(assistant_message, 'reasoning_content') and assistant_message.reasoning_content:
+        reasoning_content = _message_field('reasoning_content')
+        if reasoning_content:
             # Don't duplicate if same as reasoning
-            if assistant_message.reasoning_content not in reasoning_parts:
-                reasoning_parts.append(assistant_message.reasoning_content)
+            if reasoning_content not in reasoning_parts:
+                reasoning_parts.append(reasoning_content)
         
         # Check reasoning_details array (OpenRouter unified format)
         # Format: [{"type": "reasoning.summary", "summary": "...", ...}, ...]
-        if hasattr(assistant_message, 'reasoning_details') and assistant_message.reasoning_details:
-            for detail in assistant_message.reasoning_details:
+        reasoning_details = _message_field('reasoning_details')
+        if reasoning_details:
+            for detail in reasoning_details:
                 if isinstance(detail, dict):
                     # Extract summary from reasoning detail object
                     summary = (
@@ -15598,9 +15610,11 @@ class AIAgent:
         for msg in reversed(messages):
             if msg.get("role") == "user":
                 break  # turn boundary — don't cross into prior turns
-            if msg.get("role") == "assistant" and msg.get("reasoning"):
-                last_reasoning = msg["reasoning"]
-                break
+            if msg.get("role") == "assistant":
+                reasoning = msg.get("reasoning") or msg.get("reasoning_content")
+                if reasoning:
+                    last_reasoning = reasoning
+                    break
 
         # Build result with interrupt info if applicable
         result = {
