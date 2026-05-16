@@ -26,6 +26,10 @@ from gateway.platforms.base import (
     ProcessingOutcome,
     SendResult,
 )
+from gateway.run import (
+    _is_late_cancel_intent,
+    _should_send_first_response_before_queued_followup,
+)
 from gateway.session import SessionSource, build_session_key
 
 
@@ -326,58 +330,122 @@ class TestQueuedMessageAlreadyStreamed:
         """Partial streamed output alone must not suppress the first response
         before the queued follow-up is processed."""
         _sc = self._make_mock_sc(already_sent=True, final_response_sent=False)
+        response = {"final_response": "Implemented.", "response_previewed": False}
 
-        _already_streamed = bool(
-            _sc and getattr(_sc, "final_response_sent", False)
+        should_send = _should_send_first_response_before_queued_followup(
+            response,
+            _sc,
+            "one more thing",
         )
 
-        assert _already_streamed is False
+        assert should_send is True
 
     def test_queued_path_detects_confirmed_final_stream_delivery(self):
         """Confirmed final streamed delivery should skip the resend."""
         _sc = self._make_mock_sc(already_sent=True, final_response_sent=True)
-        response = {"response_previewed": False}
+        response = {"final_response": "Implemented.", "response_previewed": False}
 
-        _already_streamed = bool(
-            (_sc and getattr(_sc, "final_response_sent", False))
-            or bool(response.get("response_previewed"))
+        should_send = _should_send_first_response_before_queued_followup(
+            response,
+            _sc,
+            "one more thing",
         )
 
-        assert _already_streamed is True
+        assert should_send is False
 
     def test_queued_path_detects_previewed_response_delivery(self):
         """A response already previewed via the adapter should not be resent
         before processing the queued follow-up."""
         _sc = self._make_mock_sc(already_sent=False, final_response_sent=False)
-        response = {"response_previewed": True}
+        response = {"final_response": "Implemented.", "response_previewed": True}
 
-        _already_streamed = bool(
-            (_sc and getattr(_sc, "final_response_sent", False))
-            or bool(response.get("response_previewed"))
+        should_send = _should_send_first_response_before_queued_followup(
+            response,
+            _sc,
+            "one more thing",
         )
 
-        assert _already_streamed is True
+        assert should_send is False
 
     def test_queued_path_sends_when_not_streamed(self):
         """Nothing was streamed — first response should be sent before
         processing the queued message."""
         _sc = self._make_mock_sc(already_sent=False, final_response_sent=False)
+        response = {"final_response": "Implemented.", "response_previewed": False}
 
-        _already_streamed = bool(
-            _sc and getattr(_sc, "final_response_sent", False)
+        should_send = _should_send_first_response_before_queued_followup(
+            response,
+            _sc,
+            "one more thing",
         )
 
-        assert _already_streamed is False
+        assert should_send is True
 
     def test_queued_path_with_no_stream_consumer(self):
         """No stream consumer at all (streaming disabled) — not streamed."""
         _sc = None
+        response = {"final_response": "Implemented.", "response_previewed": False}
 
-        _already_streamed = bool(
-            _sc and getattr(_sc, "final_response_sent", False)
+        should_send = _should_send_first_response_before_queued_followup(
+            response,
+            _sc,
+            "one more thing",
         )
 
-        assert _already_streamed is False
+        assert should_send is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Eh nvm keep them",
+            "never mind, keep it",
+            "cancel that request",
+            "scratch that",
+            "don't ship this",
+            "do not proceed",
+        ],
+    )
+    def test_late_cancel_intent_suppresses_stale_first_response(self, text):
+        """Late cancellation should not deliver the stale completed response."""
+        _sc = self._make_mock_sc(already_sent=False, final_response_sent=False)
+        response = {"final_response": "Implemented.", "response_previewed": False}
+
+        assert _is_late_cancel_intent(text) is True
+        should_send = _should_send_first_response_before_queued_followup(
+            response,
+            _sc,
+            text,
+        )
+
+        assert should_send is False
+
+    def test_non_cancel_followup_still_sends_first_response(self):
+        _sc = self._make_mock_sc(already_sent=False, final_response_sent=False)
+        response = {"final_response": "Implemented.", "response_previewed": False}
+
+        assert _is_late_cancel_intent("also update the docs") is False
+        should_send = _should_send_first_response_before_queued_followup(
+            response,
+            _sc,
+            "also update the docs",
+        )
+
+        assert should_send is True
+
+    def test_cancel_word_inside_real_followup_does_not_suppress(self):
+        _sc = self._make_mock_sc(already_sent=False, final_response_sent=False)
+        response = {"final_response": "Implemented.", "response_previewed": False}
+
+        text = "also add a cancel button"
+
+        assert _is_late_cancel_intent(text) is False
+        should_send = _should_send_first_response_before_queued_followup(
+            response,
+            _sc,
+            text,
+        )
+
+        assert should_send is True
 
 
 # ===================================================================
