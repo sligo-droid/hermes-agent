@@ -24,7 +24,7 @@ import { Banner, Panel, SessionPanel } from './branding.js'
 import { FpsOverlay } from './fpsOverlay.js'
 import { HelpHint } from './helpHint.js'
 import { MessageLine } from './messageLine.js'
-import { QueuedMessages } from './queuedMessages.js'
+import { QueuedMessages, queueSummaryText } from './queuedMessages.js'
 import { LiveTodoPanel, StreamingAssistant } from './streamingAssistant.js'
 import { TextInput, type TextInputMouseApi } from './textInput.js'
 
@@ -255,6 +255,7 @@ const ComposerPane = memo(function ComposerPane({
   const inputColumns = stableComposerColumns(composer.cols, promptWidth)
   const inputHeight = inputVisualHeight(composer.input, inputColumns)
   const inputMouseRef = useRef<null | TextInputMouseApi>(null)
+  const queueSummary = queueSummaryText(composer.queuedDisplay, composer.cols)
 
   const captureInputDrag = (e: GutterMouseEvent) => {
     if (e.button !== 0) {
@@ -320,6 +321,10 @@ const ComposerPane = memo(function ComposerPane({
           <Text color={ui.theme.color.label}>↳ </Text>
 
           {status.stickyPrompt}
+        </Text>
+      ) : queueSummary ? (
+        <Text color={ui.theme.color.muted} wrap="truncate-end">
+          {queueSummary}
         </Text>
       ) : (
         <Box height={1} onMouseDown={captureInputDrag} onMouseDrag={dragFromSpacer} onMouseUp={endInputDrag} />

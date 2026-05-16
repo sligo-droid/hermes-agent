@@ -923,6 +923,8 @@ export function TextInput({
             v = v.slice(0, c) + text + v.slice(c)
             c += text.length
           }
+
+          return commit(v, c)
         } else if (shouldBufferInputAsPaste(text, bracketed)) {
           if (!pasteBuf.current) {
             pastePos.current = range ? range.start : c
