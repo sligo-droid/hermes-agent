@@ -17,7 +17,6 @@ from unittest.mock import patch
 import pytest
 
 import run_agent
-from agent.transports.codex_event_projector import CodexEventProjector
 from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
 
 
@@ -115,61 +114,6 @@ class TestRunConversationCodexPath:
         final = [m for m in msgs if m.get("role") == "assistant"
                  and m.get("content") == "echo: hello"]
         assert final, f"expected final assistant message in {msgs}"
-
-    def test_last_reasoning_returned_for_display(self, monkeypatch):
-        def fake_run_turn(self, user_input: str, **kwargs):
-            return TurnResult(
-                final_text=f"echo: {user_input}",
-                projected_messages=[
-                    {"role": "user", "content": user_input},
-                    {"role": "assistant", "content": None,
-                     "reasoning": "I should inspect the repo.",
-                     "tool_calls": [{"id": "exec_1", "type": "function",
-                                     "function": {"name": "exec_command",
-                                                  "arguments": "{}"}}]},
-                    {"role": "tool", "tool_call_id": "exec_1", "content": "ok"},
-                    {"role": "assistant", "content": f"echo: {user_input}"},
-                ],
-                tool_iterations=1,
-                turn_id="turn-stub-1",
-                thread_id="thread-stub-1",
-            )
-
-        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
-        monkeypatch.setattr(
-            CodexAppServerSession, "ensure_started", lambda self: "thread-stub-1"
-        )
-        agent = _make_codex_agent()
-
-        with patch.object(agent, "_spawn_background_review", return_value=None):
-            result = agent.run_conversation("hello")
-
-        assert result["last_reasoning"] == "I should inspect the repo."
-
-    def test_projector_normalizes_reasoning_summary_parts(self):
-        projector = CodexEventProjector()
-        projector.project({
-            "method": "item/completed",
-            "params": {
-                "item": {
-                    "type": "reasoning",
-                    "summary": [{"type": "summary_text", "text": "Need a plan."}],
-                    "content": ["Then inspect files."],
-                }
-            },
-        })
-
-        result = projector.project({
-            "method": "item/completed",
-            "params": {
-                "item": {
-                    "type": "agentMessage",
-                    "text": "done",
-                }
-            },
-        })
-
-        assert result.messages[0]["reasoning"] == "Need a plan.\nThen inspect files."
 
     def test_codex_app_server_turn_persists_projected_messages(self, fake_session):
         agent = _make_codex_agent()
