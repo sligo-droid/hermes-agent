@@ -1,0 +1,38 @@
+services:
+  api:
+    build:
+      context: /home/droid/honcho
+      dockerfile: /home/droid/hermes/configs/sligo-labs-vm/honcho.local.Dockerfile
+    image: honcho-local-sligo:latest
+    environment:
+      EMBEDDING_VECTOR_DIMENSIONS: 2000
+      EMBEDDING_MAX_INPUT_TOKENS: 40960
+      EMBEDDING_MODEL_CONFIG__MODEL: Qwen/Qwen3-Embedding-8B-GGUF:Q8_0
+      EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE: always
+      EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL: http://hermes-honcho-embeddings:8080/v1
+      DERIVER_MODEL_CONFIG__OVERRIDES__BASE_URL: http://host.docker.internal:8645/v1
+      SUMMARY_MODEL_CONFIG__OVERRIDES__BASE_URL: http://host.docker.internal:8645/v1
+      DIALECTIC_LEVELS__minimal__MODEL_CONFIG__OVERRIDES__BASE_URL: http://host.docker.internal:8645/v1
+      DIALECTIC_LEVELS__low__MODEL_CONFIG__OVERRIDES__BASE_URL: http://host.docker.internal:8645/v1
+      DIALECTIC_LEVELS__medium__MODEL_CONFIG__OVERRIDES__BASE_URL: http://host.docker.internal:8645/v1
+      DIALECTIC_LEVELS__high__MODEL_CONFIG__OVERRIDES__BASE_URL: http://host.docker.internal:8645/v1
+      DIALECTIC_LEVELS__max__MODEL_CONFIG__OVERRIDES__BASE_URL: http://host.docker.internal:8645/v1
+
+  deriver:
+    build:
+      context: /home/droid/honcho
+      dockerfile: /home/droid/hermes/configs/sligo-labs-vm/honcho.local.Dockerfile
+    image: honcho-local-sligo:latest
+    environment:
+      EMBEDDING_VECTOR_DIMENSIONS: 2000
+      EMBEDDING_MAX_INPUT_TOKENS: 40960
+      EMBEDDING_MODEL_CONFIG__MODEL: Qwen/Qwen3-Embedding-8B-GGUF:Q8_0
+      EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE: always
+      EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL: http://hermes-honcho-embeddings:8080/v1
+      DERIVER_MODEL_CONFIG__OVERRIDES__BASE_URL: http://host.docker.internal:8645/v1
+      SUMMARY_MODEL_CONFIG__OVERRIDES__BASE_URL: http://host.docker.internal:8645/v1
+      DIALECTIC_LEVELS__minimal__MODEL_CONFIG__OVERRIDES__BASE_URL: http://host.docker.internal:8645/v1
+      DIALECTIC_LEVELS__low__MODEL_CONFIG__OVERRIDES__BASE_URL: http://host.docker.internal:8645/v1
+      DIALECTIC_LEVELS__medium__MODEL_CONFIG__OVERRIDES__BASE_URL: http://host.docker.internal:8645/v1
+      DIALECTIC_LEVELS__high__MODEL_CONFIG__OVERRIDES__BASE_URL: http://host.docker.internal:8645/v1
+      DIALECTIC_LEVELS__max__MODEL_CONFIG__OVERRIDES__BASE_URL: http://host.docker.internal:8645/v1
