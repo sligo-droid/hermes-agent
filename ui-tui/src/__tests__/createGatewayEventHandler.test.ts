@@ -5,12 +5,13 @@ import { getOverlayState, resetOverlayState } from '../app/overlayStore.js'
 import { turnController } from '../app/turnController.js'
 import { getTurnState, resetTurnState } from '../app/turnStore.js'
 import { patchUiState, resetUiState } from '../app/uiStore.js'
+import { osc777Notify } from '../lib/terminalNotification.js'
 import { estimateTokensRough } from '../lib/text.js'
 import type { Msg } from '../types.js'
 
 const ref = <T>(current: T) => ({ current })
 
-const buildCtx = (appended: Msg[]) =>
+const buildCtx = (appended: Msg[], overrides: any = {}) =>
   ({
     composer: {
       dequeue: () => undefined,
@@ -35,7 +36,9 @@ const buildCtx = (appended: Msg[]) =>
     },
     system: {
       bellOnComplete: false,
-      sys: vi.fn()
+      terminalNotifyOnComplete: false,
+      sys: vi.fn(),
+      ...(overrides.system ?? {})
     },
     transcript: {
       appendMessage: (msg: Msg) => appended.push(msg),
@@ -85,6 +88,31 @@ describe('createGatewayEventHandler', () => {
     // doesn't visibly jump across the final answer at end-of-turn.
     expect(appended.indexOf(trail!)).toBeLessThan(appended.indexOf(finalText!))
     expect(getTurnState().todos).toEqual([])
+  })
+
+  it('writes terminal completion notification on completed assistant responses', () => {
+    const appended: Msg[] = []
+    const stdout = { isTTY: true, write: vi.fn() }
+    const onEvent = createGatewayEventHandler(
+      buildCtx(appended, { system: { stdout, terminalNotifyOnComplete: true } })
+    )
+
+    onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
+
+    expect(stdout.write).toHaveBeenCalledWith(osc777Notify())
+  })
+
+  it('does not write terminal completion notification after interrupted turns', () => {
+    const appended: Msg[] = []
+    const stdout = { isTTY: true, write: vi.fn() }
+    const onEvent = createGatewayEventHandler(
+      buildCtx(appended, { system: { stdout, terminalNotifyOnComplete: true } })
+    )
+
+    turnController.interrupted = true
+    onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
+
+    expect(stdout.write).not.toHaveBeenCalled()
   })
 
   it('archives completed todos into transcript flow at end of turn', () => {

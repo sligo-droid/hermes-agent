@@ -24,6 +24,7 @@ const buildUiState = (): UiState => ({
   status: 'summoning hermes…',
   statusBar: 'top',
   streaming: true,
+  terminalNotifyOnComplete: true,
   theme: DEFAULT_THEME,
   usage: ZERO
 })

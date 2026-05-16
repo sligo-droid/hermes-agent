@@ -113,6 +113,7 @@ export interface UiState {
   status: string
   statusBar: StatusBarMode
   streaming: boolean
+  terminalNotifyOnComplete: boolean
   theme: Theme
   usage: Usage
 }
@@ -244,6 +245,7 @@ export interface GatewayEventHandlerContext {
     bellOnComplete: boolean
     stdout?: NodeJS.WriteStream
     sys: (text: string) => void
+    terminalNotifyOnComplete: boolean
   }
   transcript: {
     appendMessage: (msg: Msg) => void

@@ -147,7 +147,8 @@ export const applyDisplay = (
     showCost: !!d.show_cost,
     showReasoning: !!d.show_reasoning,
     statusBar: normalizeStatusBar(d.tui_statusbar),
-    streaming: d.streaming !== false
+    streaming: d.streaming !== false,
+    terminalNotifyOnComplete: d.terminal_notify_on_complete !== false
   })
 }
 

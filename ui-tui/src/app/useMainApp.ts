@@ -561,7 +561,7 @@ export function useMainApp(gw: GatewayClient) {
           setCatalog
         },
         submission: { submitRef },
-        system: { bellOnComplete, stdout, sys },
+        system: { bellOnComplete, stdout, sys, terminalNotifyOnComplete: ui.terminalNotifyOnComplete },
         transcript: { appendMessage, panel, setHistoryItems },
         voice: {
           setProcessing: setVoiceProcessing,
@@ -584,7 +584,8 @@ export function useMainApp(gw: GatewayClient) {
       setVoiceRecording,
       stdout,
       submitRef,
-      sys
+      sys,
+      ui.terminalNotifyOnComplete
     ]
   )
 

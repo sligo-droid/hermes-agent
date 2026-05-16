@@ -61,6 +61,7 @@ export interface ConfigDisplayConfig {
   show_cost?: boolean
   show_reasoning?: boolean
   streaming?: boolean
+  terminal_notify_on_complete?: boolean
   thinking_mode?: string
   tui_auto_resume_recent?: boolean
   tui_compact?: boolean

@@ -109,6 +109,7 @@ from hermes_cli.browser_connect import (
     try_launch_chrome_debug,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.terminal_notifications import emit_completion_notification
 from utils import base_url_host_matches, is_truthy_value
 
 _hermes_home = get_hermes_home()
@@ -2439,6 +2440,8 @@ class HermesCLI:
         self.resume_display = CLI_CONFIG["display"].get("resume_display", "full")
         # bell_on_complete: play terminal bell (\a) when agent finishes a response
         self.bell_on_complete = CLI_CONFIG["display"].get("bell_on_complete", False)
+        # terminal_notify_on_complete: emit OSC terminal notification on response completion
+        self.terminal_notify_on_complete = CLI_CONFIG["display"].get("terminal_notify_on_complete", True)
         # show_reasoning: display model thinking/reasoning before the response
         self.show_reasoning = CLI_CONFIG["display"].get("show_reasoning", False)
         _configure_output_history(
@@ -8122,6 +8125,8 @@ class HermesCLI:
                 if self.bell_on_complete:
                     sys.stdout.write("\a")
                     sys.stdout.flush()
+                if response and not (result and result.get("interrupted")):
+                    emit_completion_notification(enabled=self.terminal_notify_on_complete)
 
             except Exception as e:
                 # Same TUI refresh pattern as success path (#2718)
@@ -11484,6 +11489,8 @@ class HermesCLI:
             if self.bell_on_complete:
                 sys.stdout.write("\a")
                 sys.stdout.flush()
+            if response and not _interrupted_this_turn:
+                emit_completion_notification(enabled=self.terminal_notify_on_complete)
 
             # Notify when iteration budget was hit
             if result and not result.get("completed") and not result.get("interrupted"):
