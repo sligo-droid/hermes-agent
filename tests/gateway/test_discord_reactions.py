@@ -111,6 +111,59 @@ async def test_process_message_background_adds_and_swaps_reactions(adapter):
 
 
 @pytest.mark.asyncio
+async def test_reaction_completion_waits_for_queued_follow_up(adapter):
+    first_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    second_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    second_started = asyncio.Event()
+    release_second = asyncio.Event()
+
+    first_event = _make_event("1", first_message)
+    session_key = build_session_key(first_event.source)
+    second_event = _make_event("2", second_message)
+
+    async def handler(event):
+        if event.message_id == "1":
+            adapter._pending_messages[session_key] = second_event
+            return "first ack"
+        second_started.set()
+        await release_second.wait()
+        return "second ack"
+
+    async def hold_typing(_chat_id, interval=2.0, metadata=None):
+        await asyncio.Event().wait()
+
+    adapter.set_message_handler(handler)
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="999"))
+    adapter._keep_typing = hold_typing
+
+    task = asyncio.create_task(
+        adapter._process_message_background(first_event, session_key)
+    )
+    await asyncio.wait_for(second_started.wait(), timeout=1.0)
+
+    first_message.add_reaction.assert_awaited_once_with("👀")
+    first_message.remove_reaction.assert_not_awaited()
+
+    release_second.set()
+    await task
+    for _ in range(100):
+        if session_key not in adapter._active_sessions:
+            break
+        await asyncio.sleep(0.01)
+
+    first_message.remove_reaction.assert_awaited_once_with("👀", adapter._client.user)
+    assert first_message.add_reaction.await_args_list[1].args == ("✅",)
+    second_message.remove_reaction.assert_awaited_once_with("👀", adapter._client.user)
+    assert second_message.add_reaction.await_args_list[1].args == ("✅",)
+
+
+@pytest.mark.asyncio
 async def test_interaction_backed_events_do_not_attempt_reactions(adapter):
     interaction = SimpleNamespace(guild_id=123456789)
 
