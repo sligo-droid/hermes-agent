@@ -272,6 +272,37 @@ class TestGoalManager:
         assert mgr2.state.goal == "do the thing"
         assert mgr2.is_active()
 
+    def test_agent_goal_context_exposes_live_status(self, hermes_home):
+        from hermes_cli.goals import GoalManager, agent_goal_context
+
+        mgr = GoalManager(session_id="context-sid", default_max_turns=7)
+        mgr.set("ship the patch")
+        mgr.state.turns_used = 2
+        mgr.state.last_verdict = "continue"
+        mgr.state.last_reason = "tests remain"
+        mgr.add_subgoal("include regression coverage")
+
+        context = agent_goal_context("context-sid")
+
+        assert "[Hermes /goal state]" in context
+        assert "Status: active" in context
+        assert "Turns: 2/7" in context
+        assert "Goal: ship the patch" in context
+        assert "Last verdict: continue" in context
+        assert "Last reason: tests remain" in context
+        assert "include regression coverage" in context
+
+    def test_agent_goal_context_empty_when_none_or_cleared(self, hermes_home):
+        from hermes_cli.goals import GoalManager, agent_goal_context
+
+        assert agent_goal_context("missing-context-sid") == ""
+
+        mgr = GoalManager(session_id="cleared-context-sid")
+        mgr.set("temporary goal")
+        mgr.clear()
+
+        assert agent_goal_context("cleared-context-sid") == ""
+
     def test_evaluate_after_turn_done(self, hermes_home):
         """Judge says done → status=done, no continuation."""
         from hermes_cli import goals

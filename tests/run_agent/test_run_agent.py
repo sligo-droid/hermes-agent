@@ -4918,6 +4918,44 @@ class TestPersistUserMessageOverride:
         first_db_write = agent._session_db.append_message.call_args_list[0].kwargs
         assert first_db_write["content"] == "Hello there"
 
+    def test_goal_context_is_api_only(self, agent):
+        agent.session_id = "goal-context-session"
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="The goal is still active.",
+            finish_reason="stop",
+        )
+
+        with (
+            patch(
+                "hermes_cli.goals.agent_goal_context",
+                return_value=(
+                    "[Hermes /goal state]\n"
+                    "Status: active\n"
+                    "Turns: 1/5\n"
+                    "Goal: ship the patch"
+                ),
+            ),
+            patch.object(agent, "_save_session_log"),
+            patch.object(agent, "_flush_messages_to_session_db"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("did the goal finish?")
+
+        sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        sent_user = sent_messages[-1]
+        assert sent_user["role"] == "user"
+        assert "[Hermes /goal state]" in sent_user["content"]
+        assert "did the goal finish?" in sent_user["content"]
+
+        result_user = next(msg for msg in result["messages"] if msg.get("role") == "user")
+        assert result_user["content"] == "did the goal finish?"
+        assert "[Hermes /goal state]" not in result_user["content"]
+
 
 class TestReasoningReplayForStrictProviders:
     """Assistant replay must preserve provider-native reasoning fields."""
