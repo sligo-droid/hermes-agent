@@ -117,6 +117,10 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         )
 
     async def handle_proxy(request: "web.Request") -> "web.StreamResponse":
+        adapter_handler = getattr(adapter, "handle_proxy_request", None)
+        if callable(adapter_handler):
+            return await adapter_handler(request)
+
         # Extract the path *after* /v1
         rel_path = request.match_info.get("tail", "")
         rel_path = "/" + rel_path.lstrip("/")

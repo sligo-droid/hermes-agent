@@ -15,6 +15,7 @@ import pytest
 from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
 from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
+from hermes_cli.proxy.adapters.openai_codex import OpenAICodexAdapter
 
 
 # ---------------------------------------------------------------------------
@@ -22,8 +23,9 @@ from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
 # ---------------------------------------------------------------------------
 
 
-def test_registry_lists_nous():
+def test_registry_lists_supported_providers():
     assert "nous" in ADAPTERS
+    assert "openai-codex" in ADAPTERS
 
 
 def test_get_adapter_returns_instance():
@@ -35,11 +37,63 @@ def test_get_adapter_returns_instance():
 def test_get_adapter_case_insensitive():
     assert isinstance(get_adapter("NOUS"), NousPortalAdapter)
     assert isinstance(get_adapter("  Nous  "), NousPortalAdapter)
+    assert isinstance(get_adapter("OPENAI-CODEX"), OpenAICodexAdapter)
 
 
 def test_get_adapter_unknown_provider_raises():
     with pytest.raises(ValueError, match="anthropic"):
         get_adapter("anthropic")  # not yet implemented
+
+
+# ---------------------------------------------------------------------------
+# OpenAICodexAdapter
+# ---------------------------------------------------------------------------
+
+
+def test_codex_adapter_metadata():
+    adapter = OpenAICodexAdapter()
+    assert adapter.name == "openai-codex"
+    assert adapter.display_name == "OpenAI Codex"
+    assert "/chat/completions" in adapter.allowed_paths
+    assert "/models" in adapter.allowed_paths
+
+
+def test_codex_adapter_not_authenticated_when_credentials_missing(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.resolve_codex_runtime_credentials",
+        MagicMock(side_effect=RuntimeError("missing")),
+    )
+    assert not OpenAICodexAdapter().is_authenticated()
+
+
+def test_codex_adapter_get_credential(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.resolve_codex_runtime_credentials",
+        MagicMock(return_value={
+            "api_key": "codex-token",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        }),
+    )
+    cred = OpenAICodexAdapter().get_credential()
+    assert cred.bearer == "codex-token"
+    assert cred.base_url == "https://chatgpt.com/backend-api/codex"
+
+
+def test_codex_adapter_response_format_conversion():
+    fmt = OpenAICodexAdapter._responses_text_format({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "Thing",
+            "schema": {"type": "object", "properties": {"x": {"type": "string"}}},
+            "strict": True,
+        },
+    })
+    assert fmt == {
+        "type": "json_schema",
+        "name": "Thing",
+        "schema": {"type": "object", "properties": {"x": {"type": "string"}}},
+        "strict": True,
+    }
 
 
 # ---------------------------------------------------------------------------
