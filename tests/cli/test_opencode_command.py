@@ -11,7 +11,7 @@ from hermes_cli.commands import COMMAND_REGISTRY
 
 def _bare_cli():
     cli = object.__new__(HermesCLI)
-    cli._opencode_mode = True
+    cli._opencode_mode = False
     cli._opencode_env_cache = None
     cli._opencode_env_cache_at = 0.0
     cli.model = "gpt-5.4"
@@ -105,7 +105,7 @@ def test_inspect_opencode_environment_extracts_version_and_credentials(monkeypat
     assert status["error"] == ""
 
 
-def test_opencode_status_reports_mode_readiness_and_credentials(monkeypatch):
+def test_opencode_status_reports_integration_disabled(monkeypatch):
     cli = _bare_cli()
     output = []
     monkeypatch.setattr(cli_mod, "_cprint", lambda text: output.append(text))
@@ -114,32 +114,25 @@ def test_opencode_status_reports_mode_readiness_and_credentials(monkeypatch):
     cli._handle_opencode_command("/opencode status")
 
     text = "\n".join(output)
-    assert "OpenCode worker mode: ON" in text
-    assert "Readiness: ready" in text
-    assert "/bin/opencode" in text
-    assert "1.14.49" in text
-    assert "1 credentials" in text
-    assert "Usage: /opencode [on|off|status]" in text
+    assert "OpenCode worker mode: disabled" in text
+    assert "temporarily disabled" in text
 
 
-def test_opencode_on_refuses_blocked_environment(monkeypatch):
+def test_opencode_on_is_disabled_even_when_environment_ready(monkeypatch):
     cli = _bare_cli()
     output = []
     monkeypatch.setattr(cli_mod, "_cprint", lambda text: output.append(text))
-    monkeypatch.setattr(cli, "_inspect_opencode_environment", lambda refresh=False: _blocked_status())
+    monkeypatch.setattr(cli, "_inspect_opencode_environment", lambda refresh=False: _ready_status())
 
     cli._handle_opencode_command("/opencode on")
 
     assert cli._opencode_mode is False
     text = "\n".join(output)
-    assert "OpenCode worker mode: OFF" in text
-    assert "Readiness: blocked" in text
-    assert "OpenCode CLI not found in PATH" in text
+    assert "OpenCode worker mode: disabled" in text
 
 
-def test_opencode_on_enables_session_only_without_saving_config(monkeypatch):
+def test_opencode_on_does_not_save_config_while_disabled(monkeypatch):
     cli = _bare_cli()
-    cli._opencode_mode = False
     monkeypatch.setattr(cli_mod, "_cprint", lambda *_a, **_kw: None)
     monkeypatch.setattr(cli, "_inspect_opencode_environment", lambda refresh=False: _ready_status())
     save_config = MagicMock()
@@ -147,7 +140,7 @@ def test_opencode_on_enables_session_only_without_saving_config(monkeypatch):
 
     cli._handle_opencode_command("/opencode on")
 
-    assert cli._opencode_mode is True
+    assert cli._opencode_mode is False
     save_config.assert_not_called()
 
 
@@ -160,8 +153,19 @@ def test_opencode_off_disables_current_session_only(monkeypatch):
     assert cli._opencode_mode is False
 
 
-def test_build_opencode_prefix_for_coding_request():
+def test_build_opencode_prefix_skips_while_integration_disabled():
     cli = _bare_cli()
+    cli.preloaded_skills = ["hermes-agent"]
+
+    prefix = cli._build_opencode_prefix("implement the parser fix in src/parser.py")
+
+    assert prefix == ""
+
+
+def test_build_opencode_prefix_for_coding_request_when_reenabled(monkeypatch):
+    monkeypatch.setattr(cli_mod, "_OPENCODE_WORKER_INTEGRATION_ENABLED", True)
+    cli = _bare_cli()
+    cli._opencode_mode = True
     cli.preloaded_skills = ["hermes-agent"]
 
     prefix = cli._build_opencode_prefix("implement the parser fix in src/parser.py")
@@ -265,8 +269,10 @@ def test_risky_audit_escalates_to_max_even_when_hermes_reasoning_is_minimal():
     assert "auth" in reason
 
 
-def test_unclear_worker_task_uses_default_variant_guidance():
+def test_unclear_worker_task_uses_default_variant_guidance(monkeypatch):
+    monkeypatch.setattr(cli_mod, "_OPENCODE_WORKER_INTEGRATION_ENABLED", True)
     cli = _bare_cli()
+    cli._opencode_mode = True
 
     variant, reason = cli._choose_opencode_variant("use opencode for this worker task")
     prefix = cli._build_opencode_prefix("use opencode for this worker task")
@@ -330,15 +336,14 @@ def _chat_ready_cli():
     return cli
 
 
-def test_coding_chat_injects_opencode_prefix_and_persists_clean_user_message():
+def test_coding_chat_does_not_inject_opencode_prefix_while_disabled():
     cli = _chat_ready_cli()
 
     cli.chat("implement a small refactor in cli.py")
 
     kwargs = cli.agent.run_conversation.call_args.kwargs
-    assert kwargs["user_message"].startswith("[OpenCode worker mode is enabled")
-    assert kwargs["user_message"].endswith("implement a small refactor in cli.py")
-    assert kwargs["persist_user_message"] == "implement a small refactor in cli.py"
+    assert kwargs["user_message"] == "implement a small refactor in cli.py"
+    assert kwargs["persist_user_message"] is None
 
 
 def test_non_coding_chat_does_not_inject_opencode_prefix():
@@ -351,9 +356,9 @@ def test_non_coding_chat_does_not_inject_opencode_prefix():
     assert kwargs["persist_user_message"] is None
 
 
-def test_new_session_resets_opencode_mode_to_default_on(monkeypatch):
+def test_new_session_resets_opencode_mode_to_default_off(monkeypatch):
     cli = _bare_cli()
-    cli._opencode_mode = False
+    cli._opencode_mode = True
     cli.agent = None
     cli.conversation_history = []
     cli._session_db = None
@@ -364,10 +369,10 @@ def test_new_session_resets_opencode_mode_to_default_on(monkeypatch):
 
     cli.new_session(silent=True)
 
-    assert cli._opencode_mode is True
+    assert cli._opencode_mode is False
 
 
-def test_resume_resets_opencode_mode_to_default_on(monkeypatch):
+def test_resume_resets_opencode_mode_to_default_off(monkeypatch):
     import hermes_cli.main as main_mod
 
     class FakeSessionDB:
@@ -399,4 +404,4 @@ def test_resume_resets_opencode_mode_to_default_on(monkeypatch):
     cli._handle_resume_command("/resume target")
 
     assert cli.session_id == "target"
-    assert cli._opencode_mode is True
+    assert cli._opencode_mode is False
