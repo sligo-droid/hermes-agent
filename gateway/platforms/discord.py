@@ -3762,10 +3762,13 @@ class DiscordAdapter(BasePlatformAdapter):
             display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
             reason = f"Auto-threaded from mention by {display_name}"
             try:
-                seed_msg = await message.channel.send(f"\U0001f9f5 Thread created by Hermes: **{thread_name}**")
-                thread = await seed_msg.create_thread(
+                create = getattr(getattr(message, "channel", None), "create_thread", None)
+                if create is None:
+                    raise RuntimeError("channel does not support direct thread creation")
+                thread = await create(
                     name=thread_name,
                     auto_archive_duration=1440,
+                    type=discord.ChannelType.public_thread,
                     reason=reason,
                 )
                 return thread
