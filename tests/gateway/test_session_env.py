@@ -69,6 +69,40 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     runner._clear_session_env(tokens)
 
 
+def test_set_session_env_sets_project_contextvars(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_name="Sligo Labs / #pid / feature",
+        chat_type="thread",
+        project_name="PID",
+        project_path="/home/droid/.hermes/workspace/PID",
+        project_github_url="https://github.com/sligo-labs/pid",
+        project_channel_id="chan-1",
+    )
+    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+
+    for name in (
+        "HERMES_PROJECT_PATH",
+        "HERMES_PROJECT_NAME",
+        "HERMES_PROJECT_GITHUB_URL",
+        "HERMES_PROJECT_CHANNEL_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    tokens = runner._set_session_env(context)
+
+    assert get_session_env("HERMES_PROJECT_PATH") == "/home/droid/.hermes/workspace/PID"
+    assert get_session_env("HERMES_PROJECT_NAME") == "PID"
+    assert get_session_env("HERMES_PROJECT_GITHUB_URL") == "https://github.com/sligo-labs/pid"
+    assert get_session_env("HERMES_PROJECT_CHANNEL_ID") == "chan-1"
+
+    runner._clear_session_env(tokens)
+    assert get_session_env("HERMES_PROJECT_PATH") == ""
+    assert get_session_env("HERMES_PROJECT_NAME") == ""
+
+
 def test_clear_session_env_restores_previous_state(monkeypatch):
     """_clear_session_env should restore contextvars to their pre-handler values."""
     runner = object.__new__(GatewayRunner)
