@@ -198,6 +198,40 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
     assert event.text == "Build a deploy dashboard"
 
 
+@pytest.mark.asyncio
+async def test_project_channel_mapping_reaches_event_and_summary_handles(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+    project_context = {
+        "project_channel_id": "100",
+        "project_name": "PID",
+        "project_path": "/home/droid/.hermes/workspace/PID",
+        "project_github_url": "https://github.com/sligo-labs/pid",
+        "project_mapping_source": "manual",
+        "project_mapping_resolved": True,
+    }
+    monkeypatch.setattr(
+        discord_platform,
+        "resolve_discord_project_context",
+        lambda channel: SimpleNamespace(to_dict=lambda: dict(project_context)),
+    )
+
+    await adapter._handle_message(
+        _make_message(adapter, channel=parent, content="<@999> Build project telemetry")
+    )
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.project_channel_id == "100"
+    assert event.source.project_name == "PID"
+    assert event.source.project_path == "/home/droid/.hermes/workspace/PID"
+    assert event.source.project_github_url == "https://github.com/sligo-labs/pid"
+    assert event.project_summary["project_context"] == project_context
+    assert event.feature_summary["project_context"] == project_context
+
+
 def test_project_summary_topic_replaces_managed_line(adapter):
     topic = adapter._merge_project_summary_topic(
         "Project Summary: Project: Old | Repo: pending | Prod: pending\n\nKeep this note",
@@ -207,6 +241,26 @@ def test_project_summary_topic_replaces_managed_line(adapter):
     assert topic.startswith("Project Summary: Project: New")
     assert "Old" not in topic
     assert "Keep this note" in topic
+
+
+def test_project_metadata_does_not_fall_back_to_cwd_when_mapped_path_missing(adapter):
+    adapter._collect_discord_project_metadata = (
+        DiscordAdapter._collect_discord_project_metadata.__get__(adapter, DiscordAdapter)
+    )
+    adapter._summary_workdir = MagicMock(side_effect=AssertionError("should not use gateway cwd"))
+
+    metadata = adapter._collect_discord_project_metadata(
+        {
+            "project_name": "PID",
+            "project_path": "/missing/project/path",
+            "project_github_url": "git@github.com:sligo-labs/pid.git",
+            "project_mapping_resolved": True,
+        }
+    )
+
+    assert metadata["project_name"] == "PID"
+    assert metadata["repo_url"] == "https://github.com/sligo-labs/pid"
+    assert metadata["branch"] is None
 
 
 @pytest.mark.asyncio

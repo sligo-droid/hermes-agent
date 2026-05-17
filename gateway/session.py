@@ -91,6 +91,12 @@ class SessionSource:
     guild_id: Optional[str] = None  # Discord guild / Slack workspace / Matrix server scope
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    project_name: Optional[str] = None
+    project_path: Optional[str] = None
+    project_github_url: Optional[str] = None
+    project_channel_id: Optional[str] = None
+    project_mapping_source: Optional[str] = None
+    project_mapping_resolved: Optional[bool] = None
     
     @property
     def description(self) -> str:
@@ -134,6 +140,18 @@ class SessionSource:
             d["parent_chat_id"] = self.parent_chat_id
         if self.message_id:
             d["message_id"] = self.message_id
+        if self.project_name:
+            d["project_name"] = self.project_name
+        if self.project_path:
+            d["project_path"] = self.project_path
+        if self.project_github_url:
+            d["project_github_url"] = self.project_github_url
+        if self.project_channel_id:
+            d["project_channel_id"] = self.project_channel_id
+        if self.project_mapping_source:
+            d["project_mapping_source"] = self.project_mapping_source
+        if self.project_mapping_resolved is not None:
+            d["project_mapping_resolved"] = self.project_mapping_resolved
         return d
 
     @classmethod
@@ -152,6 +170,12 @@ class SessionSource:
             guild_id=data.get("guild_id"),
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
+            project_name=data.get("project_name"),
+            project_path=data.get("project_path"),
+            project_github_url=data.get("project_github_url"),
+            project_channel_id=data.get("project_channel_id"),
+            project_mapping_source=data.get("project_mapping_source"),
+            project_mapping_resolved=data.get("project_mapping_resolved"),
         )
     
 
@@ -292,6 +316,37 @@ def build_session_context_prompt(
     # Channel topic (if available - provides context about the channel's purpose)
     if context.source.chat_topic:
         lines.append(f"**Channel Topic:** {context.source.chat_topic}")
+
+    if context.source.platform == Platform.DISCORD:
+        src = context.source
+        if src.project_path:
+            lines.append("")
+            lines.append("**Mapped Project:**")
+            if src.project_name:
+                lines.append(f"  - Name: {src.project_name}")
+            lines.append(f"  - Path: `{src.project_path}`")
+            if src.project_github_url:
+                lines.append(f"  - GitHub: {src.project_github_url}")
+            if src.project_channel_id:
+                lines.append(f"  - Discord project channel ID: `{src.project_channel_id}`")
+            lines.append(
+                "  - Rule: Messages in this Discord channel/thread are about this "
+                "mapped project, not the Hermes Agent codebase, unless the user "
+                "explicitly asks about Hermes itself."
+            )
+            lines.append(
+                "  - Working directory: Gateway tools may start from Hermes home; "
+                "use this project path explicitly for project files and commands."
+            )
+        elif src.project_mapping_resolved is False:
+            lines.append("")
+            lines.append(
+                "**Mapped Project:** unresolved. This Discord channel looks like a "
+                "project channel, but Hermes has no channel-ID mapping yet and found "
+                "no unique project directory. Do not assume this is the Hermes Agent "
+                "codebase; ask for or create an explicit project mapping before "
+                "editing files."
+            )
 
     # User identity.
     # In shared multi-user sessions (shared threads OR shared non-thread groups

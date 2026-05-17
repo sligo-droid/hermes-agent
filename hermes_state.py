@@ -33,7 +33,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -244,10 +244,30 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS discord_project_mappings (
+    guild_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    parent_channel_id TEXT,
+    channel_name TEXT,
+    guild_name TEXT,
+    project_key TEXT NOT NULL,
+    project_name TEXT,
+    project_path TEXT NOT NULL,
+    github_url TEXT,
+    source TEXT NOT NULL DEFAULT 'manual',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (guild_id, channel_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_discord_project_mappings_parent
+ON discord_project_mappings(guild_id, parent_channel_id);
+CREATE INDEX IF NOT EXISTS idx_discord_project_mappings_path
+ON discord_project_mappings(project_path);
 """
 
 FTS_SQL = """
@@ -2384,6 +2404,126 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    # ── Discord project-channel mappings ──
+
+    def get_discord_project_mapping(
+        self,
+        *,
+        guild_id: str,
+        channel_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the mapped project for a Discord guild/channel, if present."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM discord_project_mappings
+                WHERE guild_id = ? AND channel_id = ?
+                """,
+                (str(guild_id), str(channel_id)),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_discord_project_mapping(
+        self,
+        *,
+        guild_id: str,
+        channel_id: str,
+        project_key: str,
+        project_path: str,
+        parent_channel_id: Optional[str] = None,
+        channel_name: Optional[str] = None,
+        guild_name: Optional[str] = None,
+        project_name: Optional[str] = None,
+        github_url: Optional[str] = None,
+        source: str = "manual",
+    ) -> Dict[str, Any]:
+        """Create or update a Discord channel → project mapping."""
+        now = time.time()
+        guild_id = str(guild_id)
+        channel_id = str(channel_id)
+        parent_channel_id = str(parent_channel_id) if parent_channel_id else None
+        channel_name = str(channel_name).strip() if channel_name else None
+        guild_name = str(guild_name).strip() if guild_name else None
+        project_key = str(project_key).strip()
+        project_name = str(project_name).strip() if project_name else None
+        project_path = str(project_path).strip()
+        github_url = str(github_url).strip() if github_url else None
+        source = str(source or "manual").strip() or "manual"
+
+        if not guild_id or not channel_id:
+            raise ValueError("guild_id and channel_id are required")
+        if not project_key or not project_path:
+            raise ValueError("project_key and project_path are required")
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO discord_project_mappings (
+                    guild_id, channel_id, parent_channel_id, channel_name,
+                    guild_name, project_key, project_name, project_path,
+                    github_url, source, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+                    parent_channel_id = excluded.parent_channel_id,
+                    channel_name = excluded.channel_name,
+                    guild_name = excluded.guild_name,
+                    project_key = excluded.project_key,
+                    project_name = excluded.project_name,
+                    project_path = excluded.project_path,
+                    github_url = excluded.github_url,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    guild_id,
+                    channel_id,
+                    parent_channel_id,
+                    channel_name,
+                    guild_name,
+                    project_key,
+                    project_name,
+                    project_path,
+                    github_url,
+                    source,
+                    now,
+                    now,
+                ),
+            )
+
+        self._execute_write(_do)
+        mapping = self.get_discord_project_mapping(
+            guild_id=guild_id,
+            channel_id=channel_id,
+        )
+        if mapping is None:
+            raise sqlite3.DatabaseError("discord project mapping upsert did not persist")
+        return mapping
+
+    def list_discord_project_mappings(
+        self,
+        *,
+        guild_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List Discord project mappings, optionally scoped to one guild."""
+        with self._lock:
+            if guild_id is None:
+                rows = self._conn.execute(
+                    """
+                    SELECT * FROM discord_project_mappings
+                    ORDER BY guild_name, channel_name, project_key
+                    """
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT * FROM discord_project_mappings
+                    WHERE guild_id = ?
+                    ORDER BY channel_name, project_key
+                    """,
+                    (str(guild_id),),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
     def apply_telegram_topic_migration(self) -> None:
         """Create Telegram DM topic-mode tables on explicit /topic opt-in.
 
@@ -2963,4 +3103,3 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
-
