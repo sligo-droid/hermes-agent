@@ -733,6 +733,16 @@ def _clear_backend_probe_cache() -> None:
     _BACKEND_PROBE_CACHE.clear()
 
 
+def _local_terminal_cwd() -> str | None:
+    cwd = os.getenv("TERMINAL_CWD")
+    if cwd:
+        return os.path.expanduser(cwd)
+    try:
+        return os.getcwd()
+    except OSError:
+        return None
+
+
 def build_environment_hints() -> str:
     """Return environment-specific guidance for the system prompt.
 
@@ -771,10 +781,9 @@ def build_environment_hints() -> str:
             host_lines.append(f"Host: {platform.system()} ({platform.release()})")
 
         host_lines.append(f"User home directory: {os.path.expanduser('~')}")
-        try:
-            host_lines.append(f"Current working directory: {os.getcwd()}")
-        except OSError:
-            pass
+        cwd = _local_terminal_cwd()
+        if cwd:
+            host_lines.append(f"Current working directory: {cwd}")
 
         if sys.platform == "win32" and not is_wsl():
             host_lines.append(
