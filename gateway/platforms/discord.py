@@ -887,14 +887,7 @@ class DiscordAdapter(BasePlatformAdapter):
         return re.sub(r"\s+", " ", text).strip(" -")
 
     def _clean_obsidian_access_text(self, value: str) -> str:
-        text = self._clean_obsidian_priority_text(value)
-        text = re.sub(
-            r"\b(password|pass|token|secret|api[ _-]?key|client[ _-]?secret)\b\s*[:=]\s*\S+",
-            lambda m: f"{m.group(1)}: [redacted]",
-            text,
-            flags=re.IGNORECASE,
-        )
-        return text
+        return self._clean_obsidian_priority_text(value)
 
     def _compact_obsidian_lines(self, lines: List[str], *, limit: int) -> Optional[str]:
         cleaned_lines = [line for line in lines if line]
