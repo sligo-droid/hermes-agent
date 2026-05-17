@@ -61,6 +61,28 @@ class TestSessionSourceRoundtrip:
         assert restored.chat_topic == "Planning and coordination for Project X"
         assert restored.chat_name == "Server / #project-planning"
 
+    def test_full_roundtrip_with_project_context(self):
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-123",
+            chat_name="Sligo Labs / #pid / feature",
+            chat_type="thread",
+            project_name="PID",
+            project_path="/home/droid/.hermes/workspace/PID",
+            project_github_url="https://github.com/sligo-labs/pid",
+            project_channel_id="chan-123",
+            project_mapping_source="manual",
+            project_mapping_resolved=True,
+        )
+        restored = SessionSource.from_dict(source.to_dict())
+
+        assert restored.project_name == "PID"
+        assert restored.project_path == "/home/droid/.hermes/workspace/PID"
+        assert restored.project_github_url == "https://github.com/sligo-labs/pid"
+        assert restored.project_channel_id == "chan-123"
+        assert restored.project_mapping_source == "manual"
+        assert restored.project_mapping_resolved is True
+
     def test_minimal_roundtrip(self):
         source = SessionSource(platform=Platform.LOCAL, chat_id="cli")
         d = source.to_dict()
@@ -280,6 +302,61 @@ class TestBuildSessionContextPrompt:
 
         assert "Discord" in prompt
         assert "**Channel Topic:** Planning and coordination for Project X" in prompt
+
+    def test_discord_prompt_includes_mapped_project_context(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    token="fake-discord-token",
+                ),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-123",
+            chat_name="Sligo Labs / #pid / feature",
+            chat_type="thread",
+            parent_chat_id="chan-123",
+            thread_id="thread-123",
+            project_name="PID",
+            project_path="/home/droid/.hermes/workspace/PID",
+            project_github_url="https://github.com/sligo-labs/pid",
+            project_channel_id="chan-123",
+            project_mapping_source="manual",
+            project_mapping_resolved=True,
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "**Mapped Project:**" in prompt
+        assert "`/home/droid/.hermes/workspace/PID`" in prompt
+        assert "not the Hermes Agent codebase" in prompt
+        assert "use this project path explicitly" in prompt
+
+    def test_discord_prompt_marks_unresolved_project_channel(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    token="fake-discord-token",
+                ),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chan-123",
+            chat_name="Sligo Labs / #pid",
+            chat_type="group",
+            project_channel_id="chan-123",
+            project_mapping_source="unresolved",
+            project_mapping_resolved=False,
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "Mapped Project:** unresolved" in prompt
+        assert "Do not assume this is the Hermes Agent codebase" in prompt
 
     def test_prompt_omits_channel_topic_when_none(self):
         """Channel Topic line should NOT appear when chat_topic is None."""

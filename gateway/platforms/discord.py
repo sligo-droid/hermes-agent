@@ -90,6 +90,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 from gateway.config import Platform, PlatformConfig
 import re
 
+from gateway.discord_project_mapping import resolve_discord_project_context
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker, strip_markdown
 from utils import atomic_json_write
 from gateway.platforms.base import (
@@ -745,16 +746,52 @@ class DiscordAdapter(BasePlatformAdapter):
             return f"https://{url.rstrip('/')}"
         return url
 
-    def _collect_discord_project_metadata(self) -> Dict[str, Optional[str]]:
-        cwd = self._summary_workdir()
+    def _collect_discord_project_metadata(
+        self,
+        project_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Optional[str]]:
+        project_context = project_context or {}
+        if project_context.get("project_mapping_resolved") is False:
+            project_name = str(project_context.get("channel_name") or "Unresolved Project").strip()
+            return {
+                "project_name": self._humanize_project_name(project_name),
+                "repo_url": None,
+                "production_url": None,
+                "branch": None,
+                "branch_url": None,
+                "pr_url": None,
+                "project_path": None,
+            }
+        mapped_path = str(project_context.get("project_path") or "").strip()
+        if mapped_path and not os.path.isdir(mapped_path):
+            project_name = (
+                str(project_context.get("project_name") or "").strip()
+                or self._humanize_project_name(_Path(mapped_path).name)
+            )
+            return {
+                "project_name": project_name,
+                "repo_url": self._normalize_github_remote_url(
+                    str(project_context.get("project_github_url") or "")
+                ),
+                "production_url": None,
+                "branch": None,
+                "branch_url": None,
+                "pr_url": None,
+                "project_path": mapped_path,
+            }
+        cwd = mapped_path if mapped_path and os.path.isdir(mapped_path) else self._summary_workdir()
         root = self._run_summary_cmd(["git", "rev-parse", "--show-toplevel"], cwd=cwd) or cwd
         remote = self._run_summary_cmd(["git", "remote", "get-url", "origin"], cwd=root)
-        repo_url = self._normalize_github_remote_url(remote)
+        repo_url = self._normalize_github_remote_url(
+            str(project_context.get("project_github_url") or "") or remote
+        )
         branch = self._run_summary_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
         if branch == "HEAD":
             branch = None
 
-        project_name = self._read_project_name_from_files(root)
+        project_name = str(project_context.get("project_name") or "").strip() or None
+        if not project_name:
+            project_name = self._read_project_name_from_files(root)
         if not project_name and repo_url:
             project_name = self._humanize_project_name(repo_url.rstrip("/").rsplit("/", 1)[-1])
         if not project_name:
@@ -796,6 +833,7 @@ class DiscordAdapter(BasePlatformAdapter):
             "branch": branch,
             "branch_url": branch_url,
             "pr_url": pr_url,
+            "project_path": root,
         }
 
     def _truncate_summary_value(self, value: Optional[str], *, limit: int = 220, default: str = "pending") -> str:
@@ -859,7 +897,12 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.warning("[%s] Failed to update Discord project summary topic: %s", self.name, exc)
             return False
 
-    async def initialize_project_summary(self, channel: Any) -> Optional[Dict[str, Any]]:
+    async def initialize_project_summary(
+        self,
+        channel: Any,
+        *,
+        project_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         if channel is None or isinstance(channel, discord.DMChannel):
             return None
         channel_id = str(getattr(channel, "id", "") or "")
@@ -871,7 +914,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if isinstance(previous, dict) and previous.get("success") is True:
             return None
 
-        metadata = self._collect_discord_project_metadata()
+        metadata = self._collect_discord_project_metadata(project_context)
         ok = await self._edit_project_summary_topic(channel, metadata)
         state[key] = {
             "channel_id": channel_id,
@@ -889,6 +932,7 @@ class DiscordAdapter(BasePlatformAdapter):
             "channel_id": channel_id,
             "state_key": key,
             "metadata": metadata,
+            "project_context": project_context,
             "_channel_obj": channel,
         }
 
@@ -901,7 +945,7 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         if channel is None:
             return False
-        metadata = self._collect_discord_project_metadata()
+        metadata = self._collect_discord_project_metadata(handle.get("project_context"))
         return await self._edit_project_summary_topic(channel, metadata)
 
     def _clean_summary_text(self, text: Optional[str], *, limit: int = 900, default: str = "Pending") -> str:
@@ -976,6 +1020,7 @@ class DiscordAdapter(BasePlatformAdapter):
         *,
         parent_channel: Any = None,
         initial_request: str = "",
+        project_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         if thread_channel is None or not hasattr(thread_channel, "send"):
             return None
@@ -983,6 +1028,7 @@ class DiscordAdapter(BasePlatformAdapter):
             embed = self._build_feature_summary_embed(
                 initial_request=initial_request,
                 status="Running",
+                metadata=self._collect_discord_project_metadata(project_context),
             )
             msg = await thread_channel.send(embed=embed)
         except Exception as exc:
@@ -993,6 +1039,7 @@ class DiscordAdapter(BasePlatformAdapter):
             "message_id": str(getattr(msg, "id", "") or ""),
             "parent_channel_id": str(getattr(parent_channel, "id", "") or ""),
             "initial_request": initial_request,
+            "project_context": project_context,
             "_thread_obj": thread_channel,
             "_message_obj": msg,
         }
@@ -1028,6 +1075,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 status=status,
                 outcome=final_response,
                 title=title,
+                metadata=self._collect_discord_project_metadata(handle.get("project_context")),
             )
             await msg.edit(embed=embed)
             return True
@@ -5221,6 +5269,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     and not replies_to_self
                 ):
                     return
+        project_context_obj = resolve_discord_project_context(message.channel)
+        project_context = project_context_obj.to_dict() if project_context_obj else None
         preprocessed_attachment_media: Dict[int, Tuple[str, str]] = {}
         direct_question_prompt = False
         feature_request_intent: Optional[bool] = None
@@ -5276,12 +5326,16 @@ class DiscordAdapter(BasePlatformAdapter):
         project_summary_handle = None
         feature_summary_handle = None
         if is_parent_channel_message and mention_prefix and direct_question_prompt is False:
-            project_summary_handle = await self.initialize_project_summary(message.channel)
+            project_summary_handle = await self.initialize_project_summary(
+                message.channel,
+                project_context=project_context,
+            )
         if auto_threaded_channel is not None:
             feature_summary_handle = await self.initialize_feature_summary(
                 auto_threaded_channel,
                 parent_channel=message.channel,
                 initial_request=normalized_content,
+                project_context=project_context,
             )
 
         # Determine message type
@@ -5348,6 +5402,12 @@ class DiscordAdapter(BasePlatformAdapter):
             guild_id=str(guild.id) if guild else None,
             parent_chat_id=parent_channel_id,
             message_id=str(message.id),
+            project_name=str(project_context.get("project_name") or "") if project_context else None,
+            project_path=str(project_context.get("project_path") or "") if project_context and project_context.get("project_path") else None,
+            project_github_url=str(project_context.get("project_github_url") or "") if project_context and project_context.get("project_github_url") else None,
+            project_channel_id=str(project_context.get("project_channel_id") or "") if project_context and project_context.get("project_channel_id") else None,
+            project_mapping_source=str(project_context.get("project_mapping_source") or "") if project_context else None,
+            project_mapping_resolved=bool(project_context.get("project_mapping_resolved")) if project_context else None,
         )
 
         # Build media URLs -- download image attachments to local cache so the
