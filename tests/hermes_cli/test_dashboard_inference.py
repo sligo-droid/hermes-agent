@@ -29,6 +29,8 @@ def test_dashboard_inference_rejects_empty_question():
 def test_dashboard_inference_answers_from_retrieved_context(monkeypatch):
     from hermes_cli import web_server
 
+    calls = []
+
     monkeypatch.setattr(
         web_server,
         "_dashboard_inference_context",
@@ -57,13 +59,17 @@ def test_dashboard_inference_answers_from_retrieved_context(monkeypatch):
             ],
         ),
     )
-    monkeypatch.setattr(
-        "agent.auxiliary_client.call_llm",
-        lambda *args, **kwargs: _llm_response("Session s1 covered voice messages."),
-    )
+    def fake_call_llm(*args, **kwargs):
+        calls.append((args, kwargs))
+        return _llm_response("Session s1 covered voice messages.")
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
 
     result = web_server._run_dashboard_inference("What happened with voice messages?")
 
     assert result["answer"] == "Session s1 covered voice messages."
     assert result["model"] == "test-model"
     assert result["matches"][0]["session_id"] == "s1"
+    assert calls[0][0] == ("session_search",)
+    assert calls[0][1]["provider"] == "openai-codex"
+    assert calls[0][1]["model"] == "gpt-5.4"
