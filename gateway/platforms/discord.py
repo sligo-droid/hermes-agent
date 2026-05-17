@@ -64,6 +64,12 @@ def _discord_live_voice_enabled() -> bool:
 _DISCORD_PROJECT_SUMMARY_STATE_FILENAME = "discord_project_summaries.json"
 _DISCORD_PROJECT_SUMMARY_PREFIX = "Project Summary:"
 _DISCORD_TOPIC_LIMIT = 1024
+_DISCORD_DIRECT_QUESTION_PROMPT = (
+    "This Discord trigger was classified as a direct question/request, not a "
+    "feature request. Answer in place. Do not start a branch, PR, deployment, "
+    "feature summary, or long-lived client-project coding workflow unless the "
+    "user explicitly asks for implementation work."
+)
 
 try:
     import discord
@@ -903,12 +909,20 @@ class DiscordAdapter(BasePlatformAdapter):
             return cleaned
         return cleaned[: limit - 3] + "..."
 
+    def _summary_status_label(self, status: str) -> str:
+        lower = str(status or "").strip().lower()
+        if lower in {"complete", "completed", "done", "success", "succeeded"}:
+            return "✅ Done"
+        if lower in {"failed", "failure", "error", "errored", "interrupted"}:
+            return "❌ Failed"
+        return "🔨 In progress"
+
     def _summary_color(self, status: str):
         try:
             lower = status.lower()
-            if lower == "complete":
+            if lower in {"complete", "completed", "done", "success", "succeeded"}:
                 return discord.Color.green()
-            if lower in {"failed", "interrupted"}:
+            if lower in {"failed", "failure", "error", "errored", "interrupted"}:
                 return discord.Color.red()
             return discord.Color.blue()
         except Exception:
@@ -926,15 +940,14 @@ class DiscordAdapter(BasePlatformAdapter):
         metadata = metadata or self._collect_discord_project_metadata()
         embed_kwargs = {
             "title": self._clean_summary_text(title, limit=240, default="Generating..."),
-            "description": self._clean_summary_text(initial_request, limit=350, default="No initial request text"),
         }
         color = self._summary_color(status)
         if color is not None:
             embed_kwargs["color"] = color
         embed = discord.Embed(**embed_kwargs)
         fields = [
-            ("Status", status, True),
-            ("Concise Outcome", self._clean_summary_text(outcome, limit=900, default="Pending"), False),
+            ("Status", self._summary_status_label(status), True),
+            ("Concise Outcome", self._clean_summary_text(outcome, limit=420, default="Pending"), False),
         ]
         if metadata.get("branch"):
             fields.append(("Branch", metadata["branch"], True))
@@ -1017,6 +1030,125 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[%s] Failed to update Discord feature summary: %s", self.name, exc)
             return False
+
+    def _heuristic_feature_request_intent(self, text: str) -> Optional[bool]:
+        cleaned = re.sub(r"<@[!&]?\d+>", "", str(text or "")).strip()
+        cleaned = re.sub(r"<#\d+>", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
+        if not cleaned:
+            return None
+
+        question_starts = (
+            "what ", "why ", "when ", "where ", "who ", "whose ", "which ",
+            "how ", "can you explain", "can you tell", "do you know",
+            "is there", "are there", "does ", "do ", "did ", "should ",
+            "would ", "could you explain", "status", "what's", "whats",
+        )
+        feature_starts = (
+            "build", "create", "add", "implement", "fix", "change", "update",
+            "remove", "delete", "ship", "deploy", "make", "refactor", "wire",
+            "integrate", "set up", "setup", "turn on", "enable", "disable",
+        )
+        feature_phrases = (
+            "please build", "please create", "please add", "please implement",
+            "can you build", "can you create", "can you add", "can you implement",
+            "we need to build", "we need a", "i need you to build",
+            "feature request", "new feature", "bug fix", "make the app",
+        )
+        direct_starts = (
+            "hello", "hi", "hey", "thanks", "thank you", "ok", "okay",
+            "quick question", "question:",
+        )
+
+        if cleaned.endswith("?") or cleaned.startswith(question_starts):
+            if not cleaned.startswith(feature_starts) and not any(p in cleaned for p in feature_phrases):
+                return False
+        if cleaned.startswith(feature_starts) or any(p in cleaned for p in feature_phrases):
+            return True
+        if cleaned in direct_starts or cleaned.startswith(tuple(f"{p} " for p in direct_starts)):
+            return False
+        return None
+
+    async def _classify_discord_feature_request(self, text: str) -> bool:
+        if not str(text or "").strip():
+            return False
+        heuristic = self._heuristic_feature_request_intent(text)
+        if heuristic is not None:
+            return heuristic
+
+        prompt = (
+            "Classify this Discord message for a software-development assistant.\n"
+            "Return exactly one word: feature or question.\n\n"
+            "feature = the user is asking Hermes to implement, change, fix, deploy, "
+            "or otherwise perform project work that should get a feature thread.\n"
+            "question = the user is asking for an explanation, status, advice, or "
+            "short direct answer, even if it is about code.\n\n"
+            f"Message:\n{text[:2000]}"
+        )
+        try:
+            from agent.auxiliary_client import call_llm
+
+            response = await asyncio.to_thread(
+                call_llm,
+                task="feature_summary_triage",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a strict intent classifier. Return only feature or question.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=8,
+                temperature=0,
+                timeout=8,
+            )
+            verdict = (response.choices[0].message.content or "").strip().lower()
+            if verdict.startswith("feature"):
+                return True
+            if verdict.startswith("question"):
+                return False
+        except Exception as exc:
+            logger.debug("[%s] Discord feature-request triage failed: %s", self.name, exc)
+
+        return False
+
+    async def _preprocess_voice_for_feature_triage(
+        self,
+        attachments: List[Any],
+        *,
+        message_is_voice: bool,
+    ) -> Tuple[Dict[int, Tuple[str, str]], str]:
+        if not message_is_voice:
+            return {}, ""
+
+        preprocessed: Dict[int, Tuple[str, str]] = {}
+        transcripts: List[str] = []
+        for att in attachments:
+            if not self._is_audio_attachment(att, message_is_voice=message_is_voice):
+                continue
+            try:
+                ext, media_type = self._audio_attachment_details(att)
+                cached_path = await self._cache_discord_audio(att, ext)
+                preprocessed[id(att)] = (cached_path, media_type)
+            except Exception as exc:
+                logger.debug("[%s] Discord voice triage cache failed: %s", self.name, exc)
+                continue
+            try:
+                from tools.transcription_tools import transcribe_audio
+
+                result = await asyncio.to_thread(transcribe_audio, cached_path)
+                if result.get("success"):
+                    transcript = str(result.get("transcript") or "").strip()
+                    if transcript:
+                        transcripts.append(transcript)
+            except Exception as exc:
+                logger.debug("[%s] Discord voice triage transcription failed: %s", self.name, exc)
+        return preprocessed, "\n".join(transcripts).strip()
+
+    def _append_direct_question_prompt(self, prompt: Optional[str]) -> str:
+        if prompt and prompt.strip():
+            return f"{prompt.strip()}\n\n{_DISCORD_DIRECT_QUESTION_PROMPT}"
+        return _DISCORD_DIRECT_QUESTION_PROMPT
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -4914,8 +5046,13 @@ class DiscordAdapter(BasePlatformAdapter):
                     and not replies_to_self
                 ):
                     return
-        # Auto-thread: when enabled, automatically create a thread for every
-        # @mention in a text channel so each conversation is isolated (like Slack).
+        preprocessed_attachment_media: Dict[int, Tuple[str, str]] = {}
+        direct_question_prompt = False
+        feature_request_intent: Optional[bool] = None
+
+        # Auto-thread: when enabled, automatically create a thread for feature
+        # requests in text channels so each implementation conversation is
+        # isolated. Direct questions stay in the parent channel.
         # Messages already inside threads or DMs are unaffected.
         # no_thread_channels: channels where bot responds directly without thread.
         auto_threaded_channel = None
@@ -4925,7 +5062,24 @@ class DiscordAdapter(BasePlatformAdapter):
             skip_thread = bool(channel_ids & no_thread_channels) or is_free_channel
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
-            if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
+            should_consider_auto_thread = (
+                auto_thread
+                and not skip_thread
+                and not is_voice_linked_channel
+                and not is_reply_message
+            )
+            if should_consider_auto_thread:
+                triage_text = normalized_content
+                if message_is_voice and not triage_text.strip():
+                    preprocessed_attachment_media, voice_triage_text = await self._preprocess_voice_for_feature_triage(
+                        all_attachments,
+                        message_is_voice=message_is_voice,
+                    )
+                    triage_text = voice_triage_text
+                feature_request_intent = await self._classify_discord_feature_request(triage_text)
+                direct_question_prompt = not feature_request_intent
+
+            if should_consider_auto_thread and feature_request_intent:
                 thread = await self._auto_create_thread(message)
                 if thread:
                     parent_channel_id = str(message.channel.id)
@@ -4934,9 +5088,19 @@ class DiscordAdapter(BasePlatformAdapter):
                     auto_threaded_channel = thread
                     self._threads.mark(thread_id)
 
+        if (
+            feature_request_intent is None
+            and (
+                (is_parent_channel_message and mention_prefix)
+                or (is_thread and (mention_prefix or replies_to_self))
+            )
+        ):
+            feature_request_intent = await self._classify_discord_feature_request(normalized_content)
+            direct_question_prompt = not feature_request_intent
+
         project_summary_handle = None
         feature_summary_handle = None
-        if is_parent_channel_message and mention_prefix:
+        if is_parent_channel_message and mention_prefix and direct_question_prompt is False:
             project_summary_handle = await self.initialize_project_summary(message.channel)
         if auto_threaded_channel is not None:
             feature_summary_handle = await self.initialize_feature_summary(
@@ -5028,8 +5192,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     media_types.append(content_type)
             elif self._is_audio_attachment(att, message_is_voice=message_is_voice):
                 try:
-                    ext, media_type = self._audio_attachment_details(att)
-                    cached_path = await self._cache_discord_audio(att, ext)
+                    preprocessed = preprocessed_attachment_media.get(id(att))
+                    if preprocessed:
+                        cached_path, media_type = preprocessed
+                    else:
+                        ext, media_type = self._audio_attachment_details(att)
+                        cached_path = await self._cache_discord_audio(att, ext)
                     media_urls.append(cached_path)
                     media_types.append(media_type)
                     print(f"[Discord] Cached user audio: {cached_path}", flush=True)
@@ -5105,6 +5273,8 @@ class DiscordAdapter(BasePlatformAdapter):
         _chan_id = str(getattr(_chan, "id", ""))
         _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
+        if direct_question_prompt:
+            _channel_prompt = self._append_direct_question_prompt(_channel_prompt)
 
         reply_to_id = None
         reply_to_text = None

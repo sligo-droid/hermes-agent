@@ -738,7 +738,7 @@ async def test_auto_thread_creates_thread_and_redirects(adapter, monkeypatch):
 
     adapter.handle_message = capture_handle
 
-    msg = _fake_message(_FakeTextChannel(), content="Hello world")
+    msg = _fake_message(_FakeTextChannel(), content="Build a deploy dashboard")
 
     await adapter._handle_message(msg)
 
@@ -766,7 +766,7 @@ async def test_auto_thread_enabled_by_default_slash_commands(adapter, monkeypatc
 
     adapter.handle_message = capture_handle
 
-    msg = _fake_message(_FakeTextChannel())
+    msg = _fake_message(_FakeTextChannel(), content="Build a deploy dashboard")
 
     await adapter._handle_message(msg)
 
