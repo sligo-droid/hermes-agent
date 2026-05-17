@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect } from 'react'
+import { useLayoutEffect } from 'react'
 import { useEventCallback } from 'usehooks-ts'
 
 import type { InputEvent, Key } from '../events/input-event.js'
@@ -83,7 +83,7 @@ const useInput = (inputHandler: Handler, options: Options = {}) => {
     }
   })
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     inputEmitter?.on('input', handleData)
 
     return () => {
