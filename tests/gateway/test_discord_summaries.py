@@ -132,8 +132,19 @@ def adapter(monkeypatch):
         "DISCORD_NO_THREAD_CHANNELS",
         "DISCORD_ALLOWED_CHANNELS",
         "DISCORD_IGNORED_CHANNELS",
+        "OBSIDIAN_VAULT_PATH",
+        "PRODUCTION_URL",
+        "NEXT_PUBLIC_SITE_URL",
+        "NEXT_PUBLIC_APP_URL",
+        "PUBLIC_URL",
+        "SITE_URL",
+        "APP_URL",
+        "DEPLOYMENT_URL",
+        "VERCEL_PROJECT_PRODUCTION_URL",
+        "VERCEL_URL",
     ):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", "/nonexistent/hermes-test-obsidian-vault")
 
     instance = DiscordAdapter(PlatformConfig(enabled=True, token="fake-token"))
     instance._client = SimpleNamespace(user=SimpleNamespace(id=999))
@@ -144,6 +155,7 @@ def adapter(monkeypatch):
             "project_name": "Hermes Project",
             "repo_url": "https://github.com/acme/hermes-project",
             "production_url": None,
+            "priorities": "pending",
             "branch": "feature/summary",
             "branch_url": "https://github.com/acme/hermes-project/tree/feature/summary",
             "pr_url": None,
@@ -151,7 +163,9 @@ def adapter(monkeypatch):
     )
     state = {}
     instance._read_project_summary_state = MagicMock(side_effect=lambda: dict(state))
-    instance._write_project_summary_state = MagicMock(side_effect=lambda value: state.clear() or state.update(value))
+    instance._write_project_summary_state = MagicMock(
+        side_effect=lambda value: state.clear() or state.update(value)
+    )
     return instance
 
 
@@ -181,7 +195,9 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
     )
 
     parent.edit.assert_awaited_once()
-    assert parent.topic.startswith("Project Summary: Project: Hermes Project")
+    assert parent.topic.startswith("Project Summary: Production URL: pending")
+    assert "GitHub URL: https://github.com/acme/hermes-project" in parent.topic
+    assert "Next priorities: pending" in parent.topic
     assert "Existing channel note" in parent.topic
     assert len(thread.sent) == 1
     sent_embed = thread.sent[0][0]["embed"]
@@ -228,19 +244,165 @@ async def test_project_channel_mapping_reaches_event_and_summary_handles(adapter
     assert event.source.project_name == "PID"
     assert event.source.project_path == "/home/droid/.hermes/workspace/PID"
     assert event.source.project_github_url == "https://github.com/sligo-labs/pid"
-    assert event.project_summary["project_context"] == project_context
+    assert event.project_summary["project_context"] == {
+        **project_context,
+        "channel_name": "general",
+    }
     assert event.feature_summary["project_context"] == project_context
 
 
 def test_project_summary_topic_replaces_managed_line(adapter):
     topic = adapter._merge_project_summary_topic(
         "Project Summary: Project: Old | Repo: pending | Prod: pending\n\nKeep this note",
-        "Project Summary: Project: New | Repo: repo | Prod: prod",
+        "Project Summary: Production URL: prod | GitHub URL: repo | Next priorities: New",
     )
 
-    assert topic.startswith("Project Summary: Project: New")
+    assert topic.startswith("Project Summary: Production URL: prod")
     assert "Old" not in topic
     assert "Keep this note" in topic
+
+
+def test_project_metadata_reads_obsidian_project_priorities(adapter, tmp_path, monkeypatch):
+    adapter._collect_discord_project_metadata = (
+        DiscordAdapter._collect_discord_project_metadata.__get__(adapter, DiscordAdapter)
+    )
+    vault = tmp_path / "vault"
+    projects = vault / "Projects"
+    projects.mkdir(parents=True)
+    (projects / "PID.md").write_text(
+        """---
+repo: https://github.com/sligo-labs/PID
+---
+
+Production dashboard: https://pid.sligo-labs.vercel.app
+
+## App access
+- Login required: yes
+- Credentials: use the shared demo account from the project note
+
+## Next actions
+- Ship Discord topic refresh from Obsidian
+- [ ] Add regression coverage
+- Validate channel topic in Discord
+
+## Later
+- Ignore this
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(vault))
+    adapter._summary_workdir = MagicMock(side_effect=AssertionError("should not use gateway cwd"))
+
+    metadata = adapter._collect_discord_project_metadata(
+        {
+            "project_name": "PID",
+            "project_key": "pid",
+            "project_path": "/missing/project/path",
+            "project_mapping_resolved": True,
+        }
+    )
+
+    assert metadata["production_url"] == "https://pid.sligo-labs.vercel.app"
+    assert metadata["repo_url"] == "https://github.com/sligo-labs/PID"
+    assert metadata["priorities"] == (
+        "Ship Discord topic refresh from Obsidian; "
+        "Add regression coverage; "
+        "Validate channel topic in Discord"
+    )
+    assert metadata["app_access"] == (
+        "Login required: yes; "
+        "Credentials: use the shared demo account from the project note"
+    )
+
+
+def test_project_summary_topic_contract_contains_required_labels(adapter):
+    topic = adapter._render_project_summary_line(
+        {
+            "production_url": "https://pid.sligo-labs.vercel.app",
+            "repo_url": "https://github.com/sligo-labs/PID",
+            "priorities": "Ship Discord topic refresh from Obsidian",
+        }
+    )
+
+    assert topic.startswith("Project Summary:")
+    assert "Production URL: https://pid.sligo-labs.vercel.app" in topic
+    assert "GitHub URL: https://github.com/sligo-labs/PID" in topic
+    assert "Next priorities: Ship Discord topic refresh from Obsidian" in topic
+    assert "Login:" not in topic
+    assert len(topic) <= 1024
+
+
+def test_project_summary_topic_includes_login_when_available(adapter):
+    topic = adapter._render_project_summary_line(
+        {
+            "production_url": "https://pid.sligo-labs.vercel.app",
+            "repo_url": "https://github.com/sligo-labs/PID",
+            "priorities": "Ship Discord topic refresh from Obsidian",
+            "app_access": "Login required: yes; Credentials: use the shared demo account from the project note",
+        }
+    )
+
+    assert "Login: Login required: yes; Credentials: use the shared demo account from the project note" in topic
+    assert len(topic) <= 1024
+
+
+def test_project_summary_refresh_signal_detects_priority_requests_and_documents(adapter):
+    assert adapter._project_summary_refresh_requested("Change the next priorities to scraper validation", [])
+    assert adapter._project_summary_refresh_requested(
+        "Please process this",
+        [SimpleNamespace(filename="requirements.pdf", content_type="application/pdf")],
+    )
+    assert not adapter._project_summary_refresh_requested("What is the repo URL?", [])
+
+
+def test_project_priorities_support_implementation_priority_pseudo_heading(adapter):
+    priorities = adapter._extract_obsidian_priorities(
+        """## Current Client Focus
+
+Implementation priority:
+
+1. Build Arizona SOS ingestion.
+2. Verify Maricopa registration ingestion.
+
+Scraper design rule: keep it small.
+"""
+    )
+
+    assert priorities == "Build Arizona SOS ingestion.; Verify Maricopa registration ingestion."
+
+
+def test_project_metadata_reads_obsidian_frontmatter_app_access(adapter, tmp_path, monkeypatch):
+    adapter._collect_discord_project_metadata = (
+        DiscordAdapter._collect_discord_project_metadata.__get__(adapter, DiscordAdapter)
+    )
+    vault = tmp_path / "vault"
+    projects = vault / "Projects"
+    projects.mkdir(parents=True)
+    (projects / "PID.md").write_text(
+        """---
+app_login: use the shared demo account from the project note
+credentials: username demo; password: secret-value
+login_required: yes
+---
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(vault))
+    adapter._summary_workdir = MagicMock(side_effect=AssertionError("should not use gateway cwd"))
+
+    metadata = adapter._collect_discord_project_metadata(
+        {
+            "project_name": "PID",
+            "project_path": "/missing/project/path",
+            "project_mapping_resolved": True,
+        }
+    )
+
+    assert metadata["app_access"] == (
+        "use the shared demo account from the project note; "
+        "username demo; password: [redacted]; "
+        "required"
+    )
 
 
 def test_project_metadata_does_not_fall_back_to_cwd_when_mapped_path_missing(adapter):
@@ -261,6 +423,40 @@ def test_project_metadata_does_not_fall_back_to_cwd_when_mapped_path_missing(ada
     assert metadata["project_name"] == "PID"
     assert metadata["repo_url"] == "https://github.com/sligo-labs/pid"
     assert metadata["branch"] is None
+
+
+@pytest.mark.asyncio
+async def test_project_summary_refreshes_after_previous_success(adapter):
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    key = adapter._project_summary_state_key(parent)
+    state = {
+        key: {
+            "channel_id": "100",
+            "guild_id": "5",
+            "attempted_at": 1,
+            "success": True,
+        }
+    }
+    adapter._read_project_summary_state = MagicMock(side_effect=lambda: dict(state))
+    adapter._write_project_summary_state = MagicMock(
+        side_effect=lambda value: state.clear() or state.update(value)
+    )
+    adapter._collect_discord_project_metadata = MagicMock(
+        return_value={
+            "production_url": "https://new.example.com",
+            "repo_url": "https://github.com/acme/new",
+            "priorities": "Refresh from Obsidian",
+        }
+    )
+
+    handle = await adapter.initialize_project_summary(parent)
+
+    parent.edit.assert_awaited_once()
+    assert handle is not None
+    assert "Production URL: https://new.example.com" in parent.topic
+    assert "Next priorities: Refresh from Obsidian" in parent.topic
+    assert "Existing channel note" in parent.topic
+    assert state[key]["success"] is True
 
 
 @pytest.mark.asyncio
@@ -334,6 +530,26 @@ async def test_tagged_question_answers_in_place_without_feature_summary(adapter,
     assert event.project_summary is None
     assert event.source.chat_id == "100"
     assert event.source.chat_type == "group"
+    assert "classified as a direct question/request" in event.channel_prompt
+
+
+@pytest.mark.asyncio
+async def test_tagged_priority_change_refreshes_project_summary_without_thread(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    adapter._auto_create_thread = AsyncMock()
+    adapter._classify_discord_feature_request = AsyncMock(return_value=False)
+
+    await adapter._handle_message(
+        _make_message(adapter, channel=parent, content="<@999> Change the next priorities to scraper validation")
+    )
+
+    parent.edit.assert_awaited_once()
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.feature_summary is None
+    assert event.project_summary["channel_id"] == "100"
     assert "classified as a direct question/request" in event.channel_prompt
 
 
