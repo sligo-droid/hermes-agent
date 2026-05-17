@@ -690,6 +690,34 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
                     agent._vprint(f"  {cute_msg}")
+        elif function_name == "delegate_codex_coding_task":
+            task_preview = (function_args.get("task") or "")[:30]
+            spinner_label = f"codex {task_preview}" if task_preview else "codex worker"
+            spinner = None
+            if agent._should_emit_quiet_tool_messages() and agent._should_start_quiet_spinner():
+                face = random.choice(KawaiiSpinner.get_waiting_faces())
+                spinner = KawaiiSpinner(
+                    f"{face} {spinner_label}",
+                    spinner_type="dots",
+                    print_fn=agent._print_fn,
+                )
+                spinner.start()
+            _codex_worker_result = None
+            try:
+                function_result = agent._dispatch_codex_coding_task(function_args)
+                _codex_worker_result = function_result
+            finally:
+                tool_duration = time.time() - tool_start_time
+                cute_msg = _get_cute_tool_message_impl(
+                    "delegate_codex_coding_task",
+                    function_args,
+                    tool_duration,
+                    result=_codex_worker_result,
+                )
+                if spinner:
+                    spinner.stop(cute_msg)
+                elif agent._should_emit_quiet_tool_messages():
+                    agent._vprint(f"  {cute_msg}")
         elif agent._context_engine_tool_names and function_name in agent._context_engine_tool_names:
             # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
             spinner = None

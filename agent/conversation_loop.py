@@ -279,6 +279,31 @@ def run_conversation(
     # Preserve the original user message (no nudge injection).
     original_user_message = persist_user_message if persist_user_message is not None else user_message
 
+    # API-only Codex worker guidance. Keep the persisted transcript clean:
+    # the prefix is steering for the current model call, not user content.
+    if isinstance(original_user_message, str) and isinstance(user_message, str):
+        try:
+            from hermes_cli.codex_worker_switch import (
+                build_worker_guidance,
+                get_enabled as _codex_worker_enabled,
+            )
+            from hermes_cli.config import load_config as _load_config
+
+            _codex_worker_prefix = build_worker_guidance(
+                original_user_message,
+                enabled=_codex_worker_enabled(_load_config()),
+                tool_available=(
+                    "delegate_codex_coding_task" in agent.valid_tool_names
+                ),
+                api_mode=getattr(agent, "api_mode", ""),
+            )
+        except Exception:
+            _codex_worker_prefix = ""
+        if _codex_worker_prefix:
+            if agent._persist_user_message_override is None:
+                agent._persist_user_message_override = original_user_message
+            user_message = f"{_codex_worker_prefix}{user_message}"
+
     # Track memory nudge trigger (turn-based, checked here).
     # Skill trigger is checked AFTER the agent loop completes, based on
     # how many tool iterations THIS turn used.
