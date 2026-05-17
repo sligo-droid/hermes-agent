@@ -38,7 +38,7 @@ const modelValueForConfigSet = (arg: string) => {
 }
 
 const reasoningStatus = (r: ConfigGetValueResponse | ConfigSetResponse) =>
-  `reasoning: ${r.effort || r.value} · display ${r.display || 'hide'} · fast ${r.fast || 'off'}`
+  `reasoning: ${r.effort || r.value} · fast ${r.fast || 'off'}`
 
 export const sessionCommands: SlashCommand[] = [
   {
