@@ -30,6 +30,8 @@ from tools.mcp_tool import _ENV_VAR_PATTERN
 logger = logging.getLogger(__name__)
 
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_MCP_PROBE_GRACE_TIMEOUT_SECONDS = 10.0
+_MCP_LOGIN_TIMEOUT_SECONDS = 300.0
 
 
 _MCP_PRESETS: Dict[str, Dict[str, Any]] = {
@@ -165,7 +167,10 @@ def _apply_mcp_preset(
 # ─── Discovery (temporary connect) ───────────────────────────────────────────
 
 def _probe_single_server(
-    name: str, config: dict, connect_timeout: float = 30
+    name: str,
+    config: dict,
+    connect_timeout: Optional[float] = 30,
+    overall_timeout: Optional[float] = None,
 ) -> List[Tuple[str, str]]:
     """Temporarily connect to one MCP server, list its tools, disconnect.
 
@@ -184,9 +189,13 @@ def _probe_single_server(
     tools_found: List[Tuple[str, str]] = []
 
     async def _probe():
-        server = await asyncio.wait_for(
-            _connect_server(name, config), timeout=connect_timeout
-        )
+        connect_coro = _connect_server(name, config)
+        if connect_timeout is None:
+            server = await connect_coro
+        else:
+            server = await asyncio.wait_for(
+                connect_coro, timeout=connect_timeout
+            )
         for t in server._tools:
             desc = getattr(t, "description", "") or ""
             # Truncate long descriptions for display
@@ -196,7 +205,12 @@ def _probe_single_server(
         await server.shutdown()
 
     try:
-        _run_on_mcp_loop(_probe(), timeout=connect_timeout + 10)
+        if overall_timeout is None:
+            if connect_timeout is None:
+                overall_timeout = _MCP_LOGIN_TIMEOUT_SECONDS
+            else:
+                overall_timeout = connect_timeout + _MCP_PROBE_GRACE_TIMEOUT_SECONDS
+        _run_on_mcp_loop(_probe(), timeout=overall_timeout)
     except BaseException as exc:
         raise _unwrap_exception_group(exc) from None
     finally:
@@ -630,7 +644,12 @@ def cmd_mcp_login(args):
 
     # Probe triggers the OAuth flow (browser redirect + callback capture).
     try:
-        tools = _probe_single_server(name, server_config)
+        tools = _probe_single_server(
+            name,
+            server_config,
+            connect_timeout=None,
+            overall_timeout=_MCP_LOGIN_TIMEOUT_SECONDS,
+        )
         if tools:
             _success(f"Authenticated — {len(tools)} tool(s) available")
         else:
