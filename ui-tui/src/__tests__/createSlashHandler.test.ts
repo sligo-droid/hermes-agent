@@ -134,7 +134,7 @@ describe('createSlashHandler', () => {
       expect(getUiState().showReasoning).toBe(true)
       expect(getUiState().sections.thinking).toBe('expanded')
     })
-    expect(ctx.transcript.sys).toHaveBeenCalledWith('reasoning: high · display show · fast on')
+    expect(ctx.transcript.sys).toHaveBeenCalledWith('reasoning: high · fast on')
   })
 
   it('opens the skills hub locally for bare /skills', () => {
