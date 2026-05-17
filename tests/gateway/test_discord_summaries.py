@@ -195,7 +195,7 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
     )
 
     parent.edit.assert_awaited_once()
-    assert parent.topic.startswith("Project Summary: Production URL: pending")
+    assert parent.topic.startswith("Project Summary:\nProduction URL: pending")
     assert "GitHub URL: https://github.com/acme/hermes-project" in parent.topic
     assert "Next priorities: pending" in parent.topic
     assert "Existing channel note" in parent.topic
@@ -253,12 +253,21 @@ async def test_project_channel_mapping_reaches_event_and_summary_handles(adapter
 
 def test_project_summary_topic_replaces_managed_line(adapter):
     topic = adapter._merge_project_summary_topic(
-        "Project Summary: Project: Old | Repo: pending | Prod: pending\n\nKeep this note",
-        "Project Summary: Production URL: prod | GitHub URL: repo | Next priorities: New",
+        (
+            "Project Summary:\n"
+            "Production URL: old\n"
+            "Login: old\n"
+            "GitHub URL: old\n"
+            "Next priorities: Old\n\n"
+            "This is the start of the #pid channel.\n"
+            "Keep this note"
+        ),
+        "Project Summary:\nProduction URL: prod\nLogin: demo / pass\nGitHub URL: repo\nNext priorities: New",
     )
 
-    assert topic.startswith("Project Summary: Production URL: prod")
+    assert topic.startswith("Project Summary:\nProduction URL: prod")
     assert "Old" not in topic
+    assert "This is the start" not in topic
     assert "Keep this note" in topic
 
 
@@ -329,6 +338,7 @@ def test_project_summary_topic_contract_contains_required_labels(adapter):
     assert "GitHub URL: https://github.com/sligo-labs/PID" in topic
     assert "Next priorities: Ship Discord topic refresh from Obsidian" in topic
     assert "Login:" not in topic
+    assert " | " not in topic
     assert len(topic) <= 1024
 
 
@@ -343,6 +353,13 @@ def test_project_summary_topic_includes_login_when_available(adapter):
     )
 
     assert "Login: Login required: yes; Credentials: use the shared demo account from the project note" in topic
+    assert topic.splitlines() == [
+        "Project Summary:",
+        "Production URL: https://pid.sligo-labs.vercel.app",
+        "Login: Login required: yes; Credentials: use the shared demo account from the project note",
+        "GitHub URL: https://github.com/sligo-labs/PID",
+        "Next priorities: Ship Discord topic refresh from Obsidian",
+    ]
     assert len(topic) <= 1024
 
 
