@@ -49,7 +49,7 @@ def _simulate_config_bridge(
                 val = terminal_cfg[cfg_key]
                 # Skip cwd placeholder values — don't overwrite already-resolved
                 # TERMINAL_CWD.  Mirrors the fix in gateway/run.py.
-                if cfg_key == "cwd" and str(val) in (".", "auto", "cwd"):
+                if cfg_key == "cwd" and str(val) in {".", "auto", "cwd"}:
                     continue
                 # Expand shell tilde so subprocess.Popen never receives a literal
                 # "~/" which the kernel rejects.

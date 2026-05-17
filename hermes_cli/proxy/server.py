@@ -76,7 +76,7 @@ def _filter_response_headers(headers) -> dict:
         if key.lower() in _HOP_BY_HOP_HEADERS:
             continue
         # aiohttp recomputes Content-Encoding/Content-Length on stream — let it.
-        if key.lower() in ("content-encoding", "content-length"):
+        if key.lower() in {"content-encoding", "content-length"}:
             continue
         out[key] = value
     return out
@@ -247,7 +247,7 @@ async def run_server(
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                loop.add_signal_handler(sig, stop_event.set)
+                loop.add_signal_handler(sig, stop_event.set)  # windows-footgun: ok
             except NotImplementedError:
                 # Windows / restricted environments — Ctrl+C will still
                 # raise KeyboardInterrupt and unwind us.
