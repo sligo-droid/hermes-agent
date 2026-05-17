@@ -20,32 +20,81 @@ const graphemes = (value: string) =>
     width: Math.max(1, stringWidth(segment))
   }))
 
+// Build VisualLines from wrap-ansi's output by mapping each emitted character
+// back to its original offset in `value`. wrap-ansi only INSERTS '\n' at wrap
+// boundaries — it never drops, reorders, or substitutes existing characters —
+// so a parallel walk uniquely identifies each line's source range.
+//
+// This used to be a hand-rolled word-wrap whose break points disagreed with
+// wrap-ansi in subtle but visible ways: exact-fill rows pushed the cursor to
+// a phantom next line, mid-word breaks landed one grapheme off, etc. The
+// composer's TextInput renders text via Ink's <Text wrap="wrap">, which
+// delegates to wrap-ansi — so any drift between the two algorithms parks the
+// hardware cursor several cells away from the last rendered character.
+// Sourcing both from wrap-ansi guarantees agreement.
 function visualLines(value: string, cols: number): VisualLine[] {
-  const width = Math.max(1, cols)
-  const lines: VisualLine[] = []
-  let sourceLineStart = 0
+  if (!value.length) {
+    return [{ start: 0, end: 0 }]
+  }
 
-  for (const sourceLine of value.split('\n')) {
-    if (!sourceLine.length) {
-      lines.push({ start: sourceLineStart, end: sourceLineStart })
-      sourceLineStart += 1
+  const width = Math.max(1, cols)
+  const wrapped = wrapAnsi(value, width, { hard: true, trim: false })
+  const lines: VisualLine[] = []
+
+  let originalIdx = 0
+  let lineStart = 0
+
+  for (let i = 0; i < wrapped.length; i += 1) {
+    const ch = wrapped[i]!
+
+    if (ch === '\n') {
+      // wrap-ansi inserts '\n' to mark a soft-wrap boundary OR copies a
+      // literal '\n' from the input. Either way the next char in `wrapped`
+      // begins a new visual line. If the source character is a hard '\n',
+      // consume it (it doesn't appear in either line). Otherwise the '\n'
+      // is purely a wrap marker and originalIdx stays put.
+      lines.push({ start: lineStart, end: originalIdx })
+      const isHardNewline = originalIdx < value.length && value[originalIdx] === '\n'
+
+      if (isHardNewline) {
+        originalIdx += 1
+      }
+
+      lineStart = originalIdx
       continue
     }
 
-    let searchFrom = 0
-
-    for (const wrapped of wrapAnsi(sourceLine, width, { hard: true, trim: false }).split('\n')) {
-      const start = sourceLine.indexOf(wrapped, searchFrom)
-      const lineStart = start >= 0 ? start : searchFrom
-      const lineEnd = lineStart + wrapped.length
-
-      lines.push({ start: sourceLineStart + lineStart, end: sourceLineStart + lineEnd })
-      searchFrom = lineEnd
+    // Defensive sync check. wrap-ansi (with `hard: true, trim: false`, no
+    // styled input) is documented to only insert '\n' at break points and
+    // never substitute, drop, or reorder source characters — so under those
+    // options `wrapped[i]` should always equal `value[originalIdx]`. But
+    // future option changes, library upgrades, or callers that start passing
+    // styled input (ANSI escapes) could violate that invariant silently. If
+    // they do, we'd slide `originalIdx` past the end of `value` and emit
+    // garbage line ranges with no diagnostic. Realign by scanning forward
+    // for the matching character; bail out (return whatever we have) if the
+    // sync is unrecoverable rather than producing wrong-but-plausible output.
+    if (originalIdx >= value.length) {
+      break
     }
 
-    sourceLineStart += sourceLine.length + 1
+    if (value[originalIdx] !== ch) {
+      const reSync = value.indexOf(ch, originalIdx)
+
+      if (reSync === -1) {
+        break
+      }
+
+      originalIdx = reSync
+    }
+
+    originalIdx += 1
   }
 
+  lines.push({ start: lineStart, end: originalIdx })
+
+  // wrap-ansi collapses an empty input into [""] which we already handled
+  // above; preserve the invariant that lines is never empty for any input.
   return lines.length ? lines : [{ start: 0, end: 0 }]
 }
 
@@ -62,6 +111,12 @@ function widthBetween(value: string, start: number, end: number) {
 /**
  * Mirrors the word-wrap behavior used by the composer TextInput.
  * Returns the zero-based visual line and column of the cursor cell.
+ *
+ * IMPORTANT: this MUST stay in lock-step with how Ink's `<Text wrap="wrap">`
+ * lays the value out (which uses `wrap-ansi`). Any divergence parks the
+ * hardware cursor several cells off the last rendered character — see the
+ * "cursor drift past blank cells" bug. `visualLines` is sourced directly
+ * from wrap-ansi to enforce that invariant.
  */
 export function cursorLayout(value: string, cursor: number, cols: number) {
   const pos = Math.max(0, Math.min(cursor, value.length))
@@ -78,14 +133,14 @@ export function cursorLayout(value: string, cursor: number, cols: number) {
   }
 
   const line = lines[lineIndex]!
-  let column = widthBetween(value, line.start, Math.min(pos, line.end))
+  const column = widthBetween(value, line.start, Math.min(pos, line.end))
 
-  // trailing cursor-cell overflows to the next row at the wrap column
-  if (column >= w) {
-    lineIndex++
-    column = 0
-  }
-
+  // NOTE: the previous implementation forced an extra line break when
+  // `column >= w` (the "trailing cursor-cell overflows" rule). With
+  // `visualLines` sourcing breaks from wrap-ansi, the line wrapping
+  // above already matches what Ink will actually render. Pushing the
+  // cursor onto a phantom next line here would re-introduce the same
+  // drift we're fixing, so we don't.
   return { column, line: lineIndex }
 }
 
