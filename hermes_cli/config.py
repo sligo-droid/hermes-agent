@@ -1210,6 +1210,14 @@ DEFAULT_CONFIG = {
         "subagent_auto_approve": False,
     },
 
+    # Codex coding worker — keeps Hermes on the normal runtime, but lets
+    # coding-shaped tasks delegate the implementation/debug/test step to a
+    # Codex app-server worker. On by default; disable with /codex-worker off.
+    "codex_worker": {
+        "enabled": True,
+        "turn_timeout_seconds": 1800,
+    },
+
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
     # injected at the start of every API call for few-shot priming.
     # Never saved to sessions, logs, or trajectories.

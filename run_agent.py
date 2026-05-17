@@ -3788,6 +3788,20 @@ class AIAgent:
             parent_agent=self,
         )
 
+    def _dispatch_codex_coding_task(self, function_args: dict) -> str:
+        """Single call site for delegate_codex_coding_task dispatch."""
+        from tools.codex_worker_tool import (
+            delegate_codex_coding_task as _delegate_codex_coding_task,
+        )
+
+        return _delegate_codex_coding_task(
+            task=function_args.get("task"),
+            context=function_args.get("context"),
+            cwd=function_args.get("cwd"),
+            turn_timeout_seconds=function_args.get("turn_timeout_seconds"),
+            parent_agent=self,
+        )
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None,
                      pre_tool_block_checked: bool = False) -> str:

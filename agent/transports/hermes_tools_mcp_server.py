@@ -29,8 +29,9 @@ What we DO NOT expose:
   - read_file / write_file / patch       — codex's apply_patch + shell
   - search_files / process               — codex's shell
   - clarify                              — codex's own UX
-  - delegate_task / memory /             — `_AGENT_LOOP_TOOLS` in Hermes
-    session_search / todo                  (model_tools.py). They require
+  - delegate_task / delegate_codex_coding_task /
+    memory / session_search / todo       — `_AGENT_LOOP_TOOLS` in Hermes
+                                           (model_tools.py). They require
                                            the running AIAgent context to
                                            dispatch (mid-loop state), so a
                                            stateless MCP callback can't
@@ -60,7 +61,8 @@ logger = logging.getLogger(__name__)
 #   - terminal / shell / read_file / write_file / patch / search_files /
 #     process — codex's built-ins cover these and approval routes through
 #     codex's own UI.
-#   - delegate_task / memory / session_search / todo — these are
+#   - delegate_task / delegate_codex_coding_task / memory / session_search /
+#     todo — these are
 #     `_AGENT_LOOP_TOOLS` in Hermes (model_tools.py:493). They require
 #     the running AIAgent context to dispatch (mid-loop state), so a
 #     stateless MCP callback can't drive them. Hermes' default runtime
