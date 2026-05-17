@@ -5,6 +5,7 @@ import { useGateway } from '../app/gatewayContext.js'
 import type { AppOverlaysProps } from '../app/interfaces.js'
 import { $overlayState, patchOverlayState } from '../app/overlayStore.js'
 import { $uiSessionId, $uiTheme } from '../app/uiStore.js'
+import { pagerContentWidth } from '../lib/pager.js'
 
 import { FloatBox } from './appChrome.js'
 import { MaskedPrompt } from './maskedPrompt.js'
@@ -105,6 +106,7 @@ export function FloatingOverlays({
   const theme = useStore($uiTheme)
 
   const hasAny = overlay.modelPicker || overlay.pager || overlay.picker || overlay.skillsHub || completions.length
+  const pagerWidth = pagerContentWidth(cols)
 
   if (!hasAny) {
     return null
@@ -150,7 +152,7 @@ export function FloatingOverlays({
 
       {overlay.pager && (
         <FloatBox color={theme.color.border}>
-          <Box flexDirection="column" paddingX={1} paddingY={1}>
+          <Box flexDirection="column" paddingX={1} paddingY={1} width={pagerWidth}>
             {overlay.pager.title && (
               <Box justifyContent="center" marginBottom={1}>
                 <Text bold color={theme.color.primary}>
@@ -160,7 +162,9 @@ export function FloatingOverlays({
             )}
 
             {overlay.pager.lines.slice(overlay.pager.offset, overlay.pager.offset + pagerPageSize).map((line, i) => (
-              <Text key={i}>{line}</Text>
+              <Text key={i} wrap="truncate-end">
+                {line || ' '}
+              </Text>
             ))}
 
             <Box marginTop={1}>
