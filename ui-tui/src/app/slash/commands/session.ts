@@ -406,7 +406,11 @@ export const sessionCommands: SlashCommand[] = [
               }))
             }
 
-            ctx.transcript.sys(`reasoning: ${r.value}`)
+            if (r.effort || r.display) {
+              ctx.transcript.sys(`reasoning: ${r.effort || r.value} · display ${r.display || 'hide'}`)
+            } else {
+              ctx.transcript.sys(`reasoning: ${r.value}`)
+            }
           })
         )
     }

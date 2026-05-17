@@ -98,6 +98,8 @@ export interface ConfigGetValueResponse {
 
 export interface ConfigSetResponse {
   credential_warning?: string
+  display?: string
+  effort?: string
   history_reset?: boolean
   info?: SessionInfo
   value?: string
