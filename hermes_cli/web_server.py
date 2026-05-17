@@ -474,6 +474,10 @@ class ModelAssignment(BaseModel):
     task: str = ""
 
 
+class DashboardInferenceRequest(BaseModel):
+    question: str
+
+
 _GATEWAY_HEALTH_URL = os.getenv("GATEWAY_HEALTH_URL")
 try:
     _GATEWAY_HEALTH_TIMEOUT = float(os.getenv("GATEWAY_HEALTH_TIMEOUT", "3"))
@@ -834,6 +838,152 @@ async def search_sessions(q: str = "", limit: int = 20):
     except Exception:
         _log.exception("GET /api/sessions/search failed")
         raise HTTPException(status_code=500, detail="Search failed")
+
+
+_DASHBOARD_INFERENCE_STOPWORDS = {
+    "about", "after", "again", "agent", "answer", "before", "between",
+    "can", "could", "dashboard", "database", "from", "have", "hermes", "input",
+    "into", "like", "natural", "query", "show", "some", "tell", "text",
+    "that", "their", "there", "these", "thing", "this", "those", "uses",
+    "want", "what", "when", "where", "which", "with", "would", "you", "your",
+}
+
+
+def _dashboard_inference_search_query(question: str) -> str:
+    """Build a forgiving FTS query for dashboard natural-language prompts."""
+    import re
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"[A-Za-z0-9_][A-Za-z0-9_-]{2,}", question.lower()):
+        if token in _DASHBOARD_INFERENCE_STOPWORDS or token in seen:
+            continue
+        seen.add(token)
+        terms.append(f"{token}*")
+        if len(terms) >= 8:
+            break
+    return " OR ".join(terms)
+
+
+def _dashboard_inference_context(question: str) -> tuple[list[dict], list[dict]]:
+    """Return relevant message matches plus recent sessions from state.db."""
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        query = _dashboard_inference_search_query(question)
+        matches = db.search_messages(query=query, limit=12) if query else []
+        recent = db.list_sessions_rich(limit=8)
+        return matches, recent
+    finally:
+        db.close()
+
+
+def _dashboard_inference_prompt(
+    question: str,
+    matches: list[dict],
+    recent_sessions: list[dict],
+) -> list[dict]:
+    context = {
+        "matches": matches,
+        "recent_sessions": [
+            {
+                "id": s.get("id"),
+                "title": s.get("title"),
+                "source": s.get("source"),
+                "model": s.get("model"),
+                "started_at": s.get("started_at"),
+                "last_active": s.get("last_active"),
+                "message_count": s.get("message_count"),
+                "preview": s.get("preview"),
+            }
+            for s in recent_sessions
+        ],
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You answer questions about the local Hermes state database. "
+                "Use only the JSON context supplied by the server. If the "
+                "context does not contain enough evidence, say what is missing. "
+                "Mention session ids or titles when they support the answer. "
+                "Do not invent database rows or claim you queried tables not "
+                "present in the context."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Question: {question}\n\n"
+                f"Read-only database context:\n{json.dumps(context, ensure_ascii=False)}"
+            ),
+        },
+    ]
+
+
+def _run_dashboard_inference(question: str) -> dict:
+    question = (question or "").strip()
+    if not question:
+        raise ValueError("Question is required")
+    if len(question) > 1000:
+        raise ValueError("Question must be 1000 characters or fewer")
+
+    matches, recent_sessions = _dashboard_inference_context(question)
+    if not matches and not recent_sessions:
+        return {
+            "answer": "No session data is available in the local Hermes state database yet.",
+            "model": None,
+            "matches": [],
+        }
+
+    from agent.auxiliary_client import call_llm, extract_content_or_reasoning
+
+    response = call_llm(
+        "session_search",
+        messages=_dashboard_inference_prompt(question, matches, recent_sessions),
+        temperature=0,
+        max_tokens=700,
+    )
+    answer = extract_content_or_reasoning(response).strip()
+    if not answer:
+        answer = "The model returned an empty answer."
+
+    return {
+        "answer": answer,
+        "model": getattr(response, "model", None),
+        "matches": [
+            {
+                "session_id": m.get("session_id"),
+                "role": m.get("role"),
+                "snippet": m.get("snippet"),
+                "source": m.get("source"),
+                "model": m.get("model"),
+                "session_started": m.get("session_started"),
+            }
+            for m in matches[:6]
+        ],
+    }
+
+
+@app.post("/api/dashboard/inference")
+async def dashboard_inference(body: DashboardInferenceRequest):
+    """Answer a natural-language question over read-only dashboard state."""
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            _run_dashboard_inference,
+            body.question,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        _log.warning("POST /api/dashboard/inference unavailable: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception:
+        _log.exception("POST /api/dashboard/inference failed")
+        raise HTTPException(status_code=500, detail="Inference failed")
 
 
 def _normalize_config_for_web(config: Dict[str, Any]) -> Dict[str, Any]:
