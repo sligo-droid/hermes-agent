@@ -16,8 +16,7 @@ main checkout).
 ## Hermes Code Changes
 
 When developing Hermes itself, work in a git worktree based on `main` and keep
-the main checkout clean. Commit completed Hermes code changes to this private
-Hermes repo before handing work back; do not leave dirty changes around unless
+the main checkout clean. Merge changes back to `main` when done; do not leave dirty changes around unless
 the user explicitly asks to pause before committing.
 
 ## Project Structure
@@ -1108,6 +1107,4 @@ not the specific names.
 Reviewers should reject new change-detector tests; authors should convert
 them into invariants before re-requesting review.
 
-### Hermes self-improvement
 
-When doing hermes self-improvement, use worktrees but merge back to main at the end. Don't cleanup the worktree in case another tweak is necessary.
