@@ -875,6 +875,25 @@ class TestEnvironmentHints:
         assert "hostname" not in result
         assert "WSL" not in result
 
+    def test_build_environment_hints_prefers_terminal_cwd_for_local_backend(self, monkeypatch, tmp_path):
+        import agent.prompt_builder as _pb
+        import sys, platform
+        process_cwd = tmp_path / "process"
+        terminal_cwd = tmp_path / "terminal"
+        process_cwd.mkdir()
+        terminal_cwd.mkdir()
+        monkeypatch.chdir(process_cwd)
+        monkeypatch.setenv("TERMINAL_CWD", str(terminal_cwd))
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(platform, "system", lambda: "Linux")
+        monkeypatch.setattr(platform, "release", lambda: "6.8.0-generic")
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+        _pb._clear_backend_probe_cache()
+        result = _pb.build_environment_hints()
+        assert f"Current working directory: {terminal_cwd}" in result
+        assert f"Current working directory: {process_cwd}" not in result
+
     def test_build_environment_hints_on_windows_local(self, monkeypatch):
         import agent.prompt_builder as _pb
         import sys
@@ -1186,6 +1205,5 @@ class TestOpenAIModelExecutionGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
 
