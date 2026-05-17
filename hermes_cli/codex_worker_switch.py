@@ -109,13 +109,72 @@ def looks_like_coding_request(message: str) -> bool:
     if text.startswith("[IMPORTANT: Background process "):
         return False
 
+    # If a platform/client echoes the API-only worker guidance back into a
+    # later turn, ignore that synthetic block before classifying the user's
+    # actual request. Otherwise the words "implementation, debugging, ..."
+    # inside the guidance make every echoed turn look coding-shaped.
+    if text.startswith("[Codex worker mode is enabled."):
+        end = text.find("]")
+        if end != -1:
+            text = text[end + 1 :].strip()
+            if not text:
+                return False
+
     lower = text.lower()
+
+    # Meta/config/performance questions about the worker itself should stay in
+    # Hermes-land. A bare mention of codex-worker is not a request to delegate.
+    worker_terms = (
+        "codex worker",
+        "codex-worker",
+        "delegate_codex_coding_task",
+        "codex app-server",
+        "codex app server",
+        "openai_runtime",
+    )
+    meta_terms = (
+        "why",
+        "what",
+        "how",
+        "when",
+        "where",
+        "performance",
+        "slow",
+        "slower",
+        "latency",
+        "overhead",
+        "responsible",
+        "difference",
+        "compare",
+        "comparison",
+        "benchmark",
+        "test comparing",
+        "turn on",
+        "turn off",
+        "enable",
+        "disable",
+        "enabled",
+        "status",
+        "config",
+        "configuration",
+        "runtime",
+        "heuristic",
+        "invoking",
+        "routing",
+    )
+    if any(term in lower for term in worker_terms) and any(
+        re.search(rf"\b{re.escape(term)}\b", lower)
+        if term.isalpha()
+        else term in lower
+        for term in meta_terms
+    ):
+        return False
+
     explicit_phrases = (
         "use codex worker",
         "with codex worker",
         "delegate to codex",
         "codex coding task",
-        "codex-worker",
     )
     if any(phrase in lower for phrase in explicit_phrases):
         return True
