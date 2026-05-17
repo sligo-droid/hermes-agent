@@ -863,52 +863,6 @@ def _is_control_interrupt_message(message: Optional[str]) -> bool:
     return normalized in _CONTROL_INTERRUPT_MESSAGES
 
 
-_LATE_CANCEL_PATTERNS = (
-    re.compile(r"\b(?:nvm|nevermind|never\s+mind)\b", re.IGNORECASE),
-    re.compile(r"\b(?:scratch\s+that|forget\s+it)\b", re.IGNORECASE),
-    re.compile(
-        r"^\s*(?:please\s+)?(?:cancel|abort)(?:\s+(?:(?:that|it|this)(?:\s+(?:request|task|change|work))?|the\s+(?:request|task|change|work)))?\s*[.!?]*$",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(?:do\s+not|don't)\b.{0,80}\b(?:ship|merge|continue|proceed|do\s+that)\b",
-        re.IGNORECASE,
-    ),
-)
-
-
-def _is_late_cancel_intent(message: Optional[str]) -> bool:
-    """Return True when a queued follow-up clearly cancels the just-finished turn."""
-    if not message:
-        return False
-    normalized = " ".join(str(message).strip().split())
-    if not normalized:
-        return False
-    return any(pattern.search(normalized) for pattern in _LATE_CANCEL_PATTERNS)
-
-
-def _should_send_first_response_before_queued_followup(
-    result: Optional[dict],
-    stream_consumer: Any,
-    pending_text: Optional[str],
-) -> bool:
-    """Decide whether to deliver a completed response before a queued follow-up."""
-    if not isinstance(result, dict):
-        return False
-    first_response = result.get("final_response", "")
-    if not first_response:
-        return False
-    if _is_late_cancel_intent(pending_text):
-        return False
-    previewed = bool(result.get("response_previewed"))
-    already_streamed = bool(
-        (stream_consumer and getattr(stream_consumer, "final_response_sent", False))
-        or previewed
-        or (stream_consumer and getattr(stream_consumer, "final_content_delivered", False))
-    )
-    return not already_streamed
-
-
 def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None]:
     """Derive the /command slug and declared frontmatter name from a SKILL.md.
 
@@ -16659,14 +16613,14 @@ class GatewayRunner:
                                 pass
                         except Exception as e:
                             logger.debug("Stream consumer wait before queued message failed: %s", e)
-                    first_response = result.get("final_response", "")
-                    _late_cancel_intent = _is_late_cancel_intent(pending)
-                    _send_first_response = _should_send_first_response_before_queued_followup(
-                        result,
-                        _sc,
-                        pending,
+                    _previewed = bool(result.get("response_previewed"))
+                    _already_streamed = bool(
+                        (_sc and getattr(_sc, "final_response_sent", False))
+                        or _previewed
+                        or (_sc and getattr(_sc, "final_content_delivered", False))
                     )
-                    if first_response and _send_first_response:
+                    first_response = result.get("final_response", "")
+                    if first_response and not _already_streamed:
                         try:
                             logger.info(
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
@@ -16679,11 +16633,6 @@ class GatewayRunner:
                             )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
-                    elif first_response and _late_cancel_intent:
-                        logger.info(
-                            "Queued follow-up for session %s: suppressing stale first response because follow-up looks like cancellation intent.",
-                            session_key or "?",
-                        )
                     elif first_response:
                         logger.info(
                             "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
