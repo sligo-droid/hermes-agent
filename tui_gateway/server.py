@@ -3949,6 +3949,10 @@ def _(rid, params: dict) -> dict:
             arg = str(value or "").strip().lower()
             if arg in {"show", "on"}:
                 cfg = _load_cfg()
+                effort = str(
+                    (cfg.get("agent") or {}).get("reasoning_effort", "medium")
+                    or "medium"
+                )
                 display = (
                     cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
                 )
@@ -3964,9 +3968,16 @@ def _(rid, params: dict) -> dict:
                 _save_cfg(cfg)
                 if session:
                     session["show_reasoning"] = True
-                return _ok(rid, {"key": key, "value": "show"})
+                return _ok(
+                    rid,
+                    {"key": key, "value": "show", "effort": effort, "display": "show"},
+                )
             if arg in {"hide", "off"}:
                 cfg = _load_cfg()
+                effort = str(
+                    (cfg.get("agent") or {}).get("reasoning_effort", "medium")
+                    or "medium"
+                )
                 display = (
                     cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
                 )
@@ -3982,7 +3993,10 @@ def _(rid, params: dict) -> dict:
                 _save_cfg(cfg)
                 if session:
                     session["show_reasoning"] = False
-                return _ok(rid, {"key": key, "value": "hide"})
+                return _ok(
+                    rid,
+                    {"key": key, "value": "hide", "effort": effort, "display": "hide"},
+                )
 
             parsed = parse_reasoning_effort(arg)
             if parsed is None:

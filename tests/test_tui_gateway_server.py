@@ -1629,6 +1629,8 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
         }
     )
     assert resp_show["result"]["value"] == "show"
+    assert resp_show["result"]["effort"] == "low"
+    assert resp_show["result"]["display"] == "show"
     assert server._sessions["sid"]["show_reasoning"] is True
     assert server._load_cfg()["display"]["sections"]["thinking"] == "expanded"
 
@@ -1640,6 +1642,8 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
         }
     )
     assert resp_hide["result"]["value"] == "hide"
+    assert resp_hide["result"]["effort"] == "low"
+    assert resp_hide["result"]["display"] == "hide"
     assert server._sessions["sid"]["show_reasoning"] is False
     assert server._load_cfg()["display"]["sections"]["thinking"] == "hidden"
 
