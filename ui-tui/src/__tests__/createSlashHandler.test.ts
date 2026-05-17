@@ -124,7 +124,7 @@ describe('createSlashHandler', () => {
     const ctx = buildCtx({
       gateway: {
         ...buildGateway(),
-        rpc: vi.fn(() => Promise.resolve({ value: 'show', effort: 'high', display: 'show' }))
+        rpc: vi.fn(() => Promise.resolve({ value: 'show', effort: 'high', display: 'show', fast: 'on' }))
       }
     })
 
@@ -134,7 +134,7 @@ describe('createSlashHandler', () => {
       expect(getUiState().showReasoning).toBe(true)
       expect(getUiState().sections.thinking).toBe('expanded')
     })
-    expect(ctx.transcript.sys).toHaveBeenCalledWith('reasoning: high · display show')
+    expect(ctx.transcript.sys).toHaveBeenCalledWith('reasoning: high · display show · fast on')
   })
 
   it('opens the skills hub locally for bare /skills', () => {
