@@ -10837,7 +10837,7 @@ Examples:
     skills_parser = subparsers.add_parser(
         "skills",
         help="Search, install, configure, and manage skills",
-        description="Search, install, inspect, audit, configure, and manage skills from skills.sh, well-known agent skill endpoints, GitHub, ClawHub, and other registries.",
+        description="Search, install, inspect, audit, configure, and manage skills from HermesHub, skills.sh, well-known agent skill endpoints, GitHub, ClawHub, and other registries.",
     )
     skills_subparsers = skills_parser.add_subparsers(dest="skills_action")
 
@@ -10856,6 +10856,7 @@ Examples:
         choices=[
             "all",
             "official",
+            "hermeshub",
             "skills-sh",
             "well-known",
             "github",
@@ -10875,6 +10876,7 @@ Examples:
         choices=[
             "all",
             "official",
+            "hermeshub",
             "skills-sh",
             "well-known",
             "github",

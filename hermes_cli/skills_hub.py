@@ -301,7 +301,7 @@ def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
     # Per-source limits are generous — parallelism + 30s timeout cap prevents hangs.
     _TRUST_RANK = {"builtin": 3, "trusted": 2, "community": 1}
     _PER_SOURCE_LIMIT = {
-        "official": 200, "skills-sh": 200, "well-known": 50,
+        "official": 200, "hermeshub": 200, "skills-sh": 200, "well-known": 50,
         "github": 200, "clawhub": 500, "claude-marketplace": 100,
         "lobehub": 500,
     }
@@ -683,7 +683,7 @@ def browse_skills(page: int = 1, page_size: int = 20, source: str = "all") -> di
 
     page_size = max(1, min(page_size, 100))
     _TRUST_RANK = {"builtin": 3, "trusted": 2, "community": 1}
-    _PER_SOURCE_LIMIT = {"official": 100, "skills-sh": 100, "well-known": 25, "github": 100, "clawhub": 50,
+    _PER_SOURCE_LIMIT = {"official": 100, "hermeshub": 100, "skills-sh": 100, "well-known": 25, "github": 100, "clawhub": 50,
                          "claude-marketplace": 50, "lobehub": 50}
     auth = GitHubAuth()
     sources = create_source_router(auth)
@@ -1435,7 +1435,7 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
 
     elif action == "search":
         if not args:
-            c.print("[bold red]Usage:[/] /skills search <query> [--source skills-sh|well-known|github|official] [--limit N]\n")
+            c.print("[bold red]Usage:[/] /skills search <query> [--source hermeshub|skills-sh|well-known|github|official] [--limit N]\n")
             return
         source = "all"
         limit = 10

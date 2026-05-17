@@ -10,6 +10,7 @@ import pytest
 from tools.skills_hub import (
     GitHubAuth,
     GitHubSource,
+    HermesHubSource,
     LobeHubSource,
     SkillsShSource,
     UrlSource,
@@ -471,6 +472,98 @@ class TestSkillsShSource:
         assert result == "owner/repo/product-team/product-designer"
         requested_urls = [call.args[0] for call in mock_get.call_args_list]
         assert root_url not in requested_urls
+
+
+# ---------------------------------------------------------------------------
+# HermesHubSource
+# ---------------------------------------------------------------------------
+
+
+class TestHermesHubSource:
+    def _source(self):
+        auth = MagicMock(spec=GitHubAuth)
+        return HermesHubSource(auth=auth)
+
+    @patch("tools.skills_hub._write_index_cache")
+    @patch("tools.skills_hub._read_index_cache", return_value=None)
+    @patch("tools.skills_hub._guarded_http_get")
+    def test_search_maps_catalog_to_hermeshub_identifiers(
+        self,
+        mock_get,
+        _mock_read_cache,
+        _mock_write_cache,
+    ):
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "github-workflow": {
+                    "displayName": "GitHub Workflow",
+                    "description": "Clone, branch, commit, push, and open PRs.",
+                    "category": "development",
+                    "featured": True,
+                    "installCount": 42,
+                },
+                "data-analyst": {
+                    "displayName": "Data Analyst",
+                    "description": "SQL and spreadsheet analysis.",
+                    "category": "data",
+                },
+            },
+        )
+
+        results = self._source().search("workflow", limit=5)
+
+        assert len(results) == 1
+        assert results[0].source == "hermeshub"
+        assert results[0].identifier == "hermeshub/github-workflow"
+        assert results[0].repo == "amanning3390/hermeshub"
+        assert results[0].path == "skills/github-workflow"
+        assert results[0].trust_level == "community"
+        assert results[0].extra["install_command"] == (
+            "hermes skills install github:amanning3390/hermeshub/skills/github-workflow"
+        )
+        assert results[0].extra["featured"] is True
+
+    @patch.object(GitHubSource, "fetch")
+    def test_fetch_accepts_hermeshub_identifier_and_relabels_bundle(self, mock_fetch):
+        mock_fetch.return_value = SkillBundle(
+            name="github-workflow",
+            files={"SKILL.md": "# GitHub Workflow"},
+            source="github",
+            identifier="amanning3390/hermeshub/skills/github-workflow",
+            trust_level="community",
+        )
+
+        bundle = self._source().fetch("hermeshub/github-workflow")
+
+        assert bundle is not None
+        assert bundle.source == "hermeshub"
+        assert bundle.identifier == "hermeshub/github-workflow"
+        assert bundle.trust_level == "community"
+        assert bundle.metadata["github_identifier"] == "amanning3390/hermeshub/skills/github-workflow"
+        mock_fetch.assert_called_once_with("amanning3390/hermeshub/skills/github-workflow")
+
+    @patch.object(GitHubSource, "fetch")
+    def test_fetch_accepts_readme_github_prefix_identifier(self, mock_fetch):
+        mock_fetch.return_value = SkillBundle(
+            name="web-researcher",
+            files={"SKILL.md": "# Web Researcher"},
+            source="github",
+            identifier="amanning3390/hermeshub/skills/web-researcher",
+            trust_level="community",
+        )
+
+        bundle = self._source().fetch("github:amanning3390/hermeshub/skills/web-researcher")
+
+        assert bundle is not None
+        assert bundle.identifier == "hermeshub/web-researcher"
+        mock_fetch.assert_called_once_with("amanning3390/hermeshub/skills/web-researcher")
+
+    @patch.object(GitHubSource, "fetch")
+    def test_fetch_rejects_paths_outside_hermeshub_skills(self, mock_fetch):
+        assert self._source().fetch("github:amanning3390/hermeshub/README.md") is None
+        assert self._source().fetch("github:other/repo/skills/web-researcher") is None
+        mock_fetch.assert_not_called()
 
 
 class TestFindSkillInRepoTree:
@@ -1051,6 +1144,10 @@ class TestCheckForSkillUpdates:
 
 
 class TestCreateSourceRouter:
+    def test_includes_hermeshub_source(self):
+        sources = create_source_router(auth=MagicMock(spec=GitHubAuth))
+        assert any(isinstance(src, HermesHubSource) for src in sources)
+
     def test_includes_skills_sh_source(self):
         sources = create_source_router(auth=MagicMock(spec=GitHubAuth))
         assert any(isinstance(src, SkillsShSource) for src in sources)
