@@ -857,7 +857,8 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         key = self._project_summary_state_key(channel)
         state = self._read_project_summary_state()
-        if key in state:
+        previous = state.get(key)
+        if isinstance(previous, dict) and previous.get("success") is True:
             return None
 
         metadata = self._collect_discord_project_metadata()

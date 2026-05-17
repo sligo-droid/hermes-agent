@@ -208,6 +208,29 @@ def test_project_summary_topic_replaces_managed_line(adapter):
 
 
 @pytest.mark.asyncio
+async def test_project_summary_retries_after_failed_attempt(adapter):
+    parent = FakeTextChannel(channel_id=100, topic=None)
+    key = adapter._project_summary_state_key(parent)
+    state = {
+        key: {
+            "channel_id": "100",
+            "guild_id": "5",
+            "attempted_at": 1,
+            "success": False,
+        }
+    }
+    adapter._read_project_summary_state = MagicMock(side_effect=lambda: dict(state))
+    adapter._write_project_summary_state = MagicMock(side_effect=lambda value: state.clear() or state.update(value))
+
+    handle = await adapter.initialize_project_summary(parent)
+
+    parent.edit.assert_awaited_once()
+    assert handle is not None
+    assert handle["channel_id"] == "100"
+    assert state[key]["success"] is True
+
+
+@pytest.mark.asyncio
 async def test_feature_summary_update_edits_initial_message(adapter):
     parent = FakeTextChannel(channel_id=100)
     thread = FakeThread(channel_id=200, parent=parent)
