@@ -9728,6 +9728,71 @@ class GatewayRunner:
             return "Failed"
         return "Complete"
 
+    def _fallback_discord_feature_outcome(self, final_response: str, *, limit: int = 420) -> str:
+        text = re.sub(r"MEDIA:\s*\S+", "", str(final_response or "")).strip()
+        text = text.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "").strip()
+        text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+        text = re.sub(r"`([^`]*)`", r"\1", text)
+        text = re.sub(r"[*_>#-]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return "No visible response was produced."
+
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        concise = " ".join(s.strip() for s in sentences[:3] if s.strip()) or text
+        if len(concise) > limit:
+            concise = concise[: limit - 3].rstrip() + "..."
+        return concise
+
+    def _discord_feature_outcome_needs_summary(self, final_response: str) -> bool:
+        text = str(final_response or "")
+        if len(text) > 420:
+            return True
+        if len(re.findall(r"(?<=[.!?])\s+", text)) >= 3:
+            return True
+        bullet_lines = [
+            line for line in text.splitlines()
+            if line.lstrip().startswith(("-", "*", "•")) or re.match(r"\s*\d+[.)]\s+", line)
+        ]
+        return len(bullet_lines) > 3
+
+    def _summarize_discord_feature_outcome(self, final_response: str) -> str:
+        fallback = self._fallback_discord_feature_outcome(final_response)
+        if not self._discord_feature_outcome_needs_summary(final_response):
+            return fallback
+
+        prompt = (
+            "Summarize this completed Hermes feature-thread outcome in a few concise sentences. "
+            "State only what changed or what result the user got. Do not include logs, "
+            "long bullet lists, code, tool chatter, or copied implementation details.\n\n"
+            f"Final response:\n{str(final_response or '')[:6000]}"
+        )
+        try:
+            from agent.auxiliary_client import call_llm
+
+            response = call_llm(
+                task="feature_summary",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You write concise Discord feature-summary outcomes. "
+                            "Return 2-3 short sentences, no heading."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=180,
+                temperature=0.2,
+                timeout=15,
+            )
+            summary = (response.choices[0].message.content or "").strip()
+            if summary:
+                return self._fallback_discord_feature_outcome(summary)
+        except Exception as exc:
+            logger.debug("Discord feature outcome summarization failed: %s", exc)
+        return fallback
+
     async def _update_discord_summaries(
         self,
         *,
@@ -9758,9 +9823,13 @@ class GatewayRunner:
                 logger.debug("Discord project summary update failed", exc_info=True)
         if feature_summary and hasattr(adapter, "update_feature_summary"):
             try:
+                concise_response = await asyncio.to_thread(
+                    self._summarize_discord_feature_outcome,
+                    final_response,
+                )
                 await adapter.update_feature_summary(
                     feature_summary,
-                    final_response=final_response,
+                    final_response=concise_response,
                     status=status,
                     title=title,
                 )

@@ -5,7 +5,7 @@ import sys
 import types
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -186,7 +186,9 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
     assert len(thread.sent) == 1
     sent_embed = thread.sent[0][0]["embed"]
     assert sent_embed.title == "Generating..."
-    assert sent_embed.description == "Build a deploy dashboard"
+    assert sent_embed.description is None
+    fields = {field.name: field.value for field in sent_embed.fields}
+    assert fields["Status"] == "🔨 In progress"
     assert all(field.name != "Generated Title" for field in sent_embed.fields)
 
     adapter.handle_message.assert_awaited_once()
@@ -253,9 +255,134 @@ async def test_feature_summary_update_edits_initial_message(adapter):
     edited_embed = message.edit.await_args.kwargs["embed"]
     fields = {field.name: field.value for field in edited_embed.fields}
     assert edited_embed.title == "Project Links"
+    assert edited_embed.description is None
     assert "Generated Title" not in fields
+    assert fields["Status"] == "✅ Done"
     assert fields["Concise Outcome"].startswith("Done.")
     assert fields["Branch"] == "feature/summary"
+
+
+@pytest.mark.asyncio
+async def test_tagged_question_answers_in_place_without_feature_summary(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    adapter._auto_create_thread = AsyncMock()
+
+    await adapter._handle_message(
+        _make_message(adapter, channel=parent, content="<@999> What is the repo URL?")
+    )
+
+    parent.edit.assert_not_awaited()
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.feature_summary is None
+    assert event.project_summary is None
+    assert event.source.chat_id == "100"
+    assert event.source.chat_type == "group"
+    assert "classified as a direct question/request" in event.channel_prompt
+
+
+@pytest.mark.asyncio
+async def test_tagged_thread_question_gets_direct_answer_prompt(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._auto_create_thread = AsyncMock()
+
+    await adapter._handle_message(
+        _make_message(adapter, channel=thread, content="<@999> What changed?")
+    )
+
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.feature_summary is None
+    assert event.source.chat_id == "200"
+    assert event.source.chat_type == "thread"
+    assert "classified as a direct question/request" in event.channel_prompt
+
+
+@pytest.mark.asyncio
+async def test_native_voice_feature_request_triages_from_transcript(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+    att = SimpleNamespace(
+        url="https://cdn.discordapp.com/attachments/fake/voice-message.ogg",
+        filename="voice-message.ogg",
+        content_type=None,
+        size=10,
+        read=AsyncMock(return_value=b"fake ogg"),
+        duration_secs=2.0,
+        waveform=b"fake",
+    )
+    message = SimpleNamespace(
+        id=123,
+        content="",
+        mentions=[],
+        attachments=[att],
+        reference=None,
+        created_at=datetime.now(timezone.utc),
+        channel=parent,
+        guild=parent.guild,
+        author=SimpleNamespace(id=42, display_name="Jezza", name="Jezza", bot=False),
+        flags=SimpleNamespace(voice=True),
+        type=discord_platform.discord.MessageType.default,
+    )
+
+    with patch(
+        "gateway.platforms.discord.cache_audio_from_bytes",
+        return_value="/tmp/voice_from_read.ogg",
+    ) as mock_cache, patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "Build a deploy dashboard"},
+    ) as mock_transcribe:
+        await adapter._handle_message(message)
+
+    mock_cache.assert_called_once_with(b"fake ogg", ext=".ogg")
+    mock_transcribe.assert_called_once_with("/tmp/voice_from_read.ogg")
+    adapter._auto_create_thread.assert_awaited_once_with(message)
+    assert len(thread.sent) == 1
+    event = adapter.handle_message.await_args.args[0]
+    assert event.feature_summary["thread_id"] == "200"
+    assert event.media_urls == ["/tmp/voice_from_read.ogg"]
+    assert event.media_types == ["audio/ogg"]
+
+
+def test_failed_feature_summary_status_uses_red_cross(adapter):
+    embed = adapter._build_feature_summary_embed(
+        initial_request="",
+        status="Failed",
+        outcome="The run failed.",
+        title="Project Links",
+    )
+    fields = {field.name: field.value for field in embed.fields}
+    assert fields["Status"] == "❌ Failed"
+    assert embed.color == "red"
+
+
+def test_runner_summarizes_long_discord_feature_outcome():
+    runner = object.__new__(gateway_run.GatewayRunner)
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="Built the dashboard and added focused regression coverage. The branch is ready for review."
+                )
+            )
+        ]
+    )
+    long_response = "Done. " + "Implemented details. " * 80
+
+    with patch("agent.auxiliary_client.call_llm", return_value=response) as call_llm:
+        summary = runner._summarize_discord_feature_outcome(long_response)
+
+    assert summary == "Built the dashboard and added focused regression coverage. The branch is ready for review."
+    call_llm.assert_called_once()
+    prompt = call_llm.call_args.kwargs["messages"][1]["content"]
+    assert "few concise sentences" in prompt
 
 
 @pytest.mark.asyncio
