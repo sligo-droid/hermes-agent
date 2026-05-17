@@ -7,6 +7,7 @@ This is a library module (not an agent tool). It provides:
   - SkillSource ABC: Interface for all skill registry adapters
   - OptionalSkillSource: Official optional skills shipped with the repo (not activated by default)
   - GitHubSource: Fetch skills from any GitHub repo via the Contents API
+  - HermesHubSource: Discover HermesHub skills and fetch them through GitHub
   - HubLockFile: Track provenance of installed hub skills
   - Hub state directory management (quarantine, audit log, taps, index cache)
 
@@ -1610,6 +1611,213 @@ class SkillsShSource(SkillSource):
 
 
 # ---------------------------------------------------------------------------
+# HermesHub source adapter
+# ---------------------------------------------------------------------------
+
+class HermesHubSource(SkillSource):
+    """Discover skills from HermesHub and fetch content from its GitHub repo."""
+
+    REPO = "amanning3390/hermeshub"
+    SKILLS_PATH = "skills/"
+    SOURCE_ID = "hermeshub"
+    CATALOG_URL = (
+        "https://raw.githubusercontent.com/"
+        f"{REPO}/main/scripts/skills-meta.json"
+    )
+    SITE_URL = "https://hermeshub.xyz"
+
+    def __init__(self, auth: GitHubAuth):
+        self.auth = auth
+        self.github = GitHubSource(auth=auth)
+
+    def source_id(self) -> str:
+        return self.SOURCE_ID
+
+    def trust_level_for(self, identifier: str) -> str:
+        return "community"
+
+    def search(self, query: str, limit: int = 10) -> List[SkillMeta]:
+        query_lower = query.strip().lower()
+        results: List[SkillMeta] = []
+
+        for slug, data in self._load_catalog().items():
+            if not isinstance(data, dict):
+                continue
+            searchable = " ".join([
+                slug,
+                str(data.get("displayName", "")),
+                str(data.get("description", "")),
+                str(data.get("category", "")),
+            ]).lower()
+            if query_lower and query_lower not in searchable:
+                continue
+            try:
+                results.append(self._catalog_entry_to_meta(slug, data))
+            except ValueError:
+                logger.debug("Skipping HermesHub skill with unsafe slug: %s", slug)
+                continue
+            if len(results) >= limit:
+                return results
+
+        if results:
+            return results
+
+        # If the metadata catalog is unavailable, fall back to the repo tree.
+        try:
+            github_results = self.github._list_skills_in_repo(self.REPO, self.SKILLS_PATH)
+        except Exception:
+            return []
+
+        for meta in github_results:
+            relabeled = self._relabel_meta(meta)
+            searchable = f"{relabeled.name} {relabeled.description} {' '.join(relabeled.tags)}".lower()
+            if not query_lower or query_lower in searchable:
+                results.append(relabeled)
+            if len(results) >= limit:
+                break
+        return results
+
+    def fetch(self, identifier: str) -> Optional[SkillBundle]:
+        github_identifier = self._to_github_identifier(identifier)
+        if not github_identifier:
+            return None
+
+        bundle = self.github.fetch(github_identifier)
+        if not bundle:
+            return None
+
+        slug = github_identifier.rsplit("/", 1)[-1]
+        bundle.source = self.SOURCE_ID
+        bundle.identifier = self._wrap_identifier(slug)
+        bundle.trust_level = "community"
+        bundle.metadata.update(self._metadata_for_slug(slug))
+        return bundle
+
+    def inspect(self, identifier: str) -> Optional[SkillMeta]:
+        github_identifier = self._to_github_identifier(identifier)
+        if not github_identifier:
+            return None
+
+        slug = github_identifier.rsplit("/", 1)[-1]
+        catalog = self._load_catalog()
+        if slug in catalog and isinstance(catalog[slug], dict):
+            return self._catalog_entry_to_meta(slug, catalog[slug])
+
+        meta = self.github.inspect(github_identifier)
+        if meta:
+            return self._relabel_meta(meta)
+        return None
+
+    def _load_catalog(self) -> Dict[str, dict]:
+        cache_key = "hermeshub_skills_meta"
+        cached = _read_index_cache(cache_key)
+        if isinstance(cached, dict):
+            return cached
+
+        resp = _guarded_http_get(self.CATALOG_URL, timeout=20)
+        if resp is None or resp.status_code != 200:
+            return {}
+        try:
+            data = resp.json()
+        except (json.JSONDecodeError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+
+        catalog = {str(k): v for k, v in data.items() if isinstance(v, dict)}
+        _write_index_cache(cache_key, catalog)
+        return catalog
+
+    def _catalog_entry_to_meta(self, slug: str, data: dict) -> SkillMeta:
+        slug = _validate_skill_name(slug)
+        extra = self._metadata_for_slug(slug)
+        extra.update({
+            "category": data.get("category"),
+            "featured": bool(data.get("featured", False)),
+            "install_count": data.get("installCount"),
+        })
+        return SkillMeta(
+            name=str(data.get("displayName") or slug),
+            description=str(data.get("description") or ""),
+            source=self.SOURCE_ID,
+            identifier=self._wrap_identifier(slug),
+            trust_level="community",
+            repo=self.REPO,
+            path=f"{self.SKILLS_PATH}{slug}",
+            tags=[str(data["category"])] if data.get("category") else [],
+            extra=extra,
+        )
+
+    def _relabel_meta(self, meta: SkillMeta) -> SkillMeta:
+        slug = (meta.path or meta.identifier).rstrip("/").split("/")[-1]
+        extra = dict(meta.extra)
+        extra.update(self._metadata_for_slug(slug))
+        return SkillMeta(
+            name=meta.name,
+            description=meta.description,
+            source=self.SOURCE_ID,
+            identifier=self._wrap_identifier(slug),
+            trust_level="community",
+            repo=self.REPO,
+            path=f"{self.SKILLS_PATH}{slug}",
+            tags=meta.tags,
+            extra=extra,
+        )
+
+    def _metadata_for_slug(self, slug: str) -> Dict[str, Any]:
+        safe_slug = _validate_skill_name(slug)
+        github_identifier = f"{self.REPO}/{self.SKILLS_PATH}{safe_slug}"
+        return {
+            "repo_url": f"https://github.com/{self.REPO}",
+            "detail_url": f"{self.SITE_URL}/#/skill/{safe_slug}",
+            "install_command": f"hermes skills install github:{github_identifier}",
+            "github_identifier": github_identifier,
+        }
+
+    def _to_github_identifier(self, identifier: str) -> Optional[str]:
+        if not isinstance(identifier, str):
+            return None
+        raw = identifier.strip()
+
+        if raw.startswith("github:"):
+            raw = raw[len("github:"):]
+
+        if raw.startswith(f"{self.REPO}/{self.SKILLS_PATH}"):
+            slug = raw[len(f"{self.REPO}/{self.SKILLS_PATH}"):]
+        elif raw.startswith(f"{self.SOURCE_ID}/"):
+            slug = raw[len(f"{self.SOURCE_ID}/"):]
+        elif raw.startswith(f"{self.SOURCE_ID}:"):
+            slug = raw[len(f"{self.SOURCE_ID}:"):]
+        elif raw.startswith("https://github.com/"):
+            slug = self._slug_from_github_url(raw)
+            if slug is None:
+                return None
+        else:
+            return None
+
+        try:
+            safe_slug = _validate_skill_name(slug.strip("/"))
+        except ValueError:
+            return None
+        return f"{self.REPO}/{self.SKILLS_PATH}{safe_slug}"
+
+    def _slug_from_github_url(self, url: str) -> Optional[str]:
+        parsed = urlparse(url)
+        if parsed.netloc.lower() != "github.com":
+            return None
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 5 and "/".join(parts[:2]) == self.REPO and parts[2] in {"tree", "blob"}:
+            path_parts = parts[4:]
+            if len(path_parts) == 2 and path_parts[0] == self.SKILLS_PATH.rstrip("/"):
+                return path_parts[1]
+        return None
+
+    @classmethod
+    def _wrap_identifier(cls, slug: str) -> str:
+        return f"{cls.SOURCE_ID}/{_validate_skill_name(slug)}"
+
+
+# ---------------------------------------------------------------------------
 # ClawHub source adapter
 # ---------------------------------------------------------------------------
 
@@ -3136,6 +3344,7 @@ def create_source_router(auth: Optional[GitHubAuth] = None) -> List[SkillSource]
     sources: List[SkillSource] = [
         OptionalSkillSource(),        # Official optional skills (highest priority)
         HermesIndexSource(auth=auth), # Centralized index (search + resolved install paths)
+        HermesHubSource(auth=auth),
         SkillsShSource(auth=auth),
         WellKnownSkillSource(),
         UrlSource(),                  # Direct HTTP(S) URL to a SKILL.md file
