@@ -79,6 +79,27 @@ class TestResolveDisplaySetting:
         assert resolve_display_setting(config, "slack", "tool_progress") == "off"
         assert resolve_display_setting(config, "telegram", "tool_progress") == "all"
 
+    def test_global_show_reasoning_does_not_enable_gateway_display(self):
+        """CLI display.show_reasoning must not leak into gateway platforms."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"show_reasoning": True}}
+
+        assert resolve_display_setting(config, "discord", "show_reasoning") is False
+
+    def test_platform_show_reasoning_override_can_opt_in(self):
+        """Gateway reasoning display remains opt-in per platform."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "show_reasoning": False,
+                "platforms": {"discord": {"show_reasoning": True}},
+            }
+        }
+
+        assert resolve_display_setting(config, "discord", "show_reasoning") is True
+
 
 # ---------------------------------------------------------------------------
 # Backward compatibility: tool_progress_overrides

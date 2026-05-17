@@ -13,6 +13,10 @@ Exception: ``display.streaming`` is CLI-only.  Gateway streaming follows the
 top-level ``streaming`` config unless ``display.platforms.<platform>.streaming``
 sets an explicit per-platform override.
 
+Exception: ``display.show_reasoning`` is also CLI-first. Gateway chats default
+to hiding reasoning even when CLI sessions show it globally; use
+``display.platforms.<platform>.show_reasoning`` for an explicit platform opt-in.
+
 Backward compatibility: ``display.tool_progress_overrides`` is still read as a
 fallback for ``tool_progress`` when no ``display.platforms`` entry exists.  A
 config migration (version bump) automatically moves the old format into the new
@@ -158,7 +162,10 @@ def resolve_display_setting(
     # 2. Global user setting (display.<key>).  Skip display.streaming because
     # that key controls only CLI terminal streaming; gateway token streaming is
     # governed by the top-level streaming config plus per-platform overrides.
-    if setting != "streaming":
+    # Skip display.show_reasoning for the same isolation reason: CLI sessions
+    # may intentionally show reasoning, while gateway/Discord should stay quiet
+    # unless the platform is explicitly opted in.
+    if setting not in {"streaming", "show_reasoning"}:
         val = display_cfg.get(setting)
         if val is not None:
             return _normalise(setting, val)
