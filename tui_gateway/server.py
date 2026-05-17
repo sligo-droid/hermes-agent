@@ -883,6 +883,13 @@ def _load_service_tier() -> str | None:
     return None
 
 
+def _fast_display(session: dict | None) -> str:
+    agent = session.get("agent") if session else None
+    if agent is not None:
+        return "on" if getattr(agent, "service_tier", None) == "priority" else "off"
+    return "on" if _load_service_tier() == "priority" else "off"
+
+
 def _load_show_reasoning() -> bool:
     return bool((_load_cfg().get("display") or {}).get("show_reasoning", False))
 
@@ -3970,7 +3977,13 @@ def _(rid, params: dict) -> dict:
                     session["show_reasoning"] = True
                 return _ok(
                     rid,
-                    {"key": key, "value": "show", "effort": effort, "display": "show"},
+                    {
+                        "key": key,
+                        "value": "show",
+                        "effort": effort,
+                        "display": "show",
+                        "fast": _fast_display(session),
+                    },
                 )
             if arg in {"hide", "off"}:
                 cfg = _load_cfg()
@@ -3995,7 +4008,13 @@ def _(rid, params: dict) -> dict:
                     session["show_reasoning"] = False
                 return _ok(
                     rid,
-                    {"key": key, "value": "hide", "effort": effort, "display": "hide"},
+                    {
+                        "key": key,
+                        "value": "hide",
+                        "effort": effort,
+                        "display": "hide",
+                        "fast": _fast_display(session),
+                    },
                 )
 
             parsed = parse_reasoning_effort(arg)
@@ -4004,7 +4023,16 @@ def _(rid, params: dict) -> dict:
             _write_config_key("agent.reasoning_effort", arg)
             if session and session.get("agent") is not None:
                 session["agent"].reasoning_config = parsed
-            return _ok(rid, {"key": key, "value": arg})
+            return _ok(
+                rid,
+                {
+                    "key": key,
+                    "value": arg,
+                    "effort": arg,
+                    "display": "show" if _load_show_reasoning() else "hide",
+                    "fast": _fast_display(session),
+                },
+            )
         except Exception as e:
             return _err(rid, 5001, str(e))
 
@@ -4224,6 +4252,7 @@ def _(rid, params: dict) -> dict:
         )
     if key == "reasoning":
         cfg = _load_cfg()
+        session = _sessions.get(params.get("session_id", ""))
         effort = str(
             (cfg.get("agent") or {}).get("reasoning_effort", "medium") or "medium"
         )
@@ -4232,7 +4261,10 @@ def _(rid, params: dict) -> dict:
             if bool((cfg.get("display") or {}).get("show_reasoning", False))
             else "hide"
         )
-        return _ok(rid, {"value": effort, "display": display})
+        return _ok(
+            rid,
+            {"value": effort, "display": display, "fast": _fast_display(session)},
+        )
     if key == "fast":
         return _ok(
             rid,

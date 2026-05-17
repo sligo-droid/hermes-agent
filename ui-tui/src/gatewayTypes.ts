@@ -92,6 +92,8 @@ export interface ConfigMtimeResponse {
 
 export interface ConfigGetValueResponse {
   display?: string
+  effort?: string
+  fast?: string
   home?: string
   value?: string
 }
@@ -100,6 +102,7 @@ export interface ConfigSetResponse {
   credential_warning?: string
   display?: string
   effort?: string
+  fast?: string
   history_reset?: boolean
   info?: SessionInfo
   value?: string
