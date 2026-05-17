@@ -1,0 +1,134 @@
+from types import SimpleNamespace
+
+from gateway.discord_project_mapping import resolve_discord_project_context
+from hermes_state import SessionDB
+
+
+class FakeChannel:
+    def __init__(self, *, channel_id, name, guild=None, parent=None, category=None):
+        self.id = channel_id
+        self.name = name
+        self.guild = guild
+        self.parent = parent
+        self.parent_id = getattr(parent, "id", None)
+        self.category = category
+
+
+def _guild():
+    return SimpleNamespace(id="guild-1", name="Sligo Labs")
+
+
+def test_existing_db_mapping_wins_over_workspace_scan(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.upsert_discord_project_mapping(
+        guild_id="guild-1",
+        channel_id="chan-1",
+        channel_name="pid",
+        guild_name="Sligo Labs",
+        project_key="CanonicalPID",
+        project_name="Canonical PID",
+        project_path="/canonical/pid",
+        github_url="https://github.com/sligo-labs/canonical-pid",
+        source="manual",
+    )
+    workspace = tmp_path / "workspace"
+    (workspace / "PID").mkdir(parents=True)
+
+    ctx = resolve_discord_project_context(
+        FakeChannel(channel_id="chan-1", name="pid", guild=_guild()),
+        session_db=db,
+        workspace_root=workspace,
+    )
+
+    assert ctx is not None
+    assert ctx.resolved is True
+    assert ctx.project_path == "/canonical/pid"
+    assert ctx.mapping_source == "manual"
+    db.close()
+
+
+def test_bootstraps_unique_workspace_directory(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    workspace = tmp_path / "workspace"
+    project = workspace / "PID"
+    project.mkdir(parents=True)
+
+    ctx = resolve_discord_project_context(
+        FakeChannel(channel_id="chan-1", name="pid", guild=_guild()),
+        session_db=db,
+        workspace_root=workspace,
+    )
+
+    assert ctx is not None
+    assert ctx.resolved is True
+    assert ctx.project_key == "PID"
+    assert ctx.project_path == str(project.resolve())
+    assert ctx.mapping_source == "deterministic_directory_bootstrap"
+
+    persisted = db.get_discord_project_mapping(guild_id="guild-1", channel_id="chan-1")
+    assert persisted is not None
+    assert persisted["project_path"] == str(project.resolve())
+    db.close()
+
+
+def test_thread_inherits_parent_project_channel_mapping(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    workspace = tmp_path / "workspace"
+    project = workspace / "PID"
+    project.mkdir(parents=True)
+    parent = FakeChannel(channel_id="chan-1", name="pid", guild=_guild())
+    thread = FakeChannel(channel_id="thread-1", name="feature", guild=_guild(), parent=parent)
+
+    ctx = resolve_discord_project_context(thread, session_db=db, workspace_root=workspace)
+
+    assert ctx is not None
+    assert ctx.channel_id == "chan-1"
+    assert ctx.project_path == str(project.resolve())
+    db.close()
+
+
+def test_admin_human_and_infra_are_not_project_mapped(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    guild = _guild()
+
+    assert resolve_discord_project_context(
+        FakeChannel(channel_id="admin", name="admin", guild=guild),
+        session_db=db,
+        workspace_root=workspace,
+    ) is None
+    assert resolve_discord_project_context(
+        FakeChannel(channel_id="human", name="pid-human", guild=guild),
+        session_db=db,
+        workspace_root=workspace,
+    ) is None
+    assert resolve_discord_project_context(
+        FakeChannel(
+            channel_id="infra",
+            name="alerts",
+            guild=guild,
+            category=SimpleNamespace(name="Infra"),
+        ),
+        session_db=db,
+        workspace_root=workspace,
+    ) is None
+    db.close()
+
+
+def test_unmapped_project_channel_is_explicitly_unresolved(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    ctx = resolve_discord_project_context(
+        FakeChannel(channel_id="chan-1", name="pid", guild=_guild()),
+        session_db=db,
+        workspace_root=workspace,
+    )
+
+    assert ctx is not None
+    assert ctx.resolved is False
+    assert ctx.project_path is None
+    assert db.get_discord_project_mapping(guild_id="guild-1", channel_id="chan-1") is None
+    db.close()
