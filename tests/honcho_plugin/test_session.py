@@ -1,5 +1,6 @@
 """Tests for plugins/memory/honcho/session.py — HonchoSession and helpers."""
 
+import threading
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -7,6 +8,7 @@ from unittest.mock import MagicMock
 from plugins.memory.honcho.session import (
     HonchoSession,
     HonchoSessionManager,
+    _should_skip_honcho_message,
 )
 from plugins.memory.honcho import HonchoMemoryProvider
 
@@ -95,6 +97,87 @@ class TestHonchoSession:
         original = session.updated_at
         session.clear()
         assert session.updated_at >= original
+
+
+class TestHonchoTransientMessageFilter:
+    def test_filter_skips_background_completion_notice(self):
+        msg = {
+            "role": "user",
+            "content": "[IMPORTANT: Background process 123 completed with exit code 0]\nstdout...",
+        }
+        assert _should_skip_honcho_message(msg) is True
+
+    def test_filter_skips_mcp_reload_notice(self):
+        msg = {
+            "role": "user",
+            "content": "[System notice: MCP server list reloaded after OAuth setup]",
+        }
+        assert _should_skip_honcho_message(msg) is True
+
+    def test_filter_skips_synthetic_oauth_callback_notice(self):
+        msg = {
+            "role": "user",
+            "content": (
+                "[System notice: OAuth callback received at "
+                "http://127.0.0.1:3333/oauth/callback?code=abc&state=xyz session_id=sess-123]"
+            ),
+        }
+        assert _should_skip_honcho_message(msg) is True
+
+    def test_filter_keeps_ordinary_conversation(self):
+        msg = {
+            "role": "user",
+            "content": "Please help me debug an OAuth callback issue in my app.",
+        }
+        assert _should_skip_honcho_message(msg) is False
+
+    def test_flush_marks_transient_notice_synced_without_sending_to_honcho(self):
+        class FakePeer:
+            def __init__(self, name):
+                self.name = name
+
+            def message(self, content):
+                return {"peer": self.name, "content": content}
+
+        class FakeHonchoSession:
+            def __init__(self):
+                self.messages = []
+
+            def add_messages(self, messages):
+                self.messages.extend(messages)
+
+        mgr = HonchoSessionManager.__new__(HonchoSessionManager)
+        mgr._cache = {}
+        mgr._cache_lock = threading.RLock()
+        mgr._sessions_cache = {"sid": FakeHonchoSession()}
+        user_peer = FakePeer("user")
+        assistant_peer = FakePeer("assistant")
+        def _get_peer(peer_id):
+            return user_peer if peer_id == "user-peer" else assistant_peer
+
+        mgr._get_or_create_peer = _get_peer
+
+        session = HonchoSession(
+            key="test",
+            user_peer_id="user-peer",
+            assistant_peer_id="assistant-peer",
+            honcho_session_id="sid",
+        )
+        session.add_message(
+            "user",
+            "[IMPORTANT: Background process 77 completed with exit code 0]",
+        )
+        session.add_message("user", "My favorite editor is Vim.")
+        session.add_message("assistant", "Noted.")
+
+        assert mgr._flush_session(session) is True
+
+        sent = mgr._sessions_cache["sid"].messages
+        assert sent == [
+            {"peer": "user", "content": "My favorite editor is Vim."},
+            {"peer": "assistant", "content": "Noted."},
+        ]
+        assert all(message["_synced"] is True for message in session.messages)
 
 
 # ---------------------------------------------------------------------------

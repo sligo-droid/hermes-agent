@@ -20,6 +20,50 @@ logger = logging.getLogger(__name__)
 # Sentinel to signal the async writer thread to shut down
 _ASYNC_SHUTDOWN = object()
 
+_OAUTH_OR_PROCESS_TOKEN_RE = re.compile(
+    r"(https?://\S*(?:oauth|callback|code=|state=)|"
+    r"\b(?:pid|process id|session id|session_id)=?\s*[A-Za-z0-9_.:-]+)",
+    re.IGNORECASE,
+)
+
+
+def _should_skip_honcho_message(msg: dict[str, Any]) -> bool:
+    """Return True for synthetic operational notices that should not become memory."""
+    if msg.get("role") != "user":
+        return False
+    content = str(msg.get("content") or "").strip()
+    if not content:
+        return True
+
+    lowered = content.lower()
+    if (
+        lowered.startswith("[important: background process ")
+        and " completed" in lowered[:200]
+    ):
+        return True
+    if lowered.startswith("[system notice:") and "mcp" in lowered[:240] and (
+        "reload" in lowered[:240] or "server" in lowered[:240]
+    ):
+        return True
+    if lowered.startswith("[mcp") and "reload" in lowered[:200]:
+        return True
+    if lowered.startswith(("process completed", "background process completed")):
+        return True
+
+    synthetic_prefix = lowered.startswith(
+        (
+            "[important:",
+            "[system notice:",
+            "[process",
+            "process ",
+            "background process",
+            "tool/process",
+        )
+    )
+    if synthetic_prefix and len(content) <= 1500 and _OAUTH_OR_PROCESS_TOKEN_RE.search(content):
+        return True
+    return False
+
 
 @dataclass
 class HonchoSession:
@@ -365,21 +409,47 @@ class HonchoSessionManager:
             return True
 
         honcho_messages = []
+        messages_to_sync = []
+        skipped_messages = []
         for msg in new_messages:
+            if _should_skip_honcho_message(msg):
+                skipped_messages.append(msg)
+                continue
             peer = user_peer if msg["role"] == "user" else assistant_peer
             honcho_messages.append(peer.message(msg["content"]))
+            messages_to_sync.append(msg)
+
+        if not honcho_messages:
+            for msg in skipped_messages:
+                msg["_synced"] = True
+            logger.debug(
+                "Skipped %d transient messages for %s",
+                len(skipped_messages),
+                session.key,
+            )
+            with self._cache_lock:
+                self._cache[session.key] = session
+            return True
 
         try:
             honcho_session.add_messages(honcho_messages)
-            for msg in new_messages:
+            for msg in messages_to_sync + skipped_messages:
                 msg["_synced"] = True
+            if skipped_messages:
+                logger.debug(
+                    "Skipped %d transient messages for %s",
+                    len(skipped_messages),
+                    session.key,
+                )
             logger.debug("Synced %d messages to Honcho for %s", len(honcho_messages), session.key)
             with self._cache_lock:
                 self._cache[session.key] = session
             return True
         except Exception as e:
-            for msg in new_messages:
+            for msg in messages_to_sync:
                 msg["_synced"] = False
+            for msg in skipped_messages:
+                msg["_synced"] = True
             logger.error("Failed to sync messages to Honcho: %s", e)
             with self._cache_lock:
                 self._cache[session.key] = session
