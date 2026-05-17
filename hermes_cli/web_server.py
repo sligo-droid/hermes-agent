@@ -848,6 +848,9 @@ _DASHBOARD_INFERENCE_STOPWORDS = {
     "want", "what", "when", "where", "which", "with", "would", "you", "your",
 }
 
+_DASHBOARD_INFERENCE_PROVIDER = "openai-codex"
+_DASHBOARD_INFERENCE_MODEL = "gpt-5.4"
+
 
 def _dashboard_inference_search_query(question: str) -> str:
     """Build a forgiving FTS query for dashboard natural-language prompts."""
@@ -941,6 +944,8 @@ def _run_dashboard_inference(question: str) -> dict:
 
     response = call_llm(
         "session_search",
+        provider=_DASHBOARD_INFERENCE_PROVIDER,
+        model=_DASHBOARD_INFERENCE_MODEL,
         messages=_dashboard_inference_prompt(question, matches, recent_sessions),
         temperature=0,
         max_tokens=700,
