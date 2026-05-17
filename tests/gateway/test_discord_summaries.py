@@ -400,7 +400,7 @@ login_required: yes
 
     assert metadata["app_access"] == (
         "use the shared demo account from the project note; "
-        "username demo; password: [redacted]; "
+        "username demo; password: secret-value; "
         "required"
     )
 
