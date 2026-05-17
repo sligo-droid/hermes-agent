@@ -10646,6 +10646,20 @@ class AIAgent:
             parent_agent=self,
         )
 
+    def _dispatch_codex_coding_task(self, function_args: dict) -> str:
+        """Single call site for delegate_codex_coding_task dispatch."""
+        from tools.codex_worker_tool import (
+            delegate_codex_coding_task as _delegate_codex_coding_task,
+        )
+
+        return _delegate_codex_coding_task(
+            task=function_args.get("task"),
+            context=function_args.get("context"),
+            cwd=function_args.get("cwd"),
+            turn_timeout_seconds=function_args.get("turn_timeout_seconds"),
+            parent_agent=self,
+        )
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None,
                      pre_tool_block_checked: bool = False) -> str:
@@ -10724,6 +10738,8 @@ class AIAgent:
             )
         elif function_name == "delegate_task":
             return self._dispatch_delegate_task(function_args)
+        elif function_name == "delegate_codex_coding_task":
+            return self._dispatch_codex_coding_task(function_args)
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
@@ -11385,6 +11401,30 @@ class AIAgent:
                         spinner.stop(cute_msg)
                     elif self._should_emit_quiet_tool_messages():
                         self._vprint(f"  {cute_msg}")
+            elif function_name == "delegate_codex_coding_task":
+                task_preview = (function_args.get("task") or "")[:30]
+                spinner_label = f"codex {task_preview}" if task_preview else "codex worker"
+                spinner = None
+                if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
+                    face = random.choice(KawaiiSpinner.get_waiting_faces())
+                    spinner = KawaiiSpinner(f"{face} {spinner_label}", spinner_type='dots', print_fn=self._print_fn)
+                    spinner.start()
+                _codex_worker_result = None
+                try:
+                    function_result = self._dispatch_codex_coding_task(function_args)
+                    _codex_worker_result = function_result
+                finally:
+                    tool_duration = time.time() - tool_start_time
+                    cute_msg = _get_cute_tool_message_impl(
+                        "delegate_codex_coding_task",
+                        function_args,
+                        tool_duration,
+                        result=_codex_worker_result,
+                    )
+                    if spinner:
+                        spinner.stop(cute_msg)
+                    elif self._should_emit_quiet_tool_messages():
+                        self._vprint(f"  {cute_msg}")
             elif self._context_engine_tool_names and function_name in self._context_engine_tool_names:
                 # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
                 spinner = None
@@ -12035,6 +12075,31 @@ class AIAgent:
                 if self._persist_user_message_override is None:
                     self._persist_user_message_override = original_user_message
                 user_message = f"{_goal_context}\n\n{user_message}"
+
+        # API-only Codex worker guidance. Keep the persisted transcript clean:
+        # the prefix is steering for the current model call, not user content.
+        if isinstance(original_user_message, str) and isinstance(user_message, str):
+            try:
+                from hermes_cli.codex_worker_switch import (
+                    build_worker_guidance,
+                    get_enabled as _codex_worker_enabled,
+                )
+                from hermes_cli.config import load_config as _load_config
+
+                _codex_worker_prefix = build_worker_guidance(
+                    original_user_message,
+                    enabled=_codex_worker_enabled(_load_config()),
+                    tool_available=(
+                        "delegate_codex_coding_task" in self.valid_tool_names
+                    ),
+                    api_mode=getattr(self, "api_mode", ""),
+                )
+            except Exception:
+                _codex_worker_prefix = ""
+            if _codex_worker_prefix:
+                if self._persist_user_message_override is None:
+                    self._persist_user_message_override = original_user_message
+                user_message = f"{_codex_worker_prefix}{user_message}"
 
         # Track memory nudge trigger (turn-based, checked here).
         # Skill trigger is checked AFTER the agent loop completes, based on
