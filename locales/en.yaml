@@ -122,7 +122,7 @@ gateway:
     denied_plural:         "❌ Commands denied ({count} commands)."
 
   fast:
-    not_supported:         "⚡ /fast is only available for OpenAI models that support Priority Processing."
+    not_supported:         "⚡ Fast mode is disabled for gateway conversations. CLI and individual-session fast mode settings are unchanged."
     status:                "⚡ Priority Processing\n\nCurrent mode: `{mode}`\n\n_Usage:_ `/fast <normal|fast|status>`"
     unknown_arg:           "⚠️ Unknown argument: `{arg}`\n\n**Valid options:** normal, fast, status"
     saved:                 "⚡ ✓ Priority Processing: **{label}** (saved to config)\n_(takes effect on next message)_"

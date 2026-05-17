@@ -1,4 +1,4 @@
-"""Tests for gateway /fast support and Priority Processing routing."""
+"""Tests for keeping gateway conversations out of fast mode."""
 
 import sys
 import threading
@@ -7,8 +7,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-import yaml
-
 import gateway.run as gateway_run
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
@@ -83,7 +81,7 @@ def _make_event(text: str) -> MessageEvent:
     return MessageEvent(text=text, source=_make_source(), message_id="m1")
 
 
-def test_turn_route_injects_priority_processing_without_changing_runtime():
+def test_turn_route_does_not_inject_priority_processing_even_if_loaded():
     runner = _make_runner()
     runner._service_tier = "priority"
     runtime_kwargs = {
@@ -100,7 +98,7 @@ def test_turn_route_injects_priority_processing_without_changing_runtime():
 
     assert route["runtime"]["provider"] == "openrouter"
     assert route["runtime"]["api_mode"] == "chat_completions"
-    assert route["request_overrides"] == {"service_tier": "priority"}
+    assert route["request_overrides"] == {}
 
 
 def test_turn_route_skips_priority_processing_for_unsupported_models():
@@ -122,24 +120,37 @@ def test_turn_route_skips_priority_processing_for_unsupported_models():
 
 
 @pytest.mark.asyncio
-async def test_handle_fast_command_persists_config(monkeypatch, tmp_path):
+async def test_handle_fast_command_refuses_to_enable_gateway_fast_mode(monkeypatch, tmp_path):
     runner = _make_runner()
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
-    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    (tmp_path / "config.yaml").write_text("agent:\n  service_tier: fast\n", encoding="utf-8")
 
     response = await runner._handle_fast_command(_make_event("/fast fast"))
 
-    assert "FAST" in response
-    assert runner._service_tier == "priority"
-
-    saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
-    assert saved["agent"]["service_tier"] == "fast"
+    assert "disabled for gateway" in response
+    assert runner._service_tier is None
+    assert (
+        (tmp_path / "config.yaml").read_text(encoding="utf-8")
+        == "agent:\n  service_tier: fast\n"
+    )
 
 
 @pytest.mark.asyncio
-async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch, tmp_path):
+async def test_handle_fast_status_reports_normal_even_when_config_is_fast(monkeypatch, tmp_path):
+    runner = _make_runner()
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / "config.yaml").write_text("agent:\n  service_tier: fast\n", encoding="utf-8")
+
+    response = await runner._handle_fast_command(_make_event("/fast status"))
+
+    assert "Current mode: `normal`" in response
+    assert runner._service_tier is None
+
+
+@pytest.mark.asyncio
+async def test_run_agent_ignores_fast_config_for_gateway_agent(monkeypatch, tmp_path):
     _install_fake_agent(monkeypatch)
     runner = _make_runner()
 
@@ -174,5 +185,5 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
     )
 
     assert result["final_response"] == "ok"
-    assert _CapturingAgent.last_init["service_tier"] == "priority"
-    assert _CapturingAgent.last_init["request_overrides"] == {"service_tier": "priority"}
+    assert _CapturingAgent.last_init["service_tier"] is None
+    assert _CapturingAgent.last_init["request_overrides"] == {}
