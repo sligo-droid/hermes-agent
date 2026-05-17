@@ -4200,7 +4200,7 @@ class DiscordAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
-        """Create a thread from a user message for auto-threading.
+        """Create a thread for auto-threading without reposting the user message.
 
         Returns the created thread object, or ``None`` on failure.
         """
@@ -4217,31 +4217,22 @@ class DiscordAdapter(BasePlatformAdapter):
         if len(content) > 80:
             thread_name = thread_name[:77] + "..."
 
+        display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
+        reason = f"Auto-threaded from mention by {display_name}"
         try:
-            thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
-            return thread
-        except Exception as direct_error:
-            display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
-            reason = f"Auto-threaded from mention by {display_name}"
-            try:
-                create = getattr(getattr(message, "channel", None), "create_thread", None)
-                if create is None:
-                    raise RuntimeError("channel does not support direct thread creation")
-                thread = await create(
-                    name=thread_name,
-                    auto_archive_duration=1440,
-                    type=discord.ChannelType.public_thread,
-                    reason=reason,
-                )
-                return thread
-            except Exception as fallback_error:
-                logger.warning(
-                    "[%s] Auto-thread creation failed. Direct error: %s. Fallback error: %s",
-                    self.name,
-                    direct_error,
-                    fallback_error,
-                )
+            create = getattr(getattr(message, "channel", None), "create_thread", None)
+            if create is None:
                 return None
+            thread = await create(
+                name=thread_name,
+                auto_archive_duration=1440,
+                type=discord.ChannelType.public_thread,
+                reason=reason,
+            )
+            return thread
+        except Exception as exc:
+            logger.warning("[%s] Auto-thread creation failed: %s", self.name, exc)
+            return None
 
     async def create_handoff_thread(
         self,
