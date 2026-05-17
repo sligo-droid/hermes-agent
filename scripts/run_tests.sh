@@ -22,12 +22,23 @@ set -euo pipefail
 # Works whether this is the main checkout or a worktree.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+MAIN_REPO_ROOT=""
+if GIT_COMMON_DIR="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+  if [ "$(basename "$GIT_COMMON_DIR")" = ".git" ]; then
+    MAIN_REPO_ROOT="$(dirname "$GIT_COMMON_DIR")"
+  fi
+fi
 
 # ── Activate venv ───────────────────────────────────────────────────────────
 # Prefer a .venv in the current tree, fall back to the main checkout's venv
 # (useful for worktrees where we don't always duplicate the venv).
 VENV=""
-for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
+CANDIDATE_VENVS=("$REPO_ROOT/.venv" "$REPO_ROOT/venv")
+if [ -n "$MAIN_REPO_ROOT" ] && [ "$MAIN_REPO_ROOT" != "$REPO_ROOT" ]; then
+  CANDIDATE_VENVS+=("$MAIN_REPO_ROOT/.venv" "$MAIN_REPO_ROOT/venv")
+fi
+CANDIDATE_VENVS+=("$HOME/.hermes/hermes-agent/venv")
+for candidate in "${CANDIDATE_VENVS[@]}"; do
   if [ -f "$candidate/bin/activate" ]; then
     VENV="$candidate"
     break
@@ -35,7 +46,8 @@ for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agen
 done
 
 if [ -z "$VENV" ]; then
-  echo "error: no virtualenv found in $REPO_ROOT/.venv or $REPO_ROOT/venv" >&2
+  echo "error: no virtualenv found. Checked:" >&2
+  printf '  %s\n' "${CANDIDATE_VENVS[@]}" >&2
   exit 1
 fi
 
