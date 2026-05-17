@@ -354,8 +354,8 @@ async def test_discord_dms_ignore_mention_requirement(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_discord_auto_thread_enabled_by_default(adapter, monkeypatch):
-    """Auto-threading should be enabled by default (DISCORD_AUTO_THREAD defaults to 'true')."""
+async def test_discord_auto_thread_enabled_by_default_for_feature_requests(adapter, monkeypatch):
+    """Auto-threading is enabled by default for feature requests."""
     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
 
@@ -363,7 +363,7 @@ async def test_discord_auto_thread_enabled_by_default(adapter, monkeypatch):
     fake_thread = FakeThread(channel_id=999, name="auto-thread")
     adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
 
-    message = make_message(channel=FakeTextChannel(channel_id=123), content="hello")
+    message = make_message(channel=FakeTextChannel(channel_id=123), content="build a dashboard")
 
     await adapter._handle_message(message)
 
@@ -463,7 +463,7 @@ async def test_discord_auto_thread_tracks_participation(adapter, monkeypatch):
     fake_thread = FakeThread(channel_id=555, name="auto-thread")
     adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
 
-    message = make_message(channel=FakeTextChannel(channel_id=123), content="start a thread")
+    message = make_message(channel=FakeTextChannel(channel_id=123), content="build a dashboard")
 
     await adapter._handle_message(message)
 
