@@ -575,6 +575,45 @@ class TestMcpRemoveEvictsManager:
 
 
 class TestMcpLogin:
+    def test_login_uses_five_minute_probe_timeout(self, tmp_path, capsys, monkeypatch):
+        _seed_config(tmp_path, {
+            "vercel": {"url": "https://mcp.vercel.com/mcp", "auth": "oauth"},
+        })
+        captured = {}
+
+        class FakeManager:
+            def remove(self, name):
+                captured["removed"] = name
+
+        def fake_probe(name, config, **kwargs):
+            captured["probe"] = (name, config, kwargs)
+            return [("deploy", "Deploy a project")]
+
+        monkeypatch.setattr(
+            "tools.mcp_oauth_manager.get_manager",
+            lambda: FakeManager(),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            fake_probe,
+        )
+
+        from hermes_cli.mcp_config import (
+            _MCP_LOGIN_TIMEOUT_SECONDS,
+            cmd_mcp_login,
+        )
+
+        cmd_mcp_login(_make_args(name="vercel"))
+
+        assert captured["removed"] == "vercel"
+        assert captured["probe"][0] == "vercel"
+        assert captured["probe"][2] == {
+            "connect_timeout": None,
+            "overall_timeout": _MCP_LOGIN_TIMEOUT_SECONDS,
+        }
+        out = capsys.readouterr().out
+        assert "Authenticated" in out
+
     def test_login_rejects_unknown_server(self, tmp_path, capsys):
         _seed_config(tmp_path, {})
         from hermes_cli.mcp_config import cmd_mcp_login
@@ -599,4 +638,3 @@ class TestMcpLogin:
         cmd_mcp_login(_make_args(name="srv"))
         out = capsys.readouterr().out
         assert "no URL" in out or "not an OAuth" in out
-
