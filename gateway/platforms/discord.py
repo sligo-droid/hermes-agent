@@ -4853,6 +4853,10 @@ class DiscordAdapter(BasePlatformAdapter):
             normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
             normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
             message.content = normalized_content
+
+        all_attachments = list(message.attachments) + snapshot_attachments
+        message_is_voice = self._message_has_voice_flag(message)
+
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -4905,6 +4909,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 if (
                     self._client.user not in message.mentions
                     and not mention_prefix
+                    and not message_is_voice
                     and not replies_to_self
                 ):
                     return
@@ -4938,10 +4943,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 parent_channel=message.channel,
                 initial_request=normalized_content,
             )
-
-        all_attachments = list(message.attachments) + snapshot_attachments
-
-        message_is_voice = self._message_has_voice_flag(message)
 
         # Determine message type
         msg_type = MessageType.TEXT
