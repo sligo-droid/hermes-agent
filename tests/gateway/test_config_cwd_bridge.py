@@ -12,6 +12,7 @@ asserting the expected env var outcomes.
 import os
 import json
 import pytest
+from pathlib import Path
 
 
 def _simulate_config_bridge(
@@ -270,3 +271,44 @@ class TestVercelTerminalBridge:
         assert result["TERMINAL_CONTAINER_CPU"] == "2"
         assert result["TERMINAL_CONTAINER_MEMORY"] == "4096"
         assert result["TERMINAL_CONTAINER_DISK"] == "51200"
+
+
+class TestGatewayProcessCwd:
+    def test_local_gateway_chdirs_to_terminal_cwd_for_prompt_builder(
+        self, tmp_path, monkeypatch
+    ):
+        from gateway import run as gateway_run
+        import agent.prompt_builder as prompt_builder
+
+        start = tmp_path / "start"
+        target = tmp_path / "target"
+        start.mkdir()
+        target.mkdir()
+        monkeypatch.chdir(start)
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+        monkeypatch.setenv("TERMINAL_CWD", str(target))
+        monkeypatch.setattr(prompt_builder, "is_wsl", lambda: False)
+        prompt_builder._clear_backend_probe_cache()
+
+        assert gateway_run._apply_gateway_process_cwd() is True
+
+        assert Path.cwd() == target
+        assert os.environ["TERMINAL_CWD"] == str(target)
+        hints = prompt_builder.build_environment_hints()
+        assert f"Current working directory: {target}" in hints
+
+    def test_gateway_process_cwd_ignores_remote_backends(self, tmp_path, monkeypatch):
+        from gateway import run as gateway_run
+
+        start = tmp_path / "start"
+        target = tmp_path / "target"
+        start.mkdir()
+        target.mkdir()
+        monkeypatch.chdir(start)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("TERMINAL_CWD", str(target))
+
+        assert gateway_run._apply_gateway_process_cwd() is False
+
+        assert Path.cwd() == start
+        assert os.environ["TERMINAL_CWD"] == str(target)
