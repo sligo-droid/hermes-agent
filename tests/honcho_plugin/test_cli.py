@@ -357,6 +357,54 @@ class TestEmbeddingsCommand:
         assert "4096 != 1024" in detail
         assert "pgvector" in detail
 
+    def test_embedding_dimension_report_accepts_honcho_truncation(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        monkeypatch.setattr(
+            honcho_cli,
+            "_http_post_json",
+            lambda url, payload: (True, {"data": [{"embedding": [0.0] * 4096}]}),
+        )
+
+        ok, detail = honcho_cli._embedding_dimension_report(
+            expected_dimensions=2000,
+            model="Qwen/Qwen3-Embedding-8B-GGUF:Q8_0",
+            dimensions_mode="always",
+        )
+
+        assert ok is True
+        assert "raw backend returned 4096" in detail
+        assert "Honcho truncates to 2000" in detail
+
+    def test_embedding_status_config_prefers_cli_then_runtime_env(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        monkeypatch.setattr(
+            honcho_cli,
+            "_discover_honcho_embedding_env",
+            lambda: (
+                {
+                    "EMBEDDING_MODEL_CONFIG__MODEL": "Qwen/Qwen3-Embedding-8B-GGUF:Q8_0",
+                    "EMBEDDING_VECTOR_DIMENSIONS": "2000",
+                    "EMBEDDING_MAX_INPUT_TOKENS": "8192",
+                    "EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE": "always",
+                    "EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL": "http://127.0.0.1:9090/v1",
+                },
+                "Docker container honcho-api",
+            ),
+        )
+
+        cfg = honcho_cli._embedding_status_config(
+            SimpleNamespace(model="explicit-model", ctx=None, dimensions=None, port=None)
+        )
+
+        assert cfg["model"] == "explicit-model"
+        assert cfg["ctx"] == 8192
+        assert cfg["dimensions"] == 2000
+        assert cfg["port"] == 9090
+        assert cfg["dimensions_mode"] == "always"
+        assert cfg["source"] == "Docker container honcho-api"
+
     def test_embedding_endpoint_report_accepts_docker_backed_endpoint(self, monkeypatch):
         import plugins.memory.honcho.cli as honcho_cli
 

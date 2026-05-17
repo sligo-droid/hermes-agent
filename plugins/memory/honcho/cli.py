@@ -10,6 +10,7 @@ import os
 import shlex
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
 from plugins.memory.honcho.client import resolve_active_host, resolve_config_path, HOST
@@ -26,6 +27,14 @@ LOCAL_LLAMACPP_DOCKER_IMAGE = "ghcr.io/ggml-org/llama.cpp:server"
 LOCAL_HONCHO_BASE_URL = "http://127.0.0.1:8000"
 LOCAL_LLM_BASE_URL = "http://127.0.0.1:8645/v1"
 LOCAL_LLM_MODEL = "gpt-5.5"
+
+_EMBEDDING_RUNTIME_ENV_KEYS = (
+    "EMBEDDING_MODEL_CONFIG__MODEL",
+    "EMBEDDING_VECTOR_DIMENSIONS",
+    "EMBEDDING_MAX_INPUT_TOKENS",
+    "EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE",
+    "EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL",
+)
 
 
 LOCAL_FIRST_HONCHO_ENV = {
@@ -436,6 +445,127 @@ def _embedding_url(port: int = LOCAL_EMBEDDING_PORT, path: str = "") -> str:
     return f"{base}{path}"
 
 
+def _parse_positive_int(value: object) -> int | None:
+    try:
+        parsed = int(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _embedding_port_from_base_url(base_url: str | None) -> int | None:
+    if not base_url:
+        return None
+    parsed = urlparse(base_url)
+    try:
+        return parsed.port
+    except ValueError:
+        return None
+
+
+def _env_list_to_dict(items: object) -> dict[str, str]:
+    env: dict[str, str] = {}
+    if not isinstance(items, list):
+        return env
+    for item in items:
+        if not isinstance(item, str) or "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        env[key] = value
+    return env
+
+
+def _discover_honcho_embedding_env() -> tuple[dict[str, str], str]:
+    process_env = {
+        key: os.environ[key]
+        for key in _EMBEDDING_RUNTIME_ENV_KEYS
+        if os.environ.get(key)
+    }
+    if process_env:
+        return process_env, "process env"
+
+    try:
+        import subprocess
+
+        ps = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return {}, ""
+    if ps.returncode != 0:
+        return {}, ""
+
+    names = [
+        line.strip()
+        for line in ps.stdout.splitlines()
+        if line.strip() and "honcho" in line.strip().lower()
+    ]
+    for name in names:
+        try:
+            inspect = subprocess.run(
+                ["docker", "inspect", "--format", "{{json .Config.Env}}", name],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            continue
+        if inspect.returncode != 0:
+            continue
+        try:
+            env = _env_list_to_dict(json.loads(inspect.stdout))
+        except Exception:
+            continue
+        embedding_env = {
+            key: env[key]
+            for key in _EMBEDDING_RUNTIME_ENV_KEYS
+            if env.get(key)
+        }
+        if embedding_env:
+            return embedding_env, f"Docker container {name}"
+    return {}, ""
+
+
+def _embedding_status_config(args) -> dict[str, object]:
+    env, source = _discover_honcho_embedding_env()
+    base_url = env.get("EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL")
+    explicit_port = getattr(args, "port", None)
+
+    model = (
+        getattr(args, "model", None)
+        or env.get("EMBEDDING_MODEL_CONFIG__MODEL")
+        or LOCAL_EMBEDDING_MODEL
+    )
+    ctx = (
+        getattr(args, "ctx", None)
+        or _parse_positive_int(env.get("EMBEDDING_MAX_INPUT_TOKENS"))
+        or LOCAL_EMBEDDING_CONTEXT
+    )
+    dimensions = (
+        getattr(args, "dimensions", None)
+        or _parse_positive_int(env.get("EMBEDDING_VECTOR_DIMENSIONS"))
+        or LOCAL_EMBEDDING_DIMENSIONS
+    )
+    port = (
+        explicit_port
+        or _embedding_port_from_base_url(base_url)
+        or LOCAL_EMBEDDING_PORT
+    )
+    return {
+        "model": model,
+        "ctx": ctx,
+        "dimensions": dimensions,
+        "port": port,
+        "dimensions_mode": env.get("EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE") or "",
+        "source": source,
+    }
+
+
 def _http_get_json(url: str, timeout: float = 2.0) -> tuple[bool, object | str]:
     import urllib.error
     import urllib.request
@@ -484,6 +614,7 @@ def _embedding_dimension_report(
     port: int = LOCAL_EMBEDDING_PORT,
     expected_dimensions: int = LOCAL_EMBEDDING_DIMENSIONS,
     model: str = LOCAL_EMBEDDING_MODEL,
+    dimensions_mode: str = "",
 ) -> tuple[bool, str]:
     ok, result = _http_post_json(
         _embedding_url(port, "/v1/embeddings"),
@@ -502,6 +633,16 @@ def _embedding_dimension_report(
 
     actual = len(embedding)
     if actual != expected_dimensions:
+        if (
+            actual > expected_dimensions
+            and expected_dimensions <= 2000
+            and dimensions_mode.lower() == "always"
+        ):
+            return (
+                True,
+                "OK with truncation "
+                f"(raw backend returned {actual}; Honcho truncates to {expected_dimensions})",
+            )
         return (
             False,
             f"{actual} != {expected_dimensions}; Honcho pgvector must be bootstrapped with matching dimensions",
@@ -513,6 +654,7 @@ def _embedding_endpoint_report(
     port: int = LOCAL_EMBEDDING_PORT,
     expected_dimensions: int = LOCAL_EMBEDDING_DIMENSIONS,
     model: str = LOCAL_EMBEDDING_MODEL,
+    dimensions_mode: str = "",
 ) -> tuple[bool, list[str]]:
     lines = []
     try:
@@ -546,6 +688,7 @@ def _embedding_endpoint_report(
             port=port,
             expected_dimensions=expected_dimensions,
             model=model,
+            dimensions_mode=dimensions_mode,
         )
         lines.append(f"  Dimensions: {'OK' if ok_dims else 'FAILED'} ({dim_detail})")
     else:
@@ -646,14 +789,26 @@ def cmd_embeddings(args) -> None:
         return
 
     if action in ("status", "check"):
+        status_config = _embedding_status_config(args)
+        model = str(status_config["model"])
+        ctx = int(status_config["ctx"])
+        dimensions = int(status_config["dimensions"])
+        port = int(status_config["port"])
+        dimensions_mode = str(status_config["dimensions_mode"])
+        source = str(status_config["source"])
         print("\nHoncho llama.cpp embeddings status\n" + "-" * 40)
-        print(f"  Expected:   {LOCAL_EMBEDDING_BASE_URL}")
+        print(f"  Expected:   {_embedding_url(port, '/v1')}")
+        if source:
+            print(f"  Source:     {source}")
         print(f"  Model:      {model}")
         print(f"  Dimensions: {dimensions}")
+        if dimensions_mode:
+            print(f"  Dim mode:   {dimensions_mode}")
         ok, lines = _embedding_endpoint_report(
             port=port,
             expected_dimensions=dimensions,
             model=model,
+            dimensions_mode=dimensions_mode,
         )
         for line in lines:
             print(line)
@@ -1986,19 +2141,19 @@ def register_cli(subparser) -> None:
         help="Action to run. Defaults to status.",
     )
     embeddings_parser.add_argument(
-        "--model", default=LOCAL_EMBEDDING_MODEL,
+        "--model",
         help="Model/path for llama-server start",
     )
     embeddings_parser.add_argument(
-        "--ctx", type=int, default=LOCAL_EMBEDDING_CONTEXT,
+        "--ctx", type=int,
         help="Context length for llama-server start/check",
     )
     embeddings_parser.add_argument(
-        "--dimensions", type=int, default=LOCAL_EMBEDDING_DIMENSIONS,
+        "--dimensions", type=int,
         help="Expected embedding vector dimensions for status/check",
     )
     embeddings_parser.add_argument(
-        "--port", type=int, default=LOCAL_EMBEDDING_PORT,
+        "--port", type=int,
         help="Local llama-server port",
     )
     embeddings_parser.add_argument(
