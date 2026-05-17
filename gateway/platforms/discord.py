@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import struct
 import subprocess
 import tempfile
@@ -74,6 +75,16 @@ def _discord_live_voice_enabled() -> bool:
 _DISCORD_PROJECT_SUMMARY_STATE_FILENAME = "discord_project_summaries.json"
 _DISCORD_PROJECT_SUMMARY_PREFIX = "Project Summary:"
 _DISCORD_TOPIC_LIMIT = 1024
+_DISCORD_TOPIC_DEFAULT_START_RE = re.compile(
+    r"^\s*This is the start of the #[^\s]+ channel\.\s*$",
+    re.IGNORECASE,
+)
+_DISCORD_PROJECT_SUMMARY_MANAGED_LABELS = (
+    "Production URL:",
+    "Login:",
+    "GitHub URL:",
+    "Next priorities:",
+)
 _OBSIDIAN_PROJECT_PRIORITIES_HEADINGS = {
     "next actions",
     "next priorities",
@@ -120,7 +131,6 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
-import re
 
 from gateway.discord_project_mapping import resolve_discord_project_context
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker, strip_markdown
@@ -1122,12 +1132,17 @@ class DiscordAdapter(BasePlatformAdapter):
         repo = self._truncate_summary_value(metadata.get("repo_url"), limit=260)
         priorities = self._truncate_summary_value(metadata.get("priorities"), limit=360)
         app_access = self._truncate_summary_value(metadata.get("app_access"), limit=180, default="")
-        line = (
-            f"{_DISCORD_PROJECT_SUMMARY_PREFIX} Production URL: {prod} | "
-            f"GitHub URL: {repo} | Next priorities: {priorities}"
-        )
+        lines = [
+            _DISCORD_PROJECT_SUMMARY_PREFIX,
+            f"Production URL: {prod}",
+        ]
         if app_access:
-            line = f"{line} | Login: {app_access}"
+            lines.append(f"Login: {app_access}")
+        lines.extend([
+            f"GitHub URL: {repo}",
+            f"Next priorities: {priorities}",
+        ])
+        line = "\n".join(lines)
         if len(line) <= _DISCORD_TOPIC_LIMIT:
             return line
         return line[: _DISCORD_TOPIC_LIMIT - 3] + "..."
@@ -1160,6 +1175,14 @@ class DiscordAdapter(BasePlatformAdapter):
             lines = lines[1:]
             if lines and not lines[0].strip():
                 lines = lines[1:]
+            while lines and any(
+                lines[0].strip().startswith(label)
+                for label in _DISCORD_PROJECT_SUMMARY_MANAGED_LABELS
+            ):
+                lines = lines[1:]
+            if lines and not lines[0].strip():
+                lines = lines[1:]
+        lines = [line for line in lines if not _DISCORD_TOPIC_DEFAULT_START_RE.match(line)]
         rest = "\n".join(lines).strip()
         if not rest:
             return summary_line[:_DISCORD_TOPIC_LIMIT]
