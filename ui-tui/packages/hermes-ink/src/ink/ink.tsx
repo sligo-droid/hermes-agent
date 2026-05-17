@@ -1273,6 +1273,28 @@ export default class Ink {
   }
 
   /**
+   * Request an erase-backed repaint on the next alt-screen render.
+   *
+   * Use when a large floating overlay has just appeared/disappeared:
+   * diff-only repaint can miss cells that are already blank in the virtual
+   * buffers but still contain stale physical terminal glyphs.
+   */
+  requestRepaint(): void {
+    if (!this.options.stdout.isTTY || this.isUnmounted || this.isPaused) {
+      return
+    }
+
+    if (this.altScreenActive) {
+      this.resetFramesForAltScreen()
+      this.needsEraseBeforePaint = true
+
+      return
+    }
+
+    this.prevFrameContaminated = true
+  }
+
+  /**
    * Called by the <AlternateScreen> component on mount/unmount.
    * Controls cursor.y clamping in the renderer and gates alt-screen-aware
    * behavior in SIGCONT/resize/unmount handlers. Repaints on change so
