@@ -65,6 +65,7 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _TRUTHY_ENV_VALUES = {"true", "1", "yes", "on"}
+_CODEX_APP_SERVER_ACTIVITY_PREFIX = "Codex app-server event:"
 
 
 def _discord_live_voice_enabled() -> bool:
@@ -93,6 +94,21 @@ def _telegramize_command_mentions(text: str, platform: Any) -> str:
         return f"/{sanitized}" if sanitized else match.group(0)
 
     return _TELEGRAM_COMMAND_MENTION_RE.sub(_replace, text)
+
+
+def _format_long_running_status_detail(activity: Dict[str, Any]) -> str:
+    """Format user-facing activity context for gateway progress notices."""
+    parts = [f"iteration {activity['api_call_count']}/{activity['max_iterations']}"]
+    if activity.get("current_tool"):
+        parts.append(f"running: {activity['current_tool']}")
+    else:
+        last_activity_desc = str(activity.get("last_activity_desc") or "")
+        if (
+            last_activity_desc
+            and not last_activity_desc.startswith(_CODEX_APP_SERVER_ACTIVITY_PREFIX)
+        ):
+            parts.append(last_activity_desc)
+    return " — " + ", ".join(parts)
 
 
 # Only auto-continue interrupted gateway turns while the interruption is fresh.
@@ -16280,12 +16296,7 @@ class GatewayRunner:
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
                         _a = _agent_ref.get_activity_summary()
-                        _parts = [f"iteration {_a['api_call_count']}/{_a['max_iterations']}"]
-                        if _a.get("current_tool"):
-                            _parts.append(f"running: {_a['current_tool']}")
-                        else:
-                            _parts.append(_a.get("last_activity_desc", ""))
-                        _status_detail = " — " + ", ".join(_parts)
+                        _status_detail = _format_long_running_status_detail(_a)
                     except Exception:
                         pass
                 try:
