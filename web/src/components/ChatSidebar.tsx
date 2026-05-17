@@ -28,11 +28,19 @@ import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Card } from "@/components/ui/card";
 
 import { ModelPickerDialog } from "@/components/ModelPickerDialog";
+import { Markdown } from "@/components/Markdown";
 import { ToolCall, type ToolEntry } from "@/components/ToolCall";
 import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
 
 import { cn } from "@/lib/utils";
-import { AlertCircle, ChevronDown, RefreshCw } from "lucide-react";
+import { api } from "@/lib/api";
+import {
+  AlertCircle,
+  ChevronDown,
+  DatabaseZap,
+  RefreshCw,
+  Send,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 interface SessionInfo {
@@ -88,6 +96,13 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
   const [tools, setTools] = useState<ToolEntry[]>([]);
   const [modelOpen, setModelOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [dataQuestion, setDataQuestion] = useState("");
+  const [dataAnswer, setDataAnswer] = useState<string | null>(null);
+  const [dataModel, setDataModel] = useState<string | null>(null);
+  const [dataAskState, setDataAskState] = useState<
+    "idle" | "loading" | "error"
+  >("idle");
+  const [dataError, setDataError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -299,6 +314,25 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
   const canPickModel = state === "open" && !!sessionId;
   const modelLabel = (info.model ?? "—").split("/").slice(-1)[0] ?? "—";
   const banner = error ?? info.credential_warning ?? null;
+  const canAskData =
+    dataQuestion.trim().length > 0 && dataAskState !== "loading";
+
+  const onDataAsk = useCallback(async () => {
+    const question = dataQuestion.trim();
+    if (!question) return;
+
+    setDataAskState("loading");
+    setDataError(null);
+    try {
+      const res = await api.askDashboardData(question);
+      setDataAnswer(res.answer);
+      setDataModel(res.model);
+      setDataAskState("idle");
+    } catch (e) {
+      setDataError(e instanceof Error ? e.message : String(e));
+      setDataAskState("error");
+    }
+  }, [dataQuestion]);
 
   return (
     <aside
@@ -354,6 +388,71 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
           </div>
         </Card>
       )}
+
+      <Card className="flex flex-none flex-col gap-2 px-3 py-3">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <DatabaseZap className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            <div className="truncate text-xs uppercase tracking-wider text-muted-foreground">
+              data agent
+            </div>
+          </div>
+          {dataModel && (
+            <div
+              className="truncate text-[0.65rem] text-muted-foreground"
+              title={dataModel}
+            >
+              {dataModel.split("/").slice(-1)[0]}
+            </div>
+          )}
+        </div>
+
+        <textarea
+          value={dataQuestion}
+          onChange={(e) => setDataQuestion(e.target.value)}
+          onKeyDown={(e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+              e.preventDefault();
+              void onDataAsk();
+            }
+          }}
+          maxLength={1000}
+          rows={3}
+          placeholder="Ask about sessions, messages, tools, or recent activity"
+          className={cn(
+            "min-h-20 w-full resize-none border border-border bg-background/40 px-2.5 py-2 font-courier text-xs",
+            "placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground/30",
+          )}
+        />
+
+        <Button
+          size="sm"
+          disabled={!canAskData}
+          onClick={() => void onDataAsk()}
+          prefix={
+            dataAskState === "loading" ? (
+              <RefreshCw className="animate-spin" />
+            ) : (
+              <Send />
+            )
+          }
+          className="justify-center"
+        >
+          {dataAskState === "loading" ? "asking" : "ask data"}
+        </Button>
+
+        {dataError && (
+          <div className="wrap-break-word border border-destructive/30 bg-destructive/5 px-2 py-1.5 text-xs text-destructive">
+            {dataError}
+          </div>
+        )}
+
+        {dataAnswer && (
+          <div className="max-h-72 overflow-y-auto border border-border bg-background/30 px-2 py-2">
+            <Markdown content={dataAnswer} />
+          </div>
+        )}
+      </Card>
 
       <Card className="flex min-h-0 flex-none flex-col px-2 py-2">
         <div className="px-1 pb-2 text-xs uppercase tracking-wider text-muted-foreground">

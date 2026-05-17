@@ -208,6 +208,12 @@ export const api = {
   // Session search (FTS5)
   searchSessions: (q: string) =>
     fetchJSON<SessionSearchResponse>(`/api/sessions/search?q=${encodeURIComponent(q)}`),
+  askDashboardData: (question: string) =>
+    fetchJSON<DashboardInferenceResponse>("/api/dashboard/inference", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    }),
 
   // OAuth provider management
   getOAuthProviders: () =>
@@ -593,6 +599,21 @@ export interface SessionSearchResult {
 
 export interface SessionSearchResponse {
   results: SessionSearchResult[];
+}
+
+export interface DashboardInferenceMatch {
+  session_id: string | null;
+  role: string | null;
+  snippet: string | null;
+  source: string | null;
+  model: string | null;
+  session_started: number | null;
+}
+
+export interface DashboardInferenceResponse {
+  answer: string;
+  model: string | null;
+  matches: DashboardInferenceMatch[];
 }
 
 // ── Model info types ──────────────────────────────────────────────────
