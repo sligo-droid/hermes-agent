@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
+from types import SimpleNamespace
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote
 
@@ -51,6 +52,15 @@ _DISCORD_AUDIO_CONTENT_TYPES = {
 }
 _DISCORD_VOICE_MESSAGE_FLAG = 1 << 13
 _TRUTHY_ENV_VALUES = {"true", "1", "yes", "on"}
+_DISCORD_SHIP_REACTION_NAMES = frozenset({"+1", "thumbsup"})
+_DISCORD_SHIP_REACTION_EMOJIS = frozenset({
+    "👍",
+    "👍🏻",
+    "👍🏼",
+    "👍🏽",
+    "👍🏾",
+    "👍🏿",
+})
 
 
 def _discord_live_voice_enabled() -> bool:
@@ -625,6 +635,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Dedup cache: prevents duplicate bot responses when Discord
         # RESUME replays events after reconnects.
         self._dedup = MessageDeduplicator()
+        self._reaction_dedup = MessageDeduplicator()
         # Reply threading mode: "off" (no replies), "first" (reply on first
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -1219,6 +1230,7 @@ class DiscordAdapter(BasePlatformAdapter):
             intents.message_content = True
             intents.dm_messages = True
             intents.guild_messages = True
+            intents.reactions = True
             intents.members = (
                 any(not entry.isdigit() for entry in self._allowed_user_ids)
                 or bool(self._allowed_role_ids)  # Need members intent for role lookup
@@ -1387,6 +1399,10 @@ class DiscordAdapter(BasePlatformAdapter):
                             return
 
                 await self._handle_message(message)
+
+            @self._client.event
+            async def on_raw_reaction_add(payload):
+                await adapter_self._handle_raw_reaction_add(payload)
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
@@ -4029,6 +4045,194 @@ class DiscordAdapter(BasePlatformAdapter):
             raw_message=interaction,
             channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
         )
+
+    @staticmethod
+    def _is_ship_reaction_emoji(emoji: Any) -> bool:
+        """Return True for Discord thumbs-up reactions that mean "ship it"."""
+        text = str(emoji or "").strip()
+        name = str(getattr(emoji, "name", "") or text).strip().lower()
+        return text in _DISCORD_SHIP_REACTION_EMOJIS or name in _DISCORD_SHIP_REACTION_NAMES
+
+    async def _fetch_discord_channel(self, channel_id: Any) -> Any:
+        if not self._client:
+            return None
+        try:
+            channel_id_int = int(channel_id)
+        except (TypeError, ValueError):
+            return None
+        channel = None
+        get_channel = getattr(self._client, "get_channel", None)
+        if callable(get_channel):
+            try:
+                channel = get_channel(channel_id_int)
+            except Exception:
+                channel = None
+        if channel is not None:
+            return channel
+        fetch_channel = getattr(self._client, "fetch_channel", None)
+        if callable(fetch_channel):
+            try:
+                return await fetch_channel(channel_id_int)
+            except Exception as exc:
+                logger.debug("[%s] Discord reaction channel fetch failed: %s", self.name, exc)
+        return None
+
+    async def _resolve_reaction_user(self, payload: Any) -> Any:
+        user = getattr(payload, "member", None)
+        if user is not None:
+            return user
+        user_id = getattr(payload, "user_id", None)
+        if self._client is not None and user_id is not None:
+            try:
+                user_id_int = int(user_id)
+            except (TypeError, ValueError):
+                user_id_int = None
+            if user_id_int is not None:
+                get_user = getattr(self._client, "get_user", None)
+                if callable(get_user):
+                    try:
+                        user = get_user(user_id_int)
+                    except Exception:
+                        user = None
+                if user is not None:
+                    return user
+                fetch_user = getattr(self._client, "fetch_user", None)
+                if callable(fetch_user):
+                    try:
+                        user = await fetch_user(user_id_int)
+                    except Exception:
+                        user = None
+                if user is not None:
+                    return user
+        return SimpleNamespace(id=user_id, name=str(user_id or ""), display_name=str(user_id or "user"))
+
+    def _build_ship_reaction_event(self, payload: Any, channel: Any, message: Any, user: Any) -> MessageEvent:
+        is_dm = isinstance(channel, discord.DMChannel)
+        is_thread = isinstance(channel, discord.Thread)
+        thread_id = str(getattr(channel, "id", "")) if is_thread else None
+        parent_chat_id = self._get_parent_channel_id(channel) if is_thread else None
+
+        if is_dm:
+            chat_type = "dm"
+            chat_name = getattr(user, "display_name", None) or getattr(user, "name", None) or str(getattr(user, "id", "user"))
+        elif is_thread:
+            chat_type = "thread"
+            chat_name = self._format_thread_chat_name(channel)
+        else:
+            chat_type = "group"
+            chat_name = getattr(channel, "name", str(getattr(channel, "id", "")))
+            guild = getattr(channel, "guild", None)
+            if guild:
+                chat_name = f"{guild.name} / #{chat_name}"
+
+        guild = getattr(message, "guild", None) or getattr(channel, "guild", None)
+        if guild is None and self._client is not None and getattr(payload, "guild_id", None):
+            get_guild = getattr(self._client, "get_guild", None)
+            if callable(get_guild):
+                try:
+                    guild = get_guild(int(getattr(payload, "guild_id")))
+                except (TypeError, ValueError):
+                    guild = None
+        user_name = getattr(user, "display_name", None) or getattr(user, "name", None) or str(getattr(user, "id", "user"))
+        channel_id = str(getattr(channel, "id", getattr(payload, "channel_id", "")))
+        parent_id = str(parent_chat_id or "")
+        message_id = str(getattr(payload, "message_id", ""))
+        source = self.build_source(
+            chat_id=channel_id,
+            chat_name=chat_name,
+            chat_type=chat_type,
+            user_id=str(getattr(user, "id", getattr(payload, "user_id", ""))),
+            user_name=user_name,
+            thread_id=thread_id,
+            chat_topic=self._get_effective_topic(channel, is_thread=is_thread),
+            guild_id=str(getattr(guild, "id", "")) if guild and getattr(guild, "id", None) else None,
+            parent_chat_id=parent_chat_id,
+            message_id=message_id,
+        )
+        return MessageEvent(
+            text="ship it",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=payload,
+            message_id=message_id,
+            reply_to_message_id=message_id,
+            reply_to_text=getattr(message, "content", None) or None,
+            channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
+            auto_skill=self._resolve_channel_skills(channel_id, parent_id or None),
+        )
+
+    async def _handle_raw_reaction_add(self, payload: Any) -> None:
+        """Treat 👍 on a Hermes-authored Discord message as an exact "ship it" turn."""
+        if not self._is_ship_reaction_emoji(getattr(payload, "emoji", None)):
+            return
+        if self._client is None or getattr(self._client, "user", None) is None:
+            return
+
+        bot_user = self._client.user
+        user_id = str(getattr(payload, "user_id", "") or "")
+        if not user_id or user_id == str(getattr(bot_user, "id", "")):
+            return
+
+        channel = await self._fetch_discord_channel(getattr(payload, "channel_id", None))
+        if channel is None:
+            return
+        hard_ignore_reason = self._discord_hard_ignore_reason(channel)
+        if hard_ignore_reason:
+            logger.debug("[%s] Ignoring Discord ship reaction: %s", self.name, hard_ignore_reason)
+            return
+
+        fetch_message = getattr(channel, "fetch_message", None)
+        if not callable(fetch_message):
+            return
+        try:
+            message = await fetch_message(int(getattr(payload, "message_id")))
+        except Exception as exc:
+            logger.debug("[%s] Discord reaction message fetch failed: %s", self.name, exc)
+            return
+
+        author = getattr(message, "author", None)
+        if str(getattr(author, "id", "")) != str(getattr(bot_user, "id", "")):
+            return
+
+        user = await self._resolve_reaction_user(payload)
+        guild = getattr(message, "guild", None) or getattr(channel, "guild", None)
+        if guild is None and getattr(payload, "guild_id", None):
+            get_guild = getattr(self._client, "get_guild", None)
+            if callable(get_guild):
+                try:
+                    guild = get_guild(int(getattr(payload, "guild_id")))
+                except (TypeError, ValueError):
+                    guild = None
+        auth_interaction = SimpleNamespace(
+            channel=channel,
+            channel_id=getattr(channel, "id", getattr(payload, "channel_id", None)),
+            user=user,
+            guild=guild,
+            guild_id=getattr(guild, "id", getattr(payload, "guild_id", None)),
+        )
+        allowed, reason = self._evaluate_slash_authorization(auth_interaction)
+        if not allowed:
+            logger.warning(
+                "[Discord] Unauthorized ship reaction ignored: user=%s channel=%s guild=%s reason=%r",
+                user_id,
+                getattr(payload, "channel_id", None),
+                getattr(payload, "guild_id", None),
+                reason,
+            )
+            return
+
+        dedup = getattr(self, "_reaction_dedup", None)
+        if dedup is None:
+            dedup = MessageDeduplicator()
+            self._reaction_dedup = dedup
+        dedup_key = f"ship-reaction:{getattr(payload, 'channel_id', '')}:{getattr(payload, 'message_id', '')}"
+        if dedup.is_duplicate(dedup_key):
+            return
+
+        event = self._build_ship_reaction_event(payload, channel, message, user)
+        if event.source.thread_id:
+            self._threads.mark(event.source.thread_id)
+        await self.handle_message(event)
 
     # ------------------------------------------------------------------
     # Thread creation helpers
