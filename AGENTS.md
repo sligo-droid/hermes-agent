@@ -1085,3 +1085,7 @@ not the specific names.
 
 Reviewers should reject new change-detector tests; authors should convert
 them into invariants before re-requesting review.
+
+### Hermes self-improvement
+
+When doing hermes self-improvement, use worktrees but merge back to main at the end. Don't cleanup the worktree in case another tweak is necessary.
