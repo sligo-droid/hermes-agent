@@ -154,7 +154,10 @@ async def test_run_agent_ignores_fast_config_for_gateway_agent(monkeypatch, tmp_
     _install_fake_agent(monkeypatch)
     runner = _make_runner()
 
-    (tmp_path / "config.yaml").write_text("agent:\n  service_tier: fast\n", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(
+        "agent:\n  service_tier: fast\n  reasoning_effort: high\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
     monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
@@ -185,5 +188,19 @@ async def test_run_agent_ignores_fast_config_for_gateway_agent(monkeypatch, tmp_
     )
 
     assert result["final_response"] == "ok"
+    assert _CapturingAgent.last_init is not None
     assert _CapturingAgent.last_init["service_tier"] is None
     assert _CapturingAgent.last_init["request_overrides"] == {}
+    assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": False}
+
+
+def test_gateway_reasoning_loaders_ignore_cli_defaults(monkeypatch, tmp_path):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        "agent:\n  reasoning_effort: high\n"
+        "display:\n  show_reasoning: true\n",
+        encoding="utf-8",
+    )
+
+    assert gateway_run.GatewayRunner._load_reasoning_config() == {"enabled": False}
+    assert gateway_run.GatewayRunner._load_show_reasoning() is False
