@@ -15,7 +15,6 @@ Scope (what we expose):
   - web_search, web_extract              — Firecrawl, no codex equivalent
   - browser_navigate / _click / _type /  — Camofox/Browserbase automation
     _snapshot / _screenshot / _scroll / _back / _press / _vision
-  - delegate_task                        — Hermes subagents
   - vision_analyze                       — image inspection by vision model
   - image_generate                       — image generation
   - memory                               — Hermes' persistent memory store
@@ -52,7 +51,8 @@ logger = logging.getLogger(__name__)
 #   - terminal / shell / read_file / write_file / patch / search_files /
 #     process — codex's built-ins cover these and approval routes through
 #     codex's own UI.
-#   - delegate_task / memory / session_search / todo — these are
+#   - delegate_task / delegate_codex_coding_task / memory / session_search /
+#     todo — these are
 #     `_AGENT_LOOP_TOOLS` in Hermes (model_tools.py:493). They require
 #     the running AIAgent context to dispatch (mid-loop state), so a
 #     stateless MCP callback can't drive them. Hermes' default runtime
