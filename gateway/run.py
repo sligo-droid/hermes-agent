@@ -629,6 +629,28 @@ if not _configured_cwd or _configured_cwd in {".", "auto", "cwd"}:
     _fallback = os.getenv("MESSAGING_CWD") or str(get_hermes_home())
     os.environ["TERMINAL_CWD"] = _fallback
 
+
+def _apply_gateway_process_cwd() -> bool:
+    """Make local gateway process cwd match TERMINAL_CWD."""
+    backend = os.environ.get("TERMINAL_ENV", "").strip().lower()
+    if backend and backend != "local":
+        logger.debug("Skipping gateway process chdir for terminal backend %s", backend)
+        return False
+
+    raw_cwd = os.environ.get("TERMINAL_CWD", "").strip()
+    if not raw_cwd or raw_cwd in {".", "auto", "cwd"}:
+        return False
+
+    try:
+        os.chdir(os.path.expanduser(raw_cwd))
+    except OSError as exc:
+        logger.warning("Could not chdir gateway process to TERMINAL_CWD=%r: %s", raw_cwd, exc)
+        return False
+
+    os.environ["TERMINAL_CWD"] = os.getcwd()
+    logger.info("Gateway process cwd set to %s", os.environ["TERMINAL_CWD"])
+    return True
+
 from gateway.config import (
     Platform,
     _BUILTIN_PLATFORM_VALUES,
@@ -16826,6 +16848,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # Lower root logger level if needed so DEBUG records can reach the handler
         if _stderr_level < logging.getLogger().level:
             logging.getLogger().setLevel(_stderr_level)
+
+    _apply_gateway_process_cwd()
 
     runner = GatewayRunner(config)
     
