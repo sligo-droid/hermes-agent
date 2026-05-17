@@ -430,3 +430,127 @@ class TestHandleMessageUsesAuthenticatedRead:
         assert event.message_type == MessageType.VOICE
         assert event.media_urls == ["/tmp/voice_from_read.ogg"]
         assert event.media_types == ["audio/ogg"]
+
+    @pytest.mark.asyncio
+    async def test_untagged_discord_voice_message_counts_as_mention(self, monkeypatch):
+        """Native Discord voice messages should pass the server-channel mention gate."""
+        adapter = _make_adapter()
+        bot_user = SimpleNamespace(id=999, bot=True)
+        adapter._client = SimpleNamespace(user=bot_user)
+        adapter.handle_message = AsyncMock()
+        monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+        monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+        class _FakeDMChannel:
+            pass
+
+        class _FakeThread:
+            pass
+
+        monkeypatch.setattr(
+            "gateway.platforms.discord.discord.DMChannel",
+            _FakeDMChannel,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.discord.discord.Thread",
+            _FakeThread,
+        )
+
+        channel = SimpleNamespace(
+            id=100,
+            name="general",
+            guild=SimpleNamespace(id=10, name="Test Guild"),
+            topic=None,
+        )
+        att = SimpleNamespace(
+            url="https://cdn.discordapp.com/attachments/fake/voice-message.ogg",
+            filename="voice-message.ogg",
+            content_type=None,
+            size=len(_OGG_BYTES),
+            read=AsyncMock(return_value=_OGG_BYTES),
+            duration_secs=2.0,
+            waveform=b"fake",
+        )
+
+        from datetime import datetime, timezone
+
+        msg = SimpleNamespace(
+            id=3,
+            content="",
+            attachments=[att],
+            mentions=[],
+            reference=None,
+            created_at=datetime.now(timezone.utc),
+            channel=channel,
+            guild=channel.guild,
+            author=SimpleNamespace(id=42, display_name="U", name="U", bot=False),
+            flags=SimpleNamespace(voice=True),
+        )
+
+        with patch(
+            "gateway.platforms.discord.cache_audio_from_bytes",
+            return_value="/tmp/voice_from_read.ogg",
+        ):
+            await adapter._handle_message(msg)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.VOICE
+        assert event.media_urls == ["/tmp/voice_from_read.ogg"]
+
+    @pytest.mark.asyncio
+    async def test_untagged_audio_upload_does_not_count_as_mention(self, monkeypatch):
+        """Regular audio attachments should still obey the server-channel mention gate."""
+        adapter = _make_adapter()
+        adapter._client = SimpleNamespace(user=SimpleNamespace(id=999, bot=True))
+        adapter.handle_message = AsyncMock()
+        monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+        monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+        class _FakeDMChannel:
+            pass
+
+        class _FakeThread:
+            pass
+
+        monkeypatch.setattr(
+            "gateway.platforms.discord.discord.DMChannel",
+            _FakeDMChannel,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.discord.discord.Thread",
+            _FakeThread,
+        )
+
+        channel = SimpleNamespace(
+            id=100,
+            name="general",
+            guild=SimpleNamespace(id=10, name="Test Guild"),
+            topic=None,
+        )
+        att = SimpleNamespace(
+            url="https://cdn.discordapp.com/attachments/fake/audio.ogg",
+            filename="audio.ogg",
+            content_type="audio/ogg",
+            size=len(_OGG_BYTES),
+            read=AsyncMock(return_value=_OGG_BYTES),
+        )
+
+        from datetime import datetime, timezone
+
+        msg = SimpleNamespace(
+            id=4,
+            content="",
+            attachments=[att],
+            mentions=[],
+            reference=None,
+            created_at=datetime.now(timezone.utc),
+            channel=channel,
+            guild=channel.guild,
+            author=SimpleNamespace(id=42, display_name="U", name="U", bot=False),
+            flags=SimpleNamespace(voice=False),
+        )
+
+        await adapter._handle_message(msg)
+
+        adapter.handle_message.assert_not_awaited()
