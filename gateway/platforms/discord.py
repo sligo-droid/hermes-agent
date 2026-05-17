@@ -74,6 +74,28 @@ def _discord_live_voice_enabled() -> bool:
 _DISCORD_PROJECT_SUMMARY_STATE_FILENAME = "discord_project_summaries.json"
 _DISCORD_PROJECT_SUMMARY_PREFIX = "Project Summary:"
 _DISCORD_TOPIC_LIMIT = 1024
+_OBSIDIAN_PROJECT_PRIORITIES_HEADINGS = {
+    "next actions",
+    "next priorities",
+    "current priorities",
+    "priorities",
+    "implementation priority",
+}
+_OBSIDIAN_PROJECT_ACCESS_FRONTMATTER_KEYS = (
+    "login",
+    "app_login",
+    "credentials",
+    "demo_credentials",
+    "access",
+    "login_required",
+)
+_OBSIDIAN_PROJECT_ACCESS_HEADINGS = {
+    "app access",
+    "access",
+    "login",
+    "credentials",
+    "demo credentials",
+}
 _DISCORD_DIRECT_QUESTION_PROMPT = (
     "This Discord trigger was classified as a direct question/request, not a "
     "feature request. Answer in place. Do not start a branch, PR, deployment, "
@@ -757,17 +779,274 @@ class DiscordAdapter(BasePlatformAdapter):
             return f"https://{url.rstrip('/')}"
         return url
 
+    def _production_url_from_env(self) -> Optional[str]:
+        for key in (
+            "PRODUCTION_URL",
+            "NEXT_PUBLIC_SITE_URL",
+            "NEXT_PUBLIC_APP_URL",
+            "PUBLIC_URL",
+            "SITE_URL",
+            "APP_URL",
+            "DEPLOYMENT_URL",
+            "VERCEL_PROJECT_PRODUCTION_URL",
+            "VERCEL_URL",
+        ):
+            production_url = self._normalize_public_url(os.getenv(key))
+            if production_url:
+                return production_url
+        return None
+
+    def _obsidian_vault_path(self) -> _Path:
+        return _Path(os.getenv("OBSIDIAN_VAULT_PATH") or "/home/droid/.hermes/obsidian-vault")
+
+    def _normalize_project_note_key(self, value: Optional[str]) -> str:
+        text = str(value or "").strip().lower().lstrip("#")
+        if not text:
+            return ""
+        text = re.sub(r"\.md$", "", text)
+        return re.sub(r"[^a-z0-9]+", "", text)
+
+    def _find_obsidian_project_note(
+        self,
+        project_context: Optional[Dict[str, Any]] = None,
+        *,
+        channel_name: Optional[str] = None,
+    ) -> Optional[_Path]:
+        projects_dir = self._obsidian_vault_path() / "Projects"
+        try:
+            notes = [
+                path
+                for path in projects_dir.iterdir()
+                if path.is_file() and path.suffix.lower() == ".md"
+            ]
+        except OSError:
+            return None
+        if not notes:
+            return None
+
+        project_context = project_context or {}
+        raw_candidates = [
+            project_context.get("project_key"),
+            project_context.get("project_name"),
+            _Path(str(project_context.get("project_path") or "")).name,
+            project_context.get("channel_name"),
+            channel_name,
+        ]
+        candidate_keys = [
+            key
+            for key in (self._normalize_project_note_key(value) for value in raw_candidates)
+            if key
+        ]
+        if not candidate_keys:
+            return None
+
+        by_stem = {self._normalize_project_note_key(path.stem): path for path in notes}
+        for key in candidate_keys:
+            note = by_stem.get(key)
+            if note is not None:
+                return note
+        return None
+
+    def _parse_obsidian_frontmatter(self, text: str) -> Tuple[Dict[str, str], str]:
+        if not text.startswith("---"):
+            return {}, text
+        lines = text.splitlines()
+        if not lines or lines[0].strip() != "---":
+            return {}, text
+        frontmatter: Dict[str, str] = {}
+        end_index = None
+        for idx, line in enumerate(lines[1:], start=1):
+            if line.strip() == "---":
+                end_index = idx
+                break
+            match = re.match(r"\s*([A-Za-z0-9_.-]+)\s*:\s*(.*?)\s*$", line)
+            if match:
+                value = match.group(2).strip().strip("'\"")
+                frontmatter[match.group(1).strip().lower()] = value
+        if end_index is None:
+            return {}, text
+        return frontmatter, "\n".join(lines[end_index + 1:])
+
+    def _first_url(self, value: Optional[str]) -> Optional[str]:
+        match = re.search(r"https?://[^\s<>)\]}\"']+", str(value or ""))
+        if not match:
+            return None
+        return self._normalize_public_url(match.group(0).rstrip(".,;:"))
+
+    def _clean_obsidian_priority_text(self, value: str) -> str:
+        text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", value)
+        text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+        text = re.sub(
+            r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]",
+            lambda m: m.group(2) or m.group(1),
+            text,
+        )
+        text = re.sub(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", "", text)
+        text = re.sub(r"^\s*\[[ xX]\]\s+", "", text)
+        text = re.sub(r"[*_`~>#]+", "", text)
+        return re.sub(r"\s+", " ", text).strip(" -")
+
+    def _clean_obsidian_access_text(self, value: str) -> str:
+        text = self._clean_obsidian_priority_text(value)
+        text = re.sub(
+            r"\b(password|pass|token|secret|api[ _-]?key|client[ _-]?secret)\b\s*[:=]\s*\S+",
+            lambda m: f"{m.group(1)}: [redacted]",
+            text,
+            flags=re.IGNORECASE,
+        )
+        return text
+
+    def _compact_obsidian_lines(self, lines: List[str], *, limit: int) -> Optional[str]:
+        cleaned_lines = [line for line in lines if line]
+        if not cleaned_lines:
+            return None
+        text = "; ".join(cleaned_lines)
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3].rstrip() + "..."
+
+    def _extract_obsidian_priorities(self, body: str, *, limit: int = 360) -> Optional[str]:
+        lines = body.splitlines()
+        in_section = False
+        priorities: List[str] = []
+        for line in lines:
+            heading = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)
+            if heading:
+                title = self._clean_obsidian_priority_text(heading.group(1)).lower().rstrip(":")
+                if in_section and title not in _OBSIDIAN_PROJECT_PRIORITIES_HEADINGS:
+                    break
+                in_section = title in _OBSIDIAN_PROJECT_PRIORITIES_HEADINGS
+                continue
+            pseudo_heading = self._clean_obsidian_priority_text(line).lower().rstrip(":")
+            if pseudo_heading in _OBSIDIAN_PROJECT_PRIORITIES_HEADINGS:
+                in_section = True
+                continue
+            if not in_section:
+                continue
+            if re.match(r"^\s*(?:[-*+]\s+(?:\[[ xX]\]\s*)?|\d+[.)]\s+)", line):
+                cleaned = self._clean_obsidian_priority_text(line)
+                if cleaned:
+                    priorities.append(cleaned)
+                if len(priorities) >= 4:
+                    break
+
+        if not priorities:
+            for line in lines:
+                if "implementation priority" in line.lower():
+                    cleaned = self._clean_obsidian_priority_text(line)
+                    if cleaned:
+                        priorities.append(cleaned)
+                        break
+        if not priorities:
+            return None
+        text = "; ".join(priorities)
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3].rstrip() + "..."
+
+    def _extract_obsidian_app_access(
+        self,
+        frontmatter: Dict[str, str],
+        body: str,
+        *,
+        limit: int = 220,
+    ) -> Optional[str]:
+        frontmatter_lines: List[str] = []
+        for key in _OBSIDIAN_PROJECT_ACCESS_FRONTMATTER_KEYS:
+            value = str(frontmatter.get(key) or "").strip()
+            if not value:
+                continue
+            cleaned = self._clean_obsidian_access_text(value)
+            if key == "login_required":
+                normalized = cleaned.lower()
+                if normalized in {"true", "yes", "y", "1", "required"}:
+                    cleaned = "required"
+                elif normalized in {"false", "no", "n", "0", "not required", "none"}:
+                    cleaned = "not required"
+            if cleaned:
+                frontmatter_lines.append(cleaned)
+
+        lines = body.splitlines()
+        in_section = False
+        section_lines: List[str] = []
+        for line in lines:
+            heading = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)
+            if heading:
+                title = self._clean_obsidian_priority_text(heading.group(1)).lower().rstrip(":")
+                if in_section and title not in _OBSIDIAN_PROJECT_ACCESS_HEADINGS:
+                    break
+                in_section = title in _OBSIDIAN_PROJECT_ACCESS_HEADINGS
+                continue
+            if not in_section or not line.strip():
+                continue
+            cleaned = self._clean_obsidian_access_text(line)
+            if cleaned:
+                section_lines.append(cleaned)
+            if len(section_lines) >= 3:
+                break
+
+        return self._compact_obsidian_lines(section_lines or frontmatter_lines, limit=limit)
+
+    def _extract_obsidian_project_metadata(self, note_path: _Path) -> Dict[str, Optional[str]]:
+        try:
+            text = note_path.read_text(encoding="utf-8")
+        except OSError:
+            return {}
+        frontmatter, body = self._parse_obsidian_frontmatter(text)
+        metadata: Dict[str, Optional[str]] = {
+            "project_name": note_path.stem,
+            "repo_url": None,
+            "production_url": None,
+            "priorities": self._extract_obsidian_priorities(body),
+            "app_access": self._extract_obsidian_app_access(frontmatter, body),
+            "obsidian_note_path": str(note_path),
+        }
+
+        production_markers = ("production", "deploy", "vercel", "site", "app")
+        for key, value in frontmatter.items():
+            if any(marker in key for marker in production_markers):
+                metadata["production_url"] = self._first_url(value)
+                if metadata["production_url"]:
+                    break
+        for line in body.splitlines():
+            lower = line.lower()
+            if any(marker in lower for marker in production_markers):
+                metadata["production_url"] = metadata["production_url"] or self._first_url(line)
+            if metadata["production_url"]:
+                break
+
+        for key in ("repo", "repository", "github", "github_url"):
+            metadata["repo_url"] = self._normalize_github_remote_url(frontmatter.get(key) or "")
+            if metadata["repo_url"]:
+                break
+        if not metadata["repo_url"]:
+            for line in body.splitlines():
+                lower = line.lower()
+                if "github" in lower or re.search(r"\brepo(?:sitory)?\b", lower):
+                    metadata["repo_url"] = self._normalize_github_remote_url(self._first_url(line) or "")
+                if metadata["repo_url"]:
+                    break
+
+        return metadata
+
     def _collect_discord_project_metadata(
         self,
         project_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Optional[str]]:
         project_context = project_context or {}
+        note_path = self._find_obsidian_project_note(project_context)
+        obsidian_metadata = self._extract_obsidian_project_metadata(note_path) if note_path else {}
         if project_context.get("project_mapping_resolved") is False:
             project_name = str(project_context.get("channel_name") or "Unresolved Project").strip()
             return {
-                "project_name": self._humanize_project_name(project_name),
-                "repo_url": None,
-                "production_url": None,
+                "project_name": obsidian_metadata.get("project_name") or self._humanize_project_name(project_name),
+                "repo_url": obsidian_metadata.get("repo_url") or self._normalize_github_remote_url(
+                    str(project_context.get("project_github_url") or "")
+                ),
+                "production_url": obsidian_metadata.get("production_url") or self._production_url_from_env(),
+                "priorities": obsidian_metadata.get("priorities"),
+                "app_access": obsidian_metadata.get("app_access"),
+                "obsidian_note_path": obsidian_metadata.get("obsidian_note_path"),
                 "branch": None,
                 "branch_url": None,
                 "pr_url": None,
@@ -780,11 +1059,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 or self._humanize_project_name(_Path(mapped_path).name)
             )
             return {
-                "project_name": project_name,
-                "repo_url": self._normalize_github_remote_url(
+                "project_name": obsidian_metadata.get("project_name") or project_name,
+                "repo_url": obsidian_metadata.get("repo_url") or self._normalize_github_remote_url(
                     str(project_context.get("project_github_url") or "")
                 ),
-                "production_url": None,
+                "production_url": obsidian_metadata.get("production_url") or self._production_url_from_env(),
+                "priorities": obsidian_metadata.get("priorities"),
+                "app_access": obsidian_metadata.get("app_access"),
+                "obsidian_note_path": obsidian_metadata.get("obsidian_note_path"),
                 "branch": None,
                 "branch_url": None,
                 "pr_url": None,
@@ -808,21 +1090,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not project_name:
             project_name = self._humanize_project_name(_Path(root).name)
 
-        production_url = None
-        for key in (
-            "PRODUCTION_URL",
-            "NEXT_PUBLIC_SITE_URL",
-            "NEXT_PUBLIC_APP_URL",
-            "PUBLIC_URL",
-            "SITE_URL",
-            "APP_URL",
-            "DEPLOYMENT_URL",
-            "VERCEL_PROJECT_PRODUCTION_URL",
-            "VERCEL_URL",
-        ):
-            production_url = self._normalize_public_url(os.getenv(key))
-            if production_url:
-                break
+        production_url = self._production_url_from_env()
 
         branch_url = None
         if repo_url and branch and branch not in {"main", "master"}:
@@ -838,9 +1106,12 @@ class DiscordAdapter(BasePlatformAdapter):
             pr_url = self._normalize_public_url(pr_url)
 
         return {
-            "project_name": project_name or None,
-            "repo_url": repo_url,
-            "production_url": production_url,
+            "project_name": obsidian_metadata.get("project_name") or project_name or None,
+            "repo_url": obsidian_metadata.get("repo_url") or repo_url,
+            "production_url": obsidian_metadata.get("production_url") or production_url,
+            "priorities": obsidian_metadata.get("priorities"),
+            "app_access": obsidian_metadata.get("app_access"),
+            "obsidian_note_path": obsidian_metadata.get("obsidian_note_path"),
             "branch": branch,
             "branch_url": branch_url,
             "pr_url": pr_url,
@@ -854,13 +1125,41 @@ class DiscordAdapter(BasePlatformAdapter):
         return text[: limit - 3] + "..."
 
     def _render_project_summary_line(self, metadata: Dict[str, Optional[str]]) -> str:
-        project = self._truncate_summary_value(metadata.get("project_name"), limit=80)
-        repo = self._truncate_summary_value(metadata.get("repo_url"), limit=260)
         prod = self._truncate_summary_value(metadata.get("production_url"), limit=260)
-        line = f"{_DISCORD_PROJECT_SUMMARY_PREFIX} Project: {project} | Repo: {repo} | Prod: {prod}"
+        repo = self._truncate_summary_value(metadata.get("repo_url"), limit=260)
+        priorities = self._truncate_summary_value(metadata.get("priorities"), limit=360)
+        app_access = self._truncate_summary_value(metadata.get("app_access"), limit=180, default="")
+        line = (
+            f"{_DISCORD_PROJECT_SUMMARY_PREFIX} Production URL: {prod} | "
+            f"GitHub URL: {repo} | Next priorities: {priorities}"
+        )
+        if app_access:
+            line = f"{line} | Login: {app_access}"
         if len(line) <= _DISCORD_TOPIC_LIMIT:
             return line
         return line[: _DISCORD_TOPIC_LIMIT - 3] + "..."
+
+    def _project_summary_refresh_requested(self, text: str, attachments: Optional[List[Any]] = None) -> bool:
+        lower = str(text or "").lower()
+        if any(verb in lower for verb in ("update", "change", "refresh", "set", "edit")) and any(
+            phrase in lower
+            for phrase in (
+                "next priorit",
+                "priority",
+                "priorities",
+                "next action",
+                "channel description",
+                "channel topic",
+                "project summary",
+            )
+        ):
+            return True
+        for att in attachments or []:
+            content_type = (getattr(att, "content_type", None) or "").lower()
+            ext = self._attachment_ext(att)
+            if ext in SUPPORTED_DOCUMENT_TYPES or content_type.startswith(("application/", "text/")):
+                return True
+        return False
 
     def _merge_project_summary_topic(self, existing: Optional[str], summary_line: str) -> str:
         lines = str(existing or "").splitlines()
@@ -921,11 +1220,9 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         key = self._project_summary_state_key(channel)
         state = self._read_project_summary_state()
-        previous = state.get(key)
-        if isinstance(previous, dict) and previous.get("success") is True:
-            return None
-
-        metadata = self._collect_discord_project_metadata(project_context)
+        context_with_channel = dict(project_context or {})
+        context_with_channel.setdefault("channel_name", getattr(channel, "name", None))
+        metadata = self._collect_discord_project_metadata(context_with_channel)
         ok = await self._edit_project_summary_topic(channel, metadata)
         state[key] = {
             "channel_id": channel_id,
@@ -943,7 +1240,7 @@ class DiscordAdapter(BasePlatformAdapter):
             "channel_id": channel_id,
             "state_key": key,
             "metadata": metadata,
-            "project_context": project_context,
+            "project_context": context_with_channel,
             "_channel_obj": channel,
         }
 
@@ -956,7 +1253,9 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         if channel is None:
             return False
-        metadata = self._collect_discord_project_metadata(handle.get("project_context"))
+        context_with_channel = dict(handle.get("project_context") or {})
+        context_with_channel.setdefault("channel_name", getattr(channel, "name", None))
+        metadata = self._collect_discord_project_metadata(context_with_channel)
         return await self._edit_project_summary_topic(channel, metadata)
 
     def _clean_summary_text(self, text: Optional[str], *, limit: int = 900, default: str = "Pending") -> str:
@@ -5529,7 +5828,15 @@ class DiscordAdapter(BasePlatformAdapter):
 
         project_summary_handle = None
         feature_summary_handle = None
-        if is_parent_channel_message and mention_prefix and direct_question_prompt is False:
+        project_summary_refresh_requested = self._project_summary_refresh_requested(
+            normalized_content,
+            all_attachments,
+        )
+        if (
+            is_parent_channel_message
+            and mention_prefix
+            and (direct_question_prompt is False or project_summary_refresh_requested)
+        ):
             project_summary_handle = await self.initialize_project_summary(
                 message.channel,
                 project_context=project_context,
