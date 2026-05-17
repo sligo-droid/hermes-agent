@@ -171,6 +171,8 @@ async def test_connect_only_requests_members_intent_when_needed(monkeypatch, all
 
     assert ok is True
     assert created["bot"].intents.members is expected_members_intent
+    assert created["bot"].intents.reactions is True
+    assert "on_raw_reaction_add" in created["bot"]._events
     # Safe-default AllowedMentions must be applied on every connect so the
     # bot cannot @everyone from LLM output.  Granular overrides live in the
     # dedicated test_discord_allowed_mentions.py module.

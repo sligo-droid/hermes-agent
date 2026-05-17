@@ -41,6 +41,7 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from gateway.platforms.discord import DiscordAdapter  # noqa: E402
+from gateway.platforms.discord import discord as discord_module  # noqa: E402
 
 
 class FakeTree:
@@ -299,3 +300,189 @@ async def test_on_processing_complete_cancelled_removes_eyes_without_terminal_re
 
     raw_message.remove_reaction.assert_awaited_once_with("👀", adapter._client.user)
     raw_message.add_reaction.assert_not_awaited()
+
+
+def _ship_payload(*, emoji="👍", user_id=42, channel_id=123, message_id=999, guild_id=10):
+    return SimpleNamespace(
+        emoji=emoji,
+        user_id=user_id,
+        channel_id=channel_id,
+        message_id=message_id,
+        guild_id=guild_id,
+    )
+
+
+def _bot_message(adapter, channel, *, content="Done."):
+    return SimpleNamespace(
+        id=999,
+        content=content,
+        author=adapter._client.user,
+        channel=channel,
+        guild=getattr(channel, "guild", None),
+    )
+
+
+def _guild_channel(adapter, *, author=None):
+    guild = SimpleNamespace(id=10, name="Test Guild")
+    channel = SimpleNamespace(id=123, name="features", guild=guild, parent_id=None)
+    message = SimpleNamespace(
+        id=999,
+        content="Implemented.",
+        author=author or adapter._client.user,
+        channel=channel,
+        guild=guild,
+    )
+    channel.fetch_message = AsyncMock(return_value=message)
+    adapter._client.get_channel = lambda _id: channel
+    return channel, message
+
+
+@pytest.mark.asyncio
+async def test_thumbsup_on_hermes_message_dispatches_ship_it(adapter):
+    channel, _message = _guild_channel(adapter)
+    user = SimpleNamespace(id=42, name="jezza", display_name="Jezza", roles=[])
+    payload = _ship_payload()
+    payload.member = user
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_raw_reaction_add(payload)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "ship it"
+    assert event.message_type is MessageType.TEXT
+    assert event.raw_message is payload
+    assert event.message_id == "999"
+    assert event.reply_to_message_id == "999"
+    assert event.reply_to_text == "Implemented."
+    assert event.source.platform is Platform.DISCORD
+    assert event.source.chat_id == "123"
+    assert event.source.chat_type == "group"
+    assert event.source.user_id == "42"
+    assert event.source.user_name == "Jezza"
+    assert event.source.guild_id == "10"
+
+
+@pytest.mark.asyncio
+async def test_custom_thumbsup_name_dispatches_ship_it(adapter):
+    _channel, _message = _guild_channel(adapter)
+    payload = _ship_payload(emoji=SimpleNamespace(name="thumbsup"))
+    payload.member = SimpleNamespace(id=42, name="jezza", display_name="Jezza", roles=[])
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_raw_reaction_add(payload)
+
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].text == "ship it"
+
+
+@pytest.mark.asyncio
+async def test_ship_reaction_routes_thread_session(adapter, monkeypatch):
+    class FakeThread:
+        pass
+
+    monkeypatch.setattr(discord_module, "Thread", FakeThread)
+    guild = SimpleNamespace(id=10, name="Test Guild")
+    parent = SimpleNamespace(id=55, name="features", guild=guild, type=0, topic="parent topic")
+    thread = FakeThread()
+    thread.id = 777
+    thread.name = "Implement thing"
+    thread.guild = guild
+    thread.parent = parent
+    thread.parent_id = parent.id
+    thread.fetch_message = AsyncMock(return_value=_bot_message(adapter, thread))
+    adapter._client.get_channel = lambda _id: thread
+    payload = _ship_payload(channel_id=777)
+    payload.member = SimpleNamespace(id=42, name="jezza", display_name="Jezza", roles=[])
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_raw_reaction_add(payload)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "ship it"
+    assert event.source.chat_id == "777"
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "777"
+    assert event.source.parent_chat_id == "55"
+
+
+@pytest.mark.asyncio
+async def test_ship_reaction_ignores_non_thumbsup(adapter):
+    _channel, _message = _guild_channel(adapter)
+    payload = _ship_payload(emoji="✅")
+    payload.member = SimpleNamespace(id=42, name="jezza", display_name="Jezza", roles=[])
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_raw_reaction_add(payload)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ship_reaction_ignores_non_hermes_message(adapter):
+    other_author = SimpleNamespace(id=111, name="other", display_name="Other")
+    _channel, _message = _guild_channel(adapter, author=other_author)
+    payload = _ship_payload()
+    payload.member = SimpleNamespace(id=42, name="jezza", display_name="Jezza", roles=[])
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_raw_reaction_add(payload)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ship_reaction_ignores_bot_self_reaction(adapter):
+    _channel, _message = _guild_channel(adapter)
+    payload = _ship_payload(user_id=adapter._client.user.id)
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_raw_reaction_add(payload)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ship_reaction_enforces_authorization(adapter):
+    _channel, _message = _guild_channel(adapter)
+    adapter._allowed_user_ids = {"999"}
+    payload = _ship_payload()
+    payload.member = SimpleNamespace(id=42, name="jezza", display_name="Jezza", roles=[])
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_raw_reaction_add(payload)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ship_reaction_deduplicates_by_message(adapter):
+    _channel, _message = _guild_channel(adapter)
+    payload = _ship_payload()
+    payload.member = SimpleNamespace(id=42, name="jezza", display_name="Jezza", roles=[])
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_raw_reaction_add(payload)
+    await adapter._handle_raw_reaction_add(payload)
+
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ship_reaction_event_does_not_get_lifecycle_reactions(adapter):
+    _channel, _message = _guild_channel(adapter)
+    payload = _ship_payload()
+    payload.member = SimpleNamespace(id=42, name="jezza", display_name="Jezza", roles=[])
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_raw_reaction_add(payload)
+    event = adapter.handle_message.await_args.args[0]
+
+    adapter._add_reaction = AsyncMock()
+    adapter._remove_reaction = AsyncMock()
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    adapter._add_reaction.assert_not_awaited()
+    adapter._remove_reaction.assert_not_awaited()
