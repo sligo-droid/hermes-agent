@@ -87,6 +87,20 @@ def _make_adapter(platform_val="telegram"):
     return adapter
 
 
+def test_long_running_status_detail_omits_codex_app_server_event():
+    from gateway.run import _format_long_running_status_detail
+
+    detail = _format_long_running_status_detail({
+        "api_call_count": 1,
+        "max_iterations": 500,
+        "current_tool": None,
+        "last_activity_desc": "Codex app-server event: turn/diff/updated",
+    })
+
+    assert detail == " — iteration 1/500"
+    assert "Codex app-server event" not in detail
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
