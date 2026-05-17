@@ -264,6 +264,24 @@ class TestRedirectHandlerSshHint:
         assert "ssh -N -L" in err
         assert "Remote session detected" in err
 
+    def test_redirect_uri_port_overrides_stale_global_port(self, monkeypatch, capsys):
+        """The callback hint/listener port must match the auth URL redirect_uri."""
+        import tools.mcp_oauth as mco
+        monkeypatch.setattr(mco, "_oauth_port", 49200)
+        monkeypatch.setenv("SSH_CLIENT", "1.2.3.4 1234 22")
+        monkeypatch.delenv("SSH_TTY", raising=False)
+        monkeypatch.setattr(mco, "_can_open_browser", lambda: False)
+
+        self._run(_redirect_handler(
+            "https://example.com/auth?"
+            "redirect_uri=http%3A%2F%2F127.0.0.1%3A49299%2Fcallback"
+        ))
+
+        err = capsys.readouterr().err
+        assert "49299" in err
+        assert "49200" not in err
+        assert mco._oauth_port == 49299
+
     def test_ssh_hint_shown_via_ssh_tty(self, monkeypatch, capsys):
         import tools.mcp_oauth as mco
         monkeypatch.setattr(mco, "_oauth_port", 49201)

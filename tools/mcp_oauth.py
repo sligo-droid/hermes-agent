@@ -394,6 +394,13 @@ async def _redirect_handler(authorization_url: str) -> None:
     Opens the browser automatically when possible; always prints the URL
     as a fallback for headless/SSH/gateway environments.
     """
+    global _oauth_port
+    parsed_redirect = parse_qs(urlparse(authorization_url).query).get("redirect_uri", [None])[0]
+    if parsed_redirect:
+        parsed_port = urlparse(parsed_redirect).port
+        if parsed_port:
+            _oauth_port = parsed_port
+
     msg = (
         f"\n  MCP OAuth: authorization required.\n"
         f"  Open this URL in your browser:\n\n"
