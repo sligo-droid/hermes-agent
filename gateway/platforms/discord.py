@@ -80,6 +80,7 @@ _DISCORD_TOPIC_DEFAULT_START_RE = re.compile(
     re.IGNORECASE,
 )
 _DISCORD_PROJECT_SUMMARY_MANAGED_LABELS = (
+    "Project Summary:",
     "Production URL:",
     "Login:",
     "GitHub URL:",
@@ -897,7 +898,16 @@ class DiscordAdapter(BasePlatformAdapter):
         return re.sub(r"\s+", " ", text).strip(" -")
 
     def _clean_obsidian_access_text(self, value: str) -> str:
-        return self._clean_obsidian_priority_text(value)
+        text = self._clean_obsidian_priority_text(value)
+        text = re.sub(
+            r"^(?:credentials?|demo credentials?|login|app login|access)\s*:\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+        if re.match(r"^login required\s*:?\s*(?:yes|true|y|1|required)$", text, re.IGNORECASE):
+            return ""
+        return text
 
     def _compact_obsidian_lines(self, lines: List[str], *, limit: int) -> Optional[str]:
         cleaned_lines = [line for line in lines if line]
@@ -959,13 +969,9 @@ class DiscordAdapter(BasePlatformAdapter):
             value = str(frontmatter.get(key) or "").strip()
             if not value:
                 continue
-            cleaned = self._clean_obsidian_access_text(value)
             if key == "login_required":
-                normalized = cleaned.lower()
-                if normalized in {"true", "yes", "y", "1", "required"}:
-                    cleaned = "required"
-                elif normalized in {"false", "no", "n", "0", "not required", "none"}:
-                    cleaned = "not required"
+                continue
+            cleaned = self._clean_obsidian_access_text(value)
             if cleaned:
                 frontmatter_lines.append(cleaned)
 
@@ -1132,16 +1138,10 @@ class DiscordAdapter(BasePlatformAdapter):
         repo = self._truncate_summary_value(metadata.get("repo_url"), limit=260)
         priorities = self._truncate_summary_value(metadata.get("priorities"), limit=360)
         app_access = self._truncate_summary_value(metadata.get("app_access"), limit=180, default="")
-        lines = [
-            _DISCORD_PROJECT_SUMMARY_PREFIX,
-            f"Production URL: {prod}",
-        ]
+        lines = [prod]
         if app_access:
-            lines.append(f"Login: {app_access}")
-        lines.extend([
-            f"GitHub URL: {repo}",
-            f"Next priorities: {priorities}",
-        ])
+            lines.append(app_access)
+        lines.extend([repo, "", priorities])
         line = "\n".join(lines)
         if len(line) <= _DISCORD_TOPIC_LIMIT:
             return line
@@ -1182,6 +1182,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 lines = lines[1:]
             if lines and not lines[0].strip():
                 lines = lines[1:]
+        elif lines and self._looks_like_prefixless_project_summary_start(lines[0]):
+            lines = self._strip_prefixless_project_summary_block(lines)
         lines = [line for line in lines if not _DISCORD_TOPIC_DEFAULT_START_RE.match(line)]
         rest = "\n".join(lines).strip()
         if not rest:
@@ -1192,6 +1194,32 @@ class DiscordAdapter(BasePlatformAdapter):
         if len(rest) > budget:
             rest = rest[: max(0, budget - 3)] + "..."
         return f"{summary_line}\n{rest}"
+
+    def _looks_like_prefixless_project_summary_start(self, line: str) -> bool:
+        text = str(line or "").strip()
+        if not text:
+            return False
+        return text.lower() == "pending" or self._first_url(text) is not None
+
+    def _strip_prefixless_project_summary_block(self, lines: List[str]) -> List[str]:
+        idx = 1  # production URL / pending
+        if idx < len(lines):
+            candidate = lines[idx].strip()
+            candidate_url = self._first_url(candidate)
+            is_probable_repo = bool(
+                candidate_url and self._normalize_github_remote_url(candidate_url)
+            ) or candidate.lower() == "pending"
+            if candidate and not is_probable_repo:
+                idx += 1  # app login/access line
+        if idx < len(lines):
+            idx += 1  # GitHub URL / pending
+        while idx < len(lines) and not lines[idx].strip():
+            idx += 1
+        if idx < len(lines):
+            idx += 1  # priorities
+        if idx < len(lines) and not lines[idx].strip():
+            idx += 1
+        return lines[idx:]
 
     async def _resolve_summary_channel(self, channel_id: Optional[str], fallback: Any = None) -> Optional[Any]:
         if fallback is not None:
