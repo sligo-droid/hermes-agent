@@ -196,10 +196,11 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
 
     parent.edit.assert_awaited_once()
     assert parent.topic is not None
-    assert parent.topic.startswith("\u200b\n\npending\n")
-    assert "https://github.com/acme/hermes-project" in parent.topic
-    assert parent.topic.endswith("pending\nExisting channel note")
-    assert "Existing channel note" in parent.topic
+    assert parent.topic.splitlines() == [
+        "https://github.com/acme/hermes-project",
+        "pending",
+    ]
+    assert "Existing channel note" not in parent.topic
     assert len(thread.sent) == 1
     sent_embed = thread.sent[0][0]["embed"]
     assert sent_embed.title == "Generating..."
@@ -277,190 +278,62 @@ async def test_project_channel_mapping_reaches_event_and_summary_handles(adapter
     assert event.feature_summary["project_context"] == project_context
 
 
-def test_project_summary_topic_replaces_managed_line(adapter):
-    topic = adapter._merge_project_summary_topic(
-        (
-            "Project Summary:\n"
-            "Production URL: old\n"
-            "Login: old\n"
-            "GitHub URL: old\n"
-            "Next priorities: Old\n\n"
-            "This is the start of the #pid channel.\n"
-            "Keep this note"
-        ),
-        "\u200b\n\nprod (demo / pass)\nrepo\n\nNew",
-    )
-
-    assert topic.startswith("\u200b\n\nprod (demo / pass)\nrepo\n\nNew")
-    assert "Old" not in topic
-    assert "Production URL:" not in topic
-    assert "Login:" not in topic
-    assert "GitHub URL:" not in topic
-    assert "Next priorities:" not in topic
-    assert "This is the start" not in topic
-    assert "Keep this note" in topic
-
-
-def test_project_summary_topic_replaces_prefixless_managed_block(adapter):
-    topic = adapter._merge_project_summary_topic(
-        "\nhttps://old.example.com\nold-login\nhttps://github.com/acme/old\n\nOld priorities\nKeep this note",
-        "\u200b\n\nhttps://new.example.com/ (new-login)\nhttps://github.com/acme/new\n\nNew priorities",
-    )
-
-    assert topic == "\u200b\n\nhttps://new.example.com/ (new-login)\nhttps://github.com/acme/new\n\nNew priorities\nKeep this note"
-    assert "https://old.example.com" not in topic
-    assert "Old priorities" not in topic
-
-
-def test_project_summary_topic_replaces_separator_managed_block(adapter):
-    topic = adapter._merge_project_summary_topic(
-        "----------------------------------\nhttps://old.example.com\nold-login\nhttps://github.com/acme/old\n\nOld priorities\nKeep this note",
-        "\u200b\n\nhttps://new.example.com/ (new-login)\nhttps://github.com/acme/new\n\nNew priorities",
-    )
-
-    assert topic == "\u200b\n\nhttps://new.example.com/ (new-login)\nhttps://github.com/acme/new\n\nNew priorities\nKeep this note"
-    assert "https://old.example.com" not in topic
-    assert "Old priorities" not in topic
-
-
-def test_project_summary_topic_replaces_invisible_intro_managed_block(adapter):
-    topic = adapter._merge_project_summary_topic(
-        "\u200b\n\nhttps://old.example.com/ (old-login)\nhttps://github.com/acme/old\n\nOld priorities\nKeep this note",
-        "\u200b\n\nhttps://new.example.com/ (new-login)\nhttps://github.com/acme/new\n\nNew priorities",
-    )
-
-    assert topic == "\u200b\n\nhttps://new.example.com/ (new-login)\nhttps://github.com/acme/new\n\nNew priorities\nKeep this note"
-    assert "https://old.example.com" not in topic
-    assert "Old priorities" not in topic
-
-
-def test_project_metadata_reads_obsidian_project_priorities(adapter, tmp_path, monkeypatch):
-    adapter._collect_discord_project_metadata = (
-        DiscordAdapter._collect_discord_project_metadata.__get__(adapter, DiscordAdapter)
-    )
-    vault = tmp_path / "vault"
-    projects = vault / "Projects"
-    projects.mkdir(parents=True)
-    (projects / "PID.md").write_text(
-        """---
-repo: https://github.com/sligo-labs/PID
----
-
-Production dashboard: https://pid.sligo-labs.vercel.app
-
-## App access
-- Login required: yes
-- Credentials: use the shared demo account from the project note
-
-## Next actions
-- Ship Discord topic refresh from Obsidian
-- [ ] Add regression coverage
-- Validate channel topic in Discord
-
-## Later
-- Ignore this
-""",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(vault))
-    adapter._summary_workdir = MagicMock(side_effect=AssertionError("should not use gateway cwd"))
-
-    metadata = adapter._collect_discord_project_metadata(
-        {
-            "project_name": "PID",
-            "project_key": "pid",
-            "project_path": "/missing/project/path",
-            "project_mapping_resolved": True,
-        }
-    )
-
-    assert metadata["production_url"] == "https://pid.sligo-labs.vercel.app"
-    assert metadata["repo_url"] == "https://github.com/sligo-labs/PID"
-    assert metadata["priorities"] == (
-        "Ship Discord topic refresh from Obsidian; "
-        "Add regression coverage; "
-        "Validate channel topic in Discord"
-    )
-    assert metadata["app_access"] == "use the shared demo account from the project note"
-
-
-def test_project_summary_topic_contract_contains_required_values_without_labels(adapter):
+def test_project_description_contract_contains_static_project_access(adapter):
     topic = adapter._render_project_summary_line(
         {
             "production_url": "https://pid.sligo-labs.vercel.app",
             "repo_url": "https://github.com/sligo-labs/PID",
-            "priorities": "Ship Discord topic refresh from Obsidian",
+            "priorities": "Do not put state here",
+            "app_access": "username admin / password PID-2026",
         }
     )
 
     assert topic.splitlines() == [
-        "\u200b",
-        "",
-        "https://pid.sligo-labs.vercel.app/",
         "https://github.com/sligo-labs/PID",
-        "",
-        "Ship Discord topic refresh from Obsidian",
+        "https://pid.sligo-labs.vercel.app/",
+        "username: admin",
+        "password: PID-2026",
     ]
     assert "Project Summary:" not in topic
     assert "Production URL:" not in topic
     assert "GitHub URL:" not in topic
     assert "Next priorities:" not in topic
-    assert "Login:" not in topic
-    assert " | " not in topic
+    assert "Do not put state here" not in topic
     assert len(topic) <= 1024
 
 
-def test_project_summary_topic_inlines_generic_login_when_available(adapter):
+def test_project_description_omits_unparseable_app_access(adapter):
     topic = adapter._render_project_summary_line(
         {
             "production_url": "https://pid.sligo-labs.vercel.app",
             "repo_url": "https://github.com/sligo-labs/PID",
-            "priorities": "Ship Discord topic refresh from Obsidian",
             "app_access": "use the shared demo account from the project note",
         }
     )
 
     assert topic.splitlines() == [
-        "\u200b",
-        "",
-        "https://pid.sligo-labs.vercel.app/ (use the shared demo account from the project note)",
         "https://github.com/sligo-labs/PID",
-        "",
-        "Ship Discord topic refresh from Obsidian",
+        "https://pid.sligo-labs.vercel.app/",
     ]
-    assert "Login:" not in topic
-    assert "Credentials:" not in topic
-    assert len(topic) <= 1024
+    assert "username:" not in topic
+    assert "password:" not in topic
 
 
-def test_project_summary_topic_compacts_username_password_login(adapter):
+def test_project_description_parses_semicolon_credentials(adapter):
     topic = adapter._render_project_summary_line(
         {
-            "production_url": "https://pid.sligo-labs.vercel.app",
-            "repo_url": "https://github.com/sligo-labs/PID",
-            "priorities": "Ship Discord topic refresh from Obsidian",
-            "app_access": "username admin / password PID-2026",
+            "production_url": "https://app.example.com",
+            "repo_url": "https://github.com/acme/app",
+            "app_access": "username demo; password: secret-value",
         }
     )
 
-    assert topic.splitlines()[:4] == [
-        "\u200b",
-        "",
-        "https://pid.sligo-labs.vercel.app/ (admin - PID-2026)",
-        "https://github.com/sligo-labs/PID",
+    assert topic.splitlines() == [
+        "https://github.com/acme/app",
+        "https://app.example.com/",
+        "username: demo",
+        "password: secret-value",
     ]
-    assert "username" not in topic.lower()
-    assert "password" not in topic.lower()
-    assert len(topic) <= 1024
-
-
-def test_project_summary_refresh_signal_detects_priority_requests_and_documents(adapter):
-    assert adapter._project_summary_refresh_requested("Change the next priorities to scraper validation", [])
-    assert adapter._project_summary_refresh_requested(
-        "Please process this",
-        [SimpleNamespace(filename="requirements.pdf", content_type="application/pdf")],
-    )
-    assert not adapter._project_summary_refresh_requested("What is the repo URL?", [])
 
 
 def test_project_priorities_support_implementation_priority_pseudo_heading(adapter):
@@ -533,7 +406,7 @@ def test_project_metadata_does_not_fall_back_to_cwd_when_mapped_path_missing(ada
 
 
 @pytest.mark.asyncio
-async def test_project_summary_refreshes_after_previous_success(adapter):
+async def test_project_description_is_not_refreshed_after_previous_success(adapter):
     parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
     key = adapter._project_summary_state_key(parent)
     state = {
@@ -558,12 +431,11 @@ async def test_project_summary_refreshes_after_previous_success(adapter):
 
     handle = await adapter.initialize_project_summary(parent)
 
-    parent.edit.assert_awaited_once()
-    assert handle is not None
-    assert parent.topic is not None
-    assert "https://new.example.com" in parent.topic
-    assert "Refresh from Obsidian" in parent.topic
-    assert "Existing channel note" in parent.topic
+    parent.edit.assert_not_awaited()
+    adapter._write_project_summary_state.assert_not_called()
+    adapter._collect_discord_project_metadata.assert_not_called()
+    assert handle is None
+    assert parent.topic == "Existing channel note"
     assert state[key]["success"] is True
 
 
@@ -642,7 +514,7 @@ async def test_tagged_question_answers_in_place_without_feature_summary(adapter,
 
 
 @pytest.mark.asyncio
-async def test_tagged_priority_change_refreshes_project_summary_without_thread(adapter, monkeypatch):
+async def test_tagged_priority_change_does_not_refresh_project_description(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
     adapter._auto_create_thread = AsyncMock()
@@ -652,12 +524,12 @@ async def test_tagged_priority_change_refreshes_project_summary_without_thread(a
         _make_message(adapter, channel=parent, content="<@999> Change the next priorities to scraper validation")
     )
 
-    parent.edit.assert_awaited_once()
+    parent.edit.assert_not_awaited()
     adapter._auto_create_thread.assert_not_awaited()
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.feature_summary is None
-    assert event.project_summary["channel_id"] == "100"
+    assert event.project_summary is None
     assert "classified as a direct question/request" in event.channel_prompt
 
 
@@ -804,7 +676,7 @@ async def test_runner_registers_discord_summary_post_delivery_callback():
     if inspect.isawaitable(result):
         await result
 
-    adapter.update_project_summary.assert_awaited_once_with({"channel_id": "100"})
+    adapter.update_project_summary.assert_not_awaited()
     adapter.update_feature_summary.assert_awaited_once_with(
         {"message_id": "300"},
         final_response="Final answer",
