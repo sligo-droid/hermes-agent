@@ -89,7 +89,7 @@ gateway:
     no_provider:           "Yapılandırılmış sağlayıcı yok — sıkıştırılamıyor."
     nothing_to_do:         "Henüz sıkıştırılacak bir şey yok (transkript hâlâ tamamen korunan bağlam)."
     focus_line:            "Odak: \"{topic}\""
-    summary_failed:        "⚠️ Özet oluşturma başarısız ({error}). {count} geçmiş mesaj kaldırılıp yer tutucuyla değiştirildi; önceki bağlam artık kurtarılamaz. auxiliary.compression model yapılandırmanızı kontrol edin."
+    summary_failed:        "⚠️ Özet oluşturma başarısız ({error}). {count} geçmiş mesaj yerel yedek özetle değiştirildi; bazı önceki ayrıntılar eksik olabilir. auxiliary.compression model yapılandırmanızı kontrol edin."
     aux_failed:            "ℹ️ Yapılandırılmış sıkıştırma modeli `{model}` başarısız oldu ({error}). Ana modelinizle kurtarıldı — bağlam sağlam — ancak config.yaml içindeki `auxiliary.compression.model` öğesini kontrol etmek isteyebilirsiniz."
     failed:                "Sıkıştırma başarısız: {error}"
 

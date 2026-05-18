@@ -89,7 +89,7 @@ gateway:
     no_provider:           "Geen verskaffer opgestel nie -- kan nie saampers nie."
     nothing_to_do:         "Niks om saam te pers nie (die transkripsie is steeds heeltemal beskermde konteks)."
     focus_line:            "Fokus: \"{topic}\""
-    summary_failed:        "⚠️ Opsomming kon nie gegenereer word nie ({error}). {count} historiese boodskap(pe) is verwyder en met 'n plekhouer vervang; vroeëre konteks kan nie meer herstel word nie. Oorweeg om jou auxiliary.compression-modelopstelling na te gaan."
+    summary_failed:        "⚠️ Opsomming kon nie gegenereer word nie ({error}). {count} historiese boodskap(pe) is met 'n plaaslike terugval-opsomming vervang; sommige vroeëre besonderhede kan ontbreek. Oorweeg om jou auxiliary.compression-modelopstelling na te gaan."
     aux_failed:            "ℹ️ Opgestelde saamperseringsmodel `{model}` het misluk ({error}). Herstel met jou hoofmodel — konteks is intakt — maar jy mag dalk `auxiliary.compression.model` in config.yaml wil nagaan."
     failed:                "Saampersing het misluk: {error}"
 

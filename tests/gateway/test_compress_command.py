@@ -131,10 +131,8 @@ async def test_compress_command_explains_when_token_estimate_rises():
 
 @pytest.mark.asyncio
 async def test_compress_command_appends_warning_when_summary_generation_fails():
-    """When the auxiliary summariser fails and the compressor inserts a static
-    fallback placeholder, /compress must append a visible ⚠️ warning to its
-    reply. Otherwise the failure is silently logged and the user has no idea
-    earlier context is unrecoverable."""
+    """When the auxiliary summariser fails and the compressor inserts a local
+    fallback summary, /compress must append a visible ⚠️ warning to its reply."""
     history = _make_history()
     # Compressed shape is irrelevant for this test — we only care that the
     # warning surfaces. Drop one message so the headline is non-noop.
@@ -184,7 +182,7 @@ async def test_compress_command_appends_warning_when_summary_generation_fails():
     assert "404 model not found" in result
     # Dropped count must be visible — silently losing N messages is the bug.
     assert "7" in result
-    assert "historical message(s) were removed" in result
+    assert "local fallback summary" in result
     agent_instance.shutdown_memory_provider.assert_called_once()
     agent_instance.close.assert_called_once()
 
