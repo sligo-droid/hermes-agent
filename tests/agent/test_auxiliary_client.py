@@ -1402,7 +1402,7 @@ class TestAuxiliaryTaskExtraBody:
         assert kwargs["extra_body"]["reasoning"] == {"effort": "none"}
         assert kwargs["extra_body"]["metadata"] == {"source": "test"}
 
-    def test_compression_codex_defaults_reasoning_low(self):
+    def test_compression_codex_defaults_reasoning_disabled(self):
         client = MagicMock()
         client.base_url = "https://chatgpt.com/backend-api/codex"
         response = MagicMock()
@@ -1421,7 +1421,7 @@ class TestAuxiliaryTaskExtraBody:
 
         assert result is response
         kwargs = client.chat.completions.create.call_args.kwargs
-        assert kwargs["extra_body"]["reasoning"] == {"effort": "low"}
+        assert kwargs["extra_body"]["reasoning"] == {"enabled": False}
 
     def test_compression_codex_preserves_explicit_reasoning(self):
         client = MagicMock()

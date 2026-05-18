@@ -4117,7 +4117,7 @@ def _default_compression_reasoning_if_codex(
     client: Any,
     extra_body: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Use low reasoning for Codex compression unless the user configured it."""
+    """Disable Codex reasoning for compression unless the user configured it."""
     if task != "compression":
         return extra_body
     if not _is_codex_auxiliary_client(client):
@@ -4125,7 +4125,7 @@ def _default_compression_reasoning_if_codex(
     if "reasoning" in extra_body:
         return extra_body
     updated = dict(extra_body)
-    updated["reasoning"] = {"effort": "low"}
+    updated["reasoning"] = {"enabled": False}
     return updated
 
 
