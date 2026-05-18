@@ -134,8 +134,12 @@ def _format_window(window: Any, *, fallback_name: str) -> str:
     if used is None:
         return ""
     duration = _window_name(window.get("windowDurationMins"), fallback_name=fallback_name)
-    bar = _format_progress_bar(used)
-    usage = f"{bar} {used}% used" if bar else f"{used}% used"
+    remaining_label, remaining_value = _remaining_capacity(used)
+    bar = _format_progress_bar(remaining_value)
+    if remaining_label:
+        usage = f"{bar} {remaining_label}% remaining" if bar else f"{remaining_label}% remaining"
+    else:
+        usage = f"{used}% used"
     resets = _format_reset(window.get("resetsAt"))
     suffix = f", resets {resets}" if resets else ""
     return f"{duration}: {usage}{suffix}"
@@ -157,16 +161,41 @@ def _format_progress_bar(value: Any, *, width: int = 10) -> str:
     return "[" + "".join(pieces) + "]"
 
 
+def _remaining_capacity(value: Any) -> tuple[str, float | None]:
+    numbers = _percent_numbers(value)
+    if not numbers:
+        return "", None
+    remaining = [max(0.0, min(100.0, 100.0 - number)) for number in numbers]
+    if len(remaining) >= 2:
+        low = min(remaining[0], remaining[1])
+        high = max(remaining[0], remaining[1])
+        label = f"{_format_percent_number(low)}-{_format_percent_number(high)}"
+        return label, (low + high) / 2.0
+    return _format_percent_number(remaining[0]), remaining[0]
+
+
 def _percent_value(value: Any) -> float | None:
-    if isinstance(value, bool):
+    numbers = _percent_numbers(value)
+    if not numbers:
         return None
+    return sum(numbers) / len(numbers)
+
+
+def _percent_numbers(value: Any) -> list[float]:
+    if isinstance(value, bool):
+        return []
     if isinstance(value, (int, float)):
-        return float(value)
+        return [float(value)]
     matches = re.findall(r"\d+(?:\.\d+)?", str(value))
     if not matches:
-        return None
-    numbers = [float(match) for match in matches[:2]]
-    return sum(numbers) / len(numbers)
+        return []
+    return [float(match) for match in matches[:2]]
+
+
+def _format_percent_number(value: float) -> str:
+    if value.is_integer():
+        return str(int(value))
+    return f"{value:.1f}".rstrip("0").rstrip(".")
 
 
 def _window_name(minutes: Any, *, fallback_name: str) -> str:
