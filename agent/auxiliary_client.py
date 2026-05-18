@@ -281,6 +281,13 @@ _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
 # can still use this dict directly. Kept in sync with _FALLBACK above.
 _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = _API_KEY_PROVIDER_AUX_MODELS_FALLBACK
 
+# ChatGPT/Codex-account compression should not inherit a heavyweight main
+# runtime such as gpt-5.5. Compression is a structured summarization task:
+# mini keeps quality acceptable while avoiding the timeout/cost profile of
+# frontier chat models.
+_CODEX_COMPRESSION_MODEL = "gpt-5.4-mini"
+_CODEX_COMPRESSION_REASONING = {"effort": "low"}
+
 # Vision-specific model overrides for direct providers.
 # When the user's main provider has a dedicated vision/multimodal model that
 # differs from their main chat model, map it here.  The vision auto-detect
@@ -431,13 +438,14 @@ _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
 
 # Codex OAuth endpoint used when a caller explicitly requests
-# provider="openai-codex".  There is deliberately no hardcoded default
-# model: the set of models OpenAI accepts on this endpoint for
+# provider="openai-codex".  There is deliberately no general hardcoded
+# default model: the set of models OpenAI accepts on this endpoint for
 # ChatGPT-account auth is an undocumented, shifting allow-list, and
 # pinning one here has drifted silently twice (gpt-5.3-codex → gpt-5.2-codex
 # → gpt-5.4 over 6 weeks in early 2026).  Callers must pass the model
 # they want explicitly (from config.yaml model.model, auxiliary.<task>.model,
-# or the user's active Codex model selection).
+# or the user's active Codex model selection), except for the narrow
+# compression fallback below.
 _CODEX_AUX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 
@@ -1844,11 +1852,11 @@ def _build_xai_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str
 def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
     """Build a CodexAuxiliaryClient for an explicitly-requested model.
 
-    There is no auto-selection of the Codex model: the ChatGPT-account
-    Codex endpoint's accepted model list is an undocumented, drifting
-    allow-list, so any hardcoded default we pick goes stale.  The caller
-    is responsible for passing the model (e.g. from the user's own
-    ``model.model`` or ``auxiliary.<task>.model`` config).
+    There is no general auto-selection of the Codex model: the
+    ChatGPT-account Codex endpoint's accepted model list is an undocumented,
+    drifting allow-list.  The caller is responsible for passing the model
+    (e.g. from the user's own ``model.model`` or ``auxiliary.<task>.model``
+    config), including the compression-specific fallback.
 
     Returns (None, None) when no Codex OAuth token is available.
     """
@@ -2589,6 +2597,16 @@ def _main_runtime_uses_codex(provider: str, api_mode: str) -> bool:
     )
 
 
+def _codex_compression_model() -> str:
+    """Return the default Codex model for compression.
+
+    Explicit caller/config model overrides are handled before this helper is
+    used. This only replaces inherited main-runtime models on the implicit
+    compression fallback path.
+    """
+    return _CODEX_COMPRESSION_MODEL
+
+
 def _resolve_auto(
     main_runtime: Optional[Dict[str, Any]] = None,
     *,
@@ -2607,10 +2625,9 @@ def _resolve_auto(
       2. OpenRouter → Nous → custom → API-key providers (fallback
          chain, only used when the main provider has no working client).
 
-    Exception: compression on a Codex main runtime tries the fast text
-    fallback chain first. Codex remains the final fallback when no fast
-    backend is available, and explicit auxiliary.compression.provider still
-    bypasses this auto policy.
+    Exception: compression on a Codex main runtime uses a dedicated mini
+    Codex model instead of inheriting the main model. Explicit
+    auxiliary.compression.provider still bypasses this auto policy.
     """
     global auxiliary_is_nous, _stale_base_url_warned
     auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
@@ -2649,16 +2666,16 @@ def _resolve_auto(
     # config.yaml (auxiliary.<task>.provider) still win over this.
     main_provider = runtime_provider or _read_main_provider()
     main_model = runtime_model or _read_main_model()
-    prefer_fast_compression_backend = (
+    use_codex_compression_model = (
         task == "compression"
         and main_provider
         and main_model
         and _main_runtime_uses_codex(main_provider, runtime_api_mode)
     )
     if (main_provider and main_model
-            and main_provider not in {"auto", ""}
-            and not prefer_fast_compression_backend):
+            and main_provider not in {"auto", ""}):
         resolved_provider = main_provider
+        resolved_model = _codex_compression_model() if use_codex_compression_model else main_model
         explicit_base_url = None
         explicit_api_key = None
         if runtime_base_url and (main_provider == "custom" or main_provider.startswith("custom:")):
@@ -2676,15 +2693,15 @@ def _resolve_auto(
         else:
             client, resolved = resolve_provider_client(
                 resolved_provider,
-                main_model,
+                resolved_model,
                 explicit_base_url=explicit_base_url,
                 explicit_api_key=explicit_api_key,
                 api_mode=runtime_api_mode or None,
             )
             if client is not None:
                 logger.info("Auxiliary auto-detect: using main provider %s (%s)",
-                            main_provider, resolved or main_model)
-                return client, resolved or main_model
+                            main_provider, resolved or resolved_model)
+                return client, resolved or resolved_model
 
     # ── Step 2: aggregator / fallback chain ──────────────────────────────
     tried = []
@@ -2702,31 +2719,6 @@ def _resolve_auto(
                 logger.info("Auxiliary auto-detect: using %s (%s)", label, model or "default")
             return client, model
         tried.append(label)
-
-    if prefer_fast_compression_backend:
-        resolved_provider = main_provider
-        explicit_base_url = None
-        explicit_api_key = None
-        if runtime_base_url and (main_provider == "custom" or main_provider.startswith("custom:")):
-            resolved_provider = "custom"
-            explicit_base_url = runtime_base_url
-            explicit_api_key = runtime_api_key or None
-        client, resolved = resolve_provider_client(
-            resolved_provider,
-            main_model,
-            explicit_base_url=explicit_base_url,
-            explicit_api_key=explicit_api_key,
-            api_mode=runtime_api_mode or None,
-        )
-        if client is not None:
-            logger.info(
-                "Auxiliary compression auto-detect: fast backends unavailable "
-                "(tried: %s); falling back to main Codex provider %s (%s)",
-                ", ".join(tried) or "none",
-                main_provider,
-                resolved or main_model,
-            )
-            return client, resolved or main_model
 
     logger.warning("Auxiliary auto-detect: no provider available (tried: %s). "
                    "Compression, summarization, and memory flush will not work. "
@@ -4117,7 +4109,7 @@ def _default_compression_reasoning_if_codex(
     client: Any,
     extra_body: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Disable Codex reasoning for compression unless the user configured it."""
+    """Use low Codex reasoning for compression unless the user configured it."""
     if task != "compression":
         return extra_body
     if not _is_codex_auxiliary_client(client):
@@ -4125,7 +4117,7 @@ def _default_compression_reasoning_if_codex(
     if "reasoning" in extra_body:
         return extra_body
     updated = dict(extra_body)
-    updated["reasoning"] = {"enabled": False}
+    updated["reasoning"] = dict(_CODEX_COMPRESSION_REASONING)
     return updated
 
 
