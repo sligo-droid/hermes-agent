@@ -122,8 +122,9 @@ def _snapshot_label(snapshot: dict[str, Any]) -> str:
 def _snapshot_sort_key(snapshot: dict[str, Any]) -> tuple[int, str]:
     name = str(snapshot.get("limitName") or "")
     limit_id = str(snapshot.get("limitId") or "")
-    # Named model buckets are the most useful; put the aggregate bucket after.
-    unnamed = 1 if not name else 0
+    # The aggregate/current Codex bucket is the headline bucket; put named
+    # model-specific buckets (for example 5.3 Spark) after it.
+    unnamed = 0 if not name else 1
     return (unnamed, name.lower() or limit_id.lower())
 
 
