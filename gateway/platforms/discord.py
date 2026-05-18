@@ -2460,25 +2460,7 @@ class DiscordAdapter(BasePlatformAdapter):
         await self._edit_thread_status_emoji(thread, thread_emoji, base_name)
 
     async def _processing_reaction_message(self, event: MessageEvent) -> Any:
-        """Return the Discord message whose reactions represent this turn's state."""
-        handle = getattr(event, "feature_summary", None)
-        if isinstance(handle, dict):
-            msg = handle.get("_message_obj")
-            if msg is not None:
-                return msg
-            thread = await self._resolve_summary_channel(
-                str(handle.get("thread_id") or ""),
-                fallback=handle.get("_thread_obj"),
-            )
-            fetch = getattr(thread, "fetch_message", None) if thread is not None else None
-            message_id = str(handle.get("message_id") or "")
-            if fetch is not None and message_id:
-                try:
-                    msg = await fetch(int(message_id))
-                    handle["_message_obj"] = msg
-                    return msg
-                except Exception:
-                    pass
+        """Return the user Discord message whose reactions represent this turn."""
         return event.raw_message
 
     async def _mark_feature_summary_running(self, event: MessageEvent) -> None:
@@ -2492,9 +2474,10 @@ class DiscordAdapter(BasePlatformAdapter):
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Mark a Discord turn as in-progress.
 
-        Feature-thread turns target the summary message at the top of the
-        thread, so a completed thread is visibly reopened while Hermes is
-        working instead of leaving a stale green check mark in view.
+        Feature-thread turns still reopen/update the summary embed, but
+        lifecycle reactions belong on the triggering user message (including
+        the original post a newly-created thread is based on), not on Hermes'
+        own summary/embed message.
         """
         if not self._reactions_enabled():
             return
