@@ -155,6 +155,16 @@ class TestCodexBuildKwargs:
         )
         assert "max_output_tokens" not in kw
 
+    def test_codex_backend_ephemeral_max_output_tokens(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            max_tokens=4096,
+            ephemeral_max_output_tokens=32768,
+            is_codex_backend=True,
+        )
+        assert kw.get("max_output_tokens") == 32768
+
     def test_xai_headers(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(

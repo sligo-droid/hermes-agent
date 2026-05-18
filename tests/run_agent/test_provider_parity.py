@@ -474,6 +474,21 @@ class TestBuildApiKwargsCodex:
         kwargs = agent._build_api_kwargs(messages)
         assert "max_output_tokens" not in kwargs
 
+    def test_uses_codex_backend_ephemeral_max_output_tokens_once(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://chatgpt.com/backend-api/codex")
+        agent.model = "gpt-5.4"
+        agent.max_tokens = 20
+        agent._ephemeral_max_output_tokens = 32768
+        messages = [{"role": "user", "content": "hi"}]
+
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["max_output_tokens"] == 32768
+        assert agent._ephemeral_max_output_tokens is None
+
+        kwargs2 = agent._build_api_kwargs(messages)
+        assert "max_output_tokens" not in kwargs2
+
     def test_includes_encrypted_content_in_include(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
                             base_url="https://chatgpt.com/backend-api/codex")

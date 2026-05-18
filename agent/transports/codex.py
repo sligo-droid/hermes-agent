@@ -50,6 +50,7 @@ class ResponsesApiTransport(ProviderTransport):
             reasoning_config: dict | None — {effort, enabled}
             session_id: str | None — used for prompt_cache_key + xAI conv header
             max_tokens: int | None — max_output_tokens
+            ephemeral_max_output_tokens: int | None — one-shot continuation budget
             request_overrides: dict | None — extra kwargs merged in
             provider: str | None — provider name for backend-specific logic
             base_url: str | None — endpoint URL
@@ -164,9 +165,13 @@ class ResponsesApiTransport(ProviderTransport):
                 merged_extra_headers["x-client-request-id"] = cache_scope_id
                 kwargs["extra_headers"] = merged_extra_headers
 
-        max_tokens = params.get("max_tokens")
-        if max_tokens is not None and not is_codex_backend:
-            kwargs["max_output_tokens"] = max_tokens
+        ephemeral_max_output_tokens = params.get("ephemeral_max_output_tokens")
+        if ephemeral_max_output_tokens is not None:
+            kwargs["max_output_tokens"] = ephemeral_max_output_tokens
+        else:
+            max_tokens = params.get("max_tokens")
+            if max_tokens is not None and not is_codex_backend:
+                kwargs["max_output_tokens"] = max_tokens
 
         if is_xai_responses and session_id:
             existing_extra_headers = kwargs.get("extra_headers")
