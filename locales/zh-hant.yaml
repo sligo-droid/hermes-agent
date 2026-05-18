@@ -89,7 +89,7 @@ gateway:
     no_provider:           "未設定提供方 — 無法壓縮。"
     nothing_to_do:         "目前沒有可壓縮的內容（對話記錄仍全部為受保護的上下文）。"
     focus_line:            "聚焦：\"{topic}\""
-    summary_failed:        "⚠️ 摘要產生失敗（{error}）。{count} 則歷史訊息已被移除並以佔位符取代；先前的上下文已無法復原。建議檢查 auxiliary.compression 模型設定。"
+    summary_failed:        "⚠️ 摘要產生失敗（{error}）。{count} 則歷史訊息已替換成本機備援摘要；部分先前細節可能遺失。建議檢查 auxiliary.compression 模型設定。"
     aux_failed:            "ℹ️ 設定的壓縮模型 `{model}` 失敗（{error}）。已使用主要模型復原 — 上下文完整 — 但您可能想檢查 config.yaml 中的 `auxiliary.compression.model`。"
     failed:                "壓縮失敗：{error}"
 

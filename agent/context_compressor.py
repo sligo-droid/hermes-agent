@@ -57,6 +57,7 @@ _MIN_SUMMARY_TOKENS = 2000
 _SUMMARY_RATIO = 0.20
 # Absolute ceiling for summary tokens (even on very large context windows)
 _SUMMARY_TOKENS_CEILING = 12_000
+_LOCAL_FALLBACK_MAX_CHARS = 12_000
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
@@ -581,8 +582,8 @@ class ContextCompressor(ContextEngine):
         self._ineffective_compression_count: int = 0
         self._summary_failure_cooldown_until: float = 0.0
         self._last_summary_error: Optional[str] = None
-        # When summary generation fails and a static fallback is inserted,
-        # record how many turns were unrecoverably dropped so callers
+        # When summary generation fails and a local fallback summary is
+        # inserted, record how many turns were compacted so callers
         # (gateway hygiene, /compress) can surface a visible warning.
         self._last_summary_dropped_count: int = 0
         self._last_summary_fallback_used: bool = False
@@ -870,6 +871,42 @@ class ContextCompressor(ContextEngine):
             parts.append(f"[{role.upper()}]: {content}")
 
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _truncate_local_fallback_text(text: str, limit: int = _LOCAL_FALLBACK_MAX_CHARS) -> str:
+        """Keep a bounded head/tail excerpt for local fallback summaries."""
+        if len(text) <= limit:
+            return text
+        head = max(1, int(limit * 0.65))
+        tail = max(1, limit - head - 40)
+        return text[:head].rstrip() + "\n...[local fallback truncated]...\n" + text[-tail:].lstrip()
+
+    def _generate_local_fallback_summary(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        *,
+        n_dropped: int,
+        error: Optional[str],
+    ) -> str:
+        """Create a deterministic redacted summary when the LLM summarizer fails."""
+        serialized = self._serialize_for_summary(turns_to_summarize).strip()
+        if not serialized:
+            serialized = "[No text content could be extracted from the compacted messages.]"
+        excerpt = self._truncate_local_fallback_text(serialized)
+        err_text = redact_sensitive_text((error or "unknown error").strip() or "unknown error")
+        err_text = self._truncate_local_fallback_text(err_text, 500)
+        body = f"""## Active Task
+Use the live user message(s) after this summary as the source of the current task. This fallback was generated without an LLM and must not define a new task.
+
+## Compression Failure
+The summary LLM was unavailable ({err_text}). {n_dropped} message(s) were compacted with a local extractive fallback, so some details may be missing.
+
+## Extracted Prior Context
+{excerpt}
+
+## Remaining Work
+Continue from the recent uncompressed messages below and the current file/resource state."""
+        return self._with_summary_prefix(body)
 
     def _fallback_to_main_for_compression(self, e: Exception, reason: str) -> None:
         """Switch from a separate ``summary_model`` back to the main model.
@@ -1594,20 +1631,18 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                     )
             compressed.append(msg)
 
-        # If LLM summary failed, insert a static fallback so the model
-        # knows context was lost rather than silently dropping everything.
+        # If LLM summary failed, insert a bounded local extractive fallback so
+        # the model keeps some context instead of a bare loss marker.
         if not summary:
             if not self.quiet_mode:
-                logger.warning("Summary generation failed — inserting static fallback context marker")
+                logger.warning("Summary generation failed — inserting local fallback summary")
             n_dropped = compress_end - compress_start
             self._last_summary_dropped_count = n_dropped
             self._last_summary_fallback_used = True
-            summary = (
-                f"{SUMMARY_PREFIX}\n"
-                f"Summary generation was unavailable. {n_dropped} message(s) were "
-                f"removed to free context space but could not be summarized. The removed "
-                f"messages contained earlier work in this session. Continue based on the "
-                f"recent messages below and the current state of any files or resources."
+            summary = self._generate_local_fallback_summary(
+                turns_to_summarize,
+                n_dropped=n_dropped,
+                error=self._last_summary_error,
             )
 
         _merge_summary_into_tail = False
