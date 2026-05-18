@@ -217,6 +217,18 @@ HARDLINE_PATTERNS = [
     (_CMDPOS + r'init\s+[06]\b', "init 0/6 (shutdown/reboot)"),
     (_CMDPOS + r'systemctl\s+(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
     (_CMDPOS + r'telinit\s+[06]\b', "telinit 0/6 (shutdown/reboot)"),
+    # A gateway-hosted agent that shells out to `systemctl restart
+    # hermes-gateway` creates a self-referential stop job: the `systemctl`
+    # tool subprocess remains in the same service cgroup while systemd waits
+    # for that cgroup to drain, then SIGKILLs it at TimeoutStopSec.  Use the
+    # gateway's `/restart` path or run `hermes gateway restart` from outside
+    # the gateway service instead.
+    (
+        _CMDPOS
+        + r'systemctl\s+(?:-[^\s]+\s+)*(?:stop|restart)\s+'
+        + r'hermes-gateway(?:[-\w]*)?(?:\.service)?\b',
+        "direct systemctl stop/restart of hermes gateway",
+    ),
 ]
 
 # Pre-compiled variant used by the hot-path matcher. Building these at module
@@ -363,8 +375,8 @@ DANGEROUS_PATTERNS = [
     (r'\bhermes\s+gateway\s+(stop|restart)\b', "stop/restart hermes gateway (kills running agents)"),
     (r'\bhermes\s+update\b', "hermes update (restarts gateway, kills running agents)"),
     # Gateway protection: never start gateway outside systemd management
-    (r'gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b)', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
-    (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
+    (r'gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b)', "start gateway outside systemd (use '/restart' or 'hermes gateway restart')"),
+    (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use '/restart' or 'hermes gateway restart')"),
     # Self-termination protection: prevent agent from killing its own process
     (r'\b(pkill|killall)\b.*\b(hermes|gateway|cli\.py)\b', "kill hermes/gateway process (self-termination)"),
     # Self-termination via kill + command substitution (pgrep/pidof).

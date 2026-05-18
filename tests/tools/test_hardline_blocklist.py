@@ -76,6 +76,12 @@ _HARDLINE_BLOCK = [
     "systemctl poweroff",
     "systemctl reboot",
     "systemctl halt",
+    # Gateway self-restarts from inside agent tools wedge the service cgroup.
+    "systemctl --user restart hermes-gateway",
+    "systemctl --user restart hermes-gateway.service",
+    "sudo systemctl --user restart hermes-gateway.service",
+    "systemctl restart hermes-gateway-coder.service",
+    "systemctl --user stop hermes-gateway",
     # Compound / subshell variants
     "ls; reboot",
     "echo done && shutdown -h now",
@@ -185,6 +191,15 @@ def test_check_all_command_guards_blocks_hardline(clean_session):
     assert result["approved"] is False
     assert result.get("hardline") is True
     assert "BLOCKED (hardline)" in result["message"]
+
+
+def test_hermes_gateway_systemctl_restart_is_hardline(clean_session):
+    result = check_all_command_guards(
+        "systemctl --user restart hermes-gateway.service", "local"
+    )
+    assert result["approved"] is False
+    assert result.get("hardline") is True
+    assert "hermes gateway" in result["message"].lower()
 
 
 def test_yolo_env_var_cannot_bypass_hardline(clean_session, monkeypatch):
