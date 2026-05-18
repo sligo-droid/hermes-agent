@@ -81,6 +81,7 @@ _DISCORD_THREAD_STATUS_EMOJIS = ("👀", "❌", "✅")
 _DISCORD_THREAD_STATUS_RANK = {"👀": 0, "❌": 1, "✅": 2}
 _DISCORD_THREAD_NAME_LIMIT = 100
 _DISCORD_TOPIC_LIMIT = 1024
+_DISCORD_PROJECT_SUMMARY_SEPARATOR = "----------------------------------"
 _DISCORD_TOPIC_DEFAULT_START_RE = re.compile(
     r"^\s*This is the start of the #[^\s]+ channel\.\s*$",
     re.IGNORECASE,
@@ -1197,7 +1198,7 @@ class DiscordAdapter(BasePlatformAdapter):
         repo = self._truncate_summary_value(metadata.get("repo_url"), limit=260)
         priorities = self._truncate_summary_value(metadata.get("priorities"), limit=360)
         app_access = self._truncate_summary_value(metadata.get("app_access"), limit=180, default="")
-        lines = ["", prod]
+        lines = [_DISCORD_PROJECT_SUMMARY_SEPARATOR, prod]
         if app_access:
             lines.append(app_access)
         lines.extend([repo, "", priorities])
@@ -1237,6 +1238,13 @@ class DiscordAdapter(BasePlatformAdapter):
             and self._looks_like_prefixless_project_summary_start(lines[1])
         ):
             lines = lines[1:]
+        if (
+            lines
+            and self._is_project_summary_separator(lines[0])
+            and len(lines) > 1
+            and self._looks_like_prefixless_project_summary_start(lines[1])
+        ):
+            lines = lines[1:]
         if lines and lines[0].startswith(_DISCORD_PROJECT_SUMMARY_PREFIX):
             lines = lines[1:]
             if lines and not lines[0].strip():
@@ -1260,6 +1268,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if len(rest) > budget:
             rest = rest[: max(0, budget - 3)] + "..."
         return f"{summary_line}\n{rest}"
+
+    def _is_project_summary_separator(self, line: str) -> bool:
+        return str(line or "").strip() == _DISCORD_PROJECT_SUMMARY_SEPARATOR
 
     def _looks_like_prefixless_project_summary_start(self, line: str) -> bool:
         text = str(line or "").strip()
