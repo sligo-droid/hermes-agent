@@ -86,6 +86,9 @@ def test_format_codex_status_report_prioritizes_weekly_model_usage():
     assert "weekly: [████████▋░] 86% remaining" in report
     assert "Codex (codex)" in report
     assert "weekly: [███████▊░░] 77% remaining" in report
+    assert report.index("Codex (codex)") < report.index(
+        "GPT-5.3-Codex-Spark (codex bengalfox)"
+    )
     assert "user@example.test" not in report
 
 
