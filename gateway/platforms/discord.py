@@ -24,7 +24,7 @@ import time
 from collections import defaultdict
 from types import SimpleNamespace
 from typing import Callable, Dict, List, Optional, Any, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +81,8 @@ _DISCORD_THREAD_STATUS_EMOJIS = ("👀", "❌", "✅")
 _DISCORD_THREAD_STATUS_RANK = {"👀": 0, "❌": 1, "✅": 2}
 _DISCORD_THREAD_NAME_LIMIT = 100
 _DISCORD_TOPIC_LIMIT = 1024
-_DISCORD_PROJECT_SUMMARY_SEPARATOR = "----------------------------------"
+_DISCORD_PROJECT_SUMMARY_INTRO = "\u200b"
+_DISCORD_PROJECT_SUMMARY_LEGACY_SEPARATOR = "----------------------------------"
 _DISCORD_TOPIC_DEFAULT_START_RE = re.compile(
     r"^\s*This is the start of the #[^\s]+ channel\.\s*$",
     re.IGNORECASE,
@@ -1194,18 +1195,35 @@ class DiscordAdapter(BasePlatformAdapter):
         return text[: limit - 3] + "..."
 
     def _render_project_summary_line(self, metadata: Dict[str, Optional[str]]) -> str:
-        prod = self._truncate_summary_value(metadata.get("production_url"), limit=260)
+        prod = self._format_topic_production_url(
+            self._truncate_summary_value(metadata.get("production_url"), limit=260)
+        )
         repo = self._truncate_summary_value(metadata.get("repo_url"), limit=260)
         priorities = self._truncate_summary_value(metadata.get("priorities"), limit=360)
         app_access = self._truncate_summary_value(metadata.get("app_access"), limit=180, default="")
-        lines = [_DISCORD_PROJECT_SUMMARY_SEPARATOR, prod]
+        prod_line = prod
         if app_access:
-            lines.append(app_access)
+            prod_line = f"{prod} ({self._format_topic_app_access(app_access)})"
+        lines = [_DISCORD_PROJECT_SUMMARY_INTRO, "", prod_line]
         lines.extend([repo, "", priorities])
         line = "\n".join(lines)
         if len(line) <= _DISCORD_TOPIC_LIMIT:
             return line
         return line[: _DISCORD_TOPIC_LIMIT - 3] + "..."
+
+    def _format_topic_production_url(self, value: str) -> str:
+        text = str(value or "").strip()
+        parsed = urlparse(text)
+        if parsed.scheme in {"http", "https"} and parsed.netloc and not parsed.path and not parsed.params and not parsed.query and not parsed.fragment:
+            return f"{text}/"
+        return text
+
+    def _format_topic_app_access(self, value: str) -> str:
+        text = str(value or "").strip()
+        match = re.search(r"\busername\s+(.+?)\s*/\s*password\s+(.+)\s*$", text, re.IGNORECASE)
+        if match:
+            return f"{match.group(1).strip()} - {match.group(2).strip()}"
+        return text
 
     def _project_summary_refresh_requested(self, text: str, attachments: Optional[List[Any]] = None) -> bool:
         lower = str(text or "").lower()
@@ -1238,13 +1256,15 @@ class DiscordAdapter(BasePlatformAdapter):
             and self._looks_like_prefixless_project_summary_start(lines[1])
         ):
             lines = lines[1:]
-        if (
-            lines
-            and self._is_project_summary_separator(lines[0])
-            and len(lines) > 1
-            and self._looks_like_prefixless_project_summary_start(lines[1])
-        ):
-            lines = lines[1:]
+        if lines and self._is_project_summary_intro(lines[0]):
+            if (
+                len(lines) > 2
+                and not lines[1].strip()
+                and self._looks_like_prefixless_project_summary_start(lines[2])
+            ):
+                lines = lines[2:]
+            elif len(lines) > 1 and self._looks_like_prefixless_project_summary_start(lines[1]):
+                lines = lines[1:]
         if lines and lines[0].startswith(_DISCORD_PROJECT_SUMMARY_PREFIX):
             lines = lines[1:]
             if lines and not lines[0].strip():
@@ -1269,8 +1289,9 @@ class DiscordAdapter(BasePlatformAdapter):
             rest = rest[: max(0, budget - 3)] + "..."
         return f"{summary_line}\n{rest}"
 
-    def _is_project_summary_separator(self, line: str) -> bool:
-        return str(line or "").strip() == _DISCORD_PROJECT_SUMMARY_SEPARATOR
+    def _is_project_summary_intro(self, line: str) -> bool:
+        text = str(line or "")
+        return text == _DISCORD_PROJECT_SUMMARY_INTRO or text.strip() == _DISCORD_PROJECT_SUMMARY_LEGACY_SEPARATOR
 
     def _looks_like_prefixless_project_summary_start(self, line: str) -> bool:
         text = str(line or "").strip()
