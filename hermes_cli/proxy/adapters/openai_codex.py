@@ -156,11 +156,9 @@ class OpenAICodexAdapter(UpstreamAdapter):
                 responses_payload["tool_choice"] = payload["tool_choice"]
 
         reasoning_effort = payload.get("reasoning_effort")
-        if isinstance(reasoning_effort, str) and reasoning_effort.strip():
-            effort = reasoning_effort.strip()
-            if effort == "minimal":
-                effort = "low"
-            responses_payload["reasoning"] = {"effort": effort, "summary": "auto"}
+        reasoning = self._responses_reasoning(reasoning_effort)
+        if reasoning:
+            responses_payload["reasoning"] = reasoning
             responses_payload["include"] = ["reasoning.encrypted_content"]
 
         text_format = self._responses_text_format(payload.get("response_format"))
@@ -305,6 +303,15 @@ class OpenAICodexAdapter(UpstreamAdapter):
             "schema": schema,
             "strict": bool(schema_block.get("strict", False)),
         }
+
+    @staticmethod
+    def _responses_reasoning(reasoning_effort: Any) -> dict[str, str] | None:
+        if not isinstance(reasoning_effort, str):
+            return None
+        effort = reasoning_effort.strip()
+        if not effort:
+            return None
+        return {"effort": effort, "summary": "auto"}
 
 
 __all__ = ["OpenAICodexAdapter"]
