@@ -197,8 +197,10 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
     parent.edit.assert_awaited_once()
     assert parent.topic is not None
     assert parent.topic.splitlines() == [
-        "https://github.com/acme/hermes-project",
+        "\u200b",
+        "",
         "pending",
+        "https://github.com/acme/hermes-project",
     ]
     assert "Existing channel note" not in parent.topic
     assert len(thread.sent) == 1
@@ -289,8 +291,10 @@ def test_project_description_contract_contains_static_project_access(adapter):
     )
 
     assert topic.splitlines() == [
-        "https://github.com/sligo-labs/PID",
+        "\u200b",
+        "",
         "https://pid.sligo-labs.vercel.app/",
+        "https://github.com/sligo-labs/PID",
         "username: admin",
         "password: PID-2026",
     ]
@@ -312,8 +316,10 @@ def test_project_description_omits_unparseable_app_access(adapter):
     )
 
     assert topic.splitlines() == [
-        "https://github.com/sligo-labs/PID",
+        "\u200b",
+        "",
         "https://pid.sligo-labs.vercel.app/",
+        "https://github.com/sligo-labs/PID",
     ]
     assert "username:" not in topic
     assert "password:" not in topic
@@ -329,8 +335,10 @@ def test_project_description_parses_semicolon_credentials(adapter):
     )
 
     assert topic.splitlines() == [
-        "https://github.com/acme/app",
+        "\u200b",
+        "",
         "https://app.example.com/",
+        "https://github.com/acme/app",
         "username: demo",
         "password: secret-value",
     ]
