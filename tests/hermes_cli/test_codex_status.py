@@ -42,7 +42,7 @@ def test_build_codex_usage_report_reads_account_limits_without_starting_a_turn(m
     assert methods == ["account/read", "account/rateLimits/read"]
     assert "turn/start" not in methods
     assert "thread/start" not in methods
-    assert "weekly: 2% used" in report
+    assert "weekly: [▎░░░░░░░░░] 2% used" in report
 
 
 def test_format_codex_status_report_prioritizes_weekly_model_usage():
@@ -82,11 +82,25 @@ def test_format_codex_status_report_prioritizes_weekly_model_usage():
     assert "Codex Status" in report
     assert "Account: chatgpt, plan pro" in report
     assert "GPT-5.3-Codex-Spark (codex bengalfox)" in report
-    assert "5h: 5% used" in report
-    assert "weekly: 14% used" in report
+    assert "5h: [▌░░░░░░░░░] 5% used" in report
+    assert "weekly: [█▍░░░░░░░░] 14% used" in report
     assert "Codex (codex)" in report
-    assert "weekly: 23% used" in report
+    assert "weekly: [██▎░░░░░░░] 23% used" in report
     assert "user@example.test" not in report
+
+
+def test_format_codex_status_report_progress_bar_handles_percent_ranges():
+    report = format_codex_status_report(
+        {"account": {"type": "chatgpt"}},
+        {
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {"usedPercent": "17-18", "windowDurationMins": 300},
+            }
+        },
+    )
+
+    assert "5h: [█▊░░░░░░░░] 17-18% used" in report
 
 
 def test_format_codex_status_report_handles_missing_limits():
