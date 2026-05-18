@@ -205,7 +205,7 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
     assert sent_embed.title == "Generating..."
     assert sent_embed.description is None
     fields = {field.name: field.value for field in sent_embed.fields}
-    assert fields["Status"] == "🔨 In progress"
+    assert fields["Status"] == "👀 In progress"
     assert all(field.name != "Generated Title" for field in sent_embed.fields)
 
     adapter.handle_message.assert_awaited_once()
@@ -213,6 +213,31 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
     assert event.project_summary["channel_id"] == "100"
     assert event.feature_summary["thread_id"] == "200"
     assert event.text == "Build a deploy dashboard"
+
+
+@pytest.mark.asyncio
+async def test_tagged_thread_followup_reuses_persisted_feature_summary(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="Build a deploy dashboard",
+    )
+    assert handle is not None
+    adapter.handle_message.reset_mock()
+
+    await adapter._handle_message(
+        _make_message(adapter, channel=thread, content="<@999> Also add export")
+    )
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+    assert event.feature_summary["thread_id"] == "200"
+    assert event.feature_summary["message_id"] == "300"
+    assert event.feature_summary["_thread_obj"] is thread
 
 
 @pytest.mark.asyncio

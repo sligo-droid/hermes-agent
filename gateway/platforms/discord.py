@@ -75,6 +75,7 @@ def _discord_live_voice_enabled() -> bool:
 
 _DISCORD_PROJECT_SUMMARY_STATE_FILENAME = "discord_project_summaries.json"
 _DISCORD_PROJECT_SUMMARY_PREFIX = "Project Summary:"
+_DISCORD_FEATURE_SUMMARY_STATE_BUCKET = "_feature_summaries"
 _DISCORD_TOPIC_LIMIT = 1024
 _DISCORD_TOPIC_DEFAULT_START_RE = re.compile(
     r"^\s*This is the start of the #[^\s]+ channel\.\s*$",
@@ -718,6 +719,59 @@ class DiscordAdapter(BasePlatformAdapter):
         channel_id = getattr(channel, "id", "")
         return f"{guild_id or 'dm'}:{channel_id}"
 
+    def _feature_summary_state_key(self, thread_channel: Any) -> str:
+        guild = getattr(thread_channel, "guild", None)
+        guild_id = getattr(guild, "id", None)
+        thread_id = getattr(thread_channel, "id", "")
+        return f"{guild_id or 'dm'}:{thread_id}"
+
+    def _persist_feature_summary_handle(
+        self,
+        thread_channel: Any,
+        handle: Dict[str, Any],
+    ) -> None:
+        thread_id = str(handle.get("thread_id") or "")
+        message_id = str(handle.get("message_id") or "")
+        if not thread_id or not message_id:
+            return
+        state = self._read_project_summary_state()
+        bucket = state.get(_DISCORD_FEATURE_SUMMARY_STATE_BUCKET)
+        if not isinstance(bucket, dict):
+            bucket = {}
+        key = self._feature_summary_state_key(thread_channel)
+        bucket[key] = {
+            "thread_id": thread_id,
+            "message_id": message_id,
+            "parent_channel_id": str(handle.get("parent_channel_id") or ""),
+            "initial_request": str(handle.get("initial_request") or ""),
+            "project_context": handle.get("project_context") or None,
+            "updated_at": time.time(),
+        }
+        state[_DISCORD_FEATURE_SUMMARY_STATE_BUCKET] = bucket
+        self._write_project_summary_state(state)
+
+    def _load_feature_summary_handle_for_thread(
+        self,
+        thread_channel: Any,
+        *,
+        project_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        thread_id = str(getattr(thread_channel, "id", "") or "")
+        if not thread_id:
+            return None
+        state = self._read_project_summary_state()
+        bucket = state.get(_DISCORD_FEATURE_SUMMARY_STATE_BUCKET)
+        if not isinstance(bucket, dict):
+            return None
+        stored = bucket.get(self._feature_summary_state_key(thread_channel))
+        if not isinstance(stored, dict):
+            return None
+        handle = dict(stored)
+        handle.setdefault("thread_id", thread_id)
+        handle.setdefault("project_context", project_context)
+        handle["_thread_obj"] = thread_channel
+        return handle
+
     def _summary_workdir(self) -> str:
         raw = (os.getenv("TERMINAL_CWD") or os.getcwd() or "").strip()
         if raw and os.path.isdir(raw):
@@ -1325,7 +1379,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return "✅ Done"
         if lower in {"failed", "failure", "error", "errored", "interrupted"}:
             return "❌ Failed"
-        return "🔨 In progress"
+        return "👀 In progress"
 
     def _summary_color(self, status: str):
         try:
@@ -1396,7 +1450,7 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[%s] Failed to send Discord feature summary: %s", self.name, exc)
             return None
-        return {
+        handle = {
             "thread_id": str(getattr(thread_channel, "id", "") or ""),
             "message_id": str(getattr(msg, "id", "") or ""),
             "parent_channel_id": str(getattr(parent_channel, "id", "") or ""),
@@ -1405,6 +1459,11 @@ class DiscordAdapter(BasePlatformAdapter):
             "_thread_obj": thread_channel,
             "_message_obj": msg,
         }
+        try:
+            self._persist_feature_summary_handle(thread_channel, handle)
+        except Exception:
+            logger.debug("[%s] Failed to persist Discord feature summary handle", self.name, exc_info=True)
+        return handle
 
     async def update_feature_summary(
         self,
@@ -2342,19 +2401,57 @@ class DiscordAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+    async def _processing_reaction_message(self, event: MessageEvent) -> Any:
+        """Return the Discord message whose reactions represent this turn's state."""
+        handle = getattr(event, "feature_summary", None)
+        if isinstance(handle, dict):
+            msg = handle.get("_message_obj")
+            if msg is not None:
+                return msg
+            thread = await self._resolve_summary_channel(
+                str(handle.get("thread_id") or ""),
+                fallback=handle.get("_thread_obj"),
+            )
+            fetch = getattr(thread, "fetch_message", None) if thread is not None else None
+            message_id = str(handle.get("message_id") or "")
+            if fetch is not None and message_id:
+                try:
+                    msg = await fetch(int(message_id))
+                    handle["_message_obj"] = msg
+                    return msg
+                except Exception:
+                    pass
+        return event.raw_message
+
+    async def _mark_feature_summary_running(self, event: MessageEvent) -> None:
+        handle = getattr(event, "feature_summary", None)
+        if isinstance(handle, dict):
+            try:
+                await self.update_feature_summary(handle, status="Running")
+            except Exception as exc:
+                logger.debug("[%s] Failed to reopen Discord feature summary: %s", self.name, exc)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add an in-progress reaction for normal Discord message events."""
+        """Mark a Discord turn as in-progress.
+
+        Feature-thread turns target the summary message at the top of the
+        thread, so a completed thread is visibly reopened while Hermes is
+        working instead of leaving a stale green check mark in view.
+        """
         if not self._reactions_enabled():
             return
-        message = event.raw_message
+        await self._mark_feature_summary_running(event)
+        message = await self._processing_reaction_message(event)
         if hasattr(message, "add_reaction"):
+            await self._remove_reaction(message, "✅")
+            await self._remove_reaction(message, "❌")
             await self._add_reaction(message, "👀")
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction."""
         if not self._reactions_enabled():
             return
-        message = event.raw_message
+        message = await self._processing_reaction_message(event)
         if hasattr(message, "add_reaction"):
             await self._remove_reaction(message, "👀")
             if outcome == ProcessingOutcome.SUCCESS:
@@ -5975,6 +6072,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 auto_threaded_channel,
                 parent_channel=message.channel,
                 initial_request=normalized_content,
+                project_context=project_context,
+            )
+        elif is_thread:
+            feature_summary_handle = self._load_feature_summary_handle_for_thread(
+                message.channel,
                 project_context=project_context,
             )
 
