@@ -96,6 +96,18 @@ def test_codex_adapter_response_format_conversion():
     }
 
 
+def test_codex_adapter_preserves_minimal_reasoning_effort():
+    assert OpenAICodexAdapter._responses_reasoning("minimal") == {
+        "effort": "minimal",
+        "summary": "auto",
+    }
+    assert OpenAICodexAdapter._responses_reasoning(" low ") == {
+        "effort": "low",
+        "summary": "auto",
+    }
+    assert OpenAICodexAdapter._responses_reasoning("") is None
+
+
 # ---------------------------------------------------------------------------
 # NousPortalAdapter
 # ---------------------------------------------------------------------------
