@@ -1402,6 +1402,98 @@ class TestAuxiliaryTaskExtraBody:
         assert kwargs["extra_body"]["reasoning"] == {"effort": "none"}
         assert kwargs["extra_body"]["metadata"] == {"source": "test"}
 
+    def test_compression_codex_defaults_reasoning_low(self):
+        client = MagicMock()
+        client.base_url = "https://chatgpt.com/backend-api/codex"
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "summary"
+        client.chat.completions.create.return_value = response
+
+        with patch("hermes_cli.config.load_config", return_value={"auxiliary": {}}), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, "gpt-5.5"),
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result is response
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["extra_body"]["reasoning"] == {"effort": "low"}
+
+    def test_compression_codex_preserves_explicit_reasoning(self):
+        client = MagicMock()
+        client.base_url = "https://chatgpt.com/backend-api/codex"
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "summary"
+        client.chat.completions.create.return_value = response
+
+        config = {
+            "auxiliary": {
+                "compression": {
+                    "extra_body": {"reasoning": {"effort": "high"}}
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=config), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, "gpt-5.5"),
+        ):
+            call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["extra_body"]["reasoning"] == {"effort": "high"}
+
+    def test_compression_codex_preserves_reasoning_disabled(self):
+        client = MagicMock()
+        client.base_url = "https://chatgpt.com/backend-api/codex"
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "summary"
+        client.chat.completions.create.return_value = response
+
+        config = {
+            "auxiliary": {
+                "compression": {
+                    "extra_body": {"reasoning": {"enabled": False}}
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=config), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, "gpt-5.5"),
+        ):
+            call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["extra_body"]["reasoning"] == {"enabled": False}
+
+    def test_auto_cache_key_distinguishes_compression_task(self):
+        from agent.auxiliary_client import _client_cache_key
+
+        base = _client_cache_key(
+            "auto",
+            async_mode=False,
+            main_runtime={"provider": "openai-codex", "model": "gpt-5.5"},
+        )
+        compression = _client_cache_key(
+            "auto",
+            async_mode=False,
+            main_runtime={"provider": "openai-codex", "model": "gpt-5.5"},
+            task="compression",
+        )
+
+        assert compression != base
+
     @pytest.mark.asyncio
     async def test_async_call_explicit_extra_body_overrides_task_config(self):
         client = MagicMock()
