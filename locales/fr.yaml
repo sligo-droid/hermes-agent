@@ -89,7 +89,7 @@ gateway:
     no_provider:           "Aucun fournisseur configuré — compression impossible."
     nothing_to_do:         "Rien à compresser pour l'instant (la transcription est encore entièrement du contexte protégé)."
     focus_line:            "Focus : \"{topic}\""
-    summary_failed:        "⚠️ Échec de la génération du résumé ({error}). {count} message(s) historique(s) ont été supprimés et remplacés par un espace réservé ; le contexte antérieur n'est plus récupérable. Vérifiez la configuration du modèle auxiliary.compression."
+    summary_failed:        "⚠️ Échec de la génération du résumé ({error}). {count} message(s) historique(s) ont été remplacés par un résumé local de secours ; certains détails antérieurs peuvent manquer. Vérifiez la configuration du modèle auxiliary.compression."
     aux_failed:            "ℹ️ Le modèle de compression configuré `{model}` a échoué ({error}). Récupéré avec votre modèle principal — le contexte est intact — mais vous pouvez vérifier `auxiliary.compression.model` dans config.yaml."
     failed:                "Échec de la compression : {error}"
 
