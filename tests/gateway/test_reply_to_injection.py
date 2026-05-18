@@ -1,11 +1,7 @@
 """Tests for reply-to pointer injection in _prepare_inbound_message_text.
 
-The `[Replying to: "..."]` prefix is a *disambiguation pointer*, not
-deduplication. It must always be injected when the user explicitly replies
-to a prior message — even when the quoted text already exists somewhere
-in the conversation history. History can contain the same or similar text
-multiple times, and without an explicit pointer the agent has to guess
-which prior message the user is referencing.
+Reply context should identify what the user replied to without duplicating
+content that is already the immediately previous model-history message.
 """
 import pytest
 
@@ -61,11 +57,34 @@ async def test_reply_prefix_injected_when_text_absent_from_history():
 
 
 @pytest.mark.asyncio
-async def test_reply_prefix_still_injected_when_text_in_history():
-    """Regression test: the pointer must survive even when the quoted text
-    already appears in history. Previously a `found_in_history` guard
-    silently dropped the prefix, leaving the agent to guess which prior
-    message the user was referencing."""
+async def test_reply_to_adjacent_previous_assistant_uses_pointer_only():
+    runner = _make_runner()
+    source = _source()
+    quoted = "Japan is great for culture, food, and efficiency."
+    event = MessageEvent(
+        text="What's the best time to go?",
+        source=source,
+        reply_to_message_id="42",
+        reply_to_text=quoted,
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[
+            {"role": "user", "content": "I'm thinking of going to Japan."},
+            {"role": "assistant", "content": quoted},
+        ],
+    )
+
+    assert result is not None
+    assert result.startswith("[Replying to previous assistant message]")
+    assert f'[Replying to: "{quoted}"]' not in result
+    assert result.endswith("What's the best time to go?")
+
+
+@pytest.mark.asyncio
+async def test_reply_prefix_injected_when_match_is_not_adjacent():
     runner = _make_runner()
     source = _source()
     quoted = "Japan is great for culture, food, and efficiency."

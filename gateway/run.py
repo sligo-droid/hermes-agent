@@ -325,6 +325,57 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     return None
 
 
+def _history_message_content_text(content: Any) -> str:
+    """Return text content from an OpenAI-style history message."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return str(content)
+
+
+def _reply_target_matches_previous_history_message(
+    history: Optional[List[Dict[str, Any]]],
+    reply_to_text: str,
+) -> tuple[bool, str | None]:
+    """Return whether reply text points at the last user/assistant history row."""
+    target = (reply_to_text or "").strip()
+    if not history or not target:
+        return False, None
+
+    for msg in reversed(history):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role not in {"assistant", "user"}:
+            continue
+        content = _history_message_content_text(msg.get("content")).strip()
+        if not content:
+            return False, role
+        if target == content or target in content:
+            return True, role
+        normalized_target = " ".join(target.split())
+        normalized_content = " ".join(content.split())
+        if normalized_target and (
+            normalized_target == normalized_content
+            or normalized_target in normalized_content
+        ):
+            return True, role
+        return False, role
+
+    return False, None
+
+
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
@@ -7036,14 +7087,15 @@ class GatewayRunner:
                 message_text = f"{context_note}\n\n{message_text}"
 
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
-            # Always inject the reply-to pointer — even when the quoted text
-            # already appears in history. The prefix isn't deduplication, it's
-            # disambiguation: it tells the agent *which* prior message the user
-            # is referencing. History can contain the same or similar text
-            # multiple times, and without an explicit pointer the agent has to
-            # guess (or answer for both subjects). Token overhead is minimal.
-            reply_snippet = event.reply_to_text[:500]
-            message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+            matched_previous, previous_role = _reply_target_matches_previous_history_message(
+                history,
+                event.reply_to_text,
+            )
+            if matched_previous:
+                message_text = f"[Replying to previous {previous_role} message]\n\n{message_text}"
+            else:
+                reply_snippet = event.reply_to_text[:500]
+                message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
 
         if "@" in message_text:
             try:
