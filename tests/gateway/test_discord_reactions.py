@@ -355,6 +355,70 @@ async def test_feature_thread_reactions_target_top_summary_message(adapter):
     assert summary_message.add_reaction.await_args_list[1].args == ("✅",)
 
 
+class _StatusThread:
+    def __init__(self, *, thread_id=777, name="Build thing"):
+        self.id = thread_id
+        self.name = name
+        self.parent_id = 55
+        self.guild = SimpleNamespace(id=10)
+        self.edit = AsyncMock(side_effect=self._edit)
+
+    async def _edit(self, **kwargs):
+        if "name" in kwargs:
+            self.name = kwargs["name"]
+
+
+def _thread_status_event(message_id: str, thread: _StatusThread) -> MessageEvent:
+    raw_message = SimpleNamespace(
+        id=int(message_id),
+        channel=thread,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    event = _make_event(message_id, raw_message)
+    event.source.chat_type = "thread"
+    event.source.thread_id = str(thread.id)
+    event.source.parent_chat_id = str(thread.parent_id)
+    return event
+
+
+@pytest.mark.asyncio
+async def test_thread_name_status_emoji_tracks_minimum_status(adapter):
+    state = {}
+    adapter._read_project_summary_state = MagicMock(side_effect=lambda: dict(state))
+    adapter._write_project_summary_state = MagicMock(side_effect=lambda value: state.clear() or state.update(value))
+    thread = _StatusThread(name="Build dashboard")
+    first = _thread_status_event("1", thread)
+    second = _thread_status_event("2", thread)
+
+    await adapter.on_processing_start(first)
+    assert thread.name == "👀 Build dashboard"
+
+    await adapter.on_processing_start(second)
+    await adapter.on_processing_complete(first, ProcessingOutcome.SUCCESS)
+    assert thread.name == "👀 Build dashboard"
+
+    await adapter.on_processing_complete(second, ProcessingOutcome.SUCCESS)
+    assert thread.name == "✅ Build dashboard"
+
+
+@pytest.mark.asyncio
+async def test_thread_name_status_emoji_keeps_failure_above_done(adapter):
+    state = {}
+    adapter._read_project_summary_state = MagicMock(side_effect=lambda: dict(state))
+    adapter._write_project_summary_state = MagicMock(side_effect=lambda value: state.clear() or state.update(value))
+    thread = _StatusThread(name="✅ Build dashboard")
+    first = _thread_status_event("1", thread)
+    second = _thread_status_event("2", thread)
+
+    await adapter.on_processing_start(first)
+    await adapter.on_processing_start(second)
+    await adapter.on_processing_complete(first, ProcessingOutcome.SUCCESS)
+    await adapter.on_processing_complete(second, ProcessingOutcome.FAILURE)
+
+    assert thread.name == "❌ Build dashboard"
+
+
 def _ship_payload(*, emoji="👍", user_id=42, channel_id=123, message_id=999, guild_id=10):
     return SimpleNamespace(
         emoji=emoji,

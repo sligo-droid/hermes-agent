@@ -76,6 +76,10 @@ def _discord_live_voice_enabled() -> bool:
 _DISCORD_PROJECT_SUMMARY_STATE_FILENAME = "discord_project_summaries.json"
 _DISCORD_PROJECT_SUMMARY_PREFIX = "Project Summary:"
 _DISCORD_FEATURE_SUMMARY_STATE_BUCKET = "_feature_summaries"
+_DISCORD_THREAD_STATUS_STATE_BUCKET = "_thread_status_emojis"
+_DISCORD_THREAD_STATUS_EMOJIS = ("👀", "❌", "✅")
+_DISCORD_THREAD_STATUS_RANK = {"👀": 0, "❌": 1, "✅": 2}
+_DISCORD_THREAD_NAME_LIMIT = 100
 _DISCORD_TOPIC_LIMIT = 1024
 _DISCORD_TOPIC_DEFAULT_START_RE = re.compile(
     r"^\s*This is the start of the #[^\s]+ channel\.\s*$",
@@ -2401,6 +2405,136 @@ class DiscordAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+    def _strip_thread_status_emoji(self, name: str) -> str:
+        """Remove a Hermes-managed status emoji prefix from a thread name."""
+        cleaned = str(name or "").strip()
+        for emoji in _DISCORD_THREAD_STATUS_EMOJIS:
+            if cleaned == emoji:
+                return ""
+            if cleaned.startswith(f"{emoji} "):
+                return cleaned[len(emoji):].strip()
+        return cleaned
+
+    def _thread_name_with_status_emoji(self, emoji: Optional[str], base_name: str) -> str:
+        """Return a Discord-safe thread name with an optional status emoji prefix."""
+        base = self._strip_thread_status_emoji(base_name) or "Hermes"
+        if emoji not in _DISCORD_THREAD_STATUS_RANK:
+            return base[:_DISCORD_THREAD_NAME_LIMIT]
+        prefix = f"{emoji} "
+        limit = max(1, _DISCORD_THREAD_NAME_LIMIT - len(prefix))
+        return f"{prefix}{base[:limit]}"
+
+    async def _processing_thread_channel(self, event: MessageEvent) -> Optional[Any]:
+        """Return the Discord thread whose top-level name mirrors this turn's state."""
+        handle = getattr(event, "feature_summary", None)
+        if isinstance(handle, dict):
+            thread = await self._resolve_summary_channel(
+                str(handle.get("thread_id") or ""),
+                fallback=handle.get("_thread_obj"),
+            )
+            if thread is not None and self._get_parent_channel_id(thread):
+                return thread
+
+        raw_message = getattr(event, "raw_message", None)
+        channel = getattr(raw_message, "channel", None)
+        if channel is not None and self._get_parent_channel_id(channel):
+            return channel
+        return None
+
+    def _status_message_key(self, event: MessageEvent, message: Any) -> str:
+        """Stable key for one lifecycle status inside a Discord thread."""
+        message_id = str(getattr(event, "message_id", "") or "")
+        if message_id:
+            return message_id
+        raw_message_id = str(getattr(getattr(event, "raw_message", None), "id", "") or "")
+        if raw_message_id:
+            return raw_message_id
+        return str(getattr(message, "id", "") or "current")
+
+    async def _edit_thread_status_emoji(
+        self,
+        thread: Any,
+        emoji: Optional[str],
+        base_name: str,
+    ) -> None:
+        edit = getattr(thread, "edit", None)
+        if edit is None:
+            return
+        desired = self._thread_name_with_status_emoji(emoji, base_name)
+        if getattr(thread, "name", None) == desired:
+            return
+        try:
+            await edit(name=desired, reason="Update Hermes thread status emoji")
+            try:
+                thread.name = desired
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.debug("[%s] Failed to update Discord thread status emoji: %s", self.name, exc)
+
+    async def _update_thread_status_emoji(
+        self,
+        event: MessageEvent,
+        message: Any,
+        emoji: Optional[str],
+    ) -> None:
+        """Set one message's lifecycle emoji and mirror the minimum on the thread name.
+
+        The thread-level emoji is the lowest-ranked active status across all
+        tracked lifecycle messages in the thread: 👀 while any turn is active,
+        otherwise ❌ if any tracked turn failed, otherwise ✅ when all tracked
+        turns completed successfully.
+        """
+        thread = await self._processing_thread_channel(event)
+        if thread is None:
+            return
+
+        key = self._feature_summary_state_key(thread)
+        message_key = self._status_message_key(event, message)
+        state = self._read_project_summary_state()
+        bucket = state.get(_DISCORD_THREAD_STATUS_STATE_BUCKET)
+        if not isinstance(bucket, dict):
+            bucket = {}
+        entry = bucket.get(key)
+        if not isinstance(entry, dict):
+            entry = {}
+        statuses = entry.get("statuses")
+        if not isinstance(statuses, dict):
+            statuses = {}
+        statuses = {
+            str(status_key): status
+            for status_key, status in statuses.items()
+            if status in _DISCORD_THREAD_STATUS_RANK
+        }
+
+        if emoji in _DISCORD_THREAD_STATUS_RANK:
+            statuses[message_key] = emoji
+        else:
+            statuses.pop(message_key, None)
+
+        base_name = str(entry.get("base_name") or "")
+        if not base_name:
+            base_name = self._strip_thread_status_emoji(getattr(thread, "name", "") or "") or "Hermes"
+
+        thread_emoji = None
+        if statuses:
+            thread_emoji = min(statuses.values(), key=lambda item: _DISCORD_THREAD_STATUS_RANK[item])
+            bucket[key] = {
+                "thread_id": str(getattr(thread, "id", "") or ""),
+                "base_name": base_name,
+                "statuses": statuses,
+                "updated_at": time.time(),
+            }
+        else:
+            bucket.pop(key, None)
+
+        state[_DISCORD_THREAD_STATUS_STATE_BUCKET] = bucket
+        try:
+            self._write_project_summary_state(state)
+        except Exception:
+            logger.debug("[%s] Failed to persist Discord thread status emojis", self.name, exc_info=True)
+        await self._edit_thread_status_emoji(thread, thread_emoji, base_name)
+
     async def _processing_reaction_message(self, event: MessageEvent) -> Any:
         """Return the Discord message whose reactions represent this turn's state."""
         handle = getattr(event, "feature_summary", None)
@@ -2446,6 +2580,7 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._remove_reaction(message, "✅")
             await self._remove_reaction(message, "❌")
             await self._add_reaction(message, "👀")
+        await self._update_thread_status_emoji(event, message, "👀")
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction."""
@@ -2456,8 +2591,12 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._remove_reaction(message, "👀")
             if outcome == ProcessingOutcome.SUCCESS:
                 await self._add_reaction(message, "✅")
+                await self._update_thread_status_emoji(event, message, "✅")
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
+                await self._update_thread_status_emoji(event, message, "❌")
+            elif outcome == ProcessingOutcome.CANCELLED:
+                await self._update_thread_status_emoji(event, message, None)
 
     async def send(
         self,
