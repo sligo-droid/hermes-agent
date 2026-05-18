@@ -76,7 +76,6 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from gateway.platforms.discord import DiscordAdapter  # noqa: E402
-from gateway.platforms.discord import discord as discord_module  # noqa: E402
 
 
 class FakeTree:
@@ -509,10 +508,10 @@ async def test_auto_create_thread_uses_message_content_as_name(adapter):
     result = await adapter._auto_create_thread(message)
 
     assert result is thread
-    message.create_thread.assert_not_awaited()
     channel.send.assert_not_awaited()
-    channel.create_thread.assert_awaited_once()
-    call_kwargs = channel.create_thread.await_args[1]
+    channel.create_thread.assert_not_awaited()
+    message.create_thread.assert_awaited_once()
+    call_kwargs = message.create_thread.await_args[1]
     assert call_kwargs["name"] == "Hello world, how are you?"
     assert call_kwargs["auto_archive_duration"] == 1440
     assert call_kwargs["reason"] == "Auto-threaded from mention by Jezza"
@@ -537,9 +536,10 @@ async def test_auto_create_thread_strips_mention_syntax_from_name(adapter):
 
     await adapter._auto_create_thread(message)
 
-    message.create_thread.assert_not_awaited()
     channel.send.assert_not_awaited()
-    name = channel.create_thread.await_args[1]["name"]
+    channel.create_thread.assert_not_awaited()
+    message.create_thread.assert_awaited_once()
+    name = message.create_thread.await_args[1]["name"]
     assert "<@" not in name, f"role/user mention leaked: {name!r}"
     assert "<#" not in name, f"channel mention leaked: {name!r}"
     assert name == "please help"
@@ -560,9 +560,10 @@ async def test_auto_create_thread_falls_back_to_hermes_when_only_mentions(adapte
 
     await adapter._auto_create_thread(message)
 
-    message.create_thread.assert_not_awaited()
     channel.send.assert_not_awaited()
-    name = channel.create_thread.await_args[1]["name"]
+    channel.create_thread.assert_not_awaited()
+    message.create_thread.assert_awaited_once()
+    name = message.create_thread.await_args[1]["name"]
     assert name == "Hermes"
 
 
@@ -581,18 +582,18 @@ async def test_auto_create_thread_truncates_long_names(adapter):
     result = await adapter._auto_create_thread(message)
 
     assert result is thread
-    message.create_thread.assert_not_awaited()
     channel.send.assert_not_awaited()
-    call_kwargs = channel.create_thread.await_args[1]
+    channel.create_thread.assert_not_awaited()
+    message.create_thread.assert_awaited_once()
+    call_kwargs = message.create_thread.await_args[1]
     assert len(call_kwargs["name"]) <= 80
     assert call_kwargs["name"].endswith("...")
 
 
 @pytest.mark.asyncio
-async def test_auto_create_thread_uses_quiet_channel_thread(adapter):
-    thread = SimpleNamespace(id=555, name="Hello")
+async def test_auto_create_thread_does_not_fall_back_to_channel_thread(adapter):
     channel = SimpleNamespace(
-        create_thread=AsyncMock(return_value=thread),
+        create_thread=AsyncMock(return_value=SimpleNamespace(id=555, name="Hello")),
         send=AsyncMock(),
     )
     message = SimpleNamespace(
@@ -603,19 +604,14 @@ async def test_auto_create_thread_uses_quiet_channel_thread(adapter):
     )
 
     result = await adapter._auto_create_thread(message)
-    assert result is thread
-    message.create_thread.assert_not_awaited()
+    assert result is None
+    message.create_thread.assert_awaited_once()
     channel.send.assert_not_awaited()
-    channel.create_thread.assert_awaited_once()
-    call_kwargs = channel.create_thread.await_args[1]
-    assert call_kwargs["name"] == "Hello"
-    assert call_kwargs["auto_archive_duration"] == 1440
-    assert call_kwargs["type"] is discord_module.ChannelType.public_thread
-    assert call_kwargs["reason"] == "Auto-threaded from mention by Jezza"
+    channel.create_thread.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_auto_create_thread_does_not_post_seed_message_when_quiet_fallback_unavailable(adapter):
+async def test_auto_create_thread_does_not_post_seed_message_when_message_thread_fails(adapter):
     message = SimpleNamespace(
         content="Hello",
         create_thread=AsyncMock(side_effect=RuntimeError("no perms")),
@@ -625,6 +621,7 @@ async def test_auto_create_thread_does_not_post_seed_message_when_quiet_fallback
 
     result = await adapter._auto_create_thread(message)
     assert result is None
+    message.create_thread.assert_awaited_once()
     message.channel.send.assert_not_awaited()
 
 
@@ -680,7 +677,7 @@ async def test_thread_create_slash_with_message_can_still_use_message_as_seed(ad
 
 
 @pytest.mark.asyncio
-async def test_auto_create_thread_returns_none_when_direct_and_fallback_fail(adapter):
+async def test_auto_create_thread_returns_none_without_channel_fallback(adapter):
     message = SimpleNamespace(
         content="Hello",
         create_thread=AsyncMock(side_effect=RuntimeError("no perms")),
@@ -693,7 +690,8 @@ async def test_auto_create_thread_returns_none_when_direct_and_fallback_fail(ada
 
     result = await adapter._auto_create_thread(message)
     assert result is None
-    message.create_thread.assert_not_awaited()
+    message.create_thread.assert_awaited_once()
+    message.channel.create_thread.assert_not_awaited()
     message.channel.send.assert_not_awaited()
 
 

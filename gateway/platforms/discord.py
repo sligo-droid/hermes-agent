@@ -5196,9 +5196,12 @@ class DiscordAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
-        """Create a thread for auto-threading without reposting the user message.
+        """Create an auto-thread attached to the triggering user message.
 
-        Returns the created thread object, or ``None`` on failure.
+        Returns the created thread object, or ``None`` on failure.  Auto-threading
+        intentionally avoids channel-level thread creation here: the user's
+        message should be the thread starter, and the feature-summary embed is
+        then sent as the first bot message inside that thread.
         """
         # Build a short thread name from the message. Strip Discord mention
         # syntax (users / roles / channels) so thread titles don't end up
@@ -5216,13 +5219,13 @@ class DiscordAdapter(BasePlatformAdapter):
         display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
         reason = f"Auto-threaded from mention by {display_name}"
         try:
-            create = getattr(getattr(message, "channel", None), "create_thread", None)
+            create = getattr(message, "create_thread", None)
             if create is None:
+                logger.warning("[%s] Auto-thread creation failed: message.create_thread unavailable", self.name)
                 return None
             thread = await create(
                 name=thread_name,
                 auto_archive_duration=1440,
-                type=discord.ChannelType.public_thread,
                 reason=reason,
             )
             return thread
