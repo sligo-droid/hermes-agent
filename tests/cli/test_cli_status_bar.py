@@ -500,68 +500,33 @@ class TestCLIStatusBar:
 
 
 class TestCLIUsageReport:
-    def test_show_usage_includes_estimated_cost(self, capsys):
-        cli_obj = _attach_agent(
-            _make_cli(),
-            prompt_tokens=10_230,
-            completion_tokens=2_220,
-            total_tokens=12_450,
-            api_calls=7,
-            context_tokens=12_450,
-            context_length=200_000,
-            compressions=1,
+    def test_show_usage_reports_codex_subscription_usage(self, capsys, monkeypatch):
+        cli_obj = _make_cli()
+        monkeypatch.setattr(
+            "hermes_cli.codex_status.build_codex_usage_report",
+            lambda: "Codex Status\n\nUsage:\n- Codex\n  - weekly: 23% used",
         )
-        cli_obj.verbose = False
 
         cli_obj._show_usage()
         output = capsys.readouterr().out
 
-        assert "Model:" in output
-        assert "Cost status:" in output
-        assert "Cost source:" in output
-        assert "Total cost:" in output
-        assert "$" in output
-        assert "0.064" in output
-        assert "Session duration:" in output
-        assert "Compressions:" in output
+        assert "Codex Status" in output
+        assert "weekly: 23% used" in output
+        assert "Session Token Usage" not in output
 
-    def test_show_usage_marks_unknown_pricing(self, capsys):
-        cli_obj = _attach_agent(
-            _make_cli(model="local/my-custom-model"),
-            prompt_tokens=1_000,
-            completion_tokens=500,
-            total_tokens=1_500,
-            api_calls=1,
-            context_tokens=1_000,
-            context_length=32_000,
+    def test_show_usage_does_not_require_active_agent(self, capsys, monkeypatch):
+        cli_obj = _make_cli()
+        cli_obj.agent = None
+        monkeypatch.setattr(
+            "hermes_cli.codex_status.build_codex_usage_report",
+            lambda: "Codex Status\n\nNo Codex rate-limit usage returned.",
         )
-        cli_obj.verbose = False
 
         cli_obj._show_usage()
         output = capsys.readouterr().out
 
-        assert "Total cost:" in output
-        assert "n/a" in output
-        assert "Pricing unknown for local/my-custom-model" in output
-
-    def test_zero_priced_provider_models_stay_unknown(self, capsys):
-        cli_obj = _attach_agent(
-            _make_cli(model="glm-5"),
-            prompt_tokens=1_000,
-            completion_tokens=500,
-            total_tokens=1_500,
-            api_calls=1,
-            context_tokens=1_000,
-            context_length=32_000,
-        )
-        cli_obj.verbose = False
-
-        cli_obj._show_usage()
-        output = capsys.readouterr().out
-
-        assert "Total cost:" in output
-        assert "n/a" in output
-        assert "Pricing unknown for glm-5" in output
+        assert "Codex Status" in output
+        assert "No active agent" not in output
 
 
 class TestStatusBarWidthSource:
