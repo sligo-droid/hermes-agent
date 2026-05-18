@@ -10077,11 +10077,6 @@ class GatewayRunner:
                 title = self._session_db.get_session_title(session_id)
             except Exception:
                 title = None
-        if project_summary and hasattr(adapter, "update_project_summary"):
-            try:
-                await adapter.update_project_summary(project_summary)
-            except Exception:
-                logger.debug("Discord project summary update failed", exc_info=True)
         if feature_summary and hasattr(adapter, "update_feature_summary"):
             try:
                 concise_response = await asyncio.to_thread(

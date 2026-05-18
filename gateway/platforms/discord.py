@@ -74,26 +74,12 @@ def _discord_live_voice_enabled() -> bool:
 
 
 _DISCORD_PROJECT_SUMMARY_STATE_FILENAME = "discord_project_summaries.json"
-_DISCORD_PROJECT_SUMMARY_PREFIX = "Project Summary:"
 _DISCORD_FEATURE_SUMMARY_STATE_BUCKET = "_feature_summaries"
 _DISCORD_THREAD_STATUS_STATE_BUCKET = "_thread_status_emojis"
 _DISCORD_THREAD_STATUS_EMOJIS = ("👀", "❌", "✅")
 _DISCORD_THREAD_STATUS_RANK = {"👀": 0, "❌": 1, "✅": 2}
 _DISCORD_THREAD_NAME_LIMIT = 100
 _DISCORD_TOPIC_LIMIT = 1024
-_DISCORD_PROJECT_SUMMARY_INTRO = "\u200b"
-_DISCORD_PROJECT_SUMMARY_LEGACY_SEPARATOR = "----------------------------------"
-_DISCORD_TOPIC_DEFAULT_START_RE = re.compile(
-    r"^\s*This is the start of the #[^\s]+ channel\.\s*$",
-    re.IGNORECASE,
-)
-_DISCORD_PROJECT_SUMMARY_MANAGED_LABELS = (
-    "Project Summary:",
-    "Production URL:",
-    "Login:",
-    "GitHub URL:",
-    "Next priorities:",
-)
 _OBSIDIAN_PROJECT_PRIORITIES_HEADINGS = {
     "next actions",
     "next priorities",
@@ -1195,17 +1181,17 @@ class DiscordAdapter(BasePlatformAdapter):
         return text[: limit - 3] + "..."
 
     def _render_project_summary_line(self, metadata: Dict[str, Optional[str]]) -> str:
+        repo = self._truncate_summary_value(metadata.get("repo_url"), limit=260)
         prod = self._format_topic_production_url(
             self._truncate_summary_value(metadata.get("production_url"), limit=260)
         )
-        repo = self._truncate_summary_value(metadata.get("repo_url"), limit=260)
-        priorities = self._truncate_summary_value(metadata.get("priorities"), limit=360)
         app_access = self._truncate_summary_value(metadata.get("app_access"), limit=180, default="")
-        prod_line = prod
-        if app_access:
-            prod_line = f"{prod} ({self._format_topic_app_access(app_access)})"
-        lines = [_DISCORD_PROJECT_SUMMARY_INTRO, "", prod_line]
-        lines.extend([repo, "", priorities])
+        lines = [repo, prod]
+        username, password = self._parse_topic_app_credentials(app_access)
+        if username:
+            lines.append(f"username: {username}")
+        if password:
+            lines.append(f"password: {password}")
         line = "\n".join(lines)
         if len(line) <= _DISCORD_TOPIC_LIMIT:
             return line
@@ -1218,106 +1204,20 @@ class DiscordAdapter(BasePlatformAdapter):
             return f"{text}/"
         return text
 
-    def _format_topic_app_access(self, value: str) -> str:
+    def _parse_topic_app_credentials(self, value: str) -> Tuple[Optional[str], Optional[str]]:
         text = str(value or "").strip()
-        match = re.search(r"\busername\s+(.+?)\s*/\s*password\s+(.+)\s*$", text, re.IGNORECASE)
-        if match:
-            return f"{match.group(1).strip()} - {match.group(2).strip()}"
-        return text
-
-    def _project_summary_refresh_requested(self, text: str, attachments: Optional[List[Any]] = None) -> bool:
-        lower = str(text or "").lower()
-        if any(verb in lower for verb in ("update", "change", "refresh", "set", "edit")) and any(
-            phrase in lower
-            for phrase in (
-                "next priorit",
-                "priority",
-                "priorities",
-                "next action",
-                "channel description",
-                "channel topic",
-                "project summary",
-            )
-        ):
-            return True
-        for att in attachments or []:
-            content_type = (getattr(att, "content_type", None) or "").lower()
-            ext = self._attachment_ext(att)
-            if ext in SUPPORTED_DOCUMENT_TYPES or content_type.startswith(("application/", "text/")):
-                return True
-        return False
-
-    def _merge_project_summary_topic(self, existing: Optional[str], summary_line: str) -> str:
-        lines = str(existing or "").splitlines()
-        if (
-            lines
-            and not lines[0].strip()
-            and len(lines) > 1
-            and self._looks_like_prefixless_project_summary_start(lines[1])
-        ):
-            lines = lines[1:]
-        if lines and self._is_project_summary_intro(lines[0]):
-            if (
-                len(lines) > 2
-                and not lines[1].strip()
-                and self._looks_like_prefixless_project_summary_start(lines[2])
-            ):
-                lines = lines[2:]
-            elif len(lines) > 1 and self._looks_like_prefixless_project_summary_start(lines[1]):
-                lines = lines[1:]
-        if lines and lines[0].startswith(_DISCORD_PROJECT_SUMMARY_PREFIX):
-            lines = lines[1:]
-            if lines and not lines[0].strip():
-                lines = lines[1:]
-            while lines and any(
-                lines[0].strip().startswith(label)
-                for label in _DISCORD_PROJECT_SUMMARY_MANAGED_LABELS
-            ):
-                lines = lines[1:]
-            if lines and not lines[0].strip():
-                lines = lines[1:]
-        elif lines and self._looks_like_prefixless_project_summary_start(lines[0]):
-            lines = self._strip_prefixless_project_summary_block(lines)
-        lines = [line for line in lines if not _DISCORD_TOPIC_DEFAULT_START_RE.match(line)]
-        rest = "\n".join(lines).strip()
-        if not rest:
-            return summary_line[:_DISCORD_TOPIC_LIMIT]
-        budget = _DISCORD_TOPIC_LIMIT - len(summary_line) - 1
-        if budget <= 0:
-            return summary_line[:_DISCORD_TOPIC_LIMIT]
-        if len(rest) > budget:
-            rest = rest[: max(0, budget - 3)] + "..."
-        return f"{summary_line}\n{rest}"
-
-    def _is_project_summary_intro(self, line: str) -> bool:
-        text = str(line or "")
-        return text == _DISCORD_PROJECT_SUMMARY_INTRO or text.strip() == _DISCORD_PROJECT_SUMMARY_LEGACY_SEPARATOR
-
-    def _looks_like_prefixless_project_summary_start(self, line: str) -> bool:
-        text = str(line or "").strip()
         if not text:
-            return False
-        return text.lower() == "pending" or self._first_url(text) is not None
-
-    def _strip_prefixless_project_summary_block(self, lines: List[str]) -> List[str]:
-        idx = 1  # production URL / pending
-        if idx < len(lines):
-            candidate = lines[idx].strip()
-            candidate_url = self._first_url(candidate)
-            is_probable_repo = bool(
-                candidate_url and self._normalize_github_remote_url(candidate_url)
-            ) or candidate.lower() == "pending"
-            if candidate and not is_probable_repo:
-                idx += 1  # app login/access line
-        if idx < len(lines):
-            idx += 1  # GitHub URL / pending
-        while idx < len(lines) and not lines[idx].strip():
-            idx += 1
-        if idx < len(lines):
-            idx += 1  # priorities
-        if idx < len(lines) and not lines[idx].strip():
-            idx += 1
-        return lines[idx:]
+            return None, None
+        patterns = (
+            r"\busername\s*:?\s*([^;/\n]+?)\s*/\s*password\s*:?\s*(.+?)\s*$",
+            r"\busername\s*:?\s*([^;\n]+?)\s*;\s*password\s*:?\s*(.+?)\s*$",
+            r"\busername\s*:?\s*(\S+).*?\bpassword\s*:?\s*(\S+)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip(), match.group(2).strip()
+        return None, None
 
     async def _resolve_summary_channel(self, channel_id: Optional[str], fallback: Any = None) -> Optional[Any]:
         if fallback is not None:
@@ -1337,11 +1237,10 @@ class DiscordAdapter(BasePlatformAdapter):
         if edit is None:
             return False
         summary_line = self._render_project_summary_line(metadata)
-        new_topic = self._merge_project_summary_topic(getattr(channel, "topic", None), summary_line)
         try:
-            await edit(topic=new_topic, reason="Initialize Hermes project summary")
+            await edit(topic=summary_line, reason="Initialize Hermes project description")
             try:
-                channel.topic = new_topic
+                channel.topic = summary_line
             except Exception:
                 pass
             return True
@@ -1362,6 +1261,9 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         key = self._project_summary_state_key(channel)
         state = self._read_project_summary_state()
+        existing = state.get(key)
+        if isinstance(existing, dict) and existing.get("success"):
+            return None
         context_with_channel = dict(project_context or {})
         context_with_channel.setdefault("channel_name", getattr(channel, "name", None))
         metadata = self._collect_discord_project_metadata(context_with_channel)
@@ -1387,18 +1289,7 @@ class DiscordAdapter(BasePlatformAdapter):
         }
 
     async def update_project_summary(self, handle: Optional[Dict[str, Any]]) -> bool:
-        if not handle:
-            return False
-        channel = await self._resolve_summary_channel(
-            str(handle.get("channel_id") or ""),
-            fallback=handle.get("_channel_obj"),
-        )
-        if channel is None:
-            return False
-        context_with_channel = dict(handle.get("project_context") or {})
-        context_with_channel.setdefault("channel_name", getattr(channel, "name", None))
-        metadata = self._collect_discord_project_metadata(context_with_channel)
-        return await self._edit_project_summary_topic(channel, metadata)
+        return False
 
     def _clean_summary_text(self, text: Optional[str], *, limit: int = 900, default: str = "Pending") -> str:
         cleaned = re.sub(r"MEDIA:\s*\S+", "", str(text or "")).strip()
@@ -6228,14 +6119,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
         project_summary_handle = None
         feature_summary_handle = None
-        project_summary_refresh_requested = self._project_summary_refresh_requested(
-            normalized_content,
-            all_attachments,
-        )
         if (
             is_parent_channel_message
             and mention_prefix
-            and (direct_question_prompt is False or project_summary_refresh_requested)
+            and direct_question_prompt is False
         ):
             project_summary_handle = await self.initialize_project_summary(
                 message.channel,
