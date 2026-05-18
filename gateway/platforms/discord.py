@@ -1138,7 +1138,7 @@ class DiscordAdapter(BasePlatformAdapter):
         repo = self._truncate_summary_value(metadata.get("repo_url"), limit=260)
         priorities = self._truncate_summary_value(metadata.get("priorities"), limit=360)
         app_access = self._truncate_summary_value(metadata.get("app_access"), limit=180, default="")
-        lines = [prod]
+        lines = ["", prod]
         if app_access:
             lines.append(app_access)
         lines.extend([repo, "", priorities])
@@ -1171,6 +1171,13 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _merge_project_summary_topic(self, existing: Optional[str], summary_line: str) -> str:
         lines = str(existing or "").splitlines()
+        if (
+            lines
+            and not lines[0].strip()
+            and len(lines) > 1
+            and self._looks_like_prefixless_project_summary_start(lines[1])
+        ):
+            lines = lines[1:]
         if lines and lines[0].startswith(_DISCORD_PROJECT_SUMMARY_PREFIX):
             lines = lines[1:]
             if lines and not lines[0].strip():
