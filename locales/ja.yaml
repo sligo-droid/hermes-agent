@@ -89,7 +89,7 @@ gateway:
     no_provider:           "プロバイダーが構成されていません — 圧縮できません。"
     nothing_to_do:         "まだ圧縮するものがありません (トランスクリプトはすべて保護されたコンテキストのままです)。"
     focus_line:            "フォーカス: \"{topic}\""
-    summary_failed:        "⚠️ 要約の生成に失敗しました ({error})。{count} 件の履歴メッセージが削除され、プレースホルダーに置き換えられました。以前のコンテキストは復元できません。auxiliary.compression モデルの設定を確認してください。"
+    summary_failed:        "⚠️ 要約の生成に失敗しました ({error})。{count} 件の履歴メッセージはローカルのフォールバック要約に置き換えられました。一部の以前の詳細が欠けている可能性があります。auxiliary.compression モデルの設定を確認してください。"
     aux_failed:            "ℹ️ 構成された圧縮モデル `{model}` が失敗しました ({error})。メインモデルで復旧しました — コンテキストは無傷です — config.yaml の `auxiliary.compression.model` を確認するとよいでしょう。"
     failed:                "圧縮に失敗しました: {error}"
 

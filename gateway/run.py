@@ -7620,9 +7620,8 @@ class GatewayRunner:
                                         )
 
                                     # If summary generation failed, the
-                                    # compressor inserted a static fallback
-                                    # placeholder and the dropped turns are
-                                    # gone for good.  Surface a visible
+                                    # compressor inserted a bounded local
+                                    # fallback summary.  Surface a visible
                                     # warning to the gateway user — agent.log
                                     # alone is invisible on TG/Discord/etc.
                                     _comp = getattr(_hyg_agent, "context_compressor", None)
@@ -7632,8 +7631,8 @@ class GatewayRunner:
                                         _warn_msg = (
                                             "⚠️ Context compression summary failed "
                                             f"({_err}). {_dropped} historical message(s) "
-                                            "were removed and replaced with a placeholder. "
-                                            "Earlier context is no longer recoverable. "
+                                            "were replaced with a local fallback summary. "
+                                            "Some earlier details may be missing. "
                                             "Consider /reset for a clean session, or check "
                                             "your auxiliary.compression model configuration."
                                         )

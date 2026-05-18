@@ -89,7 +89,7 @@ gateway:
     no_provider:           "Kein Anbieter konfiguriert — Komprimierung nicht möglich."
     nothing_to_do:         "Noch nichts zu komprimieren (das Transkript ist weiterhin vollständig geschützter Kontext)."
     focus_line:            "Fokus: \"{topic}\""
-    summary_failed:        "⚠️ Zusammenfassungsgenerierung fehlgeschlagen ({error}). {count} historische Nachricht(en) wurden entfernt und durch einen Platzhalter ersetzt; früherer Kontext ist nicht mehr wiederherstellbar. Überprüfen Sie die Konfiguration des auxiliary.compression-Modells."
+    summary_failed:        "⚠️ Zusammenfassungsgenerierung fehlgeschlagen ({error}). {count} historische Nachricht(en) wurden durch eine lokale Fallback-Zusammenfassung ersetzt; einige frühere Details können fehlen. Überprüfen Sie die Konfiguration des auxiliary.compression-Modells."
     aux_failed:            "ℹ️ Das konfigurierte Komprimierungsmodell `{model}` ist fehlgeschlagen ({error}). Wiederherstellung mit Ihrem Hauptmodell — Kontext ist intakt — Sie sollten jedoch `auxiliary.compression.model` in config.yaml überprüfen."
     failed:                "Komprimierung fehlgeschlagen: {error}"
 
