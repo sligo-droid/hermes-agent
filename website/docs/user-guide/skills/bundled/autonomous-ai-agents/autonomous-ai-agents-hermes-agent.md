@@ -332,7 +332,7 @@ The registry of record is `hermes_cli/commands.py` — every consumer
 ```
 /help                Show commands
 /commands [page]     Browse all commands (gateway)
-/usage               Token usage
+/usage               Codex subscription/model usage
 /insights [days]     Usage analytics
 /gquota              Show Google Gemini Code Assist quota usage (CLI)
 /status              Session info (gateway)

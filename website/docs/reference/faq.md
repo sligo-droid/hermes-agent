@@ -522,7 +522,7 @@ You can verify the plist has the correct PATH:
 # Compress the conversation to reduce tokens
 /compress
 
-# Check session token usage
+# Check Codex subscription/model usage
 /usage
 ```
 
