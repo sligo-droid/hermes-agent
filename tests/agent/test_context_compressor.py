@@ -743,11 +743,19 @@ class TestSummaryFailureTrackingForGatewayWarning:
         assert c._last_summary_fallback_used is True
         assert c._last_summary_dropped_count > 0
         assert c._last_summary_error is not None
-        # Result must still be well-formed (fallback summary present).
-        assert any(
-            isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
-            for m in result
-        )
+        # Result must still be well-formed with a local fallback summary that
+        # preserves redacted excerpts instead of a bare loss marker.
+        summary_messages = [
+            m for m in result
+            if isinstance(m.get("content"), str) and m["content"].startswith(SUMMARY_PREFIX)
+        ]
+        assert summary_messages
+        summary = summary_messages[0]["content"]
+        assert "## Compression Failure" in summary
+        assert "## Extracted Prior Context" in summary
+        assert "404 model not found" in summary
+        assert "[USER]: msg 3" in summary or "[ASSISTANT]: msg 4" in summary
+        assert "removed to free context space but could not be summarized" not in summary
 
     def test_compress_clears_fallback_flag_on_subsequent_success(self):
         mock_response = MagicMock()
