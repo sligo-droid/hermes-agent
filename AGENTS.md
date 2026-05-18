@@ -19,6 +19,8 @@ When developing Hermes itself, work in a git worktree based on `main` and keep
 the main checkout clean. Merge changes back to `main` when done; do not leave dirty changes around unless
 the user explicitly asks to pause before committing.
 
+Prefer changing config values over making code changes, when possible.
+
 ## Project Structure
 
 File counts shift constantly — don't treat the tree below as exhaustive.
@@ -1106,5 +1108,4 @@ not the specific names.
 
 Reviewers should reject new change-detector tests; authors should convert
 them into invariants before re-requesting review.
-
 
