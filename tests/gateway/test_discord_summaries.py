@@ -196,7 +196,7 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
 
     parent.edit.assert_awaited_once()
     assert parent.topic is not None
-    assert parent.topic.startswith("----------------------------------\npending\n")
+    assert parent.topic.startswith("\u200b\n\npending\n")
     assert "https://github.com/acme/hermes-project" in parent.topic
     assert parent.topic.endswith("pending\nExisting channel note")
     assert "Existing channel note" in parent.topic
@@ -288,10 +288,10 @@ def test_project_summary_topic_replaces_managed_line(adapter):
             "This is the start of the #pid channel.\n"
             "Keep this note"
         ),
-        "----------------------------------\nprod\ndemo / pass\nrepo\n\nNew",
+        "\u200b\n\nprod (demo / pass)\nrepo\n\nNew",
     )
 
-    assert topic.startswith("----------------------------------\nprod\ndemo / pass\nrepo\n\nNew")
+    assert topic.startswith("\u200b\n\nprod (demo / pass)\nrepo\n\nNew")
     assert "Old" not in topic
     assert "Production URL:" not in topic
     assert "Login:" not in topic
@@ -304,10 +304,10 @@ def test_project_summary_topic_replaces_managed_line(adapter):
 def test_project_summary_topic_replaces_prefixless_managed_block(adapter):
     topic = adapter._merge_project_summary_topic(
         "\nhttps://old.example.com\nold-login\nhttps://github.com/acme/old\n\nOld priorities\nKeep this note",
-        "----------------------------------\nhttps://new.example.com\nnew-login\nhttps://github.com/acme/new\n\nNew priorities",
+        "\u200b\n\nhttps://new.example.com/ (new-login)\nhttps://github.com/acme/new\n\nNew priorities",
     )
 
-    assert topic == "----------------------------------\nhttps://new.example.com\nnew-login\nhttps://github.com/acme/new\n\nNew priorities\nKeep this note"
+    assert topic == "\u200b\n\nhttps://new.example.com/ (new-login)\nhttps://github.com/acme/new\n\nNew priorities\nKeep this note"
     assert "https://old.example.com" not in topic
     assert "Old priorities" not in topic
 
@@ -315,10 +315,21 @@ def test_project_summary_topic_replaces_prefixless_managed_block(adapter):
 def test_project_summary_topic_replaces_separator_managed_block(adapter):
     topic = adapter._merge_project_summary_topic(
         "----------------------------------\nhttps://old.example.com\nold-login\nhttps://github.com/acme/old\n\nOld priorities\nKeep this note",
-        "----------------------------------\nhttps://new.example.com\nnew-login\nhttps://github.com/acme/new\n\nNew priorities",
+        "\u200b\n\nhttps://new.example.com/ (new-login)\nhttps://github.com/acme/new\n\nNew priorities",
     )
 
-    assert topic == "----------------------------------\nhttps://new.example.com\nnew-login\nhttps://github.com/acme/new\n\nNew priorities\nKeep this note"
+    assert topic == "\u200b\n\nhttps://new.example.com/ (new-login)\nhttps://github.com/acme/new\n\nNew priorities\nKeep this note"
+    assert "https://old.example.com" not in topic
+    assert "Old priorities" not in topic
+
+
+def test_project_summary_topic_replaces_invisible_intro_managed_block(adapter):
+    topic = adapter._merge_project_summary_topic(
+        "\u200b\n\nhttps://old.example.com/ (old-login)\nhttps://github.com/acme/old\n\nOld priorities\nKeep this note",
+        "\u200b\n\nhttps://new.example.com/ (new-login)\nhttps://github.com/acme/new\n\nNew priorities",
+    )
+
+    assert topic == "\u200b\n\nhttps://new.example.com/ (new-login)\nhttps://github.com/acme/new\n\nNew priorities\nKeep this note"
     assert "https://old.example.com" not in topic
     assert "Old priorities" not in topic
 
@@ -383,8 +394,9 @@ def test_project_summary_topic_contract_contains_required_values_without_labels(
     )
 
     assert topic.splitlines() == [
-        "----------------------------------",
-        "https://pid.sligo-labs.vercel.app",
+        "\u200b",
+        "",
+        "https://pid.sligo-labs.vercel.app/",
         "https://github.com/sligo-labs/PID",
         "",
         "Ship Discord topic refresh from Obsidian",
@@ -398,7 +410,7 @@ def test_project_summary_topic_contract_contains_required_values_without_labels(
     assert len(topic) <= 1024
 
 
-def test_project_summary_topic_includes_login_when_available(adapter):
+def test_project_summary_topic_inlines_generic_login_when_available(adapter):
     topic = adapter._render_project_summary_line(
         {
             "production_url": "https://pid.sligo-labs.vercel.app",
@@ -409,15 +421,36 @@ def test_project_summary_topic_includes_login_when_available(adapter):
     )
 
     assert topic.splitlines() == [
-        "----------------------------------",
-        "https://pid.sligo-labs.vercel.app",
-        "use the shared demo account from the project note",
+        "\u200b",
+        "",
+        "https://pid.sligo-labs.vercel.app/ (use the shared demo account from the project note)",
         "https://github.com/sligo-labs/PID",
         "",
         "Ship Discord topic refresh from Obsidian",
     ]
     assert "Login:" not in topic
     assert "Credentials:" not in topic
+    assert len(topic) <= 1024
+
+
+def test_project_summary_topic_compacts_username_password_login(adapter):
+    topic = adapter._render_project_summary_line(
+        {
+            "production_url": "https://pid.sligo-labs.vercel.app",
+            "repo_url": "https://github.com/sligo-labs/PID",
+            "priorities": "Ship Discord topic refresh from Obsidian",
+            "app_access": "username admin / password PID-2026",
+        }
+    )
+
+    assert topic.splitlines()[:4] == [
+        "\u200b",
+        "",
+        "https://pid.sligo-labs.vercel.app/ (admin - PID-2026)",
+        "https://github.com/sligo-labs/PID",
+    ]
+    assert "username" not in topic.lower()
+    assert "password" not in topic.lower()
     assert len(topic) <= 1024
 
 
