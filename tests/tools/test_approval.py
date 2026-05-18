@@ -614,7 +614,7 @@ class TestGatewayProtection:
         cmd = "kill 1605 && cd ~/.hermes/hermes-agent && source venv/bin/activate && python -m hermes_cli.main gateway run --replace &disown; echo done"
         dangerous, key, desc = detect_dangerous_command(cmd)
         assert dangerous is True
-        assert "systemctl" in desc
+        assert "/restart" in desc or "hermes gateway restart" in desc
 
     def test_gateway_run_with_ampersand_detected(self):
         cmd = "python -m hermes_cli.main gateway run --replace &"
