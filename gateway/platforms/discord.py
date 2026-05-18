@@ -80,6 +80,7 @@ _DISCORD_THREAD_STATUS_EMOJIS = ("👀", "❌", "✅")
 _DISCORD_THREAD_STATUS_RANK = {"👀": 0, "❌": 1, "✅": 2}
 _DISCORD_THREAD_NAME_LIMIT = 100
 _DISCORD_TOPIC_LIMIT = 1024
+_DISCORD_PROJECT_SUMMARY_INTRO = "\u200b"
 _OBSIDIAN_PROJECT_PRIORITIES_HEADINGS = {
     "next actions",
     "next priorities",
@@ -1186,7 +1187,7 @@ class DiscordAdapter(BasePlatformAdapter):
             self._truncate_summary_value(metadata.get("production_url"), limit=260)
         )
         app_access = self._truncate_summary_value(metadata.get("app_access"), limit=180, default="")
-        lines = [repo, prod]
+        lines = [_DISCORD_PROJECT_SUMMARY_INTRO, "", prod, repo]
         username, password = self._parse_topic_app_credentials(app_access)
         if username:
             lines.append(f"username: {username}")
