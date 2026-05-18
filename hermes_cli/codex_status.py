@@ -8,6 +8,7 @@ subscription model usage, especially the weekly window.
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from typing import Any
 
 from agent.transports.codex_app_server import (
@@ -133,9 +134,39 @@ def _format_window(window: Any, *, fallback_name: str) -> str:
     if used is None:
         return ""
     duration = _window_name(window.get("windowDurationMins"), fallback_name=fallback_name)
+    bar = _format_progress_bar(used)
+    usage = f"{bar} {used}% used" if bar else f"{used}% used"
     resets = _format_reset(window.get("resetsAt"))
     suffix = f", resets {resets}" if resets else ""
-    return f"{duration}: {used}% used{suffix}"
+    return f"{duration}: {usage}{suffix}"
+
+
+def _format_progress_bar(value: Any, *, width: int = 10) -> str:
+    percent = _percent_value(value)
+    if percent is None:
+        return ""
+    percent = max(0.0, min(100.0, percent))
+    eighths = round((percent / 100.0) * width * 8)
+    full, partial = divmod(eighths, 8)
+    partial_chars = "▏▎▍▌▋▊▉"
+    pieces = ["█" * full]
+    if partial and full < width:
+        pieces.append(partial_chars[partial - 1])
+    visible_cells = full + (1 if partial and full < width else 0)
+    pieces.append("░" * max(0, width - visible_cells))
+    return "[" + "".join(pieces) + "]"
+
+
+def _percent_value(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    matches = re.findall(r"\d+(?:\.\d+)?", str(value))
+    if not matches:
+        return None
+    numbers = [float(match) for match in matches[:2]]
+    return sum(numbers) / len(numbers)
 
 
 def _window_name(minutes: Any, *, fallback_name: str) -> str:
