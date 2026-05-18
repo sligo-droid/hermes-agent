@@ -461,6 +461,12 @@ class TestHandleMessageUsesAuthenticatedRead:
             name="general",
             guild=SimpleNamespace(id=10, name="Test Guild"),
             topic=None,
+            fetch_message=AsyncMock(
+                return_value=SimpleNamespace(
+                    content="the exact message being replied to",
+                    clean_content="the exact message being replied to",
+                )
+            ),
         )
         att = SimpleNamespace(
             url="https://cdn.discordapp.com/attachments/fake/voice-message.ogg",
@@ -479,7 +485,12 @@ class TestHandleMessageUsesAuthenticatedRead:
             content="",
             attachments=[att],
             mentions=[],
-            reference=None,
+            reference=SimpleNamespace(
+                message_id=77,
+                channel_id=100,
+                author_id=bot_user.id,
+                resolved=None,
+            ),
             created_at=datetime.now(timezone.utc),
             channel=channel,
             guild=channel.guild,
@@ -497,6 +508,9 @@ class TestHandleMessageUsesAuthenticatedRead:
         event = adapter.handle_message.call_args[0][0]
         assert event.message_type == MessageType.VOICE
         assert event.media_urls == ["/tmp/voice_from_read.ogg"]
+        assert event.reply_to_message_id == "77"
+        assert event.reply_to_text == "the exact message being replied to"
+        channel.fetch_message.assert_awaited_once_with(77)
 
     @pytest.mark.asyncio
     async def test_untagged_audio_upload_does_not_count_as_mention(self, monkeypatch):

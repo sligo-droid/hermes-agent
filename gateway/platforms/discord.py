@@ -11,6 +11,7 @@ Uses discord.py library for:
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -5014,6 +5015,83 @@ class DiscordAdapter(BasePlatformAdapter):
             )
         return getattr(reference, "author_id", None) == getattr(bot_user, "id", None)
 
+    @staticmethod
+    def _discord_message_context_text(message: Any) -> Optional[str]:
+        """Return concise text for a Discord message used as reply context."""
+        if message is None:
+            return None
+
+        content = (
+            getattr(message, "clean_content", None)
+            or getattr(message, "content", None)
+            or ""
+        )
+        content = str(content).strip()
+        if content:
+            return content
+
+        snapshot_parts = []
+        for snap in getattr(message, "message_snapshots", None) or []:
+            snap_content = str(getattr(snap, "content", "") or "").strip()
+            if snap_content:
+                snapshot_parts.append(snap_content)
+        if snapshot_parts:
+            return "\n".join(snapshot_parts)
+
+        attachments = list(getattr(message, "attachments", None) or [])
+        if attachments:
+            names = [str(getattr(att, "filename", "") or "attachment") for att in attachments]
+            return f"(attachment: {', '.join(names)})"
+
+        return None
+
+    async def _resolve_reply_context(self, message: Any) -> Tuple[Optional[str], Optional[str]]:
+        """Return the replied-to Discord message id and text, fetching if needed."""
+        reference = getattr(message, "reference", None)
+        if not reference:
+            return None, None
+
+        reply_to_id = getattr(reference, "message_id", None)
+        if reply_to_id is None:
+            return None, None
+
+        reply_to_text = self._discord_message_context_text(getattr(reference, "resolved", None))
+        if reply_to_text:
+            return str(reply_to_id), reply_to_text
+
+        reply_to_text = self._discord_message_context_text(getattr(reference, "cached_message", None))
+        if reply_to_text:
+            return str(reply_to_id), reply_to_text
+
+        channel = getattr(message, "channel", None)
+        reference_channel_id = getattr(reference, "channel_id", None)
+        if reference_channel_id is not None and self._client is not None:
+            try:
+                current_channel_id = getattr(channel, "id", None)
+                if current_channel_id != reference_channel_id:
+                    channel = self._client.get_channel(int(reference_channel_id))
+                    if channel is None:
+                        fetch_channel = getattr(self._client, "fetch_channel", None)
+                        if callable(fetch_channel):
+                            channel_result = fetch_channel(int(reference_channel_id))
+                            if inspect.isawaitable(channel_result):
+                                channel_result = await channel_result
+                            channel = channel_result
+            except Exception as exc:
+                logger.debug("[%s] Discord reply channel fetch failed: %s", self.name, exc)
+
+        fetch_message = getattr(channel, "fetch_message", None)
+        if callable(fetch_message):
+            try:
+                resolved = fetch_message(int(reply_to_id))
+                if inspect.isawaitable(resolved):
+                    resolved = await resolved
+                reply_to_text = self._discord_message_context_text(resolved)
+            except Exception as exc:
+                logger.debug("[%s] Discord reply message fetch failed: %s", self.name, exc)
+
+        return str(reply_to_id), reply_to_text
+
     def _thread_parent_channel(self, channel: Any) -> Any:
         """Return the parent text channel when invoked from a thread."""
         return getattr(channel, "parent", None) or channel
@@ -6145,12 +6223,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if direct_question_prompt:
             _channel_prompt = self._append_direct_question_prompt(_channel_prompt)
 
-        reply_to_id = None
-        reply_to_text = None
-        if message.reference:
-            reply_to_id = str(message.reference.message_id)
-            if message.reference.resolved:
-                reply_to_text = getattr(message.reference.resolved, "content", None) or None
+        reply_to_id, reply_to_text = await self._resolve_reply_context(message)
 
         event = MessageEvent(
             text=event_text,
