@@ -102,7 +102,8 @@ def test_goal_set_returns_send_with_notice(server, session):
     r = _call(server, "command.dispatch", name="goal", arg="build a rocket", session_id=sid)
     result = r["result"]
     assert result["type"] == "send"
-    assert result["message"] == "build a rocket"
+    assert result["message"].startswith("[Starting work toward your standing goal]")
+    assert "Goal:\nbuild a rocket" in result["message"]
     assert "notice" in result
     assert "Goal set" in result["notice"]
     assert "20-turn budget" in result["notice"]
@@ -114,6 +115,31 @@ def test_goal_set_returns_send_with_notice(server, session):
     assert mgr.state is not None
     assert mgr.state.goal == "build a rocket"
     assert mgr.state.status == "active"
+
+
+def test_goal_set_parses_subgoal_lines(server, session):
+    sid, session_key, _ = session
+    r = _call(
+        server,
+        "command.dispatch",
+        name="goal",
+        arg="/subgoal Write tests\n/subgoal Update docs",
+        session_id=sid,
+    )
+    result = r["result"]
+    assert result["type"] == "send"
+    assert "Goal set" in result["notice"]
+    assert "Complete the listed subgoals." in result["notice"]
+    assert "Additional criteria" in result["message"]
+    assert "1. Write tests" in result["message"]
+    assert "2. Update docs" in result["message"]
+
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(session_key)
+    assert mgr.state is not None
+    assert mgr.state.goal == "Complete the listed subgoals."
+    assert mgr.state.subgoals == ["Write tests", "Update docs"]
 
 
 def test_goal_rejects_unexpanded_paste_placeholder(server, session):
@@ -153,8 +179,9 @@ def test_goal_resume_reactivates(server, session):
     _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)
     _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
     r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
-    assert r["result"]["type"] == "exec"
-    assert "resumed" in r["result"]["output"].lower()
+    assert r["result"]["type"] == "send"
+    assert "resumed" in r["result"]["notice"].lower()
+    assert r["result"]["message"].startswith("[Continuing toward your standing goal]")
 
     from hermes_cli.goals import GoalManager
 

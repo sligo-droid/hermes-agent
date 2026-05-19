@@ -100,11 +100,16 @@ async def test_gateway_goal_kickoff_wraps_nested_slash_body(tmp_path, monkeypatc
     response = await GatewayRunner._handle_goal_command(runner, event)
 
     try:
-        assert f"⊙ Goal set (20-turn budget): {goal_body}" in response
+        assert "⊙ Goal set (20-turn budget): Then implement the smallest fix" in response
+        state = goals.GoalManager("sid-gateway-goal-config").state
+        assert state is not None
+        assert state.goal == "Then implement the smallest fix"
+        assert state.subgoals == ["inspect the PID logs"]
         queued = adapter._pending_messages["agent:main:discord:channel:goal-config"]
         assert not queued.text.startswith("/")
-        assert "/subgoal inspect the PID logs" in queued.text
-        assert "Then implement the smallest fix" in queued.text
+        assert "Goal: Then implement the smallest fix" in queued.text
+        assert "Additional criteria" in queued.text
+        assert "1. inspect the PID logs" in queued.text
     finally:
         goals._DB_CACHE.clear()
 
