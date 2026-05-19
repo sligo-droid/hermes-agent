@@ -11,7 +11,7 @@ import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { INLINE_MODE, STARTUP_RESUME_ID } from '../config/env.js'
-import { FULL_RENDER_TAIL_ITEMS, WHEEL_SCROLL_STEP } from '../config/limits.js'
+import { FULL_RENDER_TAIL_ITEMS, MAX_HISTORY, WHEEL_SCROLL_STEP } from '../config/limits.js'
 import { SECTION_NAMES, sectionMode } from '../domain/details.js'
 import { attachedImageNotice, imageTokenMeta } from '../domain/messages.js'
 import { fmtCwdBranch, shortCwd } from '../domain/paths.js'
@@ -54,6 +54,14 @@ const GOOD_VIBES_RE = /\b(good bot|thanks|thank you|thx|ty|ily|love you)\b/i
 const BRACKET_PASTE_ON = '\x1b[?2004h'
 const BRACKET_PASTE_OFF = '\x1b[?2004l'
 const MAX_HEIGHT_CACHE_BUCKETS = 12
+
+const capHistory = (items: Msg[]): Msg[] => {
+  if (items.length <= MAX_HISTORY) {
+    return items
+  }
+
+  return items[0]?.kind === 'intro' ? [items[0]!, ...items.slice(-(MAX_HISTORY - 1))] : items.slice(-MAX_HISTORY)
+}
 
 const statusColorOf = (status: string, t: { error: string; muted: string; ok: string; warn: string }) => {
   if (status === 'ready') {
@@ -310,7 +318,10 @@ export function useMainApp(gw: GatewayClient) {
     [selection]
   )
 
-  const appendMessage = useCallback((msg: Msg) => setHistoryItems(prev => appendTranscriptMessage(prev, msg)), [])
+  const appendMessage = useCallback(
+    (msg: Msg) => setHistoryItems(prev => capHistory(appendTranscriptMessage(prev, msg))),
+    []
+  )
 
   const sys = useCallback((text: string) => appendMessage({ role: 'system', text }), [appendMessage])
 
@@ -379,6 +390,12 @@ export function useMainApp(gw: GatewayClient) {
     // fires.  This leaves kitty keyboard protocol, mouse modes, etc. enabled
     // in the parent shell.  See issue #19194.
     process.exit(0)
+  }, [exit, gw])
+
+  const dieWithCode = useCallback((code: number) => {
+    gw.kill()
+    exit()
+    process.exit(code)
   }, [exit, gw])
 
   const session = useSessionLifecycle({
@@ -648,6 +665,7 @@ export function useMainApp(gw: GatewayClient) {
         session: {
           closeSession: session.closeSession,
           die,
+          dieWithCode,
           guardBusySessionSwitch: session.guardBusySessionSwitch,
           newSession: session.newSession,
           resetVisibleHistory: session.resetVisibleHistory,
