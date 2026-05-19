@@ -10065,6 +10065,55 @@ class GatewayRunner:
         if not todos:
             return ""
 
+        source = getattr(event, "source", None)
+        platform = getattr(source, "platform", None)
+        platform_value = platform.value if hasattr(platform, "value") else str(platform or "")
+        if platform_value.lower() == "discord":
+            thread_id = str(getattr(source, "thread_id", "") or getattr(source, "chat_id", "") or "")
+            if thread_id:
+                try:
+                    from hermes_cli import discord_worker_boards as _dwb
+
+                    board = _dwb.set_goal(
+                        thread_id=thread_id,
+                        goal="Follow up on the todos from this meeting.",
+                        chat_id=str(getattr(source, "chat_id", "") or ""),
+                        guild_id=str(getattr(source, "guild_id", "") or ""),
+                        parent_channel_id=str(getattr(source, "parent_chat_id", "") or ""),
+                        project_context={
+                            k: v for k, v in {
+                                "project_name": getattr(source, "project_name", None),
+                                "project_path": getattr(source, "project_path", None),
+                                "project_github_url": getattr(source, "project_github_url", None),
+                                "project_channel_id": getattr(source, "project_channel_id", None),
+                                "project_mapping_source": getattr(source, "project_mapping_source", None),
+                                "project_mapping_resolved": getattr(source, "project_mapping_resolved", None),
+                            }.items() if v is not None
+                        },
+                    )
+                    added = 0
+                    for todo in todos:
+                        try:
+                            _dwb.add_subgoal(board.slug, todo)
+                            added += 1
+                        except Exception as exc:
+                            logger.debug("meeting auto-goal: Kanban add_subgoal failed: %s", exc)
+
+                    if added > 0:
+                        try:
+                            event.skip_post_turn_goal_once = True
+                        except Exception:
+                            pass
+                        ticket_word = "ticket" if added == 1 else "tickets"
+                        board_ref = board.public_url or board.slug
+                        return f"Kanban goal started with {added} subgoal {ticket_word}. Board: {board_ref}"
+                    return ""
+                except Exception as exc:
+                    logger.debug(
+                        "meeting auto-goal: Discord Kanban backend unavailable; falling back to legacy goal loop: %s",
+                        exc,
+                    )
+
         mgr, _session_entry = self._get_goal_manager_for_event(event)
         if mgr is None:
             return (

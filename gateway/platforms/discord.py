@@ -6129,7 +6129,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 message.channel,
                 project_context=project_context,
             )
-        if auto_threaded_channel is not None and not is_meeting_command_message:
+        if auto_threaded_channel is not None:
             feature_summary_handle = await self.initialize_feature_summary(
                 auto_threaded_channel,
                 parent_channel=message.channel,
