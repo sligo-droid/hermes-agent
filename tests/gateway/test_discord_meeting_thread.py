@@ -36,6 +36,7 @@ async def test_bare_text_meeting_command_creates_thread_anchored_to_audio_messag
     classifier = AsyncMock(return_value=False)
     monkeypatch.setattr(adapter, "_classify_discord_feature_request", classifier)
     feature_summary = AsyncMock()
+    feature_summary.return_value = {"thread_id": "777", "message_id": "summary-1"}
     monkeypatch.setattr(adapter, "initialize_feature_summary", feature_summary)
 
     guild = SimpleNamespace(id=42, name="Guild")
@@ -72,7 +73,13 @@ async def test_bare_text_meeting_command_creates_thread_anchored_to_audio_messag
     _, kwargs = create_thread.call_args
     assert kwargs["name"] == "Meeting notes — 2026-05-19 — client kickoff"
     assert kwargs["auto_archive_duration"] == 1440
-    feature_summary.assert_not_awaited()
+    feature_summary.assert_awaited_once()
+    _, summary_kwargs = feature_summary.await_args
+    assert feature_summary.await_args.args == (thread,)
+    assert summary_kwargs["parent_channel"] is channel
+    assert summary_kwargs["initial_request"] == "/meeting client kickoff"
+    assert summary_kwargs["project_context"]["guild_id"] == "42"
+    assert summary_kwargs["project_context"]["project_channel_id"] == "12345"
     classifier.assert_not_awaited()
 
     assert len(captured) == 1
@@ -85,7 +92,7 @@ async def test_bare_text_meeting_command_creates_thread_anchored_to_audio_messag
     assert event.source.chat_id == "777"
     assert event.source.thread_id == "777"
     assert event.source.parent_chat_id == "12345"
-    assert event.feature_summary is None
+    assert event.feature_summary == {"thread_id": "777", "message_id": "summary-1"}
 
 
 @pytest.mark.asyncio

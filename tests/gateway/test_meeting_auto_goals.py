@@ -34,14 +34,24 @@ class FakeGoalManager:
         return "continue meeting follow-up"
 
 
-def _meeting_event() -> MessageEvent:
+def _meeting_event(*, platform: Platform = Platform.DISCORD) -> MessageEvent:
     return MessageEvent(
         text="/meeting",
         message_type=MessageType.TEXT,
         source=SessionSource(
-            platform=Platform.DISCORD,
-            chat_id="channel-1",
+            platform=platform,
+            chat_id="thread-1" if platform == Platform.DISCORD else "channel-1",
+            chat_type="thread" if platform == Platform.DISCORD else "dm",
             user_id="user-1",
+            thread_id="thread-1" if platform == Platform.DISCORD else None,
+            guild_id="guild-1" if platform == Platform.DISCORD else None,
+            parent_chat_id="parent-1" if platform == Platform.DISCORD else None,
+            project_name="Pid" if platform == Platform.DISCORD else None,
+            project_path="/tmp/PID" if platform == Platform.DISCORD else None,
+            project_github_url="https://github.com/sligo-labs/PID" if platform == Platform.DISCORD else None,
+            project_channel_id="parent-1" if platform == Platform.DISCORD else None,
+            project_mapping_source="test" if platform == Platform.DISCORD else None,
+            project_mapping_resolved=True if platform == Platform.DISCORD else None,
         ),
         invoked_skill_name="meeting",
         invoked_skill_command="meeting",
@@ -78,7 +88,61 @@ def test_extract_meeting_todos_recovers_printed_subgoal_commands():
 
 
 @pytest.mark.asyncio
-async def test_meeting_auto_goal_directly_sets_goal_and_subgoals(monkeypatch):
+async def test_meeting_auto_goal_creates_discord_kanban_goal_and_subgoal_tickets(monkeypatch):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    calls = {"set_goal": None, "subgoals": []}
+
+    from hermes_cli import discord_worker_boards as _dwb
+
+    def fake_set_goal(**kwargs):
+        calls["set_goal"] = kwargs
+        return SimpleNamespace(slug="discord-thread-1", public_url="https://kanban.example/thread-1")
+
+    def fake_add_subgoal(board, text):
+        calls["subgoals"].append((board, text))
+        return len(calls["subgoals"]), text
+
+    monkeypatch.setattr(
+        runner,
+        "_get_goal_manager_for_event",
+        lambda event: pytest.fail("Discord meeting todos should use Kanban before legacy goals"),
+    )
+    monkeypatch.setattr(_dwb, "set_goal", fake_set_goal)
+    monkeypatch.setattr(_dwb, "add_subgoal", fake_add_subgoal)
+
+    status = await runner._apply_meeting_auto_goal_from_response(
+        _meeting_event(),
+        """
+Next todos
+- Draft the client summary.
+- Create the follow-up issue list.
+""",
+    )
+
+    assert calls["set_goal"] == {
+        "thread_id": "thread-1",
+        "goal": "Follow up on the todos from this meeting.",
+        "chat_id": "thread-1",
+        "guild_id": "guild-1",
+        "parent_channel_id": "parent-1",
+        "project_context": {
+            "project_name": "Pid",
+            "project_path": "/tmp/PID",
+            "project_github_url": "https://github.com/sligo-labs/PID",
+            "project_channel_id": "parent-1",
+            "project_mapping_source": "test",
+            "project_mapping_resolved": True,
+        },
+    }
+    assert calls["subgoals"] == [
+        ("discord-thread-1", "Draft the client summary."),
+        ("discord-thread-1", "Create the follow-up issue list."),
+    ]
+    assert status == "Kanban goal started with 2 subgoal tickets. Board: https://kanban.example/thread-1"
+
+
+@pytest.mark.asyncio
+async def test_meeting_auto_goal_directly_sets_legacy_goal_and_subgoals_for_non_discord(monkeypatch):
     runner = GatewayRunner.__new__(GatewayRunner)
     mgr = FakeGoalManager(has_goal=False)
     queued = []
@@ -95,7 +159,7 @@ async def test_meeting_auto_goal_directly_sets_goal_and_subgoals(monkeypatch):
     )
 
     status = await runner._apply_meeting_auto_goal_from_response(
-        _meeting_event(),
+        _meeting_event(platform=Platform.LOCAL),
         """
 Next todos
 - Draft the client summary.
@@ -113,6 +177,40 @@ Next todos
 
 
 @pytest.mark.asyncio
+async def test_meeting_auto_goal_falls_back_when_discord_kanban_unavailable(monkeypatch):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    mgr = FakeGoalManager(has_goal=False)
+    queued = []
+
+    from hermes_cli import discord_worker_boards as _dwb
+
+    monkeypatch.setattr(_dwb, "set_goal", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("db unavailable")))
+    monkeypatch.setattr(
+        runner,
+        "_get_goal_manager_for_event",
+        lambda event: (mgr, SimpleNamespace(session_id="sid-1")),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_enqueue_goal_work",
+        lambda event, prompt: queued.append((event, prompt)),
+    )
+
+    status = await runner._apply_meeting_auto_goal_from_response(
+        _meeting_event(),
+        """
+Next todos
+- Verify demo login.
+""",
+    )
+
+    assert mgr.goal == "Follow up on the todos from this meeting."
+    assert mgr.subgoals == ["Verify demo login."]
+    assert queued and queued[0][1] == "continue meeting follow-up"
+    assert status == "Goal tracking started with 1 subgoal."
+
+
+@pytest.mark.asyncio
 async def test_meeting_auto_goal_adds_to_existing_goal_without_overwriting(monkeypatch):
     runner = GatewayRunner.__new__(GatewayRunner)
     mgr = FakeGoalManager(has_goal=True)
@@ -125,7 +223,7 @@ async def test_meeting_auto_goal_adds_to_existing_goal_without_overwriting(monke
     monkeypatch.setattr(runner, "_enqueue_goal_work", lambda event, prompt: None)
 
     status = await runner._apply_meeting_auto_goal_from_response(
-        _meeting_event(),
+        _meeting_event(platform=Platform.LOCAL),
         """
 Next todos
 1. Check the staging deploy.
