@@ -5227,28 +5227,15 @@ class DiscordAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _meeting_trigger_match(text: str) -> Optional[re.Match[str]]:
-        """Match meeting-recording text triggers that preserve the file message.
+    def _is_meeting_command_text(text: str) -> bool:
+        """Match the canonical meeting-recording text trigger.
 
-        Discord owns native slash commands, so ``/meeting`` can be swallowed by
-        the client/app-command layer. Keep accepting it when it arrives as a
-        normal message, but also support non-slash aliases that Discord cannot
-        convert into an interaction.
+        Discord owns leading-slash app commands, so bare ``/meeting`` can be
+        swallowed by the client/app-command layer. ``@Sligo Labs /meeting`` is
+        still a normal message: the mention gate strips the bot mention first,
+        leaving this canonical text command for Hermes to process.
         """
-        return re.match(r"^(?:/meeting|!meeting|meeting)(?:\s|$)", str(text or "").strip(), re.IGNORECASE)
-
-    @classmethod
-    def _is_meeting_command_text(cls, text: str) -> bool:
-        return bool(cls._meeting_trigger_match(text))
-
-    @classmethod
-    def _canonicalize_meeting_command_text(cls, text: str) -> str:
-        stripped = str(text or "").strip()
-        match = cls._meeting_trigger_match(stripped)
-        if not match:
-            return stripped
-        remainder = stripped[match.end():].strip()
-        return f"/meeting {remainder}".strip()
+        return bool(re.match(r"^/meeting(?:\s|$)", str(text or "").strip(), re.IGNORECASE))
 
     def _meeting_thread_name(self, message: Any) -> str:
         created_at = getattr(message, "created_at", None)
@@ -5261,7 +5248,7 @@ class DiscordAdapter(BasePlatformAdapter):
         base = f"Meeting notes — {date_part}" if date_part else "Meeting notes"
 
         content = (getattr(message, "content", "") or "").strip()
-        topic = re.sub(r"^(?:/meeting|!meeting|meeting)(?:\s+|$)", "", content, flags=re.IGNORECASE).strip()
+        topic = re.sub(r"^/meeting(?:\s+|$)", "", content, flags=re.IGNORECASE).strip()
         topic = re.sub(r"<@[!&]?\d+>", "", topic)
         topic = re.sub(r"<#\d+>", "", topic)
         topic = re.sub(r"\s+", " ", topic).strip()
@@ -6064,6 +6051,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         if (
             feature_request_intent is None
+            and not is_meeting_command_message
             and (
                 (is_parent_channel_message and mention_prefix)
                 or (is_thread and (mention_prefix or replies_to_self))
@@ -6295,8 +6283,6 @@ class DiscordAdapter(BasePlatformAdapter):
         # Use normalized_content (saved before auto-threading) instead of message.content,
         # to detect /slash commands in channel messages.
         event_text = normalized_content
-        if is_meeting_command_message and meeting_audio_attachments:
-            event_text = self._canonicalize_meeting_command_text(event_text)
         if pending_text_injection:
             event_text = f"{event_text}\n\n{pending_text_injection}" if event_text else pending_text_injection
 
