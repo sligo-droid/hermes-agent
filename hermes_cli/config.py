@@ -1504,6 +1504,22 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        "discord_worker": {
+            # Public base URL for Discord embed links. When empty, the board
+            # URL is rendered as a relative /public/kanban/<token> path.
+            "public_base_url": "",
+            # Container image expected to include Python, Codex CLI, git/gh,
+            # common build tools, and this repo's runtime dependencies.
+            "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
+            "docker_bin": "docker",
+            "codex_home_root": "",
+            "review_loop_limit": 5,
+            "roles": {
+                "planner": {"reasoning": "high", "max_runtime_seconds": 1800},
+                "dev": {"reasoning": "medium", "max_runtime_seconds": 3600},
+                "reviewer": {"reasoning": "high", "max_runtime_seconds": 1800},
+            },
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
