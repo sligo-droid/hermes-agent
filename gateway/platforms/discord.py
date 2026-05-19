@@ -3938,80 +3938,6 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("Discord interaction cleanup failed: %s", e)
 
-    async def _handle_meeting_slash(
-        self,
-        interaction: Any,
-        recording: Any,
-        context: str = "",
-    ) -> None:
-        """Handle Discord's native /meeting command with an uploaded recording.
-
-        Text messages that literally contain ``/meeting`` already flow through
-        the normal skill-command path. Native Discord slash commands are a
-        separate interaction surface and do not arrive as ``on_message`` events,
-        so they need to be converted into the same MessageEvent shape here.
-        """
-        command_text = f"/meeting {context}".strip()
-
-        try:
-            _user = interaction.user
-            _chan_id = getattr(interaction.channel, "id", None) or getattr(interaction, "channel_id", None)
-            logger.info(
-                "[Discord] slash '%s' invoked by user=%s id=%s channel=%s guild=%s attachment=%s",
-                "/meeting",
-                getattr(_user, "name", "?"),
-                getattr(_user, "id", "?"),
-                _chan_id,
-                getattr(interaction, "guild_id", None),
-                getattr(recording, "filename", "?"),
-            )
-        except Exception:
-            pass
-
-        if not await self._check_slash_authorization(interaction, "/meeting"):
-            return
-
-        await interaction.response.defer(ephemeral=True)
-        try:
-            if not self._is_audio_attachment(recording, message_is_voice=True):
-                await interaction.edit_original_response(
-                    content="Please attach an audio/video meeting recording to /meeting."
-                )
-                return
-
-            try:
-                ext, media_type = self._audio_attachment_details(recording)
-                cached_path = await self._cache_discord_audio(recording, ext)
-            except Exception as exc:
-                logger.warning("[Discord] Failed to cache /meeting recording: %s", exc, exc_info=True)
-                await interaction.edit_original_response(
-                    content=f"I couldn't read that meeting recording: {exc}"
-                )
-                return
-
-            event = self._build_slash_event(interaction, command_text)
-            event.message_type = MessageType.COMMAND
-            event.media_urls = [cached_path]
-            event.media_types = [media_type]
-            # There is no normal Discord message to reply/thread against for a
-            # native slash interaction. Keep the cached interaction as raw_message
-            # but do not pretend there is a recording-file message id.
-            event.message_id = None
-            event.reply_to_message_id = None
-
-            await self.handle_message(event)
-            try:
-                await interaction.delete_original_response()
-            except Exception as exc:
-                logger.debug("Discord /meeting interaction cleanup failed: %s", exc)
-        except Exception as exc:
-            logger.error("[Discord] /meeting command failed: %s", exc, exc_info=True)
-            try:
-                await interaction.edit_original_response(
-                    content=f"/meeting failed before processing could start: {exc}"
-                )
-            except Exception:
-                pass
 
     def _register_slash_commands(self) -> None:
         """Register Discord slash commands on the command tree."""
@@ -4114,17 +4040,6 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_voice(interaction: discord.Interaction, mode: str = ""):
             await self._run_simple_slash(interaction, f"/voice {mode}".strip())
 
-        @tree.command(name="meeting", description="Transcribe/summarize a meeting recording and start follow-up goals")
-        @discord.app_commands.describe(  # pyright: ignore[reportOptionalMemberAccess]
-            recording="Audio/video meeting recording to process",
-            context="Optional context to include with the recording",
-        )
-        async def slash_meeting(
-            interaction: discord.Interaction,  # pyright: ignore[reportInvalidTypeForm]
-            recording: discord.Attachment,  # pyright: ignore[reportInvalidTypeForm]
-            context: str = "",
-        ):
-            await self._handle_meeting_slash(interaction, recording, context)
 
         @tree.command(name="update", description="Update Hermes Agent to the latest version")
         async def slash_update(interaction: discord.Interaction):
@@ -5311,6 +5226,58 @@ class DiscordAdapter(BasePlatformAdapter):
     # Auto-thread helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_meeting_command_text(text: str) -> bool:
+        """Match the canonical meeting-recording text trigger.
+
+        Discord owns leading-slash app commands, so bare ``/meeting`` can be
+        swallowed by the client/app-command layer. ``@Sligo Labs /meeting`` is
+        still a normal message: the mention gate strips the bot mention first,
+        leaving this canonical text command for Hermes to process.
+        """
+        return bool(re.match(r"^/meeting(?:\s|$)", str(text or "").strip(), re.IGNORECASE))
+
+    def _meeting_thread_name(self, message: Any) -> str:
+        created_at = getattr(message, "created_at", None)
+        date_part = ""
+        if hasattr(created_at, "strftime"):
+            try:
+                date_part = getattr(created_at, "strftime")("%Y-%m-%d")
+            except Exception:
+                pass
+        base = f"Meeting notes — {date_part}" if date_part else "Meeting notes"
+
+        content = (getattr(message, "content", "") or "").strip()
+        topic = re.sub(r"^/meeting(?:\s+|$)", "", content, flags=re.IGNORECASE).strip()
+        topic = re.sub(r"<@[!&]?\d+>", "", topic)
+        topic = re.sub(r"<#\d+>", "", topic)
+        topic = re.sub(r"\s+", " ", topic).strip()
+        if topic:
+            base = f"{base} — {topic}"
+        return base[:80] if len(base) <= 80 else base[:77] + "..."
+
+    async def _create_meeting_thread(self, message: Any) -> Optional[Any]:
+        """Create/reuse a thread anchored to the meeting recording message."""
+        existing = getattr(message, "thread", None)
+        if existing is not None:
+            return existing
+
+        create = getattr(message, "create_thread", None)
+        if create is None:
+            logger.warning("[%s] Meeting thread creation failed: message.create_thread unavailable", self.name)
+            return None
+
+        display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
+        try:
+            return await create(
+                name=self._meeting_thread_name(message),
+                auto_archive_duration=1440,
+                reason=f"Meeting recording processed by request from {display_name}",
+            )
+        except Exception as exc:
+            logger.warning("[%s] Meeting thread creation failed: %s", self.name, exc)
+            return None
+
     async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
         """Create an auto-thread attached to the triggering user message.
 
@@ -5964,6 +5931,11 @@ class DiscordAdapter(BasePlatformAdapter):
         all_attachments = list(message.attachments) + snapshot_attachments
         message_is_voice = self._message_has_voice_flag(message)
         is_slash_command_message = normalized_content.startswith("/")
+        is_meeting_command_message = self._is_meeting_command_text(normalized_content)
+        meeting_audio_attachments = [
+            att for att in all_attachments
+            if self._is_audio_attachment(att, message_is_voice=message_is_voice)
+        ] if is_meeting_command_message else []
 
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
@@ -6018,6 +5990,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     self._client.user not in message.mentions
                     and not mention_prefix
                     and not is_slash_command_message
+                    and not (is_meeting_command_message and meeting_audio_attachments)
                     and not message_is_voice
                     and not replies_to_self
                 ):
@@ -6034,6 +6007,15 @@ class DiscordAdapter(BasePlatformAdapter):
         # Messages already inside threads or DMs are unaffected.
         # no_thread_channels: channels where bot responds directly without thread.
         auto_threaded_channel = None
+        if is_parent_channel_message and is_meeting_command_message and meeting_audio_attachments:
+            thread = await self._create_meeting_thread(message)
+            if thread:
+                parent_channel_id = str(message.channel.id)
+                is_thread = True
+                thread_id = str(thread.id)
+                auto_threaded_channel = thread
+                self._threads.mark(thread_id)
+
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
@@ -6069,6 +6051,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         if (
             feature_request_intent is None
+            and not is_meeting_command_message
             and (
                 (is_parent_channel_message and mention_prefix)
                 or (is_thread and (mention_prefix or replies_to_self))
@@ -6088,7 +6071,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 message.channel,
                 project_context=project_context,
             )
-        if auto_threaded_channel is not None:
+        if auto_threaded_channel is not None and not is_meeting_command_message:
             feature_summary_handle = await self.initialize_feature_summary(
                 auto_threaded_channel,
                 parent_channel=message.channel,
@@ -6103,7 +6086,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # Determine message type
         msg_type = MessageType.TEXT
-        if normalized_content.startswith("/"):
+        if normalized_content.startswith("/") or (is_meeting_command_message and meeting_audio_attachments):
             msg_type = MessageType.COMMAND
         elif all_attachments:
             _allow_any = self._discord_allow_any_attachment()
