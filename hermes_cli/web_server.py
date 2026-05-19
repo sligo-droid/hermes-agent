@@ -246,6 +246,20 @@ async def auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+@app.get("/public/kanban/{share_token}", response_class=HTMLResponse)
+async def public_kanban_board(share_token: str):
+    """Read-only public Kanban board view for Discord worker threads."""
+    try:
+        from hermes_cli.discord_worker_boards import render_public_board_html
+
+        return HTMLResponse(render_public_board_html(share_token))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Kanban board not found")
+    except Exception as exc:
+        _log.warning("public kanban board render failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Kanban board unavailable")
+
+
 # ---------------------------------------------------------------------------
 # Config schema — auto-generated from DEFAULT_CONFIG
 # ---------------------------------------------------------------------------

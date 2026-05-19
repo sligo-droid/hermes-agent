@@ -3633,7 +3633,11 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
+def has_spawnable_ready(
+    conn: sqlite3.Connection,
+    *,
+    additional_spawnable_assignees: Optional[Iterable[str]] = None,
+) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
 
@@ -3659,8 +3663,10 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     except Exception:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
+    extra = {str(a).strip().lower() for a in (additional_spawnable_assignees or ()) if str(a).strip()}
     for row in rows:
-        if profile_exists(row["assignee"]):
+        assignee = str(row["assignee"] or "").strip().lower()
+        if assignee in extra or profile_exists(row["assignee"]):
             return True
     return False
 
@@ -3674,6 +3680,7 @@ def dispatch_once(
     max_spawn: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     board: Optional[str] = None,
+    additional_spawnable_assignees: Optional[Iterable[str]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -3764,6 +3771,11 @@ def dispatch_once(
             ).fetchone()[0]
         )
 
+    additional_spawnable = {
+        str(a).strip().lower()
+        for a in (additional_spawnable_assignees or ())
+        if str(a).strip()
+    }
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
@@ -3790,7 +3802,12 @@ def dispatch_once(
             from hermes_cli.profiles import profile_exists  # local import: avoids cycle
         except Exception:
             profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        row_assignee = str(row["assignee"] or "").strip().lower()
+        if (
+            profile_exists is not None
+            and row_assignee not in additional_spawnable
+            and not profile_exists(row["assignee"])
+        ):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses

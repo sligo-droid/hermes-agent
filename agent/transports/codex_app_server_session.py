@@ -170,6 +170,8 @@ class CodexAppServerSession:
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
+        extra_args: Optional[list[str]] = None,
+        env: Optional[dict[str, str]] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -178,6 +180,8 @@ class CodexAppServerSession:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        self._extra_args = list(extra_args or [])
+        self._env = dict(env or {})
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
@@ -210,7 +214,10 @@ class CodexAppServerSession:
             return self._thread_id
         if self._client is None:
             self._client = self._client_factory(
-                codex_bin=self._codex_bin, codex_home=self._codex_home
+                codex_bin=self._codex_bin,
+                codex_home=self._codex_home,
+                extra_args=self._extra_args,
+                env=self._env,
             )
         self._client.initialize(
             client_name="hermes",

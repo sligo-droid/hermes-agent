@@ -734,6 +734,7 @@ class DiscordAdapter(BasePlatformAdapter):
             "parent_channel_id": str(handle.get("parent_channel_id") or ""),
             "initial_request": str(handle.get("initial_request") or ""),
             "project_context": handle.get("project_context") or None,
+            "kanban_board": handle.get("kanban_board") or None,
             "updated_at": time.time(),
         }
         state[_DISCORD_FEATURE_SUMMARY_STATE_BUCKET] = bucket
@@ -1324,6 +1325,7 @@ class DiscordAdapter(BasePlatformAdapter):
         outcome: str = "Pending",
         title: Optional[str] = None,
         metadata: Optional[Dict[str, Optional[str]]] = None,
+        kanban_url: Optional[str] = None,
     ):
         metadata = metadata or self._collect_discord_project_metadata()
         embed_kwargs = {
@@ -1343,6 +1345,8 @@ class DiscordAdapter(BasePlatformAdapter):
             fields.append(("GitHub PR", metadata["pr_url"], False))
         if metadata.get("branch_url"):
             fields.append(("Feature Branch URL", metadata["branch_url"], False))
+        if kanban_url:
+            fields.append(("Kanban Board", kanban_url, False))
         for name, value, inline in fields:
             try:
                 embed.add_field(
@@ -1364,11 +1368,35 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> Optional[Dict[str, Any]]:
         if thread_channel is None or not hasattr(thread_channel, "send"):
             return None
+        board_handle: Optional[Dict[str, Any]] = None
+        try:
+            from hermes_cli.discord_worker_boards import ensure_discord_thread_board
+
+            guild = getattr(thread_channel, "guild", None)
+            board = ensure_discord_thread_board(
+                thread_id=str(getattr(thread_channel, "id", "") or ""),
+                chat_id=str(
+                    getattr(parent_channel, "id", "")
+                    or getattr(thread_channel, "id", "")
+                    or ""
+                ),
+                guild_id=str(getattr(guild, "id", "") or ""),
+                parent_channel_id=str(getattr(parent_channel, "id", "") or ""),
+                initial_request=initial_request,
+                project_context=project_context,
+            )
+            board_handle = {
+                "slug": board.slug,
+                "public_url": board.public_url,
+            }
+        except Exception as exc:
+            logger.debug("[%s] Failed to initialize Discord worker board: %s", self.name, exc)
         try:
             embed = self._build_feature_summary_embed(
                 initial_request=initial_request,
                 status="Running",
                 metadata=self._collect_discord_project_metadata(project_context),
+                kanban_url=(board_handle or {}).get("public_url"),
             )
             msg = await thread_channel.send(embed=embed)
         except Exception as exc:
@@ -1380,6 +1408,7 @@ class DiscordAdapter(BasePlatformAdapter):
             "parent_channel_id": str(getattr(parent_channel, "id", "") or ""),
             "initial_request": initial_request,
             "project_context": project_context,
+            "kanban_board": board_handle,
             "_thread_obj": thread_channel,
             "_message_obj": msg,
         }
@@ -1421,6 +1450,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 outcome=final_response,
                 title=title,
                 metadata=self._collect_discord_project_metadata(handle.get("project_context")),
+                kanban_url=(
+                    (handle.get("kanban_board") or {})
+                    if isinstance(handle.get("kanban_board"), dict)
+                    else {}
+                ).get("public_url"),
             )
             await msg.edit(embed=embed)
             return True

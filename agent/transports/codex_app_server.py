@@ -99,6 +99,12 @@ class CodexAppServerClient:
                     ),
                 )
             )
+            network_access = (
+                "true"
+                if spawn_env.get("HERMES_CODEX_WORKER_NETWORK_ACCESS", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+                else "false"
+            )
             app_server_args.extend(
                 [
                     "-c",
@@ -106,7 +112,7 @@ class CodexAppServerClient:
                     "-c",
                     f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
                     "-c",
-                    "sandbox_workspace_write.network_access=false",
+                    f"sandbox_workspace_write.network_access={network_access}",
                 ]
             )
 
