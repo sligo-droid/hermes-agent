@@ -45,10 +45,14 @@ Spawned by: CodexAppServerSession.ensure_started() when the runtime is
 
 from __future__ import annotations
 
+import copy
+import inspect
 import json
+import keyword
 import logging
 import os
 import sys
+from collections.abc import Callable
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -107,6 +111,103 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 )
 
 
+def _normalise_parameters_schema(schema: Any) -> dict[str, Any]:
+    """Return an object-shaped JSON schema suitable for MCP tool input."""
+    if not isinstance(schema, dict):
+        return {"type": "object", "properties": {}}
+    out = copy.deepcopy(schema)
+    if out.get("type") != "object":
+        out["type"] = "object"
+    if not isinstance(out.get("properties"), dict):
+        out["properties"] = {}
+    return out
+
+
+def _is_signature_safe_name(name: str) -> bool:
+    return name.isidentifier() and not keyword.iskeyword(name) and not name.startswith("_")
+
+
+def _make_handler(
+    tool_name: str,
+    description: str,
+    params_schema: dict[str, Any],
+    dispatch: Callable[[str, dict[str, Any]], str],
+) -> Callable[..., str]:
+    """Build a FastMCP callable whose signature matches top-level tool args.
+
+    FastMCP derives validation from ``inspect.signature``. A plain
+    ``**kwargs`` wrapper advertises a required ``kwargs`` property, which
+    clients such as Codex reject or call incorrectly. ``__signature__`` lets
+    us keep a generic runtime wrapper while exposing the real Hermes argument
+    names to FastMCP.
+    """
+    required = set(params_schema.get("required") or [])
+    properties = params_schema.get("properties") or {}
+    signature_params: list[inspect.Parameter] = []
+
+    for arg_name in properties:
+        if not _is_signature_safe_name(arg_name):
+            signature_params = [
+                inspect.Parameter(
+                    "kwargs",
+                    inspect.Parameter.VAR_KEYWORD,
+                    annotation=Any,
+                )
+            ]
+            break
+        signature_params.append(
+            inspect.Parameter(
+                arg_name,
+                inspect.Parameter.KEYWORD_ONLY,
+                default=(
+                    inspect.Parameter.empty
+                    if arg_name in required
+                    else None
+                ),
+                annotation=Any,
+            )
+        )
+
+    def _dispatch(**kwargs: Any) -> str:
+        try:
+            return dispatch(tool_name, kwargs or {})
+        except Exception as exc:
+            logger.exception("tool %s raised", tool_name)
+            return json.dumps({"error": str(exc), "tool": tool_name})
+
+    _dispatch.__name__ = tool_name
+    _dispatch.__doc__ = description
+    _dispatch.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
+        parameters=signature_params,
+        return_annotation=str,
+    )
+    return _dispatch
+
+
+def _patch_fastmcp_tool_schema(
+    mcp: Any,
+    tool_name: str,
+    params_schema: dict[str, Any],
+) -> None:
+    """Patch FastMCP's internal Tool with Hermes' authoritative schema.
+
+    mcp 1.26 does not expose a public ``input_schema`` argument on
+    ``FastMCP.add_tool``. It derives a lossy schema from Python type hints, so
+    we patch the registered Tool object after adding it. If a future SDK grows
+    first-class schema support, this helper can become the compatibility shim.
+    """
+    tool_manager = getattr(mcp, "_tool_manager", None)
+    get_tool = getattr(tool_manager, "get_tool", None)
+    if not callable(get_tool):
+        logger.debug("FastMCP tool manager not available; schema patch skipped")
+        return
+    tool = get_tool(tool_name)
+    if tool is None:
+        logger.debug("FastMCP tool %s not found after registration", tool_name)
+        return
+    tool.parameters = copy.deepcopy(params_schema)
+
+
 def _build_server() -> Any:
     """Create the FastMCP server with Hermes tools attached. Lazy imports
     so the module can be imported without the mcp package installed
@@ -154,37 +255,32 @@ def _build_server() -> Any:
             continue
 
         description = spec.get("description") or f"Hermes {name} tool"
-        params_schema = spec.get("parameters") or {"type": "object", "properties": {}}
-
-        # FastMCP wants a Python callable. Build a closure that takes the
-        # arguments dict, dispatches via handle_function_call, and returns
-        # the result string. We use add_tool() for full control over the
-        # input schema (FastMCP's @tool() decorator inspects type hints,
-        # which we can't get from a JSON schema at runtime).
-        def _make_handler(tool_name: str):
-            def _dispatch(**kwargs: Any) -> str:
-                try:
-                    return handle_function_call(tool_name, kwargs or {})
-                except Exception as exc:
-                    logger.exception("tool %s raised", tool_name)
-                    return json.dumps({"error": str(exc), "tool": tool_name})
-            _dispatch.__name__ = tool_name
-            _dispatch.__doc__ = description
-            return _dispatch
+        params_schema = _normalise_parameters_schema(spec.get("parameters"))
 
         try:
+            handler = _make_handler(
+                name,
+                description,
+                params_schema,
+                handle_function_call,
+            )
             mcp.add_tool(
-                _make_handler(name),
+                handler,
                 name=name,
                 description=description,
-                # FastMCP accepts JSON schema directly via the
-                # input_schema parameter on newer versions; older
-                # versions use parameters_schema. Try both for compat.
+                structured_output=False,
             )
+            _patch_fastmcp_tool_schema(mcp, name, params_schema)
         except TypeError:
             # Older mcp SDK signature — fall back to decorator-style.
-            handler = _make_handler(name)
+            handler = _make_handler(
+                name,
+                description,
+                params_schema,
+                handle_function_call,
+            )
             handler = mcp.tool(name=name, description=description)(handler)
+            _patch_fastmcp_tool_schema(mcp, name, params_schema)
 
         exposed_count += 1
 
