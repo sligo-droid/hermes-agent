@@ -355,6 +355,91 @@ async def test_feature_thread_reactions_target_triggering_user_message(adapter):
     assert raw_message.add_reaction.await_args_list[1].args == ("✅",)
 
 
+@pytest.mark.asyncio
+async def test_top_level_feature_summary_reactions_target_triggering_user_message(adapter):
+    raw_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    summary_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    event = _make_event("9", raw_message)
+    event.source.chat_type = "group"
+    event.feature_summary = {
+        "thread_id": "123",
+        "message_id": "456",
+        "_message_obj": summary_message,
+    }
+    adapter.update_feature_summary = AsyncMock(return_value=True)
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    adapter.update_feature_summary.assert_awaited_once_with(event.feature_summary, status="Running")
+    summary_message.add_reaction.assert_not_awaited()
+    summary_message.remove_reaction.assert_not_awaited()
+    assert [call.args for call in raw_message.remove_reaction.await_args_list] == [
+        ("✅", adapter._client.user),
+        ("❌", adapter._client.user),
+        ("👀", adapter._client.user),
+    ]
+    assert [call.args for call in raw_message.add_reaction.await_args_list] == [
+        ("👀",),
+        ("✅",),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_batched_text_lifecycle_reactions_target_every_user_message(adapter):
+    first_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    second_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    event = _make_event("10", first_message)
+    event._batched_raw_messages = [first_message, second_message]
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+    for message in (first_message, second_message):
+        assert [call.args for call in message.remove_reaction.await_args_list] == [
+            ("✅", adapter._client.user),
+            ("❌", adapter._client.user),
+            ("👀", adapter._client.user),
+        ]
+        assert [call.args for call in message.add_reaction.await_args_list] == [
+            ("👀",),
+            ("❌",),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_text_batching_preserves_all_user_reaction_messages(adapter):
+    adapter._text_batch_delay_seconds = 30
+    first_message = SimpleNamespace(add_reaction=AsyncMock(), remove_reaction=AsyncMock())
+    second_message = SimpleNamespace(add_reaction=AsyncMock(), remove_reaction=AsyncMock())
+    first = _make_event("11", first_message)
+    second = _make_event("12", second_message)
+
+    adapter._enqueue_text_event(first)
+    adapter._enqueue_text_event(second)
+
+    key = adapter._text_batch_key(first)
+    pending = adapter._pending_text_batches[key]
+    assert pending.raw_message is first_message
+    assert pending._batched_raw_messages == [first_message, second_message]
+
+    for task in list(adapter._pending_text_batch_tasks.values()):
+        task.cancel()
+    await asyncio.sleep(0)
+
+
 class _StatusThread:
     def __init__(self, *, thread_id=777, name="Build thing"):
         self.id = thread_id

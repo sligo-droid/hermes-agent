@@ -2463,6 +2463,27 @@ class DiscordAdapter(BasePlatformAdapter):
         """Return the user Discord message whose reactions represent this turn."""
         return event.raw_message
 
+    async def _processing_reaction_messages(self, event: MessageEvent) -> List[Any]:
+        """Return all user Discord messages whose reactions represent this turn."""
+        messages = getattr(event, "_batched_raw_messages", None)
+        if messages is None:
+            message = await self._processing_reaction_message(event)
+            return [message] if message is not None else []
+        if not isinstance(messages, (list, tuple, set)):
+            messages = [messages]
+
+        result = []
+        seen = set()
+        for message in messages:
+            if message is None:
+                continue
+            identity = id(message)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            result.append(message)
+        return result
+
     async def _mark_feature_summary_running(self, event: MessageEvent) -> None:
         handle = getattr(event, "feature_summary", None)
         if isinstance(handle, dict):
@@ -2482,28 +2503,36 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._reactions_enabled():
             return
         await self._mark_feature_summary_running(event)
-        message = await self._processing_reaction_message(event)
-        if hasattr(message, "add_reaction"):
+        messages = await self._processing_reaction_messages(event)
+        for message in messages:
+            if not hasattr(message, "add_reaction"):
+                continue
             await self._remove_reaction(message, "✅")
             await self._remove_reaction(message, "❌")
             await self._add_reaction(message, "👀")
+        message = messages[0] if messages else await self._processing_reaction_message(event)
         await self._update_thread_status_emoji(event, message, "👀")
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction."""
         if not self._reactions_enabled():
             return
-        message = await self._processing_reaction_message(event)
-        if hasattr(message, "add_reaction"):
+        messages = await self._processing_reaction_messages(event)
+        for message in messages:
+            if not hasattr(message, "add_reaction"):
+                continue
             await self._remove_reaction(message, "👀")
             if outcome == ProcessingOutcome.SUCCESS:
                 await self._add_reaction(message, "✅")
-                await self._update_thread_status_emoji(event, message, "✅")
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
-                await self._update_thread_status_emoji(event, message, "❌")
-            elif outcome == ProcessingOutcome.CANCELLED:
-                await self._update_thread_status_emoji(event, message, None)
+        message = messages[0] if messages else await self._processing_reaction_message(event)
+        if outcome == ProcessingOutcome.SUCCESS:
+            await self._update_thread_status_emoji(event, message, "✅")
+        elif outcome == ProcessingOutcome.FAILURE:
+            await self._update_thread_status_emoji(event, message, "❌")
+        elif outcome == ProcessingOutcome.CANCELLED:
+            await self._update_thread_status_emoji(event, message, None)
 
     async def send(
         self,
@@ -6427,11 +6456,17 @@ class DiscordAdapter(BasePlatformAdapter):
         chunk_len = len(event.text or "")
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            event._batched_raw_messages = [event.raw_message]  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
         else:
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            raw_messages = getattr(existing, "_batched_raw_messages", None)
+            if raw_messages is None:
+                raw_messages = [existing.raw_message]
+                existing._batched_raw_messages = raw_messages  # type: ignore[attr-defined]
+            raw_messages.append(event.raw_message)
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
