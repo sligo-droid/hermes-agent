@@ -835,6 +835,12 @@ class DiscordAdapter(BasePlatformAdapter):
             return f"https://{url.rstrip('/')}"
         return url
 
+    def _normalize_absolute_public_url(self, raw: Optional[str]) -> Optional[str]:
+        url = self._normalize_public_url(raw)
+        if url and url.startswith(("http://", "https://")):
+            return url
+        return None
+
     def _production_url_from_env(self) -> Optional[str]:
         for key in (
             "PRODUCTION_URL",
@@ -1345,6 +1351,7 @@ class DiscordAdapter(BasePlatformAdapter):
             fields.append(("GitHub PR", metadata["pr_url"], False))
         if metadata.get("branch_url"):
             fields.append(("Feature Branch URL", metadata["branch_url"], False))
+        kanban_url = self._normalize_absolute_public_url(kanban_url)
         if kanban_url:
             fields.append(("Kanban Board", kanban_url, False))
         for name, value, inline in fields:

@@ -142,6 +142,10 @@ def adapter(monkeypatch):
         "DEPLOYMENT_URL",
         "VERCEL_PROJECT_PRODUCTION_URL",
         "VERCEL_URL",
+        "HERMES_KANBAN_HOME",
+        "HERMES_PUBLIC_KANBAN_BASE_URL",
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "HERMES_DASHBOARD_URL",
     ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("OBSIDIAN_VAULT_PATH", "/nonexistent/hermes-test-obsidian-vault")
@@ -498,6 +502,43 @@ async def test_feature_summary_update_edits_initial_message(adapter):
     assert fields["Status"] == "✅ Done"
     assert fields["Concise Outcome"].startswith("Done.")
     assert fields["Branch"] == "feature/summary"
+
+
+@pytest.mark.asyncio
+async def test_feature_summary_uses_absolute_kanban_board_url(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://hermes.example.test")
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="Ship project links",
+    )
+
+    assert handle is not None
+    sent_embed = thread.sent[0][0]["embed"]
+    fields = {field.name: field.value for field in sent_embed.fields}
+    assert fields["Kanban Board"].startswith("https://hermes.example.test/public/kanban/")
+
+
+@pytest.mark.asyncio
+async def test_feature_summary_omits_relative_kanban_board_path(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="Ship project links",
+    )
+
+    assert handle is not None
+    sent_embed = thread.sent[0][0]["embed"]
+    fields = {field.name: field.value for field in sent_embed.fields}
+    assert "Kanban Board" not in fields
 
 
 @pytest.mark.asyncio
