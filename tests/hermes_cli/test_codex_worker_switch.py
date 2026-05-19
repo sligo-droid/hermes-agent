@@ -40,6 +40,11 @@ def test_coding_request_detection_is_conservative():
     assert cws.looks_like_coding_request("implement the parser fix in src/parser.py")
     assert cws.looks_like_coding_request("use codex worker to debug failing tests")
     assert cws.looks_like_coding_request("review this diff before merge")
+    assert cws.looks_like_coding_request("add a dashboard component for sessions")
+    assert cws.looks_like_coding_request("wire up the CLI command config loader")
+    assert cws.looks_like_coding_request("integrate the auth provider")
+    assert cws.looks_like_coding_request("write tests for the gateway route")
+    assert cws.looks_like_coding_request("add regression test coverage")
     assert not cws.looks_like_coding_request("what is the weather today?")
 
 
@@ -53,6 +58,10 @@ def test_codex_worker_meta_questions_do_not_trigger_guidance():
     assert not cws.looks_like_coding_request(
         "tighten the heuristic for invoking codex/opencode later"
     )
+    assert not cws.looks_like_coding_request(
+        "when does the handoff to codex app server happen?"
+    )
+    assert not cws.looks_like_coding_request("improve the routing criteria")
 
 
 def test_echoed_codex_worker_guidance_is_ignored_before_classification():
@@ -97,3 +106,128 @@ def test_worker_guidance_requires_enabled_tool_and_normal_runtime():
         tool_available=True,
         api_mode="codex_app_server",
     ) == ""
+
+
+def test_hermes_context_detects_prompt_references_and_cwd(monkeypatch, tmp_path):
+    hermes_root = tmp_path / "hermes"
+    hermes_root.mkdir()
+    monkeypatch.setattr(cws, "_known_hermes_roots", lambda: (hermes_root,))
+    monkeypatch.setattr(cws, "_git_common_dir", lambda cwd: None)
+
+    assert cws.message_references_hermes_repo("update the Hermes repo CLI command")
+    assert cws.message_references_hermes_repo("fix /home/droid/hermes run_agent.py")
+    assert cws.message_references_hermes_repo("add tests in ~/hermes")
+    assert cws.cwd_is_hermes_repo(str(hermes_root / "agent"))
+
+
+def test_hermes_context_detects_git_worktree_common_dir(monkeypatch, tmp_path):
+    hermes_root = tmp_path / "hermes"
+    worktree = tmp_path / "worktrees" / "feature"
+    worktree.mkdir(parents=True)
+    monkeypatch.setattr(cws, "_known_hermes_roots", lambda: (hermes_root,))
+    monkeypatch.setattr(cws, "_git_common_dir", lambda cwd: hermes_root / ".git")
+
+    assert cws.cwd_is_hermes_repo(str(worktree))
+
+
+def test_hermes_coding_request_mandates_codex_worker(monkeypatch, tmp_path):
+    hermes_root = tmp_path / "hermes"
+    hermes_root.mkdir()
+    monkeypatch.setattr(cws, "_known_hermes_roots", lambda: (hermes_root,))
+    monkeypatch.setattr(cws, "_git_common_dir", lambda cwd: None)
+
+    decision = cws.assess_worker_routing(
+        "add a gateway regression test",
+        enabled=True,
+        tool_available=True,
+        api_mode="chat_completions",
+        cwd=str(hermes_root),
+    )
+
+    assert decision.required is True
+    assert decision.should_delegate is True
+    assert "must call `delegate_codex_coding_task`" in decision.guidance
+
+
+def test_hermes_coding_request_ignores_disabled_toggle(monkeypatch, tmp_path):
+    hermes_root = tmp_path / "hermes"
+    hermes_root.mkdir()
+    monkeypatch.setattr(cws, "_known_hermes_roots", lambda: (hermes_root,))
+    monkeypatch.setattr(cws, "_git_common_dir", lambda cwd: None)
+
+    decision = cws.assess_worker_routing(
+        "add a gateway regression test",
+        enabled=False,
+        tool_available=True,
+        api_mode="chat_completions",
+        cwd=str(hermes_root),
+    )
+
+    assert decision.required is True
+    assert decision.should_delegate is True
+
+
+def test_hermes_context_enables_improvement_classifier(monkeypatch, tmp_path):
+    hermes_root = tmp_path / "hermes"
+    hermes_root.mkdir()
+    monkeypatch.setattr(cws, "_known_hermes_roots", lambda: (hermes_root,))
+    monkeypatch.setattr(cws, "_git_common_dir", lambda cwd: None)
+
+    for message in (
+        "tighten the heuristic",
+        "improve the routing criteria",
+    ):
+        decision = cws.assess_worker_routing(
+            message,
+            enabled=False,
+            tool_available=True,
+            api_mode="chat_completions",
+            cwd=str(hermes_root),
+        )
+        assert decision.required is True
+        assert decision.coding_request is True
+
+
+def test_improvement_classifier_requires_hermes_context():
+    decision = cws.assess_worker_routing(
+        "tighten the heuristic for invoking codex/opencode later",
+        enabled=True,
+        tool_available=True,
+        api_mode="chat_completions",
+        cwd="/tmp/not-hermes",
+    )
+
+    assert decision == cws.CodexWorkerRoutingDecision()
+
+
+def test_hermes_coding_request_fails_loud_when_tool_unavailable(monkeypatch, tmp_path):
+    hermes_root = tmp_path / "hermes"
+    hermes_root.mkdir()
+    monkeypatch.setattr(cws, "_known_hermes_roots", lambda: (hermes_root,))
+    monkeypatch.setattr(cws, "_git_common_dir", lambda cwd: None)
+
+    decision = cws.assess_worker_routing(
+        "update the TUI session state",
+        enabled=True,
+        tool_available=False,
+        api_mode="chat_completions",
+        cwd=str(hermes_root),
+    )
+
+    assert decision.required is True
+    assert decision.fail_loud is True
+    assert "tool is unavailable" in decision.guidance
+
+
+def test_full_codex_app_server_runtime_remains_opt_in(monkeypatch, tmp_path):
+    hermes_root = tmp_path / "hermes"
+    hermes_root.mkdir()
+    monkeypatch.setattr(cws, "_known_hermes_roots", lambda: (hermes_root,))
+
+    assert cws.assess_worker_routing(
+        "update the Hermes repo CLI command",
+        enabled=True,
+        tool_available=True,
+        api_mode="codex_app_server",
+        cwd=str(hermes_root),
+    ) == cws.CodexWorkerRoutingDecision()
