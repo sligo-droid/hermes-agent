@@ -2183,19 +2183,41 @@ class GatewayRunner:
 
     @staticmethod
     def _is_goal_continuation_event(event_or_text: Any) -> bool:
-        """Return True for synthetic /goal continuation turns.
+        """Return True for synthetic /goal work turns.
 
-        Goal continuations are normal queued user-role events, so pause/clear
-        must distinguish them from real user /queue messages before removing or
-        suppressing them.
+        Goal kickoff/resume/continuation prompts are normal queued user-role
+        events, so pause/clear must distinguish them from real user /queue
+        messages before removing or suppressing them.
         """
-        text = getattr(event_or_text, "text", event_or_text) or ""
-        return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
+        text = str(getattr(event_or_text, "text", event_or_text) or "")
+        return text.startswith(
+            (
+                "[Starting work toward your standing goal]\nGoal:\n",
+                "[Continuing toward your standing goal]\nGoal:",
+            )
+        )
 
     @staticmethod
     def _goal_kickoff_prompt(goal: str) -> str:
         """Wrap a newly set goal so nested slash lines are agent work."""
         return f"[Starting work toward your standing goal]\nGoal:\n{goal}"
+
+    def _enqueue_goal_work(self, event: "MessageEvent", prompt: str) -> None:
+        """Queue a synthetic goal work turn for the event's session."""
+        if not prompt or event.source is None:
+            return
+        adapter = self.adapters.get(event.source.platform)
+        session_key = self._session_key_for_source(event.source)
+        if not adapter or not session_key:
+            return
+        goal_event = MessageEvent(
+            text=prompt,
+            message_type=MessageType.TEXT,
+            source=event.source,
+            message_id=event.message_id,
+            channel_prompt=event.channel_prompt,
+        )
+        self._enqueue_fifo(session_key, goal_event, adapter)
 
     def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
         """Remove queued synthetic /goal continuations for one session.
@@ -9834,6 +9856,11 @@ class GatewayRunner:
             state = mgr.resume()
             if state is None:
                 return t("gateway.goal.no_resume")
+            try:
+                prompt = mgr.next_continuation_prompt() or self._goal_kickoff_prompt(state.goal)
+                self._enqueue_goal_work(event, prompt)
+            except Exception as exc:
+                logger.debug("goal resume enqueue failed: %s", exc)
             return t("gateway.goal.resumed", goal=state.goal)
 
         if lower in {"clear", "stop", "done"}:
@@ -9856,20 +9883,10 @@ class GatewayRunner:
 
         # Queue a wrapped goal prompt as an immediate first turn so the
         # agent starts making progress. The post-turn hook takes over after.
-        adapter = self.adapters.get(event.source.platform) if event.source else None
-        _quick_key = self._session_key_for_source(event.source) if event.source else None
-        if adapter and _quick_key:
-            try:
-                kickoff_event = MessageEvent(
-                    text=self._goal_kickoff_prompt(state.goal),
-                    message_type=MessageType.TEXT,
-                    source=event.source,
-                    message_id=event.message_id,
-                    channel_prompt=event.channel_prompt,
-                )
-                self._enqueue_fifo(_quick_key, kickoff_event, adapter)
-            except Exception as exc:
-                logger.debug("goal kickoff enqueue failed: %s", exc)
+        try:
+            self._enqueue_goal_work(event, self._goal_kickoff_prompt(state.goal))
+        except Exception as exc:
+            logger.debug("goal kickoff enqueue failed: %s", exc)
 
         return t("gateway.goal.set", budget=state.max_turns, goal=state.goal)
 
