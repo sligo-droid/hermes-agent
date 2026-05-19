@@ -3938,6 +3938,81 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("Discord interaction cleanup failed: %s", e)
 
+    async def _handle_meeting_slash(
+        self,
+        interaction: Any,
+        recording: Any,
+        context: str = "",
+    ) -> None:
+        """Handle Discord's native /meeting command with an uploaded recording.
+
+        Text messages that literally contain ``/meeting`` already flow through
+        the normal skill-command path. Native Discord slash commands are a
+        separate interaction surface and do not arrive as ``on_message`` events,
+        so they need to be converted into the same MessageEvent shape here.
+        """
+        command_text = f"/meeting {context}".strip()
+
+        try:
+            _user = interaction.user
+            _chan_id = getattr(interaction.channel, "id", None) or getattr(interaction, "channel_id", None)
+            logger.info(
+                "[Discord] slash '%s' invoked by user=%s id=%s channel=%s guild=%s attachment=%s",
+                "/meeting",
+                getattr(_user, "name", "?"),
+                getattr(_user, "id", "?"),
+                _chan_id,
+                getattr(interaction, "guild_id", None),
+                getattr(recording, "filename", "?"),
+            )
+        except Exception:
+            pass
+
+        if not await self._check_slash_authorization(interaction, "/meeting"):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            if not self._is_audio_attachment(recording, message_is_voice=True):
+                await interaction.edit_original_response(
+                    content="Please attach an audio/video meeting recording to /meeting."
+                )
+                return
+
+            try:
+                ext, media_type = self._audio_attachment_details(recording)
+                cached_path = await self._cache_discord_audio(recording, ext)
+            except Exception as exc:
+                logger.warning("[Discord] Failed to cache /meeting recording: %s", exc, exc_info=True)
+                await interaction.edit_original_response(
+                    content=f"I couldn't read that meeting recording: {exc}"
+                )
+                return
+
+            event = self._build_slash_event(interaction, command_text)
+            event.message_type = MessageType.COMMAND
+            event.media_urls = [cached_path]
+            event.media_types = [media_type]
+            # There is no normal Discord message to reply/thread against for a
+            # native slash interaction. Keep the cached interaction as raw_message
+            # but do not pretend there is a recording-file message id.
+            event.message_id = None
+            event.reply_to_message_id = None
+
+            await self.handle_message(event)
+            try:
+                await interaction.delete_original_response()
+            except Exception as exc:
+                logger.debug("Discord /meeting interaction cleanup failed: %s", exc)
+        except Exception as exc:
+            logger.error("[Discord] /meeting command failed: %s", exc, exc_info=True)
+            try:
+                await interaction.edit_original_response(
+                    content=f"/meeting failed before processing could start: {exc}"
+                )
+            except Exception:
+                pass
+
     def _register_slash_commands(self) -> None:
         """Register Discord slash commands on the command tree."""
         if not self._client:
@@ -4038,6 +4113,18 @@ class DiscordAdapter(BasePlatformAdapter):
         ])
         async def slash_voice(interaction: discord.Interaction, mode: str = ""):
             await self._run_simple_slash(interaction, f"/voice {mode}".strip())
+
+        @tree.command(name="meeting", description="Transcribe/summarize a meeting recording and start follow-up goals")
+        @discord.app_commands.describe(  # pyright: ignore[reportOptionalMemberAccess]
+            recording="Audio/video meeting recording to process",
+            context="Optional context to include with the recording",
+        )
+        async def slash_meeting(
+            interaction: discord.Interaction,  # pyright: ignore[reportInvalidTypeForm]
+            recording: discord.Attachment,  # pyright: ignore[reportInvalidTypeForm]
+            context: str = "",
+        ):
+            await self._handle_meeting_slash(interaction, recording, context)
 
         @tree.command(name="update", description="Update Hermes Agent to the latest version")
         async def slash_update(interaction: discord.Interaction):
@@ -5876,6 +5963,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         all_attachments = list(message.attachments) + snapshot_attachments
         message_is_voice = self._message_has_voice_flag(message)
+        is_slash_command_message = normalized_content.startswith("/")
 
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
@@ -5929,6 +6017,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 if (
                     self._client.user not in message.mentions
                     and not mention_prefix
+                    and not is_slash_command_message
                     and not message_is_voice
                     and not replies_to_self
                 ):
@@ -5956,6 +6045,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not skip_thread
                 and not is_voice_linked_channel
                 and not is_reply_message
+                and not is_slash_command_message
             )
             if should_consider_auto_thread:
                 triage_text = normalized_content
