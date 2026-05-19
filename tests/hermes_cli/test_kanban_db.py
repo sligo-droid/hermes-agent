@@ -1058,6 +1058,7 @@ class TestSharedBoardPaths:
                 self.pid = 4242
 
         monkeypatch.setattr("subprocess.Popen", _FakePopen)
+        monkeypatch.setenv("HERMES_KANBAN_WORKER_SYSTEMD", "0")
 
         task = kb.Task(
             id="t_dispatch_env",
@@ -1084,6 +1085,88 @@ class TestSharedBoardPaths:
             default_home / "kanban" / "workspaces"
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
+
+    def test_systemd_worker_env_filters_secrets(self):
+        env = {
+            "HERMES_HOME": "/home/droid/.hermes/profiles/coder",
+            "HERMES_PROFILE": "coder",
+            "HERMES_KANBAN_TASK": "t_demo",
+            "HERMES_KANBAN_DB": "/home/droid/.hermes/kanban.db",
+            "PATH": "/usr/bin",
+            "OPENAI_API_KEY": "secret",
+            "ANTHROPIC_API_KEY": "secret",
+        }
+
+        out = kb._systemd_worker_env(env)
+
+        assert out["HERMES_HOME"] == "/home/droid/.hermes/profiles/coder"
+        assert out["HERMES_KANBAN_TASK"] == "t_demo"
+        assert out["PATH"] == "/usr/bin"
+        assert "OPENAI_API_KEY" not in out
+        assert "ANTHROPIC_API_KEY" not in out
+
+    def test_spawn_systemd_worker_uses_transient_user_service(self, tmp_path, monkeypatch):
+        calls = []
+
+        class _Result:
+            def __init__(self, returncode=0, stdout="", stderr=""):
+                self.returncode = returncode
+                self.stdout = stdout
+                self.stderr = stderr
+
+        def _which(name):
+            return f"/usr/bin/{name}"
+
+        def _run(args, **kwargs):
+            calls.append((args, kwargs))
+            if args[0].endswith("systemd-run"):
+                return _Result(0, "")
+            return _Result(0, "4321\n")
+
+        monkeypatch.setattr(kb.shutil, "which", _which)
+        monkeypatch.setattr(kb.subprocess, "run", _run)
+
+        pid = kb._spawn_systemd_worker(
+            cmd=["/usr/bin/hermes", "-p", "coder", "chat", "-q", "work kanban task t_demo"],
+            workspace=str(tmp_path),
+            env={
+                "HERMES_HOME": "/home/droid/.hermes/profiles/coder",
+                "HERMES_KANBAN_TASK": "t_demo",
+                "OPENAI_API_KEY": "secret",
+            },
+            log_path=tmp_path / "worker.log",
+            unit_name="hermes-kanban-worker-default-t_demo-r1",
+        )
+
+        assert pid == 4321
+        systemd_args = calls[0][0]
+        assert systemd_args[:4] == [
+            "/usr/bin/systemd-run",
+            "--user",
+            "--unit",
+            "hermes-kanban-worker-default-t_demo-r1",
+        ]
+        assert "--collect" in systemd_args
+        assert f"StandardOutput=append:{tmp_path / 'worker.log'}" in systemd_args
+        assert f"StandardError=append:{tmp_path / 'worker.log'}" in systemd_args
+        assert f"WorkingDirectory={tmp_path}" in systemd_args
+        assert "--setenv=HERMES_KANBAN_TASK=t_demo" in systemd_args
+        assert all("OPENAI_API_KEY" not in arg for arg in systemd_args)
+        assert systemd_args[-6:] == [
+            "/usr/bin/hermes",
+            "-p",
+            "coder",
+            "chat",
+            "-q",
+            "work kanban task t_demo",
+        ]
+        assert calls[1][0][:5] == [
+            "/usr/bin/systemctl",
+            "--user",
+            "show",
+            "hermes-kanban-worker-default-t_demo-r1.service",
+            "--property",
+        ]
 
 
 # ---------------------------------------------------------------------------
