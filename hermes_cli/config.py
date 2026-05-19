@@ -1511,6 +1511,9 @@ DEFAULT_CONFIG = {
             # /workers/<session_id>. When empty, Discord embeds omit the
             # Kanban Board field.
             "public_base_url": "",
+            # "host" runs the local Codex app-server worker directly. "docker"
+            # is opt-in for installs with a reachable worker image.
+            "runner": "host",
             # Container image expected to include Python, Codex CLI, git/gh,
             # common build tools, and this repo's runtime dependencies.
             "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",

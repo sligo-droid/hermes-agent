@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -25,17 +27,78 @@ def _worker_config() -> dict[str, Any]:
         return {}
 
 
-def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
-    """Spawn a Docker-backed Codex worker for planner/dev/reviewer tasks.
+def _runner_kind(cfg: dict[str, Any]) -> str:
+    raw = os.getenv("HERMES_CODEX_WORKER_RUNNER") or cfg.get("runner") or "host"
+    runner = str(raw).strip().lower()
+    return runner if runner in {"host", "docker"} else "host"
 
-    Returns the host-side docker subprocess pid so the existing Kanban crash
-    detector can observe the worker lifecycle. The container process itself is
-    disposable; durable state lives in the board DB and mounted worktree.
+
+def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
+    """Spawn a Codex worker for planner/dev/reviewer tasks.
+
+    Returns the host-side subprocess pid so the existing Kanban crash detector
+    can observe the worker lifecycle. Durable state lives in the board DB and
+    mounted worktree.
     """
     role = str(getattr(task, "assignee", "") or "").strip().lower()
     if role not in ROLE_ASSIGNEES:
         return None
     cfg = _worker_config()
+    if _runner_kind(cfg) == "docker":
+        return _spawn_docker_worker(task, workspace, cfg=cfg, board=board)
+    return _spawn_host_worker(task, workspace, cfg=cfg, board=board)
+
+
+def _spawn_host_worker(
+    task: Any,
+    workspace: str,
+    *,
+    cfg: dict[str, Any],
+    board: Optional[str],
+) -> Optional[int]:
+    workspace_path = Path(workspace).expanduser().resolve()
+    workspace_path.mkdir(parents=True, exist_ok=True)
+
+    codex_home = _codex_home(task, cfg)
+    _write_minimal_codex_home(codex_home)
+
+    from hermes_cli import kanban_db
+
+    board_db = str(kanban_db.kanban_db_path(board=board))
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env.update(
+        {
+            "HERMES_KANBAN_TASK": str(getattr(task, "id", "")),
+            "HERMES_KANBAN_BOARD": str(board or ""),
+            "HERMES_KANBAN_DB": board_db,
+            "HERMES_KANBAN_WORKSPACE": str(workspace_path),
+            "HERMES_KANBAN_WORKSPACES_ROOT": str(kanban_db.workspaces_root(board=board)),
+            "HERMES_CODEX_WORKER_ROLE": str(getattr(task, "assignee", "") or "").strip().lower(),
+            "CODEX_HOME": str(codex_home),
+            "PYTHONPATH": (
+                f"{_repo_root()}{os.pathsep}{existing_pythonpath}"
+                if existing_pythonpath else str(_repo_root())
+            ),
+        }
+    )
+    if getattr(task, "claim_lock", None):
+        env["HERMES_KANBAN_CLAIM_LOCK"] = str(task.claim_lock)
+    if getattr(task, "current_run_id", None) is not None:
+        env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+
+    cmd = [sys.executable, "-m", "hermes_cli.kanban_codex_worker"]
+    return _spawn_logged_process(task, cmd, str(workspace_path), env, board=board)
+
+
+def _spawn_docker_worker(
+    task: Any,
+    workspace: str,
+    *,
+    cfg: dict[str, Any],
+    board: Optional[str],
+) -> Optional[int]:
+    role = str(getattr(task, "assignee", "") or "").strip().lower()
     image = str(
         cfg.get("docker_image")
         or os.getenv("HERMES_CODEX_WORKER_IMAGE")
@@ -45,11 +108,7 @@ def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None
     workspace_path = Path(workspace).expanduser().resolve()
     workspace_path.mkdir(parents=True, exist_ok=True)
 
-    codex_home = (
-        Path(cfg.get("codex_home_root") or (Path.home() / ".hermes" / "codex-worker-homes"))
-        / str(getattr(task, "id", "task"))
-    )
-    codex_home.mkdir(parents=True, exist_ok=True)
+    codex_home = _codex_home(task, cfg)
     _write_minimal_codex_home(codex_home)
 
     env = os.environ.copy()
@@ -65,13 +124,14 @@ def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None
     )
     if getattr(task, "claim_lock", None):
         env["HERMES_KANBAN_CLAIM_LOCK"] = str(task.claim_lock)
+    if getattr(task, "current_run_id", None) is not None:
+        env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
 
-    board_db = os.environ.get("HERMES_KANBAN_DB")
-    if not board_db:
-        from hermes_cli import kanban_db
+    from hermes_cli import kanban_db
 
-        board_db = str(kanban_db.kanban_db_path(board=board))
+    board_db = str(kanban_db.kanban_db_path(board=board))
     env["HERMES_KANBAN_DB"] = board_db
+    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(kanban_db.workspaces_root(board=board))
 
     cmd = [
         docker_bin,
@@ -96,14 +156,73 @@ def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None
             cmd.extend(["-e", f"{key}={value}"])
     cmd.extend([image, "python", "-m", "hermes_cli.kanban_codex_worker"])
 
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(workspace_path),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
+    return _spawn_logged_process(task, cmd, str(workspace_path), env, board=board)
+
+
+def _codex_home(task: Any, cfg: dict[str, Any]) -> Path:
+    root = Path(
+        cfg.get("codex_home_root")
+        or (Path.home() / ".hermes" / "codex-worker-homes")
     )
+    path = root / str(getattr(task, "id", "task"))
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _spawn_logged_process(
+    task: Any,
+    cmd: list[str],
+    workspace: str,
+    env: dict[str, str],
+    *,
+    board: Optional[str],
+) -> Optional[int]:
+    from hermes_cli import kanban_db
+
+    log_path = kanban_db.worker_log_path(str(getattr(task, "id", "")), board=board)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    kanban_db._append_worker_log_line(
+        log_path,
+        f"[kanban dispatcher] spawning Codex role worker: {' '.join(cmd)}",
+    )
+    log_f = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=workspace,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+        )
+    finally:
+        log_f.close()
+
+    time.sleep(0.2)
+    exit_code = proc.poll()
+    if exit_code not in (None, 0):
+        if _task_still_running(str(getattr(task, "id", "")), board=board):
+            raise RuntimeError(
+                f"Codex role worker exited immediately with code {exit_code}; "
+                f"check log: {log_path}"
+            )
     return int(proc.pid)
+
+
+def _task_still_running(task_id: str, *, board: Optional[str]) -> bool:
+    if not task_id:
+        return False
+    try:
+        from hermes_cli import kanban_db
+
+        conn = kanban_db.connect(board=board)
+        try:
+            task = kanban_db.get_task(conn, task_id)
+            return task is not None and task.status == "running"
+        finally:
+            conn.close()
+    except Exception:
+        return True
 
 
 def _write_minimal_codex_home(path: Path) -> None:
