@@ -6,7 +6,7 @@ from pathlib import Path
 def _home(monkeypatch, tmp_path: Path) -> Path:
     root = tmp_path / "hermes"
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
-    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://example.test/kanban")
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://example.test")
     return root
 
 
@@ -25,7 +25,7 @@ def test_ensure_discord_thread_board_creates_public_metadata(monkeypatch, tmp_pa
     )
 
     assert board.slug == "discord-12345"
-    assert board.public_url == "https://example.test/kanban/12345"
+    assert board.public_url == "https://example.test/12345"
     meta = kanban_db.read_board_metadata(board.slug)
     worker = meta["discord_worker"]
     assert worker["thread_id"] == "12345"
@@ -64,7 +64,7 @@ def test_public_snapshot_does_not_expose_share_token(monkeypatch, tmp_path):
     assert "share_token" not in snapshot["worker"]
     assert "worktree_path" not in snapshot["worker"]
     assert "project_path" not in snapshot["worker"]
-    assert snapshot["worker"]["public_url"] == "https://example.test/kanban/888"
+    assert snapshot["worker"]["public_url"] == "https://example.test/888"
 
 
 def test_public_session_snapshot_resolves_discord_thread_id(monkeypatch, tmp_path):
@@ -88,7 +88,7 @@ def test_public_board_index_lists_session_links(monkeypatch, tmp_path):
     html = dwb.render_public_board_index_html()
 
     assert "Hermes Kanban" in html
-    assert "/kanban/5151" in html
+    assert "/5151" in html
     assert "Build the thing" in html
 
 
@@ -96,19 +96,26 @@ def test_public_kanban_web_routes(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from fastapi.testclient import TestClient
     from hermes_cli import discord_worker_boards as dwb
-    from hermes_cli.web_server import app
+    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
 
     board = dwb.set_goal(thread_id="6161", goal="Build the thing")
     token = board.worker["share_token"]
     client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
     index = client.get("/kanban")
+    root_session = client.get("/6161")
+    session_redirect = client.get("/kanban/6161", follow_redirects=False)
     session = client.get("/kanban/6161")
     legacy_token = client.get(f"/kanban/public/kanban/{token}")
     missing = client.get("/kanban/does-not-exist")
 
     assert index.status_code == 200
-    assert "/kanban/6161" in index.text
+    assert "/6161" in index.text
+    assert root_session.status_code == 200
+    assert "Discord 6161" in root_session.text
+    assert session_redirect.status_code == 307
+    assert session_redirect.headers["location"] == "/6161"
     assert session.status_code == 200
     assert "Discord 6161" in session.text
     assert legacy_token.status_code == 200
