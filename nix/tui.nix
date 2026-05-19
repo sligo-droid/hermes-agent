@@ -17,7 +17,7 @@ pkgs.buildNpmPackage (npm // {
   inherit src npmDeps version;
 
   doCheck = false;
-  npmFlags = [ "--legacy-peer-deps" ];
+  npmFlags = [ "--legacy-peer-deps" "--engine-strict=false" ];
 
   installPhase = ''
     runHook preInstall

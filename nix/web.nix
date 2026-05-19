@@ -18,6 +18,8 @@ pkgs.buildNpmPackage (npm // {
 
   doCheck = false;
 
+  npmFlags = [ "--engine-strict=false" ];
+
   buildPhase = ''
     npx tsc -b
     npx vite build --outDir dist
