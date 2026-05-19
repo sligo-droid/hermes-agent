@@ -468,40 +468,17 @@ def _thread_status_event(message_id: str, thread: _StatusThread) -> MessageEvent
 
 
 @pytest.mark.asyncio
-async def test_thread_name_status_emoji_tracks_minimum_status(adapter):
-    state = {}
-    adapter._read_project_summary_state = MagicMock(side_effect=lambda: dict(state))
-    adapter._write_project_summary_state = MagicMock(side_effect=lambda value: state.clear() or state.update(value))
+async def test_processing_lifecycle_does_not_rename_discord_thread(adapter):
     thread = _StatusThread(name="Build dashboard")
-    first = _thread_status_event("1", thread)
-    second = _thread_status_event("2", thread)
+    event = _thread_status_event("1", thread)
 
-    await adapter.on_processing_start(first)
-    assert thread.name == "👀 Build dashboard"
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
-    await adapter.on_processing_start(second)
-    await adapter.on_processing_complete(first, ProcessingOutcome.SUCCESS)
-    assert thread.name == "👀 Build dashboard"
-
-    await adapter.on_processing_complete(second, ProcessingOutcome.SUCCESS)
-    assert thread.name == "✅ Build dashboard"
-
-
-@pytest.mark.asyncio
-async def test_thread_name_status_emoji_keeps_failure_above_done(adapter):
-    state = {}
-    adapter._read_project_summary_state = MagicMock(side_effect=lambda: dict(state))
-    adapter._write_project_summary_state = MagicMock(side_effect=lambda value: state.clear() or state.update(value))
-    thread = _StatusThread(name="✅ Build dashboard")
-    first = _thread_status_event("1", thread)
-    second = _thread_status_event("2", thread)
-
-    await adapter.on_processing_start(first)
-    await adapter.on_processing_start(second)
-    await adapter.on_processing_complete(first, ProcessingOutcome.SUCCESS)
-    await adapter.on_processing_complete(second, ProcessingOutcome.FAILURE)
-
-    assert thread.name == "❌ Build dashboard"
+    assert thread.name == "Build dashboard"
+    thread.edit.assert_not_awaited()
+    event.raw_message.add_reaction.assert_any_await("👀")
+    event.raw_message.add_reaction.assert_any_await("✅")
 
 
 def _ship_payload(*, emoji="👍", user_id=42, channel_id=123, message_id=999, guild_id=10):
