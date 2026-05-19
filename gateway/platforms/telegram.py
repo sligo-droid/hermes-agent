@@ -4414,6 +4414,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         if ext == ".txt":
                             injection = text_content
                             event.text_document_inlined = True
+                            event.inlined_text_document_names.append(original_filename or f"document{ext}")
                         else:
                             display_name = original_filename or f"document{ext}"
                             display_name = re.sub(r'[^\w.\- ]', '_', display_name)

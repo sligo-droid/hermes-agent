@@ -975,6 +975,7 @@ class MessageEvent:
     # metadata ahead of the text, preserving the same order as if the user had
     # typed/pasted the message body followed by the uploaded file content.
     text_document_inlined: bool = False
+    inlined_text_document_names: List[str] = field(default_factory=list)
 
     # Slash-skill metadata captured before gateway/run.py replaces ``text``
     # with the loaded skill payload.  This lets deterministic gateway

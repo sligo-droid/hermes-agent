@@ -190,6 +190,7 @@ class TestIncomingDocumentHandling:
         event = adapter.handle_message.call_args[0][0]
         assert event.text == "summarize this\n\nHello from a text file"
         assert event.text_document_inlined is True
+        assert event.inlined_text_document_names == ["notes.txt"]
         assert event.is_command() is False
 
     @pytest.mark.asyncio
@@ -361,6 +362,7 @@ class TestIncomingDocumentHandling:
         event = adapter.handle_message.call_args[0][0]
         assert event.text == "First file content\n\nSecond file content"
         assert event.text_document_inlined is True
+        assert event.inlined_text_document_names == ["file1.txt", "file2.txt"]
 
     @pytest.mark.asyncio
     async def test_image_attachment_unaffected(self, adapter):
@@ -503,6 +505,7 @@ class TestAllowAnyAttachment:
         event = adapter.handle_message.call_args[0][0]
         assert event.text == "check this\n\nstill a text file"
         assert event.text_document_inlined is True
+        assert event.inlined_text_document_names == ["notes.txt"]
         assert event.media_types == ["text/plain"]
 
     def test_helper_reads_env_fallback(self, adapter, monkeypatch):
@@ -523,4 +526,3 @@ class TestAllowAnyAttachment:
         """Garbage in max_attachment_bytes config falls back to 32 MiB."""
         adapter.config.extra["max_attachment_bytes"] = "not-a-number"
         assert adapter._discord_max_attachment_bytes() == 32 * 1024 * 1024
-

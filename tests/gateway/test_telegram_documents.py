@@ -213,6 +213,7 @@ class TestDocumentDownloadBlock:
         event = adapter.handle_message.call_args[0][0]
         assert event.text == "Hello from a text file"
         assert event.text_document_inlined is True
+        assert event.inlined_text_document_names == ["notes.txt"]
 
     @pytest.mark.asyncio
     async def test_supported_md_injects_content(self, adapter):
@@ -244,6 +245,7 @@ class TestDocumentDownloadBlock:
         event = adapter.handle_message.call_args[0][0]
         assert event.text == "Please summarize\n\nfile text"
         assert event.text_document_inlined is True
+        assert event.inlined_text_document_names == ["doc.txt"]
 
     @pytest.mark.asyncio
     async def test_zip_document_cached(self, adapter):
