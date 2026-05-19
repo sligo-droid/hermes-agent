@@ -290,6 +290,7 @@ async def auth_middleware(request: Request, call_next):
 
 
 @app.get("/public/kanban/{share_token}", response_class=HTMLResponse)
+@app.get("/workers/public/kanban/{share_token}", response_class=HTMLResponse)
 @app.get("/kanban/public/kanban/{share_token}", response_class=HTMLResponse)
 async def public_kanban_board(share_token: str):
     """Read-only public Kanban board view for Discord worker threads."""
@@ -304,8 +305,8 @@ async def public_kanban_board(share_token: str):
         raise HTTPException(status_code=500, detail="Kanban board unavailable")
 
 
-@app.get("/kanban", response_class=HTMLResponse)
-async def public_kanban_index():
+@app.get("/workers", response_class=HTMLResponse)
+async def public_workers_index():
     """Read-only public index of Discord worker session boards."""
     try:
         from hermes_cli.discord_worker_boards import render_public_board_index_html
@@ -316,27 +317,9 @@ async def public_kanban_index():
         raise HTTPException(status_code=500, detail="Kanban index unavailable")
 
 
-@app.get("/{session_id:int}", response_class=HTMLResponse)
-async def public_kanban_session_board(session_id: int):
+@app.get("/workers/{session_id}", response_class=HTMLResponse)
+async def public_worker_session_board(session_id: str):
     """Read-only public Kanban board view for a Discord session id."""
-    try:
-        from hermes_cli.discord_worker_boards import render_public_session_board_html
-
-        return HTMLResponse(render_public_session_board_html(str(session_id)))
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Kanban board not found")
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Kanban board not found")
-    except Exception as exc:
-        _log.warning("public kanban session render failed: %s", exc)
-        raise HTTPException(status_code=500, detail="Kanban board unavailable")
-
-
-@app.get("/kanban/{session_id}", response_class=HTMLResponse)
-async def public_kanban_session_board_legacy(session_id: str):
-    """Backward-compatible redirect for old /kanban/<session_id> links."""
-    if session_id.isdigit():
-        return RedirectResponse(url=f"/{session_id}", status_code=307)
     try:
         from hermes_cli.discord_worker_boards import render_public_session_board_html
 
@@ -348,6 +331,21 @@ async def public_kanban_session_board_legacy(session_id: str):
     except Exception as exc:
         _log.warning("public kanban session render failed: %s", exc)
         raise HTTPException(status_code=500, detail="Kanban board unavailable")
+
+
+@app.get("/{session_id:int}", response_class=HTMLResponse)
+async def public_worker_session_board_root_legacy(session_id: int):
+    """Backward-compatible redirect for old /<session_id> worker board links."""
+    return RedirectResponse(url=f"/workers/{session_id}", status_code=307)
+
+
+@app.get("/kanban/{session_id}", response_class=HTMLResponse)
+async def public_kanban_session_board_legacy(session_id: str):
+    """Backward-compatible redirect for old /kanban/<session_id> links."""
+    return RedirectResponse(
+        url=f"/workers/{urllib.parse.quote(session_id, safe='')}",
+        status_code=307,
+    )
 
 
 # ---------------------------------------------------------------------------
