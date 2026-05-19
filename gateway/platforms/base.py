@@ -975,6 +975,13 @@ class MessageEvent:
     # metadata ahead of the text, preserving the same order as if the user had
     # typed/pasted the message body followed by the uploaded file content.
     text_document_inlined: bool = False
+
+    # Slash-skill metadata captured before gateway/run.py replaces ``text``
+    # with the loaded skill payload.  This lets deterministic gateway
+    # post-processing know which user command triggered the turn.
+    invoked_skill_name: Optional[str] = None
+    invoked_skill_command: Optional[str] = None
+    skip_post_turn_goal_once: bool = False
     
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
