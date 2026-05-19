@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
 
 from hermes_cli import kanban_db
 from utils import atomic_json_write
@@ -72,24 +73,14 @@ def _update_worker_meta(board: str, updates: dict[str, Any]) -> dict[str, Any]:
 
 
 def _public_base_url() -> str:
-    for key in (
-        "HERMES_PUBLIC_KANBAN_BASE_URL",
-        "HERMES_DASHBOARD_PUBLIC_URL",
-        "HERMES_DASHBOARD_URL",
-        "PUBLIC_URL",
-    ):
-        value = str(os.getenv(key) or "").strip()
-        if value:
-            return value.rstrip("/")
+    value = str(os.getenv("HERMES_PUBLIC_KANBAN_BASE_URL") or "").strip()
+    if value:
+        return value.rstrip("/")
     try:
         from hermes_cli.config import load_config
 
         cfg = load_config() or {}
-        value = (
-            ((cfg.get("kanban") or {}).get("discord_worker") or {}).get("public_base_url")
-            or ((cfg.get("dashboard") or {}).get("public_base_url"))
-            or ""
-        )
+        value = ((cfg.get("kanban") or {}).get("discord_worker") or {}).get("public_base_url") or ""
         if value:
             return str(value).strip().rstrip("/")
     except Exception:
@@ -97,10 +88,24 @@ def _public_base_url() -> str:
     return ""
 
 
-def public_board_url(token: str) -> str:
-    path = f"/public/kanban/{token}"
+def _absolute_public_base_url() -> str:
     base = _public_base_url()
-    return f"{base}{path}" if base else path
+    if base.startswith(("http://", "https://")):
+        return base
+    return ""
+
+
+def public_session_board_url(session_id: str) -> str:
+    base = _absolute_public_base_url()
+    session = quote(str(session_id or "").strip(), safe="")
+    return f"{base}/{session}" if base and session else ""
+
+
+def public_board_url(token: str) -> str:
+    """Return the legacy token URL when an absolute public base is configured."""
+    path = f"/public/kanban/{token}"
+    base = _absolute_public_base_url()
+    return f"{base}{path}" if base else ""
 
 
 def _default_worktree_path(project_path: Optional[str], thread_id: str) -> str:
@@ -167,7 +172,7 @@ def ensure_discord_thread_board(
             "review_loop_count": int(worker.get("review_loop_count") or 0),
             "review_loop_limit": int(worker.get("review_loop_limit") or _review_loop_limit()),
             "share_token": token,
-            "public_url": public_board_url(str(token)),
+            "public_url": public_session_board_url(str(thread_id)),
             "created_at": worker.get("created_at") or _now(),
         }
     )
@@ -235,6 +240,20 @@ def public_board_snapshot(token: str) -> dict[str, Any]:
     board = find_board_by_share_token(token)
     if not board:
         raise KeyError("unknown board token")
+    return _public_board_snapshot_for_board(board)
+
+
+def public_board_snapshot_for_session(session_id: str) -> dict[str, Any]:
+    board = board_slug_for_discord_thread(session_id)
+    if not kanban_db.board_exists(board):
+        raise KeyError("unknown board session")
+    worker = _read_worker_meta(board)
+    if worker.get("kind") != "discord_worker_board":
+        raise KeyError("unknown board session")
+    return _public_board_snapshot_for_board(board)
+
+
+def _public_board_snapshot_for_board(board: str) -> dict[str, Any]:
     metadata = kanban_db.read_board_metadata(board)
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
     conn = kanban_db.connect(board=board)
@@ -267,13 +286,40 @@ def public_board_snapshot(token: str) -> dict[str, Any]:
 
 
 def _public_worker_meta(worker: dict[str, Any]) -> dict[str, Any]:
-    safe = dict(worker)
-    safe.pop("share_token", None)
-    return safe
+    allowed = {
+        "kind",
+        "thread_id",
+        "initial_request",
+        "root_goal",
+        "goal_status",
+        "phase",
+        "execution_mode",
+        "criteria",
+        "review_loop_count",
+        "review_loop_limit",
+        "public_url",
+        "pr_url",
+        "pr_number",
+        "paused",
+        "cancelled",
+        "blocked_reason",
+        "created_at",
+        "updated_at",
+    }
+    return {key: value for key, value in worker.items() if key in allowed}
 
 
 def render_public_board_html(token: str) -> str:
     snapshot = public_board_snapshot(token)
+    return _render_public_board_html(snapshot)
+
+
+def render_public_session_board_html(session_id: str) -> str:
+    snapshot = public_board_snapshot_for_session(session_id)
+    return _render_public_board_html(snapshot)
+
+
+def _render_public_board_html(snapshot: dict[str, Any]) -> str:
     worker = snapshot["worker"]
     tasks = snapshot["tasks"]
     columns = ["triage", "todo", "ready", "running", "blocked", "done"]
@@ -337,6 +383,92 @@ def render_public_board_html(token: str) -> str:
   <main>
     <div class="criteria"><strong>Acceptance Criteria</strong><ol>{criteria}</ol></div>
     <div class="board">{''.join(cards)}</div>
+  </main>
+</body>
+</html>"""
+
+
+def public_board_index_snapshot() -> dict[str, Any]:
+    boards = []
+    for board in kanban_db.list_boards(include_archived=False):
+        slug = str(board.get("slug") or kanban_db.DEFAULT_BOARD)
+        worker = _read_worker_meta(slug)
+        if worker.get("kind") != "discord_worker_board":
+            continue
+        conn = kanban_db.connect(board=slug)
+        try:
+            counts = kanban_db.board_stats(conn).get("by_status", {})
+        finally:
+            conn.close()
+        session_id = str(worker.get("thread_id") or "")
+        boards.append(
+            {
+                "board": slug,
+                "name": board.get("name") or slug,
+                "description": board.get("description") or "",
+                "session_id": session_id,
+                "public_url": public_session_board_url(session_id),
+                "worker": _public_worker_meta(worker),
+                "counts": counts,
+            }
+        )
+    return {"boards": boards}
+
+
+def render_public_board_index_html() -> str:
+    snapshot = public_board_index_snapshot()
+
+    def esc(value: Any) -> str:
+        return html.escape(str(value or ""))
+
+    items = []
+    for board in snapshot["boards"]:
+        worker = board.get("worker") or {}
+        session_id = str(board.get("session_id") or "")
+        href = f"/kanban/{quote(session_id, safe='')}" if session_id else ""
+        counts = board.get("counts") or {}
+        count_text = " ".join(
+            f"{esc(status)}:{esc(count)}"
+            for status, count in sorted(counts.items())
+        )
+        title = esc(worker.get("root_goal") or worker.get("initial_request") or board.get("name"))
+        link = f'<a href="{href}">{title}</a>' if href else title
+        items.append(
+            "<li><strong>{link}</strong><br>"
+            "<code>{session}</code> {status}<p>{counts}</p></li>".format(
+                link=link,
+                session=esc(session_id),
+                status=esc(worker.get("goal_status") or worker.get("phase") or ""),
+                counts=count_text,
+            )
+        )
+    body = "\n".join(items) or "<li>No public Discord Kanban boards yet.</li>"
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hermes Kanban</title>
+  <style>
+    body {{ margin: 0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f7f7f5; color: #1f2933; }}
+    header {{ padding: 24px 28px; border-bottom: 1px solid #d7d7d2; background: #ffffff; }}
+    h1 {{ margin: 0 0 8px; font-size: 24px; }}
+    main {{ padding: 20px; max-width: 900px; }}
+    ul {{ list-style: none; margin: 0; padding: 0; }}
+    li {{ border: 1px solid #e6e6e2; border-radius: 6px; padding: 12px; margin-bottom: 10px; background: #fff; }}
+    code {{ color: #5965f2; }}
+    p {{ margin: 8px 0 0; color: #52606d; font-size: 13px; }}
+    a {{ color: #1d4ed8; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Hermes Kanban</h1>
+    <div>{len(snapshot["boards"])} public session boards</div>
+  </header>
+  <main>
+    <ul>{body}</ul>
   </main>
 </body>
 </html>"""

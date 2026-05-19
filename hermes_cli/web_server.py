@@ -247,6 +247,7 @@ async def auth_middleware(request: Request, call_next):
 
 
 @app.get("/public/kanban/{share_token}", response_class=HTMLResponse)
+@app.get("/kanban/public/kanban/{share_token}", response_class=HTMLResponse)
 async def public_kanban_board(share_token: str):
     """Read-only public Kanban board view for Discord worker threads."""
     try:
@@ -257,6 +258,34 @@ async def public_kanban_board(share_token: str):
         raise HTTPException(status_code=404, detail="Kanban board not found")
     except Exception as exc:
         _log.warning("public kanban board render failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Kanban board unavailable")
+
+
+@app.get("/kanban", response_class=HTMLResponse)
+async def public_kanban_index():
+    """Read-only public index of Discord worker session boards."""
+    try:
+        from hermes_cli.discord_worker_boards import render_public_board_index_html
+
+        return HTMLResponse(render_public_board_index_html())
+    except Exception as exc:
+        _log.warning("public kanban index render failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Kanban index unavailable")
+
+
+@app.get("/kanban/{session_id}", response_class=HTMLResponse)
+async def public_kanban_session_board(session_id: str):
+    """Read-only public Kanban board view for a Discord session id."""
+    try:
+        from hermes_cli.discord_worker_boards import render_public_session_board_html
+
+        return HTMLResponse(render_public_session_board_html(session_id))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Kanban board not found")
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Kanban board not found")
+    except Exception as exc:
+        _log.warning("public kanban session render failed: %s", exc)
         raise HTTPException(status_code=500, detail="Kanban board unavailable")
 
 
