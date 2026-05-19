@@ -1466,6 +1466,16 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
         return None
 
+    def _contains_discord_message_link(self, text: str) -> bool:
+        return bool(
+            re.search(
+                r"https?://(?:canary\.|ptb\.)?discord(?:app)?\.com/channels/"
+                r"\d+/\d+/\d+(?:[/?#][^\s<]*)?",
+                str(text or ""),
+                re.IGNORECASE,
+            )
+        )
+
     async def _classify_discord_feature_request(self, text: str) -> bool:
         if not str(text or "").strip():
             return False
@@ -6019,7 +6029,10 @@ class DiscordAdapter(BasePlatformAdapter):
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
-            skip_thread = bool(channel_ids & no_thread_channels) or is_free_channel
+            has_discord_message_link = self._contains_discord_message_link(normalized_content)
+            skip_thread = bool(channel_ids & no_thread_channels) or (
+                is_free_channel and not has_discord_message_link
+            )
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             should_consider_auto_thread = (
@@ -6037,7 +6050,11 @@ class DiscordAdapter(BasePlatformAdapter):
                         message_is_voice=message_is_voice,
                     )
                     triage_text = voice_triage_text
-                feature_request_intent = await self._classify_discord_feature_request(triage_text)
+                feature_request_intent = (
+                    True
+                    if has_discord_message_link
+                    else await self._classify_discord_feature_request(triage_text)
+                )
                 direct_question_prompt = not feature_request_intent
 
             if should_consider_auto_thread and feature_request_intent:
