@@ -2869,6 +2869,35 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    async def _dispatch_command_without_typing(
+        self,
+        event: MessageEvent,
+        cmd: str,
+    ) -> None:
+        """Dispatch a deterministic command without starting inference typing."""
+        logger.debug(
+            "[%s] Command '/%s' dispatching without typing heartbeat",
+            self.name,
+            cmd,
+        )
+        thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        response = await self._message_handler(event)
+        text, eph_ttl = self._unwrap_ephemeral(response)
+        if not text:
+            return
+        result = await self._send_with_retry(
+            chat_id=event.source.chat_id,
+            content=text,
+            reply_to=_reply_anchor_for_event(event),
+            metadata=thread_meta,
+        )
+        if eph_ttl > 0 and getattr(result, "success", False) and getattr(result, "message_id", None):
+            self._schedule_ephemeral_delete(
+                chat_id=event.source.chat_id,
+                message_id=result.message_id,
+                ttl_seconds=eph_ttl,
+            )
+
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
@@ -3043,6 +3072,28 @@ class BasePlatformAdapter(ABC):
             # Signal the interrupt (the processing task checks this)
             self._active_sessions[session_key].set()
             return  # Don't process now - will be handled after current task finishes
+
+        # /stop is a deterministic control command, not an agent turn.  On
+        # the cold path it previously went through _process_message_background,
+        # which started the platform typing heartbeat before the runner could
+        # return "no active task" or "stopped".  Dispatch it inline so it
+        # cannot emit an inference-style typing indicator.
+        cmd = event.get_command()
+        if cmd:
+            try:
+                from hermes_cli.commands import resolve_command
+                cmd_def = resolve_command(cmd)
+            except Exception:
+                cmd_def = None
+            if cmd_def is not None and cmd_def.name == "stop":
+                try:
+                    await self._dispatch_command_without_typing(event, cmd)
+                except Exception as e:
+                    logger.error(
+                        "[%s] Command '/%s' dispatch failed: %s",
+                        self.name, cmd, e, exc_info=True,
+                    )
+                return
         
         # Mark session as active BEFORE spawning background task to close
         # the race window where a second message arriving before the task

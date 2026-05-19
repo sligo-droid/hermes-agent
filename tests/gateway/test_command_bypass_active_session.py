@@ -402,18 +402,21 @@ class TestNoActiveSessionNormalDispatch:
 
     @pytest.mark.asyncio
     async def test_stop_when_no_session_active(self):
-        """/stop without an active session spawns a background task
-        (the Level 2 handler will return 'No active task')."""
+        """/stop without an active session dispatches without typing."""
         adapter = _make_adapter()
         sk = _session_key()
+        adapter._keep_typing = AsyncMock()
 
         # No active session — _active_sessions is empty
         assert sk not in adapter._active_sessions
 
         await adapter.handle_message(_make_event("/stop"))
 
-        # Should have gone through the normal path (background task spawned)
-        # and NOT be in _pending_messages (that's the queued-during-active path)
+        # /stop is control-plane only: it should not create a background
+        # agent-style task or start the typing heartbeat.
+        adapter._keep_typing.assert_not_called()
+        assert any("handled:stop" in r for r in adapter.sent_responses)
+        assert sk not in adapter._active_sessions
         assert sk not in adapter._pending_messages
 
 
