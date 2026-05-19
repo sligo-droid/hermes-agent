@@ -5,7 +5,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import (
     SessionSource,
     SessionStore,
@@ -576,6 +576,36 @@ class TestSenderPrefixWithBackfill:
         assert "[Alice] [Bob]" not in result
         assert "[Alice] [Charlie" not in result
         assert "[Alice] [Recent" not in result
+
+    @pytest.mark.asyncio
+    async def test_inlined_txt_document_preserves_user_then_file_order(self, runner, source, tmp_path):
+        """Decoded .txt uploads should reach the agent like pasted text."""
+        doc_path = tmp_path / "doc_abc_notes.txt"
+        doc_path.write_text("file line", encoding="utf-8")
+        event = MessageEvent(
+            text="please inspect\n\nfile line",
+            source=source,
+            message_type=MessageType.DOCUMENT,
+            media_urls=[str(doc_path)],
+            media_types=["text/plain"],
+            text_document_inlined=True,
+        )
+
+        result = await runner._prepare_inbound_message_text(
+            event=event, source=source, history=[],
+        )
+
+        assert result == "[Alice] please inspect\n\nfile line"
+        assert "The file is also saved at" not in result
+
+    def test_document_text_starting_with_slash_is_not_a_gateway_command(self):
+        event = MessageEvent(
+            text="/goal this is file content, not a slash command",
+            message_type=MessageType.DOCUMENT,
+        )
+
+        assert event.is_command() is False
+        assert event.get_command() is None
 
 
 class TestSessionStoreRewriteTranscript:

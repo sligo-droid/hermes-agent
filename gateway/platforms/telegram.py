@@ -4404,16 +4404,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 event.media_types = [mime_type]
                 logger.info("[Telegram] Cached user document at %s", cached_path)
 
-                # For text files, inject content into event.text (capped at 100 KB)
+                # For text files, inject content into event.text (capped at 100 KB).
+                # For .txt, use the decoded file body itself so a captioned
+                # upload matches the user pasting: caption first, then file text.
                 MAX_TEXT_INJECT_BYTES = 100 * 1024
                 if ext in {".md", ".txt"} and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                     try:
                         text_content = raw_bytes.decode("utf-8")
-                        display_name = original_filename or f"document{ext}"
-                        display_name = re.sub(r'[^\w.\- ]', '_', display_name)
-                        injection = f"[Content of {display_name}]:\n{text_content}"
+                        if ext == ".txt":
+                            injection = text_content
+                            event.text_document_inlined = True
+                        else:
+                            display_name = original_filename or f"document{ext}"
+                            display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                            injection = f"[Content of {display_name}]:\n{text_content}"
                         if event.text:
-                            event.text = f"{injection}\n\n{event.text}"
+                            event.text = f"{event.text}\n\n{injection}"
                         else:
                             event.text = injection
                     except UnicodeDecodeError:

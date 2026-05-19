@@ -7078,8 +7078,8 @@ class GatewayRunner:
             _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
             for i, path in enumerate(event.media_urls):
                 mtype = event.media_types[i] if i < len(event.media_types) else ""
+                _ext = os.path.splitext(path)[1].lower()
                 if mtype in {"", "application/octet-stream"}:
-                    _ext = os.path.splitext(path)[1].lower()
                     if _ext in _TEXT_EXTENSIONS:
                         mtype = "text/plain"
                     else:
@@ -7087,6 +7087,17 @@ class GatewayRunner:
                         if guessed:
                             mtype = guessed
                 if not mtype.startswith(("application/", "text/")):
+                    continue
+
+                if (
+                    getattr(event, "text_document_inlined", False)
+                    and _ext == ".txt"
+                    and mtype.startswith("text/")
+                ):
+                    # The platform adapter already decoded the .txt body into
+                    # event.text in user-message order.  Do not prepend a path
+                    # note here; uploaded .txt should be replaceable with the
+                    # same text pasted directly by the user.
                     continue
 
                 basename = os.path.basename(path)

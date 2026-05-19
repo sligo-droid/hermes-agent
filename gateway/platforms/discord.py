@@ -6231,6 +6231,7 @@ class DiscordAdapter(BasePlatformAdapter):
         media_urls = []
         media_types = []
         pending_text_injection: Optional[str] = None
+        text_document_inlined = False
         for att in all_attachments:
             content_type = getattr(att, "content_type", None) or "unknown"
             if content_type.startswith("image/"):
@@ -6312,18 +6313,26 @@ class DiscordAdapter(BasePlatformAdapter):
                                 "document" if in_allowlist else "attachment",
                                 cached_path,
                             )
-                            # Inject text content for plain-text documents (capped at 100 KB)
+                            # Inject text content for plain-text documents (capped at 100 KB).
+                            # For .txt, use the decoded file body itself so a
+                            # message with caption+upload is equivalent to the
+                            # user pasting: caption first, then file text.
                             MAX_TEXT_INJECT_BYTES = 100 * 1024
                             if in_allowlist and ext in {".md", ".txt", ".log"} and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                                 try:
                                     text_content = raw_bytes.decode("utf-8")
-                                    display_name = att.filename or f"document{ext}"
-                                    display_name = re.sub(r'[^\w.\- ]', '_', display_name)
-                                    injection = f"[Content of {display_name}]:\n{text_content}"
+                                    if ext == ".txt":
+                                        injection = text_content
+                                    else:
+                                        display_name = att.filename or f"document{ext}"
+                                        display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                                        injection = f"[Content of {display_name}]:\n{text_content}"
                                     if pending_text_injection:
                                         pending_text_injection = f"{pending_text_injection}\n\n{injection}"
                                     else:
                                         pending_text_injection = injection
+                                    if ext == ".txt":
+                                        text_document_inlined = True
                                 except UnicodeDecodeError:
                                     pass
                             # NOTE: for the allow_any_attachment path we deliberately
@@ -6343,7 +6352,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # to detect /slash commands in channel messages.
         event_text = normalized_content
         if pending_text_injection:
-            event_text = f"{pending_text_injection}\n\n{event_text}" if event_text else pending_text_injection
+            event_text = f"{event_text}\n\n{pending_text_injection}" if event_text else pending_text_injection
 
         # ── History backfill ─────────────────────────────────────────
         # When require_mention is active, the bot only processes messages
@@ -6417,6 +6426,7 @@ class DiscordAdapter(BasePlatformAdapter):
             feature_summary=feature_summary_handle,
             project_summary=project_summary_handle,
             channel_context=_channel_context,
+            text_document_inlined=text_document_inlined,
         )
 
         # Track thread participation so the bot won't require @mention for

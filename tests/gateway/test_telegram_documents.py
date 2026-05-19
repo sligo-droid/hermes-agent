@@ -211,8 +211,8 @@ class TestDocumentDownloadBlock:
 
         await adapter._handle_media_message(update, MagicMock())
         event = adapter.handle_message.call_args[0][0]
-        assert "Hello from a text file" in event.text
-        assert "[Content of notes.txt]" in event.text
+        assert event.text == "Hello from a text file"
+        assert event.text_document_inlined is True
 
     @pytest.mark.asyncio
     async def test_supported_md_injects_content(self, adapter):
@@ -242,8 +242,8 @@ class TestDocumentDownloadBlock:
 
         await adapter._handle_media_message(update, MagicMock())
         event = adapter.handle_message.call_args[0][0]
-        assert "file text" in event.text
-        assert "Please summarize" in event.text
+        assert event.text == "Please summarize\n\nfile text"
+        assert event.text_document_inlined is True
 
     @pytest.mark.asyncio
     async def test_zip_document_cached(self, adapter):

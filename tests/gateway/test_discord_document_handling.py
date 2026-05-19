@@ -177,7 +177,7 @@ class TestIncomingDocumentHandling:
 
     @pytest.mark.asyncio
     async def test_txt_content_injected(self, adapter):
-        """.txt file under 100KB should have its content injected into event.text."""
+        """.txt upload should append decoded content after any accompanying text."""
         file_content = b"Hello from a text file"
 
         with _mock_aiohttp_download(file_content):
@@ -188,11 +188,9 @@ class TestIncomingDocumentHandling:
             await adapter._handle_message(msg)
 
         event = adapter.handle_message.call_args[0][0]
-        assert "[Content of notes.txt]:" in event.text
-        assert "Hello from a text file" in event.text
-        assert "summarize this" in event.text
-        # injection prepended before caption
-        assert event.text.index("[Content of") < event.text.index("summarize this")
+        assert event.text == "summarize this\n\nHello from a text file"
+        assert event.text_document_inlined is True
+        assert event.is_command() is False
 
     @pytest.mark.asyncio
     async def test_md_content_injected(self, adapter):
@@ -361,11 +359,8 @@ class TestIncomingDocumentHandling:
             await adapter._handle_message(msg)
 
         event = adapter.handle_message.call_args[0][0]
-        assert "[Content of file1.txt]:" in event.text
-        assert "First file content" in event.text
-        assert "[Content of file2.txt]:" in event.text
-        assert "Second file content" in event.text
-        assert event.text.index("file1") < event.text.index("file2")
+        assert event.text == "First file content\n\nSecond file content"
+        assert event.text_document_inlined is True
 
     @pytest.mark.asyncio
     async def test_image_attachment_unaffected(self, adapter):
@@ -506,8 +501,8 @@ class TestAllowAnyAttachment:
             await adapter._handle_message(msg)
 
         event = adapter.handle_message.call_args[0][0]
-        assert "[Content of notes.txt]:" in event.text
-        assert "still a text file" in event.text
+        assert event.text == "check this\n\nstill a text file"
+        assert event.text_document_inlined is True
         assert event.media_types == ["text/plain"]
 
     def test_helper_reads_env_fallback(self, adapter, monkeypatch):
