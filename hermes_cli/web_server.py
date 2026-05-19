@@ -165,6 +165,24 @@ def _has_dashboard_access(request: Request) -> bool:
     return _has_valid_session_token(request) or _has_valid_basic_auth(request)
 
 
+def _is_public_worker_board_path(path: str) -> bool:
+    parts = [part for part in path.strip("/").split("/") if part]
+    if parts == ["workers"]:
+        return True
+    if len(parts) == 2 and parts[0] == "workers":
+        return True
+    if len(parts) == 3 and parts[:2] == ["public", "kanban"]:
+        return True
+    if len(parts) == 4 and parts[:3] in (
+        ["workers", "public", "kanban"],
+        ["kanban", "public", "kanban"],
+    ):
+        return True
+    if len(parts) == 2 and parts[0] == "kanban":
+        return True
+    return len(parts) == 1 and parts[0].isdigit()
+
+
 def _basic_auth_challenge() -> JSONResponse:
     return JSONResponse(
         status_code=401,
@@ -284,6 +302,8 @@ async def auth_middleware(request: Request, call_next):
                     ),
                 },
             )
+    if _is_public_worker_board_path(request.url.path):
+        return await call_next(request)
     if not _has_dashboard_access(request):
         return _basic_auth_challenge()
     return await call_next(request)

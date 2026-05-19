@@ -164,6 +164,45 @@ def test_public_kanban_web_routes(monkeypatch, tmp_path):
     assert missing.status_code == 404
 
 
+def test_public_worker_routes_do_not_require_dashboard_auth(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli.web_server import app
+
+    board = dwb.set_goal(thread_id="7171", goal="Public workers stay public")
+    token = board.worker["share_token"]
+    client = TestClient(app)
+
+    dashboard = client.get("/")
+    dashboard_kanban = client.get("/kanban")
+    index = client.get("/workers")
+    session = client.get("/workers/7171")
+    root_legacy = client.get("/7171", follow_redirects=False)
+    kanban_legacy = client.get("/kanban/7171", follow_redirects=False)
+    token_resp = client.get(f"/workers/public/kanban/{token}")
+    old_token_resp = client.get(f"/public/kanban/{token}")
+    nested_worker = client.get("/workers/7171/extra")
+    nested_kanban = client.get("/kanban/7171/extra")
+    nested_token = client.get(f"/workers/public/kanban/{token}/extra")
+
+    assert dashboard.status_code == 401
+    assert dashboard_kanban.status_code == 401
+    assert index.status_code == 200
+    assert "/workers/7171" in index.text
+    assert session.status_code == 200
+    assert "Discord 7171" in session.text
+    assert root_legacy.status_code == 307
+    assert root_legacy.headers["location"] == "/workers/7171"
+    assert kanban_legacy.status_code == 307
+    assert kanban_legacy.headers["location"] == "/workers/7171"
+    assert token_resp.status_code == 200
+    assert old_token_resp.status_code == 200
+    assert nested_worker.status_code == 401
+    assert nested_kanban.status_code == 401
+    assert nested_token.status_code == 401
+
+
 def test_subgoal_remove_deactivates_and_archives_unstarted_task(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
