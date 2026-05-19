@@ -6089,6 +6089,7 @@ class DiscordAdapter(BasePlatformAdapter):
         media_types = []
         pending_text_injection: Optional[str] = None
         text_document_inlined = False
+        inlined_text_document_names: list[str] = []
         for att in all_attachments:
             content_type = getattr(att, "content_type", None) or "unknown"
             if content_type.startswith("image/"):
@@ -6190,6 +6191,7 @@ class DiscordAdapter(BasePlatformAdapter):
                                         pending_text_injection = injection
                                     if ext == ".txt":
                                         text_document_inlined = True
+                                        inlined_text_document_names.append(att.filename or f"document{ext}")
                                 except UnicodeDecodeError:
                                     pass
                             # NOTE: for the allow_any_attachment path we deliberately
@@ -6284,6 +6286,7 @@ class DiscordAdapter(BasePlatformAdapter):
             project_summary=project_summary_handle,
             channel_context=_channel_context,
             text_document_inlined=text_document_inlined,
+            inlined_text_document_names=inlined_text_document_names,
         )
 
         # Track thread participation so the bot won't require @mention for

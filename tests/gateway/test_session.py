@@ -578,8 +578,11 @@ class TestSenderPrefixWithBackfill:
         assert "[Alice] [Recent" not in result
 
     @pytest.mark.asyncio
-    async def test_inlined_txt_document_preserves_user_then_file_order(self, runner, source, tmp_path):
+    async def test_inlined_txt_document_adds_obsidian_instruction_and_preserves_order(
+        self, runner, source, tmp_path, monkeypatch,
+    ):
         """Decoded .txt uploads should reach the agent like pasted text."""
+        monkeypatch.delenv("OBSIDIAN_VAULT_PATH", raising=False)
         doc_path = tmp_path / "doc_abc_notes.txt"
         doc_path.write_text("file line", encoding="utf-8")
         event = MessageEvent(
@@ -589,14 +592,40 @@ class TestSenderPrefixWithBackfill:
             media_urls=[str(doc_path)],
             media_types=["text/plain"],
             text_document_inlined=True,
+            inlined_text_document_names=["notes.txt"],
         )
 
         result = await runner._prepare_inbound_message_text(
             event=event, source=source, history=[],
         )
 
-        assert result == "[Alice] please inspect\n\nfile line"
+        assert result.startswith("[Gateway note: The user uploaded .txt document(s) 'notes.txt'.")
+        assert "synthesize durable non-secret learnings" in result
+        assert "/home/droid/.hermes/obsidian-vault" in result
+        assert result.endswith("[Alice] please inspect\n\nfile line")
         assert "The file is also saved at" not in result
+
+    @pytest.mark.asyncio
+    async def test_non_inlined_txt_document_keeps_path_note_only(self, runner, source, tmp_path):
+        """Large .txt documents keep file-path semantics when not decoded into text."""
+        doc_path = tmp_path / "doc_abc_large.txt"
+        doc_path.write_text("large file body", encoding="utf-8")
+        event = MessageEvent(
+            text="please inspect",
+            source=source,
+            message_type=MessageType.DOCUMENT,
+            media_urls=[str(doc_path)],
+            media_types=["text/plain"],
+            text_document_inlined=False,
+        )
+
+        result = await runner._prepare_inbound_message_text(
+            event=event, source=source, history=[],
+        )
+
+        assert "The user sent a text document: 'large.txt'" in result
+        assert "The file is also saved at" in result
+        assert "synthesize durable non-secret learnings" not in result
 
     def test_document_text_starting_with_slash_is_not_a_gateway_command(self):
         event = MessageEvent(
