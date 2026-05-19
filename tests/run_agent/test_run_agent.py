@@ -2576,6 +2576,112 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_hermes_codex_worker_guardrail_blocks_direct_mutation(
+        self, agent, monkeypatch, tmp_path
+    ):
+        self._setup_agent(agent)
+        hermes_root = tmp_path / "hermes"
+        hermes_root.mkdir()
+        monkeypatch.setattr(
+            "hermes_cli.codex_worker_switch._known_hermes_roots",
+            lambda: (hermes_root,),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.codex_worker_switch._git_common_dir",
+            lambda cwd: None,
+        )
+        agent.session_cwd = str(hermes_root)
+        agent.valid_tool_names.update({"patch", "delegate_codex_coding_task"})
+
+        tc = _mock_tool_call(
+            name="patch",
+            arguments='{"path":"run_agent.py","old":"a","new":"b"}',
+            call_id="c1",
+        )
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="Blocked", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        with (
+            patch(
+                "run_agent.handle_function_call",
+                return_value="should not run",
+            ) as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("update the Hermes repo CLI command")
+
+        assert result["final_response"] == "Blocked"
+        assert mock_handle_function_call.call_count == 0
+        tool_messages = [m for m in result["messages"] if m.get("role") == "tool"]
+        assert tool_messages
+        assert "delegate_codex_coding_task first" in tool_messages[0]["content"]
+
+    def test_hermes_codex_worker_guardrail_stays_after_partial_delegate(
+        self, agent, monkeypatch, tmp_path
+    ):
+        self._setup_agent(agent)
+        hermes_root = tmp_path / "hermes"
+        hermes_root.mkdir()
+        monkeypatch.setattr(
+            "hermes_cli.codex_worker_switch._known_hermes_roots",
+            lambda: (hermes_root,),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.codex_worker_switch._git_common_dir",
+            lambda cwd: None,
+        )
+        agent.session_cwd = str(hermes_root)
+        agent.valid_tool_names.update({"patch", "delegate_codex_coding_task"})
+
+        delegate_tc = _mock_tool_call(
+            name="delegate_codex_coding_task",
+            arguments='{"task":"tighten the heuristic"}',
+            call_id="c1",
+        )
+        patch_tc = _mock_tool_call(
+            name="patch",
+            arguments='{"path":"run_agent.py","old":"a","new":"b"}',
+            call_id="c2",
+        )
+        resp1 = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[delegate_tc],
+        )
+        resp2 = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[patch_tc],
+        )
+        resp3 = _mock_response(content="Blocked", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3]
+
+        with (
+            patch.object(
+                agent,
+                "_dispatch_codex_coding_task",
+                return_value=json.dumps({"summary": "partial result"}),
+            ),
+            patch(
+                "run_agent.handle_function_call",
+                return_value="should not run",
+            ) as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("tighten the heuristic")
+
+        assert result["final_response"] == "Blocked"
+        assert mock_handle_function_call.call_count == 0
+        tool_messages = [m for m in result["messages"] if m.get("role") == "tool"]
+        assert len(tool_messages) >= 2
+        assert "success" not in json.loads(tool_messages[0]["content"])
+        assert "delegate_codex_coding_task first" in tool_messages[1]["content"]
+
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

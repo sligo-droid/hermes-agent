@@ -54,11 +54,47 @@ logger = logging.getLogger(__name__)
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
 
+_CODEX_WORKER_BLOCKED_MUTATION_TOOLS = frozenset({
+    "write_file",
+    "patch",
+    "execute_code",
+})
+
 
 def _ra():
     """Lazy reference to ``run_agent`` so patches like ``run_agent._set_interrupt`` work."""
     import run_agent
     return run_agent
+
+
+def _codex_worker_mutation_block(agent, function_name: str) -> Optional[str]:
+    """Return a guardrail message when Hermes-codebase work skipped Codex."""
+    if function_name == "delegate_codex_coding_task":
+        return None
+    if function_name not in _CODEX_WORKER_BLOCKED_MUTATION_TOOLS:
+        return None
+    if str(getattr(agent, "api_mode", "") or "").strip().lower() == "codex_app_server":
+        return None
+    if not getattr(agent, "_codex_worker_required_this_turn", False):
+        return None
+    if getattr(agent, "_codex_worker_used_this_turn", False):
+        return None
+    return (
+        "Hermes codebase coding requests must use delegate_codex_coding_task "
+        "before direct mutation tools. Call delegate_codex_coding_task first; "
+        "if that tool is unavailable, report that blocker instead of editing."
+    )
+
+
+def _codex_worker_result_succeeded(result: object) -> bool:
+    """Return True only for explicit successful delegate JSON."""
+    if not isinstance(result, str):
+        return False
+    try:
+        payload = json.loads(result)
+    except Exception:
+        return False
+    return isinstance(payload, dict) and payload.get("success") is True
 
 
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
@@ -124,13 +160,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
         block_result = None
         blocked_by_guardrail = False
-        try:
-            from hermes_cli.plugins import get_pre_tool_call_block_message
-            block_message = get_pre_tool_call_block_message(
-                function_name, function_args, task_id=effective_task_id or "",
-            )
-        except Exception:
-            block_message = None
+        block_message = _codex_worker_mutation_block(agent, function_name)
+        if block_message is None:
+            try:
+                from hermes_cli.plugins import get_pre_tool_call_block_message
+                block_message = get_pre_tool_call_block_message(
+                    function_name, function_args, task_id=effective_task_id or "",
+                )
+            except Exception:
+                block_message = None
 
         if block_message is not None:
             block_result = json.dumps({"error": block_message}, ensure_ascii=False)
@@ -360,6 +398,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             function_name, function_args, function_result, tool_duration, is_error, blocked = r
 
             if not blocked:
+                if (
+                    function_name == "delegate_codex_coding_task"
+                    and _codex_worker_result_succeeded(function_result)
+                ):
+                    agent._codex_worker_used_this_turn = True
+
                 function_result = agent._append_guardrail_observation(
                     function_name,
                     function_args,
@@ -504,13 +548,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         # Check plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
-        try:
-            from hermes_cli.plugins import get_pre_tool_call_block_message
-            _block_msg = get_pre_tool_call_block_message(
-                function_name, function_args, task_id=effective_task_id or "",
-            )
-        except Exception:
-            pass
+        _block_msg = _codex_worker_mutation_block(agent, function_name)
+        if _block_msg is None:
+            try:
+                from hermes_cli.plugins import get_pre_tool_call_block_message
+                _block_msg = get_pre_tool_call_block_message(
+                    function_name, function_args, task_id=effective_task_id or "",
+                )
+            except Exception:
+                pass
 
         _guardrail_block_decision: ToolGuardrailDecision | None = None
         if _block_msg is None:
@@ -706,6 +752,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 function_result = agent._dispatch_codex_coding_task(function_args)
                 _codex_worker_result = function_result
+                if _codex_worker_result_succeeded(function_result):
+                    agent._codex_worker_used_this_turn = True
             finally:
                 tool_duration = time.time() - tool_start_time
                 cute_msg = _get_cute_tool_message_impl(
