@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -20,6 +21,16 @@ from plugins.teams_pipeline.models import MeetingArtifact
 class FakeGraphClient:
     def __init__(self) -> None:
         self.downloaded = False
+
+
+def _fake_llm_response(payload: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(payload), reasoning=None)
+            )
+        ]
+    )
 
 
 async def _transcript_meeting_resolver(client, *, meeting_id=None, join_web_url=None, tenant_id=None):
@@ -227,6 +238,225 @@ def test_store_notification_receipts_are_idempotent(tmp_path):
 
     reloaded = TeamsPipelineStore(tmp_path / "teams-store.json")
     assert reloaded.has_notification_receipt(receipt_key) is True
+
+
+def test_summary_normalizes_webvtt_transcript_noise():
+    from plugins.teams_pipeline.pipeline import _normalize_transcript_text
+
+    raw = """WEBVTT
+
+1
+00:00:00.000 --> 00:00:02.000
+<v Ada>We need to send the launch checklist.</v>
+
+NOTE hidden caption metadata
+this should disappear
+
+2
+00:00:02.500 --> 00:00:04.000 align:start position:0%
+Ben: Risk is QA sign-off.
+"""
+
+    normalized = _normalize_transcript_text(raw)
+
+    assert "WEBVTT" not in normalized
+    assert "-->" not in normalized
+    assert "hidden caption metadata" not in normalized
+    assert "Ada: We need to send the launch checklist." in normalized
+    assert "Ben: Risk is QA sign-off." in normalized
+
+
+def test_heuristic_summary_extracts_implicit_and_compound_action_items():
+    from plugins.teams_pipeline.pipeline import _heuristic_summary
+
+    parsed = _heuristic_summary(
+        "Ada: I'll send the draft and then check with Legal.\n"
+        "Ben: Can you update the roadmap before Friday?\n"
+    )
+
+    assert any("send the draft" in item for item in parsed["action_items"])
+    assert any("check with Legal" in item for item in parsed["action_items"])
+    assert any("update the roadmap" in item for item in parsed["action_items"])
+
+
+@pytest.mark.anyio
+async def test_summary_json_schema_rejection_retries_prompt_only(monkeypatch):
+    from plugins.teams_pipeline import pipeline as pipeline_module
+
+    calls = []
+
+    async def _fake_call(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            assert kwargs.get("extra_body")
+            raise RuntimeError("unsupported_parameter: response_format json_schema")
+        return _fake_llm_response({"action_items": []})
+
+    monkeypatch.setattr(pipeline_module, "async_call_llm", _fake_call)
+
+    result = await pipeline_module._call_summary_llm_json(
+        messages=[{"role": "user", "content": "Return JSON."}],
+        schema_name="test_schema_retry",
+        schema=pipeline_module._SUMMARY_VERIFICATION_SCHEMA,
+        max_tokens=200,
+    )
+
+    assert result == {"action_items": []}
+    assert len(calls) == 2
+    assert "extra_body" not in calls[1]
+
+
+@pytest.mark.anyio
+async def test_summary_extracts_action_after_legacy_transcript_cutoff(tmp_path, monkeypatch):
+    from plugins.teams_pipeline import pipeline as pipeline_module
+
+    filler = "\n".join(f"Filler discussion line {i}: status updates only." for i in range(650))
+    transcript = (
+        f"{filler}\n"
+        "Ada: Please upload the compliance checklist after the meeting.\n"
+    )
+    meeting = await _transcript_meeting_resolver(FakeGraphClient(), meeting_id="meeting-long")
+
+    async def _fake_call(**kwargs):
+        prompt = kwargs["messages"][-1]["content"]
+        if "Transcript chunk" in prompt:
+            actions = (
+                ["Upload the compliance checklist after the meeting."]
+                if "compliance checklist" in prompt
+                else []
+            )
+            return _fake_llm_response(
+                {
+                    "summary_points": ["Status updates."],
+                    "key_decisions": [],
+                    "action_items": actions,
+                    "risks": [],
+                    "confidence_notes": "chunk",
+                }
+            )
+        if "Verification pass" in prompt:
+            return _fake_llm_response({"action_items": [], "confidence_notes": "verified"})
+        assert "Candidate extraction payloads" in prompt
+        assert "Upload the compliance checklist after the meeting." in prompt
+        return _fake_llm_response(
+            {
+                "summary": "Discussed status updates.",
+                "key_decisions": [],
+                "action_items": ["Upload the compliance checklist after the meeting."],
+                "risks": [],
+                "confidence": "high",
+                "confidence_notes": "final",
+            }
+        )
+
+    monkeypatch.setattr(pipeline_module, "async_call_llm", _fake_call)
+
+    pipeline = TeamsMeetingPipeline(
+        graph_client=FakeGraphClient(),
+        store=TeamsPipelineStore(tmp_path / "teams-store.json"),
+    )
+    payload = await pipeline._generate_summary_payload(
+        resolved_meeting=meeting,
+        transcript_text=transcript,
+        artifacts=[MeetingArtifact(artifact_type="transcript", artifact_id="tx-long")],
+    )
+
+    assert "Upload the compliance checklist after the meeting." in payload.action_items
+    assert all(isinstance(item, str) for item in payload.action_items)
+    assert "verification pass completed" in (payload.confidence_notes or "")
+
+
+@pytest.mark.anyio
+async def test_summary_verification_pass_adds_missed_action_item(tmp_path, monkeypatch):
+    from plugins.teams_pipeline import pipeline as pipeline_module
+
+    meeting = await _transcript_meeting_resolver(FakeGraphClient(), meeting_id="meeting-verify")
+    transcript = "Mina: We should publish the launch runbook before the go-live review."
+
+    async def _fake_call(**kwargs):
+        prompt = kwargs["messages"][-1]["content"]
+        if "Transcript chunk" in prompt:
+            return _fake_llm_response(
+                {
+                    "summary_points": ["Discussed go-live prep."],
+                    "key_decisions": [],
+                    "action_items": [],
+                    "risks": [],
+                    "confidence_notes": "missed action",
+                }
+            )
+        if "Verification pass" in prompt:
+            return _fake_llm_response(
+                {
+                    "action_items": ["Publish the launch runbook before the go-live review."],
+                    "confidence_notes": "verification found missing action",
+                }
+            )
+        assert "Publish the launch runbook before the go-live review." in prompt
+        return _fake_llm_response(
+            {
+                "summary": "Discussed go-live prep.",
+                "key_decisions": [],
+                "action_items": [],
+                "risks": [],
+                "confidence": "high",
+                "confidence_notes": "final",
+            }
+        )
+
+    monkeypatch.setattr(pipeline_module, "async_call_llm", _fake_call)
+
+    pipeline = TeamsMeetingPipeline(
+        graph_client=FakeGraphClient(),
+        store=TeamsPipelineStore(tmp_path / "teams-store.json"),
+    )
+    payload = await pipeline._generate_summary_payload(
+        resolved_meeting=meeting,
+        transcript_text=transcript,
+        artifacts=[],
+    )
+
+    assert payload.action_items == ["Publish the launch runbook before the go-live review."]
+
+
+@pytest.mark.anyio
+async def test_summary_final_failure_preserves_extracted_action_items(tmp_path, monkeypatch):
+    from plugins.teams_pipeline import pipeline as pipeline_module
+
+    meeting = await _transcript_meeting_resolver(FakeGraphClient(), meeting_id="meeting-final-fails")
+    transcript = "Ada: Please send the incident recap to Support."
+
+    async def _fake_call(**kwargs):
+        prompt = kwargs["messages"][-1]["content"]
+        if "Transcript chunk" in prompt:
+            return _fake_llm_response(
+                {
+                    "summary_points": ["Discussed incident follow-up."],
+                    "key_decisions": [],
+                    "action_items": ["Send the incident recap to Support."],
+                    "risks": [],
+                    "confidence_notes": "chunk",
+                }
+            )
+        if "Verification pass" in prompt:
+            return _fake_llm_response({"action_items": [], "confidence_notes": "verified"})
+        raise RuntimeError("final synthesis unavailable")
+
+    monkeypatch.setattr(pipeline_module, "async_call_llm", _fake_call)
+
+    pipeline = TeamsMeetingPipeline(
+        graph_client=FakeGraphClient(),
+        store=TeamsPipelineStore(tmp_path / "teams-store.json"),
+    )
+    payload = await pipeline._generate_summary_payload(
+        resolved_meeting=meeting,
+        transcript_text=transcript,
+        artifacts=[],
+    )
+
+    assert payload.summary == "Discussed incident follow-up."
+    assert payload.action_items == ["Send the incident recap to Support."]
+    assert "final synthesis unavailable" in (payload.confidence_notes or "")
 
 
 @pytest.mark.anyio

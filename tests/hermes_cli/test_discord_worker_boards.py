@@ -25,7 +25,7 @@ def test_ensure_discord_thread_board_creates_public_metadata(monkeypatch, tmp_pa
     )
 
     assert board.slug == "discord-12345"
-    assert board.public_url == "https://example.test/12345"
+    assert board.public_url == "https://example.test/workers/12345"
     meta = kanban_db.read_board_metadata(board.slug)
     worker = meta["discord_worker"]
     assert worker["thread_id"] == "12345"
@@ -84,7 +84,7 @@ def test_public_snapshot_does_not_expose_share_token(monkeypatch, tmp_path):
     assert "share_token" not in snapshot["worker"]
     assert "worktree_path" not in snapshot["worker"]
     assert "project_path" not in snapshot["worker"]
-    assert snapshot["worker"]["public_url"] == "https://example.test/888"
+    assert snapshot["worker"]["public_url"] == "https://example.test/workers/888"
 
 
 def test_public_session_snapshot_resolves_discord_thread_id(monkeypatch, tmp_path):
@@ -99,6 +99,22 @@ def test_public_session_snapshot_resolves_discord_thread_id(monkeypatch, tmp_pat
     assert snapshot["worker"]["thread_id"] == "4242"
 
 
+def test_public_session_url_accepts_workers_base(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://example.test/workers")
+    from hermes_cli import discord_worker_boards as dwb
+
+    assert dwb.public_session_board_url("4242") == "https://example.test/workers/4242"
+
+
+def test_public_session_url_migrates_legacy_kanban_base(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://example.test/kanban")
+    from hermes_cli import discord_worker_boards as dwb
+
+    assert dwb.public_session_board_url("4242") == "https://example.test/workers/4242"
+
+
 def test_public_board_index_lists_session_links(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -108,7 +124,7 @@ def test_public_board_index_lists_session_links(monkeypatch, tmp_path):
     html = dwb.render_public_board_index_html()
 
     assert "Hermes Kanban" in html
-    assert "/5151" in html
+    assert "/workers/5151" in html
     assert "Build the thing" in html
 
 
@@ -123,23 +139,28 @@ def test_public_kanban_web_routes(monkeypatch, tmp_path):
     client = TestClient(app)
     client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
-    index = client.get("/kanban")
-    root_session = client.get("/6161")
-    session_redirect = client.get("/kanban/6161", follow_redirects=False)
-    session = client.get("/kanban/6161")
+    index = client.get("/workers")
+    dashboard_kanban = client.get("/kanban")
+    root_session_redirect = client.get("/6161", follow_redirects=False)
+    kanban_session_redirect = client.get("/kanban/6161", follow_redirects=False)
+    session = client.get("/workers/6161")
     legacy_token = client.get(f"/kanban/public/kanban/{token}")
-    missing = client.get("/kanban/does-not-exist")
+    token_resp = client.get(f"/workers/public/kanban/{token}")
+    missing = client.get("/workers/does-not-exist")
 
     assert index.status_code == 200
-    assert "/6161" in index.text
-    assert root_session.status_code == 200
-    assert "Discord 6161" in root_session.text
-    assert session_redirect.status_code == 307
-    assert session_redirect.headers["location"] == "/6161"
+    assert "/workers/6161" in index.text
+    assert "public session boards" not in dashboard_kanban.text
+    assert root_session_redirect.status_code == 307
+    assert root_session_redirect.headers["location"] == "/workers/6161"
+    assert kanban_session_redirect.status_code == 307
+    assert kanban_session_redirect.headers["location"] == "/workers/6161"
     assert session.status_code == 200
     assert "Discord 6161" in session.text
     assert legacy_token.status_code == 200
     assert "Discord 6161" in legacy_token.text
+    assert token_resp.status_code == 200
+    assert "Discord 6161" in token_resp.text
     assert missing.status_code == 404
 
 

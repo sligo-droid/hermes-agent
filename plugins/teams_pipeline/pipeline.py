@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -48,6 +49,47 @@ ACTIVE_PIPELINE_STATES = {
     "writing_notion",
     "writing_linear",
     "sending_teams",
+}
+
+TRANSCRIPT_CHUNK_TARGET_CHARS = 10_000
+TRANSCRIPT_CHUNK_OVERLAP_CHARS = 1_000
+
+_EXTRACTION_MAX_TOKENS = 1800
+_VERIFICATION_MAX_TOKENS = 1400
+_FINAL_SUMMARY_MAX_TOKENS = 2400
+
+_SUMMARY_EXTRACTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "summary_points": {"type": "array", "items": {"type": "string"}},
+        "key_decisions": {"type": "array", "items": {"type": "string"}},
+        "action_items": {"type": "array", "items": {"type": "string"}},
+        "risks": {"type": "array", "items": {"type": "string"}},
+        "confidence_notes": {"type": "string"},
+    },
+    "required": ["summary_points", "key_decisions", "action_items", "risks"],
+}
+
+_SUMMARY_VERIFICATION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "action_items": {"type": "array", "items": {"type": "string"}},
+        "confidence_notes": {"type": "string"},
+    },
+    "required": ["action_items"],
+}
+
+_SUMMARY_FINAL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "key_decisions": {"type": "array", "items": {"type": "string"}},
+        "action_items": {"type": "array", "items": {"type": "string"}},
+        "risks": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "confidence_notes": {"type": "string"},
+    },
+    "required": ["summary", "key_decisions", "action_items", "risks", "confidence"],
 }
 
 
@@ -509,28 +551,16 @@ class TeamsMeetingPipeline:
         transcript_text: str,
         artifacts: list[MeetingArtifact],
     ) -> TeamsMeetingSummaryPayload:
-        prompt = _build_summary_prompt(resolved_meeting, transcript_text, artifacts)
+        normalized_transcript = _normalize_transcript_text(transcript_text)
         try:
-            response = await async_call_llm(
-                task="call",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You summarize meeting transcripts. Return only valid JSON with keys: "
-                            "summary, key_decisions, action_items, risks, confidence, confidence_notes."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-                max_tokens=900,
+            parsed = await _generate_high_recall_summary(
+                resolved_meeting=resolved_meeting,
+                transcript_text=normalized_transcript,
+                artifacts=artifacts,
             )
-            content = extract_content_or_reasoning(response)
-            parsed = _parse_summary_json(content)
         except Exception as exc:
             logger.info("Teams pipeline LLM summary unavailable, using heuristic summary: %s", exc)
-            parsed = _heuristic_summary(transcript_text)
+            parsed = _heuristic_summary(normalized_transcript or transcript_text)
 
         metrics = _collect_call_metrics(artifacts)
         return TeamsMeetingSummaryPayload(
@@ -616,6 +646,376 @@ def _extract_meeting_id_from_resource(resource: str) -> str | None:
     return parts[-1]
 
 
+async def _generate_high_recall_summary(
+    *,
+    resolved_meeting: TeamsMeetingRef,
+    transcript_text: str,
+    artifacts: list[MeetingArtifact],
+) -> dict[str, Any]:
+    chunks = _chunk_transcript(transcript_text)
+    if not chunks:
+        return _heuristic_summary("")
+
+    extracted: list[dict[str, Any]] = []
+    existing_actions: list[str] = []
+    total_chunks = len(chunks)
+
+    for index, chunk in enumerate(chunks, start=1):
+        payload = await _extract_summary_chunk(
+            meeting_ref=resolved_meeting,
+            artifacts=artifacts,
+            chunk=chunk,
+            chunk_index=index,
+            chunk_count=total_chunks,
+        )
+        normalized = _normalize_chunk_payload(payload, source=f"chunk {index}/{total_chunks}")
+        extracted.append(normalized)
+        existing_actions = _dedupe_strings(existing_actions + normalized["action_items"])
+
+    verification_payloads: list[dict[str, Any]] = []
+    verification_skipped = False
+    for index, chunk in enumerate(chunks, start=1):
+        try:
+            payload = await _verify_summary_chunk(
+                meeting_ref=resolved_meeting,
+                chunk=chunk,
+                chunk_index=index,
+                chunk_count=total_chunks,
+                existing_action_items=existing_actions,
+            )
+        except Exception as exc:
+            logger.info(
+                "Teams pipeline action verification skipped for chunk %s/%s: %s",
+                index,
+                total_chunks,
+                exc,
+            )
+            verification_skipped = True
+            continue
+        normalized = _normalize_verification_payload(payload, source=f"verification {index}/{total_chunks}")
+        if normalized["action_items"]:
+            verification_payloads.append(normalized)
+            existing_actions = _dedupe_strings(existing_actions + normalized["action_items"])
+
+    all_extractions = extracted + verification_payloads
+    try:
+        parsed = await _finalize_summary_payload(
+            meeting_ref=resolved_meeting,
+            artifacts=artifacts,
+            extracted_payloads=all_extractions,
+            chunk_count=total_chunks,
+        )
+    except Exception as exc:
+        logger.info("Teams pipeline final summary synthesis unavailable, preserving extracted notes: %s", exc)
+        parsed = _summary_from_extractions(all_extractions, chunk_count=total_chunks)
+    parsed = _normalize_summary_payload(parsed)
+    candidate_actions = _dedupe_strings(
+        [
+            item
+            for payload in all_extractions
+            for item in payload.get("action_items", [])
+        ]
+    )
+    candidate_decisions = _dedupe_strings(
+        [
+            item
+            for payload in all_extractions
+            for item in payload.get("key_decisions", [])
+        ]
+    )
+    candidate_risks = _dedupe_strings(
+        [
+            item
+            for payload in all_extractions
+            for item in payload.get("risks", [])
+        ]
+    )
+    parsed["key_decisions"] = _dedupe_strings(candidate_decisions + parsed["key_decisions"])
+    parsed["action_items"] = _dedupe_strings(candidate_actions + parsed["action_items"])
+    parsed["risks"] = _dedupe_strings(candidate_risks + parsed["risks"])
+    verification_note = (
+        "verification pass partially skipped."
+        if verification_skipped
+        else "verification pass completed."
+    )
+    parsed["confidence_notes"] = _combine_notes(
+        parsed.get("confidence_notes"),
+        f"Generated from {total_chunks} transcript chunk(s); {verification_note}",
+    )
+    return parsed
+
+
+def _summary_from_extractions(extracted_payloads: list[dict[str, Any]], *, chunk_count: int) -> dict[str, Any]:
+    summary_points = _dedupe_strings(
+        [
+            item
+            for payload in extracted_payloads
+            for item in payload.get("summary_points", [])
+        ]
+    )
+    key_decisions = _dedupe_strings(
+        [
+            item
+            for payload in extracted_payloads
+            for item in payload.get("key_decisions", [])
+        ]
+    )
+    action_items = _dedupe_strings(
+        [
+            item
+            for payload in extracted_payloads
+            for item in payload.get("action_items", [])
+        ]
+    )
+    risks = _dedupe_strings(
+        [
+            item
+            for payload in extracted_payloads
+            for item in payload.get("risks", [])
+        ]
+    )
+    summary = " ".join(summary_points[:8])[:1200]
+    if not summary:
+        summary = "Meeting transcript processed; no concise summary points were extracted."
+    return {
+        "summary": summary,
+        "key_decisions": key_decisions,
+        "action_items": action_items,
+        "risks": risks,
+        "confidence": "medium" if summary_points or action_items else "low",
+        "confidence_notes": (
+            f"Generated from {chunk_count} transcript chunk(s); final synthesis unavailable, "
+            "so extracted notes were preserved directly."
+        ),
+    }
+
+
+async def _extract_summary_chunk(
+    *,
+    meeting_ref: TeamsMeetingRef,
+    artifacts: list[MeetingArtifact],
+    chunk: str,
+    chunk_index: int,
+    chunk_count: int,
+) -> dict[str, Any]:
+    return await _call_summary_llm_json(
+        messages=[
+            {"role": "system", "content": _summary_system_prompt()},
+            {
+                "role": "user",
+                "content": _build_chunk_extraction_prompt(
+                    meeting_ref=meeting_ref,
+                    artifacts=artifacts,
+                    chunk=chunk,
+                    chunk_index=chunk_index,
+                    chunk_count=chunk_count,
+                ),
+            },
+        ],
+        schema_name="teams_meeting_chunk_extract",
+        schema=_SUMMARY_EXTRACTION_SCHEMA,
+        max_tokens=_EXTRACTION_MAX_TOKENS,
+    )
+
+
+async def _verify_summary_chunk(
+    *,
+    meeting_ref: TeamsMeetingRef,
+    chunk: str,
+    chunk_index: int,
+    chunk_count: int,
+    existing_action_items: list[str],
+) -> dict[str, Any]:
+    return await _call_summary_llm_json(
+        messages=[
+            {"role": "system", "content": _summary_system_prompt()},
+            {
+                "role": "user",
+                "content": _build_verification_prompt(
+                    meeting_ref=meeting_ref,
+                    chunk=chunk,
+                    chunk_index=chunk_index,
+                    chunk_count=chunk_count,
+                    existing_action_items=existing_action_items,
+                ),
+            },
+        ],
+        schema_name="teams_meeting_action_verification",
+        schema=_SUMMARY_VERIFICATION_SCHEMA,
+        max_tokens=_VERIFICATION_MAX_TOKENS,
+    )
+
+
+async def _finalize_summary_payload(
+    *,
+    meeting_ref: TeamsMeetingRef,
+    artifacts: list[MeetingArtifact],
+    extracted_payloads: list[dict[str, Any]],
+    chunk_count: int,
+) -> dict[str, Any]:
+    return await _call_summary_llm_json(
+        messages=[
+            {"role": "system", "content": _summary_system_prompt()},
+            {
+                "role": "user",
+                "content": _build_final_summary_prompt(
+                    meeting_ref=meeting_ref,
+                    artifacts=artifacts,
+                    extracted_payloads=extracted_payloads,
+                    chunk_count=chunk_count,
+                ),
+            },
+        ],
+        schema_name="teams_meeting_summary_final",
+        schema=_SUMMARY_FINAL_SCHEMA,
+        max_tokens=_FINAL_SUMMARY_MAX_TOKENS,
+        temperature=0.1,
+    )
+
+
+async def _call_summary_llm_json(
+    *,
+    messages: list[dict[str, Any]],
+    schema_name: str,
+    schema: dict[str, Any],
+    max_tokens: int,
+    temperature: float = 0.0,
+) -> dict[str, Any]:
+    extra_body = {
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_name,
+                "schema": schema,
+                "strict": False,
+            },
+        }
+    }
+    try:
+        response = await async_call_llm(
+            task="call",
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            extra_body=extra_body,
+        )
+    except Exception as exc:
+        if not _is_structured_json_rejection(exc):
+            raise
+        logger.info(
+            "Teams pipeline summary provider rejected structured JSON response format; retrying prompt-only JSON: %s",
+            exc,
+        )
+        response = await async_call_llm(
+            task="call",
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    return _extract_json_payload(extract_content_or_reasoning(response))
+
+
+def _summary_system_prompt() -> str:
+    return (
+        "You extract high-recall meeting notes from transcripts. Return only valid JSON. "
+        "Use the transcript as the source of truth. Do not invent owners, dates, decisions, "
+        "risks, or tasks. Prefer recall over brevity for action items."
+    )
+
+
+def _build_chunk_extraction_prompt(
+    *,
+    meeting_ref: TeamsMeetingRef,
+    artifacts: list[MeetingArtifact],
+    chunk: str,
+    chunk_index: int,
+    chunk_count: int,
+) -> str:
+    return (
+        f"{_meeting_prompt_header(meeting_ref, artifacts)}\n\n"
+        f"Transcript chunk {chunk_index}/{chunk_count}\n\n"
+        "Task:\n"
+        "- Extract concise summary_points for this chunk.\n"
+        "- Extract key_decisions only when the transcript states an actual decision.\n"
+        "- Extract risks/blockers/unknowns that may affect follow-up work.\n"
+        "- Extract every actionable commitment, request, assignment, follow-up, next step, "
+        "investigation, reminder, or deliverable.\n"
+        "- Split compound statements into separate action_items. For example, 'send the draft "
+        "and check with Legal' is two action items.\n"
+        "- Keep action_items fine-grained and concrete. Include owner and due date in the same "
+        "string only when stated or strongly implied by speaker wording.\n"
+        "- Do not collapse unrelated action_items into one broad task. Do not drop vague but "
+        "actionable asks; preserve the available wording.\n\n"
+        "Return JSON with keys: summary_points, key_decisions, action_items, risks, confidence_notes.\n\n"
+        "Transcript:\n"
+        "<<<TRANSCRIPT_CHUNK\n"
+        f"{chunk}\n"
+        "TRANSCRIPT_CHUNK>>>"
+    )
+
+
+def _build_verification_prompt(
+    *,
+    meeting_ref: TeamsMeetingRef,
+    chunk: str,
+    chunk_index: int,
+    chunk_count: int,
+    existing_action_items: list[str],
+) -> str:
+    return (
+        f"Meeting ID: {meeting_ref.meeting_id}\n"
+        f"Title: {meeting_ref.metadata.get('subject') or 'Unknown'}\n"
+        f"Verification pass for transcript chunk {chunk_index}/{chunk_count}.\n\n"
+        "Existing action_items already extracted:\n"
+        f"{json.dumps(existing_action_items, ensure_ascii=False, indent=2)}\n\n"
+        "Task:\n"
+        "- Re-read the transcript chunk and return only action_items that are NOT already covered.\n"
+        "- Treat commitments, requests, owner assignments, follow-ups, due dates, and next steps as actionable.\n"
+        "- Split compound actions into separate items.\n"
+        "- Return an empty action_items array if nothing is missing.\n\n"
+        "Return JSON with keys: action_items, confidence_notes.\n\n"
+        "Transcript:\n"
+        "<<<TRANSCRIPT_CHUNK\n"
+        f"{chunk}\n"
+        "TRANSCRIPT_CHUNK>>>"
+    )
+
+
+def _build_final_summary_prompt(
+    *,
+    meeting_ref: TeamsMeetingRef,
+    artifacts: list[MeetingArtifact],
+    extracted_payloads: list[dict[str, Any]],
+    chunk_count: int,
+) -> str:
+    return (
+        f"{_meeting_prompt_header(meeting_ref, artifacts)}\n\n"
+        f"The transcript was processed in {chunk_count} chunk(s). Candidate extraction payloads follow.\n\n"
+        f"{json.dumps(extracted_payloads, ensure_ascii=False, indent=2)}\n\n"
+        "Task:\n"
+        "- Produce one concise meeting summary.\n"
+        "- Merge key decisions and risks, deduplicating exact or near-exact repeats.\n"
+        "- Merge action_items without reducing recall. Keep every distinct fine-grained task.\n"
+        "- Deduplicate action_items only when they name the same owner, same task, and same due date/time window.\n"
+        "- Keep action_items as plain strings. Include owner/due/source context in the string when present.\n\n"
+        "Return JSON with keys: summary, key_decisions, action_items, risks, confidence, confidence_notes."
+    )
+
+
+def _meeting_prompt_header(meeting_ref: TeamsMeetingRef, artifacts: list[MeetingArtifact]) -> str:
+    artifact_lines = [
+        f"- {artifact.artifact_type}:{artifact.artifact_id}:{artifact.display_name or ''}"
+        for artifact in artifacts
+    ]
+    participants = _collect_participants(meeting_ref)
+    return (
+        f"Meeting ID: {meeting_ref.meeting_id}\n"
+        f"Title: {meeting_ref.metadata.get('subject') or 'Unknown'}\n"
+        f"Participants: {', '.join(participants) if participants else 'Unknown'}\n"
+        f"Artifacts:\n{chr(10).join(artifact_lines) or '- none'}"
+    )
+
+
 def _build_summary_prompt(
     meeting_ref: TeamsMeetingRef,
     transcript_text: str,
@@ -627,7 +1027,7 @@ def _build_summary_prompt(
         f"Title: {meeting_ref.metadata.get('subject') or 'Unknown'}\n"
         f"Artifacts:\n{chr(10).join(artifact_lines) or '- none'}\n\n"
         "Transcript:\n"
-        f"{transcript_text[:18000]}"
+        f"{_normalize_transcript_text(transcript_text)}"
     )
 
 
@@ -635,30 +1035,287 @@ def _parse_summary_json(content: str) -> dict[str, Any]:
     text = (content or "").strip()
     if not text:
         return _heuristic_summary("")
+    return _normalize_summary_payload(_extract_json_payload(text))
+
+
+_VTT_TIMESTAMP_RE = re.compile(
+    r"^\s*(?:(?:\d{1,2}:)?\d{2}:)?\d{2}[.,]\d{3}\s+-->\s+",
+    re.IGNORECASE,
+)
+
+_ACTION_PREFIX_RE = re.compile(
+    r"^\s*(?:action|actions?|todo|to-do|next steps?|follow[- ]?ups?)\s*[:\-]\s*",
+    re.IGNORECASE,
+)
+
+_ACTIONABLE_RE = re.compile(
+    r"("
+    r"\bi\s*'?ll\b|\bi will\b|\bwe need to\b|\bwe should\b|\bwe have to\b|"
+    r"\bcan you\b|\bcould you\b|\bplease\b|\bsomeone should\b|\bnext steps?\b|"
+    r"\bfollow up\b|\bmake sure\b|\blet'?s\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_COMPOUND_ACTION_RE = re.compile(
+    r"\s*(?:;|\band then\b|\bthen\b|\band\s+(?="
+    r"send|check|review|follow|create|update|schedule|confirm|draft|prepare|"
+    r"file|open|share|publish|ship|validate|investigate"
+    r"\b))\s+",
+    re.IGNORECASE,
+)
+
+_EMPTY_ITEM_VALUES = {"", "none", "n/a", "na", "no action items", "no actions", "not applicable"}
+
+
+def _normalize_transcript_text(transcript_text: str) -> str:
+    text = (transcript_text or "").replace("\ufeff", "")
+    lines = text.splitlines()
+    normalized: list[str] = []
+    skip_note_block = False
+
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if skip_note_block:
+            if not stripped:
+                skip_note_block = False
+            continue
+
+        if not stripped:
+            if normalized and normalized[-1] != "":
+                normalized.append("")
+            continue
+
+        upper = stripped.upper()
+        if upper == "WEBVTT" or upper.startswith("WEBVTT "):
+            continue
+        if upper.startswith("NOTE"):
+            skip_note_block = True
+            continue
+        if re.match(r"^(?:KIND|LANGUAGE|STYLE|REGION)\b", stripped, re.IGNORECASE):
+            continue
+        if _VTT_TIMESTAMP_RE.match(stripped):
+            continue
+        if (
+            re.match(r"^\d+$", stripped)
+            and index + 1 < len(lines)
+            and _VTT_TIMESTAMP_RE.match(lines[index + 1].strip())
+        ):
+            continue
+
+        stripped = re.sub(r"<v\s+([^>]+)>", r"\1: ", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"</v>", "", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"<[^>]+>", "", stripped)
+        stripped = re.sub(r"\s+", " ", stripped).strip()
+        if stripped:
+            normalized.append(stripped)
+
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(normalized)).strip()
+
+
+def _chunk_transcript(
+    transcript_text: str,
+    *,
+    target_chars: int = TRANSCRIPT_CHUNK_TARGET_CHARS,
+    overlap_chars: int = TRANSCRIPT_CHUNK_OVERLAP_CHARS,
+) -> list[str]:
+    text = (transcript_text or "").strip()
+    if not text:
+        return []
+    if len(text) <= target_chars:
+        return [text]
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    for line in text.splitlines():
+        line_len = len(line) + 1
+        if current and current_len + line_len > target_chars:
+            chunk = "\n".join(current).strip()
+            if chunk:
+                chunks.append(chunk)
+            overlap: list[str] = []
+            overlap_len = 0
+            for previous in reversed(current):
+                overlap.append(previous)
+                overlap_len += len(previous) + 1
+                if overlap_len >= overlap_chars:
+                    break
+            current = list(reversed(overlap))
+            current_len = sum(len(item) + 1 for item in current)
+
+        current.append(line)
+        current_len += line_len
+
+    final = "\n".join(current).strip()
+    if final:
+        chunks.append(final)
+    return chunks
+
+
+def _extract_json_payload(content: str) -> dict[str, Any]:
+    text = (content or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
     start = text.find("{")
     end = text.rfind("}")
     if start >= 0 and end > start:
         text = text[start : end + 1]
     payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise ValueError("Teams summary response must be a JSON object.")
+    return payload
+
+
+def _normalize_chunk_payload(payload: dict[str, Any], *, source: str) -> dict[str, Any]:
     return {
-        "summary": str(payload.get("summary") or "").strip(),
-        "key_decisions": [str(item).strip() for item in payload.get("key_decisions", []) if str(item).strip()],
-        "action_items": [str(item).strip() for item in payload.get("action_items", []) if str(item).strip()],
-        "risks": [str(item).strip() for item in payload.get("risks", []) if str(item).strip()],
-        "confidence": str(payload.get("confidence") or "medium").strip(),
-        "confidence_notes": str(payload.get("confidence_notes") or "").strip(),
+        "source": source,
+        "summary_points": _coerce_string_list(payload.get("summary_points") or payload.get("summary")),
+        "key_decisions": _coerce_string_list(payload.get("key_decisions") or payload.get("keyDecisions")),
+        "action_items": _coerce_string_list(payload.get("action_items") or payload.get("actionItems")),
+        "risks": _coerce_string_list(payload.get("risks")),
+        "confidence_notes": str(payload.get("confidence_notes") or payload.get("confidenceNotes") or "").strip(),
     }
 
 
+def _normalize_verification_payload(payload: dict[str, Any], *, source: str) -> dict[str, Any]:
+    return {
+        "source": source,
+        "summary_points": [],
+        "key_decisions": [],
+        "action_items": _coerce_string_list(payload.get("action_items") or payload.get("actionItems")),
+        "risks": [],
+        "confidence_notes": str(payload.get("confidence_notes") or payload.get("confidenceNotes") or "").strip(),
+    }
+
+
+def _normalize_summary_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    summary = str(payload.get("summary") or "").strip()
+    if not summary:
+        summary = " ".join(_coerce_string_list(payload.get("summary_points")))[:1200]
+    confidence = str(payload.get("confidence") or "medium").strip().lower()
+    if confidence not in {"low", "medium", "high"}:
+        confidence = "medium"
+    return {
+        "summary": summary,
+        "key_decisions": _dedupe_strings(
+            _coerce_string_list(payload.get("key_decisions") or payload.get("keyDecisions"))
+        ),
+        "action_items": _dedupe_strings(
+            _coerce_string_list(payload.get("action_items") or payload.get("actionItems"))
+        ),
+        "risks": _dedupe_strings(_coerce_string_list(payload.get("risks"))),
+        "confidence": confidence,
+        "confidence_notes": str(payload.get("confidence_notes") or payload.get("confidenceNotes") or "").strip(),
+    }
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    values = value if isinstance(value, list) else [value]
+    result: list[str] = []
+    for item in values:
+        text = _stringify_action_item(item)
+        if text:
+            result.append(text)
+    return _dedupe_strings(result)
+
+
+def _stringify_action_item(item: Any) -> str:
+    if isinstance(item, dict):
+        text = (
+            item.get("text")
+            or item.get("description")
+            or item.get("action")
+            or item.get("task")
+            or item.get("content")
+            or item.get("title")
+            or ""
+        )
+        owner = str(item.get("owner") or item.get("assignee") or "").strip()
+        due = str(item.get("due") or item.get("due_date") or item.get("dueDate") or "").strip()
+        parts = []
+        if owner and owner.lower() not in str(text).lower():
+            parts.append(f"Owner: {owner}")
+        if due and due.lower() not in str(text).lower():
+            parts.append(f"Due: {due}")
+        if parts:
+            text = f"{text} ({'; '.join(parts)})"
+    else:
+        text = str(item)
+
+    text = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", str(text)).strip()
+    text = re.sub(r"\s+", " ", text)
+    if text.strip().lower() in _EMPTY_ITEM_VALUES:
+        return ""
+    return text
+
+
+def _dedupe_strings(items: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        clean = _stringify_action_item(item)
+        if not clean:
+            continue
+        key = re.sub(r"[^a-z0-9]+", " ", clean.casefold()).strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(clean)
+    return result
+
+
+def _combine_notes(*notes: Any) -> str:
+    return " ".join(str(note).strip() for note in notes if str(note or "").strip()).strip()
+
+
+def _is_structured_json_rejection(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "response_format",
+            "json_schema",
+            "json schema",
+            "json_object",
+            "unsupported_parameter",
+            "unsupported parameter",
+        )
+    )
+
+
+def _heuristic_action_items(lines: list[str]) -> list[str]:
+    items: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        explicit = bool(_ACTION_PREFIX_RE.match(stripped))
+        candidate = _ACTION_PREFIX_RE.sub("", stripped).strip() if explicit else stripped
+        if not explicit and not _ACTIONABLE_RE.search(candidate):
+            continue
+        for part in _split_compound_action(candidate):
+            items.append(part)
+    return _dedupe_strings(items)
+
+
+def _split_compound_action(text: str) -> list[str]:
+    parts = [part.strip(" .\t") for part in _COMPOUND_ACTION_RE.split(text) if part.strip(" .\t")]
+    return parts or [text.strip(" .\t")]
+
+
 def _heuristic_summary(transcript_text: str) -> dict[str, Any]:
-    lines = [line.strip(" -*\t") for line in transcript_text.splitlines() if line.strip()]
+    normalized = _normalize_transcript_text(transcript_text)
+    lines = [line.strip(" -*\t") for line in normalized.splitlines() if line.strip()]
     summary = " ".join(lines[:3])[:1200] or "Transcript unavailable or too sparse for a confident summary."
-    action_items = [
-        line for line in lines if line.lower().startswith(("action:", "todo:", "next step:", "follow up:"))
-    ][:8]
+    action_items = _heuristic_action_items(lines)
     risks = [line for line in lines if "risk" in line.lower() or "blocker" in line.lower()][:6]
     decisions = [line for line in lines if "decide" in line.lower() or "decision" in line.lower()][:6]
-    confidence = "low" if len(transcript_text.strip()) < 300 else "medium"
+    confidence = "low" if len(normalized.strip()) < 300 else "medium"
     return {
         "summary": summary,
         "key_decisions": decisions,
