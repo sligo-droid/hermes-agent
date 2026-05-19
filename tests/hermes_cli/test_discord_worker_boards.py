@@ -6,7 +6,7 @@ from pathlib import Path
 def _home(monkeypatch, tmp_path: Path) -> Path:
     root = tmp_path / "hermes"
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
-    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://example.test")
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://example.test/kanban")
     return root
 
 
@@ -25,7 +25,7 @@ def test_ensure_discord_thread_board_creates_public_metadata(monkeypatch, tmp_pa
     )
 
     assert board.slug == "discord-12345"
-    assert board.public_url.startswith("https://example.test/public/kanban/")
+    assert board.public_url == "https://example.test/kanban/12345"
     meta = kanban_db.read_board_metadata(board.slug)
     worker = meta["discord_worker"]
     assert worker["thread_id"] == "12345"
@@ -62,7 +62,58 @@ def test_public_snapshot_does_not_expose_share_token(monkeypatch, tmp_path):
 
     assert snapshot["board"] == board.slug
     assert "share_token" not in snapshot["worker"]
-    assert snapshot["worker"]["public_url"].endswith(token)
+    assert "worktree_path" not in snapshot["worker"]
+    assert "project_path" not in snapshot["worker"]
+    assert snapshot["worker"]["public_url"] == "https://example.test/kanban/888"
+
+
+def test_public_session_snapshot_resolves_discord_thread_id(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(thread_id="4242", goal="Ship it")
+
+    snapshot = dwb.public_board_snapshot_for_session("4242")
+
+    assert snapshot["board"] == board.slug
+    assert snapshot["worker"]["thread_id"] == "4242"
+
+
+def test_public_board_index_lists_session_links(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    dwb.set_goal(thread_id="5151", goal="Build the thing")
+
+    html = dwb.render_public_board_index_html()
+
+    assert "Hermes Kanban" in html
+    assert "/kanban/5151" in html
+    assert "Build the thing" in html
+
+
+def test_public_kanban_web_routes(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli.web_server import app
+
+    board = dwb.set_goal(thread_id="6161", goal="Build the thing")
+    token = board.worker["share_token"]
+    client = TestClient(app)
+
+    index = client.get("/kanban")
+    session = client.get("/kanban/6161")
+    legacy_token = client.get(f"/kanban/public/kanban/{token}")
+    missing = client.get("/kanban/does-not-exist")
+
+    assert index.status_code == 200
+    assert "/kanban/6161" in index.text
+    assert session.status_code == 200
+    assert "Discord 6161" in session.text
+    assert legacy_token.status_code == 200
+    assert "Discord 6161" in legacy_token.text
+    assert missing.status_code == 404
 
 
 def test_subgoal_remove_deactivates_and_archives_unstarted_task(monkeypatch, tmp_path):
