@@ -4769,6 +4769,25 @@ class GatewayRunner:
             conn = None
             try:
                 conn = _kb.connect(board=slug)
+                try:
+                    from hermes_cli import discord_worker_boards as _dwb
+                    from hermes_cli.kanban_codex_workers import spawn_or_default as _spawn_or_default
+
+                    if _dwb.is_discord_worker_board(slug):
+                        _dwb.reconcile_board(slug)
+                        if _dwb.is_paused_or_cancelled(slug):
+                            return None
+                        board_max_spawn = 1
+                        return _kb.dispatch_once(
+                            conn,
+                            board=slug,
+                            max_spawn=board_max_spawn,
+                            failure_limit=failure_limit,
+                            spawn_fn=_spawn_or_default,
+                            additional_spawnable_assignees=_dwb.ROLE_ASSIGNEES,
+                        )
+                except Exception:
+                    logger.debug("kanban dispatcher: Discord worker routing skipped for board %s", slug, exc_info=True)
                 # `connect()` runs the schema + idempotent migration on
                 # first open per process; the previous explicit
                 # `init_db()` call here busted the per-process cache and
@@ -4829,8 +4848,20 @@ class GatewayRunner:
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
-                        return True
+                    try:
+                        from hermes_cli import discord_worker_boards as _dwb
+
+                        ready = _kb.has_spawnable_ready(
+                            conn,
+                            additional_spawnable_assignees=(
+                                _dwb.ROLE_ASSIGNEES if _dwb.is_discord_worker_board(slug) else None
+                            ),
+                        )
+                        if ready:
+                            return True
+                    except Exception:
+                        if _kb.has_spawnable_ready(conn):
+                            return True
                 except Exception:
                     continue
                 finally:
@@ -6343,6 +6374,13 @@ class GatewayRunner:
                 _goal_arg = (event.get_command_args() or "").strip().lower()
                 if not _goal_arg or _goal_arg in {"status", "pause", "resume", "clear", "stop", "done"}:
                     return await self._handle_goal_command(event)
+                try:
+                    from hermes_cli.discord_worker_boards import board_for_gateway_event
+
+                    if board_for_gateway_event(event, create=True) is not None:
+                        return await self._handle_goal_command(event)
+                except Exception:
+                    pass
                 return "Agent is running — use /goal status / pause / clear mid-run, or /stop before setting a new goal."
 
             # /subgoal is safe mid-run — it only modifies the goal's
@@ -10070,6 +10108,45 @@ class GatewayRunner:
         args = (event.get_command_args() or "").strip()
         lower = args.lower()
 
+        try:
+            from hermes_cli import discord_worker_boards as _dwb
+
+            is_set = bool(args and lower not in {"status", "pause", "resume", "clear", "stop", "done"})
+            board = _dwb.board_for_gateway_event(event, create=is_set)
+            if board is not None:
+                if not args or lower == "status":
+                    return _dwb.status_line(board.slug)
+                if lower == "pause":
+                    _dwb.pause_board(board.slug)
+                    return "Kanban goal paused."
+                if lower == "resume":
+                    _dwb.resume_board(board.slug)
+                    return "Kanban goal resumed."
+                if lower in {"clear", "stop", "done"}:
+                    _dwb.clear_board_goal(board.slug)
+                    return None
+                source = event.source
+                board = _dwb.set_goal(
+                    thread_id=str(getattr(source, "thread_id", "") or getattr(source, "chat_id", "") or ""),
+                    goal=args,
+                    chat_id=str(getattr(source, "chat_id", "") or ""),
+                    guild_id=str(getattr(source, "guild_id", "") or ""),
+                    parent_channel_id=str(getattr(source, "parent_chat_id", "") or ""),
+                    project_context={
+                        k: v for k, v in {
+                            "project_name": getattr(source, "project_name", None),
+                            "project_path": getattr(source, "project_path", None),
+                            "project_github_url": getattr(source, "project_github_url", None),
+                            "project_channel_id": getattr(source, "project_channel_id", None),
+                            "project_mapping_source": getattr(source, "project_mapping_source", None),
+                            "project_mapping_resolved": getattr(source, "project_mapping_resolved", None),
+                        }.items() if v is not None
+                    },
+                )
+                return f"Kanban goal set. Board: {board.public_url or board.slug}"
+        except Exception as exc:
+            logger.debug("Discord Kanban goal backend unavailable; falling back to legacy goal loop: %s", exc)
+
         mgr, session_entry = self._get_goal_manager_for_event(event)
         if mgr is None:
             return t("gateway.goal.unavailable")
@@ -10138,6 +10215,32 @@ class GatewayRunner:
         to invoke while the agent is running.
         """
         args = (event.get_command_args() or "").strip()
+        try:
+            from hermes_cli import discord_worker_boards as _dwb
+
+            board = _dwb.board_for_gateway_event(event, create=False)
+            if board is not None:
+                if not args:
+                    return _dwb.status_line(board.slug) + "\n" + _dwb.list_subgoals(board.slug)
+                tokens = args.split(None, 1)
+                verb = tokens[0].lower()
+                rest = tokens[1].strip() if len(tokens) > 1 else ""
+                if verb == "remove":
+                    if not rest:
+                        return "Usage: /subgoal remove <n>"
+                    try:
+                        removed = _dwb.deactivate_subgoal(board.slug, int(rest.split()[0]))
+                    except (ValueError, IndexError) as exc:
+                        return f"/subgoal remove: {exc}"
+                    return f"Removed subgoal: {removed}"
+                if verb == "clear":
+                    count = _dwb.clear_subgoals(board.slug)
+                    return f"Cleared {count} subgoal{'s' if count != 1 else ''}."
+                idx, text = _dwb.add_subgoal(board.slug, args)
+                return f"Added subgoal {idx}: {text}"
+        except Exception as exc:
+            logger.debug("Discord Kanban subgoal backend unavailable; falling back to legacy goal loop: %s", exc)
+
         mgr, _session_entry = self._get_goal_manager_for_event(event)
         if mgr is None:
             return t("gateway.goal.unavailable")
@@ -10410,6 +10513,20 @@ class GatewayRunner:
         user message that arrives simultaneously is handled by the same
         queue and takes priority naturally.
         """
+        try:
+            from gateway.platforms.base import MessageEvent, MessageType
+            from hermes_cli.discord_worker_boards import board_for_gateway_event
+
+            probe = MessageEvent(
+                text="",
+                message_type=MessageType.TEXT,
+                source=source,
+                internal=True,
+            )
+            if board_for_gateway_event(probe, create=False) is not None:
+                return
+        except Exception:
+            pass
         try:
             from hermes_cli.goals import GoalManager
         except Exception as exc:
