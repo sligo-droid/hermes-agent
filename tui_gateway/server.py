@@ -4819,14 +4819,13 @@ def _(rid, params: dict) -> dict:
             state = mgr.resume()
             if state is None:
                 return _ok(rid, {"type": "exec", "output": "No goal to resume."})
+            prompt = mgr.next_continuation_prompt() or state.goal
             return _ok(
                 rid,
                 {
-                    "type": "exec",
-                    "output": (
-                        f"▶ Goal resumed: {state.goal}\n"
-                        "Send any message to continue, or wait — I'll take the next step on the next turn."
-                    ),
+                    "type": "send",
+                    "notice": f"▶ Goal resumed: {state.goal}",
+                    "message": prompt,
                 },
             )
         if lower in {"clear", "stop", "done"}:
@@ -4858,13 +4857,17 @@ def _(rid, params: dict) -> dict:
             "I'll keep working until the goal is done, you pause/clear it, or the budget is exhausted.\n"
             "Controls: /goal status · /goal pause · /goal resume · /goal clear"
         )
-        # Send the goal text as the kickoff prompt. The TUI client sees
+        # Send the goal kickoff prompt. The TUI client sees
         # {type: send, notice, message} → renders `notice` as a sys line,
         # then submits `message` as a user turn. The post-turn judge
         # wired in _run_prompt_submit takes over from there.
         return _ok(
             rid,
-            {"type": "send", "notice": notice, "message": state.goal},
+            {
+                "type": "send",
+                "notice": notice,
+                "message": mgr.initial_work_prompt() or state.goal,
+            },
         )
 
     if name in {"snapshot", "snap"}:

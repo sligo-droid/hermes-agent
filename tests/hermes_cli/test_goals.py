@@ -625,6 +625,29 @@ class TestGoalManagerSubgoals:
         assert text == "use bullet points"
         assert mgr.state.subgoals == ["use bullet points"]
 
+    def test_goal_body_subgoal_lines_become_structured_subgoals(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+        mgr = GoalManager(session_id="sub-parse")
+        state = mgr.set("""Reach the milestone.
+/subgoal Write regression tests
+/subgoal Update the docs
+Ship it.""")
+
+        assert state.goal == "Reach the milestone.\nShip it."
+        assert state.subgoals == ["Write regression tests", "Update the docs"]
+
+    def test_goal_body_with_only_subgoal_lines_gets_default_goal(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+        mgr = GoalManager(session_id="sub-parse-only")
+        state = mgr.set("""/subgoal Audit the data ledger
+/subgoal Verify the agent sees Arizona data""")
+
+        assert state.goal == "Complete the listed subgoals."
+        assert state.subgoals == [
+            "Audit the data ledger",
+            "Verify the agent sees Arizona data",
+        ]
+
     def test_add_subgoal_requires_active_goal(self, hermes_home):
         import pytest
         from hermes_cli.goals import GoalManager

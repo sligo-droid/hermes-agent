@@ -66,6 +66,7 @@ _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
 # exhausted with every reply shaped like `judge returned empty response` or
 # `judge reply was not JSON`.
 DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
+DEFAULT_GOAL_FOR_SUBGOAL_ONLY_BODY = "Complete the listed subgoals."
 
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -89,6 +90,22 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "additional criterion are complete, state so explicitly and stop. "
     "If you are blocked and need input from the user, say so clearly "
     "and stop."
+)
+
+START_PROMPT_TEMPLATE = (
+    "[Starting work toward your standing goal]\n"
+    "Goal:\n{goal}"
+)
+
+START_PROMPT_WITH_SUBGOALS_TEMPLATE = (
+    "[Starting work toward your standing goal]\n"
+    "Goal: {goal}\n\n"
+    "Additional criteria parsed from /subgoal lines:\n"
+    "{subgoals_block}\n\n"
+    "Work toward the goal AND all additional criteria. Take the next "
+    "concrete step. If you believe the goal and every additional "
+    "criterion are complete, state so explicitly and stop. If you are "
+    "blocked and need input from the user, say so clearly and stop."
 )
 
 
@@ -292,6 +309,28 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "… [truncated]"
+
+
+_GOAL_BODY_SUBGOAL_RE = re.compile(r"^\s*/subgoal(?:\s+(.*))?$", re.IGNORECASE)
+
+
+def _parse_goal_body(goal: str) -> Tuple[str, List[str]]:
+    """Split slash-looking /subgoal lines out of a /goal body."""
+    goal_lines: List[str] = []
+    subgoals: List[str] = []
+    for raw_line in (goal or "").splitlines():
+        match = _GOAL_BODY_SUBGOAL_RE.match(raw_line)
+        if match:
+            subgoal = (match.group(1) or "").strip()
+            if subgoal:
+                subgoals.append(subgoal)
+            continue
+        goal_lines.append(raw_line.rstrip())
+
+    parsed_goal = "\n".join(goal_lines).strip()
+    if not parsed_goal and subgoals:
+        parsed_goal = DEFAULT_GOAL_FOR_SUBGOAL_ONLY_BODY
+    return parsed_goal, subgoals
 
 
 def agent_goal_context(session_id: str) -> str:
@@ -601,7 +640,7 @@ class GoalManager:
     # --- mutation -----------------------------------------------------
 
     def set(self, goal: str, *, max_turns: Optional[int] = None) -> GoalState:
-        goal = (goal or "").strip()
+        goal, parsed_subgoals = _parse_goal_body(goal or "")
         if not goal:
             raise ValueError("goal text is empty")
         state = GoalState(
@@ -611,6 +650,7 @@ class GoalManager:
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
             created_at=time.time(),
             last_turn_at=0.0,
+            subgoals=parsed_subgoals,
         )
         self._state = state
         save_goal(self.session_id, state)
@@ -839,6 +879,16 @@ class GoalManager:
                 subgoals_block=self._state.render_subgoals_block(),
             )
         return CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+
+    def initial_work_prompt(self) -> Optional[str]:
+        if not self._state or self._state.status != "active":
+            return None
+        if self._state.subgoals:
+            return START_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
+                goal=self._state.goal,
+                subgoals_block=self._state.render_subgoals_block(),
+            )
+        return START_PROMPT_TEMPLATE.format(goal=self._state.goal)
 
 
 __all__ = [

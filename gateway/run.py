@@ -2192,7 +2192,7 @@ class GatewayRunner:
         text = str(getattr(event_or_text, "text", event_or_text) or "")
         return text.startswith(
             (
-                "[Starting work toward your standing goal]\nGoal:\n",
+                "[Starting work toward your standing goal]\nGoal",
                 "[Continuing toward your standing goal]\nGoal:",
             )
         )
@@ -9895,7 +9895,10 @@ class GatewayRunner:
         # Queue a wrapped goal prompt as an immediate first turn so the
         # agent starts making progress. The post-turn hook takes over after.
         try:
-            self._enqueue_goal_work(event, self._goal_kickoff_prompt(state.goal))
+            self._enqueue_goal_work(
+                event,
+                mgr.initial_work_prompt() or self._goal_kickoff_prompt(state.goal),
+            )
         except Exception as exc:
             logger.debug("goal kickoff enqueue failed: %s", exc)
 
