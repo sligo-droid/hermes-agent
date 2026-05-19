@@ -4,7 +4,7 @@ let
   src = ../ui-tui;
   npmDeps = pkgs.fetchNpmDeps {
     inherit src;
-    hash = "sha256-9r1EYQ600gNXOnNXwakorpEk7hS/FPxZVbB2JksrhYs=";
+    hash = "sha256-+BxX1n91PjOvGz+JJzhp8TruP99/AtpmvQu+RXdiuGM=";
   };
 
   npm = hermesNpmLib.mkNpmPassthru { folder = "ui-tui"; attr = "tui"; pname = "hermes-tui"; };
@@ -17,7 +17,7 @@ pkgs.buildNpmPackage (npm // {
   inherit src npmDeps version;
 
   doCheck = false;
-  npmFlags = [ "--legacy-peer-deps" ];
+  npmFlags = [ "--legacy-peer-deps" "--engine-strict=false" ];
 
   installPhase = ''
     runHook preInstall

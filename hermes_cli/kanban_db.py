@@ -75,6 +75,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -3892,8 +3893,6 @@ def _resolve_hermes_argv() -> list[str]:
     local (not imported from gateway) because ``hermes_cli`` sits below
     ``gateway`` in the dependency order.
     """
-    import shutil
-
     hermes_bin = shutil.which("hermes")
     if hermes_bin:
         return [hermes_bin]
@@ -3901,6 +3900,134 @@ def _resolve_hermes_argv() -> list[str]:
     # console-script target declared in pyproject.toml, NOT a top-level
     # ``hermes`` package — there is no ``hermes`` package to import.
     return [sys.executable, "-m", "hermes_cli.main"]
+
+
+_SYSTEMD_WORKER_ENV_EXACT = frozenset({
+    "HOME",
+    "HERMES_HOME",
+    "HERMES_PROFILE",
+    "HERMES_TENANT",
+    "LANG",
+    "LC_ALL",
+    "LOGNAME",
+    "PATH",
+    "PYTHONPATH",
+    "SHELL",
+    "USER",
+    "VIRTUAL_ENV",
+})
+
+
+def _systemd_worker_env(env: dict[str, str]) -> dict[str, str]:
+    """Return the small env surface passed to transient worker services.
+
+    Do not shovel the gateway's full process environment into systemd unit
+    metadata. Workers can load credentials from ``HERMES_HOME/.env`` as usual;
+    the transient unit only needs runtime routing keys plus basic shell/Python
+    path state.
+    """
+    out: dict[str, str] = {}
+    for key, value in env.items():
+        if not value:
+            continue
+        if key in _SYSTEMD_WORKER_ENV_EXACT or key.startswith("HERMES_KANBAN_"):
+            out[key] = str(value)
+    return out
+
+
+def _systemd_worker_unit_name(task: Task, board: Optional[str] = None) -> str:
+    """Stable, safe transient unit name for a kanban worker attempt."""
+    try:
+        slug = _normalize_board_slug(board) or get_current_board()
+    except Exception:
+        slug = DEFAULT_BOARD
+    run_part = task.current_run_id if task.current_run_id is not None else int(time.time())
+    raw = f"hermes-kanban-worker-{slug}-{task.id}-r{run_part}"
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip(".-")
+    return (safe or "hermes-kanban-worker")[:240]
+
+
+def _should_use_systemd_worker() -> bool:
+    """Whether dispatcher workers should be launched outside our cgroup."""
+    override = os.environ.get("HERMES_KANBAN_WORKER_SYSTEMD", "").strip().lower()
+    if override in {"0", "false", "no", "off"}:
+        return False
+    if os.name == "nt":
+        return False
+    return bool(shutil.which("systemd-run") and shutil.which("systemctl"))
+
+
+def _append_worker_log_line(log_path: Path, line: str) -> None:
+    try:
+        with open(log_path, "ab") as f:
+            f.write(line.encode("utf-8", errors="replace"))
+            if not line.endswith("\n"):
+                f.write(b"\n")
+    except OSError:
+        pass
+
+
+def _spawn_systemd_worker(
+    *,
+    cmd: list[str],
+    workspace: str,
+    env: dict[str, str],
+    log_path: Path,
+    unit_name: str,
+) -> Optional[int]:
+    """Start a worker as a transient user service and return MainPID.
+
+    The important bit is ownership: systemd owns the worker unit, not the
+    gateway service cgroup, so ``hermes-gateway.service`` can restart without
+    killing already-running workers.
+    """
+    systemd_run = shutil.which("systemd-run") or "systemd-run"
+    systemctl = shutil.which("systemctl") or "systemctl"
+    args = [
+        systemd_run,
+        "--user",
+        "--unit", unit_name,
+        "--collect",
+        "--quiet",
+        "--property", f"StandardOutput=append:{log_path}",
+        "--property", f"StandardError=append:{log_path}",
+    ]
+    if os.path.isdir(workspace):
+        args.extend(["--property", f"WorkingDirectory={workspace}"])
+    for key, value in sorted(_systemd_worker_env(env).items()):
+        args.append(f"--setenv={key}={value}")
+    args.extend(["--", *cmd])
+
+    proc = subprocess.run(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "systemd-run failed").strip()
+        raise RuntimeError(detail[:500])
+
+    unit_ref = unit_name if unit_name.endswith(".service") else f"{unit_name}.service"
+    for _ in range(10):
+        show = subprocess.run(
+            [systemctl, "--user", "show", unit_ref, "--property", "MainPID", "--value"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        try:
+            pid = int((show.stdout or "0").strip() or "0")
+        except ValueError:
+            pid = 0
+        if show.returncode == 0 and pid > 0:
+            return pid
+        time.sleep(0.1)
+    return None
 
 
 def _default_spawn(
@@ -4013,6 +4140,26 @@ def _default_spawn(
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task.id}.log"
     _rotate_worker_log(log_path, DEFAULT_LOG_ROTATE_BYTES)
+
+    if _should_use_systemd_worker():
+        unit_name = _systemd_worker_unit_name(task, board=board)
+        try:
+            return _spawn_systemd_worker(
+                cmd=cmd,
+                workspace=workspace,
+                env=env,
+                log_path=log_path,
+                unit_name=unit_name,
+            )
+        except Exception as exc:
+            # Keep workers flowing on hosts without a usable user systemd
+            # manager or older systemd properties. The log line makes the
+            # fallback visible to operators debugging restart behavior.
+            _append_worker_log_line(
+                log_path,
+                f"[kanban dispatcher] systemd-run worker launch failed; "
+                f"falling back to direct spawn: {exc}",
+            )
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")

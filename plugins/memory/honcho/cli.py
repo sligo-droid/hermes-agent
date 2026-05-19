@@ -714,11 +714,9 @@ def _embedding_log_path() -> Path:
 
 
 def _pid_running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    from gateway.status import _pid_exists
+
+    return _pid_exists(int(pid))
 
 
 def cmd_embeddings(args) -> None:
