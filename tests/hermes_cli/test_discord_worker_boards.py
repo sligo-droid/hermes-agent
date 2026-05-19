@@ -51,6 +51,26 @@ def test_set_goal_creates_planner_task_for_role_lane(monkeypatch, tmp_path):
     assert tasks[0].workspace_kind == "dir"
 
 
+def test_intake_board_reconcile_does_not_create_planner(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.ensure_discord_thread_board(
+        thread_id="778",
+        initial_request="Feature summary only",
+    )
+
+    assert dwb.reconcile_board(board.slug) is None
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+
+    assert tasks == []
+
+
 def test_public_snapshot_does_not_expose_share_token(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -219,11 +239,34 @@ def _create_ready_dev_task(board_slug: str, title: str = "Implement task") -> st
 def _make_discord_board(thread_id: str):
     from hermes_cli import discord_worker_boards as dwb
 
+    return dwb.set_goal(thread_id=thread_id, goal=f"Work for {thread_id}")
+
+
+def _make_intake_discord_board(thread_id: str):
+    from hermes_cli import discord_worker_boards as dwb
+
     return dwb.ensure_discord_thread_board(
         thread_id=thread_id,
         initial_request=f"Work for {thread_id}",
-        project_context={"project_path": "/repo/app"},
     )
+
+
+def test_discord_worker_dispatch_skips_intake_board(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
+
+    board = _make_intake_discord_board("1901")
+    _create_ready_dev_task(board.slug)
+    spawned = []
+
+    dispatch_discord_worker_boards(
+        [board.slug],
+        max_global_workers=1,
+        max_workers_per_board=1,
+        spawn_fn=lambda task, workspace, board=None: spawned.append(board) or 1901,
+    )
+
+    assert spawned == []
 
 
 def test_discord_worker_dispatch_spawns_across_two_boards(monkeypatch, tmp_path):

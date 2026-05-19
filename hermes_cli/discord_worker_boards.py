@@ -716,6 +716,8 @@ def reconcile_board(board: str) -> Optional[str]:
     worker = _read_worker_meta(board)
     if worker.get("kind") != "discord_worker_board":
         return None
+    if not is_executable_worker_board(board):
+        return None
     if worker.get("paused") or worker.get("cancelled") or worker.get("goal_status") in {"done", "blocked", "cancelled"}:
         return None
 
@@ -772,6 +774,15 @@ def reconcile_board(board: str) -> Optional[str]:
 
 def is_discord_worker_board(board: str) -> bool:
     return _read_worker_meta(board).get("kind") == "discord_worker_board"
+
+
+def is_executable_worker_board(board: str) -> bool:
+    worker = _read_worker_meta(board)
+    return (
+        worker.get("kind") == "discord_worker_board"
+        and worker.get("execution_mode") == "kanban_pipeline"
+        and worker.get("goal_status") == "active"
+    )
 
 
 def is_paused_or_cancelled(board: str) -> bool:

@@ -57,8 +57,8 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
     schema = _schema_instructions(role)
     git = _git_summary(os.environ.get("HERMES_KANBAN_WORKSPACE", "") or os.getcwd())
     return (
-        f"You are the Discord Kanban {role} worker. You are running inside a Codex app-server container.\n"
-        "Do not call Hermes tools. Work only from the repository, shell, and files available in this container.\n"
+        f"You are the Discord Kanban {role} worker. You are running as a Codex app-server worker.\n"
+        "Do not call Hermes tools. Work only from the repository, shell, and files available in this worker environment.\n"
         "Return exactly one JSON object matching the schema below; do not wrap it in Markdown.\n\n"
         f"{schema}\n\n"
         f"Git context:\n{git}\n\n"
