@@ -1506,9 +1506,9 @@ DEFAULT_CONFIG = {
         "failure_limit": 2,
         "discord_worker": {
             # Public base URL for Discord embed links. Expected shape:
-            # https://host.example/kanban, where the index lives at the base
-            # and session boards live at /<session_id>. When empty, Discord
-            # embeds omit the Kanban Board field.
+            # https://kanban.example, where the index lives at the base and
+            # session boards live at /<session_id>. When empty, Discord embeds
+            # omit the Kanban Board field.
             "public_base_url": "",
             # Container image expected to include Python, Codex CLI, git/gh,
             # common build tools, and this repo's runtime dependencies.

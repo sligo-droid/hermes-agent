@@ -10,6 +10,7 @@ Usage:
 """
 
 import asyncio
+import base64
 import hmac
 import importlib.util
 import json
@@ -52,7 +53,7 @@ from gateway.status import get_running_pid, read_runtime_status
 try:
     from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError:
@@ -64,7 +65,7 @@ except ImportError:
         _lazy_ensure("tool.dashboard", prompt=False)
         from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
         from fastapi.middleware.cors import CORSMiddleware
-        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
         from fastapi.staticfiles import StaticFiles
         from pydantic import BaseModel
     except Exception:
@@ -85,6 +86,10 @@ app = FastAPI(title="Hermes Agent", version=__version__)
 # ---------------------------------------------------------------------------
 _SESSION_TOKEN = secrets.token_urlsafe(32)
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
+_DASHBOARD_AUTH_REALM = "Hermes Dashboard"
+_DASHBOARD_DEFAULT_USERNAME = "hermes"
+_DASHBOARD_EPHEMERAL_PASSWORD = secrets.token_urlsafe(18)
+_DASHBOARD_PASSWORD_ANNOUNCED = False
 
 # In-browser Chat tab (/chat, /api/pty, …).  Off unless ``hermes dashboard --tui``
 # or HERMES_DASHBOARD_TUI=1.  Set from :func:`start_server`.
@@ -106,22 +111,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# Endpoints that do NOT require the session token.  Everything else under
-# /api/ is gated by the auth middleware below.  Keep this list minimal —
-# only truly non-sensitive, read-only endpoints belong here.
-# ---------------------------------------------------------------------------
-_PUBLIC_API_PATHS: frozenset = frozenset({
-    "/api/status",
-    "/api/config/defaults",
-    "/api/config/schema",
-    "/api/model/info",
-    "/api/dashboard/themes",
-    "/api/dashboard/plugins",
-    "/api/dashboard/plugins/rescan",
-})
-
-
 def _has_valid_session_token(request: Request) -> bool:
     """True if the request carries a valid dashboard session token.
 
@@ -140,6 +129,48 @@ def _has_valid_session_token(request: Request) -> bool:
     auth = request.headers.get("authorization", "")
     expected = f"Bearer {_SESSION_TOKEN}"
     return hmac.compare_digest(auth.encode(), expected.encode())
+
+
+def _dashboard_basic_username() -> str:
+    return os.getenv("HERMES_DASHBOARD_USERNAME") or _DASHBOARD_DEFAULT_USERNAME
+
+
+def _dashboard_basic_password() -> str:
+    return os.getenv("HERMES_DASHBOARD_PASSWORD") or _DASHBOARD_EPHEMERAL_PASSWORD
+
+
+def _compare_secret(left: str, right: str) -> bool:
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+
+
+def _has_valid_basic_auth(request: Request) -> bool:
+    auth = request.headers.get("authorization", "")
+    scheme, _, encoded = auth.partition(" ")
+    if scheme.lower() != "basic" or not encoded:
+        return False
+    try:
+        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+    except Exception:
+        return False
+    username, sep, password = decoded.partition(":")
+    if not sep:
+        return False
+    return _compare_secret(username, _dashboard_basic_username()) and _compare_secret(
+        password,
+        _dashboard_basic_password(),
+    )
+
+
+def _has_dashboard_access(request: Request) -> bool:
+    return _has_valid_session_token(request) or _has_valid_basic_auth(request)
+
+
+def _basic_auth_challenge() -> JSONResponse:
+    return JSONResponse(
+        status_code=401,
+        content={"detail": "Unauthorized"},
+        headers={"WWW-Authenticate": f'Basic realm="{_DASHBOARD_AUTH_REALM}"'},
+    )
 
 
 def _require_token(request: Request) -> None:
@@ -235,14 +266,26 @@ async def host_header_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Require the session token on all /api/ routes except the public list."""
-    path = request.url.path
-    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
-        if not _has_valid_session_token(request):
+    """Require dashboard auth before serving HTML, assets, or APIs.
+
+    Basic auth is the public entry gate. The existing per-process session token
+    remains valid for in-browser API calls after the authenticated HTML loads.
+    """
+    bound_host = getattr(app.state, "bound_host", None)
+    if bound_host:
+        host_header = request.headers.get("host", "")
+        if not _is_accepted_host(host_header, bound_host):
             return JSONResponse(
-                status_code=401,
-                content={"detail": "Unauthorized"},
+                status_code=400,
+                content={
+                    "detail": (
+                        "Invalid Host header. Dashboard requests must use "
+                        "the hostname the server was bound to."
+                    ),
+                },
             )
+    if not _has_dashboard_access(request):
+        return _basic_auth_challenge()
     return await call_next(request)
 
 
@@ -273,9 +316,27 @@ async def public_kanban_index():
         raise HTTPException(status_code=500, detail="Kanban index unavailable")
 
 
-@app.get("/kanban/{session_id}", response_class=HTMLResponse)
-async def public_kanban_session_board(session_id: str):
+@app.get("/{session_id:int}", response_class=HTMLResponse)
+async def public_kanban_session_board(session_id: int):
     """Read-only public Kanban board view for a Discord session id."""
+    try:
+        from hermes_cli.discord_worker_boards import render_public_session_board_html
+
+        return HTMLResponse(render_public_session_board_html(str(session_id)))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Kanban board not found")
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Kanban board not found")
+    except Exception as exc:
+        _log.warning("public kanban session render failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Kanban board unavailable")
+
+
+@app.get("/kanban/{session_id}", response_class=HTMLResponse)
+async def public_kanban_session_board_legacy(session_id: str):
+    """Backward-compatible redirect for old /kanban/<session_id> links."""
+    if session_id.isdigit():
+        return RedirectResponse(url=f"/{session_id}", status_code=307)
     try:
         from hermes_cli.discord_worker_boards import render_public_session_board_html
 
@@ -4422,7 +4483,7 @@ def start_server(
     """Start the web UI server."""
     import uvicorn
 
-    global _DASHBOARD_EMBEDDED_CHAT_ENABLED
+    global _DASHBOARD_EMBEDDED_CHAT_ENABLED, _DASHBOARD_PASSWORD_ANNOUNCED
     _DASHBOARD_EMBEDDED_CHAT_ENABLED = embedded_chat
 
     _LOCALHOST = ("127.0.0.1", "localhost", "::1")
@@ -4477,6 +4538,10 @@ def start_server(
             )
 
     print(f"  Hermes Web UI → http://{host}:{port}")
+    print(f"  Dashboard login username → {_dashboard_basic_username()}")
+    if not os.getenv("HERMES_DASHBOARD_PASSWORD") and not _DASHBOARD_PASSWORD_ANNOUNCED:
+        print(f"  Dashboard login password → {_DASHBOARD_EPHEMERAL_PASSWORD}")
+        _DASHBOARD_PASSWORD_ANNOUNCED = True
     # proxy_headers=False so _ws_client_is_allowed sees the real connection peer
     # rather than X-Forwarded-For's rewritten value (which would defeat the
     # loopback gate when behind a reverse proxy).

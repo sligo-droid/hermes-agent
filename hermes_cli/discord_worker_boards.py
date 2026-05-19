@@ -425,7 +425,7 @@ def render_public_board_index_html() -> str:
     for board in snapshot["boards"]:
         worker = board.get("worker") or {}
         session_id = str(board.get("session_id") or "")
-        href = f"/kanban/{quote(session_id, safe='')}" if session_id else ""
+        href = f"/{quote(session_id, safe='')}" if session_id else ""
         counts = board.get("counts") or {}
         count_text = " ".join(
             f"{esc(status)}:{esc(count)}"
