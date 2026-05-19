@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from hermes_cli import kanban_db
 from utils import atomic_json_write
@@ -95,16 +95,29 @@ def _absolute_public_base_url() -> str:
     return ""
 
 
-def public_session_board_url(session_id: str) -> str:
+def _public_workers_base_url() -> str:
     base = _absolute_public_base_url()
+    if not base:
+        return ""
+    parts = urlsplit(base)
+    path = parts.path.rstrip("/")
+    if path.endswith("/kanban"):
+        path = path[: -len("/kanban")]
+    if not path.endswith("/workers"):
+        path = f"{path}/workers"
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def public_session_board_url(session_id: str) -> str:
+    base = _public_workers_base_url()
     session = quote(str(session_id or "").strip(), safe="")
     return f"{base}/{session}" if base and session else ""
 
 
 def public_board_url(token: str) -> str:
-    """Return the legacy token URL when an absolute public base is configured."""
+    """Return the token URL when an absolute public base is configured."""
     path = f"/public/kanban/{token}"
-    base = _absolute_public_base_url()
+    base = _public_workers_base_url()
     return f"{base}{path}" if base else ""
 
 
@@ -425,7 +438,7 @@ def render_public_board_index_html() -> str:
     for board in snapshot["boards"]:
         worker = board.get("worker") or {}
         session_id = str(board.get("session_id") or "")
-        href = f"/{quote(session_id, safe='')}" if session_id else ""
+        href = f"/workers/{quote(session_id, safe='')}" if session_id else ""
         counts = board.get("counts") or {}
         count_text = " ".join(
             f"{esc(status)}:{esc(count)}"

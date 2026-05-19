@@ -507,7 +507,7 @@ async def test_feature_summary_update_edits_initial_message(adapter):
 @pytest.mark.asyncio
 async def test_feature_summary_uses_absolute_kanban_board_url(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
-    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://sligo-labs.com")
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://hermes.sligolabs.com")
     parent = FakeTextChannel(channel_id=100)
     thread = FakeThread(channel_id=200, parent=parent)
 
@@ -520,7 +520,7 @@ async def test_feature_summary_uses_absolute_kanban_board_url(adapter, monkeypat
     assert handle is not None
     sent_embed = thread.sent[0][0]["embed"]
     fields = {field.name: field.value for field in sent_embed.fields}
-    assert fields["Kanban Board"] == "https://sligo-labs.com/200"
+    assert fields["Kanban Board"] == "https://hermes.sligolabs.com/workers/200"
 
 
 @pytest.mark.asyncio
