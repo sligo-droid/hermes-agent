@@ -1,5 +1,6 @@
 """Tests for hermes_cli.web_server and related config utilities."""
 
+import base64
 import os
 import json
 import tempfile
@@ -324,8 +325,32 @@ class TestWebServerEndpoints:
         assert resp.status_code == 401
         resp = unauth_client.get("/api/config")
         assert resp.status_code == 401
-        # Public endpoints should still work
         resp = unauth_client.get("/api/status")
+        assert resp.status_code == 401
+
+    def test_unauthenticated_spa_html_blocked(self):
+        """The root page must not expose the injected dashboard session token."""
+        from starlette.testclient import TestClient
+        from hermes_cli.web_server import app
+
+        unauth_client = TestClient(app)
+        resp = unauth_client.get("/")
+
+        assert resp.status_code == 401
+        assert resp.headers["www-authenticate"] == 'Basic realm="Hermes Dashboard"'
+        assert "__HERMES_SESSION_TOKEN__" not in resp.text
+
+    def test_basic_auth_allows_dashboard_requests(self, monkeypatch):
+        from starlette.testclient import TestClient
+        from hermes_cli.web_server import app
+
+        monkeypatch.setenv("HERMES_DASHBOARD_USERNAME", "operator")
+        monkeypatch.setenv("HERMES_DASHBOARD_PASSWORD", "correct horse battery")
+        raw = base64.b64encode(b"operator:correct horse battery").decode("ascii")
+        client = TestClient(app)
+
+        resp = client.get("/api/status", headers={"Authorization": f"Basic {raw}"})
+
         assert resp.status_code == 200
 
     def test_path_traversal_blocked(self):
@@ -1201,8 +1226,9 @@ class TestModelInfoEndpoint:
             from starlette.testclient import TestClient
         except ImportError:
             pytest.skip("fastapi/starlette not installed")
-        from hermes_cli.web_server import app
+        from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
         self.client = TestClient(app)
+        self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
     def test_model_info_returns_200(self):
         resp = self.client.get("/api/model/info")

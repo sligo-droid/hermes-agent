@@ -116,8 +116,8 @@ class TestHostHeaderMiddleware:
         app.state.bound_host = "127.0.0.1"
         try:
             client = TestClient(app)
-            # /api/status is in _PUBLIC_API_PATHS — passes auth — so the
-            # only thing that can reject is the host header middleware
+            # Session auth is absent, so a valid Host should reach the auth
+            # challenge rather than fail at the Host-header middleware.
             resp = client.get(
                 "/api/status",
                 headers={"Host": "localhost:9119"},
