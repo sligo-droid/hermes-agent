@@ -2192,6 +2192,11 @@ class GatewayRunner:
         text = getattr(event_or_text, "text", event_or_text) or ""
         return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
 
+    @staticmethod
+    def _goal_kickoff_prompt(goal: str) -> str:
+        """Wrap a newly set goal so nested slash lines are agent work."""
+        return f"[Starting work toward your standing goal]\nGoal:\n{goal}"
+
     def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
         """Remove queued synthetic /goal continuations for one session.
 
@@ -9849,14 +9854,14 @@ class GatewayRunner:
         except ValueError as exc:
             return t("gateway.goal.invalid", error=str(exc))
 
-        # Queue the goal text as an immediate first turn so the agent
-        # starts making progress. The post-turn hook takes over after.
+        # Queue a wrapped goal prompt as an immediate first turn so the
+        # agent starts making progress. The post-turn hook takes over after.
         adapter = self.adapters.get(event.source.platform) if event.source else None
         _quick_key = self._session_key_for_source(event.source) if event.source else None
         if adapter and _quick_key:
             try:
                 kickoff_event = MessageEvent(
-                    text=state.goal,
+                    text=self._goal_kickoff_prompt(state.goal),
                     message_type=MessageType.TEXT,
                     source=event.source,
                     message_id=event.message_id,
