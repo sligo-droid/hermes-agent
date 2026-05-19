@@ -89,6 +89,58 @@ async def test_bare_text_meeting_command_creates_thread_anchored_to_audio_messag
 
 
 @pytest.mark.asyncio
+async def test_non_slash_meeting_tag_with_audio_canonicalizes_to_meeting_command(adapter, monkeypatch):
+    import discord
+
+    captured = []
+
+    async def fake_cache(att, ext):
+        return "/tmp/uploaded-meeting.ogg"
+
+    async def fake_handle(event):
+        captured.append(event)
+
+    monkeypatch.setattr(adapter, "_cache_discord_audio", fake_cache)
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    classifier = AsyncMock(return_value=False)
+    monkeypatch.setattr(adapter, "_classify_discord_feature_request", classifier)
+
+    guild = SimpleNamespace(id=42, name="Guild")
+    channel = SimpleNamespace(id=12345, name="general", guild=guild)
+    thread = SimpleNamespace(id=777, name="Meeting notes — 2026-05-19 — client kickoff", parent=channel, guild=guild)
+    create_thread = AsyncMock(return_value=thread)
+    message = SimpleNamespace(
+        id=557,
+        content="meeting client kickoff",
+        clean_content="meeting client kickoff",
+        type=discord.MessageType.default,
+        channel=channel,
+        author=SimpleNamespace(id=100200300, display_name="tbrent", name="tbrent", bot=False),
+        mentions=[],
+        attachments=[SimpleNamespace(filename="meeting.ogg", content_type="audio/ogg", url="https://cdn.discordapp.example/meeting.ogg", size=123)],
+        message_snapshots=[],
+        flags=SimpleNamespace(value=0, voice=False),
+        guild=guild,
+        created_at=datetime(2026, 5, 19, 4, 0, 0),
+        reference=None,
+        create_thread=create_thread,
+        thread=None,
+    )
+
+    await adapter._handle_message(message)
+
+    create_thread.assert_awaited_once()
+    assert create_thread.call_args.kwargs["name"] == "Meeting notes — 2026-05-19 — client kickoff"
+    assert len(captured) == 1
+    event = captured[0]
+    assert event.text == "/meeting client kickoff"
+    assert event.message_type == MessageType.COMMAND
+    assert event.media_urls == ["/tmp/uploaded-meeting.ogg"]
+    assert event.source.thread_id == "777"
+    classifier.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_bare_text_meeting_command_reuses_existing_recording_thread(adapter, monkeypatch):
     import discord
 
