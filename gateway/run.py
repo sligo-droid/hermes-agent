@@ -66,6 +66,7 @@ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _TRUTHY_ENV_VALUES = {"true", "1", "yes", "on"}
 _CODEX_APP_SERVER_ACTIVITY_PREFIX = "Codex app-server event:"
+_MEETING_GOAL_SKILL_NAMES = {"meeting", "discord-meeting-intake"}
 
 
 def _discord_live_voice_enabled() -> bool:
@@ -6834,6 +6835,16 @@ class GatewayRunner:
                     # list at scan time; per-platform overrides need checking
                     # here because the cache is process-global across platforms.
                     _skill_name = skill_cmds[cmd_key].get("name", "")
+                    try:
+                        # Preserve the user-visible skill command that caused
+                        # this turn before event.text is replaced by the full
+                        # skill payload. Post-turn gateway features (not the
+                        # model) use this to apply deterministic follow-up
+                        # behavior such as /meeting goal/subgoal creation.
+                        event.invoked_skill_name = _skill_name
+                        event.invoked_skill_command = command.replace("_", "-")
+                    except Exception:
+                        pass
                     _plat = source.platform.value if source.platform else None
                     if _plat and _skill_name:
                         from agent.skill_utils import get_disabled_skill_names as _get_plat_disabled
@@ -6918,7 +6929,7 @@ class GatewayRunner:
                 # Skip for empty responses (interrupted / errored) — the
                 # judge would almost always say "continue" and we'd loop
                 # on error. Let the user drive the next turn.
-                if _final_text.strip():
+                if _final_text.strip() and not getattr(event, "skip_post_turn_goal_once", False):
                     try:
                         session_entry = self.session_store.get_or_create_session(source)
                     except Exception:
@@ -7889,6 +7900,18 @@ class GatewayRunner:
                 agent_result, response, history_len=len(history),
             )
 
+            meeting_goal_status = ""
+            if response and not agent_result.get("failed"):
+                try:
+                    meeting_goal_status = await self._apply_meeting_auto_goal_from_response(
+                        event,
+                        response,
+                    )
+                    if meeting_goal_status:
+                        response = f"{response.rstrip()}\n\n{meeting_goal_status}"
+                except Exception as _meeting_goal_exc:
+                    logger.debug("meeting auto-goal hook failed: %s", _meeting_goal_exc)
+
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
@@ -8167,6 +8190,17 @@ class GatewayRunner:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
+                if meeting_goal_status:
+                    try:
+                        _status_adapter = self.adapters.get(source.platform)
+                        if _status_adapter:
+                            await _status_adapter.send(
+                                source.chat_id,
+                                meeting_goal_status,
+                                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                            )
+                    except Exception as _e:
+                        logger.debug("meeting auto-goal status send failed: %s", _e)
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
                 # Send it now as a small trailing message so Telegram/Discord/etc.
@@ -9782,6 +9816,169 @@ class GatewayRunner:
         
         # Let the normal message handler process it
         return await self._handle_message(retry_event)
+
+    # ────────────────────────────────────────────────────────────────
+    # /meeting — deterministic goal/subgoal creation from meeting summaries
+    # ────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _is_meeting_skill_event(event: "MessageEvent") -> bool:
+        """Return true when this turn came from the meeting intake skill."""
+        skill_name = str(getattr(event, "invoked_skill_name", "") or "").strip().lower()
+        command = str(getattr(event, "invoked_skill_command", "") or "").strip().lower()
+        return skill_name in _MEETING_GOAL_SKILL_NAMES or command == "meeting"
+
+    @staticmethod
+    def _clean_meeting_todo_line(line: str) -> str:
+        """Normalize a single todo bullet/numbered item from a meeting reply."""
+        text = (line or "").strip()
+        text = re.sub(r"^>\s*", "", text)
+        text = re.sub(r"^[-*•]\s+", "", text)
+        text = re.sub(r"^\d+[.)]\s+", "", text)
+        text = re.sub(r"^\[[ xX]\]\s+", "", text)
+        text = text.strip(" -\t")
+        if not text:
+            return ""
+        lowered = text.lower().strip(" .")
+        if lowered in {
+            "none",
+            "n/a",
+            "no clear follow-up todos were stated",
+            "no clear todos",
+            "no follow-up todos",
+        }:
+            return ""
+        if lowered.startswith(("no clear follow-up", "no clear todo", "no follow-up todo")):
+            return ""
+        return text
+
+    @classmethod
+    def _extract_meeting_todos_from_response(cls, response: str) -> list[str]:
+        """Extract actionable todo lines from a meeting-intake response.
+
+        The model still summarizes and identifies todos, but the gateway owns
+        the /goal and /subgoal state mutation.  Accept both the requested
+        `Next todos` section and the older failure mode where the model printed
+        `/subgoal ...` commands for the user to copy-paste.
+        """
+        text = str(response or "")
+        todos: list[str] = []
+
+        # Backward-compatible recovery for responses shaped like:
+        #   /goal Follow up ... /subgoal Do the thing /subgoal Do another thing
+        for match in re.finditer(r"(?is)(?:^|\s)/subgoal\s+(.+?)(?=(?:\s+/subgoal\b)|\s*$)", text):
+            candidate = cls._clean_meeting_todo_line(match.group(1))
+            if candidate:
+                todos.append(candidate)
+
+        in_todos = False
+        seen_any = False
+        stop_headers = (
+            "meeting summary",
+            "summary",
+            "decisions",
+            "decisions / agreements",
+            "open questions",
+            "open questions / risks",
+            "risks",
+            "goal tracking",
+            "transcript",
+            "raw transcript",
+        )
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("```"):
+                continue
+            header = line.strip("#*: ").lower()
+            if "next todos" in header or header in {"todos", "todo", "action items", "next steps"}:
+                in_todos = True
+                seen_any = False
+                continue
+            if in_todos and seen_any and any(header.startswith(h) for h in stop_headers):
+                break
+            if not in_todos:
+                continue
+            candidate = cls._clean_meeting_todo_line(line)
+            if not candidate:
+                continue
+            # In a todos section, only accept bullet/numbered/checklist-style
+            # lines. This avoids swallowing prose after the section.
+            if not re.match(r"^\s*(?:[-*•]|\d+[.)]|\[[ xX]\])\s+", raw_line):
+                continue
+            todos.append(candidate)
+            seen_any = True
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for todo in todos:
+            key = re.sub(r"\s+", " ", todo).strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(todo)
+            if len(deduped) >= 20:
+                break
+        return deduped
+
+    async def _apply_meeting_auto_goal_from_response(
+        self,
+        event: "MessageEvent",
+        response: str,
+    ) -> str:
+        """Create/update /goal state for a completed /meeting turn.
+
+        This intentionally bypasses the model for the state mutation.  The
+        model may summarize and list todos, but the gateway directly calls the
+        same GoalManager methods used by /goal and /subgoal instead of sending
+        slash-command text back to the user.
+        """
+        if not self._is_meeting_skill_event(event):
+            return ""
+
+        todos = self._extract_meeting_todos_from_response(response)
+        if not todos:
+            return ""
+
+        mgr, _session_entry = self._get_goal_manager_for_event(event)
+        if mgr is None:
+            return (
+                f"⚠️ I found {len(todos)} meeting todo(s), but goal tracking "
+                "is unavailable in this gateway session."
+            )
+
+        created_goal = not mgr.has_goal()
+        if created_goal:
+            state = mgr.set("Follow up on the todos from this meeting.")
+        else:
+            state = mgr.state
+
+        added = 0
+        for todo in todos:
+            try:
+                mgr.add_subgoal(todo)
+                added += 1
+            except Exception as exc:
+                logger.debug("meeting auto-goal: add_subgoal failed: %s", exc)
+
+        if added <= 0:
+            return ""
+
+        # Avoid judging the meeting summary as if it were work toward the new
+        # follow-up goal; enqueue the first real goal-continuation turn instead.
+        try:
+            event.skip_post_turn_goal_once = True
+        except Exception:
+            pass
+
+        if created_goal and state is not None:
+            try:
+                prompt = mgr.next_continuation_prompt() or self._goal_kickoff_prompt(state.goal)
+                self._enqueue_goal_work(event, prompt)
+            except Exception as exc:
+                logger.debug("meeting auto-goal: kickoff enqueue failed: %s", exc)
+
+        if created_goal:
+            return f"Goal tracking started with {added} subgoal{'s' if added != 1 else ''}."
+        return f"Added {added} meeting subgoal{'s' if added != 1 else ''} to the active goal."
 
     # ────────────────────────────────────────────────────────────────
     # /goal — persistent cross-turn goals (Ralph-style loop)
