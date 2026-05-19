@@ -184,6 +184,8 @@ def run_conversation(
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
     agent._tool_guardrail_halt_decision = None
+    agent._codex_worker_required_this_turn = False
+    agent._codex_worker_used_this_turn = False
     # True until the server rejects an image_url content part with an error
     # like "Only 'text' content type is supported."  Set to False on first
     # rejection and kept False for the rest of the session so we never re-send
@@ -284,21 +286,30 @@ def run_conversation(
     if isinstance(original_user_message, str) and isinstance(user_message, str):
         try:
             from hermes_cli.codex_worker_switch import (
-                build_worker_guidance,
+                assess_worker_routing,
                 get_enabled as _codex_worker_enabled,
             )
             from hermes_cli.config import load_config as _load_config
 
-            _codex_worker_prefix = build_worker_guidance(
+            _session_cwd = (
+                getattr(agent, "session_cwd", None)
+                or os.environ.get("TERMINAL_CWD")
+                or os.getcwd()
+            )
+            _codex_worker_decision = assess_worker_routing(
                 original_user_message,
                 enabled=_codex_worker_enabled(_load_config()),
                 tool_available=(
                     "delegate_codex_coding_task" in agent.valid_tool_names
                 ),
                 api_mode=getattr(agent, "api_mode", ""),
+                cwd=_session_cwd,
             )
+            _codex_worker_prefix = _codex_worker_decision.guidance
+            agent._codex_worker_required_this_turn = _codex_worker_decision.required
         except Exception:
             _codex_worker_prefix = ""
+            agent._codex_worker_required_this_turn = False
         if _codex_worker_prefix:
             if agent._persist_user_message_override is None:
                 agent._persist_user_message_override = original_user_message
