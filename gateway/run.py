@@ -4727,6 +4727,33 @@ class GatewayRunner:
         if max_spawn is not None:
             logger.info(f"kanban dispatcher: max_spawn={max_spawn}")
 
+        discord_worker_cfg = (
+            kanban_cfg.get("discord_worker", {})
+            if isinstance(kanban_cfg.get("discord_worker", {}), dict)
+            else {}
+        )
+
+        def _positive_int_config(value, default: int) -> int:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return default
+            return parsed if parsed > 0 else default
+
+        discord_max_global_workers = _positive_int_config(
+            discord_worker_cfg.get("max_global_workers"),
+            4,
+        )
+        discord_max_workers_per_board = _positive_int_config(
+            discord_worker_cfg.get("max_workers_per_board"),
+            1,
+        )
+        logger.info(
+            "kanban dispatcher: Discord worker pool max_global_workers=%d max_workers_per_board=%d",
+            discord_max_global_workers,
+            discord_max_workers_per_board,
+        )
+
         raw_failure_limit = kanban_cfg.get("failure_limit", _kb.DEFAULT_FAILURE_LIMIT)
         try:
             failure_limit = int(raw_failure_limit)
@@ -4769,25 +4796,6 @@ class GatewayRunner:
             conn = None
             try:
                 conn = _kb.connect(board=slug)
-                try:
-                    from hermes_cli import discord_worker_boards as _dwb
-                    from hermes_cli.kanban_codex_workers import spawn_or_default as _spawn_or_default
-
-                    if _dwb.is_discord_worker_board(slug):
-                        _dwb.reconcile_board(slug)
-                        if _dwb.is_paused_or_cancelled(slug):
-                            return None
-                        board_max_spawn = 1
-                        return _kb.dispatch_once(
-                            conn,
-                            board=slug,
-                            max_spawn=board_max_spawn,
-                            failure_limit=failure_limit,
-                            spawn_fn=_spawn_or_default,
-                            additional_spawnable_assignees=_dwb.ROLE_ASSIGNEES,
-                        )
-                except Exception:
-                    logger.debug("kanban dispatcher: Discord worker routing skipped for board %s", slug, exc_info=True)
                 # `connect()` runs the schema + idempotent migration on
                 # first open per process; the previous explicit
                 # `init_db()` call here busted the per-process cache and
@@ -4822,8 +4830,41 @@ class GatewayRunner:
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             out: list[tuple[str, "Optional[object]"]] = []
+            discord_slugs: list[str] = []
+            try:
+                from hermes_cli import discord_worker_boards as _dwb
+
+                for b in boards:
+                    slug = b.get("slug") or _kb.DEFAULT_BOARD
+                    if _dwb.is_discord_worker_board(slug):
+                        discord_slugs.append(slug)
+            except Exception:
+                logger.debug("kanban dispatcher: Discord board detection failed", exc_info=True)
+                discord_slugs = []
+
+            discord_slug_set = set(discord_slugs)
+            if discord_slugs:
+                cursor = int(getattr(self, "_discord_worker_dispatch_cursor", 0) or 0)
+                offset = cursor % len(discord_slugs)
+                ordered_discord_slugs = discord_slugs[offset:] + discord_slugs[:offset]
+                self._discord_worker_dispatch_cursor = (cursor + 1) % len(discord_slugs)
+                try:
+                    from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
+
+                    out.extend(
+                        dispatch_discord_worker_boards(
+                            ordered_discord_slugs,
+                            max_global_workers=discord_max_global_workers,
+                            max_workers_per_board=discord_max_workers_per_board,
+                            failure_limit=failure_limit,
+                        )
+                    )
+                except Exception:
+                    logger.exception("kanban dispatcher: Discord worker dispatch failed")
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                if slug in discord_slug_set:
+                    continue
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
@@ -4843,6 +4884,21 @@ class GatewayRunner:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            discord_running_total = 0
+            discord_running_by_board: dict[str, int] = {}
+            try:
+                from hermes_cli import discord_worker_boards as _dwb
+                from hermes_cli.discord_worker_dispatch import running_role_count
+
+                for b in boards:
+                    slug = b.get("slug") or _kb.DEFAULT_BOARD
+                    if _dwb.is_discord_worker_board(slug):
+                        running = running_role_count(slug)
+                        discord_running_by_board[slug] = running
+                        discord_running_total += running
+            except Exception:
+                discord_running_by_board = {}
+                discord_running_total = 0
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None
@@ -4851,6 +4907,13 @@ class GatewayRunner:
                     try:
                         from hermes_cli import discord_worker_boards as _dwb
 
+                        if _dwb.is_discord_worker_board(slug):
+                            board_running = discord_running_by_board.get(slug, 0)
+                            if (
+                                discord_running_total >= discord_max_global_workers
+                                or board_running >= discord_max_workers_per_board
+                            ):
+                                continue
                         ready = _kb.has_spawnable_ready(
                             conn,
                             additional_spawnable_assignees=(

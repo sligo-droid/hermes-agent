@@ -1513,6 +1513,10 @@ DEFAULT_CONFIG = {
             "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
             "docker_bin": "docker",
             "codex_home_root": "",
+            # Discord worker boards stay serial by default, but separate
+            # Discord threads may make progress concurrently.
+            "max_global_workers": 4,
+            "max_workers_per_board": 1,
             "review_loop_limit": 5,
             "roles": {
                 "planner": {"reasoning": "high", "max_runtime_seconds": 1800},
