@@ -1505,8 +1505,10 @@ DEFAULT_CONFIG = {
         # resets the streak for the new profile.
         "failure_limit": 2,
         "discord_worker": {
-            # Public base URL for Discord embed links. When empty, the board
-            # URL is rendered as a relative /public/kanban/<token> path.
+            # Public base URL for Discord embed links. Expected shape:
+            # https://host.example/kanban, where the index lives at the base
+            # and session boards live at /<session_id>. When empty, Discord
+            # embeds omit the Kanban Board field.
             "public_base_url": "",
             # Container image expected to include Python, Codex CLI, git/gh,
             # common build tools, and this repo's runtime dependencies.
