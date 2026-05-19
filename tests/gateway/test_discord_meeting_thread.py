@@ -89,7 +89,7 @@ async def test_bare_text_meeting_command_creates_thread_anchored_to_audio_messag
 
 
 @pytest.mark.asyncio
-async def test_non_slash_meeting_tag_with_audio_canonicalizes_to_meeting_command(adapter, monkeypatch):
+async def test_mentioned_meeting_command_with_audio_canonicalizes_after_mention_strip(adapter, monkeypatch):
     import discord
 
     captured = []
@@ -109,14 +109,15 @@ async def test_non_slash_meeting_tag_with_audio_canonicalizes_to_meeting_command
     channel = SimpleNamespace(id=12345, name="general", guild=guild)
     thread = SimpleNamespace(id=777, name="Meeting notes — 2026-05-19 — client kickoff", parent=channel, guild=guild)
     create_thread = AsyncMock(return_value=thread)
+    bot_user = adapter._client.user
     message = SimpleNamespace(
         id=557,
-        content="meeting client kickoff",
-        clean_content="meeting client kickoff",
+        content=f"<@{bot_user.id}> /meeting client kickoff",
+        clean_content="@Sligo Labs /meeting client kickoff",
         type=discord.MessageType.default,
         channel=channel,
         author=SimpleNamespace(id=100200300, display_name="tbrent", name="tbrent", bot=False),
-        mentions=[],
+        mentions=[bot_user],
         attachments=[SimpleNamespace(filename="meeting.ogg", content_type="audio/ogg", url="https://cdn.discordapp.example/meeting.ogg", size=123)],
         message_snapshots=[],
         flags=SimpleNamespace(value=0, voice=False),
