@@ -204,6 +204,92 @@ async def test_gateway_goal_control_commands_do_not_enqueue_work(tmp_path, monke
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["/goal clear", "/goal stop", "/goal done"])
+async def test_gateway_goal_clear_aliases_are_silent_control_commands(tmp_path, monkeypatch, text):
+    """Clearing a gateway goal should mutate state without sending chat text."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    goals._DB_CACHE.clear()
+
+    adapter = _FakeAdapter()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _FakeSessionStore()
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._queued_events = {}
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="chat-goal-config",
+        chat_type="channel",
+        user_id="user-goal-config",
+    )
+    mgr = goals.GoalManager("sid-gateway-goal-config")
+    mgr.set("clear silently")
+
+    try:
+        event = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=f"msg-{text.rsplit(' ', 1)[-1]}",
+        )
+
+        response = await GatewayRunner._handle_goal_command(runner, event)
+
+        assert response is None
+        cleared_mgr = goals.GoalManager("sid-gateway-goal-config")
+        assert not cleared_mgr.is_active()
+        assert not cleared_mgr.has_goal()
+        assert adapter._pending_messages == {}
+        assert runner._queued_events == {}
+    finally:
+        goals._DB_CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_gateway_goal_clear_is_silent_when_no_goal_exists(tmp_path, monkeypatch):
+    """Repeated /goal clear should not answer with a noisy 'No active goal'."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    goals._DB_CACHE.clear()
+
+    adapter = _FakeAdapter()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _FakeSessionStore()
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._queued_events = {}
+
+    event = MessageEvent(
+        text="/goal clear",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chat-goal-config",
+            chat_type="channel",
+            user_id="user-goal-config",
+        ),
+        message_id="msg-clear-empty",
+    )
+
+    try:
+        response = await GatewayRunner._handle_goal_command(runner, event)
+
+        assert response is None
+        assert adapter._pending_messages == {}
+        assert runner._queued_events == {}
+    finally:
+        goals._DB_CACHE.clear()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("text", ["/goal pause", "/goal clear"])
 async def test_gateway_goal_pause_and_clear_remove_pending_goal_work(tmp_path, monkeypatch, text):
     """Pause/clear must stop a kickoff that was queued but not yet drained."""

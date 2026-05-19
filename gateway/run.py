@@ -10052,7 +10052,7 @@ class GatewayRunner:
         max_turns = self._goal_max_turns_from_config()
         return GoalManager(session_id=sid, default_max_turns=max_turns), session_entry
 
-    async def _handle_goal_command(self, event: "MessageEvent") -> str:
+    async def _handle_goal_command(self, event: "MessageEvent") -> Optional[str]:
         """Handle /goal for gateway platforms.
 
         Subcommands: ``/goal`` / ``/goal status`` / ``/goal pause`` /
@@ -10062,6 +10062,10 @@ class GatewayRunner:
         Setting a new goal queues the goal text as the next turn so the
         agent starts working on it immediately — the post-turn
         continuation hook then takes over from there.
+
+        ``/goal clear`` is intentionally silent on gateway platforms: it is
+        a deterministic control-plane mutation, not something that should
+        clutter chat or create a response that can be misread as an agent turn.
         """
         args = (event.get_command_args() or "").strip()
         lower = args.lower()
@@ -10098,7 +10102,6 @@ class GatewayRunner:
             return t("gateway.goal.resumed", goal=state.goal)
 
         if lower in {"clear", "stop", "done"}:
-            had = mgr.has_goal()
             mgr.clear()
             try:
                 adapter = self.adapters.get(event.source.platform) if event.source else None
@@ -10107,7 +10110,7 @@ class GatewayRunner:
                     self._clear_goal_pending_continuations(_quick_key, adapter)
             except Exception as exc:
                 logger.debug("goal clear: pending continuation cleanup failed: %s", exc)
-            return t("gateway.goal_cleared") if had else t("gateway.no_active_goal")
+            return None
 
         # Otherwise — treat the remaining text as the new goal.
         try:
