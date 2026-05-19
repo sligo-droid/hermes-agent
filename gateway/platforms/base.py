@@ -969,6 +969,12 @@ class MessageEvent:
     # from ``text`` so the sender-prefix logic in run.py can operate on the
     # trigger message alone, then prepend this context afterward.
     channel_context: Optional[str] = None
+
+    # True when a platform adapter has already decoded an uploaded .txt file
+    # directly into ``text``.  The runner uses this to avoid adding document
+    # metadata ahead of the text, preserving the same order as if the user had
+    # typed/pasted the message body followed by the uploaded file content.
+    text_document_inlined: bool = False
     
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
@@ -979,6 +985,8 @@ class MessageEvent:
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
+        if self.message_type not in {MessageType.TEXT, MessageType.COMMAND}:
+            return False
         return self.text.startswith("/")
     
     def get_command(self) -> Optional[str]:
