@@ -185,6 +185,25 @@ def test_public_board_index_lists_session_links(monkeypatch, tmp_path):
     assert "Build the thing" in html
 
 
+def test_public_board_index_lists_newest_sessions_first(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    monkeypatch.setattr(dwb, "_now", lambda: 100)
+    dwb.set_goal(thread_id="1001", goal="Older worker")
+    monkeypatch.setattr(dwb, "_now", lambda: 200)
+    dwb.set_goal(thread_id="1002", goal="Newer worker")
+
+    snapshot = dwb.public_board_index_snapshot()
+    html = dwb.render_public_board_index_html()
+
+    assert [board["session_id"] for board in snapshot["boards"][:2]] == [
+        "1002",
+        "1001",
+    ]
+    assert html.index("Newer worker") < html.index("Older worker")
+
+
 def test_public_kanban_web_routes(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from fastapi.testclient import TestClient

@@ -96,6 +96,13 @@ const CHAT_NAV_ITEM: NavItem = {
   icon: Terminal,
 };
 
+const WORKERS_NAV_ITEM: NavItem = {
+  path: "/workers",
+  label: "Workers",
+  icon: Wrench,
+  reloadDocument: true,
+};
+
 /**
  * Built-in routes except /chat.  Chat is rendered persistently (outside
  * <Routes>) when embedded — see the persistent chat host block rendered
@@ -370,7 +377,13 @@ export default function App() {
   }, [embeddedChat, showTokenAnalytics]);
 
   const sidebarNav = useMemo(
-    () => partitionSidebarNav(builtinNav, manifests),
+    () => {
+      const nav = partitionSidebarNav(builtinNav, manifests);
+      return {
+        ...nav,
+        pluginItems: [WORKERS_NAV_ITEM, ...nav.pluginItems],
+      };
+    },
     [builtinNav, manifests],
   );
   const routes = useMemo(
@@ -666,6 +679,7 @@ function SidebarNavLink({ closeMobile, item, t }: SidebarNavLinkProps) {
       <NavLink
         to={path}
         end={path === "/sessions"}
+        reloadDocument={item.reloadDocument}
         onClick={closeMobile}
         className={({ isActive }) =>
           cn(
@@ -821,6 +835,7 @@ interface NavItem {
   label: string;
   labelKey?: string;
   path: string;
+  reloadDocument?: boolean;
 }
 
 interface SidebarNavLinkProps {

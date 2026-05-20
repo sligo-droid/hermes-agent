@@ -403,6 +403,18 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
 
 
 def public_board_index_snapshot() -> dict[str, Any]:
+    def newest_sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
+        worker = item.get("worker") or {}
+        try:
+            created_at = int(worker.get("created_at") or 0)
+        except (TypeError, ValueError):
+            created_at = 0
+        try:
+            session_id = int(item.get("session_id") or 0)
+        except (TypeError, ValueError):
+            session_id = 0
+        return (created_at, session_id, str(item.get("board") or ""))
+
     boards = []
     for board in kanban_db.list_boards(include_archived=False):
         slug = str(board.get("slug") or kanban_db.DEFAULT_BOARD)
@@ -426,6 +438,7 @@ def public_board_index_snapshot() -> dict[str, Any]:
                 "counts": counts,
             }
         )
+    boards.sort(key=newest_sort_key, reverse=True)
     return {"boards": boards}
 
 
