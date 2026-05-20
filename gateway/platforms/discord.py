@@ -1588,14 +1588,19 @@ class DiscordAdapter(BasePlatformAdapter):
             )
         )
 
+    @staticmethod
+    def parse_goal_command_payload(text: str) -> Optional[str]:
+        """Return the payload for a leading Discord /goal command, if present."""
+        raw = str(text or "")
+        match = re.match(r"^\s*/goal(?=$|\s)", raw, re.IGNORECASE)
+        if not match:
+            return None
+        return raw[match.end():].lstrip()
+
     def _slash_command_starts_threaded_work(self, text: str) -> bool:
-        cleaned = str(text or "").strip()
-        if not cleaned.startswith("/"):
+        args = self.parse_goal_command_payload(text)
+        if args is None:
             return False
-        match = re.match(r"^/([^\s]+)(?:\s+(.*))?$", cleaned, re.DOTALL)
-        if not match or match.group(1).lower() != "goal":
-            return False
-        args = match.group(2) or ""
         lower_args = args.strip().lower()
         return bool(
             lower_args

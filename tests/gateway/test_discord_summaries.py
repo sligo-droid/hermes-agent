@@ -349,6 +349,78 @@ def test_project_description_contract_contains_static_project_access(adapter):
     assert len(topic) <= 1024
 
 
+@pytest.mark.parametrize(
+    ("text", "payload"),
+    [
+        ("/goal Ship it", "Ship it"),
+        ("   /goal Ship it", "Ship it"),
+        ("/goal\n\nShip it", "Ship it"),
+        ("/goal", ""),
+        ("/goal   ", ""),
+        ("/subgoal Ship it", None),
+        ("please /goal Ship it", None),
+        ("/goalkeeper Ship it", None),
+        ("/goal: Ship it", None),
+    ],
+)
+def test_discord_goal_command_parser_matches_only_leading_goal_token(adapter, text, payload):
+    assert adapter.parse_goal_command_payload(text) == payload
+
+
+@pytest.mark.asyncio
+async def test_discord_goal_routes_to_kanban_summary_and_preserves_goal_command_for_runner(
+    adapter,
+    monkeypatch,
+):
+    from hermes_cli import discord_worker_boards as dwb
+
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+    ensure_board = MagicMock(
+        return_value=SimpleNamespace(
+            slug="discord-200",
+            public_url="https://kanban.example/workers/200",
+        )
+    )
+    monkeypatch.setattr(dwb, "ensure_discord_thread_board", ensure_board)
+
+    await adapter._handle_message(
+        _make_message(adapter, channel=parent, content="<@999>   /goal Ship the dashboard")
+    )
+
+    ensure_board.assert_called_once()
+    assert ensure_board.call_args.kwargs["initial_request"] == "/goal Ship the dashboard"
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "/goal Ship the dashboard"
+    assert event.feature_summary["kanban_board"]["slug"] == "discord-200"
+
+
+@pytest.mark.asyncio
+async def test_discord_normal_message_calls_only_orchestrator_path_with_original_text(
+    adapter,
+    monkeypatch,
+):
+    from hermes_cli import discord_worker_boards as dwb
+
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    ensure_board = MagicMock(side_effect=AssertionError("normal text must not create a Kanban board"))
+    monkeypatch.setattr(dwb, "ensure_discord_thread_board", ensure_board)
+    adapter._auto_create_thread = AsyncMock()
+
+    await adapter._handle_message(
+        _make_message(adapter, channel=parent, content="<@999> what is /goal routing?")
+    )
+
+    ensure_board.assert_not_called()
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "what is /goal routing?"
+    assert event.feature_summary is None
+
+
 def test_project_description_omits_unparseable_app_access(adapter):
     topic = adapter._render_project_summary_line(
         {
