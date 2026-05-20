@@ -5651,32 +5651,12 @@ class GatewayRunner:
             text = text[:77].rstrip() + "..."
         return text
 
-    def _generate_discord_kanban_feature_title(self, target: Dict[str, Any]) -> str:
+    def _discord_kanban_feature_title(self, target: Dict[str, Any]) -> str:
         existing = str(target.get("title") or "").strip()
         if existing:
             return existing
         board = str(target.get("board") or "").strip()
-        fallback = self._fallback_discord_kanban_feature_title(target)
-        title = ""
-        try:
-            from agent.title_generator import generate_title
-
-            def _title_failure_cb(task: str, exc: BaseException) -> None:
-                logger.debug(
-                    "Discord Kanban feature-title generation failed (%s): %s",
-                    task,
-                    exc,
-                )
-
-            title = generate_title(
-                str(target.get("fallback_title") or fallback),
-                str(target.get("outcome") or ""),
-                timeout=15,
-                failure_callback=_title_failure_cb,
-            ) or ""
-        except Exception:
-            logger.debug("Discord Kanban feature-title generation crashed", exc_info=True)
-        title = title or fallback
+        title = self._fallback_discord_kanban_feature_title(target)
         if board and title:
             try:
                 from hermes_cli.discord_worker_boards import set_feature_summary_title
@@ -5774,10 +5754,7 @@ class GatewayRunner:
                                 continue
                             target_for_sync = dict(target)
                             if not str(target_for_sync.get("title") or "").strip():
-                                title = await asyncio.to_thread(
-                                    self._generate_discord_kanban_feature_title,
-                                    target_for_sync,
-                                )
+                                title = self._discord_kanban_feature_title(target_for_sync)
                                 if title:
                                     target_for_sync["title"] = title
                             sync_key = self._discord_kanban_summary_sync_key(target_for_sync)
