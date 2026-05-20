@@ -596,6 +596,40 @@ def set_goal(
     )
 
 
+def start_direct_goal(
+    *,
+    thread_id: str,
+    goal: str,
+    chat_id: Optional[str] = None,
+    guild_id: Optional[str] = None,
+    parent_channel_id: Optional[str] = None,
+    project_context: Optional[dict[str, Any]] = None,
+) -> DiscordBoard:
+    """Activate a Discord worker board whose work items already exist."""
+    raw_goal = str(goal or "").strip()
+    board = ensure_discord_thread_board(
+        thread_id=thread_id,
+        chat_id=chat_id,
+        guild_id=guild_id,
+        parent_channel_id=parent_channel_id,
+        initial_request=raw_goal,
+        project_context=project_context,
+    )
+    worker = board.worker
+    worker.update(
+        {
+            "root_goal": raw_goal,
+            "goal_status": "active",
+            "phase": "dev",
+            "execution_mode": "kanban_pipeline",
+            "paused": False,
+            "cancelled": False,
+        }
+    )
+    metadata = _update_worker_meta(board.slug, worker)
+    return DiscordBoard(slug=board.slug, metadata=metadata)
+
+
 def start_planner_request(
     *,
     thread_id: str,
