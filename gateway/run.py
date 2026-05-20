@@ -5459,15 +5459,15 @@ class GatewayRunner:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 if attempted >= auto_decompose_per_tick:
                     break
-                # Pin this board for the duration of the call — same
-                # pattern as the dashboard specify endpoint. The
-                # decomposer module connects with no board kwarg and
-                # relies on the env var.
-                prev_env = os.environ.get("HERMES_KANBAN_BOARD")
                 try:
-                    os.environ["HERMES_KANBAN_BOARD"] = slug
+                    from hermes_cli import discord_worker_boards as _dwb
+                    if _dwb.is_discord_worker_board(slug):
+                        continue
+                except Exception:
+                    pass
+                try:
                     try:
-                        triage_ids = _decomp.list_triage_ids()
+                        triage_ids = _decomp.list_triage_ids(board=slug)
                     except Exception as exc:
                         logger.debug(
                             "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
@@ -5480,7 +5480,7 @@ class GatewayRunner:
                         attempted += 1
                         try:
                             outcome = _decomp.decompose_task(
-                                tid, author="auto-decomposer",
+                                tid, author="auto-decomposer", board=slug,
                             )
                         except Exception:
                             logger.exception(
@@ -5507,11 +5507,8 @@ class GatewayRunner:
                                 "kanban auto-decompose [%s]: %s skipped: %s",
                                 slug, tid, outcome.reason,
                             )
-                finally:
-                    if prev_env is None:
-                        os.environ.pop("HERMES_KANBAN_BOARD", None)
-                    else:
-                        os.environ["HERMES_KANBAN_BOARD"] = prev_env
+                except Exception:
+                    logger.exception("kanban auto-decompose: tick failed on board %s", slug)
             return successes
 
         logger.info(

@@ -106,3 +106,51 @@ def test_docker_runner_logs_immediate_registry_failure(monkeypatch, tmp_path):
     assert log is not None
     assert "ghcr.io/nousresearch/hermes-codex-worker:latest" in log
     assert "error from registry: denied" in log
+
+
+def test_planner_output_links_parent_dependencies(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_PLANNER
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    payload = {
+        "status": "planned",
+        "summary": "Planned two steps.",
+        "acceptance_criteria": ["done"],
+        "tasks": [
+            {"title": "Build foundation", "body": "Do first.", "priority": 20, "parents": []},
+            {"title": "Wire feature", "body": "Do second.", "priority": 10, "parents": [0]},
+        ],
+    }
+
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        worker._apply_role_output(
+            conn,
+            task.id,
+            ROLE_PLANNER,
+            payload,
+            board=board.slug,
+            workspace=str(tmp_path / "repo"),
+            expected_run_id=task.current_run_id,
+        )
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+        dev_tasks = [item for item in tasks if item.assignee == "dev"]
+        assert len(dev_tasks) == 2
+        first = next(item for item in dev_tasks if item.title == "Build foundation")
+        second = next(item for item in dev_tasks if item.title == "Wire feature")
+        assert first.status == "ready"
+        assert second.status == "todo"
+        assert second.id in kanban_db.child_ids(conn, first.id)
+    finally:
+        conn.close()
+
+
+def test_planner_schema_uses_parents_not_depends_on():
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_PLANNER
+
+    schema = worker._schema_instructions(ROLE_PLANNER)
+    assert '"parents"' in schema
+    assert "depends_on" not in schema
