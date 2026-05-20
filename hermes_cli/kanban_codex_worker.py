@@ -130,6 +130,15 @@ def _run_codex(
         return result
     finally:
         session.close()
+        try:
+            from agent.codex_worker_auth import sync_codex_worker_home
+
+            sync_codex_worker_home(
+                os.environ.get("CODEX_HOME"),
+                os.environ.get("HERMES_CODEX_WORKER_CREDENTIAL_ID"),
+            )
+        except Exception:
+            pass
 
 
 def _role_extra_args(role: str) -> list[str]:

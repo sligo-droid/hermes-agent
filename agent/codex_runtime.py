@@ -72,6 +72,15 @@ def _close_codex_app_server_session(agent) -> None:
             session.close()
         except Exception:
             pass
+        try:
+            from agent.codex_worker_auth import sync_codex_worker_home
+
+            sync_codex_worker_home(
+                getattr(agent, "_codex_worker_home", None),
+                getattr(agent, "_codex_worker_credential_id", None),
+            )
+        except Exception:
+            pass
     agent._codex_session = None
 
 
@@ -173,8 +182,32 @@ def run_codex_app_server_turn(
             suffix = f": {item_type}" if item_type else ""
             agent._touch_activity(f"Codex app-server event: {method}{suffix}")
 
+        codex_home = getattr(agent, "_codex_worker_home", None)
+        if codex_home is None:
+            try:
+                import uuid
+
+                from agent.codex_worker_auth import prepare_codex_worker_home
+                from hermes_constants import get_hermes_home
+
+                codex_home_path = (
+                    get_hermes_home()
+                    / "codex-worker-homes"
+                    / f"session-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+                )
+                credential_id = prepare_codex_worker_home(
+                    codex_home_path,
+                    parent_agent=agent,
+                )
+                codex_home = str(codex_home_path)
+                agent._codex_worker_home = codex_home
+                agent._codex_worker_credential_id = credential_id
+            except Exception:
+                codex_home = None
+
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            codex_home=codex_home,
             approval_callback=approval_callback,
             on_event=_codex_event_activity,
         )
@@ -246,6 +279,15 @@ def run_codex_app_server_turn(
                 "partial": True,
                 "error": str(exc),
             }
+        try:
+            from agent.codex_worker_auth import sync_codex_worker_home
+
+            sync_codex_worker_home(
+                getattr(agent, "_codex_worker_home", None),
+                getattr(agent, "_codex_worker_credential_id", None),
+            )
+        except Exception:
+            pass
 
         # Splice projected messages into the conversation. The projector emits
         # standard {role, content, tool_calls, tool_call_id} entries, which

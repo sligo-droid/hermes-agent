@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -104,7 +103,7 @@ def _spawn_host_worker(
     workspace_path.mkdir(parents=True, exist_ok=True)
 
     codex_home = _codex_home(task, cfg)
-    _write_minimal_codex_home(codex_home)
+    inherited_credential_id = _write_minimal_codex_home(codex_home)
 
     from hermes_cli import kanban_db
 
@@ -132,6 +131,8 @@ def _spawn_host_worker(
         env["HERMES_KANBAN_CLAIM_LOCK"] = str(task.claim_lock)
     if getattr(task, "current_run_id", None) is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    if inherited_credential_id:
+        env["HERMES_CODEX_WORKER_CREDENTIAL_ID"] = inherited_credential_id
 
     cmd = [sys.executable, "-m", "hermes_cli.kanban_codex_worker"]
     return _spawn_logged_process(task, cmd, str(workspace_path), env, settings=settings, board=board)
@@ -156,7 +157,7 @@ def _spawn_docker_worker(
     workspace_path.mkdir(parents=True, exist_ok=True)
 
     codex_home = _codex_home(task, cfg)
-    _write_minimal_codex_home(codex_home)
+    inherited_credential_id = _write_minimal_codex_home(codex_home)
 
     env = os.environ.copy()
     env.update(
@@ -175,6 +176,8 @@ def _spawn_docker_worker(
         env["HERMES_KANBAN_CLAIM_LOCK"] = str(task.claim_lock)
     if getattr(task, "current_run_id", None) is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    if inherited_credential_id:
+        env["HERMES_CODEX_WORKER_CREDENTIAL_ID"] = inherited_credential_id
 
     from hermes_cli import kanban_db
 
@@ -281,30 +284,11 @@ def _task_still_running(task_id: str, *, board: Optional[str]) -> bool:
         return True
 
 
-def _write_minimal_codex_home(path: Path) -> None:
+def _write_minimal_codex_home(path: Path) -> Optional[str]:
     """Create a Codex home with auth but no Hermes MCP/tool bridge."""
-    config = path / "config.toml"
-    source_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
-    for name in ("auth.json", "credentials.json"):
-        src = source_home / name
-        dst = path / name
-        if src.exists() and not dst.exists():
-            try:
-                shutil.copy2(src, dst)
-            except OSError:
-                pass
-    if config.exists():
-        return
-    config.write_text(
-        "\n".join(
-            [
-                'sandbox_mode = "workspace-write"',
-                'approval_policy = "never"',
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    from agent.codex_worker_auth import prepare_codex_worker_home
+
+    return prepare_codex_worker_home(path)
 
 
 def spawn_or_default(task: Any, workspace: str, *, board: Optional[str] = None) -> Optional[int]:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -101,6 +102,25 @@ def delegate_codex_coding_task(
     except Exception:
         approval_callback = None
 
+    codex_home = None
+    inherited_credential_id = None
+    try:
+        from agent.codex_worker_auth import prepare_codex_worker_home
+        from hermes_constants import get_hermes_home
+
+        codex_home = (
+            get_hermes_home()
+            / "codex-worker-homes"
+            / f"delegate-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        )
+        inherited_credential_id = prepare_codex_worker_home(
+            codex_home,
+            parent_agent=parent_agent,
+        )
+    except Exception:
+        codex_home = None
+        inherited_credential_id = None
+
     def _touch_codex_activity(note: dict) -> None:
         try:
             method = note.get("method", "")
@@ -112,15 +132,25 @@ def delegate_codex_coding_task(
             pass
 
     started = time.monotonic()
-    with CodexAppServerSession(
-        cwd=workdir,
-        approval_callback=approval_callback,
-        on_event=_touch_codex_activity,
-    ) as session:
-        turn = session.run_turn(
-            user_input=worker_prompt,
-            turn_timeout=timeout,
-        )
+    try:
+        with CodexAppServerSession(
+            cwd=workdir,
+            codex_home=str(codex_home) if codex_home is not None else None,
+            approval_callback=approval_callback,
+            on_event=_touch_codex_activity,
+        ) as session:
+            turn = session.run_turn(
+                user_input=worker_prompt,
+                turn_timeout=timeout,
+            )
+    finally:
+        if codex_home is not None and inherited_credential_id:
+            try:
+                from agent.codex_worker_auth import sync_codex_worker_home
+
+                sync_codex_worker_home(codex_home, inherited_credential_id)
+            except Exception:
+                pass
 
     duration = round(time.monotonic() - started, 2)
     success = bool(turn.final_text) and not turn.error and not turn.interrupted

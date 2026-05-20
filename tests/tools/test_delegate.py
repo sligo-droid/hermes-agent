@@ -1557,7 +1557,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "completed")
-        child._credential_pool.acquire_lease.assert_called_once_with()
+        child._credential_pool.acquire_lease.assert_called_once_with("cred-b")
         child._swap_credential.assert_called_once_with(leased_entry)
         child._credential_pool.release_lease.assert_called_once_with("cred-b")
 
@@ -1578,6 +1578,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "error")
+        child._credential_pool.acquire_lease.assert_called_once_with("cred-a")
         child._credential_pool.release_lease.assert_called_once_with("cred-a")
 
 

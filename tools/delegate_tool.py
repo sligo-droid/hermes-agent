@@ -1354,7 +1354,15 @@ def _run_single_child(
     child_pool = getattr(child, "_credential_pool", None)
     leased_cred_id = None
     if child_pool is not None:
-        leased_cred_id = child_pool.acquire_lease()
+        preferred_cred_id = None
+        try:
+            current_entry = child_pool.current()
+            current_status = str(getattr(current_entry, "last_status", "") or "").lower()
+            if current_entry is not None and current_status != "exhausted":
+                preferred_cred_id = getattr(current_entry, "id", None)
+        except Exception:
+            preferred_cred_id = None
+        leased_cred_id = child_pool.acquire_lease(preferred_cred_id)
         if leased_cred_id is not None:
             try:
                 leased_entry = child_pool.current()

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -71,6 +73,72 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     assert captured["env"]["HERMES_KANBAN_BOARD"] == board.slug
     assert captured["env"]["CODEX_HOME"].endswith("/homes/" + task.id)
     assert captured["start_new_session"] is True
+
+
+def test_codex_role_worker_inherits_available_pool_credential(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credential_pool": {
+                    "openai-codex": [
+                        {
+                            "id": "cred-1",
+                            "label": "primary",
+                            "auth_type": "oauth",
+                            "priority": 0,
+                            "source": "manual:device_code",
+                            "access_token": "access-1",
+                            "refresh_token": "refresh-1",
+                            "last_status": "exhausted",
+                            "last_status_at": time.time(),
+                            "last_error_code": 429,
+                            "last_error_reset_at": time.time() + 5 * 3600,
+                        },
+                        {
+                            "id": "cred-2",
+                            "label": "secondary",
+                            "auth_type": "oauth",
+                            "priority": 1,
+                            "source": "manual:device_code",
+                            "access_token": "access-2",
+                            "refresh_token": "refresh-2",
+                        },
+                    ]
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    workspace = tmp_path / "repo"
+    captured = {}
+
+    class Proc:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, cwd, stdout, stderr, env, start_new_session):
+        captured.update({"env": env})
+        return Proc()
+
+    monkeypatch.setattr(workers, "_worker_config", lambda: {"codex_home_root": str(tmp_path / "homes")})
+    monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
+
+    workers.spawn_codex_worker(task, str(workspace), board=board.slug)
+
+    codex_home = Path(captured["env"]["CODEX_HOME"])
+    payload = json.loads((codex_home / "auth.json").read_text())
+    assert captured["env"]["HERMES_CODEX_WORKER_CREDENTIAL_ID"] == "cred-2"
+    assert payload["tokens"]["access_token"] == "access-2"
+    assert payload["tokens"]["refresh_token"] == "refresh-2"
 
 
 def test_codex_role_worker_logs_scheduled_runtime_settings(monkeypatch, tmp_path):
