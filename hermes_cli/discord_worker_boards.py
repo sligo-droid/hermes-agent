@@ -33,6 +33,7 @@ ROLE_ASSIGNEES = frozenset({ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER})
 CODEX_STATE_MAX_EVENTS = 200
 CODEX_STATE_MAX_TEXT_BYTES = 24_000
 CODEX_STATE_LOG_TAIL_BYTES = 64_000
+GOAL_CONTROL_COMMANDS = frozenset({"status", "pause", "resume", "clear", "stop", "done"})
 _POSIX_PATH_RE = re.compile(
     r"(?<![\w:/.-])/(?:home|Users|tmp|var|etc|opt|private|workspace|workspaces|mnt|srv|repo|root)"
     r"(?:/[^\s\"'<>),;{}\[\]]*)?"
@@ -1559,7 +1560,7 @@ def start_planner_request(
     request_id: Optional[str] = None,
     created_by: str = "discord-feature-request",
 ) -> DiscordBoard:
-    raw_request = str(request or "").strip()
+    raw_request = _canonical_planner_request_text(request)
     board = ensure_discord_thread_board(
         thread_id=thread_id,
         chat_id=chat_id,
@@ -1593,13 +1594,30 @@ def start_planner_request(
     return DiscordBoard(slug=board.slug, metadata=metadata)
 
 
+def _canonical_planner_request_text(request: str) -> str:
+    text = re.sub(r"\r\n?", "\n", str(request or "")).strip()
+    match = re.match(r"^/goal(?:\s+(.*))?$", text, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return text
+    args = (match.group(1) or "").strip()
+    if args.lower() in GOAL_CONTROL_COMMANDS:
+        return text
+    return args
+
+
+def _planner_request_fingerprint(request: str) -> str:
+    return re.sub(r"\s+", " ", _canonical_planner_request_text(request)).strip().casefold()
+
+
 def _planner_request_key(request: str, *, request_id: Optional[str] = None) -> str:
+    normalized = re.sub(r"\s+", " ", _canonical_planner_request_text(request)).strip()
+    if normalized:
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        return f"request-{digest}"
     explicit = str(request_id or "").strip()
     if explicit:
         return re.sub(r"[^0-9A-Za-z_.:-]+", "-", explicit)[:80] or "request"
-    normalized = re.sub(r"\s+", " ", str(request or "").strip())
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
-    return f"request-{digest}"
+    return "request-empty"
 
 
 def _planner_instructions() -> list[str]:
@@ -1625,8 +1643,13 @@ def _ensure_planner_task(
 ) -> str:
     conn = kanban_db.connect(board=board)
     try:
-        planner_request = str(request or worker.get("root_goal") or worker.get("initial_request") or "")
+        planner_request = _canonical_planner_request_text(
+            str(request or worker.get("root_goal") or worker.get("initial_request") or "")
+        )
         planner_key = request_key or _planner_request_key(planner_request)
+        existing = _find_existing_planner_task(conn, planner_request)
+        if existing:
+            return existing
         body = json.dumps(
             {
                 "role": ROLE_PLANNER,
@@ -1656,6 +1679,34 @@ def _ensure_planner_task(
         )
     finally:
         conn.close()
+
+
+def _find_existing_planner_task(conn, planner_request: str) -> Optional[str]:
+    fingerprint = _planner_request_fingerprint(planner_request)
+    if not fingerprint:
+        return None
+    rows = conn.execute(
+        """
+        SELECT id, body
+        FROM tasks
+        WHERE title = 'Plan Discord implementation work'
+          AND assignee = ?
+          AND status != 'archived'
+        ORDER BY created_at ASC, id ASC
+        """,
+        (ROLE_PLANNER,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["body"] or "{}")
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        existing_request = payload.get("request") or payload.get("root_goal") or ""
+        if _planner_request_fingerprint(existing_request) == fingerprint:
+            return row["id"]
+    return None
 
 
 def _role_runtime_seconds(role: str) -> Optional[int]:

@@ -175,6 +175,35 @@ def test_feature_request_starts_distinct_planner_tickets(monkeypatch, tmp_path):
     ]
 
 
+def test_goal_reuses_existing_feature_summary_planner(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_planner_request(
+        thread_id="780",
+        request="/goal\n\nBuild the drilldown page",
+        request_id="feature-summary",
+    )
+    reused = dwb.set_goal(
+        thread_id="780",
+        goal="Build the drilldown page",
+        request_id="goal-message",
+    )
+
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+
+    assert reused.slug == board.slug
+    assert len(tasks) == 1
+    assert tasks[0].assignee == "planner"
+    payload = json.loads(tasks[0].body or "{}")
+    assert payload["request"] == "Build the drilldown page"
+
+
 def test_intake_board_reconcile_does_not_create_planner(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
