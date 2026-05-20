@@ -52,6 +52,46 @@ def test_set_goal_creates_planner_task_for_role_lane(monkeypatch, tmp_path):
     assert tasks[0].workspace_kind == "dir"
 
 
+def test_board_thread_state_reflects_kanban_tasks(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(thread_id="780", goal="Track thread emoji state")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        assert dwb.board_thread_state(board.slug) == "active"
+
+        claimed = kanban_db.claim_task(conn, task.id)
+        assert claimed is not None
+        kanban_db.block_task(
+            conn,
+            task.id,
+            reason="needs user input",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert dwb.board_thread_state(board.slug) == "blocked"
+
+        kanban_db.unblock_task(conn, task.id)
+        claimed = kanban_db.claim_task(conn, task.id)
+        assert claimed is not None
+        kanban_db.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+        assert dwb.board_thread_state(board.slug) == "active"
+        dwb._update_worker_meta(board.slug, {"goal_status": "done", "phase": "complete"})
+        assert dwb.board_thread_state(board.slug) == "done"
+
+        failed = kanban_db.create_task(conn, title="Broken ticket", tenant=board.slug)
+        conn.execute(
+            "UPDATE tasks SET status='blocked', last_failure_error='worker crashed' WHERE id=?",
+            (failed,),
+        )
+        conn.commit()
+        assert dwb.board_thread_state(board.slug) == "errored"
+    finally:
+        conn.close()
+
+
 def test_start_direct_goal_activates_board_without_planner(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
