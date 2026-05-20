@@ -528,6 +528,7 @@ def test_public_session_board_auto_refreshes(monkeypatch, tmp_path):
 
     assert '<meta http-equiv="refresh" content="15">' in html
     assert html.count('data-ticket-terminal-url="/workers/6160/tickets/') == 2
+    assert html.count('data-ticket-url="/workers/6160/tickets/') == 2
     assert html.count('data-ticket-move-url="/workers/6160/tickets/') == 2
     assert html.count('class="ticket-card"') == 2
     assert 'id="ticket-move-error"' in html
@@ -540,11 +541,45 @@ def test_public_session_board_auto_refreshes(monkeypatch, tmp_path):
     assert 'id="ticket-modal"' in html
     assert "Terminal Log" in html
     assert "setInterval" in html
+    assert "window.history.pushState" in html
+    assert "const startupTicketId = initialTicketId || ticketIdFromPath();" in html
     assert "Unable to load ticket terminal" in html
     assert '<a class="brand" href="/workers">Hermes<br>Kanban</a>' in html
     assert "Codex result" not in html
     assert "Recent internals" not in html
     assert "codex_state" not in html
+
+
+def test_public_session_ticket_deep_link_opens_modal(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    board = dwb.set_goal(thread_id="6164", goal="Share ticket links")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.list_tasks(conn, include_archived=False)[0].id
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    html = dwb.render_public_session_board_html("6164", active_ticket_id=task_id)
+    assert f'const initialTicketId = "{task_id}";' in html
+    assert f'data-ticket-status="review" data-ticket-move-url="/workers/6164/tickets/{task_id}/move"' in html
+    assert f'data-ticket-url="/workers/6164/tickets/{task_id}"' in html
+    assert "openTicket(startupTicketId" in html
+
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    resp = client.get(f"/workers/6164/tickets/{task_id}")
+    missing = client.get("/workers/6164/tickets/t_missing")
+
+    assert resp.status_code == 200
+    assert f'const initialTicketId = "{task_id}";' in resp.text
+    assert missing.status_code == 404
 
 
 def test_public_session_board_shows_runtime_controls(monkeypatch, tmp_path):
@@ -746,6 +781,7 @@ def test_worker_routes_require_dashboard_auth(monkeypatch, tmp_path):
     index = client.get("/workers")
     session = client.get("/workers/7171")
     ticket_state = client.get(f"/workers/7171/tickets/{task_id}/state")
+    ticket_page = client.get(f"/workers/7171/tickets/{task_id}")
     ticket_terminal = client.get(f"/workers/7171/tickets/{task_id}/terminal")
     ticket_move = client.post(
         f"/workers/7171/tickets/{task_id}/move",
@@ -766,6 +802,7 @@ def test_worker_routes_require_dashboard_auth(monkeypatch, tmp_path):
     assert index.status_code == 401
     assert session.status_code == 401
     assert ticket_state.status_code == 401
+    assert ticket_page.status_code == 401
     assert ticket_terminal.status_code == 401
     assert ticket_move.status_code == 401
     assert root_legacy.status_code == 401

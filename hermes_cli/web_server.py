@@ -333,6 +333,28 @@ async def public_worker_session_board(session_id: str):
         raise HTTPException(status_code=500, detail="Kanban board unavailable")
 
 
+@app.get("/workers/{session_id}/tickets/{task_id}", response_class=HTMLResponse)
+async def public_worker_session_ticket(session_id: str, task_id: str):
+    """Public worker board with one ticket modal opened by URL."""
+    try:
+        from hermes_cli.discord_worker_boards import (
+            render_public_session_board_html,
+            ticket_state_for_session,
+        )
+
+        ticket_state_for_session(session_id, task_id)
+        return HTMLResponse(
+            render_public_session_board_html(session_id, active_ticket_id=task_id)
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    except Exception as exc:
+        _log.warning("public kanban ticket render failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Ticket unavailable")
+
+
 def _worker_action_redirect_url(session_id: str, return_to: Optional[str]) -> str:
     quoted_session = urllib.parse.quote(str(session_id or ""), safe="")
     detail_url = f"/workers/{quoted_session}"
