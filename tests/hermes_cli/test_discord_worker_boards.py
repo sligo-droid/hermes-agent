@@ -336,6 +336,50 @@ def test_public_board_index_lists_session_links(monkeypatch, tmp_path):
     assert "Build the thing" in html
 
 
+def test_generated_summary_title_replaces_workers_board_title(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(thread_id="5158", goal="Build the thing", guild_id="111")
+    dwb.set_feature_summary_title(board.slug, "Deploy Dashboard")
+
+    index_html = dwb.render_public_board_index_html()
+    session_html = dwb.render_public_session_board_html("5158")
+
+    assert '<a class="board-title" href="/workers/5158">Deploy Dashboard</a>' in index_html
+    assert '<h1>Deploy Dashboard</h1>' in session_html
+    assert "Build the thing" not in index_html
+
+
+def test_feature_summary_snapshot_uses_kanban_branch_and_outcome(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(thread_id="5159", goal="Build summary sync", guild_id="111")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        claimed = kanban_db.claim_task(conn, task.id)
+        assert claimed is not None
+        kanban_db.complete_task(
+            conn,
+            task.id,
+            summary="Planner created implementation tickets.",
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    snapshot = dwb.feature_summary_snapshot(board.slug)
+
+    assert snapshot["state"] == "active"
+    assert snapshot["branch"] == "discord/5159"
+    assert snapshot["fallback_title"] == "Build summary sync"
+    assert snapshot["outcome"].startswith("In progress. Planner created implementation tickets.")
+    assert snapshot["sync_key"]
+
+
 def test_public_board_index_lists_operational_row_data(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

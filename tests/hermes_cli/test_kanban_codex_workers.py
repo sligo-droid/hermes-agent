@@ -616,3 +616,18 @@ def test_run_codex_records_app_server_state(monkeypatch, tmp_path):
     assert state["events"][0]["item_type"] == "commandExecution"
     assert "/home/droid/secret" not in rendered
     assert "[REDACTED_PATH]" in rendered
+
+
+def test_update_phase_refreshes_worker_updated_at(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board, _task = _claimed_planner(monkeypatch, tmp_path)
+    monkeypatch.setattr(worker.time, "time", lambda: 12345)
+
+    worker._update_phase(board.slug, "complete", goal_status="done")
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert meta["phase"] == "complete"
+    assert meta["goal_status"] == "done"
+    assert meta["updated_at"] == 12345
