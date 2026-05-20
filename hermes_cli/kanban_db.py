@@ -2055,6 +2055,143 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
     return promoted
 
 
+def parents_blocking_ready(
+    conn: sqlite3.Connection, task_id: str,
+) -> list[dict[str, Any]]:
+    """Return parent tasks that prevent a manual move to ``ready``."""
+    rows = conn.execute(
+        "SELECT t.id, t.title, t.status FROM tasks t "
+        "JOIN task_links l ON l.parent_id = t.id "
+        "WHERE l.child_id = ? AND t.status != 'done'",
+        (task_id,),
+    ).fetchall()
+    return [
+        {"id": r["id"], "title": r["title"], "status": r["status"]}
+        for r in rows
+    ]
+
+
+def set_status_direct(
+    conn: sqlite3.Connection,
+    task_id: str,
+    new_status: str,
+    *,
+    source: str = "dashboard/direct",
+) -> bool:
+    """Direct status write for operator drag/drop moves.
+
+    Structured transitions such as complete/block/archive own their own
+    lifecycle side effects. This helper covers manual column moves like
+    ``todo -> ready`` or yanking a stuck ``running`` task back to ``ready``.
+    """
+    with write_txn(conn):
+        prev = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if prev is None:
+            return False
+
+        if new_status == "ready" and parents_blocking_ready(conn, task_id):
+            return False
+
+        was_running = prev["status"] == "running"
+        reopening_satisfied_parent = (
+            prev["status"] in {"done", "archived"}
+            and new_status not in {"done", "archived"}
+        )
+
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, "
+            "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
+            "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
+            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
+            "WHERE id = ?",
+            (new_status, new_status, new_status, new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = None
+        if was_running and new_status != "running" and prev["current_run_id"]:
+            run_id = _end_run(
+                conn, task_id,
+                outcome="reclaimed", status="reclaimed",
+                summary=f"status changed to {new_status} ({source})",
+            )
+        _append_event(
+            conn,
+            task_id,
+            "status",
+            {"status": new_status},
+            run_id=run_id,
+        )
+        if reopening_satisfied_parent:
+            for row in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+                (task_id,),
+            ).fetchall():
+                child_id = row["child_id"]
+                demoted = conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'",
+                    (child_id,),
+                )
+                if demoted.rowcount == 1:
+                    _append_event(
+                        conn,
+                        child_id,
+                        "status",
+                        {
+                            "status": "todo",
+                            "reason": "parent_reopened",
+                            "parent": task_id,
+                        },
+                    )
+    if new_status in {"done", "ready"}:
+        recompute_ready(conn)
+    return True
+
+
+def move_task_status(
+    conn: sqlite3.Connection,
+    task_id: str,
+    new_status: str,
+    *,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    block_reason: Optional[str] = None,
+    source: str = "dashboard/direct",
+) -> bool:
+    """Apply the same manual status move semantics across UI surfaces."""
+    if new_status == "done":
+        return complete_task(
+            conn,
+            task_id,
+            result=result,
+            summary=summary,
+            metadata=metadata,
+        )
+    if new_status == "blocked":
+        return block_task(conn, task_id, reason=block_reason)
+    if new_status == "scheduled":
+        return schedule_task(conn, task_id, reason=block_reason)
+    if new_status == "ready":
+        current = get_task(conn, task_id)
+        if current and current.status in ("blocked", "scheduled"):
+            return unblock_task(conn, task_id)
+        return set_status_direct(conn, task_id, "ready", source=source)
+    if new_status == "archived":
+        return archive_task(conn, task_id)
+    if new_status == "running":
+        raise ValueError(
+            "Cannot set status to 'running' directly; use the dispatcher/claim path"
+        )
+    if new_status in {"todo", "triage", "review"}:
+        return set_status_direct(conn, task_id, new_status, source=source)
+    raise ValueError(f"unknown status: {new_status}")
+
+
 # ---------------------------------------------------------------------------
 # Claim / complete / block
 # ---------------------------------------------------------------------------

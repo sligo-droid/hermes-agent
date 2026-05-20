@@ -34,11 +34,16 @@ CODEX_STATE_MAX_EVENTS = 200
 CODEX_STATE_MAX_TEXT_BYTES = 24_000
 CODEX_STATE_LOG_TAIL_BYTES = 64_000
 GOAL_CONTROL_COMMANDS = frozenset({"status", "pause", "resume", "clear", "stop", "done"})
+PUBLIC_BOARD_COLUMNS = ("triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done")
 _POSIX_PATH_RE = re.compile(
     r"(?<![\w:/.-])/(?:home|Users|tmp|var|etc|opt|private|workspace|workspaces|mnt|srv|repo|root)"
     r"(?:/[^\s\"'<>),;{}\[\]]*)?"
 )
 _WINDOWS_PATH_RE = re.compile(r"(?<![\w:/.-])[A-Za-z]:\\[^\s\"'<>),;{}\[\]]+")
+
+
+class TicketMoveConflict(RuntimeError):
+    """Raised when a ticket status move is valid syntax but refused."""
 
 
 def board_slug_for_discord_thread(thread_id: str) -> str:
@@ -503,6 +508,58 @@ def ticket_terminal_feed_for_session(session_id: str, task_id: str) -> dict[str,
     return _ticket_terminal_feed_for_board(board, task_id, worker=worker)
 
 
+def move_ticket_for_session(session_id: str, task_id: str, status: str) -> dict[str, Any]:
+    """Move one public worker-board ticket to another visible status column."""
+    board = board_slug_for_discord_thread(session_id)
+    if not kanban_db.board_exists(board):
+        raise KeyError("unknown board session")
+    worker = _read_worker_meta(board)
+    if worker.get("kind") != "discord_worker_board":
+        raise KeyError("unknown board session")
+
+    task_id = str(task_id or "").strip()
+    new_status = str(status or "").strip().lower()
+    if not task_id:
+        raise KeyError("unknown ticket")
+    if new_status not in PUBLIC_BOARD_COLUMNS:
+        raise ValueError(f"unknown status: {new_status}")
+
+    conn = kanban_db.connect(board=board)
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise KeyError("unknown ticket")
+        ok = kanban_db.move_task_status(
+            conn,
+            task_id,
+            new_status,
+            source="workers-page",
+        )
+        if not ok:
+            if new_status == "ready":
+                blockers = kanban_db.parents_blocking_ready(conn, task_id)
+                if blockers:
+                    names = ", ".join(
+                        f"{p['title']!r} ({p['id']}, status={p['status']})"
+                        for p in blockers
+                    )
+                    raise TicketMoveConflict(
+                        "Cannot move to 'ready': blocked by parent(s) "
+                        f"not done - {names}"
+                    )
+            raise TicketMoveConflict(
+                f"status transition to {new_status!r} not valid from current state"
+            )
+    finally:
+        conn.close()
+
+    snapshot = _public_board_snapshot_for_board(board)
+    updated = next(
+        (task for task in snapshot.get("tasks", []) if task.get("id") == task_id),
+        None,
+    )
+    return {"ok": True, "task": updated, "snapshot": snapshot}
+
+
 def _ticket_state_for_board(
     board: str,
     task_id: str,
@@ -822,7 +879,7 @@ def _public_review_text(worker: dict[str, Any]) -> str:
 def _public_count_text(counts: dict[str, Any]) -> str:
     if not counts:
         return "none"
-    ordered = ["triage", "todo", "ready", "running", "blocked", "done"]
+    ordered = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"]
     keys = [key for key in ordered if key in counts]
     keys.extend(sorted(key for key in counts if key not in ordered))
     return " ".join(f"{key}:{counts.get(key) or 0}" for key in keys)
@@ -1190,15 +1247,22 @@ def _workers_page_css() -> str:
     button, .button-link { background: var(--text); border: 1px solid var(--text); border-radius: 6px; color: #ffffff; cursor: pointer; font: inherit; padding: 6px 10px; text-decoration: none; }
     button:hover, .button-link:hover { background: #374151; }
     .board { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
-    .column { min-height: 190px; overflow: hidden; }
+    .column { min-height: 190px; overflow: hidden; transition: border-color 120ms ease, box-shadow 120ms ease; }
+    .column.column-drop { border-color: var(--code); box-shadow: 0 0 0 2px rgba(89, 101, 242, 0.16); }
+    .column.column-disabled { opacity: 0.72; }
     .column h2 { align-items: center; border-bottom: 1px solid var(--line-soft); display: flex; font-size: 14px; justify-content: space-between; margin: 0; padding: 12px; text-transform: uppercase; }
-    .column ul { list-style: none; margin: 0; padding: 10px; }
+    .column ul { list-style: none; margin: 0; min-height: 132px; padding: 10px; }
     .column li { background: var(--panel-soft); border: 1px solid var(--line-soft); border-radius: 6px; margin-bottom: 8px; padding: 10px; }
+    .ticket-card { cursor: grab; touch-action: manipulation; }
+    .ticket-card.dragging { opacity: 0.48; }
+    .ticket-card:active { cursor: grabbing; }
     .ticket { appearance: none; background: transparent; border: 0; color: inherit; cursor: pointer; display: block; font: inherit; padding: 0; text-align: left; width: 100%; }
     .ticket:hover strong { color: var(--link); text-decoration: underline; }
     .ticket:focus-visible { outline: 2px solid var(--code); outline-offset: 3px; }
     .ticket strong { display: block; font-size: 14px; line-height: 1.25; }
     .ticket p { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .move-error { background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; color: #991b1b; font-size: 13px; margin-bottom: 12px; padding: 10px 12px; }
+    .move-error[hidden] { display: none; }
     .criteria { margin-bottom: 18px; padding: 14px; }
     .criteria strong { display: block; font-size: 14px; margin-bottom: 8px; }
     .criteria ol { margin: 0; padding-left: 20px; }
@@ -1220,7 +1284,7 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
     tasks = snapshot["tasks"]
     runtime = snapshot.get("runtime") or {"state": "idle", "reason": "no active tickets"}
     session_id = str(snapshot.get("session_id") or worker.get("thread_id") or "")
-    columns = ["triage", "todo", "ready", "running", "blocked", "done"]
+    columns = list(PUBLIC_BOARD_COLUMNS)
     by_status = {status: [] for status in columns}
     for task in tasks:
         by_status.setdefault(task["status"], []).append(task)
@@ -1232,22 +1296,37 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
     for status in columns:
         items = by_status.get(status, [])
         body = "\n".join(
-            "<li><button type=\"button\" class=\"ticket\" data-ticket-id=\"{id}\" "
-            "data-ticket-title=\"{title}\" data-ticket-terminal-url=\"{url}\">"
+            "<li class=\"ticket-card\" draggable=\"true\" data-ticket-item "
+            "data-ticket-id=\"{id}\" data-ticket-status=\"{status}\" "
+            "data-ticket-move-url=\"{move_url}\">"
+            "<button type=\"button\" class=\"ticket\" data-ticket-id=\"{id}\" "
+            "data-ticket-title=\"{title}\" data-ticket-terminal-url=\"{terminal_url}\">"
             "<strong>{title}</strong><br><code>{id}</code> {assignee}<p>{summary}</p>"
             "</button></li>".format(
                 title=esc(item["title"]),
                 id=esc(item["id"]),
-                url=esc(
+                status=esc(status),
+                terminal_url=esc(
                     f"/workers/{quote(session_id, safe='')}/tickets/"
                     f"{quote(str(item['id']), safe='')}/terminal"
+                ),
+                move_url=esc(
+                    f"/workers/{quote(session_id, safe='')}/tickets/"
+                    f"{quote(str(item['id']), safe='')}/move"
                 ),
                 assignee=esc(item["assignee"] or ""),
                 summary=esc(item["latest_summary"] or ""),
             )
             for item in items
         )
-        cards.append(f"<section class=\"column\"><h2>{esc(status)} <span>{len(items)}</span></h2><ul>{body}</ul></section>")
+        disabled = " column-disabled" if status == "running" else ""
+        drop_disabled = "true" if status == "running" else "false"
+        cards.append(
+            f"<section class=\"column{disabled}\" data-column data-status=\"{esc(status)}\" "
+            f"data-drop-disabled=\"{drop_disabled}\"><h2>{esc(status)} "
+            f"<span data-column-count>{len(items)}</span></h2>"
+            f"<ul data-ticket-list>{body}</ul></section>"
+        )
     criteria = "\n".join(
         f"<li>{esc(c.get('text') if isinstance(c, dict) else c)}</li>"
         for c in (worker.get("criteria") or [])
@@ -1301,6 +1380,7 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
   </header>
   <main>
     <div class="criteria"><strong>Acceptance Criteria</strong><ol>{criteria}</ol></div>
+    <div class="move-error" id="ticket-move-error" role="alert" hidden></div>
     <div class="board">{''.join(cards)}</div>
   </main>
   <div class="modal" id="ticket-modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="ticket-modal-title">
@@ -1318,8 +1398,79 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
       const title = document.getElementById("ticket-modal-title");
       const body = document.getElementById("ticket-modal-body");
       const close = document.getElementById("ticket-modal-close");
+      const moveError = document.getElementById("ticket-move-error");
       let refreshTimer = null;
       let activeUrl = "";
+      let draggingItem = null;
+      let touchState = null;
+      let suppressClickUntil = 0;
+      const columns = Array.from(document.querySelectorAll("[data-column]"));
+      const clearColumnDrops = () => {{
+        columns.forEach((column) => column.classList.remove("column-drop"));
+      }};
+      const showMoveError = (message) => {{
+        if (!moveError) return;
+        moveError.textContent = message || "Move failed";
+        moveError.hidden = false;
+      }};
+      const clearMoveError = () => {{
+        if (!moveError) return;
+        moveError.textContent = "";
+        moveError.hidden = true;
+      }};
+      const updateCounts = () => {{
+        columns.forEach((column) => {{
+          const count = column.querySelector("[data-column-count]");
+          const list = column.querySelector("[data-ticket-list]");
+          if (count && list) count.textContent = String(list.querySelectorAll("[data-ticket-item]").length);
+        }});
+      }};
+      const parseApiError = async (response) => {{
+        try {{
+          const payload = await response.json();
+          return payload?.detail || `HTTP ${{response.status}}`;
+        }} catch (_error) {{
+          return `HTTP ${{response.status}}`;
+        }}
+      }};
+      const moveTicket = async (item, targetColumn) => {{
+        if (!item || !targetColumn) return;
+        const status = targetColumn.dataset.status || "";
+        if (targetColumn.dataset.dropDisabled === "true") {{
+          showMoveError("Workers can only enter running through the dispatcher.");
+          return;
+        }}
+        if (!status || item.dataset.ticketStatus === status) return;
+        const targetList = targetColumn.querySelector("[data-ticket-list]");
+        if (!targetList) return;
+
+        clearMoveError();
+        const originalParent = item.parentElement;
+        const originalNext = item.nextSibling;
+        const originalStatus = item.dataset.ticketStatus || "";
+        targetList.appendChild(item);
+        item.dataset.ticketStatus = status;
+        updateCounts();
+        try {{
+          const response = await fetch(item.dataset.ticketMoveUrl, {{
+            method: "POST",
+            headers: {{
+              "Accept": "application/json",
+              "Content-Type": "application/json",
+            }},
+            body: JSON.stringify({{ status }}),
+          }});
+          if (!response.ok) {{
+            throw new Error(await parseApiError(response));
+          }}
+          window.location.reload();
+        }} catch (error) {{
+          if (originalParent) originalParent.insertBefore(item, originalNext);
+          item.dataset.ticketStatus = originalStatus;
+          updateCounts();
+          showMoveError(`Move failed: ${{error?.message || error}}`);
+        }}
+      }};
       const hide = () => {{
         if (refreshTimer) {{
           clearInterval(refreshTimer);
@@ -1347,6 +1498,92 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
         body.textContent = renderTerminal(feed);
         body.scrollTop = body.scrollHeight;
       }};
+      document.querySelectorAll("[data-ticket-item]").forEach((item) => {{
+        item.addEventListener("dragstart", (event) => {{
+          draggingItem = item;
+          item.classList.add("dragging");
+          if (event.dataTransfer) {{
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/plain", item.dataset.ticketId || "");
+          }}
+        }});
+        item.addEventListener("dragend", () => {{
+          item.classList.remove("dragging");
+          draggingItem = null;
+          clearColumnDrops();
+        }});
+        item.addEventListener("pointerdown", (event) => {{
+          if (event.pointerType === "mouse" || event.button !== 0) return;
+          touchState = {{
+            item,
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            targetColumn: null,
+            started: false,
+          }};
+          if (item.setPointerCapture) item.setPointerCapture(event.pointerId);
+        }});
+      }});
+      columns.forEach((column) => {{
+        column.addEventListener("dragover", (event) => {{
+          if (!draggingItem || column.dataset.dropDisabled === "true") return;
+          event.preventDefault();
+          column.classList.add("column-drop");
+          if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+        }});
+        column.addEventListener("dragleave", (event) => {{
+          if (!column.contains(event.relatedTarget)) column.classList.remove("column-drop");
+        }});
+        column.addEventListener("drop", (event) => {{
+          if (!draggingItem) return;
+          event.preventDefault();
+          clearColumnDrops();
+          moveTicket(draggingItem, column);
+        }});
+      }});
+      document.addEventListener("pointermove", (event) => {{
+        if (!touchState || event.pointerId !== touchState.pointerId) return;
+        const dx = Math.abs(event.clientX - touchState.startX);
+        const dy = Math.abs(event.clientY - touchState.startY);
+        if (!touchState.started && dx + dy < 10) return;
+        touchState.started = true;
+        draggingItem = touchState.item;
+        touchState.item.classList.add("dragging");
+        event.preventDefault();
+        const target = document.elementFromPoint(event.clientX, event.clientY)?.closest("[data-column]");
+        clearColumnDrops();
+        if (target && target.dataset.dropDisabled !== "true") {{
+          target.classList.add("column-drop");
+          touchState.targetColumn = target;
+        }} else {{
+          touchState.targetColumn = null;
+        }}
+      }}, {{ passive: false }});
+      document.addEventListener("pointerup", (event) => {{
+        if (!touchState || event.pointerId !== touchState.pointerId) return;
+        const state = touchState;
+        touchState = null;
+        clearColumnDrops();
+        state.item.classList.remove("dragging");
+        draggingItem = null;
+        if (state.started) {{
+          suppressClickUntil = Date.now() + 350;
+          moveTicket(state.item, state.targetColumn);
+        }}
+      }});
+      document.addEventListener("pointercancel", () => {{
+        if (touchState?.item) touchState.item.classList.remove("dragging");
+        touchState = null;
+        draggingItem = null;
+        clearColumnDrops();
+      }});
+      document.addEventListener("click", (event) => {{
+        if (Date.now() < suppressClickUntil && event.target.closest("[data-ticket-item]")) {{
+          event.preventDefault();
+          event.stopPropagation();
+        }}
+      }}, true);
       document.querySelectorAll("[data-ticket-terminal-url]").forEach((button) => {{
         button.addEventListener("click", async () => {{
           show(button.dataset.ticketTitle || button.dataset.ticketId || "Ticket State");

@@ -527,6 +527,14 @@ def test_public_session_board_auto_refreshes(monkeypatch, tmp_path):
 
     assert '<meta http-equiv="refresh" content="15">' in html
     assert html.count('data-ticket-terminal-url="/workers/6160/tickets/') == 2
+    assert html.count('data-ticket-move-url="/workers/6160/tickets/') == 2
+    assert html.count('class="ticket-card"') == 2
+    assert 'id="ticket-move-error"' in html
+    assert 'data-drop-disabled="true"' in html
+    assert "Workers can only enter running through the dispatcher." in html
+    assert "JSON.stringify({ status })" in html
+    for status in dwb.PUBLIC_BOARD_COLUMNS:
+        assert f'data-status="{status}"' in html
     assert 'id="ticket-modal"' in html
     assert "Terminal Log" in html
     assert "setInterval" in html
@@ -535,7 +543,6 @@ def test_public_session_board_auto_refreshes(monkeypatch, tmp_path):
     assert "Codex result" not in html
     assert "Recent internals" not in html
     assert "codex_state" not in html
-    assert "JSON.stringify" not in html
 
 
 def test_public_session_board_shows_runtime_controls(monkeypatch, tmp_path):
@@ -609,6 +616,113 @@ def test_public_kanban_web_routes(monkeypatch, tmp_path):
     assert missing.status_code == 404
 
 
+def test_worker_ticket_move_endpoint_moves_between_columns(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    board = dwb.set_goal(thread_id="7172", goal="Move tickets")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.list_tasks(conn, include_archived=False)[0].id
+    finally:
+        conn.close()
+
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    resp = client.post(
+        f"/workers/7172/tickets/{task_id}/move",
+        json={"status": "todo"},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["task"]["id"] == task_id
+    assert data["task"]["status"] == "todo"
+    assert any(
+        task["id"] == task_id and task["status"] == "todo"
+        for task in data["snapshot"]["tasks"]
+    )
+
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        assert kanban_db.get_task(conn, task_id).status == "todo"
+    finally:
+        conn.close()
+
+
+def test_worker_ticket_move_endpoint_rejects_running_target(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    board = dwb.set_goal(thread_id="7173", goal="Reject running")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.list_tasks(conn, include_archived=False)[0].id
+    finally:
+        conn.close()
+
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    resp = client.post(
+        f"/workers/7173/tickets/{task_id}/move",
+        json={"status": "running"},
+    )
+
+    assert resp.status_code == 400
+    assert "running" in resp.json()["detail"]
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        assert kanban_db.get_task(conn, task_id).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_worker_ticket_move_endpoint_reports_ready_blockers(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    board = dwb.set_goal(thread_id="7174", goal="Ready blockers")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        parent_id = kanban_db.create_task(conn, title="Parent ticket", tenant=board.slug)
+        child_id = kanban_db.create_task(
+            conn,
+            title="Child ticket",
+            parents=[parent_id],
+            tenant=board.slug,
+        )
+    finally:
+        conn.close()
+
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    resp = client.post(
+        f"/workers/7174/tickets/{child_id}/move",
+        json={"status": "ready"},
+    )
+    missing = client.post(
+        "/workers/7174/tickets/t_missing/move",
+        json={"status": "todo"},
+    )
+
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert "Cannot move to 'ready'" in detail
+    assert parent_id in detail
+    assert "Parent ticket" in detail
+    assert missing.status_code == 404
+
+
 def test_worker_routes_require_dashboard_auth(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from fastapi.testclient import TestClient
@@ -631,6 +745,10 @@ def test_worker_routes_require_dashboard_auth(monkeypatch, tmp_path):
     session = client.get("/workers/7171")
     ticket_state = client.get(f"/workers/7171/tickets/{task_id}/state")
     ticket_terminal = client.get(f"/workers/7171/tickets/{task_id}/terminal")
+    ticket_move = client.post(
+        f"/workers/7171/tickets/{task_id}/move",
+        json={"status": "todo"},
+    )
     root_legacy = client.get("/7171", follow_redirects=False)
     kanban_legacy = client.get("/kanban/7171", follow_redirects=False)
     token_resp = client.get(f"/workers/public/kanban/{token}")
@@ -647,6 +765,7 @@ def test_worker_routes_require_dashboard_auth(monkeypatch, tmp_path):
     assert session.status_code == 401
     assert ticket_state.status_code == 401
     assert ticket_terminal.status_code == 401
+    assert ticket_move.status_code == 401
     assert root_legacy.status_code == 401
     assert kanban_legacy.status_code == 401
     assert token_resp.status_code == 401
