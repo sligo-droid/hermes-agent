@@ -11,7 +11,13 @@ from typing import Any, Optional
 
 from agent.transports.codex_app_server_session import CodexAppServerSession
 from hermes_cli import kanban_db
-from hermes_cli.discord_worker_boards import ROLE_DEV, ROLE_PLANNER, ROLE_REVIEWER
+from hermes_cli.discord_worker_boards import (
+    ROLE_DEV,
+    ROLE_PLANNER,
+    ROLE_REVIEWER,
+    record_codex_worker_event,
+    record_codex_worker_result,
+)
 
 
 def main() -> int:
@@ -28,7 +34,7 @@ def main() -> int:
         if task is None:
             return 2
         prompt = _build_prompt(conn, task_id, role)
-        result = _run_codex(prompt, workspace, role)
+        result = _run_codex(prompt, workspace, role, task_id=task_id, board=board)
         if result.error:
             raise RuntimeError(result.error)
         payload = _parse_json(result.final_text)
@@ -86,8 +92,22 @@ def _schema_instructions(role: str) -> str:
     )
 
 
-def _run_codex(prompt: str, workspace: str, role: str):
+def _run_codex(
+    prompt: str,
+    workspace: str,
+    role: str,
+    *,
+    task_id: str,
+    board: Optional[str],
+):
     extra_args = _role_extra_args(role)
+
+    def on_event(note: dict) -> None:
+        try:
+            record_codex_worker_event(task_id, board=board, event=note)
+        except Exception:
+            pass
+
     session = CodexAppServerSession(
         cwd=workspace,
         codex_home=os.environ.get("CODEX_HOME"),
@@ -96,9 +116,15 @@ def _run_codex(prompt: str, workspace: str, role: str):
             "HERMES_DISABLE_MCP": "1",
             "HERMES_CODEX_WORKER_NETWORK_ACCESS": "1",
         },
+        on_event=on_event,
     )
     try:
-        return session.run_turn(prompt, turn_timeout=_role_timeout(role))
+        result = session.run_turn(prompt, turn_timeout=_role_timeout(role))
+        try:
+            record_codex_worker_result(task_id, board=board, result=result)
+        except Exception:
+            pass
+        return result
     finally:
         session.close()
 

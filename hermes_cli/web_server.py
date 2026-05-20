@@ -165,24 +165,6 @@ def _has_dashboard_access(request: Request) -> bool:
     return _has_valid_session_token(request) or _has_valid_basic_auth(request)
 
 
-def _is_public_worker_board_path(path: str) -> bool:
-    parts = [part for part in path.strip("/").split("/") if part]
-    if parts == ["workers"]:
-        return True
-    if len(parts) == 2 and parts[0] == "workers":
-        return True
-    if len(parts) == 3 and parts[:2] == ["public", "kanban"]:
-        return True
-    if len(parts) == 4 and parts[:3] in (
-        ["workers", "public", "kanban"],
-        ["kanban", "public", "kanban"],
-    ):
-        return True
-    if len(parts) == 2 and parts[0] == "kanban":
-        return True
-    return len(parts) == 1 and parts[0].isdigit()
-
-
 def _basic_auth_challenge() -> JSONResponse:
     return JSONResponse(
         status_code=401,
@@ -302,8 +284,6 @@ async def auth_middleware(request: Request, call_next):
                     ),
                 },
             )
-    if _is_public_worker_board_path(request.url.path):
-        return await call_next(request)
     if not _has_dashboard_access(request):
         return _basic_auth_challenge()
     return await call_next(request)
@@ -351,6 +331,70 @@ async def public_worker_session_board(session_id: str):
     except Exception as exc:
         _log.warning("public kanban session render failed: %s", exc)
         raise HTTPException(status_code=500, detail="Kanban board unavailable")
+
+
+@app.post("/workers/{session_id}/start")
+async def start_worker_session_board(session_id: str):
+    """Start or resume a Discord worker session board."""
+    try:
+        from hermes_cli.discord_worker_boards import (
+            board_slug_for_discord_thread,
+            start_board,
+        )
+        from hermes_cli import kanban_db
+
+        board = board_slug_for_discord_thread(session_id)
+        if not kanban_db.board_exists(board):
+            raise KeyError("unknown board session")
+        start_board(board)
+        return RedirectResponse(url="/workers", status_code=303)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Kanban board not found")
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Kanban board not found")
+    except Exception as exc:
+        _log.warning("worker board start failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Kanban board unavailable")
+
+
+@app.post("/workers/{session_id}/pause")
+async def pause_worker_session_board(session_id: str):
+    """Pause a Discord worker session board."""
+    try:
+        from hermes_cli.discord_worker_boards import (
+            board_slug_for_discord_thread,
+            pause_board,
+        )
+        from hermes_cli import kanban_db
+
+        board = board_slug_for_discord_thread(session_id)
+        if not kanban_db.board_exists(board):
+            raise KeyError("unknown board session")
+        pause_board(board, reason="workers-page")
+        return RedirectResponse(url="/workers", status_code=303)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Kanban board not found")
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Kanban board not found")
+    except Exception as exc:
+        _log.warning("worker board pause failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Kanban board unavailable")
+
+
+@app.get("/workers/{session_id}/tickets/{task_id}/state", response_class=JSONResponse)
+async def worker_ticket_state(session_id: str, task_id: str):
+    """Detailed read-only state for one Discord worker ticket."""
+    try:
+        from hermes_cli.discord_worker_boards import ticket_state_for_session
+
+        return JSONResponse(ticket_state_for_session(session_id, task_id))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Ticket state not found")
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Ticket state not found")
+    except Exception as exc:
+        _log.warning("worker ticket state render failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Ticket state unavailable")
 
 
 @app.get("/{session_id:int}", response_class=HTMLResponse)
