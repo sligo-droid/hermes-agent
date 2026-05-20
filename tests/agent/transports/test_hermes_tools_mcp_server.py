@@ -8,9 +8,9 @@ build helper assembles a server when the SDK is present.
 
 from __future__ import annotations
 
-from unittest.mock import patch
-
-import pytest
+import inspect
+import json
+from types import SimpleNamespace
 
 
 class TestModuleSurface:
@@ -103,6 +103,54 @@ class TestModuleSurface:
             assert orch_tool in EXPOSED_TOOLS, (
                 f"{orch_tool!r} missing from codex callback"
             )
+
+    def test_generated_handler_accepts_top_level_schema_args(self):
+        """Regression: FastMCP must not expose a synthetic required
+        ``kwargs`` parameter. Codex validates MCP tool schemas strictly and
+        starts the server only if arguments are top-level JSON object fields."""
+        from agent.transports.hermes_tools_mcp_server import _make_handler
+
+        params_schema = {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["query"],
+        }
+
+        def dispatch(name, args):
+            return json.dumps({"name": name, "args": args})
+
+        handler = _make_handler("web_search", "Search the web", params_schema, dispatch)
+        signature = inspect.signature(handler)
+
+        assert list(signature.parameters) == ["query", "limit"]
+        assert signature.parameters["query"].default is inspect.Parameter.empty
+        assert signature.parameters["limit"].default is None
+        result = json.loads(handler(query="Hermes", limit=3))
+        assert result == {
+            "name": "web_search",
+            "args": {"query": "Hermes", "limit": 3},
+        }
+
+    def test_fastmcp_tool_schema_is_patched_to_hermes_schema(self):
+        from agent.transports.hermes_tools_mcp_server import _patch_fastmcp_tool_schema
+
+        tool = SimpleNamespace(parameters={"properties": {"kwargs": {"title": "Kwargs"}}})
+        mcp = SimpleNamespace(
+            _tool_manager=SimpleNamespace(get_tool=lambda name: tool)
+        )
+        params_schema = {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        }
+
+        _patch_fastmcp_tool_schema(mcp, "web_search", params_schema)
+
+        assert tool.parameters == params_schema
+        assert "kwargs" not in tool.parameters["properties"]
 
 
 class TestMain:
