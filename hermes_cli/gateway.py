@@ -69,6 +69,21 @@ class ProfileGatewayProcess:
     path: Path
     pid: int
 
+
+def _restart_dashboard_after_gateway_restart(args) -> None:
+    if getattr(args, "no_dashboard_restart", False):
+        return
+    try:
+        from hermes_cli.dashboard_lifecycle import restart_dashboard_if_running
+
+        restart_dashboard_if_running(
+            reason="gateway restart",
+            quiet_when_missing=True,
+        )
+    except Exception as exc:
+        print(f"⚠ Dashboard restart failed: {exc}")
+
+
 def _get_service_pids() -> set:
     """Return PIDs currently managed by systemd or launchd gateway services.
 
@@ -5312,7 +5327,9 @@ def _gateway_command_inner(args):
                 # stopped and can die before the replacement is stable.
                 gateway_windows.start()
             else:
+                _restart_dashboard_after_gateway_restart(args)
                 run_gateway(verbose=0)
+            _restart_dashboard_after_gateway_restart(args)
             return
         
         if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
@@ -5341,6 +5358,7 @@ def _gateway_command_inner(args):
             service_configured = gateway_windows.is_installed()
             try:
                 gateway_windows.restart()
+                _restart_dashboard_after_gateway_restart(args)
                 return
             except (subprocess.CalledProcessError, RuntimeError, OSError):
                 pass
@@ -5377,7 +5395,11 @@ def _gateway_command_inner(args):
 
             # Start fresh
             print("Starting gateway...")
+            _restart_dashboard_after_gateway_restart(args)
             run_gateway(verbose=0)
+
+        if service_available:
+            _restart_dashboard_after_gateway_restart(args)
     
     elif subcmd == "status":
         deep = getattr(args, 'deep', False)

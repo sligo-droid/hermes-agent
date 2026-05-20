@@ -25,6 +25,9 @@ This starts a local web server and opens `http://127.0.0.1:9119` in your browser
 | `--no-open` | — | Don't auto-open the browser |
 | `--insecure` | off | Allow binding to non-localhost hosts (**DANGEROUS** — exposes API keys on the network; pair with a firewall and strong auth) |
 | `--tui` | off | Expose the in-browser Chat tab (embedded `hermes --tui` via PTY/WebSocket). Alternatively set `HERMES_DASHBOARD_TUI=1`. |
+| `--restart` | — | Restart a running dashboard with its previous launch command and exit |
+| `--stop` | — | Stop running dashboard processes and exit |
+| `--status` | — | List running dashboard processes and exit |
 
 ```bash
 # Custom port
@@ -38,7 +41,12 @@ hermes dashboard --no-open
 
 # Enable the in-browser Chat tab
 hermes dashboard --tui
+
+# Restart the current dashboard process
+hermes dashboard --restart
 ```
+
+When you run `hermes gateway restart`, Hermes also restarts an already-running dashboard so the browser UI and Python backend stay on the same code. Use `hermes gateway restart --no-dashboard-restart` to leave the dashboard untouched.
 
 ## Prerequisites
 

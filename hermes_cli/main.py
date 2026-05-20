@@ -10185,6 +10185,12 @@ def cmd_dashboard(args):
         remaining = _find_stale_dashboard_pids()
         sys.exit(1 if remaining else 0)
 
+    if getattr(args, "restart", False):
+        from hermes_cli.dashboard_lifecycle import restart_dashboard_if_running
+
+        restarted = restart_dashboard_if_running(reason="requested via --restart")
+        sys.exit(0 if restarted else 0)
+
     try:
         import fastapi  # noqa: F401
         import uvicorn  # noqa: F401
@@ -10219,8 +10225,18 @@ def cmd_dashboard(args):
         print(f"→ Skipping web UI build (--skip-build); using dist at {_dist_root}")
 
     from hermes_cli.web_server import start_server
+    from hermes_cli.dashboard_lifecycle import record_dashboard_runtime
 
     embedded_chat = args.tui or os.environ.get("HERMES_DASHBOARD_TUI") == "1"
+    record_dashboard_runtime(
+        argv=list(sys.argv),
+        cwd=os.getcwd(),
+        host=args.host,
+        port=args.port,
+        skip_build=getattr(args, "skip_build", False),
+        tui=embedded_chat,
+        insecure=getattr(args, "insecure", False),
+    )
     start_server(
         host=args.host,
         port=args.port,
@@ -10575,6 +10591,11 @@ def main():
         "--all",
         action="store_true",
         help="Kill ALL gateway processes across all profiles before restarting",
+    )
+    gateway_restart.add_argument(
+        "--no-dashboard-restart",
+        action="store_true",
+        help="Do not restart an already-running dashboard after the gateway restart",
     )
 
     # gateway status
@@ -12992,6 +13013,11 @@ Examples:
         "--status",
         action="store_true",
         help="List running hermes dashboard processes and exit",
+    )
+    dashboard_parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Restart a running hermes dashboard process and exit",
     )
     dashboard_parser.set_defaults(func=cmd_dashboard)
 

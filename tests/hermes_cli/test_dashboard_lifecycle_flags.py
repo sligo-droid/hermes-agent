@@ -22,7 +22,7 @@ def _ns(**kw):
     """Build an argparse.Namespace with dashboard defaults plus overrides."""
     defaults = dict(
         port=9119, host="127.0.0.1", no_open=False, insecure=False,
-        tui=False, stop=False, status=False,
+        tui=False, skip_build=False, stop=False, status=False, restart=False,
     )
     defaults.update(kw)
     return argparse.Namespace(**defaults)
@@ -155,6 +155,34 @@ class TestLifecycleFlagsTakePrecedence:
              patch.dict(sys.modules, {"hermes_cli.web_server": fake_ws}), \
              pytest.raises(SystemExit):
             cmd_dashboard(_ns(stop=True))
+        assert called["start"] is False
+
+
+class TestDashboardRestart:
+    def test_restart_when_nothing_running_exits_zero(self):
+        with patch(
+            "hermes_cli.dashboard_lifecycle.restart_dashboard_if_running",
+            return_value=False,
+        ) as mock_restart, pytest.raises(SystemExit) as exc:
+            cmd_dashboard(_ns(restart=True))
+
+        assert exc.value.code == 0
+        mock_restart.assert_called_once()
+
+    def test_restart_does_not_import_fastapi_or_start_server(self):
+        called = {"start": False}
+
+        def fake_start_server(**kw):
+            called["start"] = True
+
+        fake_ws = MagicMock()
+        fake_ws.start_server = fake_start_server
+        with patch(
+            "hermes_cli.dashboard_lifecycle.restart_dashboard_if_running",
+            return_value=True,
+        ), patch.dict(sys.modules, {"hermes_cli.web_server": fake_ws}), pytest.raises(SystemExit):
+            cmd_dashboard(_ns(restart=True))
+
         assert called["start"] is False
 
 

@@ -38,6 +38,66 @@ class TestUserSystemdPrivateSocketPreflight:
 
 
 class TestSystemdServiceRefresh:
+    def test_gateway_restart_restarts_dashboard_after_service_restart(
+        self, tmp_path, monkeypatch
+    ):
+        unit_path = tmp_path / "hermes-gateway.service"
+        unit_path.write_text("unit\n", encoding="utf-8")
+        calls = []
+
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
+        monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
+        monkeypatch.setattr(
+            gateway_cli,
+            "systemd_restart",
+            lambda system=False: calls.append(("gateway", system)),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_restart_dashboard_after_gateway_restart",
+            lambda args: calls.append(("dashboard", args.no_dashboard_restart)),
+        )
+
+        gateway_cli._gateway_command_inner(
+            SimpleNamespace(
+                gateway_command="restart",
+                system=False,
+                all=False,
+                no_dashboard_restart=False,
+            )
+        )
+
+        assert calls == [("gateway", False), ("dashboard", False)]
+
+    def test_gateway_restart_dashboard_opt_out(self, monkeypatch):
+        calls = []
+
+        monkeypatch.setattr(
+            "hermes_cli.dashboard_lifecycle.restart_dashboard_if_running",
+            lambda **kwargs: calls.append(kwargs),
+        )
+
+        gateway_cli._restart_dashboard_after_gateway_restart(
+            SimpleNamespace(no_dashboard_restart=True)
+        )
+
+        assert calls == []
+
+    def test_dashboard_restart_failure_only_warns(self, monkeypatch, capsys):
+        def boom(**kwargs):
+            raise RuntimeError("dashboard busy")
+
+        monkeypatch.setattr(
+            "hermes_cli.dashboard_lifecycle.restart_dashboard_if_running",
+            boom,
+        )
+
+        gateway_cli._restart_dashboard_after_gateway_restart(
+            SimpleNamespace(no_dashboard_restart=False)
+        )
+
+        assert "Dashboard restart failed: dashboard busy" in capsys.readouterr().out
+
     def test_systemd_install_repairs_outdated_unit_without_force(self, tmp_path, monkeypatch):
         unit_path = tmp_path / "hermes-gateway.service"
         unit_path.write_text("old unit\n", encoding="utf-8")
@@ -1008,8 +1068,11 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(
             gateway_cli,
             "systemd_install",
-            lambda force=False, system=False, run_as_user=None: calls.append((force, system, run_as_user)),
+            lambda force=False, system=False, run_as_user=None, **kwargs: calls.append(
+                (force, system, run_as_user)
+            ),
         )
+        monkeypatch.setattr(gateway_cli, "prompt_yes_no", lambda *args, **kwargs: False)
 
         gateway_cli.gateway_command(
             SimpleNamespace(gateway_command="install", force=True, system=True, run_as_user="alice")

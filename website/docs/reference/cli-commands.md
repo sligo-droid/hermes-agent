@@ -222,6 +222,7 @@ Options:
 | Option | Description |
 |--------|-------------|
 | `--all` | On `start` / `restart` / `stop`: act on **every profile's** gateway, not just the active `HERMES_HOME`. Useful if you run multiple profiles side-by-side and want to restart them all after `hermes update`. |
+| `--no-dashboard-restart` | On `restart`: leave any running `hermes dashboard` process untouched. By default, an already-running dashboard is restarted after the gateway restarts. |
 
 :::tip WSL users
 Use `hermes gateway run` instead of `hermes gateway start` — WSL's systemd support is unreliable. Wrap it in tmux for persistence: `tmux new -s hermes 'hermes gateway run'`. See [WSL FAQ](/docs/reference/faq#wsl-gateway-keeps-disconnecting-or-hermes-gateway-start-fails) for details.
@@ -1156,6 +1157,7 @@ Launch the web dashboard — a browser-based UI for managing configuration, API 
 | `--insecure` | off | Allow binding to non-localhost hosts. Exposes dashboard credentials on the network; use only behind trusted network controls. |
 | `--stop` | — | Stop running `hermes dashboard` processes and exit. |
 | `--status` | — | List running `hermes dashboard` processes and exit. |
+| `--restart` | — | Restart a running `hermes dashboard` process with its previous launch command and exit. |
 
 ```bash
 # Default — opens browser to http://127.0.0.1:9119
@@ -1166,6 +1168,9 @@ hermes dashboard --port 8080 --no-open
 
 # Enable the browser Chat tab
 hermes dashboard --tui
+
+# Restart the existing dashboard process
+hermes dashboard --restart
 ```
 
 ## `hermes profile`
