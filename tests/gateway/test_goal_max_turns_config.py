@@ -160,6 +160,50 @@ async def test_discord_subgoal_without_board_creates_dev_ticket(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_discord_feature_summary_goal_set_suppresses_board_ack(tmp_path, monkeypatch):
+    kanban_home = tmp_path / "kanban-home"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://kanban.example")
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+
+    event = MessageEvent(
+        text="/goal Ship the dashboard",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="1506523962190860318",
+            chat_type="thread",
+            thread_id="1506523962190860318",
+            parent_chat_id="parent-channel",
+            user_id="user-goal-config",
+        ),
+        message_id="msg-goal",
+        feature_summary={
+            "thread_id": "1506523962190860318",
+            "message_id": "summary-message",
+            "kanban_board": {
+                "public_url": "https://kanban.example/workers/1506523962190860318",
+            },
+        },
+    )
+
+    response = await GatewayRunner._handle_goal_command(runner, event)
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.board_slug_for_discord_thread("1506523962190860318")
+    meta = kanban_db.read_board_metadata(board)
+
+    assert response is None
+    assert meta["discord_worker"]["root_goal"] == "Ship the dashboard"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("pause_first", [False, True])
 async def test_gateway_goal_resume_queues_continuation_turn(tmp_path, monkeypatch, pause_first):
     """Regression: /goal resume must wake the gateway loop, not just report state."""
