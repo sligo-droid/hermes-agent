@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from agent.transports.codex_app_server_session import TurnResult
-from tools import codex_worker_tool as cwt
+from tools import coding_worker_tool as cwt
 
 
 class FakeSession:
@@ -44,13 +44,13 @@ def _parent(tmp_path, api_mode="chat_completions"):
 
 
 def test_requires_parent_agent():
-    result = json.loads(cwt.delegate_codex_coding_task(task="fix bug"))
+    result = json.loads(cwt.delegate_coding_task(task="fix bug"))
     assert "requires a parent agent" in result["error"]
 
 
 def test_unavailable_inside_codex_app_server(tmp_path):
     result = json.loads(
-        cwt.delegate_codex_coding_task(
+        cwt.delegate_coding_task(
             task="fix bug",
             parent_agent=_parent(tmp_path, api_mode="codex_app_server"),
         )
@@ -64,10 +64,10 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
         "agent.transports.codex_app_server_session.CodexAppServerSession",
         FakeSession,
     )
-    monkeypatch.setattr(cwt, "_load_codex_worker_timeout", lambda: 123.0)
+    monkeypatch.setattr(cwt, "_load_coding_worker_timeout", lambda: 123.0)
 
     result = json.loads(
-        cwt.delegate_codex_coding_task(
+        cwt.delegate_coding_task(
             task="fix the parser",
             context="focus on src/parser.py",
             parent_agent=_parent(tmp_path),
@@ -107,7 +107,7 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
     monkeypatch.setattr(ow, "run_opencode_task", fake_run)
 
     result = json.loads(
-        cwt.delegate_codex_coding_task(
+        cwt.delegate_coding_task(
             task="fix the parser",
             context="focus on src/parser.py",
             parent_agent=_parent(tmp_path),
@@ -164,7 +164,7 @@ def test_runs_with_available_codex_pool_credential(monkeypatch, tmp_path):
     )
 
     result = json.loads(
-        cwt.delegate_codex_coding_task(
+        cwt.delegate_coding_task(
             task="fix the parser",
             parent_agent=_parent(tmp_path),
         )

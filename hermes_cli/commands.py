@@ -125,7 +125,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]"),
-    CommandDef("codex-worker", "Toggle Codex coding-worker delegation",
+    CommandDef("coding-worker", "Toggle coding worker delegation",
                "Configuration", args_hint="[on|off|status]",
                subcommands=("on", "off", "status")),
     CommandDef("gquota", "Show Google Gemini Code Assist quota usage", "Info",

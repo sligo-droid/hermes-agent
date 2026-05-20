@@ -3831,13 +3831,13 @@ class AIAgent:
             parent_agent=self,
         )
 
-    def _dispatch_codex_coding_task(self, function_args: dict) -> str:
-        """Single call site for delegate_codex_coding_task dispatch."""
-        from tools.codex_worker_tool import (
-            delegate_codex_coding_task as _delegate_codex_coding_task,
+    def _dispatch_coding_task(self, function_args: dict) -> str:
+        """Single call site for delegate_coding_task dispatch."""
+        from tools.coding_worker_tool import (
+            delegate_coding_task as _delegate_coding_task,
         )
 
-        return _delegate_codex_coding_task(
+        return _delegate_coding_task(
             task=function_args.get("task"),
             context=function_args.get("context"),
             cwd=function_args.get("cwd"),

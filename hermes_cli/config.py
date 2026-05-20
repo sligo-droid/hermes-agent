@@ -1274,11 +1274,13 @@ DEFAULT_CONFIG = {
         "subagent_auto_approve": False,
     },
 
-    # Coding worker backend selection. The public command/tool names still
-    # say "codex-worker" for compatibility, but the backend can be switched
-    # to OpenCode for non-PTY worker execution.
+    # Coding worker settings. Hermes stays on the normal runtime while
+    # coding-shaped requests can delegate implementation/debug/test work to
+    # the configured backend.
     "coding_worker": {
+        "enabled": True,
         "backend": "codex",  # codex | opencode
+        "turn_timeout_seconds": 1800,
         "opencode": {
             "binary": "opencode",
             "model": "",
@@ -1289,15 +1291,6 @@ DEFAULT_CONFIG = {
             "complex_build_reasoning_level": "medium",
             "dangerously_skip_permissions": False,
         },
-    },
-
-    # Codex worker compatibility settings — keeps Hermes on the normal
-    # runtime, but lets coding-shaped tasks delegate the implementation/debug/
-    # test step to a coding worker. On by default; disable with
-    # /codex-worker off.
-    "codex_worker": {
-        "enabled": True,
-        "turn_timeout_seconds": 1800,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

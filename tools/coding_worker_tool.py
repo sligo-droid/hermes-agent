@@ -1,7 +1,6 @@
 """Coding worker tool for delegated implementation work.
 
-The public tool name remains ``delegate_codex_coding_task`` for compatibility,
-but the execution backend is selected by ``coding_worker.backend``.
+The execution backend is selected by ``coding_worker.backend``.
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ from typing import Any, Optional
 from tools.registry import registry, tool_error
 
 
-def check_codex_worker_requirements() -> bool:
+def check_coding_worker_requirements() -> bool:
     try:
         from agent.opencode_worker import BACKEND_OPENCODE, check_opencode_binary, load_coding_worker_backend
 
@@ -35,12 +34,12 @@ def check_codex_worker_requirements() -> bool:
         return False
 
 
-def _load_codex_worker_timeout() -> float:
+def _load_coding_worker_timeout() -> float:
     try:
         from hermes_cli.config import load_config
 
         cfg = load_config()
-        worker_cfg = cfg.get("codex_worker") or {}
+        worker_cfg = cfg.get("coding_worker") or {}
         value = worker_cfg.get("turn_timeout_seconds", 1800)
         timeout = float(value)
     except Exception:
@@ -56,7 +55,7 @@ def _resolve_cwd(cwd: Optional[str], parent_agent: Any) -> str:
     return str(path.resolve())
 
 
-def delegate_codex_coding_task(
+def delegate_coding_task(
     task: Optional[str] = None,
     context: Optional[str] = None,
     cwd: Optional[str] = None,
@@ -65,17 +64,17 @@ def delegate_codex_coding_task(
 ) -> str:
     """Run a bounded coding task in the configured coding worker backend."""
     if parent_agent is None:
-        return tool_error("delegate_codex_coding_task requires a parent agent context.")
+        return tool_error("delegate_coding_task requires a parent agent context.")
 
     if getattr(parent_agent, "api_mode", "") == "codex_app_server":
         return tool_error(
-            "delegate_codex_coding_task is unavailable while the parent agent "
+            "delegate_coding_task is unavailable while the parent agent "
             "is already running on codex_app_server."
         )
 
     task_text = str(task or "").strip()
     if not task_text:
-        return tool_error("delegate_codex_coding_task requires a non-empty task.")
+        return tool_error("delegate_coding_task requires a non-empty task.")
 
     workdir = _resolve_cwd(cwd, parent_agent)
     if not Path(workdir).exists():
@@ -84,7 +83,7 @@ def delegate_codex_coding_task(
     timeout = (
         float(turn_timeout_seconds)
         if turn_timeout_seconds is not None
-        else _load_codex_worker_timeout()
+        else _load_coding_worker_timeout()
     )
     timeout = max(30.0, timeout)
 
@@ -183,7 +182,7 @@ def delegate_codex_coding_task(
             item = ((note.get("params") or {}).get("item") or {})
             item_type = item.get("type") or ""
             suffix = f": {item_type}" if item_type else ""
-            parent_agent._touch_activity(f"Codex worker event: {method}{suffix}")
+            parent_agent._touch_activity(f"Coding worker event: {method}{suffix}")
         except Exception:
             pass
 
@@ -229,8 +228,8 @@ def delegate_codex_coding_task(
     )
 
 
-CODEX_WORKER_SCHEMA = {
-    "name": "delegate_codex_coding_task",
+CODING_WORKER_SCHEMA = {
+    "name": "delegate_coding_task",
     "description": (
         "Delegate a bounded implementation, debugging, test-fixing, refactor, "
         "or code-review task to the configured coding worker backend. Use from "
@@ -263,7 +262,7 @@ CODEX_WORKER_SCHEMA = {
                 "type": "number",
                 "description": (
                     "Optional per-call timeout. Defaults to "
-                    "codex_worker.turn_timeout_seconds, minimum 30 seconds."
+                    "coding_worker.turn_timeout_seconds, minimum 30 seconds."
                 ),
             },
         },
@@ -273,16 +272,16 @@ CODEX_WORKER_SCHEMA = {
 
 
 registry.register(
-    name="delegate_codex_coding_task",
+    name="delegate_coding_task",
     toolset="delegation",
-    schema=CODEX_WORKER_SCHEMA,
-    handler=lambda args, **kw: delegate_codex_coding_task(
+    schema=CODING_WORKER_SCHEMA,
+    handler=lambda args, **kw: delegate_coding_task(
         task=args.get("task"),
         context=args.get("context"),
         cwd=args.get("cwd"),
         turn_timeout_seconds=args.get("turn_timeout_seconds"),
         parent_agent=kw.get("parent_agent"),
     ),
-    check_fn=check_codex_worker_requirements,
-    emoji="codex",
+    check_fn=check_coding_worker_requirements,
+    emoji="code",
 )

@@ -7507,9 +7507,9 @@ class HermesCLI:
         if result.success and result.requires_new_session:
             _cprint("    Tip: `/reset` starts a new session immediately.")
 
-    def _handle_codex_worker_command(self, cmd_original: str) -> None:
-        """Handle /codex-worker — toggle Codex coding-worker delegation."""
-        from hermes_cli import codex_worker_switch as cws
+    def _handle_coding_worker_command(self, cmd_original: str) -> None:
+        """Handle /coding-worker — toggle coding worker delegation."""
+        from hermes_cli import coding_worker_switch as cws
 
         parts = cmd_original.split(None, 1)
         raw_args = parts[1].strip() if len(parts) > 1 else ""
@@ -7534,7 +7534,7 @@ class HermesCLI:
 
         prefix = "✓" if result.success else "✗"
         for line in result.message.splitlines():
-            _cprint(f"  {prefix} {line}" if line.startswith("codex_worker")
+            _cprint(f"  {prefix} {line}" if line.startswith("coding_worker")
                     else f"    {line}")
 
     def _should_handle_model_command_inline(self, text: str, has_images: bool = False) -> bool:
@@ -8231,8 +8231,8 @@ class HermesCLI:
             self._handle_model_switch(cmd_original)
         elif canonical == "codex-runtime":
             self._handle_codex_runtime(cmd_original)
-        elif canonical == "codex-worker":
-            self._handle_codex_worker_command(cmd_original)
+        elif canonical == "coding-worker":
+            self._handle_coding_worker_command(cmd_original)
         elif canonical == "gquota":
             self._handle_gquota_command(cmd_original)
 

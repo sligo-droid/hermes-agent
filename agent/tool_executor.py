@@ -72,7 +72,7 @@ def _current_session_cwd(agent: Any = None) -> str:
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
 
-_CODEX_WORKER_BLOCKED_MUTATION_TOOLS = frozenset({
+_CODING_WORKER_BLOCKED_MUTATION_TOOLS = frozenset({
     "write_file",
     "patch",
     "execute_code",
@@ -85,26 +85,26 @@ def _ra():
     return run_agent
 
 
-def _codex_worker_mutation_block(agent, function_name: str) -> Optional[str]:
-    """Return a guardrail message when Hermes-codebase work skipped Codex."""
-    if function_name == "delegate_codex_coding_task":
+def _coding_worker_mutation_block(agent, function_name: str) -> Optional[str]:
+    """Return a guardrail message when Hermes-codebase work skipped the worker."""
+    if function_name == "delegate_coding_task":
         return None
-    if function_name not in _CODEX_WORKER_BLOCKED_MUTATION_TOOLS:
+    if function_name not in _CODING_WORKER_BLOCKED_MUTATION_TOOLS:
         return None
     if str(getattr(agent, "api_mode", "") or "").strip().lower() == "codex_app_server":
         return None
-    if not getattr(agent, "_codex_worker_required_this_turn", False):
+    if not getattr(agent, "_coding_worker_required_this_turn", False):
         return None
-    if getattr(agent, "_codex_worker_used_this_turn", False):
+    if getattr(agent, "_coding_worker_used_this_turn", False):
         return None
     return (
-        "Hermes codebase coding requests must use delegate_codex_coding_task "
-        "before direct mutation tools. Call delegate_codex_coding_task first; "
+        "Hermes codebase coding requests must use delegate_coding_task "
+        "before direct mutation tools. Call delegate_coding_task first; "
         "if that tool is unavailable, report that blocker instead of editing."
     )
 
 
-def _codex_worker_result_succeeded(result: object) -> bool:
+def _coding_worker_result_succeeded(result: object) -> bool:
     """Return True only for explicit successful delegate JSON."""
     if not isinstance(result, str):
         return False
@@ -177,7 +177,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
         block_result = None
         blocked_by_guardrail = False
-        block_message = _codex_worker_mutation_block(agent, function_name)
+        block_message = _coding_worker_mutation_block(agent, function_name)
         if block_message is None:
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
@@ -416,10 +416,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
             if not blocked:
                 if (
-                    function_name == "delegate_codex_coding_task"
-                    and _codex_worker_result_succeeded(function_result)
+                    function_name == "delegate_coding_task"
+                    and _coding_worker_result_succeeded(function_result)
                 ):
-                    agent._codex_worker_used_this_turn = True
+                    agent._coding_worker_used_this_turn = True
 
                 function_result = agent._append_guardrail_observation(
                     function_name,
@@ -559,7 +559,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         # Check plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
-        _block_msg = _codex_worker_mutation_block(agent, function_name)
+        _block_msg = _coding_worker_mutation_block(agent, function_name)
         if _block_msg is None:
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
@@ -751,9 +751,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
                     agent._vprint(f"  {cute_msg}")
-        elif function_name == "delegate_codex_coding_task":
+        elif function_name == "delegate_coding_task":
             task_preview = (function_args.get("task") or "")[:30]
-            spinner_label = f"codex {task_preview}" if task_preview else "codex worker"
+            spinner_label = f"worker {task_preview}" if task_preview else "coding worker"
             spinner = None
             if agent._should_emit_quiet_tool_messages() and agent._should_start_quiet_spinner():
                 face = random.choice(KawaiiSpinner.get_waiting_faces())
@@ -763,19 +763,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     print_fn=agent._print_fn,
                 )
                 spinner.start()
-            _codex_worker_result = None
+            _coding_worker_result = None
             try:
-                function_result = agent._dispatch_codex_coding_task(function_args)
-                _codex_worker_result = function_result
-                if _codex_worker_result_succeeded(function_result):
-                    agent._codex_worker_used_this_turn = True
+                function_result = agent._dispatch_coding_task(function_args)
+                _coding_worker_result = function_result
+                if _coding_worker_result_succeeded(function_result):
+                    agent._coding_worker_used_this_turn = True
             finally:
                 tool_duration = time.time() - tool_start_time
                 cute_msg = _get_cute_tool_message_impl(
-                    "delegate_codex_coding_task",
+                    "delegate_coding_task",
                     function_args,
                     tool_duration,
-                    result=_codex_worker_result,
+                    result=_coding_worker_result,
                 )
                 if spinner:
                     spinner.stop(cute_msg)
