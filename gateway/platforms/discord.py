@@ -1366,6 +1366,23 @@ class DiscordAdapter(BasePlatformAdapter):
                 pass
         return embed
 
+    def _format_feature_summary_transcript_quote(
+        self,
+        transcript: Optional[str],
+    ) -> str:
+        text = str(transcript or "").strip()
+        if not text:
+            return ""
+        text = text.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+        text = re.sub(r"\r\n?", "\n", text)
+        quote = "\n".join(
+            f"> {line.rstrip()}" if line.strip() else ">"
+            for line in text.splitlines()
+        ).strip()
+        if len(quote) <= self.MAX_MESSAGE_LENGTH:
+            return quote
+        return quote[: self.MAX_MESSAGE_LENGTH - 3].rstrip() + "..."
+
     async def initialize_feature_summary(
         self,
         thread_channel: Any,
@@ -1373,6 +1390,7 @@ class DiscordAdapter(BasePlatformAdapter):
         parent_channel: Any = None,
         initial_request: str = "",
         project_context: Optional[Dict[str, Any]] = None,
+        transcript_quote: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         if thread_channel is None or not hasattr(thread_channel, "send"):
             return None
@@ -1411,6 +1429,12 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[%s] Failed to send Discord feature summary: %s", self.name, exc)
             return None
+        quote = self._format_feature_summary_transcript_quote(transcript_quote)
+        if quote:
+            try:
+                await thread_channel.send(content=quote)
+            except Exception as exc:
+                logger.warning("[%s] Failed to send Discord voice transcript quote: %s", self.name, exc)
         handle = {
             "thread_id": str(getattr(thread_channel, "id", "") or ""),
             "message_id": str(getattr(msg, "id", "") or ""),
@@ -6086,6 +6110,7 @@ class DiscordAdapter(BasePlatformAdapter):
         preprocessed_attachment_media: Dict[int, Tuple[str, str]] = {}
         direct_question_prompt = False
         feature_request_intent: Optional[bool] = None
+        voice_feature_transcript = ""
 
         # Auto-thread: when enabled, automatically create a thread for feature
         # requests in text channels so each implementation conversation is
@@ -6126,6 +6151,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         message_is_voice=message_is_voice,
                     )
                     triage_text = voice_triage_text
+                    voice_feature_transcript = voice_triage_text
                 feature_request_intent = (
                     True
                     if has_discord_message_link
@@ -6170,6 +6196,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 parent_channel=message.channel,
                 initial_request=normalized_content,
                 project_context=project_context,
+                transcript_quote=voice_feature_transcript if message_is_voice else None,
             )
         elif is_thread:
             feature_summary_handle = self._load_feature_summary_handle_for_thread(
