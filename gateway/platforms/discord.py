@@ -1604,9 +1604,10 @@ class DiscordAdapter(BasePlatformAdapter):
         cleaned = str(text or "").strip()
         if not cleaned.startswith("/"):
             return False
-        command, _, args = cleaned[1:].partition(" ")
-        if command.lower() != "goal":
+        match = re.match(r"^/([^\s]+)(?:\s+(.*))?$", cleaned, re.DOTALL)
+        if not match or match.group(1).lower() != "goal":
             return False
+        args = match.group(2) or ""
         lower_args = args.strip().lower()
         return bool(
             lower_args

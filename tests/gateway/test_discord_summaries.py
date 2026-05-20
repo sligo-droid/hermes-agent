@@ -605,6 +605,32 @@ async def test_goal_feature_summary_defers_planner_to_goal_handler(adapter, monk
 
 
 @pytest.mark.asyncio
+async def test_goal_feature_summary_with_newline_defers_planner(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="/goal\n\nShip the dashboard",
+    )
+
+    assert handle is not None
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.board_slug_for_discord_thread("200")
+    conn = kanban_db.connect(board=board)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+
+    assert tasks == []
+
+
+@pytest.mark.asyncio
 async def test_feature_summary_omits_relative_kanban_board_path(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     monkeypatch.setenv("PUBLIC_URL", "https://pid.sligo-labs.vercel.app")
