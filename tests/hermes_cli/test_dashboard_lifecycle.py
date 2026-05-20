@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -34,6 +35,30 @@ def test_record_dashboard_runtime_writes_launch_metadata():
     assert data["skip_build"] is True
     assert isinstance(data["pid"], int)
     assert isinstance(data["started_at"], float)
+
+
+def test_record_dashboard_runtime_makes_python_source_argv_restartable(tmp_path):
+    script = tmp_path / "main.py"
+    script.write_text("print('dashboard')\n", encoding="utf-8")
+
+    lifecycle.record_dashboard_runtime(
+        argv=[str(script), "dashboard", "--port", "9119"],
+        cwd="/tmp/hermes",
+        host="127.0.0.1",
+        port=9119,
+        skip_build=True,
+        tui=False,
+        insecure=False,
+    )
+
+    data = json.loads(lifecycle.dashboard_runtime_path().read_text(encoding="utf-8"))
+    assert data["argv"] == [
+        sys.executable,
+        str(script),
+        "dashboard",
+        "--port",
+        "9119",
+    ]
 
 
 def test_scan_dashboard_launches_reads_argv_and_cwd_from_proc(monkeypatch):
@@ -145,3 +170,25 @@ def test_spawn_dashboard_detaches_and_logs(monkeypatch, tmp_path):
     assert calls[0][1]["stdin"] is subprocess.DEVNULL
     assert calls[0][1]["stderr"] is subprocess.STDOUT
     assert calls[0][1]["start_new_session"] is True
+
+
+def test_spawn_dashboard_repairs_older_python_source_runtime(monkeypatch, tmp_path):
+    script = tmp_path / "main.py"
+    script.write_text("print('dashboard')\n", encoding="utf-8")
+    launch = lifecycle.DashboardLaunch(
+        pid=123,
+        argv=[str(script), "dashboard"],
+        cwd=str(tmp_path),
+        source="runtime",
+    )
+    calls = []
+
+    def fake_popen(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(pid=456)
+
+    monkeypatch.setattr(lifecycle.subprocess, "Popen", fake_popen)
+
+    lifecycle._spawn_dashboard(launch)
+
+    assert calls[0][0] == [sys.executable, str(script), "dashboard"]
