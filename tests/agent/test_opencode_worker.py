@@ -7,16 +7,14 @@ from types import SimpleNamespace
 from agent import opencode_worker as ow
 
 
-def _cfg():
-    return {
-        "coding_worker": {
-            "opencode": {
-                "binary": "opencode",
-                "plan_variant": "high",
-                "complex_variant": "high",
-            }
-        }
-    }
+def _cfg(**opencode_overrides):
+    opencode_cfg = {"binary": "opencode"}
+    opencode_cfg.update(opencode_overrides)
+    return {"coding_worker": {"opencode": opencode_cfg}}
+
+
+def _option(cmd, name):
+    return cmd[cmd.index(name) + 1] if name in cmd else None
 
 
 def test_simple_task_runs_build_only(monkeypatch, tmp_path):
@@ -47,7 +45,8 @@ def test_simple_task_runs_build_only(monkeypatch, tmp_path):
     assert result.error is None
     assert result.final_text == "done"
     assert result.agents == ["build"]
-    assert calls[0][calls[0].index("--agent") + 1] == "build"
+    assert _option(calls[0], "--agent") == "build"
+    assert _option(calls[0], "--variant") == "high"
 
 
 def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
@@ -85,8 +84,87 @@ def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
     assert result.error is None
     assert result.agents == ["plan", "build"]
     assert result.plan_text.startswith("Plan:")
-    assert [cmd[cmd.index("--agent") + 1] for cmd in calls] == ["plan", "build"]
+    assert [_option(cmd, "--agent") for cmd in calls] == ["plan", "build"]
+    assert [_option(cmd, "--variant") for cmd in calls] == ["xhigh", "medium"]
     assert "OpenCode plan to follow:" in briefs[1]
+
+
+def test_reasoning_levels_are_configurable_by_mode(monkeypatch, tmp_path):
+    calls = []
+
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {"type": "message", "sessionID": "ses-build", "message": "done"}
+            )
+            + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+
+    cfg = _cfg(
+        simple_build_reasoning_level="medium",
+        complex_plan_reasoning_level="max",
+        complex_build_reasoning_level="low",
+    )
+
+    simple = ow.run_opencode_task(
+        "fix typo in README",
+        str(tmp_path),
+        timeout=60,
+        config=cfg,
+    )
+
+    assert simple.error is None
+    assert [_option(cmd, "--agent") for cmd in calls] == ["build"]
+    assert [_option(cmd, "--variant") for cmd in calls] == ["medium"]
+
+    calls.clear()
+
+    complex_result = ow.run_opencode_task(
+        "fix production auth race",
+        str(tmp_path),
+        timeout=60,
+        config=cfg,
+    )
+
+    assert complex_result.error is None
+    assert [_option(cmd, "--agent") for cmd in calls] == ["plan", "build"]
+    assert [_option(cmd, "--variant") for cmd in calls] == ["max", "low"]
+
+
+def test_legacy_variant_keys_still_configure_reasoning_levels(monkeypatch, tmp_path):
+    calls = []
+
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {"type": "message", "sessionID": "ses-build", "message": "done"}
+            )
+            + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+
+    result = ow.run_opencode_task(
+        "fix production auth race",
+        str(tmp_path),
+        timeout=60,
+        config=_cfg(plan_variant="high", complex_variant="max"),
+    )
+
+    assert result.error is None
+    assert [_option(cmd, "--variant") for cmd in calls] == ["high", "max"]
 
 
 def test_auth_error_is_classified(monkeypatch, tmp_path):
