@@ -9001,7 +9001,10 @@ class GatewayRunner:
             # Drain watch pattern notifications that arrived during the agent run.
             # Watch events and completions share the same queue; completions are
             # already handled by the per-process watcher task above, so we only
-            # inject watch-type events here.
+            # deliver watch-type status notifications here. These are direct
+            # platform notifications, not synthetic user turns: a late server
+            # readiness line should not trigger a second "what happened?" agent
+            # response after the original turn is already complete.
             try:
                 from tools.process_registry import process_registry as _pr
                 _watch_events = []
@@ -9017,7 +9020,7 @@ class GatewayRunner:
                         try:
                             await self._inject_watch_notification(synth_text, evt)
                         except Exception as e2:
-                            logger.error("Watch notification injection error: %s", e2)
+                            logger.error("Watch notification delivery error: %s", e2)
             except Exception as e:
                 logger.debug("Watch queue drain error: %s", e)
 
@@ -15216,11 +15219,26 @@ class GatewayRunner:
         )
 
     async def _inject_watch_notification(self, synth_text: str, evt: dict) -> None:
-        """Inject a watch-pattern notification as a synthetic message event.
+        """Deliver a watch-pattern notification directly to the originating chat.
 
         Routing must come from the queued watch event itself, not from whatever
         foreground message happened to be active when the queue was drained.
+
+        Unlike notify_on_complete, watch matches are mid-process status signals
+        (for example a local dev server printing ``Local:``). They should not be
+        re-injected as synthetic user turns after the original agent turn has
+        already produced its final answer; doing so creates noisy follow-up
+        responses like "that was a delayed readiness notification...".
         """
+        notify_mode = self._load_background_notifications_mode()
+        if notify_mode != "all":
+            logger.debug(
+                "Dropping watch notification for process %s because background notifications mode is %s",
+                evt.get("session_id", "unknown"),
+                notify_mode,
+            )
+            return
+
         source = self._build_process_event_source(evt)
         if not source:
             logger.warning(
@@ -15234,25 +15252,19 @@ class GatewayRunner:
             if p.value == platform_name:
                 adapter = a
                 break
-        if not adapter:
+        if not adapter or not source.chat_id:
             return
         try:
-            synth_event = MessageEvent(
-                text=synth_text,
-                message_type=MessageType.TEXT,
-                source=source,
-                internal=True,
-                message_id=str(evt.get("message_id") or "").strip() or None,
-            )
+            metadata = {"thread_id": source.thread_id} if source.thread_id else None
             logger.info(
-                "Watch pattern notification — injecting for %s chat=%s thread=%s",
+                "Watch pattern notification — sending direct notice for %s chat=%s thread=%s",
                 platform_name,
                 source.chat_id,
                 source.thread_id,
             )
-            await adapter.handle_message(synth_event)
+            await adapter.send(source.chat_id, synth_text, metadata=metadata)
         except Exception as e:
-            logger.error("Watch notification injection error: %s", e)
+            logger.error("Watch notification delivery error: %s", e)
 
     async def _run_process_watcher(self, watcher: dict) -> None:
         """

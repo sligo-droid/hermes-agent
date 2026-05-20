@@ -249,7 +249,7 @@ async def test_no_thread_id_sends_no_metadata(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_inject_watch_notification_routes_from_session_store_origin(monkeypatch, tmp_path):
+async def test_inject_watch_notification_sends_direct_notice_from_session_store_origin(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 
     runner = _build_runner(monkeypatch, tmp_path, "all")
@@ -272,15 +272,12 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
 
     await runner._inject_watch_notification("[SYSTEM: Background process matched]", evt)
 
-    adapter.handle_message.assert_awaited_once()
-    synth_event = adapter.handle_message.await_args.args[0]
-    assert synth_event.internal is True
-    assert synth_event.source.platform == Platform.TELEGRAM
-    assert synth_event.source.chat_id == "-100"
-    assert synth_event.source.chat_type == "group"
-    assert synth_event.source.thread_id == "42"
-    assert synth_event.source.user_id == "123"
-    assert synth_event.source.user_name == "Emiliyan"
+    adapter.handle_message.assert_not_awaited()
+    adapter.send.assert_awaited_once_with(
+        "-100",
+        "[SYSTEM: Background process matched]",
+        metadata={"thread_id": "42"},
+    )
 
 
 @pytest.mark.asyncio
@@ -358,7 +355,7 @@ async def test_agent_notification_no_message_id_is_tolerated(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeypatch, tmp_path):
+async def test_inject_watch_notification_sends_to_thread_without_agent_turn(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 
     runner = _build_runner(monkeypatch, tmp_path, "all")
@@ -382,10 +379,12 @@ async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeyp
 
     await runner._inject_watch_notification("[SYSTEM: Background process matched]", evt)
 
-    adapter.handle_message.assert_awaited_once()
-    synth_event = adapter.handle_message.await_args.args[0]
-    assert synth_event.message_id == "777"
-    assert synth_event.source.thread_id == "24296"
+    adapter.handle_message.assert_not_awaited()
+    adapter.send.assert_awaited_once_with(
+        "123",
+        "[SYSTEM: Background process matched]",
+        metadata={"thread_id": "24296"},
+    )
 
 
 def test_build_process_event_source_falls_back_to_session_key_chat_type(monkeypatch, tmp_path):
@@ -474,11 +473,48 @@ async def test_inject_watch_notification_ignores_foreground_event_source(monkeyp
 
     await runner._inject_watch_notification("[SYSTEM: watch match]", evt)
 
-    adapter.handle_message.assert_awaited_once()
-    synth_event = adapter.handle_message.await_args.args[0]
+    adapter.handle_message.assert_not_awaited()
     # Must route to thread 42 (process origin), NOT some other thread
-    assert synth_event.source.thread_id == "42"
-    assert synth_event.source.user_id == "proc_owner"
+    adapter.send.assert_awaited_once_with(
+        "-100",
+        "[SYSTEM: watch match]",
+        metadata={"thread_id": "42"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_inject_watch_notification_respects_result_mode(monkeypatch, tmp_path):
+    """Non-"all" background notification modes suppress watch-match chatter.
+
+    Watch matches are intermediate process status, not final results. In result
+    mode they should not trigger either a direct chat message or a synthetic
+    agent turn.
+    """
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "result")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    runner.session_store._entries["agent:main:telegram:group:-100:42"] = SimpleNamespace(
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100",
+            chat_type="group",
+            thread_id="42",
+            user_id="proc_owner",
+            user_name="alice",
+        )
+    )
+
+    await runner._inject_watch_notification(
+        "[SYSTEM: watch match]",
+        {
+            "session_id": "proc_result_mode",
+            "session_key": "agent:main:telegram:group:-100:42",
+        },
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    adapter.send.assert_not_awaited()
 
 
 def test_build_process_event_source_returns_none_for_empty_evt(monkeypatch, tmp_path):
