@@ -52,6 +52,52 @@ def test_set_goal_creates_planner_task_for_role_lane(monkeypatch, tmp_path):
     assert tasks[0].workspace_kind == "dir"
 
 
+def test_set_goal_repairs_unmapped_board_workspace(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    def fake_worktree_path(project_path, thread_id):
+        name = Path(project_path or "unmapped").name
+        return str(tmp_path / f"{name}-discord-{thread_id}")
+
+    monkeypatch.setattr(dwb, "_default_worktree_path", fake_worktree_path)
+    monkeypatch.setattr(dwb, "_ensure_code_island", lambda worker: None)
+
+    board = dwb.set_goal(thread_id="7780", goal="Fix worker routing")
+    old_worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    old_worktree = old_worker["worktree_path"]
+    assert old_worktree.endswith("unmapped-discord-7780")
+
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        assert task.workspace_path == old_worktree
+    finally:
+        conn.close()
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    repaired = dwb.set_goal(
+        thread_id="7780",
+        goal="Fix worker routing",
+        project_context={"project_path": str(project)},
+    )
+    worker = kanban_db.read_board_metadata(repaired.slug)["discord_worker"]
+    new_worktree = worker["worktree_path"]
+
+    assert worker["project_path"] == str(project)
+    assert new_worktree.endswith("repo-discord-7780")
+    assert new_worktree != old_worktree
+
+    conn = kanban_db.connect(board=repaired.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        assert task.workspace_path == new_worktree
+    finally:
+        conn.close()
+
+
 def test_board_thread_state_reflects_kanban_tasks(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

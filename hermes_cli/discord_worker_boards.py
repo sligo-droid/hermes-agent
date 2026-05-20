@@ -277,9 +277,19 @@ def ensure_discord_thread_board(
 ) -> DiscordBoard:
     """Create or update the board backing a Discord thread."""
     slug = board_slug_for_discord_thread(thread_id)
-    project_context = dict(project_context or {})
-    project_path = str(project_context.get("project_path") or "").strip() or None
-    token = _read_worker_meta(slug).get("share_token") or secrets.token_urlsafe(PUBLIC_TOKEN_BYTES)
+    worker = _read_worker_meta(slug)
+    existing_context = worker.get("project_context")
+    merged_project_context = dict(existing_context) if isinstance(existing_context, dict) else {}
+    incoming_project_context = dict(project_context or {})
+    merged_project_context.update(
+        {k: v for k, v in incoming_project_context.items() if v is not None}
+    )
+    incoming_project_path = str(incoming_project_context.get("project_path") or "").strip() or None
+    existing_project_path = str(worker.get("project_path") or "").strip() or None
+    project_path = incoming_project_path or existing_project_path
+    if project_path:
+        merged_project_context["project_path"] = project_path
+    token = worker.get("share_token") or secrets.token_urlsafe(PUBLIC_TOKEN_BYTES)
     branch = f"discord/{thread_id}"
     metadata = kanban_db.create_board(
         slug,
@@ -288,7 +298,11 @@ def ensure_discord_thread_board(
         icon="",
         color="#22c55e",
     )
-    worker = _read_worker_meta(slug)
+    previous_worktree_path = str(worker.get("worktree_path") or "").strip()
+    project_path_changed = bool(project_path and project_path != existing_project_path)
+    worktree_path = previous_worktree_path
+    if not worktree_path or (project_path_changed and not worker.get("code_island_ready")):
+        worktree_path = _default_worktree_path(project_path, str(thread_id))
     worker.update(
         {
             "kind": "discord_worker_board",
@@ -297,11 +311,11 @@ def ensure_discord_thread_board(
             "guild_id": str(guild_id or ""),
             "parent_channel_id": str(parent_channel_id or ""),
             "initial_request": str(initial_request or worker.get("initial_request") or ""),
-            "project_context": project_context,
+            "project_context": merged_project_context,
             "project_path": project_path,
-            "base_branch": worker.get("base_branch") or project_context.get("base_branch") or "main",
+            "base_branch": worker.get("base_branch") or merged_project_context.get("base_branch") or "main",
             "worker_branch": worker.get("worker_branch") or branch,
-            "worktree_path": worker.get("worktree_path") or _default_worktree_path(project_path, str(thread_id)),
+            "worktree_path": worktree_path,
             "execution_mode": worker.get("execution_mode") or "pending",
             "phase": worker.get("phase") or "intake",
             "goal_status": worker.get("goal_status") or "unset",
@@ -316,7 +330,42 @@ def ensure_discord_thread_board(
     _ensure_code_island(worker)
     metadata[DISCORD_WORKER_META_KEY] = worker
     metadata = _write_metadata(slug, metadata)
+    if previous_worktree_path != str(worker.get("worktree_path") or ""):
+        _sync_role_task_workspaces(
+            slug,
+            old_path=previous_worktree_path,
+            new_path=str(worker.get("worktree_path") or ""),
+        )
     return DiscordBoard(slug=slug, metadata=metadata)
+
+
+def _sync_role_task_workspaces(board: str, *, old_path: str, new_path: str) -> None:
+    """Move queued role-lane tasks when board project context is repaired."""
+    if not new_path:
+        return
+    statuses = ("triage", "todo", "ready", "blocked", "review")
+    assignees = tuple(sorted(ROLE_ASSIGNEES))
+    placeholders = ",".join("?" for _ in assignees)
+    status_placeholders = ",".join("?" for _ in statuses)
+    params: list[Any] = [new_path, *assignees, *statuses]
+    path_clause = "workspace_path = ?"
+    if old_path:
+        params.append(old_path)
+    else:
+        path_clause = "(workspace_path IS NULL OR workspace_path = '')"
+    conn = kanban_db.connect(board=board)
+    try:
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? "
+            "WHERE workspace_kind = 'dir' "
+            f"AND lower(assignee) IN ({placeholders}) "
+            f"AND status IN ({status_placeholders}) "
+            f"AND {path_clause}",
+            tuple(params),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _ensure_code_island(worker: dict[str, Any]) -> None:
