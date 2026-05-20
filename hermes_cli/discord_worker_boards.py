@@ -154,6 +154,7 @@ def record_codex_worker_result(
     result: Any,
 ) -> None:
     payload = {
+        "backend": getattr(result, "backend", "codex"),
         "final_text": getattr(result, "final_text", ""),
         "error": getattr(result, "error", None),
         "interrupted": bool(getattr(result, "interrupted", False)),
@@ -162,6 +163,10 @@ def record_codex_worker_result(
         "tool_iterations": int(getattr(result, "tool_iterations", 0) or 0),
         "turn_id": getattr(result, "turn_id", None),
         "thread_id": getattr(result, "thread_id", None),
+        "agents": getattr(result, "agents", []),
+        "plan_text": getattr(result, "plan_text", ""),
+        "exit_code": getattr(result, "exit_code", None),
+        "duration_seconds": getattr(result, "duration_seconds", None),
     }
     _write_codex_worker_state(
         task_id,

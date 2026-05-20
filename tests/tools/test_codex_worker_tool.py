@@ -84,6 +84,42 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     assert "focus on src/parser.py" in prompt
 
 
+def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    monkeypatch.setattr(ow, "load_coding_worker_backend", lambda: ow.BACKEND_OPENCODE)
+
+    def fake_run(prompt, workspace, **kwargs):
+        assert "fix the parser" in prompt
+        assert workspace == str(tmp_path)
+        assert kwargs["context_for_classification"]
+        return SimpleNamespace(
+            final_text="Changed src/parser.py and ran pytest.",
+            error=None,
+            interrupted=False,
+            agents=["build"],
+            plan_text="",
+            thread_id="ses-build",
+            turn_id="ses-build",
+            tool_iterations=1,
+        )
+
+    monkeypatch.setattr(ow, "run_opencode_task", fake_run)
+
+    result = json.loads(
+        cwt.delegate_codex_coding_task(
+            task="fix the parser",
+            context="focus on src/parser.py",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert result["backend"] == "opencode"
+    assert result["agents"] == ["build"]
+    assert result["summary"] == "Changed src/parser.py and ran pytest."
+
+
 def test_runs_with_available_codex_pool_credential(monkeypatch, tmp_path):
     FakeSession.instances = []
     hermes_home = tmp_path / "hermes"

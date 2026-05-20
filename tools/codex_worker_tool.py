@@ -1,4 +1,8 @@
-"""Codex app-server worker tool for coding delegation."""
+"""Coding worker tool for delegated implementation work.
+
+The public tool name remains ``delegate_codex_coding_task`` for compatibility,
+but the execution backend is selected by ``coding_worker.backend``.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +17,15 @@ from tools.registry import registry, tool_error
 
 
 def check_codex_worker_requirements() -> bool:
+    try:
+        from agent.opencode_worker import BACKEND_OPENCODE, check_opencode_binary, load_coding_worker_backend
+
+        if load_coding_worker_backend() == BACKEND_OPENCODE:
+            ok, _ = check_opencode_binary()
+            return bool(ok)
+    except Exception:
+        return False
+
     try:
         from agent.transports.codex_app_server import check_codex_binary
 
@@ -50,7 +63,7 @@ def delegate_codex_coding_task(
     turn_timeout_seconds: Optional[float] = None,
     parent_agent: Any = None,
 ) -> str:
-    """Run a bounded coding task in a Codex app-server worker."""
+    """Run a bounded coding task in the configured coding worker backend."""
     if parent_agent is None:
         return tool_error("delegate_codex_coding_task requires a parent agent context.")
 
@@ -75,8 +88,16 @@ def delegate_codex_coding_task(
     )
     timeout = max(30.0, timeout)
 
+    try:
+        from agent.opencode_worker import BACKEND_OPENCODE, load_coding_worker_backend
+
+        backend = load_coding_worker_backend()
+    except Exception:
+        backend = "codex"
+
+    worker_label = "OpenCode" if backend == BACKEND_OPENCODE else "Codex"
     worker_prompt_parts = [
-        "You are a Codex coding worker launched by Hermes.",
+        f"You are a {worker_label} coding worker launched by Hermes.",
         "Work in the requested repository, make direct file edits when needed, "
         "and run focused checks that fit the task.",
         "Do not create commits or pull requests.",
@@ -89,6 +110,41 @@ def delegate_codex_coding_task(
     if context and str(context).strip():
         worker_prompt_parts.extend(["", "Context from Hermes:", str(context).strip()])
     worker_prompt = "\n".join(worker_prompt_parts)
+
+    if backend == BACKEND_OPENCODE:
+        try:
+            from agent.opencode_worker import run_opencode_task
+        except Exception as exc:
+            return tool_error(f"could not import OpenCode worker backend: {exc}")
+
+        started = time.monotonic()
+        result = run_opencode_task(
+            worker_prompt,
+            workdir,
+            timeout=timeout,
+            context_for_classification=f"{task_text}\n{context or ''}",
+            title="Hermes delegated coding task",
+        )
+        duration = round(time.monotonic() - started, 2)
+        success = bool(result.final_text) and not result.error and not result.interrupted
+        return json.dumps(
+            {
+                "success": success,
+                "status": "completed" if success else "partial",
+                "summary": result.final_text,
+                "error": result.error,
+                "interrupted": result.interrupted,
+                "duration_seconds": duration,
+                "cwd": workdir,
+                "backend": "opencode",
+                "agents": result.agents,
+                "plan_used": bool(result.plan_text),
+                "thread_id": result.thread_id,
+                "turn_id": result.turn_id,
+                "tool_iterations": result.tool_iterations,
+            },
+            ensure_ascii=False,
+        )
 
     try:
         from agent.transports.codex_app_server_session import CodexAppServerSession
@@ -163,6 +219,7 @@ def delegate_codex_coding_task(
             "interrupted": turn.interrupted,
             "duration_seconds": duration,
             "cwd": workdir,
+            "backend": "codex",
             "thread_id": turn.thread_id,
             "turn_id": turn.turn_id,
             "tool_iterations": turn.tool_iterations,
@@ -176,8 +233,8 @@ CODEX_WORKER_SCHEMA = {
     "name": "delegate_codex_coding_task",
     "description": (
         "Delegate a bounded implementation, debugging, test-fixing, refactor, "
-        "or code-review task to a Codex app-server coding worker. Use from "
-        "Hermes' normal runtime when Codex should do the coding-heavy step; "
+        "or code-review task to the configured coding worker backend. Use from "
+        "Hermes' normal runtime when a worker should do the coding-heavy step; "
         "Hermes remains responsible for reviewing the worker result and "
         "reporting final status to the user."
     ),
@@ -186,7 +243,7 @@ CODEX_WORKER_SCHEMA = {
         "properties": {
             "task": {
                 "type": "string",
-                "description": "Concrete coding task for the Codex worker.",
+                "description": "Concrete coding task for the coding worker.",
             },
             "context": {
                 "type": "string",
