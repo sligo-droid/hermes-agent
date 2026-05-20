@@ -66,9 +66,53 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     assert captured["cmd"][1:] == ["-m", "hermes_cli.kanban_codex_worker"]
     assert captured["cwd"] == str(workspace.resolve())
     assert captured["env"]["HERMES_CODEX_WORKER_ROLE"] == "planner"
+    assert captured["env"]["HERMES_CODEX_WORKER_REASONING"] == "high"
+    assert captured["env"]["HERMES_CODEX_WORKER_SERVICE_TIER"] == "normal"
     assert captured["env"]["HERMES_KANBAN_BOARD"] == board.slug
     assert captured["env"]["CODEX_HOME"].endswith("/homes/" + task.id)
     assert captured["start_new_session"] is True
+
+
+def test_codex_role_worker_logs_scheduled_runtime_settings(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+    from hermes_cli import kanban_db
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+
+    class Proc:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(
+        workers,
+        "_worker_config",
+        lambda: {
+            "codex_home_root": str(tmp_path / "homes"),
+            "roles": {"planner": {"reasoning": "xhigh", "service_tier": "fast"}},
+        },
+    )
+    monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(workers.subprocess, "Popen", lambda *args, **kwargs: Proc())
+
+    workers.spawn_codex_worker(task, str(tmp_path / "repo"), board=board.slug)
+
+    log = kanban_db.read_worker_log(task.id, board=board.slug)
+    assert log is not None
+    assert "[kanban dispatcher] scheduled Codex role worker: role=planner reasoning=xhigh mode=fast" in log
+
+
+def test_role_extra_args_use_scheduled_runtime_env(monkeypatch):
+    from hermes_cli import kanban_codex_worker as worker
+
+    monkeypatch.setenv("HERMES_CODEX_WORKER_REASONING", "low")
+    monkeypatch.setenv("HERMES_CODEX_WORKER_SERVICE_TIER", "fast")
+
+    assert worker._role_extra_args("planner") == [
+        "-c", 'model_reasoning_effort="low"',
+        "-c", 'service_tier="fast"',
+    ]
 
 
 def test_docker_runner_logs_immediate_registry_failure(monkeypatch, tmp_path):

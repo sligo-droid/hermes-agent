@@ -12,6 +12,12 @@ from typing import Any, Optional
 
 from hermes_cli.discord_worker_boards import ROLE_ASSIGNEES
 
+_ROLE_DEFAULT_REASONING = {
+    "planner": "high",
+    "dev": "medium",
+    "reviewer": "high",
+}
+
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
@@ -33,6 +39,42 @@ def _runner_kind(cfg: dict[str, Any]) -> str:
     return runner if runner in {"host", "docker"} else "host"
 
 
+def _role_runtime_settings(role: str, cfg: dict[str, Any]) -> dict[str, str]:
+    roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
+    role_cfg = roles.get(role) if isinstance(roles.get(role), dict) else {}
+
+    reasoning = str(
+        os.getenv("HERMES_CODEX_WORKER_REASONING")
+        or role_cfg.get("reasoning")
+        or _ROLE_DEFAULT_REASONING.get(role)
+        or "medium"
+    ).strip().lower()
+    if reasoning not in {"minimal", "low", "medium", "high", "xhigh"}:
+        reasoning = _ROLE_DEFAULT_REASONING.get(role, "medium")
+
+    raw_tier = (
+        os.getenv("HERMES_CODEX_WORKER_SERVICE_TIER")
+        or role_cfg.get("service_tier")
+        or role_cfg.get("mode")
+        or role_cfg.get("fast")
+        or cfg.get("service_tier")
+        or cfg.get("mode")
+        or cfg.get("fast")
+        or "normal"
+    )
+    tier = _normalize_service_tier(raw_tier)
+    return {"reasoning": reasoning, "service_tier": tier, "mode": tier}
+
+
+def _normalize_service_tier(value: Any) -> str:
+    if isinstance(value, bool):
+        return "fast" if value else "normal"
+    raw = str(value or "").strip().lower()
+    if raw in {"fast", "priority", "on", "true", "1", "yes"}:
+        return "fast"
+    return "normal"
+
+
 def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
     """Spawn a Codex worker for planner/dev/reviewer tasks.
 
@@ -44,9 +86,10 @@ def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None
     if role not in ROLE_ASSIGNEES:
         return None
     cfg = _worker_config()
+    settings = _role_runtime_settings(role, cfg)
     if _runner_kind(cfg) == "docker":
-        return _spawn_docker_worker(task, workspace, cfg=cfg, board=board)
-    return _spawn_host_worker(task, workspace, cfg=cfg, board=board)
+        return _spawn_docker_worker(task, workspace, cfg=cfg, settings=settings, board=board)
+    return _spawn_host_worker(task, workspace, cfg=cfg, settings=settings, board=board)
 
 
 def _spawn_host_worker(
@@ -54,6 +97,7 @@ def _spawn_host_worker(
     workspace: str,
     *,
     cfg: dict[str, Any],
+    settings: dict[str, str],
     board: Optional[str],
 ) -> Optional[int]:
     workspace_path = Path(workspace).expanduser().resolve()
@@ -75,6 +119,8 @@ def _spawn_host_worker(
             "HERMES_KANBAN_WORKSPACE": str(workspace_path),
             "HERMES_KANBAN_WORKSPACES_ROOT": str(kanban_db.workspaces_root(board=board)),
             "HERMES_CODEX_WORKER_ROLE": str(getattr(task, "assignee", "") or "").strip().lower(),
+            "HERMES_CODEX_WORKER_REASONING": settings["reasoning"],
+            "HERMES_CODEX_WORKER_SERVICE_TIER": settings["service_tier"],
             "CODEX_HOME": str(codex_home),
             "PYTHONPATH": (
                 f"{_repo_root()}{os.pathsep}{existing_pythonpath}"
@@ -88,7 +134,7 @@ def _spawn_host_worker(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
 
     cmd = [sys.executable, "-m", "hermes_cli.kanban_codex_worker"]
-    return _spawn_logged_process(task, cmd, str(workspace_path), env, board=board)
+    return _spawn_logged_process(task, cmd, str(workspace_path), env, settings=settings, board=board)
 
 
 def _spawn_docker_worker(
@@ -96,6 +142,7 @@ def _spawn_docker_worker(
     workspace: str,
     *,
     cfg: dict[str, Any],
+    settings: dict[str, str],
     board: Optional[str],
 ) -> Optional[int]:
     role = str(getattr(task, "assignee", "") or "").strip().lower()
@@ -118,6 +165,8 @@ def _spawn_docker_worker(
             "HERMES_KANBAN_BOARD": str(board or ""),
             "HERMES_KANBAN_WORKSPACE": str(workspace_path),
             "HERMES_CODEX_WORKER_ROLE": role,
+            "HERMES_CODEX_WORKER_REASONING": settings["reasoning"],
+            "HERMES_CODEX_WORKER_SERVICE_TIER": settings["service_tier"],
             "CODEX_HOME": "/codex-home",
             "PYTHONPATH": "/hermes",
         }
@@ -156,7 +205,7 @@ def _spawn_docker_worker(
             cmd.extend(["-e", f"{key}={value}"])
     cmd.extend([image, "python", "-m", "hermes_cli.kanban_codex_worker"])
 
-    return _spawn_logged_process(task, cmd, str(workspace_path), env, board=board)
+    return _spawn_logged_process(task, cmd, str(workspace_path), env, settings=settings, board=board)
 
 
 def _codex_home(task: Any, cfg: dict[str, Any]) -> Path:
@@ -175,12 +224,19 @@ def _spawn_logged_process(
     workspace: str,
     env: dict[str, str],
     *,
+    settings: dict[str, str],
     board: Optional[str],
 ) -> Optional[int]:
     from hermes_cli import kanban_db
 
     log_path = kanban_db.worker_log_path(str(getattr(task, "id", "")), board=board)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    role = str(getattr(task, "assignee", "") or "").strip().lower()
+    kanban_db._append_worker_log_line(
+        log_path,
+        "[kanban dispatcher] scheduled Codex role worker: "
+        f"role={role or '-'} reasoning={settings['reasoning']} mode={settings['mode']}",
+    )
     kanban_db._append_worker_log_line(
         log_path,
         f"[kanban dispatcher] spawning Codex role worker: {' '.join(cmd)}",
