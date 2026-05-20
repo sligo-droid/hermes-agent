@@ -669,7 +669,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
     per process. Used only for non-local backends where the agent's tools
     operate on a different machine than the host Hermes runs on.
     """
-    cwd_hint = os.getenv("TERMINAL_CWD", "")
+    cwd_hint = _local_terminal_cwd() or ""
     cache_key = (env_type, cwd_hint)
     cached = _BACKEND_PROBE_CACHE.get(cache_key)
     if cached is not None:
@@ -743,7 +743,14 @@ def _clear_backend_probe_cache() -> None:
 
 
 def _local_terminal_cwd() -> str | None:
-    cwd = os.getenv("TERMINAL_CWD")
+    cwd = ""
+    try:
+        from gateway.session_context import get_session_env
+
+        cwd = get_session_env("HERMES_SESSION_CWD", "")
+    except Exception:
+        cwd = ""
+    cwd = cwd or os.getenv("TERMINAL_CWD")
     if cwd:
         return os.path.expanduser(cwd)
     try:

@@ -231,7 +231,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # mode).  The gateway process runs from the hermes-agent install
         # dir, so os.getcwd() would pick up the repo's AGENTS.md and
         # other dev files — inflating token usage by ~10k for no benefit.
-        _context_cwd = os.getenv("TERMINAL_CWD") or None
+        _context_cwd = None
+        try:
+            from gateway.session_context import get_session_env
+
+            _context_cwd = get_session_env("HERMES_SESSION_CWD", "") or None
+        except Exception:
+            pass
+        _context_cwd = _context_cwd or os.getenv("TERMINAL_CWD") or None
         context_files_prompt = _r.build_context_files_prompt(
             cwd=_context_cwd, skip_soul=_soul_loaded)
         if context_files_prompt:

@@ -1295,6 +1295,74 @@ def _load_gateway_config() -> dict:
     return {}
 
 
+def _expand_configured_cwd(value: Any, *, fallback: Optional[str] = None) -> str:
+    raw = str(value or "").strip()
+    if not raw or raw in {".", "auto", "cwd"}:
+        raw = fallback or str(get_hermes_home())
+    return os.path.expanduser(os.path.expandvars(raw))
+
+
+def _default_gateway_session_cwd(config: Optional[dict] = None) -> str:
+    cfg = config or {}
+    configured = cfg_get(cfg, "terminal", "cwd", default="")
+    return _expand_configured_cwd(configured, fallback=str(get_hermes_home()))
+
+
+def _configured_channel_cwds(config: Optional[dict] = None) -> dict[str, str]:
+    raw = cfg_get(config or {}, "discord", "channel_cwds", default={})
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        channel_id = str(key or "").strip()
+        cwd = str(value or "").strip()
+        if channel_id and cwd:
+            out[channel_id] = _expand_configured_cwd(cwd)
+    return out
+
+
+def _discord_source_channel_ids(source: Any) -> list[str]:
+    ids: list[str] = []
+    for value in (
+        getattr(source, "chat_id", None),
+        getattr(source, "parent_chat_id", None),
+        getattr(source, "project_channel_id", None),
+    ):
+        text = str(value or "").strip()
+        if text and text not in ids:
+            ids.append(text)
+    return ids
+
+
+def _resolve_gateway_session_cwd(
+    source: Any,
+    config: Optional[dict] = None,
+) -> str:
+    """Resolve the task-local cwd for one gateway turn.
+
+    TERMINAL_CWD remains the process/global default.  This function handles
+    per-message overrides without mutating process-global state, which matters
+    because gateway turns can run concurrently.
+    """
+    cfg = config or {}
+    default_cwd = _default_gateway_session_cwd(cfg)
+
+    if getattr(source, "platform", None) != Platform.DISCORD:
+        return default_cwd
+
+    channel_ids = _discord_source_channel_ids(source)
+    for channel_id, cwd in _configured_channel_cwds(cfg).items():
+        if channel_id in channel_ids:
+            return cwd
+
+    if getattr(source, "project_path", None) or getattr(source, "project_channel_id", None):
+        project_cwd = cfg_get(cfg, "discord", "project_channel_cwd", default="")
+        if str(project_cwd or "").strip():
+            return _expand_configured_cwd(project_cwd, fallback=default_cwd)
+
+    return default_cwd
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -8020,7 +8088,12 @@ class GatewayRunner:
                 from agent.context_references import preprocess_context_references_async
                 from agent.model_metadata import get_model_context_length
 
-                _msg_cwd = os.environ.get("TERMINAL_CWD", os.path.expanduser("~"))
+                from gateway.session_context import get_session_env
+
+                _msg_cwd = (
+                    get_session_env("HERMES_SESSION_CWD", "")
+                    or os.environ.get("TERMINAL_CWD", os.path.expanduser("~"))
+                )
                 _msg_runtime = _resolve_runtime_agent_kwargs()
                 _msg_config_ctx = None
                 try:
@@ -8185,17 +8258,29 @@ class GatewayRunner:
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
-        
-        # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
-        
-        # Read privacy.redact_pii from config (re-read per message)
+
+        _pcfg = {}
         _redact_pii = False
         try:
             _pcfg = _load_gateway_config()
             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
         except Exception:
             pass
+
+        session_cwd = _resolve_gateway_session_cwd(source, _pcfg)
+
+        # Set session context variables for tools (task-local, concurrency-safe).
+        _set_env = self._set_session_env
+        try:
+            _set_env_sig = inspect.signature(_set_env)
+            if "session_cwd" in _set_env_sig.parameters:
+                _session_env_tokens = _set_env(context, session_cwd=session_cwd)
+            else:
+                # Some focused tests replace _set_session_env with a minimal
+                # one-arg stub; keep those harnesses working.
+                _session_env_tokens = _set_env(context)
+        except (TypeError, ValueError):
+            _session_env_tokens = _set_env(context, session_cwd=session_cwd)
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
@@ -8860,7 +8945,7 @@ class GatewayRunner:
                     model=agent_result.get("model"),
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
-                    cwd=os.environ.get("TERMINAL_CWD", ""),
+                    cwd=session_cwd,
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
@@ -12109,7 +12194,9 @@ class GatewayRunner:
             max_file_size_mb=cp_cfg.get("max_file_size_mb", 10),
         )
 
-        cwd = os.getenv("TERMINAL_CWD", str(Path.home()))
+        from gateway.session_context import get_session_env
+
+        cwd = get_session_env("HERMES_SESSION_CWD", "") or os.getenv("TERMINAL_CWD", str(Path.home()))
         arg = event.get_command_args().strip()
 
         if not arg:
@@ -14799,7 +14886,7 @@ class GatewayRunner:
 
         return delivered
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    def _set_session_env(self, context: SessionContext, *, session_cwd: str = "") -> list:
         """Set session context variables for the current async task.
 
         Uses ``contextvars`` instead of ``os.environ`` so that concurrent
@@ -14817,6 +14904,7 @@ class GatewayRunner:
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            session_cwd=session_cwd,
             project_path=str(context.source.project_path) if context.source.project_path else "",
             project_name=str(context.source.project_name) if context.source.project_name else "",
             project_github_url=str(context.source.project_github_url) if context.source.project_github_url else "",
@@ -16121,6 +16209,7 @@ class GatewayRunner:
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
+        session_cwd = _resolve_gateway_session_cwd(source, user_config)
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
@@ -16937,7 +17026,10 @@ class GatewayRunner:
                 turn_route["runtime"],
                 enabled_toolsets,
                 combined_ephemeral,
-                cache_keys=self._extract_cache_busting_config(user_config),
+                cache_keys={
+                    **self._extract_cache_busting_config(user_config),
+                    "gateway.session_cwd": session_cwd,
+                },
             )
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -17006,6 +17098,8 @@ class GatewayRunner:
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
+            agent.session_cwd = session_cwd
+            agent.terminal_cwd = session_cwd
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []
