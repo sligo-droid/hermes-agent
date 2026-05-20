@@ -456,11 +456,26 @@ def test_public_session_board_auto_refreshes(monkeypatch, tmp_path):
     assert "Terminal Log" in html
     assert "setInterval" in html
     assert "Unable to load ticket terminal" in html
-    assert '<a class="brand" href="/">Hermes<br>Kanban</a>' in html
+    assert '<a class="brand" href="/workers">Hermes<br>Kanban</a>' in html
     assert "Codex result" not in html
     assert "Recent internals" not in html
     assert "codex_state" not in html
     assert "JSON.stringify" not in html
+
+
+def test_public_session_board_links_discord_thread_and_workers_index(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    dwb.set_goal(thread_id="6162", goal="Watch the board", guild_id="111")
+
+    html = dwb.render_public_session_board_html("6162")
+
+    assert '<a class="back-link" href="/workers">Worker Boards</a>' in html
+    assert (
+        '<span>Discord: <a href="https://discord.com/channels/111/6162" '
+        'target="_blank" rel="noopener noreferrer"><code>6162</code></a></span>'
+    ) in html
 
 
 def test_public_kanban_web_routes(monkeypatch, tmp_path):

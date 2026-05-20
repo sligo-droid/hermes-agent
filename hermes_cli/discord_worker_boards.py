@@ -1081,6 +1081,9 @@ def _workers_page_css() -> str:
     header { border-bottom: 1px solid var(--line); background: var(--panel); padding: 24px 28px; }
     .brand { color: var(--link); display: inline-block; font-size: 13px; font-weight: 700; line-height: 1.05; text-decoration: none; }
     .brand:hover { text-decoration: underline; }
+    .top-nav { align-items: flex-start; display: flex; gap: 18px; justify-content: space-between; }
+    .back-link { color: var(--link); font-size: 14px; font-weight: 700; text-decoration: none; }
+    .back-link:hover { text-decoration: underline; }
     .hero { margin-top: 14px; }
     h1 { font-size: 24px; line-height: 1.2; margin: 0 0 8px; text-transform: none; }
     .subtle { color: var(--muted); font-size: 14px; }
@@ -1174,6 +1177,13 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
         for c in (worker.get("criteria") or [])
         if (c.get("active", True) if isinstance(c, dict) else True)
     )
+    discord_thread_url = str(worker.get("discord_thread_url") or "").strip()
+    session_text = (
+        f'<a href="{esc(discord_thread_url)}" target="_blank" rel="noopener noreferrer">'
+        f"<code>{esc(session_id)}</code></a>"
+        if discord_thread_url
+        else f"<code>{esc(session_id)}</code>"
+    )
     return f"""<!doctype html>
 <html>
 <head>
@@ -1187,11 +1197,15 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
 </head>
 <body>
   <header>
-    <a class="brand" href="/">Hermes<br>Kanban</a>
+    <div class="top-nav">
+      <a class="brand" href="/workers">Hermes<br>Kanban</a>
+      <a class="back-link" href="/workers">Worker Boards</a>
+    </div>
     <div class="hero">
       <div>
         <h1>{esc(snapshot["name"])}</h1>
         <div class="meta">
+          <span>Discord: {session_text}</span>
           <span>Status: {esc(_public_status_text(worker))}</span>
           <span>Branch: {esc(worker.get("worker_branch") or "")}</span>
           <span>PR: {esc(worker.get("pr_url") or "not opened")}</span>
