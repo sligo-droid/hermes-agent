@@ -443,6 +443,16 @@ def ticket_state_for_session(session_id: str, task_id: str) -> dict[str, Any]:
     return _ticket_state_for_board(board, task_id, worker=worker)
 
 
+def ticket_terminal_feed_for_session(session_id: str, task_id: str) -> dict[str, Any]:
+    board = board_slug_for_discord_thread(session_id)
+    if not kanban_db.board_exists(board):
+        raise KeyError("unknown board session")
+    worker = _read_worker_meta(board)
+    if worker.get("kind") != "discord_worker_board":
+        raise KeyError("unknown board session")
+    return _ticket_terminal_feed_for_board(board, task_id, worker=worker)
+
+
 def _ticket_state_for_board(
     board: str,
     task_id: str,
@@ -476,6 +486,158 @@ def _ticket_state_for_board(
     finally:
         conn.close()
     return _redact_public_state(payload)
+
+
+def _ticket_terminal_feed_for_board(
+    board: str,
+    task_id: str,
+    *,
+    worker: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        raise KeyError("unknown ticket")
+    conn = kanban_db.connect(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            raise KeyError("unknown ticket")
+        runs = kanban_db.list_runs(conn, task_id)
+        events = kanban_db.list_events(conn, task_id)
+        current_run = _current_run_state(task, runs)
+        log_text = kanban_db.read_worker_log(
+            task_id,
+            tail_bytes=CODEX_STATE_LOG_TAIL_BYTES,
+            board=board,
+        )
+    finally:
+        conn.close()
+
+    lines = _terminal_feed_lines(task, current_run=current_run, events=events, log_text=log_text)
+    payload = {
+        "board": board,
+        "worker": _public_worker_meta(worker or _read_worker_meta(board)),
+        "task": {
+            "id": task.id,
+            "title": task.title,
+            "status": task.status,
+            "assignee": task.assignee,
+        },
+        "current_run": _public_terminal_run(current_run),
+        "updated_at": _now(),
+        "lines": lines,
+    }
+    return _redact_public_state(payload)
+
+
+def _public_terminal_run(run: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if not run:
+        return None
+    keys = ("id", "status", "outcome", "worker_pid", "started_at", "last_heartbeat_at", "ended_at")
+    return {key: run.get(key) for key in keys}
+
+
+def _safe_terminal_text(value: Any, *, max_chars: int = 240) -> str:
+    text = str(value or "").strip().replace("\r", " ").replace("\n", " ")
+    if len(text) > max_chars:
+        return f"{text[:max_chars].rstrip()}..."
+    return text
+
+
+def _terminal_feed_lines(
+    task: Any,
+    *,
+    current_run: Optional[dict[str, Any]],
+    events: list[Any],
+    log_text: Optional[str],
+) -> list[str]:
+    lines = [
+        f"$ ticket {task.id}",
+        f"title: {_safe_terminal_text(task.title)}",
+        f"status: {_safe_terminal_text(task.status)}",
+    ]
+    if task.assignee:
+        lines.append(f"assignee: {_safe_terminal_text(task.assignee)}")
+    if current_run:
+        run_bits = [
+            f"run={current_run.get('id') or '-'}",
+            f"status={current_run.get('status') or current_run.get('outcome') or '-'}",
+        ]
+        if current_run.get("worker_pid"):
+            run_bits.append(f"pid={current_run.get('worker_pid')}")
+        started = _format_public_timestamp(current_run.get("started_at"))
+        heartbeat = _format_public_timestamp(current_run.get("last_heartbeat_at"))
+        ended = _format_public_timestamp(current_run.get("ended_at"))
+        if started:
+            run_bits.append(f"started={started}")
+        if heartbeat:
+            run_bits.append(f"heartbeat={heartbeat}")
+        if ended:
+            run_bits.append(f"ended={ended}")
+        lines.append("run: " + " ".join(run_bits))
+    else:
+        lines.append("run: not started")
+
+    event_lines: list[str] = []
+    for event in events[-40:]:
+        line = _terminal_event_line(event)
+        if line:
+            event_lines.append(line)
+    if event_lines:
+        lines.append("")
+        lines.append("# lifecycle")
+        lines.extend(event_lines)
+
+    public_log_lines = _public_worker_log_lines(log_text)
+    if public_log_lines:
+        lines.append("")
+        lines.append("# worker terminal")
+        lines.extend(public_log_lines)
+    elif log_text:
+        lines.append("")
+        lines.append("# worker terminal")
+        lines.append("(worker process output hidden in public view)")
+    return lines
+
+
+def _terminal_event_line(event: Any) -> str:
+    kind = str(getattr(event, "kind", "") or "").strip()
+    if not kind:
+        return ""
+    created = _format_public_timestamp(getattr(event, "created_at", None)) or "time unknown"
+    payload = getattr(event, "payload", None) if isinstance(getattr(event, "payload", None), dict) else {}
+    if kind == "claimed":
+        return f"[{created}] claimed by worker"
+    if kind == "spawned":
+        pid = payload.get("pid") if isinstance(payload, dict) else None
+        return f"[{created}] spawned worker pid={pid}" if pid else f"[{created}] spawned worker"
+    if kind == "completed":
+        summary = _safe_terminal_text(payload.get("summary") if isinstance(payload, dict) else "")
+        return f"[{created}] completed: {summary}" if summary else f"[{created}] completed"
+    if kind == "blocked":
+        reason = _safe_terminal_text(payload.get("reason") if isinstance(payload, dict) else "")
+        return f"[{created}] blocked: {reason}" if reason else f"[{created}] blocked"
+    if kind in {"reclaimed", "archived", "scheduled", "promoted", "assigned"}:
+        return f"[{created}] {kind}"
+    if kind in {"spawn_failed", "crashed", "timed_out", "gave_up"}:
+        return f"[{created}] {kind.replace('_', ' ')}"
+    return ""
+
+
+def _public_worker_log_lines(log_text: Optional[str]) -> list[str]:
+    if not log_text:
+        return []
+    lines: list[str] = []
+    for raw in str(log_text).splitlines()[-80:]:
+        line = raw.strip()
+        if not line.startswith("[kanban dispatcher]"):
+            continue
+        if "spawning Codex role worker" in line:
+            continue
+        lines.append(_safe_terminal_text(line, max_chars=260))
+        if len(lines) >= 20:
+            break
+    return lines
 
 
 def _task_state_dict(task: Any) -> dict[str, Any]:
@@ -855,75 +1017,70 @@ def render_public_session_board_html(session_id: str) -> str:
 
 def _workers_page_css() -> str:
     return """
-    :root { color-scheme: dark; --bg: #041c1c; --panel: rgba(255, 230, 203, 0.055); --panel-strong: rgba(255, 230, 203, 0.11); --line: rgba(255, 230, 203, 0.18); --text: #ffe6cb; --muted: rgba(255, 230, 203, 0.62); --faint: rgba(255, 230, 203, 0.38); --green: #4ade80; --yellow: #ffbd38; --red: #fb7185; --blue: #7dd3fc; }
+    :root { color-scheme: light; --bg: #f7f7f5; --panel: #ffffff; --panel-soft: #fbfbfa; --line: #d7d7d2; --line-soft: #e6e6e2; --text: #1f2933; --muted: #52606d; --link: #1d4ed8; --code: #5965f2; }
     * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
-    body::after { content: ""; position: fixed; inset: 0; pointer-events: none; opacity: 0.16; mix-blend-mode: color-dodge; background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' fill='%23eaeaea' filter='url(%23n)' opacity='0.45'/%3E%3C/svg%3E"); background-size: 512px 512px; }
-    header { border-bottom: 1px solid var(--line); background: rgba(4, 28, 28, 0.88); backdrop-filter: blur(10px); padding: 18px clamp(16px, 3vw, 34px); position: sticky; top: 0; z-index: 5; }
-    .brand { color: var(--text); display: inline-block; font-size: 12px; font-weight: 800; letter-spacing: 0.18em; line-height: 1.05; text-decoration: none; text-transform: uppercase; }
-    .brand:hover { text-decoration: underline; text-underline-offset: 4px; }
-    .hero { align-items: end; display: flex; flex-wrap: wrap; gap: 14px 24px; justify-content: space-between; margin-top: 18px; }
-    h1 { font-size: clamp(28px, 5vw, 56px); line-height: 0.95; margin: 0; max-width: 1000px; text-transform: uppercase; }
-    .subtle { color: var(--muted); font-size: 13px; }
-    main { margin: 0 auto; max-width: 1480px; padding: 22px clamp(14px, 3vw, 34px) 38px; position: relative; z-index: 1; }
-    a { color: inherit; }
-    code { color: var(--blue); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.88em; }
-    .metrics { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-bottom: 18px; }
-    .metric, .board-card, .column, .criteria { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
-    .metric { padding: 12px; }
-    .metric strong { display: block; font-size: 24px; line-height: 1; }
-    .metric span { color: var(--muted); display: block; font-size: 11px; letter-spacing: 0.12em; margin-top: 6px; text-transform: uppercase; }
-    .board-list { display: grid; gap: 12px; list-style: none; margin: 0; padding: 0; }
-    .board-card { overflow: hidden; padding: 0; }
-    .board-card-head { align-items: start; display: grid; gap: 12px; grid-template-columns: 1fr auto; padding: 14px; }
-    .board-title { font-size: 17px; font-weight: 760; line-height: 1.25; text-decoration: none; }
-    .board-title:hover { text-decoration: underline; text-underline-offset: 3px; }
-    .board-meta, .meta { color: var(--muted); display: flex; flex-wrap: wrap; gap: 8px 14px; font-size: 12px; margin-top: 8px; }
-    .chips { display: flex; flex-wrap: wrap; gap: 7px; }
-    .chip { border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: 11px; letter-spacing: 0.08em; padding: 4px 8px; text-transform: uppercase; white-space: nowrap; }
-    .runtime { border-color: currentColor; color: var(--muted); }
-    .runtime-running { color: var(--green); }
-    .runtime-queued { color: var(--yellow); }
-    .runtime-paused { color: var(--yellow); }
-    .runtime-blocked, .runtime-cancelled, .runtime-stale { color: var(--red); }
-    .runtime-done { color: var(--green); }
-    .board-card-body { border-top: 1px solid var(--line); display: grid; gap: 12px; grid-template-columns: minmax(0, 1fr) auto; padding: 14px; }
-    .status-grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(72px, 1fr)); }
-    .status-cell { background: rgba(255, 230, 203, 0.04); border: 1px solid rgba(255, 230, 203, 0.09); border-radius: 6px; padding: 8px; }
-    .status-cell b { display: block; font-size: 18px; line-height: 1; }
-    .status-cell span { color: var(--faint); display: block; font-size: 10px; letter-spacing: 0.11em; margin-top: 5px; text-transform: uppercase; }
-    .reason { color: var(--muted); font-size: 13px; margin-top: 10px; }
-    .actions { align-self: start; display: flex; justify-content: end; }
+    body { margin: 0; min-height: 100vh; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+    header { border-bottom: 1px solid var(--line); background: var(--panel); padding: 24px 28px; }
+    .brand { color: var(--link); display: inline-block; font-size: 13px; font-weight: 700; line-height: 1.05; text-decoration: none; }
+    .brand:hover { text-decoration: underline; }
+    .hero { margin-top: 14px; }
+    h1 { font-size: 24px; line-height: 1.2; margin: 0 0 8px; text-transform: none; }
+    .subtle { color: var(--muted); font-size: 14px; }
+    main { padding: 20px; }
+    a { color: var(--link); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code { color: var(--code); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; }
+    p { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .board-list { list-style: none; margin: 0; max-width: 900px; padding: 0; }
+    .board-card, .column, .criteria { background: var(--panel); border: 1px solid var(--line-soft); border-radius: 6px; }
+    .board-card { margin-bottom: 10px; padding: 12px; }
+    .board-card-head { display: block; padding: 0; }
+    .board-title { font-size: 16px; font-weight: 700; line-height: 1.25; text-decoration: none; }
+    .board-meta, .meta { color: var(--muted); display: flex; flex-wrap: wrap; gap: 8px 12px; font-size: 14px; margin-top: 8px; }
+    .chips { margin-top: 8px; }
+    .chip { color: var(--muted); font-size: 13px; }
+    .runtime { font-weight: 700; text-transform: uppercase; }
+    .board-card-body { display: block; padding: 0; }
+    .status-grid { color: var(--muted); font-size: 13px; margin-top: 8px; }
+    .status-cell { display: inline; }
+    .status-cell + .status-cell::before { content: " "; }
+    .status-cell b { font-weight: 400; }
+    .status-cell span::after { content: ":"; }
+    .status-cell span { margin-right: 0; }
+    .reason { color: var(--muted); font-size: 13px; margin-top: 8px; }
+    .actions { margin-top: 10px; }
     form { display: inline; margin: 0; }
-    button, .button-link { align-items: center; background: var(--text); border: 1px solid var(--text); border-radius: 6px; color: var(--bg); cursor: pointer; display: inline-flex; font: inherit; font-size: 12px; font-weight: 720; gap: 6px; min-height: 34px; padding: 7px 11px; text-decoration: none; text-transform: uppercase; }
-    button:hover, .button-link:hover { background: transparent; color: var(--text); }
+    button, .button-link { background: var(--text); border: 1px solid var(--text); border-radius: 6px; color: #ffffff; cursor: pointer; font: inherit; padding: 6px 10px; text-decoration: none; }
+    button:hover, .button-link:hover { background: #374151; }
     .board { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
     .column { min-height: 190px; overflow: hidden; }
-    .column h2 { align-items: center; border-bottom: 1px solid var(--line); display: flex; font-size: 12px; justify-content: space-between; letter-spacing: 0.13em; margin: 0; padding: 11px 12px; text-transform: uppercase; }
+    .column h2 { align-items: center; border-bottom: 1px solid var(--line-soft); display: flex; font-size: 14px; justify-content: space-between; margin: 0; padding: 12px; text-transform: uppercase; }
     .column ul { list-style: none; margin: 0; padding: 10px; }
-    .column li { margin-bottom: 8px; }
-    .ticket { appearance: none; background: rgba(255, 230, 203, 0.055); border: 1px solid rgba(255, 230, 203, 0.12); border-radius: 6px; color: inherit; cursor: pointer; display: block; font: inherit; padding: 10px; text-align: left; width: 100%; }
-    .ticket:hover { border-color: rgba(255, 230, 203, 0.38); }
-    .ticket strong { display: block; font-size: 13px; line-height: 1.25; }
-    .ticket p { color: var(--muted); font-size: 12px; margin: 7px 0 0; }
-    .criteria { margin-bottom: 16px; padding: 14px; }
-    .criteria strong { display: block; font-size: 12px; letter-spacing: 0.13em; margin-bottom: 8px; text-transform: uppercase; }
+    .column li { background: var(--panel-soft); border: 1px solid var(--line-soft); border-radius: 6px; margin-bottom: 8px; padding: 10px; }
+    .ticket { appearance: none; background: transparent; border: 0; color: inherit; cursor: pointer; display: block; font: inherit; padding: 0; text-align: left; width: 100%; }
+    .ticket:hover strong { color: var(--link); text-decoration: underline; }
+    .ticket:focus-visible { outline: 2px solid var(--code); outline-offset: 3px; }
+    .ticket strong { display: block; font-size: 14px; line-height: 1.25; }
+    .ticket p { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .criteria { margin-bottom: 18px; padding: 14px; }
+    .criteria strong { display: block; font-size: 14px; margin-bottom: 8px; }
     .criteria ol { margin: 0; padding-left: 20px; }
-    .criteria li { color: var(--muted); margin: 4px 0; }
-    .modal { align-items: center; background: rgba(0, 0, 0, 0.68); display: none; inset: 0; justify-content: center; padding: 18px; position: fixed; z-index: 20; }
+    .criteria li { color: var(--text); margin: 4px 0; }
+    .modal { align-items: center; background: rgba(15, 23, 42, 0.54); display: none; inset: 0; justify-content: center; padding: 20px; position: fixed; z-index: 20; }
     .modal[aria-hidden="false"] { display: flex; }
-    .modal-panel { background: #071f1f; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 24px 70px rgba(0, 0, 0, 0.46); max-height: min(88vh, 920px); max-width: min(980px, 96vw); min-width: min(760px, 96vw); overflow: hidden; }
-    .modal-head { align-items: center; border-bottom: 1px solid var(--line); display: flex; gap: 16px; justify-content: space-between; padding: 14px 16px; }
-    .modal-head h2 { font-size: 15px; margin: 0; text-transform: uppercase; }
-    .modal-body { color: var(--text); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 0; max-height: calc(min(88vh, 920px) - 58px); overflow: auto; padding: 14px; white-space: pre-wrap; word-break: break-word; }
-    @media (max-width: 760px) { .board-card-head, .board-card-body { grid-template-columns: 1fr; } .actions { justify-content: start; } }
+    .modal-panel { background: #ffffff; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 24px 60px rgba(15, 23, 42, 0.28); max-height: min(86vh, 900px); max-width: min(920px, 96vw); min-width: min(720px, 96vw); overflow: hidden; }
+    .modal-head { align-items: center; border-bottom: 1px solid var(--line-soft); display: flex; gap: 16px; justify-content: space-between; padding: 14px 16px; }
+    .modal-head h2 { font-size: 16px; margin: 0; }
+    .modal-close { background: #f3f4f6; border: 1px solid var(--line); color: var(--text); }
+    .modal-close:hover { background: #e5e7eb; }
+    .modal-body { background: #111827; color: #f9fafb; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 0; max-height: calc(min(86vh, 900px) - 58px); overflow: auto; padding: 14px; white-space: pre-wrap; word-break: break-word; }
+    @media (max-width: 760px) { .modal-panel { min-width: min(100%, 96vw); } }
     """
 
 
 def _render_public_board_html(snapshot: dict[str, Any]) -> str:
     worker = snapshot["worker"]
     tasks = snapshot["tasks"]
-    counts = snapshot.get("counts") or {}
     runtime = snapshot.get("runtime") or {"state": "idle", "reason": "no active tickets"}
     session_id = str(snapshot.get("session_id") or worker.get("thread_id") or "")
     columns = ["triage", "todo", "ready", "running", "blocked", "done"]
@@ -939,14 +1096,14 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
         items = by_status.get(status, [])
         body = "\n".join(
             "<li><button type=\"button\" class=\"ticket\" data-ticket-id=\"{id}\" "
-            "data-ticket-title=\"{title}\" data-ticket-state-url=\"{url}\">"
+            "data-ticket-title=\"{title}\" data-ticket-terminal-url=\"{url}\">"
             "<strong>{title}</strong><br><code>{id}</code> {assignee}<p>{summary}</p>"
             "</button></li>".format(
                 title=esc(item["title"]),
                 id=esc(item["id"]),
                 url=esc(
                     f"/workers/{quote(session_id, safe='')}/tickets/"
-                    f"{quote(str(item['id']), safe='')}/state"
+                    f"{quote(str(item['id']), safe='')}/terminal"
                 ),
                 assignee=esc(item["assignee"] or ""),
                 summary=esc(item["latest_summary"] or ""),
@@ -958,10 +1115,6 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
         f"<li>{esc(c.get('text') if isinstance(c, dict) else c)}</li>"
         for c in (worker.get("criteria") or [])
         if (c.get("active", True) if isinstance(c, dict) else True)
-    )
-    metric_cards = "".join(
-        f'<div class="metric"><strong>{int(counts.get(status) or 0)}</strong><span>{esc(status)}</span></div>'
-        for status in ("ready", "running", "blocked", "done")
     )
     return f"""<!doctype html>
 <html>
@@ -986,16 +1139,13 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
           <span>PR: {esc(worker.get("pr_url") or "not opened")}</span>
           <span>Review: {esc(_public_review_text(worker))}</span>
           <span>Updated: {esc(_format_public_timestamp(worker.get("updated_at")) or "never")}</span>
+          <span>Runtime: <strong class="runtime runtime-{esc(runtime.get("state"))}">{esc(runtime.get("state"))}</strong></span>
+          <span>{esc(runtime.get("reason"))}</span>
         </div>
-      </div>
-      <div class="chips">
-        <span class="chip runtime runtime-{esc(runtime.get("state"))}">{esc(runtime.get("state"))}</span>
-        <span class="chip">{esc(runtime.get("reason"))}</span>
       </div>
     </div>
   </header>
   <main>
-    <div class="metrics">{metric_cards}</div>
     <div class="criteria"><strong>Acceptance Criteria</strong><ol>{criteria}</ol></div>
     <div class="board">{''.join(cards)}</div>
   </main>
@@ -1014,104 +1164,51 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
       const title = document.getElementById("ticket-modal-title");
       const body = document.getElementById("ticket-modal-body");
       const close = document.getElementById("ticket-modal-close");
-      const emptyCodexMessage = "No Codex app-server internals captured for this ticket yet.";
+      let refreshTimer = null;
+      let activeUrl = "";
       const hide = () => {{
+        if (refreshTimer) {{
+          clearInterval(refreshTimer);
+          refreshTimer = null;
+        }}
+        activeUrl = "";
         modal.setAttribute("aria-hidden", "true");
         body.textContent = "";
       }};
       const show = (label) => {{
-        title.textContent = label ? label + " - Worker Internals" : "Worker Internals";
+        title.textContent = label ? label + " - Terminal Log" : "Terminal Log";
         body.textContent = "Loading...";
         modal.setAttribute("aria-hidden", "false");
       }};
-      const value = (v) => {{
-        if (v === null || v === undefined || v === "") return "-";
-        if (typeof v === "object") return Object.entries(v).map(([k, item]) => `${{k}}=${{value(item)}}`).join(", ");
-        return String(v);
+      const renderTerminal = (feed) => {{
+        const lines = Array.isArray(feed?.lines) ? feed.lines : [];
+        return lines.length ? lines.join("\\n") : "(no terminal activity yet)";
       }};
-      const time = (v) => {{
-        if (!v) return "-";
-        const d = new Date(Number(v) * 1000);
-        return Number.isNaN(d.getTime()) ? value(v) : d.toISOString().replace("T", " ").replace(".000Z", " UTC");
-      }};
-      const lines = [];
-      const push = (label, v) => lines.push(`${{label}}: ${{value(v)}}`);
-      const section = (label) => {{
-        if (lines.length) lines.push("");
-        lines.push(label.toUpperCase());
-        lines.push("-".repeat(label.length));
-      }};
-      const interestingText = (payload) => {{
-        const item = payload?.params?.item || payload?.item || payload || {{}};
-        return item.aggregatedOutput || item.output || item.text || item.content || item.summary || item.message || "";
-      }};
-      const renderState = (state) => {{
-        lines.length = 0;
-        const task = state?.task || {{}};
-        const run = state?.current_run || {{}};
-        section("Ticket");
-        push("id", task.id);
-        push("title", task.title);
-        push("status", task.status);
-        push("assignee", task.assignee);
-        push("failure", task.last_failure_error);
-        push("result", task.result);
-
-        section("Current run");
-        push("run", run.id);
-        push("status", run.status || run.outcome);
-        push("pid", run.worker_pid || task.worker_pid);
-        push("started", time(run.started_at || task.started_at));
-        push("heartbeat", time(run.last_heartbeat_at || task.last_heartbeat_at));
-        push("ended", time(run.ended_at));
-        push("summary", run.summary);
-        push("error", run.error);
-
-        const codex = state?.codex_state || {{}};
-        section("Codex result");
-        if (codex.available === false) {{
-          lines.push(codex.message || emptyCodexMessage);
-        }} else {{
-          const result = codex.result || {{}};
-          push("final_text", result.final_text);
-          push("error", result.error);
-          push("interrupted", result.interrupted);
-          push("timed_out", result.timed_out);
-          push("tool_iterations", result.tool_iterations);
-          push("turn_id", result.turn_id);
-          push("thread_id", result.thread_id);
+      const loadTerminal = async (url) => {{
+        const response = await fetch(url, {{ headers: {{ "Accept": "application/json" }} }});
+        if (!response.ok) {{
+          throw new Error(`HTTP ${{response.status}}`);
         }}
-
-        const events = Array.isArray(codex.events) ? codex.events.slice(-20) : [];
-        section("Recent internals");
-        if (!events.length) {{
-          lines.push("No captured Codex events.");
-        }} else {{
-          for (const event of events) {{
-            const text = interestingText(event.payload);
-            lines.push(`[${{time(event.ts)}}] ${{value(event.method)}} ${{value(event.item_type)}}`);
-            if (text) lines.push(text);
-          }}
-        }}
-
-        section("Worker log");
-        lines.push(state?.worker_log_tail || "No worker log captured.");
-        return lines.join("\\n");
+        const feed = await response.json();
+        body.textContent = renderTerminal(feed);
+        body.scrollTop = body.scrollHeight;
       }};
-      document.querySelectorAll("[data-ticket-state-url]").forEach((button) => {{
+      document.querySelectorAll("[data-ticket-terminal-url]").forEach((button) => {{
         button.addEventListener("click", async () => {{
           show(button.dataset.ticketTitle || button.dataset.ticketId || "Ticket State");
+          activeUrl = button.dataset.ticketTerminalUrl;
+          if (refreshTimer) clearInterval(refreshTimer);
           try {{
-            const response = await fetch(button.dataset.ticketStateUrl, {{
-              headers: {{ "Accept": "application/json" }},
-            }});
-            if (!response.ok) {{
-              throw new Error(`HTTP ${{response.status}}`);
-            }}
-            const state = await response.json();
-            body.textContent = renderState(state);
+            await loadTerminal(activeUrl);
+            refreshTimer = setInterval(() => {{
+              if (activeUrl && modal.getAttribute("aria-hidden") === "false") {{
+                loadTerminal(activeUrl).catch((error) => {{
+                  body.textContent = `Unable to load ticket terminal: ${{error}}`;
+                }});
+              }}
+            }}, 2000);
           }} catch (error) {{
-            body.textContent = `Unable to load ticket state: ${{error}}`;
+            body.textContent = `Unable to load ticket terminal: ${{error}}`;
           }}
         }});
       }});
@@ -1183,15 +1280,6 @@ def render_public_board_index_html() -> str:
     def esc(value: Any) -> str:
         return html.escape(str(value or ""))
 
-    def status_grid(counts: dict[str, Any]) -> str:
-        return "".join(
-            '<div class="status-cell"><b>{count}</b><span>{label}</span></div>'.format(
-                count=int(counts.get(status) or 0),
-                label=esc(status),
-            )
-            for status in ("ready", "running", "blocked", "done")
-        )
-
     items = []
     for board in snapshot["boards"]:
         worker = board.get("worker") or {}
@@ -1200,11 +1288,13 @@ def render_public_board_index_html() -> str:
         counts = board.get("counts") or {}
         running = board.get("running") if isinstance(board.get("running"), list) else []
         runtime = board.get("runtime") if isinstance(board.get("runtime"), dict) else {}
+        count_text = _public_count_text(counts)
         running_text = _running_status_text(running)
         runtime_state = str(runtime.get("state") or "idle")
         runtime_reason = str(runtime.get("reason") or running_text)
         runtime_label = "Queue" if runtime_state == "queued" else "Status"
         title = esc(worker.get("root_goal") or worker.get("initial_request") or board.get("name"))
+        link = f'<a class="board-title" href="{esc(href)}">{title}</a>' if href else title
         discord_thread_url = str(worker.get("discord_thread_url") or "").strip()
         session_text = (
             f'<a href="{esc(discord_thread_url)}" target="_blank" rel="noopener noreferrer">'
@@ -1261,37 +1351,31 @@ def render_public_board_index_html() -> str:
             primary_action = ""
         items.append(
             '<li class="board-card">'
-            '<div class="board-card-head">'
-            '<div><a class="board-title" href="{href}">{link_text}</a>'
-            '<div class="board-meta">{session}<span>{status}</span><span>{branch}</span><span>{mode}</span><span>PR: {pr}</span><span>Review: {review}</span></div>'
-            '</div>'
-            '<div class="chips"><span class="chip runtime runtime-{runtime_class}">{runtime}</span></div>'
-            '</div>'
-            '<div class="board-card-body">'
-            '<div><div class="status-grid">{status_grid}</div>'
-            '<div class="reason">{reason_label}: {reason}</div>'
-            '<div class="reason">Running: {running}</div>'
-            '<div class="reason">{timestamps}</div>'
+            '<strong>{link}</strong><br>'
+            '{session} {status}'
+            '<p>Runtime: <strong class="runtime runtime-{runtime_class}">{runtime}</strong></p>'
+            '<p>{counts}</p>'
+            '<p>{reason_label}: {reason}</p>'
+            '<p>Running: {running}</p>'
+            '<p>{branch}{mode}{pr}{review}</p>'
+            '<p>{timestamps}</p>'
             '{flags}'
-            '</div>'
             '<div class="actions">{action}</div>'
-            '</div>'
             '</li>'.format(
-                href=esc(href or "#"),
-                link_text=title,
+                link=link,
                 session=session_text,
                 status=esc(status),
                 runtime=esc(runtime_state),
                 runtime_class=esc(runtime_state),
                 reason_label=esc(runtime_label),
                 reason=esc(runtime_reason),
+                counts=esc(count_text),
                 running=esc(running_text),
                 branch=f"Branch: {esc(branch)}" if branch else "Branch: pending",
-                mode=f"Mode: {esc(execution_mode)}" if execution_mode else "Mode: pending",
-                pr=pr_text,
-                review=esc(_public_review_text(worker)),
+                mode=f" Mode: {esc(execution_mode)}" if execution_mode else "",
+                pr=f" PR: {pr_text}",
+                review=f" Review: {esc(_public_review_text(worker))}",
                 timestamps=timestamps,
-                status_grid=status_grid(counts),
                 flags=f"<p>{esc(flags_text)}</p>" if flags_text else "",
                 action=primary_action,
             )

@@ -252,9 +252,9 @@ def test_public_board_index_lists_operational_row_data(monkeypatch, tmp_path):
     html = dwb.render_public_board_index_html()
 
     assert "active / dev" in html
-    assert 'runtime runtime-paused">paused</span>' in html
-    assert "<b>1</b><span>ready</span>" in html
-    assert "<b>1</b><span>running</span>" in html
+    assert 'class="runtime runtime-paused">paused</strong>' in html
+    assert "ready:1" in html
+    assert "running:1" in html
     assert "Running: idle" in html
     assert "Branch: discord/5152" in html
     assert 'PR: <a href="https://github.example/pull/42">#42</a>' in html
@@ -277,7 +277,7 @@ def test_public_board_index_shows_pause_control_for_active_board(monkeypatch, tm
 
     html = dwb.render_public_board_index_html()
 
-    assert 'runtime runtime-queued">queued</span>' in html
+    assert 'class="runtime runtime-queued">queued</strong>' in html
     assert "Queue: awaiting next dispatcher tick" in html
     assert "Running: idle" in html
     assert 'action="/workers/5153/pause"' in html
@@ -301,7 +301,7 @@ def test_public_board_index_shows_running_runtime(monkeypatch, tmp_path):
 
     html = dwb.render_public_board_index_html()
 
-    assert 'runtime runtime-running">running</span>' in html
+    assert 'class="runtime runtime-running">running</strong>' in html
     assert "Running: Active dev ticket" in html
     assert "pid=123" in html
 
@@ -324,7 +324,7 @@ def test_public_board_index_live_worker_overrides_stale_blocked_meta(monkeypatch
 
     html = dwb.render_public_board_index_html()
 
-    assert 'runtime runtime-running">running</span>' in html
+    assert 'class="runtime runtime-running">running</strong>' in html
     assert "Running: Live worker ticket" in html
     assert "Status: Live worker ticket" in html
 
@@ -346,7 +346,7 @@ def test_public_board_index_does_not_show_dead_pid_as_running(monkeypatch, tmp_p
 
     html = dwb.render_public_board_index_html()
 
-    assert 'runtime runtime-stale">stale</span>' in html
+    assert 'class="runtime runtime-stale">stale</strong>' in html
     assert "running ticket has no live worker" in html
     assert "Pause</button>" not in html
 
@@ -369,7 +369,7 @@ def test_public_board_index_done_board_has_no_pause_action(monkeypatch, tmp_path
 
     html = dwb.render_public_board_index_html()
 
-    assert 'runtime runtime-done">done</span>' in html
+    assert 'class="runtime runtime-done">done</strong>' in html
     assert 'action="/workers/5156/pause"' not in html
 
 
@@ -407,14 +407,15 @@ def test_public_session_board_auto_refreshes(monkeypatch, tmp_path):
     html = dwb.render_public_session_board_html("6160")
 
     assert '<meta http-equiv="refresh" content="15">' in html
-    assert html.count('data-ticket-state-url="/workers/6160/tickets/') == 2
+    assert html.count('data-ticket-terminal-url="/workers/6160/tickets/') == 2
     assert 'id="ticket-modal"' in html
-    assert "Worker Internals" in html
-    assert "No Codex app-server internals captured for this ticket yet." in html
-    assert "Unable to load ticket state" in html
+    assert "Terminal Log" in html
+    assert "setInterval" in html
+    assert "Unable to load ticket terminal" in html
     assert '<a class="brand" href="/">Hermes<br>Kanban</a>' in html
-    assert "Codex result" in html
-    assert "Recent internals" in html
+    assert "Codex result" not in html
+    assert "Recent internals" not in html
+    assert "codex_state" not in html
     assert "JSON.stringify" not in html
 
 
@@ -475,6 +476,7 @@ def test_worker_routes_require_dashboard_auth(monkeypatch, tmp_path):
     index = client.get("/workers")
     session = client.get("/workers/7171")
     ticket_state = client.get(f"/workers/7171/tickets/{task_id}/state")
+    ticket_terminal = client.get(f"/workers/7171/tickets/{task_id}/terminal")
     root_legacy = client.get("/7171", follow_redirects=False)
     kanban_legacy = client.get("/kanban/7171", follow_redirects=False)
     token_resp = client.get(f"/workers/public/kanban/{token}")
@@ -490,6 +492,7 @@ def test_worker_routes_require_dashboard_auth(monkeypatch, tmp_path):
     assert index.status_code == 401
     assert session.status_code == 401
     assert ticket_state.status_code == 401
+    assert ticket_terminal.status_code == 401
     assert root_legacy.status_code == 401
     assert kanban_legacy.status_code == 401
     assert token_resp.status_code == 401
@@ -589,6 +592,75 @@ def test_worker_ticket_state_endpoint_returns_redacted_state(monkeypatch, tmp_pa
     assert "sk-proj-A1B2C3D4E5F6G7H8I9J0" not in rendered
     assert data["codex_state"]["available"] is True
     assert data["codex_state"]["events"][0]["item_type"] == "commandExecution"
+    assert missing.status_code == 404
+
+
+def test_worker_ticket_terminal_endpoint_returns_sanitized_feed(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    board = dwb.set_goal(thread_id="8183", goal="Inspect terminal")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        claimed = kanban_db.claim_task(conn, task.id)
+        assert claimed is not None
+        kanban_db._set_worker_pid(conn, task.id, 12345)
+        kanban_db.complete_task(
+            conn,
+            task.id,
+            summary="Read /home/droid/private/config.yaml",
+            metadata={"path": "/home/droid/private/config.yaml"},
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+    kanban_db._append_worker_log_line(
+        kanban_db.worker_log_path(task.id, board=board.slug),
+        "[kanban dispatcher] spawning Codex role worker: hermes chat -q secret prompt",
+    )
+    kanban_db._append_worker_log_line(
+        kanban_db.worker_log_path(task.id, board=board.slug),
+        "ran cat /home/droid/private/config.yaml with key sk-proj-A1B2C3D4E5F6G7H8I9J0",
+    )
+    dwb.record_codex_worker_event(
+        task.id,
+        board=board.slug,
+        event={
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "commandExecution",
+                    "cwd": "/home/droid/private",
+                    "aggregatedOutput": "token sk-proj-A1B2C3D4E5F6G7H8I9J0",
+                }
+            },
+        },
+    )
+
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    resp = client.get(f"/workers/8183/tickets/{task.id}/terminal")
+    missing = client.get("/workers/8183/tickets/t_missing/terminal")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    rendered = json.dumps(data)
+    assert data["task"]["id"] == task.id
+    assert data["current_run"]["id"] == claimed.current_run_id
+    assert data["lines"][0] == f"$ ticket {task.id}"
+    assert "completed: Read [REDACTED_PATH]" in "\n".join(data["lines"])
+    assert "codex_state" not in data
+    assert "events" not in data
+    assert "aggregatedOutput" not in rendered
+    assert "commandExecution" not in rendered
+    assert "spawning Codex role worker" not in rendered
+    assert "secret prompt" not in rendered
+    assert "/home/droid/private" not in rendered
+    assert "sk-proj-A1B2C3D4E5F6G7H8I9J0" not in rendered
     assert missing.status_code == 404
 
 
