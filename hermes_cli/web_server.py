@@ -333,8 +333,16 @@ async def public_worker_session_board(session_id: str):
         raise HTTPException(status_code=500, detail="Kanban board unavailable")
 
 
+def _worker_action_redirect_url(session_id: str, return_to: Optional[str]) -> str:
+    quoted_session = urllib.parse.quote(str(session_id or ""), safe="")
+    detail_url = f"/workers/{quoted_session}"
+    if return_to in {"/workers", detail_url}:
+        return return_to
+    return "/workers"
+
+
 @app.post("/workers/{session_id}/start")
-async def start_worker_session_board(session_id: str):
+async def start_worker_session_board(session_id: str, return_to: Optional[str] = None):
     """Start or resume a Discord worker session board."""
     try:
         from hermes_cli.discord_worker_boards import (
@@ -347,7 +355,10 @@ async def start_worker_session_board(session_id: str):
         if not kanban_db.board_exists(board):
             raise KeyError("unknown board session")
         start_board(board)
-        return RedirectResponse(url="/workers", status_code=303)
+        return RedirectResponse(
+            url=_worker_action_redirect_url(session_id, return_to),
+            status_code=303,
+        )
     except KeyError:
         raise HTTPException(status_code=404, detail="Kanban board not found")
     except ValueError:
@@ -358,7 +369,7 @@ async def start_worker_session_board(session_id: str):
 
 
 @app.post("/workers/{session_id}/pause")
-async def pause_worker_session_board(session_id: str):
+async def pause_worker_session_board(session_id: str, return_to: Optional[str] = None):
     """Pause a Discord worker session board."""
     try:
         from hermes_cli.discord_worker_boards import (
@@ -371,7 +382,10 @@ async def pause_worker_session_board(session_id: str):
         if not kanban_db.board_exists(board):
             raise KeyError("unknown board session")
         pause_board(board, reason="workers-page")
-        return RedirectResponse(url="/workers", status_code=303)
+        return RedirectResponse(
+            url=_worker_action_redirect_url(session_id, return_to),
+            status_code=303,
+        )
     except KeyError:
         raise HTTPException(status_code=404, detail="Kanban board not found")
     except ValueError:

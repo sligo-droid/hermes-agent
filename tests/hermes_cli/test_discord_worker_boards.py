@@ -463,6 +463,26 @@ def test_public_session_board_auto_refreshes(monkeypatch, tmp_path):
     assert "JSON.stringify" not in html
 
 
+def test_public_session_board_shows_runtime_controls(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(thread_id="6163", goal="Control the board")
+
+    active_html = dwb.render_public_session_board_html("6163")
+
+    assert 'class="runtime runtime-queued">queued</strong>' in active_html
+    assert 'action="/workers/6163/pause?return_to=/workers/6163"' in active_html
+    assert ">Pause Queue</button>" in active_html
+
+    dwb.pause_board(board.slug)
+    paused_html = dwb.render_public_session_board_html("6163")
+
+    assert 'class="runtime runtime-paused">paused</strong>' in paused_html
+    assert 'action="/workers/6163/start?return_to=/workers/6163"' in paused_html
+    assert ">Resume</button>" in paused_html
+
+
 def test_public_session_board_links_discord_thread_and_workers_index(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -592,6 +612,42 @@ def test_worker_index_start_and_pause_actions(monkeypatch, tmp_path):
     assert started["goal_status"] == "active"
     assert started["phase"] == "planning"
     assert missing.status_code == 404
+
+
+def test_worker_detail_start_and_pause_actions_redirect_back(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    board = dwb.set_goal(thread_id="7373", goal="Toggle board from detail")
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+
+    pause_resp = client.post(
+        "/workers/7373/pause?return_to=/workers/7373",
+        follow_redirects=False,
+    )
+    paused = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    start_resp = client.post(
+        "/workers/7373/start?return_to=/workers/7373",
+        follow_redirects=False,
+    )
+    started = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    external_resp = client.post(
+        "/workers/7373/pause?return_to=https%3A%2F%2Fexample.test%2Fbad",
+        follow_redirects=False,
+    )
+
+    assert pause_resp.status_code == 303
+    assert pause_resp.headers["location"] == "/workers/7373"
+    assert paused["paused"] is True
+    assert start_resp.status_code == 303
+    assert start_resp.headers["location"] == "/workers/7373"
+    assert started["paused"] is False
+    assert external_resp.status_code == 303
+    assert external_resp.headers["location"] == "/workers"
 
 
 def test_worker_ticket_state_endpoint_returns_redacted_state(monkeypatch, tmp_path):
