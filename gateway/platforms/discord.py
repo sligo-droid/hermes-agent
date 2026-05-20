@@ -2379,7 +2379,40 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def _processing_reaction_message(self, event: MessageEvent) -> Any:
         """Return the user Discord message whose reactions represent this turn."""
-        return event.raw_message
+        raw_message = getattr(event, "raw_message", None)
+        channel = getattr(raw_message, "channel", None)
+        if channel is not None and self._get_parent_channel_id(channel):
+            origin = await self._thread_origin_message(channel)
+            if origin is not None:
+                return origin
+        return raw_message
+
+    async def _thread_origin_message(self, thread_channel: Any) -> Optional[Any]:
+        """Resolve the message that started a Discord thread, when possible."""
+        starter = getattr(thread_channel, "starter_message", None)
+        if starter is not None and hasattr(starter, "add_reaction"):
+            return starter
+
+        candidate_ids = []
+        for value in (
+            getattr(thread_channel, "starter_message_id", None),
+            getattr(thread_channel, "id", None),
+        ):
+            if value is not None and str(value) not in candidate_ids:
+                candidate_ids.append(str(value))
+
+        for source in (thread_channel, getattr(thread_channel, "parent", None)):
+            fetch_message = getattr(source, "fetch_message", None)
+            if not callable(fetch_message):
+                continue
+            for message_id in candidate_ids:
+                try:
+                    message = await fetch_message(int(message_id))
+                except Exception:
+                    continue
+                if message is not None and hasattr(message, "add_reaction"):
+                    return message
+        return None
 
     async def _processing_reaction_messages(self, event: MessageEvent) -> List[Any]:
         """Return all user Discord messages whose reactions represent this turn."""
