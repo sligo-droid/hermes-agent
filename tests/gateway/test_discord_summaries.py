@@ -476,7 +476,8 @@ async def test_project_summary_retries_after_failed_attempt(adapter):
 
 
 @pytest.mark.asyncio
-async def test_feature_summary_update_edits_initial_message(adapter):
+async def test_feature_summary_update_edits_initial_message(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     parent = FakeTextChannel(channel_id=100)
     thread = FakeThread(channel_id=200, parent=parent)
     handle = await adapter.initialize_feature_summary(
@@ -500,9 +501,27 @@ async def test_feature_summary_update_edits_initial_message(adapter):
     assert edited_embed.title == "Project Links"
     assert edited_embed.description is None
     assert "Generated Title" not in fields
-    assert fields["Status"] == "✅ Done"
+    assert fields["Status"] == "👀 In progress"
     assert fields["Concise Outcome"].startswith("Done.")
     assert fields["Branch"] == "feature/summary"
+
+
+def test_feature_summary_kanban_status_labels(adapter):
+    adapter._feature_kanban_reaction_state = MagicMock(return_value="done")
+    done_embed = adapter._build_feature_summary_embed(
+        initial_request="",
+        status=adapter._feature_kanban_summary_status({"kanban_board": {"slug": "board"}}) or "Running",
+    )
+    done_fields = {field.name: field.value for field in done_embed.fields}
+    assert done_fields["Status"] == "✅ Done"
+
+    adapter._feature_kanban_reaction_state = MagicMock(return_value="blocked")
+    blocked_embed = adapter._build_feature_summary_embed(
+        initial_request="",
+        status=adapter._feature_kanban_summary_status({"kanban_board": {"slug": "board"}}) or "Running",
+    )
+    blocked_fields = {field.name: field.value for field in blocked_embed.fields}
+    assert blocked_fields["Status"] == "❓ Blocked"
 
 
 @pytest.mark.asyncio

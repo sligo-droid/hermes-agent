@@ -392,6 +392,36 @@ async def test_top_level_feature_summary_reactions_target_triggering_user_messag
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "emoji"),
+    [
+        ("active", "👀"),
+        ("done", "✅"),
+        ("blocked", "❓"),
+        ("errored", "❌"),
+    ],
+)
+async def test_feature_summary_reactions_follow_kanban_state(adapter, state, emoji):
+    raw_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    event = _make_event("9", raw_message)
+    event.feature_summary = {
+        "thread_id": "123",
+        "message_id": "456",
+        "kanban_board": {"slug": "discord-thread-123"},
+    }
+    adapter._feature_kanban_reaction_state = MagicMock(return_value=state)
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    assert raw_message.add_reaction.await_args_list[-1].args == (emoji,)
+    assert ("❓", adapter._client.user) in [call.args for call in raw_message.remove_reaction.await_args_list]
+
+
+@pytest.mark.asyncio
 async def test_thread_followup_reactions_target_origin_message(adapter):
     origin_message = SimpleNamespace(
         id=1000,
