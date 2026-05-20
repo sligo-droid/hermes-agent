@@ -2747,6 +2747,66 @@ def test_default_spawn_auto_loads_kanban_worker_skill(kanban_home, monkeypatch):
     assert env.get("HERMES_PROFILE") == "some-profile"
 
 
+def test_default_spawn_inherits_root_skills_for_profile_worker(kanban_home, monkeypatch):
+    """Profile-scoped workers should see root-installed coding skills without
+    preloading all of them into the prompt."""
+    root_skills = kanban_home / "skills"
+    (root_skills / "devops" / "kanban-worker").mkdir(parents=True)
+    (root_skills / "devops" / "kanban-worker" / "SKILL.md").write_text(
+        "---\nname: kanban-worker\ndescription: Kanban worker\n---\n\nWorker.\n"
+    )
+    (root_skills / "general-coding").mkdir(parents=True)
+    (root_skills / "general-coding" / "SKILL.md").write_text(
+        "---\nname: general-coding\ndescription: Root coding rules\n---\n\nRules.\n"
+    )
+    (root_skills / "software-development" / "systematic-debugging").mkdir(parents=True)
+    (root_skills / "software-development" / "systematic-debugging" / "SKILL.md").write_text(
+        "---\nname: systematic-debugging\ndescription: Debug systematically\n---\n\nDebug.\n"
+    )
+    profile_home = kanban_home / "profiles" / "worker-profile"
+    profile_home.mkdir(parents=True)
+
+    captured = {}
+
+    class FakeProc:
+        pid = 99998
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env", {})
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(kb, "_should_use_systemd_worker", lambda: False)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.resolve_profile_env",
+        lambda _profile: str(profile_home),
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="inherited skill worker", assignee="worker-profile")
+        task = kb.get_task(conn, tid)
+        workspace = kb.resolve_workspace(task)
+        pid = kb._default_spawn(task, str(workspace))
+        assert pid == 99998
+    finally:
+        conn.close()
+
+    env = captured["env"]
+    assert env["HERMES_HOME"] == str(profile_home)
+    assert env["HERMES_INHERITED_SKILLS_DIRS"] == str(root_skills)
+
+    skill_names = [
+        captured["cmd"][i + 1]
+        for i, tok in enumerate(captured["cmd"])
+        if tok == "--skills" and i + 1 < len(captured["cmd"])
+    ]
+    assert skill_names == ["kanban-worker"]
+    assert "general-coding" not in skill_names
+    assert "systematic-debugging" not in skill_names
+
+
 def test_default_spawn_raises_terminal_timeout_to_task_runtime(kanban_home, monkeypatch):
     """A task runtime cap should raise the worker's terminal default.
 

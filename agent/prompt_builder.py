@@ -1023,10 +1023,11 @@ def build_skills_system_prompt(
 
     Falls back to a full filesystem scan when both layers miss.
 
-    External skill directories (``skills.external_dirs`` in config.yaml) are
-    scanned alongside the local ``~/.hermes/skills/`` directory.  External dirs
-    are read-only — they appear in the index but new skills are always created
-    in the local dir.  Local skills take precedence when names collide.
+    Additional skill directories (``skills.external_dirs`` in config.yaml and
+    ``HERMES_INHERITED_SKILLS_DIRS``) are scanned alongside the local
+    ``~/.hermes/skills/`` directory.  Additional dirs are read-only — they
+    appear in the index but new skills are always created in the local dir.
+    Local skills take precedence when names collide.
     """
     skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
@@ -1133,10 +1134,11 @@ def build_skills_system_prompt(
             category_descriptions,
         )
 
-    # ── External skill directories ─────────────────────────────────────
-    # Scan external dirs directly (no snapshot caching — they're read-only
-    # and typically small).  Local skills already in skills_by_category take
-    # precedence: we track seen names and skip duplicates from external dirs.
+    # ── Additional skill directories ───────────────────────────────────
+    # Scan external and inherited dirs directly (no snapshot caching — they're
+    # read-only and typically small).  Local skills already in
+    # skills_by_category take precedence: we track seen names and skip
+    # duplicates from additional dirs.
     seen_skill_names: set[str] = set()
     for cat_skills in skills_by_category.values():
         for name, _desc in cat_skills:

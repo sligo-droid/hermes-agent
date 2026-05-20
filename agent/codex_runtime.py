@@ -75,6 +75,65 @@ def _close_codex_app_server_session(agent) -> None:
     agent._codex_session = None
 
 
+def _codex_kanban_worker_bootstrap() -> str:
+    """Return concise Codex-only guidance for kanban worker sessions."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return ""
+
+    software_skills: list[str] = []
+    general_available = False
+    try:
+        from tools.skills_tool import _find_all_skills
+
+        for entry in _find_all_skills():
+            name = str(entry.get("name") or "").strip()
+            category = str(entry.get("category") or "").strip()
+            if name == "general-coding":
+                general_available = True
+            if category == "software-development" and name:
+                software_skills.append(name)
+    except Exception:
+        software_skills = []
+
+    skill_lines = []
+    if general_available:
+        skill_lines.append(
+            "- `general-coding` (`~/AGENTS.md`): load before coding, repo "
+            "edits, debugging, or tests."
+        )
+    if software_skills:
+        listed = ", ".join(sorted(dict.fromkeys(software_skills)))
+        skill_lines.append(
+            f"- `software-development/*` skills available via `skill_view`: "
+            f"{listed}."
+        )
+    else:
+        skill_lines.append(
+            "- Use `skills_list` to discover available "
+            "`software-development/*` skills."
+        )
+
+    return (
+        "[Hermes kanban Codex worker bootstrap]\n"
+        "You are a Hermes kanban worker running through Codex app-server. "
+        "Codex has shell/apply-patch for file work, and the Hermes MCP callback "
+        "exposes `kanban_*`, `skill_view`, and `skills_list`.\n\n"
+        "Required startup:\n"
+        "1. Call `kanban_show()` first and treat its `worker_context` as the task truth.\n"
+        "2. For ordinary coding, repo editing, debugging, or tests, call "
+        "`skill_view(name=\"general-coding\")` before implementing. This is the "
+        "same content as `~/AGENTS.md`.\n"
+        "3. Load only the specific `software-development/*` skills that match "
+        "the task, for example debugging, test-driven development, planning, "
+        "or code review. Do not assume these skills are preloaded.\n\n"
+        "Accessible coding skills:\n"
+        + "\n".join(skill_lines)
+        + "\n\n"
+        "Original user request follows.\n"
+        "[/Hermes kanban Codex worker bootstrap]\n\n"
+    )
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -124,6 +183,11 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
     codex_input = user_message
+    if not getattr(agent, "_codex_kanban_bootstrap_sent", False):
+        bootstrap = _codex_kanban_worker_bootstrap()
+        if bootstrap and isinstance(codex_input, str):
+            codex_input = bootstrap + codex_input
+            agent._codex_kanban_bootstrap_sent = True
     turn_timeout = _resolved_codex_app_server_turn_timeout()
     api_call_count = 0
     last_timeout_error: Optional[str] = None

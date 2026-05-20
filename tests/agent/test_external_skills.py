@@ -103,6 +103,27 @@ class TestGetAllSkillsDirs:
         assert result[0] == hermes_home / "skills"
         assert result[1] == external_skills_dir.resolve()
 
+    def test_inherited_dirs_follow_external_dirs(self, hermes_home, external_skills_dir, tmp_path):
+        inherited = tmp_path / "root-skills"
+        inherited.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_skills_dir}\n"
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_HOME": str(hermes_home),
+                "HERMES_INHERITED_SKILLS_DIRS": str(inherited),
+            },
+        ):
+            from agent.skill_utils import get_all_skills_dirs
+            result = get_all_skills_dirs()
+        assert result == [
+            hermes_home / "skills",
+            external_skills_dir.resolve(),
+            inherited.resolve(),
+        ]
+
 
 class TestExternalSkillsInFindAll:
     def test_external_skills_found(self, hermes_home, external_skills_dir):
@@ -140,6 +161,63 @@ class TestExternalSkillsInFindAll:
         assert len(matching) == 1
         assert matching[0]["description"] == "Local version"
 
+    def test_inherited_skills_found_as_fallback(self, hermes_home, tmp_path):
+        inherited = tmp_path / "root-skills"
+        inherited_skill = inherited / "software-development" / "test-driven-development"
+        inherited_skill.mkdir(parents=True)
+        (inherited_skill / "SKILL.md").write_text(
+            "---\n"
+            "name: test-driven-development\n"
+            "description: Root TDD workflow\n"
+            "---\n\n"
+            "Root skill.\n"
+        )
+        local_skills = hermes_home / "skills"
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "HERMES_HOME": str(hermes_home),
+                    "HERMES_INHERITED_SKILLS_DIRS": str(inherited),
+                },
+            ),
+            patch("tools.skills_tool.SKILLS_DIR", local_skills),
+        ):
+            from tools.skills_tool import _find_all_skills
+            skills = _find_all_skills()
+        matching = [s for s in skills if s["name"] == "test-driven-development"]
+        assert len(matching) == 1
+        assert matching[0]["description"] == "Root TDD workflow"
+
+    def test_local_skills_override_inherited(self, hermes_home, tmp_path):
+        inherited = tmp_path / "root-skills"
+        inherited_skill = inherited / "general-coding"
+        inherited_skill.mkdir(parents=True)
+        (inherited_skill / "SKILL.md").write_text(
+            "---\nname: general-coding\ndescription: Root version\n---\n\nRoot.\n"
+        )
+        local_skills = hermes_home / "skills"
+        local_skill = local_skills / "general-coding"
+        local_skill.mkdir(parents=True)
+        (local_skill / "SKILL.md").write_text(
+            "---\nname: general-coding\ndescription: Local version\n---\n\nLocal.\n"
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "HERMES_HOME": str(hermes_home),
+                    "HERMES_INHERITED_SKILLS_DIRS": str(inherited),
+                },
+            ),
+            patch("tools.skills_tool.SKILLS_DIR", local_skills),
+        ):
+            from tools.skills_tool import _find_all_skills
+            skills = _find_all_skills()
+        matching = [s for s in skills if s["name"] == "general-coding"]
+        assert len(matching) == 1
+        assert matching[0]["description"] == "Local version"
+
 
 class TestExternalSkillView:
     def test_skill_view_finds_external(self, hermes_home, external_skills_dir):
@@ -155,3 +233,55 @@ class TestExternalSkillView:
             result = json.loads(skill_view("my-external-skill"))
         assert result["success"] is True
         assert "external things" in result["content"]
+
+    def test_skill_view_finds_inherited_when_missing_locally(self, hermes_home, tmp_path):
+        inherited = tmp_path / "root-skills"
+        inherited_skill = inherited / "general-coding"
+        inherited_skill.mkdir(parents=True)
+        (inherited_skill / "SKILL.md").write_text(
+            "---\nname: general-coding\ndescription: Root coding rules\n---\n\nRoot AGENTS content.\n"
+        )
+        local_skills = hermes_home / "skills"
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "HERMES_HOME": str(hermes_home),
+                    "HERMES_INHERITED_SKILLS_DIRS": str(inherited),
+                },
+            ),
+            patch("tools.skills_tool.SKILLS_DIR", local_skills),
+        ):
+            from tools.skills_tool import skill_view
+            result = json.loads(skill_view("general-coding"))
+        assert result["success"] is True
+        assert "Root AGENTS content" in result["content"]
+
+    def test_skill_view_prefers_local_over_inherited_duplicate(self, hermes_home, tmp_path):
+        inherited = tmp_path / "root-skills"
+        inherited_skill = inherited / "general-coding"
+        inherited_skill.mkdir(parents=True)
+        (inherited_skill / "SKILL.md").write_text(
+            "---\nname: general-coding\ndescription: Root coding rules\n---\n\nRoot.\n"
+        )
+        local_skills = hermes_home / "skills"
+        local_skill = local_skills / "general-coding"
+        local_skill.mkdir(parents=True)
+        (local_skill / "SKILL.md").write_text(
+            "---\nname: general-coding\ndescription: Local coding rules\n---\n\nLocal.\n"
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "HERMES_HOME": str(hermes_home),
+                    "HERMES_INHERITED_SKILLS_DIRS": str(inherited),
+                },
+            ),
+            patch("tools.skills_tool.SKILLS_DIR", local_skills),
+        ):
+            from tools.skills_tool import skill_view
+            result = json.loads(skill_view("general-coding"))
+        assert result["success"] is True
+        assert "Local." in result["content"]
+        assert "Root." not in result["content"]

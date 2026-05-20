@@ -266,6 +266,39 @@ class TestBuildSkillsSystemPrompt:
         assert "Debug Python scripts" in result
         assert "available_skills" in result
 
+    def test_builds_index_with_inherited_skills(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        local_skill = tmp_path / "profile" / "skills" / "general-coding"
+        inherited_root = tmp_path / "root-skills"
+        inherited_general = inherited_root / "general-coding"
+        inherited_tdd = (
+            inherited_root
+            / "software-development"
+            / "test-driven-development"
+        )
+        for skill_dir in (local_skill, inherited_general, inherited_tdd):
+            skill_dir.mkdir(parents=True)
+
+        (local_skill / "SKILL.md").write_text(
+            "---\nname: general-coding\ndescription: Profile coding rules\n---\n"
+        )
+        (inherited_general / "SKILL.md").write_text(
+            "---\nname: general-coding\ndescription: Root coding rules\n---\n"
+        )
+        (inherited_tdd / "SKILL.md").write_text(
+            "---\n"
+            "name: test-driven-development\n"
+            "description: Root TDD workflow\n"
+            "---\n"
+        )
+        monkeypatch.setenv("HERMES_INHERITED_SKILLS_DIRS", str(inherited_root))
+
+        result = build_skills_system_prompt()
+
+        assert "general-coding: Profile coding rules" in result
+        assert "Root coding rules" not in result
+        assert "test-driven-development: Root TDD workflow" in result
+
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"
@@ -1211,5 +1244,4 @@ class TestOpenAIModelExecutionGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
