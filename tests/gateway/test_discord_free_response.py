@@ -623,6 +623,60 @@ async def test_discord_message_link_in_free_response_channel_starts_thread(adapt
     assert event.source.thread_id == "999"
 
 
+@pytest.mark.asyncio
+async def test_discord_goal_command_in_free_response_channel_starts_thread(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "1505275259006484570")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    fake_thread = FakeThread(channel_id=1506489727258198148, name="auto-thread")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=1505275259006484570, name="pid"),
+        content=(
+            "<@999> /goal make sure the AI Agent home page is querying the db "
+            "with a complete interface / query language for all data"
+        ),
+        mentions=[adapter._client.user],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once_with(message)
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text.startswith("/goal make sure the AI Agent home page")
+    assert event.source.chat_id == "1506489727258198148"
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "1506489727258198148"
+    assert event.source.parent_chat_id == "1505275259006484570"
+
+
+@pytest.mark.asyncio
+async def test_discord_goal_status_command_does_not_start_thread(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "1505275259006484570")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    adapter._auto_create_thread = AsyncMock()
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=1505275259006484570, name="pid"),
+        content="<@999> /goal status",
+        mentions=[adapter._client.user],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "/goal status"
+    assert event.source.chat_id == "1505275259006484570"
+    assert event.source.chat_type == "group"
+
+
 
 @pytest.mark.asyncio
 async def test_discord_voice_linked_parent_thread_still_requires_mention(adapter, monkeypatch):
