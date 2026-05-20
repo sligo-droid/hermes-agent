@@ -199,13 +199,17 @@ def test_public_board_index_lists_session_links(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
 
-    dwb.set_goal(thread_id="5151", goal="Build the thing")
+    dwb.set_goal(thread_id="5151", goal="Build the thing", guild_id="111")
 
     html = dwb.render_public_board_index_html()
 
     assert "Hermes Kanban" in html
     assert '<a class="brand" href="/">Hermes<br>Kanban</a>' in html
     assert "/workers/5151" in html
+    assert (
+        '<a href="https://discord.com/channels/111/5151" target="_blank" '
+        'rel="noopener noreferrer"><code>5151</code></a>'
+    ) in html
     assert "Build the thing" in html
 
 

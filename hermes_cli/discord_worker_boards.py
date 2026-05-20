@@ -233,6 +233,17 @@ def public_board_url(token: str) -> str:
     return f"{base}{path}" if base else ""
 
 
+def _discord_thread_url(worker: dict[str, Any]) -> str:
+    guild_id = str(worker.get("guild_id") or "").strip()
+    thread_id = str(worker.get("thread_id") or "").strip()
+    if not guild_id or not thread_id:
+        return ""
+    return (
+        "https://discord.com/channels/"
+        f"{quote(guild_id, safe='')}/{quote(thread_id, safe='')}"
+    )
+
+
 def _default_worktree_path(project_path: Optional[str], thread_id: str) -> str:
     repo_name = Path(project_path or os.getcwd()).resolve().name or "project"
     safe_repo = re.sub(r"[^a-zA-Z0-9_.-]+", "-", repo_name).strip("-") or "project"
@@ -725,7 +736,11 @@ def _public_worker_meta(worker: dict[str, Any]) -> dict[str, Any]:
         "created_at",
         "updated_at",
     }
-    return {key: value for key, value in worker.items() if key in allowed}
+    public = {key: value for key, value in worker.items() if key in allowed}
+    discord_url = _discord_thread_url(worker)
+    if discord_url:
+        public["discord_thread_url"] = discord_url
+    return public
 
 
 def _format_public_timestamp(value: Any) -> str:
@@ -1280,6 +1295,13 @@ def render_public_board_index_html() -> str:
         runtime_label = "Queue" if runtime_state == "queued" else "Status"
         title = esc(worker.get("root_goal") or worker.get("initial_request") or board.get("name"))
         link = f'<a class="board-title" href="{esc(href)}">{title}</a>' if href else title
+        discord_thread_url = str(worker.get("discord_thread_url") or "").strip()
+        session_text = (
+            f'<a href="{esc(discord_thread_url)}" target="_blank" rel="noopener noreferrer">'
+            f"<code>{esc(session_id)}</code></a>"
+            if discord_thread_url
+            else f"<code>{esc(session_id)}</code>"
+        )
         status = _public_status_text(worker)
         execution_mode = str(worker.get("execution_mode") or "").strip()
         branch = str(worker.get("worker_branch") or "").strip()
@@ -1330,7 +1352,7 @@ def render_public_board_index_html() -> str:
         items.append(
             '<li class="board-card">'
             '<strong>{link}</strong><br>'
-            '<code>{session}</code> {status}'
+            '{session} {status}'
             '<p>Runtime: <strong class="runtime runtime-{runtime_class}">{runtime}</strong></p>'
             '<p>{counts}</p>'
             '<p>{reason_label}: {reason}</p>'
@@ -1341,7 +1363,7 @@ def render_public_board_index_html() -> str:
             '<div class="actions">{action}</div>'
             '</li>'.format(
                 link=link,
-                session=esc(session_id),
+                session=session_text,
                 status=esc(status),
                 runtime=esc(runtime_state),
                 runtime_class=esc(runtime_state),
