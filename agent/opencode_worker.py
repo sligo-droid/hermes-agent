@@ -80,6 +80,45 @@ def load_coding_worker_backend(
     return BACKEND_CODEX
 
 
+def load_coding_worker_pass_config(
+    config: Optional[dict[str, Any]] = None,
+    *,
+    worker_config: Optional[dict[str, Any]] = None,
+) -> dict[str, str]:
+    cfg = config
+    if cfg is None:
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+        except Exception:
+            cfg = {}
+
+    coding_cfg: dict[str, Any] = {}
+    if isinstance(cfg, dict) and isinstance(cfg.get("coding_worker"), dict):
+        coding_cfg.update(cfg["coding_worker"])
+    if worker_config:
+        for key in (
+            "simple_build_reasoning_level",
+            "complex_plan_reasoning_level",
+            "complex_build_reasoning_level",
+        ):
+            if key in worker_config:
+                coding_cfg[key] = worker_config[key]
+
+    return {
+        "simple_build_reasoning_level": _normalize_reasoning_level(
+            coding_cfg.get("simple_build_reasoning_level") or "high"
+        ),
+        "complex_plan_reasoning_level": _normalize_reasoning_level(
+            coding_cfg.get("complex_plan_reasoning_level") or "xhigh"
+        ),
+        "complex_build_reasoning_level": _normalize_reasoning_level(
+            coding_cfg.get("complex_build_reasoning_level") or "medium"
+        ),
+    }
+
+
 def load_opencode_config(
     config: Optional[dict[str, Any]] = None,
     *,
@@ -103,23 +142,15 @@ def load_opencode_config(
     if worker_config and isinstance(worker_config.get("opencode"), dict):
         opencode_cfg.update(worker_config["opencode"])
 
+    pass_cfg = load_coding_worker_pass_config(cfg, worker_config=worker_config)
     return {
         "binary": str(opencode_cfg.get("binary") or "opencode"),
         "model": str(opencode_cfg.get("model") or "").strip(),
         "plan_agent": str(opencode_cfg.get("plan_agent") or "plan").strip() or "plan",
         "build_agent": str(opencode_cfg.get("build_agent") or "build").strip() or "build",
-        "simple_build_reasoning_level": _normalize_reasoning_level(
-            opencode_cfg.get("simple_build_reasoning_level")
-            or "high"
-        ),
-        "complex_plan_reasoning_level": _normalize_reasoning_level(
-            opencode_cfg.get("complex_plan_reasoning_level")
-            or "xhigh"
-        ),
-        "complex_build_reasoning_level": _normalize_reasoning_level(
-            opencode_cfg.get("complex_build_reasoning_level")
-            or "medium"
-        ),
+        "simple_build_reasoning_level": pass_cfg["simple_build_reasoning_level"],
+        "complex_plan_reasoning_level": pass_cfg["complex_plan_reasoning_level"],
+        "complex_build_reasoning_level": pass_cfg["complex_build_reasoning_level"],
         "dangerously_skip_permissions": bool(opencode_cfg.get("dangerously_skip_permissions", False)),
     }
 

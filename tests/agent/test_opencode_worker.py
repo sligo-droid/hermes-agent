@@ -7,10 +7,11 @@ from types import SimpleNamespace
 from agent import opencode_worker as ow
 
 
-def _cfg(**opencode_overrides):
+def _cfg(**coding_overrides):
     opencode_cfg = {"binary": "opencode"}
-    opencode_cfg.update(opencode_overrides)
-    return {"coding_worker": {"opencode": opencode_cfg}}
+    coding_cfg = {"opencode": opencode_cfg}
+    coding_cfg.update(coding_overrides)
+    return {"coding_worker": coding_cfg}
 
 
 def _option(cmd, name):
