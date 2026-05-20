@@ -940,6 +940,32 @@ def _board_runtime_snapshot(
     }
 
 
+def _runtime_action_form_html(
+    session_id: str,
+    runtime: dict[str, Any],
+    *,
+    return_to: str = "",
+) -> str:
+    control = str(runtime.get("control") or "none")
+    control_label = str(runtime.get("control_label") or "")
+    if control in {"resume", "start"}:
+        action = "start"
+        label = control_label or ("Resume" if control == "resume" else "Start")
+    elif control == "pause":
+        action = "pause"
+        label = control_label or "Pause"
+    else:
+        return ""
+
+    action_url = f"/workers/{quote(session_id, safe='')}/{action}"
+    if return_to:
+        action_url = f"{action_url}?return_to={quote(return_to, safe='/')}"
+    return (
+        f'<form method="post" action="{html.escape(action_url)}">'
+        f'<button type="submit">{html.escape(label)}</button></form>'
+    )
+
+
 def _queue_reason(
     worker: dict[str, Any],
     *,
@@ -1184,6 +1210,11 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
         if discord_thread_url
         else f"<code>{esc(session_id)}</code>"
     )
+    runtime_action = _runtime_action_form_html(
+        session_id,
+        runtime,
+        return_to=f"/workers/{quote(session_id, safe='')}",
+    )
     return f"""<!doctype html>
 <html>
 <head>
@@ -1214,6 +1245,7 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
           <span>Runtime: <strong class="runtime runtime-{esc(runtime.get("state"))}">{esc(runtime.get("state"))}</strong></span>
           <span>{esc(runtime.get("reason"))}</span>
         </div>
+        <div class="actions">{runtime_action}</div>
       </div>
     </div>
   </header>
@@ -1402,25 +1434,7 @@ def render_public_board_index_html() -> str:
         if blocked_reason:
             flags.append(f"blocked: {blocked_reason}")
         flags_text = " ".join(flags)
-        control = str(runtime.get("control") or "none")
-        control_label = str(runtime.get("control_label") or "")
-        if control == "resume":
-            primary_action = (
-                f'<form method="post" action="/workers/{quote(session_id, safe="")}/start">'
-                f'<button type="submit">{esc(control_label or "Resume")}</button></form>'
-            )
-        elif control == "start":
-            primary_action = (
-                f'<form method="post" action="/workers/{quote(session_id, safe="")}/start">'
-                f'<button type="submit">{esc(control_label or "Start")}</button></form>'
-            )
-        elif control == "pause":
-            primary_action = (
-                f'<form method="post" action="/workers/{quote(session_id, safe="")}/pause">'
-                f'<button type="submit">{esc(control_label or "Pause")}</button></form>'
-            )
-        else:
-            primary_action = ""
+        primary_action = _runtime_action_form_html(session_id, runtime)
         items.append(
             '<li class="board-card">'
             '<strong>{link}</strong><br>'
