@@ -322,6 +322,18 @@ def test_dispatcher_tick_does_not_call_init_db(kanban_home, monkeypatch):
     )
 
 
+def test_gateway_auto_decompose_skips_discord_worker_boards():
+    """Discord Codex worker boards own their planner/dev/reviewer flow."""
+    from gateway.run import GatewayRunner
+
+    import inspect
+
+    src = inspect.getsource(GatewayRunner._kanban_dispatcher_watcher)
+    assert "if _dwb.is_discord_worker_board(slug):" in src
+    assert "_decomp.list_triage_ids(board=slug)" in src
+    assert 'tid, author="auto-decomposer", board=slug' in src
+
+
 @pytest.mark.asyncio
 async def test_notifier_skips_subscription_owned_by_other_profile(kanban_home):
     """Each gateway keeps its watcher on, but only the subscribing profile claims."""

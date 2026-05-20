@@ -479,6 +479,8 @@ The kanban board has two ways to handle a task you drop into the Triage column:
 
 Flip between the two modes from the **Orchestration: Auto/Manual** pill at the top of the kanban page (emerald = Auto, muted gray = Manual), or by editing `config.yaml` directly. Both modes coexist with `hermes kanban specify` — that's still available as a single-task spec rewrite when you don't want fan-out.
 
+Discord Codex worker boards are a separate specialized board kind. They use the same Kanban lifecycle database, but their planner/dev/reviewer role lanes are driven by `kanban.discord_worker.*` config and are not auto-decomposed by the generic profile-roster decomposer.
+
 The decomposer's routing decisions depend on profile descriptions, which is a per-profile labeling primitive you set with `hermes profile create --description "..."`, `hermes profile describe <name> --text "..."`, `hermes profile describe <name> --auto` (LLM-generates from the profile's installed skills + model), or the dashboard's per-profile editor in the expanded **Orchestration settings** panel. Profiles without a description still appear in the roster — they're routable by name, just less precisely. The decomposer NEVER lands a child task with `assignee=None`: when the LLM picks an unknown profile, the child gets routed to `kanban.default_assignee` (or the active default profile if that's unset).
 
 Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
