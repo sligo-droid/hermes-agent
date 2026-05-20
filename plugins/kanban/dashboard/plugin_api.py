@@ -1990,19 +1990,12 @@ def decompose_task_endpoint(
     can take minutes on reasoning models.
     """
     board = _resolve_board(board)
-    prev_env = os.environ.get("HERMES_KANBAN_BOARD")
-    try:
-        os.environ["HERMES_KANBAN_BOARD"] = board or kanban_db.DEFAULT_BOARD
-        from hermes_cli import kanban_decompose  # noqa: WPS433 (intentional)
-        outcome = kanban_decompose.decompose_task(
-            task_id,
-            author=(payload.author or None),
-        )
-    finally:
-        if prev_env is None:
-            os.environ.pop("HERMES_KANBAN_BOARD", None)
-        else:
-            os.environ["HERMES_KANBAN_BOARD"] = prev_env
+    from hermes_cli import kanban_decompose  # noqa: WPS433 (intentional)
+    outcome = kanban_decompose.decompose_task(
+        task_id,
+        author=(payload.author or None),
+        board=board,
+    )
 
     return {
         "ok": bool(outcome.ok),

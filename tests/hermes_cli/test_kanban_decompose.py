@@ -114,6 +114,45 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.assignee == "engineer"
 
 
+def test_decompose_uses_explicit_board_without_env(kanban_home, monkeypatch):
+    kb.create_board("beta")
+    with kb.connect(board="beta") as conn:
+        tid = kb.create_task(conn, title="ship a feature", triage=True)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", kb.DEFAULT_BOARD)
+
+    assert decomp.list_triage_ids(board="beta") == [tid]
+    assert decomp.list_triage_ids(board=kb.DEFAULT_BOARD) == []
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "test split",
+        "tasks": [
+            {"title": "research", "body": "look it up", "assignee": "researcher", "parents": []},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "researcher"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me", board="beta")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids and len(outcome.child_ids) == 1
+    with kb.connect(board="beta") as conn:
+        root = kb.get_task(conn, tid)
+        child = kb.get_task(conn, outcome.child_ids[0])
+    with kb.connect(board=kb.DEFAULT_BOARD) as conn:
+        default_root = kb.get_task(conn, tid)
+    assert root is not None and root.status == "todo"
+    assert child is not None and child.assignee == "researcher"
+    assert default_root is None
+
+
 def test_decompose_fanout_false_assigns_default_when_unassigned(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="just one thing", triage=True)

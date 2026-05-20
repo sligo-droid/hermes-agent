@@ -70,7 +70,8 @@ def _schema_instructions(role: str) -> str:
     if role == ROLE_PLANNER:
         return (
             'Schema: {"status":"planned|blocked","summary":"...","acceptance_criteria":["..."],'
-            '"tasks":[{"title":"...","body":"...","priority":0,"depends_on":[] }],"blocker":null}'
+            '"tasks":[{"title":"...","body":"...","priority":0,"parents":[]}],"blocker":null} '
+            'In each task, "parents" is a list of earlier task indices this task depends on.'
         )
     if role == ROLE_REVIEWER:
         return (
@@ -162,12 +163,18 @@ def _apply_role_output(
             title = str(spec.get("title") or "").strip()
             if not title:
                 continue
+            parent_ids = [
+                created[parent_idx]
+                for parent_idx in _parent_indices(spec, len(tasks), idx - 1)
+                if parent_idx < len(created)
+            ]
             created.append(
                 kanban_db.create_task(
                     conn,
                     title=title,
                     body=str(spec.get("body") or ""),
                     assignee=ROLE_DEV,
+                    parents=parent_ids,
                     created_by=ROLE_PLANNER,
                     workspace_kind="dir",
                     workspace_path=workspace,
@@ -260,6 +267,26 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(v).strip() for v in value if str(v).strip()]
+
+
+def _parent_indices(spec: dict[str, Any], task_count: int, current_idx: int) -> list[int]:
+    raw = spec.get("parents")
+    if raw is None and "depends_on" in spec:
+        raw = spec.get("depends_on")
+    if not isinstance(raw, list):
+        return []
+    out: list[int] = []
+    seen: set[int] = set()
+    for item in raw:
+        try:
+            idx = int(item)
+        except (TypeError, ValueError):
+            continue
+        if idx < 0 or idx >= task_count or idx >= current_idx or idx in seen:
+            continue
+        seen.add(idx)
+        out.append(idx)
+    return out
 
 
 def _git_summary(workspace: str) -> str:
