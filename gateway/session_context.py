@@ -56,6 +56,7 @@ _SESSION_USER_ID: ContextVar = ContextVar("HERMES_SESSION_USER_ID", default=_UNS
 _SESSION_USER_NAME: ContextVar = ContextVar("HERMES_SESSION_USER_NAME", default=_UNSET)
 _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
 _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
+_SESSION_CWD: ContextVar = ContextVar("HERMES_SESSION_CWD", default=_UNSET)
 _PROJECT_PATH: ContextVar = ContextVar("HERMES_PROJECT_PATH", default=_UNSET)
 _PROJECT_NAME: ContextVar = ContextVar("HERMES_PROJECT_NAME", default=_UNSET)
 _PROJECT_GITHUB_URL: ContextVar = ContextVar("HERMES_PROJECT_GITHUB_URL", default=_UNSET)
@@ -80,6 +81,7 @@ _VAR_MAP = {
     "HERMES_SESSION_USER_NAME": _SESSION_USER_NAME,
     "HERMES_SESSION_KEY": _SESSION_KEY,
     "HERMES_SESSION_ID": _SESSION_ID,
+    "HERMES_SESSION_CWD": _SESSION_CWD,
     "HERMES_PROJECT_PATH": _PROJECT_PATH,
     "HERMES_PROJECT_NAME": _PROJECT_NAME,
     "HERMES_PROJECT_GITHUB_URL": _PROJECT_GITHUB_URL,
@@ -99,6 +101,7 @@ def set_session_vars(
     user_id: str = "",
     user_name: str = "",
     session_key: str = "",
+    session_cwd: str = "",
     project_path: str = "",
     project_name: str = "",
     project_github_url: str = "",
@@ -121,6 +124,7 @@ def set_session_vars(
         _SESSION_USER_ID.set(user_id),
         _SESSION_USER_NAME.set(user_name),
         _SESSION_KEY.set(session_key),
+        _SESSION_CWD.set(session_cwd),
         _PROJECT_PATH.set(project_path),
         _PROJECT_NAME.set(project_name),
         _PROJECT_GITHUB_URL.set(project_github_url),
@@ -149,6 +153,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_USER_ID,
         _SESSION_USER_NAME,
         _SESSION_KEY,
+        _SESSION_CWD,
         _PROJECT_PATH,
         _PROJECT_NAME,
         _PROJECT_GITHUB_URL,

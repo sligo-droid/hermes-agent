@@ -1630,7 +1630,14 @@ def _resolve_child_cwd(mode: str, staging_dir: str) -> str:
     """
     if mode != "project":
         return staging_dir
-    raw = os.environ.get("TERMINAL_CWD", "").strip()
+    raw = ""
+    try:
+        from gateway.session_context import get_session_env
+
+        raw = get_session_env("HERMES_SESSION_CWD", "").strip()
+    except Exception:
+        raw = ""
+    raw = raw or os.environ.get("TERMINAL_CWD", "").strip()
     if raw:
         expanded = os.path.expanduser(raw)
         if os.path.isdir(expanded):

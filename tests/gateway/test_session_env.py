@@ -4,7 +4,6 @@ import os
 import pytest
 
 from gateway.config import Platform
-from gateway.run import GatewayRunner
 from gateway.session import SessionContext, SessionSource
 from gateway.session_context import (
     get_session_env,
@@ -13,6 +12,14 @@ from gateway.session_context import (
     _VAR_MAP,
     _UNSET,
 )
+
+
+def _gateway_runner():
+    # Import after the per-test HERMES_HOME fixture has run. Importing
+    # gateway.run during collection can cache the developer's live config.
+    from gateway.run import GatewayRunner
+
+    return object.__new__(GatewayRunner)
 
 
 @pytest.fixture(autouse=True)
@@ -32,7 +39,7 @@ def _reset_contextvars():
 
 def test_set_session_env_sets_contextvars(monkeypatch):
     """_set_session_env should populate contextvars, not os.environ."""
-    runner = object.__new__(GatewayRunner)
+    runner = _gateway_runner()
     source = SessionSource(
         platform=Platform.TELEGRAM,
         chat_id="-1001",
@@ -50,8 +57,9 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CWD", raising=False)
 
-    tokens = runner._set_session_env(context)
+    tokens = runner._set_session_env(context, session_cwd="/home/droid/hermes")
 
     # Values should be readable via get_session_env (contextvar path)
     assert get_session_env("HERMES_SESSION_PLATFORM") == "telegram"
@@ -60,17 +68,19 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     assert get_session_env("HERMES_SESSION_USER_ID") == "123456"
     assert get_session_env("HERMES_SESSION_USER_NAME") == "alice"
     assert get_session_env("HERMES_SESSION_THREAD_ID") == "17585"
+    assert get_session_env("HERMES_SESSION_CWD") == "/home/droid/hermes"
 
     # os.environ should NOT be touched
     assert os.getenv("HERMES_SESSION_PLATFORM") is None
     assert os.getenv("HERMES_SESSION_THREAD_ID") is None
+    assert os.getenv("HERMES_SESSION_CWD") is None
 
     # Clean up
     runner._clear_session_env(tokens)
 
 
 def test_set_session_env_sets_project_contextvars(monkeypatch):
-    runner = object.__new__(GatewayRunner)
+    runner = _gateway_runner()
     source = SessionSource(
         platform=Platform.DISCORD,
         chat_id="thread-1",
@@ -105,7 +115,7 @@ def test_set_session_env_sets_project_contextvars(monkeypatch):
 
 def test_clear_session_env_restores_previous_state(monkeypatch):
     """_clear_session_env should restore contextvars to their pre-handler values."""
-    runner = object.__new__(GatewayRunner)
+    runner = _gateway_runner()
 
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
@@ -168,7 +178,7 @@ def test_get_session_env_default_when_nothing_set(monkeypatch):
 
 def test_set_session_env_handles_missing_optional_fields():
     """_set_session_env should handle None chat_name and thread_id gracefully."""
-    runner = object.__new__(GatewayRunner)
+    runner = _gateway_runner()
     source = SessionSource(
         platform=Platform.TELEGRAM,
         chat_id="-1001",
@@ -226,7 +236,7 @@ def test_session_key_falls_back_to_os_environ(monkeypatch):
 
 def test_set_session_env_includes_session_key():
     """_set_session_env should propagate session_key from SessionContext."""
-    runner = object.__new__(GatewayRunner)
+    runner = _gateway_runner()
     source = SessionSource(
         platform=Platform.TELEGRAM,
         chat_id="-1001",
@@ -292,7 +302,7 @@ def test_session_key_no_race_condition_with_contextvars(monkeypatch):
 @pytest.mark.asyncio
 async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
     """Gateway executor work should inherit session contextvars for tool routing."""
-    runner = object.__new__(GatewayRunner)
+    runner = _gateway_runner()
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
@@ -337,7 +347,7 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
 @pytest.mark.asyncio
 async def test_run_in_executor_with_context_forwards_args():
     """_run_in_executor_with_context should forward *args to the callable."""
-    runner = object.__new__(GatewayRunner)
+    runner = _gateway_runner()
 
     def add(a, b):
         return a + b
@@ -349,7 +359,7 @@ async def test_run_in_executor_with_context_forwards_args():
 @pytest.mark.asyncio
 async def test_run_in_executor_with_context_propagates_exceptions():
     """Exceptions inside the executor should propagate to the caller."""
-    runner = object.__new__(GatewayRunner)
+    runner = _gateway_runner()
 
     def blow_up():
         raise ValueError("boom")

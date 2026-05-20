@@ -1388,8 +1388,15 @@ def init_agent(
         except Exception as _ce_err:
             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
 
+    _session_cwd = None
+    try:
+        from gateway.session_context import get_session_env
+
+        _session_cwd = get_session_env("HERMES_SESSION_CWD", "") or None
+    except Exception:
+        pass
     agent._subdirectory_hints = SubdirectoryHintTracker(
-        working_dir=os.getenv("TERMINAL_CWD") or None,
+        working_dir=_session_cwd or os.getenv("TERMINAL_CWD") or None,
     )
     agent._user_turn_count = 0
 

@@ -649,7 +649,16 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     teaching subagents a fake container path while still helping them avoid
     guessing `/workspace/...` for local repo tasks.
     """
+    try:
+        from gateway.session_context import get_session_env
+
+        session_cwd = get_session_env("HERMES_SESSION_CWD", "")
+    except Exception:
+        session_cwd = ""
+
     candidates = [
+        session_cwd,
+        getattr(parent_agent, "session_cwd", None),
         os.getenv("TERMINAL_CWD"),
         getattr(
             getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None

@@ -18,6 +18,25 @@ class TestResolvePath:
         result = _resolve_path("foo/bar.py")
         assert result == (tmp_path / "foo" / "bar.py")
 
+    def test_relative_path_prefers_gateway_session_cwd(self, monkeypatch, tmp_path):
+        """Gateway task-local cwd wins over process-global TERMINAL_CWD."""
+        env_cwd = tmp_path / "env"
+        session_cwd = tmp_path / "session"
+        env_cwd.mkdir()
+        session_cwd.mkdir()
+        monkeypatch.setenv("TERMINAL_CWD", str(env_cwd))
+
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.file_tools import _resolve_path
+
+        tokens = set_session_vars(session_cwd=str(session_cwd))
+        try:
+            result = _resolve_path("foo/bar.py")
+        finally:
+            clear_session_vars(tokens)
+
+        assert result == session_cwd / "foo" / "bar.py"
+
     def test_absolute_path_ignores_terminal_cwd(self, monkeypatch, tmp_path):
         """Absolute paths are unaffected by TERMINAL_CWD."""
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
