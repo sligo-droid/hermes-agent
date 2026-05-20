@@ -204,6 +204,7 @@ def test_public_board_index_lists_session_links(monkeypatch, tmp_path):
     html = dwb.render_public_board_index_html()
 
     assert "Hermes Kanban" in html
+    assert '<a class="brand" href="/">Hermes<br>Kanban</a>' in html
     assert "/workers/5151" in html
     assert "Build the thing" in html
 
@@ -247,9 +248,10 @@ def test_public_board_index_lists_operational_row_data(monkeypatch, tmp_path):
     html = dwb.render_public_board_index_html()
 
     assert "active / dev" in html
-    assert 'Runtime: <strong class="runtime runtime-paused">paused</strong>' in html
-    assert "ready:1 running:1" in html
-    assert "Running: Running task" in html
+    assert 'runtime runtime-paused">paused</span>' in html
+    assert "<b>1</b><span>ready</span>" in html
+    assert "<b>1</b><span>running</span>" in html
+    assert "Running: idle" in html
     assert "Branch: discord/5152" in html
     assert 'PR: <a href="https://github.example/pull/42">#42</a>' in html
     assert "Review: 2/5" in html
@@ -271,10 +273,11 @@ def test_public_board_index_shows_pause_control_for_active_board(monkeypatch, tm
 
     html = dwb.render_public_board_index_html()
 
-    assert 'Runtime: <strong class="runtime runtime-idle">idle</strong>' in html
+    assert 'runtime runtime-queued">queued</span>' in html
+    assert "Queue: awaiting next dispatcher tick" in html
     assert "Running: idle" in html
     assert 'action="/workers/5153/pause"' in html
-    assert ">Pause</button>" in html
+    assert ">Pause Queue</button>" in html
 
 
 def test_public_board_index_shows_running_runtime(monkeypatch, tmp_path):
@@ -282,6 +285,7 @@ def test_public_board_index_shows_running_runtime(monkeypatch, tmp_path):
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_db
 
+    monkeypatch.setattr(kanban_db, "_pid_alive", lambda pid: pid == 123)
     board = dwb.set_goal(thread_id="5154", goal="Run the thing")
     conn = kanban_db.connect(board=board.slug)
     try:
@@ -293,9 +297,76 @@ def test_public_board_index_shows_running_runtime(monkeypatch, tmp_path):
 
     html = dwb.render_public_board_index_html()
 
-    assert 'Runtime: <strong class="runtime runtime-running">running</strong>' in html
+    assert 'runtime runtime-running">running</span>' in html
     assert "Running: Active dev ticket" in html
     assert "pid=123" in html
+
+
+def test_public_board_index_live_worker_overrides_stale_blocked_meta(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(kanban_db, "_pid_alive", lambda pid: pid == 123)
+    board = dwb.set_goal(thread_id="5157", goal="Run despite stale meta")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(conn, title="Live worker ticket")
+        conn.execute("UPDATE tasks SET status='running', worker_pid=123 WHERE id=?", (task_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    dwb._update_worker_meta(board.slug, {"blocked_reason": "old blocker"})
+
+    html = dwb.render_public_board_index_html()
+
+    assert 'runtime runtime-running">running</span>' in html
+    assert "Running: Live worker ticket" in html
+    assert "Status: Live worker ticket" in html
+
+
+def test_public_board_index_does_not_show_dead_pid_as_running(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(kanban_db, "_pid_alive", lambda _pid: False)
+    board = dwb.set_goal(thread_id="5155", goal="Run the thing")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(conn, title="Dead worker ticket")
+        conn.execute("UPDATE tasks SET status='running', worker_pid=123 WHERE id=?", (task_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    html = dwb.render_public_board_index_html()
+
+    assert 'runtime runtime-stale">stale</span>' in html
+    assert "running ticket has no live worker" in html
+    assert "Pause</button>" not in html
+
+
+def test_public_board_index_done_board_has_no_pause_action(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(thread_id="5156", goal="Finish the thing")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        claimed = kanban_db.claim_task(conn, task.id)
+        assert claimed is not None
+        kanban_db.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+    dwb._update_worker_meta(board.slug, {"goal_status": "done", "phase": "complete"})
+
+    html = dwb.render_public_board_index_html()
+
+    assert 'runtime runtime-done">done</span>' in html
+    assert 'action="/workers/5156/pause"' not in html
 
 
 def test_public_board_index_lists_newest_sessions_first(monkeypatch, tmp_path):
@@ -337,6 +408,10 @@ def test_public_session_board_auto_refreshes(monkeypatch, tmp_path):
     assert "Worker Internals" in html
     assert "No Codex app-server internals captured for this ticket yet." in html
     assert "Unable to load ticket state" in html
+    assert '<a class="brand" href="/">Hermes<br>Kanban</a>' in html
+    assert "Codex result" in html
+    assert "Recent internals" in html
+    assert "JSON.stringify" not in html
 
 
 def test_public_kanban_web_routes(monkeypatch, tmp_path):
