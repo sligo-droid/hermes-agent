@@ -16,6 +16,14 @@ class RecordingAdapter:
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
 
 
+class TypingAdapter:
+    def __init__(self):
+        self.typing = []
+
+    async def send_typing_once(self, chat_id, metadata=None):
+        self.typing.append({"chat_id": chat_id, "metadata": metadata or {}})
+
+
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
 
@@ -36,11 +44,29 @@ async def _run_one_notifier_tick(monkeypatch, runner):
     await runner._kanban_notifier_watcher(interval=1)
 
 
+async def _run_one_discord_typing_tick(monkeypatch, runner):
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    await runner._discord_kanban_typing_watcher(interval=1)
+
+
 def _make_runner(adapter):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._kanban_sub_fail_counts = {}
+    return runner
+
+
+def _make_discord_runner(adapter):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.DISCORD: adapter}
     return runner
 
 
@@ -87,6 +113,40 @@ def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monke
     assert len(adapter.sent) == 1
     assert "Kanban" in adapter.sent[0]["text"]
     assert tid in adapter.sent[0]["text"]
+
+
+def test_discord_kanban_typing_watcher_pulses_running_thread(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(
+        thread_id="99001",
+        goal="Show Discord typing while active",
+        chat_id="parent-990",
+    )
+    conn = kb.connect(board=board.slug)
+    try:
+        tid = kb.create_task(
+            conn,
+            title="Active dev task",
+            assignee=dwb.ROLE_DEV,
+            tenant=board.slug,
+        )
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+
+    adapter = TypingAdapter()
+    runner = _make_discord_runner(adapter)
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert adapter.typing == [
+        {
+            "chat_id": "parent-990",
+            "metadata": {"thread_id": "99001"},
+        }
+    ]
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):

@@ -4163,6 +4163,11 @@ class GatewayRunner:
         # simply don't use kanban; this loop becomes a no-op.
         asyncio.create_task(self._kanban_dispatcher_watcher())
 
+        # Pulse Discord's native typing indicator while Discord thread-backed
+        # Kanban workers are active. This is independent from dispatcher
+        # ownership so external dispatchers still surface activity.
+        asyncio.create_task(self._discord_kanban_typing_watcher())
+
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
             logger.info(
@@ -5565,6 +5570,45 @@ class GatewayRunner:
             while slept < interval and self._running:
                 await asyncio.sleep(min(1.0, interval - slept))
                 slept += 1.0
+
+    async def _discord_kanban_typing_watcher(self, interval: float = 8.0) -> None:
+        """Keep Discord thread typing visible while thread workers are running."""
+        interval = max(float(interval or 8.0), 1.0)
+        while self._running:
+            try:
+                adapter = self.adapters.get(Platform.DISCORD)
+                sender = getattr(adapter, "send_typing_once", None) if adapter else None
+                if adapter is not None and callable(sender):
+                    try:
+                        from hermes_cli.discord_worker_boards import running_worker_thread_targets
+                    except Exception:
+                        logger.debug(
+                            "discord kanban typing: worker board helper unavailable",
+                            exc_info=True,
+                        )
+                        targets = []
+                    else:
+                        targets = await asyncio.to_thread(running_worker_thread_targets)
+                    for target in targets:
+                        thread_id = str(target.get("thread_id") or "").strip()
+                        if not thread_id:
+                            continue
+                        chat_id = str(target.get("chat_id") or thread_id)
+                        try:
+                            await sender(chat_id, metadata={"thread_id": thread_id})
+                        except Exception as exc:
+                            logger.debug(
+                                "discord kanban typing: heartbeat failed for thread %s: %s",
+                                thread_id,
+                                exc,
+                            )
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                logger.debug("discord kanban typing: cancelled")
+                raise
+            except Exception:
+                logger.exception("discord kanban typing: unexpected watcher error")
+                await asyncio.sleep(interval)
 
     async def _platform_reconnect_watcher(self) -> None:
         """Background task that periodically retries connecting failed platforms.

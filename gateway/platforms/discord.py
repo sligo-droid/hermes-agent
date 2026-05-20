@@ -656,6 +656,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Persistent typing indicator loops per channel (DMs don't reliably
         # show the standard typing gateway event for bots)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
+        self._typing_aliases: Dict[str, set[str]] = {}
         self._bot_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None
         # Dedup cache: prevents duplicate bot responses when Discord
@@ -3856,6 +3857,22 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to send document, falling back to base adapter: %s", self.name, e, exc_info=True)
             return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
 
+    def _typing_target_id(self, chat_id: str, metadata=None) -> str:
+        if metadata and metadata.get("thread_id"):
+            return str(metadata["thread_id"])
+        return str(chat_id)
+
+    async def send_typing_once(self, chat_id: str, metadata=None) -> None:
+        """Send one Discord typing heartbeat without starting a loop."""
+        if not self._client:
+            return
+        target_id = self._typing_target_id(chat_id, metadata=metadata)
+        route = discord.http.Route(
+            "POST", "/channels/{channel_id}/typing",
+            channel_id=target_id,
+        )
+        await self._client.http.request(route)
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Start a persistent typing indicator for a channel.
 
@@ -3866,41 +3883,46 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         if not self._client:
             return
+        target_id = self._typing_target_id(chat_id, metadata=metadata)
         # Don't start a duplicate loop
-        if chat_id in self._typing_tasks:
+        if target_id in self._typing_tasks:
             return
+        if target_id != str(chat_id):
+            self._typing_aliases.setdefault(str(chat_id), set()).add(target_id)
 
         async def _typing_loop() -> None:
             try:
                 while True:
                     try:
-                        route = discord.http.Route(
-                            "POST", "/channels/{channel_id}/typing",
-                            channel_id=chat_id,
-                        )
-                        await self._client.http.request(route)
+                        await self.send_typing_once(target_id)
                     except asyncio.CancelledError:
                         return
                     except Exception as e:
-                        logger.debug("Discord typing indicator failed for %s: %s", chat_id, e)
+                        logger.debug("Discord typing indicator failed for %s: %s", target_id, e)
                         return
                     await asyncio.sleep(8)
             except asyncio.CancelledError:
                 pass
             finally:
-                self._typing_tasks.pop(chat_id, None)
+                self._typing_tasks.pop(target_id, None)
+                for aliases in self._typing_aliases.values():
+                    aliases.discard(target_id)
 
-        self._typing_tasks[chat_id] = asyncio.create_task(_typing_loop())
+        self._typing_tasks[target_id] = asyncio.create_task(_typing_loop())
 
-    async def stop_typing(self, chat_id: str) -> None:
+    async def stop_typing(self, chat_id: str, metadata=None) -> None:
         """Stop the persistent typing indicator for a channel."""
-        task = self._typing_tasks.pop(chat_id, None)
-        if task:
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        target_id = self._typing_target_id(chat_id, metadata=metadata)
+        targets = {target_id}
+        targets.update(self._typing_aliases.pop(str(chat_id), set()))
+        for target in targets:
+            task = self._typing_tasks.pop(target, None)
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Discord channel."""
