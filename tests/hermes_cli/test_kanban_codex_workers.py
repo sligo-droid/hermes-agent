@@ -171,6 +171,38 @@ def test_codex_role_worker_logs_scheduled_runtime_settings(monkeypatch, tmp_path
     assert "[kanban dispatcher] scheduled Codex role worker: role=planner reasoning=xhigh mode=fast" in log
 
 
+def test_role_worker_env_carries_opencode_backend(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+    from agent import opencode_worker as ow
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    workspace = tmp_path / "repo"
+    captured = {}
+
+    class Proc:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, cwd, stdout, stderr, env, start_new_session):
+        captured.update({"env": env})
+        return Proc()
+
+    monkeypatch.setattr(
+        workers,
+        "_worker_config",
+        lambda: {"backend": "opencode", "codex_home_root": str(tmp_path / "homes")},
+    )
+    monkeypatch.setattr(ow, "check_opencode_binary", lambda: (True, "/bin/opencode"))
+    monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
+
+    workers.spawn_codex_worker(task, str(workspace), board=board.slug)
+
+    assert captured["env"]["HERMES_CODING_WORKER_BACKEND"] == "opencode"
+
+
 def test_role_extra_args_use_scheduled_runtime_env(monkeypatch):
     from hermes_cli import kanban_codex_worker as worker
 
@@ -181,6 +213,77 @@ def test_role_extra_args_use_scheduled_runtime_env(monkeypatch):
         "-c", 'model_reasoning_effort="low"',
         "-c", 'service_tier="fast"',
     ]
+
+
+def test_dev_role_uses_opencode_backend(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+    from agent import opencode_worker as ow
+
+    monkeypatch.setenv("HERMES_CODING_WORKER_BACKEND", "opencode")
+    monkeypatch.setattr(worker, "record_codex_worker_result", lambda *args, **kwargs: None)
+    calls = []
+
+    def fake_run(prompt, workspace, **kwargs):
+        calls.append((prompt, workspace, kwargs))
+        return SimpleNamespace(
+            final_text='{"status":"completed","summary":"ok","changed_files":[],"tests":[]}',
+            error=None,
+            interrupted=False,
+            timed_out=False,
+            should_retire=False,
+            tool_iterations=1,
+            thread_id="ses-build",
+            turn_id="ses-build",
+            backend="opencode",
+            agents=["build"],
+            plan_text="",
+            exit_code=0,
+        )
+
+    monkeypatch.setattr(ow, "run_opencode_task", fake_run)
+
+    result = worker._run_role_backend(
+        "prompt",
+        str(tmp_path),
+        ROLE_DEV,
+        task=SimpleNamespace(id="t_dev", title="Fix bug", body="Fix parser bug"),
+        task_id="t_dev",
+        board=None,
+    )
+
+    assert result.backend == "opencode"
+    assert calls
+    assert calls[0][1] == str(tmp_path)
+
+
+def test_reviewer_role_does_not_use_opencode_backend(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+    from agent import opencode_worker as ow
+
+    monkeypatch.setenv("HERMES_CODING_WORKER_BACKEND", "opencode")
+    monkeypatch.setattr(
+        ow,
+        "run_opencode_task",
+        lambda *args, **kwargs: pytest.fail("reviewer must not call OpenCode"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_run_codex",
+        lambda *args, **kwargs: SimpleNamespace(final_text="{}", error=None),
+    )
+
+    result = worker._run_role_backend(
+        "prompt",
+        str(tmp_path),
+        ROLE_REVIEWER,
+        task=SimpleNamespace(id="t_review", title="Review", body=""),
+        task_id="t_review",
+        board=None,
+    )
+
+    assert result.error is None
 
 
 def test_docker_runner_logs_immediate_registry_failure(monkeypatch, tmp_path):

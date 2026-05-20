@@ -38,6 +38,15 @@ def _runner_kind(cfg: dict[str, Any]) -> str:
     return runner if runner in {"host", "docker"} else "host"
 
 
+def _coding_backend(cfg: dict[str, Any]) -> str:
+    try:
+        from agent.opencode_worker import load_coding_worker_backend
+
+        return load_coding_worker_backend(worker_config=cfg)
+    except Exception:
+        return "codex"
+
+
 def _role_runtime_settings(role: str, cfg: dict[str, Any]) -> dict[str, str]:
     roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
     role_cfg = roles.get(role) if isinstance(roles.get(role), dict) else {}
@@ -85,10 +94,25 @@ def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None
     if role not in ROLE_ASSIGNEES:
         return None
     cfg = _worker_config()
+    backend = _coding_backend(cfg)
     settings = _role_runtime_settings(role, cfg)
+    if backend == "opencode":
+        try:
+            from agent.opencode_worker import check_opencode_binary
+
+            ok, detail = check_opencode_binary()
+        except Exception as exc:
+            ok, detail = False, str(exc)
+        if not ok:
+            raise RuntimeError(detail)
+    if backend == "opencode" and _runner_kind(cfg) == "docker":
+        raise RuntimeError(
+            "OpenCode worker backend currently supports only host runner; "
+            "set kanban.discord_worker.runner=host or coding_worker.backend=codex."
+        )
     if _runner_kind(cfg) == "docker":
-        return _spawn_docker_worker(task, workspace, cfg=cfg, settings=settings, board=board)
-    return _spawn_host_worker(task, workspace, cfg=cfg, settings=settings, board=board)
+        return _spawn_docker_worker(task, workspace, cfg=cfg, settings=settings, backend=backend, board=board)
+    return _spawn_host_worker(task, workspace, cfg=cfg, settings=settings, backend=backend, board=board)
 
 
 def _spawn_host_worker(
@@ -97,6 +121,7 @@ def _spawn_host_worker(
     *,
     cfg: dict[str, Any],
     settings: dict[str, str],
+    backend: str,
     board: Optional[str],
 ) -> Optional[int]:
     workspace_path = Path(workspace).expanduser().resolve()
@@ -120,6 +145,7 @@ def _spawn_host_worker(
             "HERMES_CODEX_WORKER_ROLE": str(getattr(task, "assignee", "") or "").strip().lower(),
             "HERMES_CODEX_WORKER_REASONING": settings["reasoning"],
             "HERMES_CODEX_WORKER_SERVICE_TIER": settings["service_tier"],
+            "HERMES_CODING_WORKER_BACKEND": backend,
             "CODEX_HOME": str(codex_home),
             "PYTHONPATH": (
                 f"{_repo_root()}{os.pathsep}{existing_pythonpath}"
@@ -135,7 +161,7 @@ def _spawn_host_worker(
         env["HERMES_CODEX_WORKER_CREDENTIAL_ID"] = inherited_credential_id
 
     cmd = [sys.executable, "-m", "hermes_cli.kanban_codex_worker"]
-    return _spawn_logged_process(task, cmd, str(workspace_path), env, settings=settings, board=board)
+    return _spawn_logged_process(task, cmd, str(workspace_path), env, settings=settings, backend=backend, board=board)
 
 
 def _spawn_docker_worker(
@@ -144,6 +170,7 @@ def _spawn_docker_worker(
     *,
     cfg: dict[str, Any],
     settings: dict[str, str],
+    backend: str,
     board: Optional[str],
 ) -> Optional[int]:
     role = str(getattr(task, "assignee", "") or "").strip().lower()
@@ -168,6 +195,7 @@ def _spawn_docker_worker(
             "HERMES_CODEX_WORKER_ROLE": role,
             "HERMES_CODEX_WORKER_REASONING": settings["reasoning"],
             "HERMES_CODEX_WORKER_SERVICE_TIER": settings["service_tier"],
+            "HERMES_CODING_WORKER_BACKEND": backend,
             "CODEX_HOME": "/codex-home",
             "PYTHONPATH": "/hermes",
         }
@@ -208,7 +236,7 @@ def _spawn_docker_worker(
             cmd.extend(["-e", f"{key}={value}"])
     cmd.extend([image, "python", "-m", "hermes_cli.kanban_codex_worker"])
 
-    return _spawn_logged_process(task, cmd, str(workspace_path), env, settings=settings, board=board)
+    return _spawn_logged_process(task, cmd, str(workspace_path), env, settings=settings, backend=backend, board=board)
 
 
 def _codex_home(task: Any, cfg: dict[str, Any]) -> Path:
@@ -228,6 +256,7 @@ def _spawn_logged_process(
     env: dict[str, str],
     *,
     settings: dict[str, str],
+    backend: str,
     board: Optional[str],
 ) -> Optional[int]:
     from hermes_cli import kanban_db
@@ -235,14 +264,15 @@ def _spawn_logged_process(
     log_path = kanban_db.worker_log_path(str(getattr(task, "id", "")), board=board)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     role = str(getattr(task, "assignee", "") or "").strip().lower()
+    label = "OpenCode" if backend == "opencode" else "Codex"
     kanban_db._append_worker_log_line(
         log_path,
-        "[kanban dispatcher] scheduled Codex role worker: "
+        f"[kanban dispatcher] scheduled {label} role worker: "
         f"role={role or '-'} reasoning={settings['reasoning']} mode={settings['mode']}",
     )
     kanban_db._append_worker_log_line(
         log_path,
-        f"[kanban dispatcher] spawning Codex role worker: {' '.join(cmd)}",
+        f"[kanban dispatcher] spawning {label} role worker: {' '.join(cmd)}",
     )
     log_f = open(log_path, "ab")
     try:
@@ -262,7 +292,7 @@ def _spawn_logged_process(
     if exit_code not in (None, 0):
         if _task_still_running(str(getattr(task, "id", "")), board=board):
             raise RuntimeError(
-                f"Codex role worker exited immediately with code {exit_code}; "
+                f"{label} role worker exited immediately with code {exit_code}; "
                 f"check log: {log_path}"
             )
     return int(proc.pid)

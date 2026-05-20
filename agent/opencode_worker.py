@@ -1,0 +1,569 @@
+"""OpenCode non-PTY coding worker backend."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+
+BACKEND_CODEX = "codex"
+BACKEND_OPENCODE = "opencode"
+_VALID_BACKENDS = {BACKEND_CODEX, BACKEND_OPENCODE}
+_VALID_VARIANTS = {"minimal", "high", "max"}
+
+
+@dataclass
+class OpenCodeRunResult:
+    final_text: str = ""
+    error: Optional[str] = None
+    interrupted: bool = False
+    timed_out: bool = False
+    should_retire: bool = False
+    tool_iterations: int = 0
+    turn_id: Optional[str] = None
+    thread_id: Optional[str] = None
+    backend: str = BACKEND_OPENCODE
+    agents: list[str] = field(default_factory=list)
+    plan_text: str = ""
+    events: list[dict[str, Any]] = field(default_factory=list)
+    exit_code: Optional[int] = None
+    duration_seconds: float = 0.0
+    stdout: str = ""
+    stderr: str = ""
+
+
+def normalize_coding_worker_backend(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    return raw if raw in _VALID_BACKENDS else BACKEND_CODEX
+
+
+def load_coding_worker_backend(
+    config: Optional[dict[str, Any]] = None,
+    *,
+    worker_config: Optional[dict[str, Any]] = None,
+) -> str:
+    """Resolve coding worker backend.
+
+    Precedence:
+      1. HERMES_CODING_WORKER_BACKEND
+      2. kanban.discord_worker.backend (passed as worker_config)
+      3. coding_worker.backend
+      4. legacy codex_worker.backend, for early adopters only
+      5. codex
+    """
+    raw_env = os.getenv("HERMES_CODING_WORKER_BACKEND")
+    if raw_env:
+        return normalize_coding_worker_backend(raw_env)
+
+    if worker_config and worker_config.get("backend"):
+        return normalize_coding_worker_backend(worker_config.get("backend"))
+
+    cfg = config
+    if cfg is None:
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+        except Exception:
+            cfg = {}
+    if isinstance(cfg, dict):
+        coding_cfg = cfg.get("coding_worker") if isinstance(cfg.get("coding_worker"), dict) else {}
+        if coding_cfg.get("backend"):
+            return normalize_coding_worker_backend(coding_cfg.get("backend"))
+        legacy_cfg = cfg.get("codex_worker") if isinstance(cfg.get("codex_worker"), dict) else {}
+        if legacy_cfg.get("backend"):
+            return normalize_coding_worker_backend(legacy_cfg.get("backend"))
+    return BACKEND_CODEX
+
+
+def load_opencode_config(
+    config: Optional[dict[str, Any]] = None,
+    *,
+    worker_config: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    cfg = config
+    if cfg is None:
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+        except Exception:
+            cfg = {}
+
+    opencode_cfg: dict[str, Any] = {}
+    if isinstance(cfg, dict):
+        coding_cfg = cfg.get("coding_worker") if isinstance(cfg.get("coding_worker"), dict) else {}
+        if isinstance(coding_cfg.get("opencode"), dict):
+            opencode_cfg.update(coding_cfg["opencode"])
+
+    if worker_config and isinstance(worker_config.get("opencode"), dict):
+        opencode_cfg.update(worker_config["opencode"])
+
+    return {
+        "binary": str(opencode_cfg.get("binary") or "opencode"),
+        "model": str(opencode_cfg.get("model") or "").strip(),
+        "plan_agent": str(opencode_cfg.get("plan_agent") or "plan").strip() or "plan",
+        "build_agent": str(opencode_cfg.get("build_agent") or "build").strip() or "build",
+        "plan_variant": _normalize_variant(opencode_cfg.get("plan_variant")),
+        "build_variant": _normalize_variant(opencode_cfg.get("build_variant")),
+        "simple_variant": _normalize_variant(opencode_cfg.get("simple_variant")),
+        "complex_variant": _normalize_variant(opencode_cfg.get("complex_variant")),
+        "dangerously_skip_permissions": bool(opencode_cfg.get("dangerously_skip_permissions", False)),
+    }
+
+
+def check_opencode_binary(config: Optional[dict[str, Any]] = None) -> tuple[bool, str]:
+    binary = load_opencode_config(config).get("binary") or "opencode"
+    if os.path.isabs(str(binary)):
+        path = Path(str(binary))
+        if path.is_file() and os.access(path, os.X_OK):
+            return True, str(path)
+        return False, f"OpenCode binary is not executable: {path}"
+    resolved = shutil.which(str(binary))
+    if not resolved:
+        return False, f"OpenCode CLI not found in PATH: {binary}"
+    return True, resolved
+
+
+def opencode_credentials_look_configured(config: Optional[dict[str, Any]] = None) -> tuple[bool, str]:
+    ok, resolved = check_opencode_binary(config)
+    if not ok:
+        return False, resolved
+    try:
+        proc = subprocess.run(
+            [resolved, "providers", "list"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception as exc:
+        return False, f"OpenCode credentials check failed: {exc}"
+    output = "\n".join(
+        part.strip() for part in (proc.stdout, proc.stderr) if part and part.strip()
+    )
+    if proc.returncode != 0:
+        return False, output or f"OpenCode credentials check exited {proc.returncode}"
+    plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output).strip()
+    if not plain or re.search(r"\b(?:0|no) credentials\b", plain, flags=re.IGNORECASE):
+        return False, "OpenCode is installed but has no configured credentials."
+    return True, plain
+
+
+def looks_complex_or_risky(task: str, context: str = "") -> bool:
+    lower = f"{task}\n{context}".lower()
+    if not lower.strip():
+        return False
+    explicit_plan = (
+        "plan first",
+        "first plan",
+        "planning pass",
+        "two phase",
+        "two-phase",
+        "design before",
+    )
+    if any(phrase in lower for phrase in explicit_plan):
+        return True
+
+    simple_signals = (
+        "typo",
+        "comment",
+        "formatting",
+        "small docs",
+        "documentation",
+        "readme",
+        "changelog",
+        "one-line",
+        "one line",
+        "trivial",
+        "mechanical",
+    )
+    if any(_contains_signal(lower, signal) for signal in simple_signals):
+        return False
+
+    risky_signals = (
+        "security",
+        "auth",
+        "permission",
+        "sandbox",
+        "secret",
+        "credential",
+        "payment",
+        "wallet",
+        "signing",
+        "race",
+        "deadlock",
+        "concurrency",
+        "data loss",
+        "migration",
+        "schema migration",
+        "breaking change",
+        "architecture",
+        "design review",
+        "audit",
+        "incident",
+        "production",
+        "unsafe",
+        "dangerous",
+        "rewrite",
+        "upgrade",
+        "rebase",
+        "merge conflict",
+        "flaky",
+        "intermittent",
+        "root cause",
+        "state machine",
+        "async",
+        "cache",
+        "performance",
+    )
+    return any(_contains_signal(lower, signal) for signal in risky_signals)
+
+
+def run_opencode_task(
+    prompt: str,
+    workspace: str,
+    *,
+    timeout: float,
+    context_for_classification: str = "",
+    force_plan: Optional[bool] = None,
+    title: str = "",
+    config: Optional[dict[str, Any]] = None,
+    worker_config: Optional[dict[str, Any]] = None,
+    on_event: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> OpenCodeRunResult:
+    cfg = load_opencode_config(config, worker_config=worker_config)
+    needs_plan = (
+        bool(force_plan)
+        if force_plan is not None
+        else looks_complex_or_risky(prompt, context_for_classification)
+    )
+    started = time.monotonic()
+    events: list[dict[str, Any]] = []
+    agents: list[str] = []
+
+    def _capture(event: dict[str, Any]) -> None:
+        events.append(event)
+        if on_event is not None:
+            on_event(event)
+
+    plan_text = ""
+    if needs_plan:
+        agents.append(cfg["plan_agent"])
+        plan = _run_opencode_once(
+            prompt=_plan_prompt(prompt),
+            workspace=workspace,
+            timeout=max(30.0, timeout),
+            cfg=cfg,
+            agent=cfg["plan_agent"],
+            variant=cfg["plan_variant"] or cfg["complex_variant"] or "high",
+            title=title,
+            on_event=_capture,
+        )
+        if plan.error:
+            plan.backend = BACKEND_OPENCODE
+            plan.agents = agents
+            plan.events = events
+            plan.plan_text = plan.final_text
+            plan.duration_seconds = round(time.monotonic() - started, 2)
+            return plan
+        plan_text = plan.final_text.strip()
+
+    agents.append(cfg["build_agent"])
+    build_prompt = prompt
+    if plan_text:
+        build_prompt = (
+            f"{prompt.rstrip()}\n\n"
+            "OpenCode plan to follow:\n"
+            f"{plan_text}\n"
+        )
+    build = _run_opencode_once(
+        prompt=build_prompt,
+        workspace=workspace,
+        timeout=max(30.0, timeout),
+        cfg=cfg,
+        agent=cfg["build_agent"],
+        variant=(
+            cfg["build_variant"]
+            or (cfg["complex_variant"] if needs_plan else cfg["simple_variant"])
+        ),
+        title=title,
+        on_event=_capture,
+    )
+    build.backend = BACKEND_OPENCODE
+    build.agents = agents
+    build.plan_text = plan_text
+    build.events = events
+    build.tool_iterations = len(events)
+    build.timed_out = bool(build.timed_out)
+    if build.error is None and not build.final_text.strip():
+        build.error = "OpenCode completed without producing final text."
+    build.exit_code = build.exit_code
+    if build.thread_id is None:
+        build.thread_id = _last_session_id(events)
+    build.turn_id = build.thread_id
+    build.duration_seconds = round(time.monotonic() - started, 2)
+    if build.stderr:
+        build.stderr = build.stderr.strip()
+    build.stdout = build.stdout.strip()
+    return build
+
+
+def _run_opencode_once(
+    *,
+    prompt: str,
+    workspace: str,
+    timeout: float,
+    cfg: dict[str, Any],
+    agent: str,
+    variant: str,
+    title: str,
+    on_event: Callable[[dict[str, Any]], None],
+) -> OpenCodeRunResult:
+    ok, binary_or_error = check_opencode_binary({"coding_worker": {"opencode": cfg}})
+    if not ok:
+        return OpenCodeRunResult(error=binary_or_error)
+
+    workdir = str(Path(workspace).expanduser().resolve())
+    brief_path = _write_brief(prompt)
+    cmd = [
+        binary_or_error,
+        "run",
+        "--format",
+        "json",
+        "--agent",
+        agent,
+        "--dir",
+        workdir,
+    ]
+    if cfg.get("model"):
+        cmd.extend(["--model", str(cfg["model"])])
+    if variant:
+        cmd.extend(["--variant", variant])
+    if title:
+        cmd.extend(["--title", title])
+    if cfg.get("dangerously_skip_permissions"):
+        cmd.append("--dangerously-skip-permissions")
+    cmd.extend(["--file", str(brief_path), "Read the attached Hermes worker brief and follow it exactly."])
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except subprocess.TimeoutExpired as exc:
+        return OpenCodeRunResult(
+            error=f"OpenCode {agent} run timed out after {timeout:g}s.",
+            timed_out=True,
+            should_retire=True,
+            stdout=exc.stdout or "",
+            stderr=exc.stderr or "",
+        )
+    except Exception as exc:
+        return OpenCodeRunResult(error=f"OpenCode {agent} run failed to start: {exc}")
+    finally:
+        try:
+            brief_path.unlink()
+        except OSError:
+            pass
+
+    result = _parse_opencode_output(proc.stdout, proc.stderr, on_event=on_event)
+    result.exit_code = proc.returncode
+    result.stdout = proc.stdout or ""
+    result.stderr = proc.stderr or ""
+    if proc.returncode != 0 and result.error is None:
+        result.error = _classify_opencode_error(
+            result.stdout,
+            result.stderr,
+            f"OpenCode {agent} exited with code {proc.returncode}.",
+        )
+    if result.error is not None:
+        result.error = _classify_opencode_error(result.error, result.stdout, result.stderr)
+    result.thread_id = result.thread_id or _last_session_id(result.events)
+    result.turn_id = result.thread_id
+    result.tool_iterations = len(result.events)
+    return result
+
+
+def _parse_opencode_output(
+    stdout: str,
+    stderr: str,
+    *,
+    on_event: Callable[[dict[str, Any]], None],
+) -> OpenCodeRunResult:
+    events: list[dict[str, Any]] = []
+    texts: list[str] = []
+    raw_text_lines: list[str] = []
+    error: Optional[str] = None
+    session_id: Optional[str] = None
+
+    for line in (stdout or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            raw_text_lines.append(stripped)
+            continue
+        if not isinstance(event, dict):
+            raw_text_lines.append(stripped)
+            continue
+        events.append(event)
+        on_event(event)
+        session_id = session_id or _event_session_id(event)
+        if str(event.get("type") or "").lower() == "error":
+            error = _event_error_text(event) or "OpenCode reported an error."
+            continue
+        text = _event_text(event)
+        if text:
+            texts.append(text)
+
+    final_text = "\n".join(texts).strip()
+    if not final_text and raw_text_lines:
+        final_text = "\n".join(raw_text_lines).strip()
+    if not final_text and stderr and error is None:
+        final_text = stderr.strip()
+
+    return OpenCodeRunResult(
+        final_text=final_text,
+        error=error,
+        events=events,
+        thread_id=session_id,
+        turn_id=session_id,
+    )
+
+
+def _write_brief(prompt: str) -> Path:
+    root = Path(tempfile.gettempdir()) / "opencode"
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        prefix="hermes-worker-",
+        suffix=".md",
+        dir=str(root),
+        delete=False,
+    ) as handle:
+        handle.write(prompt)
+        handle.write("\n")
+        return Path(handle.name)
+
+
+def _plan_prompt(prompt: str) -> str:
+    return (
+        "Create a concise implementation plan for the attached Hermes worker "
+        "brief. Do not edit repository files. Focus on the minimum safe changes, "
+        "key files to inspect, and verification steps. Return plain text.\n\n"
+        f"Worker brief:\n{prompt}"
+    )
+
+
+def _normalize_variant(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    return raw if raw in _VALID_VARIANTS else ""
+
+
+def _contains_signal(text: str, signal: str) -> bool:
+    if " " in signal or "-" in signal:
+        return signal in text
+    return bool(re.search(rf"\b{re.escape(signal)}\b", text))
+
+
+def _event_session_id(event: dict[str, Any]) -> Optional[str]:
+    for key in ("sessionID", "sessionId", "session_id"):
+        value = event.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _last_session_id(events: list[dict[str, Any]]) -> Optional[str]:
+    session_id = None
+    for event in events:
+        session_id = _event_session_id(event) or session_id
+    return session_id
+
+
+def _event_error_text(event: dict[str, Any]) -> str:
+    err = event.get("error")
+    if isinstance(err, str):
+        return err
+    if isinstance(err, dict):
+        parts = []
+        for key in ("message", "code", "name"):
+            value = err.get(key)
+            if value:
+                parts.append(str(value))
+        data = err.get("data")
+        if isinstance(data, dict):
+            message = data.get("message")
+            if message:
+                parts.append(str(message))
+        return ": ".join(parts)
+    return ""
+
+
+def _event_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return "\n".join(filter(None, (_event_text(item) for item in value))).strip()
+    if not isinstance(value, dict):
+        return ""
+
+    if str(value.get("type") or "").lower() == "error":
+        return ""
+    for key in ("text", "message", "content", "output", "result", "final"):
+        if key in value:
+            text = _event_text(value.get(key))
+            if text:
+                return text
+    data = value.get("data")
+    if isinstance(data, dict):
+        text = _event_text(data)
+        if text:
+            return text
+    return ""
+
+
+def _classify_opencode_error(*parts: str) -> str:
+    text = "\n".join(part for part in parts if part).strip()
+    lower = text.lower()
+    if any(
+        needle in lower
+        for needle in (
+            "token_invalidated",
+            "authentication token has been invalidated",
+            "authentication failed",
+            "not authenticated",
+            "unauthorized",
+            "401",
+            "signing in again",
+            "please login",
+            "please log in",
+            "invalid api key",
+            "invalid_api_key",
+        )
+    ):
+        return (
+            "OpenCode authentication failed. Run `opencode auth login` "
+            f"or configure a valid OpenCode provider, then retry. Details: {text}"
+        )
+    return text or "OpenCode worker failed."

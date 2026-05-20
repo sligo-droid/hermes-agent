@@ -1,0 +1,169 @@
+from __future__ import annotations
+
+import json
+import subprocess
+from types import SimpleNamespace
+
+from agent import opencode_worker as ow
+
+
+def _cfg():
+    return {
+        "coding_worker": {
+            "opencode": {
+                "binary": "opencode",
+                "plan_variant": "high",
+                "complex_variant": "high",
+            }
+        }
+    }
+
+
+def test_simple_task_runs_build_only(monkeypatch, tmp_path):
+    calls = []
+
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {"type": "message", "sessionID": "ses-build", "message": "done"}
+            )
+            + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+
+    result = ow.run_opencode_task(
+        "fix typo in README",
+        str(tmp_path),
+        timeout=60,
+        config=_cfg(),
+    )
+
+    assert result.error is None
+    assert result.final_text == "done"
+    assert result.agents == ["build"]
+    assert calls[0][calls[0].index("--agent") + 1] == "build"
+
+
+def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
+    calls = []
+    briefs = []
+
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        brief = cmd[cmd.index("--file") + 1]
+        briefs.append(open(brief, encoding="utf-8").read())
+        agent = cmd[cmd.index("--agent") + 1]
+        if agent == "plan":
+            text = "Plan: update auth boundary, add regression tests."
+            sid = "ses-plan"
+        else:
+            text = '{"status":"completed","summary":"built","changed_files":[],"tests":[]}'
+            sid = "ses-build"
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"type": "message", "sessionID": sid, "message": text}) + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+
+    result = ow.run_opencode_task(
+        "fix auth credential handling",
+        str(tmp_path),
+        timeout=60,
+        config=_cfg(),
+    )
+
+    assert result.error is None
+    assert result.agents == ["plan", "build"]
+    assert result.plan_text.startswith("Plan:")
+    assert [cmd[cmd.index("--agent") + 1] for cmd in calls] == ["plan", "build"]
+    assert "OpenCode plan to follow:" in briefs[1]
+
+
+def test_auth_error_is_classified(monkeypatch, tmp_path):
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+
+    def fake_run(cmd, **_kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "type": "error",
+                    "sessionID": "ses-auth",
+                    "error": {
+                        "name": "APIError",
+                        "data": {
+                            "message": "Your authentication token has been invalidated.",
+                            "statusCode": 401,
+                        },
+                    },
+                }
+            )
+            + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+
+    result = ow.run_opencode_task(
+        "fix parser.py",
+        str(tmp_path),
+        timeout=60,
+        config=_cfg(),
+    )
+
+    assert result.error is not None
+    assert "opencode auth login" in result.error
+    assert result.thread_id == "ses-auth"
+
+
+def test_timeout_becomes_worker_error(monkeypatch, tmp_path):
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+
+    def fake_run(cmd, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd, 30, output="", stderr="")
+
+    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+
+    result = ow.run_opencode_task(
+        "fix parser.py",
+        str(tmp_path),
+        timeout=30,
+        config=_cfg(),
+    )
+
+    assert result.timed_out is True
+    assert result.should_retire is True
+    assert "timed out" in result.error
+
+
+def test_missing_binary_becomes_worker_error(monkeypatch, tmp_path):
+    monkeypatch.setattr(ow.shutil, "which", lambda name: None)
+
+    result = ow.run_opencode_task(
+        "fix parser.py",
+        str(tmp_path),
+        timeout=30,
+        config=_cfg(),
+    )
+
+    assert result.error is not None
+    assert "not found" in result.error.lower()
+
+
+def test_backend_prefers_coding_worker_key_over_legacy_codex_worker():
+    cfg = {
+        "coding_worker": {"backend": "opencode"},
+        "codex_worker": {"backend": "codex"},
+    }
+
+    assert ow.load_coding_worker_backend(cfg) == "opencode"

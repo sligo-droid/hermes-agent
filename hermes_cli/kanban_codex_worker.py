@@ -1,4 +1,4 @@
-"""Run one Kanban planner/dev/reviewer task through Codex app-server."""
+"""Run one Kanban planner/dev/reviewer task through a coding worker."""
 
 from __future__ import annotations
 
@@ -34,7 +34,14 @@ def main() -> int:
         if task is None:
             return 2
         prompt = _build_prompt(conn, task_id, role)
-        result = _run_codex(prompt, workspace, role, task_id=task_id, board=board)
+        result = _run_role_backend(
+            prompt,
+            workspace,
+            role,
+            task=task,
+            task_id=task_id,
+            board=board,
+        )
         if result.error:
             raise RuntimeError(result.error)
         payload = _parse_json(result.final_text)
@@ -50,7 +57,7 @@ def main() -> int:
         return 0
     except Exception as exc:
         try:
-            kanban_db.block_task(conn, task_id, reason=f"Codex worker failed: {exc}")
+            kanban_db.block_task(conn, task_id, reason=f"{_backend_label(role)} worker failed: {exc}")
         except Exception:
             pass
         return 1
@@ -63,7 +70,7 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
     schema = _schema_instructions(role)
     git = _git_summary(os.environ.get("HERMES_KANBAN_WORKSPACE", "") or os.getcwd())
     return (
-        f"You are the Discord Kanban {role} worker. You are running as a Codex app-server worker.\n"
+        f"You are the Discord Kanban {role} worker.\n"
         "Do not call Hermes tools. Work only from the repository, shell, and files available in this worker environment.\n"
         "Return exactly one JSON object matching the schema below; do not wrap it in Markdown.\n\n"
         f"{schema}\n\n"
@@ -93,6 +100,35 @@ def _schema_instructions(role: str) -> str:
         'Schema: {"status":"completed|blocked|checkpoint","summary":"...","changed_files":["..."],'
         '"tests":[{"command":"...","result":"passed|failed|not_run","output":"..."}],"blocker":null,"pr_ready":false}'
     )
+
+
+def _configured_backend() -> str:
+    try:
+        from agent.opencode_worker import load_coding_worker_backend
+
+        return load_coding_worker_backend()
+    except Exception:
+        return "codex"
+
+
+def _backend_label(role: str) -> str:
+    if role == ROLE_DEV and _configured_backend() == "opencode":
+        return "OpenCode"
+    return "Codex"
+
+
+def _run_role_backend(
+    prompt: str,
+    workspace: str,
+    role: str,
+    *,
+    task: Any,
+    task_id: str,
+    board: Optional[str],
+):
+    if role == ROLE_DEV and _configured_backend() == "opencode":
+        return _run_opencode(prompt, workspace, role, task=task, task_id=task_id, board=board)
+    return _run_codex(prompt, workspace, role, task_id=task_id, board=board)
 
 
 def _run_codex(
@@ -139,6 +175,53 @@ def _run_codex(
             )
         except Exception:
             pass
+
+
+def _run_opencode(
+    prompt: str,
+    workspace: str,
+    role: str,
+    *,
+    task: Any,
+    task_id: str,
+    board: Optional[str],
+):
+    def on_event(note: dict) -> None:
+        try:
+            record_codex_worker_event(
+                task_id,
+                board=board,
+                event={
+                    "method": f"opencode/{note.get('type') or 'event'}",
+                    "params": {"item": note},
+                },
+            )
+        except Exception:
+            pass
+
+    from agent.opencode_worker import run_opencode_task
+
+    context = "\n".join(
+        str(part or "")
+        for part in (
+            getattr(task, "title", ""),
+            getattr(task, "body", ""),
+            prompt,
+        )
+    )
+    result = run_opencode_task(
+        prompt,
+        workspace,
+        timeout=_role_timeout(role),
+        context_for_classification=context,
+        title=f"kanban {task_id}",
+        on_event=on_event,
+    )
+    try:
+        record_codex_worker_result(task_id, board=board, result=result)
+    except Exception:
+        pass
+    return result
 
 
 def _role_extra_args(role: str) -> list[str]:

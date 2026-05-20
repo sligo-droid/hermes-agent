@@ -1274,9 +1274,28 @@ DEFAULT_CONFIG = {
         "subagent_auto_approve": False,
     },
 
-    # Codex coding worker — keeps Hermes on the normal runtime, but lets
-    # coding-shaped tasks delegate the implementation/debug/test step to a
-    # Codex app-server worker. On by default; disable with /codex-worker off.
+    # Coding worker backend selection. The public command/tool names still
+    # say "codex-worker" for compatibility, but the backend can be switched
+    # to OpenCode for non-PTY worker execution.
+    "coding_worker": {
+        "backend": "codex",  # codex | opencode
+        "opencode": {
+            "binary": "opencode",
+            "model": "",
+            "plan_agent": "plan",
+            "build_agent": "build",
+            "plan_variant": "high",
+            "build_variant": "",
+            "simple_variant": "",
+            "complex_variant": "high",
+            "dangerously_skip_permissions": False,
+        },
+    },
+
+    # Codex worker compatibility settings — keeps Hermes on the normal
+    # runtime, but lets coding-shaped tasks delegate the implementation/debug/
+    # test step to a coding worker. On by default; disable with
+    # /codex-worker off.
     "codex_worker": {
         "enabled": True,
         "turn_timeout_seconds": 1800,
@@ -1577,8 +1596,10 @@ DEFAULT_CONFIG = {
             # /workers/<session_id>. When empty, Discord embeds omit the
             # Kanban Board field.
             "public_base_url": "",
-            # "host" runs the local Codex app-server worker directly. "docker"
-            # is opt-in for installs with a reachable worker image.
+            # "host" runs the local role worker directly. "docker" is opt-in
+            # for Codex installs with a reachable worker image; OpenCode uses
+            # host mode in this version.
+            "backend": "",  # empty inherits coding_worker.backend; codex | opencode
             "runner": "host",
             # Container image expected to include Python, Codex CLI, git/gh,
             # common build tools, and this repo's runtime dependencies.
