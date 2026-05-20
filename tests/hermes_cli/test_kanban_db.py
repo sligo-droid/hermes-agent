@@ -273,6 +273,20 @@ def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
         assert task.last_failure_error is None
 
 
+def test_recompute_ready_does_not_promote_root_blocked_task(kanban_home):
+    """Root blocked tasks need an explicit unblock/archive, not auto-retry."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="needs clarification", assignee="planner")
+        kb.claim_task(conn, tid)
+        assert kb.block_task(conn, tid, reason="clarification needed")
+
+        promoted = kb.recompute_ready(conn)
+
+        task = kb.get_task(conn, tid)
+        assert promoted == 0
+        assert task.status == "blocked"
+
+
 def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
     with kb.connect() as conn:
         a = kb.create_task(conn, title="a")

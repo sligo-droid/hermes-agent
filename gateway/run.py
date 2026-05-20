@@ -10828,7 +10828,7 @@ class GatewayRunner:
                 try:
                     from hermes_cli import discord_worker_boards as _dwb
 
-                    board = _dwb.set_goal(
+                    board = _dwb.start_direct_goal(
                         thread_id=thread_id,
                         goal="Follow up on the todos from this meeting.",
                         chat_id=str(getattr(source, "chat_id", "") or ""),

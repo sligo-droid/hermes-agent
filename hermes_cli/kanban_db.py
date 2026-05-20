@@ -2023,6 +2023,8 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
+            if not parents and cur_status == "blocked":
+                continue
             if all(p["status"] in ("done", "archived") for p in parents):
                 # Blocked tasks also get their failure counters reset —
                 # this is effectively an auto-unblock.

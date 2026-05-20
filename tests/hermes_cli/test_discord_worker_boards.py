@@ -52,6 +52,29 @@ def test_set_goal_creates_planner_task_for_role_lane(monkeypatch, tmp_path):
     assert tasks[0].workspace_kind == "dir"
 
 
+def test_start_direct_goal_activates_board_without_planner(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="778",
+        goal="Follow up on the todos from this meeting.",
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert tasks == []
+    assert worker["execution_mode"] == "kanban_pipeline"
+    assert worker["goal_status"] == "active"
+    assert worker["phase"] == "dev"
+    assert worker["root_goal"] == "Follow up on the todos from this meeting."
+
+
 def test_set_goal_preserves_nested_subgoal_text_for_planner(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
