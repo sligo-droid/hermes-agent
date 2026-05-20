@@ -86,7 +86,7 @@ CUSTOM_POOL_PREFIX = "custom:"
 _EXTRA_KEYS = frozenset({
     "token_type", "scope", "client_id", "portal_base_url", "obtained_at",
     "expires_in", "agent_key_id", "agent_key_expires_in", "agent_key_reused",
-    "agent_key_obtained_at", "tls",
+    "agent_key_obtained_at", "tls", "id_token", "account_id",
 })
 
 
@@ -511,14 +511,18 @@ class CredentialPool:
                 return entry
             store_access = tokens.get("access_token", "")
             store_refresh = tokens.get("refresh_token", "")
+            store_id_token = tokens.get("id_token", "")
+            store_account_id = tokens.get("account_id", "")
             # Adopt auth.json tokens when either side differs.  Codex refresh
             # tokens are single-use too, so a fresh refresh_token from
             # another process means our entry's pair is consumed/stale.
             entry_access = entry.access_token or ""
             entry_refresh = entry.refresh_token or ""
+            entry_id_token = str(entry.extra.get("id_token") or "")
             if store_access and (
                 store_access != entry_access
                 or (store_refresh and store_refresh != entry_refresh)
+                or (store_id_token and store_id_token != entry_id_token)
             ):
                 logger.debug(
                     "Pool entry %s: syncing Codex tokens from auth.json "
@@ -537,6 +541,13 @@ class CredentialPool:
                 }
                 if state.get("last_refresh"):
                     field_updates["last_refresh"] = state["last_refresh"]
+                extra_updates = dict(entry.extra)
+                if store_id_token:
+                    extra_updates["id_token"] = store_id_token
+                if store_account_id:
+                    extra_updates["account_id"] = store_account_id
+                if extra_updates != entry.extra:
+                    field_updates["extra"] = extra_updates
                 updated = replace(entry, **field_updates)
                 self._replace_entry(entry, updated)
                 self._persist()
@@ -738,6 +749,10 @@ class CredentialPool:
                     tokens["access_token"] = entry.access_token
                     if entry.refresh_token:
                         tokens["refresh_token"] = entry.refresh_token
+                    if entry.extra.get("id_token"):
+                        tokens["id_token"] = entry.extra["id_token"]
+                    if entry.extra.get("account_id"):
+                        tokens["account_id"] = entry.extra["account_id"]
                     if entry.last_refresh:
                         state["last_refresh"] = entry.last_refresh
                     _store_provider_state(auth_store, "openai-codex", state, set_active=False)
@@ -1709,6 +1724,8 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                     "auth_type": AUTH_TYPE_OAUTH,
                     "access_token": tokens.get("access_token", ""),
                     "refresh_token": tokens.get("refresh_token"),
+                    "id_token": tokens.get("id_token"),
+                    "account_id": tokens.get("account_id"),
                     "base_url": "https://chatgpt.com/backend-api/codex",
                     "last_refresh": state.get("last_refresh"),
                     "label": label_from_token(tokens.get("access_token", ""), "device_code"),

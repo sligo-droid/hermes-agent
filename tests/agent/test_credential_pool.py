@@ -1700,6 +1700,7 @@ def _codex_auth_store(access: str, refresh: str) -> dict:
                     "access_token": access,
                     "refresh_token": refresh,
                     "id_token": "id-" + access,
+                    "account_id": "acct-" + access,
                 },
                 "last_refresh": "2026-04-28T00:00:00Z",
             }
@@ -1719,6 +1720,8 @@ def test_sync_codex_entry_from_auth_store_adopts_newer_tokens(tmp_path, monkeypa
     assert entry is not None
     assert entry.access_token == "access-OLD"
     assert entry.refresh_token == "refresh-OLD"
+    assert entry.extra["id_token"] == "id-access-OLD"
+    assert entry.extra["account_id"] == "acct-access-OLD"
 
     # Simulate `hermes auth openai-codex` replacing the token pair on disk.
     _write_auth_store(tmp_path, _codex_auth_store("access-NEW", "refresh-NEW"))
@@ -1727,6 +1730,8 @@ def test_sync_codex_entry_from_auth_store_adopts_newer_tokens(tmp_path, monkeypa
     assert synced is not entry
     assert synced.access_token == "access-NEW"
     assert synced.refresh_token == "refresh-NEW"
+    assert synced.extra["id_token"] == "id-access-NEW"
+    assert synced.extra["account_id"] == "acct-access-NEW"
     assert synced.last_status is None
     assert synced.last_error_code is None
     assert synced.last_error_reset_at is None
@@ -1979,6 +1984,8 @@ def _codex_auth_store(access_token: str, refresh_token: str) -> dict:
                 "tokens": {
                     "access_token": access_token,
                     "refresh_token": refresh_token,
+                    "id_token": "id-" + access_token,
+                    "account_id": "acct-" + access_token,
                 },
             }
         },

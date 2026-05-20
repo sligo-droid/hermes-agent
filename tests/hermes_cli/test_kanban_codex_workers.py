@@ -101,6 +101,7 @@ def test_codex_role_worker_inherits_available_pool_credential(monkeypatch, tmp_p
                             "source": "manual:device_code",
                             "access_token": "access-1",
                             "refresh_token": "refresh-1",
+                            "id_token": "id-1",
                             "last_status": "exhausted",
                             "last_status_at": time.time(),
                             "last_error_code": 429,
@@ -114,6 +115,7 @@ def test_codex_role_worker_inherits_available_pool_credential(monkeypatch, tmp_p
                             "source": "manual:device_code",
                             "access_token": "access-2",
                             "refresh_token": "refresh-2",
+                            "id_token": "id-2",
                         },
                     ]
                 },

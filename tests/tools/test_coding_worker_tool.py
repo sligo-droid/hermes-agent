@@ -237,6 +237,7 @@ def test_runs_with_available_codex_pool_credential(monkeypatch, tmp_path):
                             "source": "manual:device_code",
                             "access_token": "access-1",
                             "refresh_token": "refresh-1",
+                            "id_token": "id-1",
                             "last_status": "exhausted",
                             "last_status_at": time.time(),
                             "last_error_code": 429,
@@ -250,6 +251,7 @@ def test_runs_with_available_codex_pool_credential(monkeypatch, tmp_path):
                             "source": "manual:device_code",
                             "access_token": "access-2",
                             "refresh_token": "refresh-2",
+                            "id_token": "id-2",
                         },
                     ]
                 },
@@ -284,6 +286,7 @@ def test_codex_worker_home_prefers_parent_current_credential(tmp_path):
         id="cred-current",
         access_token="access-current",
         refresh_token="refresh-current",
+        id_token="id-current",
         last_status=None,
     )
     pool = SimpleNamespace(

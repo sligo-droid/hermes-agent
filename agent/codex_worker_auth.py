@@ -13,15 +13,26 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+def _string_attr(entry: Any, name: str) -> str:
+    value = getattr(entry, name, "")
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _entry_tokens(entry: Any) -> Optional[dict[str, str]]:
-    access_token = str(getattr(entry, "access_token", "") or "").strip()
-    refresh_token = str(getattr(entry, "refresh_token", "") or "").strip()
-    if not access_token or not refresh_token:
+    access_token = _string_attr(entry, "access_token")
+    refresh_token = _string_attr(entry, "refresh_token")
+    id_token = _string_attr(entry, "id_token")
+    if not access_token or not refresh_token or not id_token:
         return None
-    return {
+    tokens = {
         "access_token": access_token,
         "refresh_token": refresh_token,
+        "id_token": id_token,
     }
+    account_id = _string_attr(entry, "account_id")
+    if account_id:
+        tokens["account_id"] = account_id
+    return tokens
 
 
 def _entry_is_usable(entry: Any) -> bool:
@@ -183,7 +194,8 @@ def sync_codex_worker_home(
         return
     access_token = str(tokens.get("access_token", "") or "").strip()
     refresh_token = str(tokens.get("refresh_token", "") or "").strip()
-    if not access_token or not refresh_token:
+    id_token = str(tokens.get("id_token", "") or "").strip()
+    if not access_token or not refresh_token or not id_token:
         return
 
     try:
@@ -205,10 +217,16 @@ def sync_codex_worker_home(
                     and getattr(entry, "refresh_token", None) == refresh_token
                 ):
                     return
+                extra = dict(getattr(entry, "extra", {}) or {})
+                extra["id_token"] = id_token
+                account_id = str(tokens.get("account_id", "") or "").strip()
+                if account_id:
+                    extra["account_id"] = account_id
                 updated_entry = replace(
                     entry,
                     access_token=access_token,
                     refresh_token=refresh_token,
+                    extra=extra,
                     last_status=None,
                     last_status_at=None,
                     last_error_code=None,
