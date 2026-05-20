@@ -92,6 +92,43 @@ def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
     assert "OpenCode plan to follow:" in briefs[1]
 
 
+def test_nested_text_part_is_used_as_final_text(monkeypatch, tmp_path):
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+
+    def fake_run(cmd, **_kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "type": "text",
+                    "sessionID": "ses-plan",
+                    "part": {
+                        "type": "text",
+                        "text": '{"status":"planned","tasks":[]}',
+                    },
+                }
+            )
+            + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+
+    result = ow.run_opencode_single_pass(
+        "plan work",
+        str(tmp_path),
+        timeout=60,
+        agent="plan",
+        reasoning_level="xhigh",
+        config=_cfg(),
+    )
+
+    assert result.error is None
+    assert result.backend == "opencode"
+    assert result.final_text == '{"status":"planned","tasks":[]}'
+    assert result.thread_id == "ses-plan"
+
+
 def test_reasoning_levels_are_configurable_by_mode(monkeypatch, tmp_path):
     calls = []
 

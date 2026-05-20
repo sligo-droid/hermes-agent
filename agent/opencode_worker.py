@@ -616,7 +616,7 @@ def _event_text(value: Any) -> str:
 
     if str(value.get("type") or "").lower() == "error":
         return ""
-    for key in ("text", "message", "content", "output", "result", "final"):
+    for key in ("text", "message", "content", "output", "result", "final", "part"):
         if key in value:
             text = _event_text(value.get(key))
             if text:
