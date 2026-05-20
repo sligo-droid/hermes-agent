@@ -1,7 +1,6 @@
 """Tests for Discord project and feature summary surfaces."""
 
 import inspect
-import json
 import sys
 import types
 from datetime import datetime, timezone
@@ -220,7 +219,46 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
     event = adapter.handle_message.await_args.args[0]
     assert event.project_summary["channel_id"] == "100"
     assert event.feature_summary["thread_id"] == "200"
+    assert event.feature_summary["kanban_board"] is None
     assert event.text == "Build a deploy dashboard"
+
+
+@pytest.mark.asyncio
+async def test_non_goal_feature_summary_does_not_start_kanban_pipeline(adapter, monkeypatch):
+    from hermes_cli import discord_worker_boards as dwb
+
+    def fail_start_planner_request(**kwargs):
+        raise AssertionError("non-/goal feature summaries must not start Kanban planner work")
+
+    monkeypatch.setattr(dwb, "start_planner_request", fail_start_planner_request)
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="Build a deploy dashboard",
+    )
+
+    assert handle is not None
+    assert handle["kanban_board"] is None
+    fields = {field.name: field.value for field in thread.sent[0][0]["embed"].fields}
+    assert "Kanban Board" not in fields
+
+
+@pytest.mark.asyncio
+async def test_goal_feature_summary_keeps_worker_board_handle(adapter):
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="/goal Build a deploy dashboard",
+    )
+
+    assert handle is not None
+    assert handle["kanban_board"]["slug"] == "discord-200"
 
 
 @pytest.mark.asyncio
@@ -501,7 +539,7 @@ async def test_feature_summary_update_edits_initial_message(adapter, monkeypatch
     assert edited_embed.title == "Project Links"
     assert edited_embed.description is None
     assert "Generated Title" not in fields
-    assert fields["Status"] == "👀 In progress"
+    assert fields["Status"] == "✅ Done"
     assert fields["Concise Outcome"].startswith("Done.")
     assert fields["Branch"] == "feature/summary"
 
@@ -525,7 +563,7 @@ def test_feature_summary_kanban_status_labels(adapter):
 
 
 @pytest.mark.asyncio
-async def test_feature_summary_uses_absolute_kanban_board_url(adapter, monkeypatch, tmp_path):
+async def test_goal_feature_summary_uses_absolute_kanban_board_url(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://hermes.sligolabs.com")
     parent = FakeTextChannel(channel_id=100)
@@ -534,7 +572,7 @@ async def test_feature_summary_uses_absolute_kanban_board_url(adapter, monkeypat
     handle = await adapter.initialize_feature_summary(
         thread,
         parent_channel=parent,
-        initial_request="Ship project links",
+        initial_request="/goal Ship project links",
     )
 
     assert handle is not None
@@ -544,7 +582,7 @@ async def test_feature_summary_uses_absolute_kanban_board_url(adapter, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_feature_summary_starts_session_kanban_planner(adapter, monkeypatch, tmp_path):
+async def test_non_goal_feature_summary_does_not_create_session_kanban_planner(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     parent = FakeTextChannel(channel_id=100)
     thread = FakeThread(channel_id=200, parent=parent)
@@ -556,24 +594,20 @@ async def test_feature_summary_starts_session_kanban_planner(adapter, monkeypatc
     )
 
     assert handle is not None
+    assert handle["kanban_board"] is None
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_db
 
     board = dwb.board_slug_for_discord_thread("200")
     meta = kanban_db.read_board_metadata(board)
-    worker = meta["discord_worker"]
     conn = kanban_db.connect(board=board)
     try:
         tasks = kanban_db.list_tasks(conn, include_archived=False)
     finally:
         conn.close()
 
-    assert worker["execution_mode"] == "kanban_pipeline"
-    assert worker["goal_status"] == "active"
-    assert len(tasks) == 1
-    assert tasks[0].assignee == "planner"
-    assert tasks[0].created_by == "discord-feature-request"
-    assert json.loads(tasks[0].body or "{}")["request"] == "Build the drilldown page"
+    assert "discord_worker" not in meta
+    assert tasks == []
 
 
 @pytest.mark.asyncio

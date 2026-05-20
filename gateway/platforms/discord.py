@@ -1439,41 +1439,29 @@ class DiscordAdapter(BasePlatformAdapter):
         if thread_channel is None or not hasattr(thread_channel, "send"):
             return None
         board_handle: Optional[Dict[str, Any]] = None
-        try:
-            from hermes_cli.discord_worker_boards import (
-                ensure_discord_thread_board,
-                start_planner_request,
-            )
+        if self._slash_command_starts_threaded_work(initial_request):
+            try:
+                from hermes_cli.discord_worker_boards import ensure_discord_thread_board
 
-            guild = getattr(thread_channel, "guild", None)
-            board_kwargs = {
-                "thread_id": str(getattr(thread_channel, "id", "") or ""),
-                "chat_id": str(
-                    getattr(parent_channel, "id", "")
-                    or getattr(thread_channel, "id", "")
-                    or ""
-                ),
-                "guild_id": str(getattr(guild, "id", "") or ""),
-                "parent_channel_id": str(getattr(parent_channel, "id", "") or ""),
-                "project_context": project_context,
-            }
-            if self._slash_command_starts_threaded_work(initial_request):
+                guild = getattr(thread_channel, "guild", None)
                 board = ensure_discord_thread_board(
+                    thread_id=str(getattr(thread_channel, "id", "") or ""),
+                    chat_id=str(
+                        getattr(parent_channel, "id", "")
+                        or getattr(thread_channel, "id", "")
+                        or ""
+                    ),
+                    guild_id=str(getattr(guild, "id", "") or ""),
+                    parent_channel_id=str(getattr(parent_channel, "id", "") or ""),
                     initial_request=initial_request,
-                    **board_kwargs,
+                    project_context=project_context,
                 )
-            else:
-                board = start_planner_request(
-                    request=initial_request,
-                    created_by="discord-feature-request",
-                    **board_kwargs,
-                )
-            board_handle = {
-                "slug": board.slug,
-                "public_url": board.public_url,
-            }
-        except Exception as exc:
-            logger.debug("[%s] Failed to initialize Discord worker board: %s", self.name, exc)
+                board_handle = {
+                    "slug": board.slug,
+                    "public_url": board.public_url,
+                }
+            except Exception as exc:
+                logger.debug("[%s] Failed to initialize Discord worker board: %s", self.name, exc)
         try:
             embed = self._build_feature_summary_embed(
                 initial_request=initial_request,
