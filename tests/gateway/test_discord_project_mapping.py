@@ -87,6 +87,53 @@ def test_thread_inherits_parent_project_channel_mapping(tmp_path):
     db.close()
 
 
+def test_configured_channel_cwd_becomes_project_context(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = tmp_path / "hermes"
+    project.mkdir()
+
+    ctx = resolve_discord_project_context(
+        FakeChannel(channel_id="dev-chan", name="dev", guild=_guild()),
+        session_db=db,
+        workspace_root=workspace,
+        config={"discord": {"channel_cwds": {"dev-chan": str(project)}}},
+    )
+
+    assert ctx is not None
+    assert ctx.resolved is True
+    assert ctx.channel_id == "dev-chan"
+    assert ctx.project_path == str(project.resolve())
+    assert ctx.project_key == "hermes"
+    assert ctx.mapping_source == "configured_channel_cwd"
+    assert db.get_discord_project_mapping(guild_id="guild-1", channel_id="dev-chan") is None
+    db.close()
+
+
+def test_configured_channel_cwd_applies_to_threads(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project = tmp_path / "hermes"
+    project.mkdir()
+    parent = FakeChannel(channel_id="dev-chan", name="dev", guild=_guild())
+    thread = FakeChannel(channel_id="thread-1", name="feature", guild=_guild(), parent=parent)
+
+    ctx = resolve_discord_project_context(
+        thread,
+        session_db=db,
+        workspace_root=workspace,
+        config={"discord": {"channel_cwds": {"dev-chan": str(project)}}},
+    )
+
+    assert ctx is not None
+    assert ctx.channel_id == "dev-chan"
+    assert ctx.project_path == str(project.resolve())
+    assert ctx.mapping_source == "configured_channel_cwd"
+    db.close()
+
+
 def test_admin_human_and_infra_are_not_project_mapped(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     workspace = tmp_path / "workspace"

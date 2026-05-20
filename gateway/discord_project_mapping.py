@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from hermes_cli.config import cfg_get, load_config
 from hermes_constants import get_hermes_home
 from hermes_state import SessionDB
 
@@ -50,6 +52,7 @@ def resolve_discord_project_context(
     *,
     session_db: Optional[SessionDB] = None,
     workspace_root: Optional[Path] = None,
+    config: Optional[dict[str, Any]] = None,
 ) -> Optional[DiscordProjectContext]:
     """Resolve the project context for a Discord channel or thread.
 
@@ -83,6 +86,15 @@ def resolve_discord_project_context(
             row = db.get_discord_project_mapping(guild_id=guild_id, channel_id=channel_id)
             if row:
                 return _context_from_row(row)
+
+        configured = _context_from_configured_channel_cwd(
+            target,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            config=config,
+        )
+        if configured is not None:
+            return configured
 
         bootstrapped = _bootstrap_from_workspace(
             target,
@@ -144,6 +156,45 @@ def _context_from_row(row: dict[str, Any]) -> DiscordProjectContext:
         project_path=row.get("project_path"),
         github_url=row.get("github_url"),
         mapping_source=row.get("source") or "manual",
+        resolved=True,
+    )
+
+
+def _context_from_configured_channel_cwd(
+    channel: Any,
+    *,
+    guild_id: str,
+    channel_id: str,
+    config: Optional[dict[str, Any]],
+) -> Optional[DiscordProjectContext]:
+    cfg = config
+    if cfg is None:
+        try:
+            cfg = load_config() or {}
+        except Exception:
+            cfg = {}
+    raw = cfg_get(cfg, "discord", "channel_cwds", default={})
+    if not isinstance(raw, dict):
+        return None
+    configured = raw.get(channel_id) or raw.get(str(channel_id))
+    if not configured:
+        return None
+    project_path = Path(os.path.expandvars(str(configured))).expanduser()
+    if not project_path.is_absolute() or not project_path.is_dir():
+        return None
+    project_path = project_path.resolve()
+    guild = getattr(channel, "guild", None)
+    return DiscordProjectContext(
+        guild_id=guild_id,
+        channel_id=channel_id,
+        parent_channel_id=_string_id(getattr(channel, "parent_id", None)),
+        channel_name=_channel_name(channel),
+        guild_name=str(getattr(guild, "name", "") or "") or None,
+        project_key=project_path.name,
+        project_name=_humanize_project_name(project_path.name),
+        project_path=str(project_path),
+        github_url=_git_remote_url(project_path),
+        mapping_source="configured_channel_cwd",
         resolved=True,
     )
 
