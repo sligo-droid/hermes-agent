@@ -309,6 +309,7 @@ def _public_worker_meta(worker: dict[str, Any]) -> dict[str, Any]:
         "phase",
         "execution_mode",
         "criteria",
+        "worker_branch",
         "review_loop_count",
         "review_loop_limit",
         "public_url",
@@ -321,6 +322,41 @@ def _public_worker_meta(worker: dict[str, Any]) -> dict[str, Any]:
         "updated_at",
     }
     return {key: value for key, value in worker.items() if key in allowed}
+
+
+def _format_public_timestamp(value: Any) -> str:
+    try:
+        ts = int(value)
+    except (TypeError, ValueError):
+        return ""
+    if ts <= 0:
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(ts))
+
+
+def _public_status_text(worker: dict[str, Any]) -> str:
+    status = str(worker.get("goal_status") or "").strip()
+    phase = str(worker.get("phase") or "").strip()
+    if status and phase and status != phase:
+        return f"{status} / {phase}"
+    return status or phase or "pending"
+
+
+def _public_review_text(worker: dict[str, Any]) -> str:
+    count = worker.get("review_loop_count")
+    limit = worker.get("review_loop_limit")
+    if limit not in (None, ""):
+        return f"{count or 0}/{limit}"
+    return str(count or 0)
+
+
+def _public_count_text(counts: dict[str, Any]) -> str:
+    if not counts:
+        return "none"
+    ordered = ["triage", "todo", "ready", "running", "blocked", "done"]
+    keys = [key for key in ordered if key in counts]
+    keys.extend(sorted(key for key in counts if key not in ordered))
+    return " ".join(f"{key}:{counts.get(key) or 0}" for key in keys)
 
 
 def render_public_board_html(token: str) -> str:
@@ -367,6 +403,7 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="15">
   <title>{esc(snapshot["name"])}</title>
   <style>
     body {{ margin: 0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f7f7f5; color: #1f2933; }}
@@ -392,6 +429,7 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
       <span>Branch: {esc(worker.get("worker_branch") or "")}</span>
       <span>PR: {esc(worker.get("pr_url") or "not opened")}</span>
       <span>Review loops: {esc(worker.get("review_loop_count") or 0)}</span>
+      <span>Updated: {esc(_format_public_timestamp(worker.get("updated_at")) or "never")}</span>
     </div>
   </header>
   <main>
@@ -454,19 +492,54 @@ def render_public_board_index_html() -> str:
         session_id = str(board.get("session_id") or "")
         href = f"/workers/{quote(session_id, safe='')}" if session_id else ""
         counts = board.get("counts") or {}
-        count_text = " ".join(
-            f"{esc(status)}:{esc(count)}"
-            for status, count in sorted(counts.items())
-        )
+        count_text = _public_count_text(counts)
         title = esc(worker.get("root_goal") or worker.get("initial_request") or board.get("name"))
         link = f'<a href="{href}">{title}</a>' if href else title
+        status = _public_status_text(worker)
+        execution_mode = str(worker.get("execution_mode") or "").strip()
+        branch = str(worker.get("worker_branch") or "").strip()
+        pr_url = str(worker.get("pr_url") or "").strip()
+        pr_number = str(worker.get("pr_number") or "").strip()
+        if pr_url.startswith(("http://", "https://")):
+            pr_label = f"#{pr_number}" if pr_number else pr_url
+            pr_text = f'<a href="{esc(pr_url)}">{esc(pr_label)}</a>'
+        else:
+            pr_text = esc(pr_url or "not opened")
+        created_at = _format_public_timestamp(worker.get("created_at"))
+        updated_at = _format_public_timestamp(worker.get("updated_at"))
+        timestamps = " ".join(
+            bit for bit in (
+                f"Created: {esc(created_at)}" if created_at else "",
+                f"Updated: {esc(updated_at)}" if updated_at else "",
+            )
+            if bit
+        )
+        flags = []
+        if worker.get("paused"):
+            flags.append("paused")
+        if worker.get("cancelled"):
+            flags.append("cancelled")
+        blocked_reason = str(worker.get("blocked_reason") or "").strip()
+        if blocked_reason:
+            flags.append(f"blocked: {blocked_reason}")
+        flags_text = " ".join(flags)
         items.append(
             "<li><strong>{link}</strong><br>"
-            "<code>{session}</code> {status}<p>{counts}</p></li>".format(
+            "<code>{session}</code> {status}"
+            "<p>{counts}</p>"
+            "<p>{branch}{mode}{pr}{review}</p>"
+            "<p>{timestamps}</p>"
+            "{flags}</li>".format(
                 link=link,
                 session=esc(session_id),
-                status=esc(worker.get("goal_status") or worker.get("phase") or ""),
-                counts=count_text,
+                status=esc(status),
+                counts=esc(count_text),
+                branch=f"Branch: {esc(branch)}" if branch else "Branch: pending",
+                mode=f" Mode: {esc(execution_mode)}" if execution_mode else "",
+                pr=f" PR: {pr_text}",
+                review=f" Review: {esc(_public_review_text(worker))}",
+                timestamps=timestamps,
+                flags=f"<p>{esc(flags_text)}</p>" if flags_text else "",
             )
         )
     body = "\n".join(items) or "<li>No public Discord Kanban boards yet.</li>"
