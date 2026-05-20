@@ -185,6 +185,57 @@ def test_public_board_index_lists_session_links(monkeypatch, tmp_path):
     assert "Build the thing" in html
 
 
+def test_public_board_index_lists_operational_row_data(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(dwb, "_now", lambda: 100)
+    board = dwb.ensure_discord_thread_board(
+        thread_id="5152",
+        initial_request="Build private thing",
+        project_context={"project_path": "/repo/app"},
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        kanban_db.create_task(conn, title="Ready task")
+        running = kanban_db.create_task(conn, title="Running task")
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (running,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(dwb, "_now", lambda: 200)
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "active",
+            "phase": "dev",
+            "execution_mode": "kanban_pipeline",
+            "pr_url": "https://github.example/pull/42",
+            "pr_number": 42,
+            "review_loop_count": 2,
+            "review_loop_limit": 5,
+            "paused": True,
+            "blocked_reason": "waiting for review",
+        },
+    )
+
+    html = dwb.render_public_board_index_html()
+
+    assert "active / dev" in html
+    assert "ready:1 running:1" in html
+    assert "Branch: discord/5152" in html
+    assert 'PR: <a href="https://github.example/pull/42">#42</a>' in html
+    assert "Review: 2/5" in html
+    assert "Created: 1970-01-01 00:01:40 UTC" in html
+    assert "Updated: 1970-01-01 00:03:20 UTC" in html
+    assert "paused blocked: waiting for review" in html
+    assert "/repo/app" not in html
+    assert "app-discord-5152" not in html
+    assert "share_token" not in html
+
+
 def test_public_board_index_lists_newest_sessions_first(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -202,6 +253,17 @@ def test_public_board_index_lists_newest_sessions_first(monkeypatch, tmp_path):
         "1001",
     ]
     assert html.index("Newer worker") < html.index("Older worker")
+
+
+def test_public_session_board_auto_refreshes(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    dwb.set_goal(thread_id="6160", goal="Watch the board")
+
+    html = dwb.render_public_session_board_html("6160")
+
+    assert '<meta http-equiv="refresh" content="15">' in html
 
 
 def test_public_kanban_web_routes(monkeypatch, tmp_path):
