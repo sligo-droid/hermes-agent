@@ -270,14 +270,48 @@ def get_external_skills_dirs() -> List[Path]:
     return result
 
 
+def get_inherited_skills_dirs() -> List[Path]:
+    """Return fallback skill roots inherited from a parent Hermes install.
+
+    Kanban workers often run under profile-scoped ``HERMES_HOME`` values, so
+    their local ``skills/`` tree may not contain root-installed workflow skills.
+    ``HERMES_INHERITED_SKILLS_DIRS`` lets the dispatcher provide read-only
+    fallback roots without mutating user config. These roots are searched after
+    local skills and configured ``skills.external_dirs``.
+    """
+    raw = os.environ.get("HERMES_INHERITED_SKILLS_DIRS", "")
+    if not raw.strip():
+        return []
+
+    local_skills = get_skills_dir().resolve()
+    seen: Set[Path] = set()
+    result: List[Path] = []
+    for entry in raw.split(os.pathsep):
+        entry = entry.strip()
+        if not entry:
+            continue
+        p = Path(os.path.expanduser(os.path.expandvars(entry)))
+        try:
+            p = p.resolve()
+        except OSError:
+            continue
+        if p == local_skills or p in seen or not p.is_dir():
+            continue
+        seen.add(p)
+        result.append(p)
+    return result
+
+
 def get_all_skills_dirs() -> List[Path]:
     """Return all skill directories: local ``~/.hermes/skills/`` first, then external.
 
     The local dir is always first (and always included even if it doesn't exist
-    yet — callers handle that).  External dirs follow in config order.
+    yet — callers handle that).  External dirs follow in config order, then
+    dispatcher-provided inherited dirs as fallback-only roots.
     """
     dirs = [get_skills_dir()]
     dirs.extend(get_external_skills_dirs())
+    dirs.extend(get_inherited_skills_dirs())
     return dirs
 
 

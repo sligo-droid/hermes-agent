@@ -5164,6 +5164,42 @@ def _resolve_hermes_argv() -> list[str]:
     return _module_hermes_argv()
 
 
+def _skill_name_available_in_roots(roots: Iterable[Path], skill_name: str) -> bool:
+    for skills_root in roots:
+        if not skills_root.is_dir():
+            continue
+        if (skills_root / "devops" / skill_name / "SKILL.md").is_file():
+            return True
+        if (skills_root / skill_name / "SKILL.md").is_file():
+            return True
+        try:
+            for skill_md in skills_root.rglob(f"{skill_name}/SKILL.md"):
+                if skill_md.is_file():
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def _parse_env_path_list(value: Optional[str]) -> list[Path]:
+    if not value:
+        return []
+    paths: list[Path] = []
+    for raw in str(value).split(os.pathsep):
+        raw = raw.strip()
+        if raw:
+            paths.append(Path(raw).expanduser())
+    return paths
+
+
+def _append_env_path(value: Optional[str], path: Path) -> str:
+    path_s = str(path)
+    parts = [p for p in str(value or "").split(os.pathsep) if p]
+    if path_s not in parts:
+        parts.append(path_s)
+    return os.pathsep.join(parts)
+
+
 def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
     """True if the bundled ``kanban-worker`` skill resolves for the home the
     spawned worker will run under.
@@ -5178,25 +5214,12 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
     the kanban lifecycle contract is still injected via ``KANBAN_GUIDANCE``, so
     omitting the flag only drops the supplementary pattern library.
     """
-    from pathlib import Path as _Path
-
     # An unset HERMES_HOME means the worker falls back to the default root
     # home (``~/.hermes``), which ships the bundled skill.
-    base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
-    skills_root = base / "skills"
-    if not skills_root.is_dir():
-        return False
-    # Canonical bundled location first (cheap), then a bounded scan for
-    # profiles that have it nested elsewhere.
-    if (skills_root / "devops" / "kanban-worker" / "SKILL.md").is_file():
-        return True
-    try:
-        for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
-            if skill_md.is_file():
-                return True
-    except OSError:
-        pass
-    return False
+    base = Path(hermes_home) if hermes_home else (Path.home() / ".hermes")
+    roots = [base / "skills"]
+    roots.extend(_parse_env_path_list(os.environ.get("HERMES_INHERITED_SKILLS_DIRS")))
+    return _skill_name_available_in_roots(roots, "kanban-worker")
 
 
 def _worker_terminal_timeout_env(
@@ -5404,6 +5427,12 @@ def _default_spawn(
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
+    root_skills = kanban_home() / "skills"
+    if root_skills.is_dir():
+        env["HERMES_INHERITED_SKILLS_DIRS"] = _append_env_path(
+            env.get("HERMES_INHERITED_SKILLS_DIRS"),
+            root_skills,
+        )
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
@@ -5468,7 +5497,11 @@ def _default_spawn(
     # profile-scoped skills dirs, and preloading a missing skill is
     # fatal at CLI startup. Omitting it is safe — the lifecycle
     # contract still ships via KANBAN_GUIDANCE.
-    if _kanban_worker_skill_available(env.get("HERMES_HOME")):
+    inherited_skill_roots = _parse_env_path_list(env.get("HERMES_INHERITED_SKILLS_DIRS"))
+    if (
+        _kanban_worker_skill_available(env.get("HERMES_HOME"))
+        or _skill_name_available_in_roots(inherited_skill_roots, "kanban-worker")
+    ):
         cmd.extend(["--skills", "kanban-worker"])
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI

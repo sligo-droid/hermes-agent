@@ -152,6 +152,55 @@ class TestRunConversationCodexPath:
                  and m.get("content") == "echo: hello"]
         assert final, f"expected final assistant message in {msgs}"
 
+    def test_kanban_worker_bootstrap_is_api_only(self, monkeypatch, tmp_path):
+        calls = []
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            calls.append(user_input)
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-stub-1",
+                thread_id="thread-stub-1",
+            )
+
+        skills_root = tmp_path / "skills"
+        general = skills_root / "general-coding"
+        general.mkdir(parents=True)
+        (general / "SKILL.md").write_text(
+            "---\nname: general-coding\ndescription: Coding rules\n---\n\nRules.\n"
+        )
+        tdd = skills_root / "software-development" / "test-driven-development"
+        tdd.mkdir(parents=True)
+        (tdd / "SKILL.md").write_text(
+            "---\nname: test-driven-development\ndescription: TDD\n---\n\nTDD.\n"
+        )
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_bootstrap")
+        monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", skills_root)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-stub-1"
+        )
+
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("fix the repo bug")
+
+        assert result["final_response"] == "done"
+        assert len(calls) == 1
+        sent = calls[0]
+        assert "Hermes kanban Codex worker bootstrap" in sent
+        assert "kanban_show()" in sent
+        assert "skill_view" in sent
+        assert "general-coding" in sent
+        assert "~/AGENTS.md" in sent
+        assert "software-development/*" in sent
+        assert "test-driven-development" in sent
+        assert sent.endswith("fix the repo bug")
+        # The stored conversation keeps the real user request clean.
+        assert result["messages"][0]["content"] == "fix the repo bug"
+
     def test_codex_app_server_turn_persists_projected_messages(self, fake_session):
         agent = _make_codex_agent()
         db = RecordingSessionDB()
