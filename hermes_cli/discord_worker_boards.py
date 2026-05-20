@@ -482,7 +482,7 @@ def _public_board_snapshot_for_board(board: str) -> dict[str, Any]:
         conn.close()
     return {
         "board": board,
-        "name": metadata.get("name") or board,
+        "name": _worker_board_name(worker, metadata, board),
         "description": metadata.get("description") or "",
         "session_id": str(worker.get("thread_id") or ""),
         "worker": _public_worker_meta(worker),
@@ -1015,6 +1015,8 @@ def _public_worker_meta(worker: dict[str, Any]) -> dict[str, Any]:
         "thread_id",
         "initial_request",
         "root_goal",
+        "summary_title",
+        "concise_outcome",
         "goal_status",
         "phase",
         "execution_mode",
@@ -1036,6 +1038,68 @@ def _public_worker_meta(worker: dict[str, Any]) -> dict[str, Any]:
     if discord_url:
         public["discord_thread_url"] = discord_url
     return public
+
+
+def _clean_feature_summary_text(
+    value: Any,
+    *,
+    max_chars: int,
+    default: str = "",
+) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip()) or default
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _worker_generated_title(worker: dict[str, Any]) -> str:
+    return _clean_feature_summary_text(
+        worker.get("summary_title"),
+        max_chars=80,
+        default="",
+    )
+
+
+def _fallback_feature_title(worker: dict[str, Any]) -> str:
+    source = str(worker.get("root_goal") or worker.get("initial_request") or "").strip()
+    match = re.match(r"^/goal(?:\s+(.*))?$", source, re.IGNORECASE | re.DOTALL)
+    if match and (match.group(1) or "").strip().lower() not in GOAL_CONTROL_COMMANDS:
+        source = (match.group(1) or "").strip()
+    return _clean_feature_summary_text(
+        source,
+        max_chars=80,
+        default="Discord Worker Feature",
+    )
+
+
+def _worker_index_title(worker: dict[str, Any], fallback: Any) -> str:
+    return (
+        _worker_generated_title(worker)
+        or _clean_feature_summary_text(
+            worker.get("root_goal") or worker.get("initial_request") or fallback,
+            max_chars=160,
+            default="Discord Worker Board",
+        )
+    )
+
+
+def _worker_board_name(worker: dict[str, Any], metadata: dict[str, Any], board: str) -> str:
+    return _worker_generated_title(worker) or str(metadata.get("name") or board)
+
+
+def set_feature_summary_title(board: str, title: str) -> str:
+    """Persist the generated feature title used by embeds and /workers."""
+    cleaned = _clean_feature_summary_text(title, max_chars=80, default="")
+    if not board or not cleaned:
+        return ""
+    worker = _read_worker_meta(board)
+    if worker.get("kind") != "discord_worker_board":
+        return ""
+    if _worker_generated_title(worker) == cleaned:
+        return cleaned
+    worker["summary_title"] = cleaned
+    _update_worker_meta(board, worker)
+    return cleaned
 
 
 def _format_public_timestamp(value: Any) -> str:
@@ -1143,6 +1207,147 @@ def board_thread_state(board: str) -> str:
     return "active"
 
 
+def _latest_task_summaries(tasks: list[Any], summaries: dict[str, str]) -> list[str]:
+    ordered = sorted(
+        tasks,
+        key=lambda task: (
+            getattr(task, "completed_at", None)
+            or getattr(task, "started_at", None)
+            or getattr(task, "created_at", 0)
+            or 0
+        ),
+        reverse=True,
+    )
+    out: list[str] = []
+    for task in ordered:
+        summary = _clean_feature_summary_text(
+            summaries.get(getattr(task, "id", "")),
+            max_chars=220,
+            default="",
+        )
+        if summary:
+            out.append(summary)
+        if len(out) >= 2:
+            break
+    return out
+
+
+def _feature_summary_outcome(
+    worker: dict[str, Any],
+    *,
+    state: str,
+    tasks: list[Any],
+    summaries: dict[str, str],
+    counts: dict[str, Any],
+    running: list[dict[str, Any]],
+) -> str:
+    stored = _clean_feature_summary_text(
+        worker.get("concise_outcome"),
+        max_chars=420,
+        default="",
+    )
+    if stored:
+        return stored
+
+    latest = _latest_task_summaries(tasks, summaries)
+    blocked_tasks = [task for task in tasks if getattr(task, "status", "") == "blocked"]
+    blocker = _clean_feature_summary_text(
+        worker.get("blocked_reason"),
+        max_chars=320,
+        default="",
+    )
+    if not blocker and blocked_tasks:
+        task = blocked_tasks[0]
+        blocker = _clean_feature_summary_text(
+            getattr(task, "last_failure_error", None)
+            or summaries.get(getattr(task, "id", ""))
+            or getattr(task, "title", ""),
+            max_chars=320,
+            default="",
+        )
+
+    if state == "errored":
+        return _clean_feature_summary_text(
+            f"Failed. {blocker}" if blocker else "Failed. A Kanban worker hit an unrecoverable error.",
+            max_chars=420,
+        )
+    if state == "blocked":
+        return _clean_feature_summary_text(
+            f"Blocked. {blocker}" if blocker else "Blocked. Kanban is waiting on input or a failed ticket.",
+            max_chars=420,
+        )
+    if state == "done":
+        detail = " ".join(latest)
+        return _clean_feature_summary_text(
+            f"Done. {detail}" if detail else "Done. Kanban work completed.",
+            max_chars=420,
+        )
+
+    running_text = _running_status_text(running)
+    if running and running_text != "idle":
+        return _clean_feature_summary_text(
+            f"In progress. {running_text}",
+            max_chars=420,
+        )
+    if latest:
+        return _clean_feature_summary_text(
+            "In progress. " + " ".join(latest),
+            max_chars=420,
+        )
+
+    queued = int(counts.get("ready") or 0) + int(counts.get("todo") or 0) + int(counts.get("review") or 0)
+    if queued:
+        return f"In progress. {queued} Kanban ticket{'s' if queued != 1 else ''} queued."
+    if int(counts.get("done") or 0):
+        return "In progress. Completed tickets are awaiting final board reconciliation."
+    return "In progress. Kanban pipeline is preparing work."
+
+
+def feature_summary_snapshot(board: str) -> dict[str, Any]:
+    """Return the current feature-summary values for a Discord worker board."""
+    metadata = kanban_db.read_board_metadata(board)
+    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    if worker.get("kind") != "discord_worker_board":
+        raise KeyError("unknown Discord worker board")
+
+    conn = kanban_db.connect(board=board)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+        summaries = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        counts = kanban_db.board_stats(conn).get("by_status", {})
+        running = _running_ticket_snapshot(conn)
+    finally:
+        conn.close()
+
+    state = board_thread_state(board)
+    title = _worker_generated_title(worker)
+    outcome = _feature_summary_outcome(
+        worker,
+        state=state,
+        tasks=tasks,
+        summaries=summaries,
+        counts=counts,
+        running=running,
+    )
+    snapshot = {
+        "board": board,
+        "thread_id": str(worker.get("thread_id") or ""),
+        "chat_id": str(worker.get("chat_id") or worker.get("thread_id") or ""),
+        "state": state,
+        "title": title,
+        "fallback_title": _fallback_feature_title(worker),
+        "outcome": outcome,
+        "branch": str(worker.get("worker_branch") or "").strip(),
+        "pr_url": str(worker.get("pr_url") or "").strip(),
+        "pr_number": str(worker.get("pr_number") or "").strip(),
+        "public_url": str(worker.get("public_url") or "").strip(),
+        "updated_at": worker.get("updated_at"),
+    }
+    key_payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    snapshot["sync_key"] = hashlib.sha256(key_payload.encode("utf-8")).hexdigest()
+    return snapshot
+
+
 def thread_status_targets() -> list[dict[str, Any]]:
     """Return Discord thread targets with their current board state."""
     targets: list[dict[str, Any]] = []
@@ -1154,12 +1359,24 @@ def thread_status_targets() -> list[dict[str, Any]]:
         thread_id = str(worker.get("thread_id") or "").strip()
         if not thread_id:
             continue
+        try:
+            summary = feature_summary_snapshot(board)
+        except Exception:
+            summary = {"state": board_thread_state(board)}
         targets.append(
             {
                 "board": board,
                 "thread_id": thread_id,
                 "chat_id": str(worker.get("chat_id") or thread_id),
-                "state": board_thread_state(board),
+                "state": summary.get("state") or board_thread_state(board),
+                "title": summary.get("title") or "",
+                "fallback_title": summary.get("fallback_title") or "",
+                "outcome": summary.get("outcome") or "",
+                "branch": summary.get("branch") or "",
+                "pr_url": summary.get("pr_url") or "",
+                "pr_number": summary.get("pr_number") or "",
+                "public_url": summary.get("public_url") or "",
+                "sync_key": summary.get("sync_key") or "",
             }
         )
     return targets
@@ -1882,7 +2099,7 @@ def public_board_index_snapshot() -> dict[str, Any]:
         boards.append(
             {
                 "board": slug,
-                "name": board.get("name") or slug,
+                "name": _worker_board_name(worker, board, slug),
                 "description": board.get("description") or "",
                 "session_id": session_id,
                 "public_url": public_session_board_url(session_id),
@@ -1915,7 +2132,7 @@ def render_public_board_index_html() -> str:
         runtime_state = str(runtime.get("state") or "idle")
         runtime_reason = str(runtime.get("reason") or running_text)
         runtime_label = "Queue" if runtime_state == "queued" else "Status"
-        title = esc(worker.get("root_goal") or worker.get("initial_request") or board.get("name"))
+        title = esc(_worker_index_title(worker, board.get("name")))
         link = f'<a class="board-title" href="{esc(href)}">{title}</a>' if href else title
         discord_thread_url = str(worker.get("discord_thread_url") or "").strip()
         session_text = (

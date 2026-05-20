@@ -5639,6 +5639,68 @@ class GatewayRunner:
                 await asyncio.sleep(min(1.0, interval - slept))
                 slept += 1.0
 
+    def _fallback_discord_kanban_feature_title(self, target: Dict[str, Any]) -> str:
+        text = str(target.get("fallback_title") or "").strip()
+        text = re.sub(r"^/goal(?:\s+(.*))?$", r"\1", text, flags=re.IGNORECASE | re.DOTALL).strip()
+        text = re.sub(r"`([^`]*)`", r"\1", text)
+        text = re.sub(r"[*_>#-]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip(" .")
+        if not text:
+            text = "Discord Worker Feature"
+        if len(text) > 80:
+            text = text[:77].rstrip() + "..."
+        return text
+
+    def _generate_discord_kanban_feature_title(self, target: Dict[str, Any]) -> str:
+        existing = str(target.get("title") or "").strip()
+        if existing:
+            return existing
+        board = str(target.get("board") or "").strip()
+        fallback = self._fallback_discord_kanban_feature_title(target)
+        title = ""
+        try:
+            from agent.title_generator import generate_title
+
+            def _title_failure_cb(task: str, exc: BaseException) -> None:
+                logger.debug(
+                    "Discord Kanban feature-title generation failed (%s): %s",
+                    task,
+                    exc,
+                )
+
+            title = generate_title(
+                str(target.get("fallback_title") or fallback),
+                str(target.get("outcome") or ""),
+                timeout=15,
+                failure_callback=_title_failure_cb,
+            ) or ""
+        except Exception:
+            logger.debug("Discord Kanban feature-title generation crashed", exc_info=True)
+        title = title or fallback
+        if board and title:
+            try:
+                from hermes_cli.discord_worker_boards import set_feature_summary_title
+
+                return set_feature_summary_title(board, title) or title
+            except Exception:
+                logger.debug("Discord Kanban feature-title persistence failed", exc_info=True)
+        return title
+
+    def _discord_kanban_summary_sync_key(self, target: Dict[str, Any]) -> str:
+        return json.dumps(
+            {
+                "sync_key": str(target.get("sync_key") or ""),
+                "state": str(target.get("state") or ""),
+                "title": str(target.get("title") or ""),
+                "outcome": str(target.get("outcome") or ""),
+                "branch": str(target.get("branch") or ""),
+                "pr_url": str(target.get("pr_url") or ""),
+                "public_url": str(target.get("public_url") or ""),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
     async def _discord_kanban_typing_watcher(self, interval: float = 8.0) -> None:
         """Keep Discord thread typing visible while thread workers are running."""
         interval = max(float(interval or 8.0), 1.0)
@@ -5647,7 +5709,8 @@ class GatewayRunner:
                 adapter = self.adapters.get(Platform.DISCORD)
                 sender = getattr(adapter, "send_typing_once", None) if adapter else None
                 reaction_sync = getattr(adapter, "sync_kanban_thread_reaction", None) if adapter else None
-                if adapter is not None and (callable(sender) or callable(reaction_sync)):
+                summary_sync = getattr(adapter, "sync_kanban_feature_summary", None) if adapter else None
+                if adapter is not None and (callable(sender) or callable(reaction_sync) or callable(summary_sync)):
                     try:
                         from hermes_cli.discord_worker_boards import (
                             running_worker_thread_targets,
@@ -5700,6 +5763,37 @@ class GatewayRunner:
                                 continue
                             if synced_state:
                                 reaction_cache[board] = str(synced_state)
+                    if callable(summary_sync):
+                        summary_cache = getattr(self, "_discord_kanban_summary_states", None)
+                        if not isinstance(summary_cache, dict):
+                            summary_cache = {}
+                            self._discord_kanban_summary_states = summary_cache
+                        for target in reaction_targets:
+                            board = str(target.get("board") or "")
+                            if not board:
+                                continue
+                            target_for_sync = dict(target)
+                            if not str(target_for_sync.get("title") or "").strip():
+                                title = await asyncio.to_thread(
+                                    self._generate_discord_kanban_feature_title,
+                                    target_for_sync,
+                                )
+                                if title:
+                                    target_for_sync["title"] = title
+                            sync_key = self._discord_kanban_summary_sync_key(target_for_sync)
+                            if summary_cache.get(board) == sync_key:
+                                continue
+                            try:
+                                synced_key = await summary_sync(target_for_sync)
+                            except Exception as exc:
+                                logger.debug(
+                                    "discord kanban summary: sync failed for board %s: %s",
+                                    board,
+                                    exc,
+                                )
+                                continue
+                            if synced_key:
+                                summary_cache[board] = sync_key
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 logger.debug("discord kanban typing: cancelled")

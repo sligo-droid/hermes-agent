@@ -107,11 +107,16 @@ class FakeThread:
         self.parent_id = getattr(parent, "id", None)
         self.guild = getattr(parent, "guild", None)
         self.sent = []
+        self._messages = {}
 
     async def send(self, **kwargs):
         msg = SimpleNamespace(id=300, edit=AsyncMock())
         self.sent.append((kwargs, msg))
+        self._messages[msg.id] = msg
         return msg
+
+    async def fetch_message(self, message_id):
+        return self._messages[int(message_id)]
 
 
 @pytest.fixture
@@ -582,6 +587,80 @@ async def test_goal_feature_summary_uses_absolute_kanban_board_url(adapter, monk
 
 
 @pytest.mark.asyncio
+async def test_kanban_feature_summary_update_uses_board_snapshot(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://hermes.sligolabs.com")
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="/goal Ship project links",
+    )
+    assert handle is not None
+
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(thread_id="200", goal="Ship project links")
+    dwb.set_feature_summary_title(board.slug, "Project Link Summary")
+
+    assert await adapter.update_feature_summary(
+        handle,
+        final_response="This direct response should not replace Kanban state.",
+        status="Complete",
+    )
+
+    message = handle["_message_obj"]
+    edited_embed = message.edit.await_args.kwargs["embed"]
+    fields = {field.name: field.value for field in edited_embed.fields}
+    assert edited_embed.title == "Project Link Summary"
+    assert fields["Status"] == "👀 In progress"
+    assert fields["Concise Outcome"] != "Pending"
+    assert "Kanban" in fields["Concise Outcome"] or "ticket" in fields["Concise Outcome"]
+    assert fields["Branch"] == "discord/200"
+    assert fields["Kanban Board"] == "https://hermes.sligolabs.com/workers/200"
+    assert "Feature Branch URL" not in fields
+
+
+@pytest.mark.asyncio
+async def test_sync_kanban_feature_summary_reopens_persisted_handle(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://hermes.sligolabs.com")
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 200 else None
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="/goal Ship the dashboard",
+    )
+    assert handle is not None
+
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(thread_id="200", goal="Ship the dashboard")
+    synced = await adapter.sync_kanban_feature_summary(
+        {
+            "board": board.slug,
+            "thread_id": "200",
+            "state": "active",
+            "title": "Dashboard Shipment",
+            "public_url": "https://hermes.sligolabs.com/workers/200",
+            "sync_key": "sync-1",
+        }
+    )
+
+    assert synced == "sync-1"
+    message = handle["_message_obj"]
+    edited_embed = message.edit.await_args.kwargs["embed"]
+    fields = {field.name: field.value for field in edited_embed.fields}
+    assert edited_embed.title == "Dashboard Shipment"
+    assert fields["Branch"] == "discord/200"
+
+
+@pytest.mark.asyncio
 async def test_non_goal_feature_summary_does_not_create_session_kanban_planner(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     parent = FakeTextChannel(channel_id=100)
@@ -833,6 +912,27 @@ def test_runner_summarizes_long_discord_feature_outcome():
     call_llm.assert_called_once()
     prompt = call_llm.call_args.kwargs["messages"][1]["content"]
     assert "few concise sentences" in prompt
+
+
+def test_runner_generates_and_persists_discord_kanban_title(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(thread_id="200", goal="Ship the deploy dashboard")
+    runner = object.__new__(gateway_run.GatewayRunner)
+
+    with patch("agent.title_generator.generate_title", return_value="Deploy Dashboard") as generate_title:
+        title = runner._generate_discord_kanban_feature_title(
+            {
+                "board": board.slug,
+                "fallback_title": "Ship the deploy dashboard",
+                "outcome": "In progress. Planner created implementation tickets.",
+            }
+        )
+
+    assert title == "Deploy Dashboard"
+    assert dwb.feature_summary_snapshot(board.slug)["title"] == "Deploy Dashboard"
+    generate_title.assert_called_once()
 
 
 @pytest.mark.asyncio

@@ -764,6 +764,24 @@ class DiscordAdapter(BasePlatformAdapter):
         handle["_thread_obj"] = thread_channel
         return handle
 
+    def _load_feature_summary_handle_by_thread_id(
+        self,
+        thread_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        needle = str(thread_id or "").strip()
+        if not needle:
+            return None
+        state = self._read_project_summary_state()
+        bucket = state.get(_DISCORD_FEATURE_SUMMARY_STATE_BUCKET)
+        if not isinstance(bucket, dict):
+            return None
+        for stored in bucket.values():
+            if not isinstance(stored, dict):
+                continue
+            if str(stored.get("thread_id") or "") == needle:
+                return dict(stored)
+        return None
+
     def _summary_workdir(self) -> str:
         raw = (os.getenv("TERMINAL_CWD") or os.getcwd() or "").strip()
         if raw and os.path.isdir(raw):
@@ -1348,6 +1366,21 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("[%s] Failed to read Discord kanban board state: %s", self.name, exc)
             return None
 
+    def _feature_kanban_summary_snapshot(
+        self,
+        handle: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        slug = self._feature_kanban_board_slug(handle)
+        if not slug:
+            return None
+        try:
+            from hermes_cli.discord_worker_boards import feature_summary_snapshot
+
+            return feature_summary_snapshot(slug)
+        except Exception as exc:
+            logger.debug("[%s] Failed to read Discord kanban summary: %s", self.name, exc)
+            return None
+
     def _feature_kanban_summary_status(self, handle: Optional[Dict[str, Any]]) -> Optional[str]:
         state = self._feature_kanban_reaction_state(handle)
         if state == "done":
@@ -1505,7 +1538,21 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> bool:
         if not handle:
             return False
-        status = self._feature_kanban_summary_status(handle) or status
+        slug = self._feature_kanban_board_slug(handle)
+        if slug and title:
+            try:
+                from hermes_cli.discord_worker_boards import set_feature_summary_title
+
+                title = set_feature_summary_title(slug, title) or title
+            except Exception:
+                logger.debug("[%s] Failed to persist Discord kanban summary title", self.name, exc_info=True)
+        kanban_snapshot = self._feature_kanban_summary_snapshot(handle)
+        if kanban_snapshot:
+            status = self._feature_kanban_summary_status(handle) or status
+            final_response = str(kanban_snapshot.get("outcome") or final_response or "")
+            title = str(title or kanban_snapshot.get("title") or "") or None
+        else:
+            status = self._feature_kanban_summary_status(handle) or status
         thread = await self._resolve_summary_channel(
             str(handle.get("thread_id") or ""),
             fallback=handle.get("_thread_obj"),
@@ -1527,18 +1574,75 @@ class DiscordAdapter(BasePlatformAdapter):
                 status=status,
                 outcome=final_response,
                 title=title,
-                metadata=self._collect_discord_project_metadata(handle.get("project_context")),
-                kanban_url=(
-                    (handle.get("kanban_board") or {})
-                    if isinstance(handle.get("kanban_board"), dict)
-                    else {}
-                ).get("public_url"),
+                metadata=self._feature_summary_metadata(
+                    handle,
+                    kanban_snapshot=kanban_snapshot,
+                ),
+                kanban_url=self._feature_summary_kanban_url(
+                    handle,
+                    kanban_snapshot=kanban_snapshot,
+                ),
             )
             await msg.edit(embed=embed)
             return True
         except Exception as exc:
             logger.warning("[%s] Failed to update Discord feature summary: %s", self.name, exc)
             return False
+
+    def _feature_summary_metadata(
+        self,
+        handle: Dict[str, Any],
+        *,
+        kanban_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Optional[str]]:
+        metadata = self._collect_discord_project_metadata(handle.get("project_context"))
+        if not kanban_snapshot:
+            return metadata
+        branch = str(kanban_snapshot.get("branch") or "").strip()
+        if branch:
+            metadata["branch"] = branch
+            metadata["branch_url"] = None
+        pr_url = str(kanban_snapshot.get("pr_url") or "").strip()
+        if pr_url:
+            metadata["pr_url"] = pr_url
+        return metadata
+
+    def _feature_summary_kanban_url(
+        self,
+        handle: Dict[str, Any],
+        *,
+        kanban_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        if kanban_snapshot and kanban_snapshot.get("public_url"):
+            return str(kanban_snapshot.get("public_url") or "")
+        board = handle.get("kanban_board") or {}
+        if not isinstance(board, dict):
+            return None
+        return board.get("public_url")
+
+    async def sync_kanban_feature_summary(self, target: Dict[str, Any]) -> Optional[str]:
+        """Update a persisted feature-summary embed from Kanban board state."""
+        thread_id = str(target.get("thread_id") or "").strip()
+        board = str(target.get("board") or "").strip()
+        if not thread_id or not board:
+            return None
+        handle = self._load_feature_summary_handle_by_thread_id(thread_id)
+        if not handle:
+            return None
+        board_handle = handle.get("kanban_board") if isinstance(handle.get("kanban_board"), dict) else {}
+        board_handle = dict(board_handle or {})
+        board_handle.setdefault("slug", board)
+        if target.get("public_url"):
+            board_handle["public_url"] = target.get("public_url")
+        handle["kanban_board"] = board_handle
+        ok = await self.update_feature_summary(
+            handle,
+            status=str(target.get("state") or "Running"),
+            title=str(target.get("title") or "") or None,
+        )
+        if not ok:
+            return None
+        return str(target.get("sync_key") or board)
 
     def _heuristic_feature_request_intent(self, text: str) -> Optional[bool]:
         cleaned = re.sub(r"<@[!&]?\d+>", "", str(text or "")).strip()

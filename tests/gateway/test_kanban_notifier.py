@@ -24,6 +24,15 @@ class TypingAdapter:
         self.typing.append({"chat_id": chat_id, "metadata": metadata or {}})
 
 
+class FeatureSummarySyncAdapter:
+    def __init__(self):
+        self.synced = []
+
+    async def sync_kanban_feature_summary(self, target):
+        self.synced.append(dict(target))
+        return target.get("sync_key") or target.get("board")
+
+
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
 
@@ -147,6 +156,31 @@ def test_discord_kanban_typing_watcher_pulses_running_thread(tmp_path, monkeypat
             "metadata": {"thread_id": "99001"},
         }
     ]
+
+
+def test_discord_kanban_typing_watcher_syncs_feature_summary(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(
+        thread_id="99002",
+        goal="Sync the feature summary card",
+        chat_id="parent-991",
+    )
+
+    adapter = FeatureSummarySyncAdapter()
+    runner = _make_discord_runner(adapter)
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert len(adapter.synced) == 1
+    target = adapter.synced[0]
+    assert target["board"] == board.slug
+    assert target["thread_id"] == "99002"
+    assert target["state"] == "active"
+    assert target["fallback_title"] == "Sync the feature summary card"
+    assert target["outcome"]
+    assert target["sync_key"]
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):
