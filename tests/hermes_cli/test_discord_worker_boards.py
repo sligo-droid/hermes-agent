@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 
@@ -49,6 +50,62 @@ def test_set_goal_creates_planner_task_for_role_lane(monkeypatch, tmp_path):
     assert tasks[0].assignee == "planner"
     assert tasks[0].status == "ready"
     assert tasks[0].workspace_kind == "dir"
+
+
+def test_set_goal_preserves_nested_subgoal_text_for_planner(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    body = "/subgoal inspect logs\nThen implement the smallest fix"
+    board = dwb.set_goal(thread_id="779", goal=body, request_id="msg-779")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+
+    assert len(tasks) == 1
+    assert tasks[0].assignee == "planner"
+    assert tasks[0].created_by == "discord-goal"
+    payload = json.loads(tasks[0].body or "{}")
+    assert payload["request"] == body
+    assert "/subgoal inspect logs" in payload["request"]
+    assert payload["planner_instructions"]
+
+
+def test_feature_request_starts_distinct_planner_tickets(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_planner_request(
+        thread_id="780",
+        request="Build the drilldown page",
+        request_id="msg-a",
+    )
+    dwb.start_planner_request(
+        thread_id="780",
+        request="Also add CSV export",
+        request_id="msg-b",
+    )
+    dwb.start_planner_request(
+        thread_id="780",
+        request="Also add CSV export",
+        request_id="msg-b",
+    )
+
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+
+    assert [task.assignee for task in tasks] == ["planner", "planner"]
+    assert [json.loads(task.body or "{}")["request"] for task in tasks] == [
+        "Build the drilldown page",
+        "Also add CSV export",
+    ]
 
 
 def test_intake_board_reconcile_does_not_create_planner(monkeypatch, tmp_path):
@@ -224,6 +281,34 @@ def test_subgoal_remove_deactivates_and_archives_unstarted_task(monkeypatch, tmp
         conn.close()
     assert len(subgoal_tasks) == 1
     assert subgoal_tasks[0].status == "archived"
+
+
+def test_add_subgoal_activates_direct_dev_ticket_board(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.ensure_discord_thread_board(
+        thread_id="1001",
+        initial_request="/subgoal Add regression tests",
+    )
+    idx, text = dwb.add_subgoal(board.slug, "Add regression tests")
+
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+
+    meta = kanban_db.read_board_metadata(board.slug)
+    worker = meta["discord_worker"]
+    assert (idx, text) == (1, "Add regression tests")
+    assert worker["execution_mode"] == "kanban_pipeline"
+    assert worker["goal_status"] == "active"
+    assert worker["phase"] == "dev"
+    assert len(tasks) == 1
+    assert tasks[0].assignee == "dev"
+    assert tasks[0].created_by == "discord-subgoal"
 
 
 def test_dispatch_once_allows_explicit_role_lane_assignees(monkeypatch, tmp_path):
