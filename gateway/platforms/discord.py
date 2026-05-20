@@ -1543,6 +1543,16 @@ class DiscordAdapter(BasePlatformAdapter):
             )
         )
 
+    def _slash_command_starts_threaded_work(self, text: str) -> bool:
+        cleaned = str(text or "").strip()
+        if not cleaned.startswith("/"):
+            return False
+        command, _, args = cleaned[1:].partition(" ")
+        if command.lower() != "goal":
+            return False
+        lower_args = args.strip().lower()
+        return bool(lower_args and lower_args not in {"status", "pause", "resume", "clear", "stop", "done"})
+
     async def _classify_discord_feature_request(self, text: str) -> bool:
         if not str(text or "").strip():
             return False
@@ -6041,6 +6051,7 @@ class DiscordAdapter(BasePlatformAdapter):
         all_attachments = list(message.attachments) + snapshot_attachments
         message_is_voice = self._message_has_voice_flag(message)
         is_slash_command_message = normalized_content.startswith("/")
+        slash_command_starts_threaded_work = self._slash_command_starts_threaded_work(normalized_content)
         is_meeting_command_message = self._is_meeting_command_text(normalized_content)
         meeting_audio_attachments = [
             att for att in all_attachments
@@ -6132,7 +6143,7 @@ class DiscordAdapter(BasePlatformAdapter):
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
             has_discord_message_link = self._contains_discord_message_link(normalized_content)
             skip_thread = bool(channel_ids & no_thread_channels) or (
-                is_free_channel and not has_discord_message_link
+                is_free_channel and not has_discord_message_link and not slash_command_starts_threaded_work
             )
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
@@ -6141,7 +6152,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not skip_thread
                 and not is_voice_linked_channel
                 and not is_reply_message
-                and not is_slash_command_message
+                and (not is_slash_command_message or slash_command_starts_threaded_work)
             )
             if should_consider_auto_thread:
                 triage_text = normalized_content
@@ -6154,7 +6165,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     voice_feature_transcript = voice_triage_text
                 feature_request_intent = (
                     True
-                    if has_discord_message_link
+                    if has_discord_message_link or slash_command_starts_threaded_work
                     else await self._classify_discord_feature_request(triage_text)
                 )
                 direct_question_prompt = not feature_request_intent
