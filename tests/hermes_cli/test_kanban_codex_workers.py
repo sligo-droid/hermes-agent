@@ -155,6 +155,9 @@ def test_planner_schema_uses_parents_not_depends_on():
     schema = worker._schema_instructions(ROLE_PLANNER)
     assert '"parents"' in schema
     assert "depends_on" not in schema
+    assert "fewest coherent dev tickets" in schema
+    assert "Do not create standalone discovery, audit, polish, or verification tickets" in schema
+    assert "deduplicated canonical board-level list" in schema
 
 
 def test_run_codex_records_app_server_state(monkeypatch, tmp_path):
