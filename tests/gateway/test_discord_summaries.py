@@ -678,11 +678,20 @@ async def test_native_voice_feature_request_triages_from_transcript(adapter, mon
     mock_cache.assert_called_once_with(b"fake ogg", ext=".ogg")
     mock_transcribe.assert_called_once_with("/tmp/voice_from_read.ogg")
     adapter._auto_create_thread.assert_awaited_once_with(message)
-    assert len(thread.sent) == 1
+    assert len(thread.sent) == 2
+    assert thread.sent[1][0]["content"] == "> Build a deploy dashboard"
     event = adapter.handle_message.await_args.args[0]
     assert event.feature_summary["thread_id"] == "200"
     assert event.media_urls == ["/tmp/voice_from_read.ogg"]
     assert event.media_types == ["audio/ogg"]
+
+
+def test_feature_summary_transcript_quote_sanitizes_mass_mentions(adapter):
+    quote = adapter._format_feature_summary_transcript_quote(
+        "Please alert @everyone\nand @here"
+    )
+
+    assert quote == "> Please alert @\u200beveryone\n> and @\u200bhere"
 
 
 def test_failed_feature_summary_status_uses_red_cross(adapter):
