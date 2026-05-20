@@ -13,15 +13,26 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+def _string_attr(entry: Any, name: str) -> str:
+    value = getattr(entry, name, "")
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _entry_tokens(entry: Any) -> Optional[dict[str, str]]:
-    access_token = str(getattr(entry, "access_token", "") or "").strip()
-    refresh_token = str(getattr(entry, "refresh_token", "") or "").strip()
-    if not access_token or not refresh_token:
+    access_token = _string_attr(entry, "access_token")
+    refresh_token = _string_attr(entry, "refresh_token")
+    id_token = _string_attr(entry, "id_token")
+    if not access_token or not refresh_token or not id_token:
         return None
-    return {
+    tokens = {
         "access_token": access_token,
         "refresh_token": refresh_token,
+        "id_token": id_token,
     }
+    account_id = _string_attr(entry, "account_id")
+    if account_id:
+        tokens["account_id"] = account_id
+    return tokens
 
 
 def _entry_is_usable(entry: Any) -> bool:
@@ -80,15 +91,27 @@ def select_codex_worker_credential(parent_agent: Any = None) -> tuple[Any, Any]:
     return pool, None
 
 
-def _copy_codex_file_if_missing(codex_home: Path, name: str) -> None:
+def _copy_codex_file(codex_home: Path, name: str, *, overwrite: bool = False) -> None:
     source_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
     src = source_home / name
     dst = codex_home / name
-    if src.exists() and not dst.exists():
+    if src.exists() and (overwrite or not dst.exists()):
         try:
             shutil.copy2(src, dst)
         except OSError:
             pass
+
+
+def _codex_auth_has_id_token(codex_home: Path) -> bool:
+    auth_path = codex_home / "auth.json"
+    if not auth_path.is_file():
+        return False
+    try:
+        payload = json.loads(auth_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    return isinstance(tokens, dict) and bool(str(tokens.get("id_token", "") or "").strip())
 
 
 def _write_minimal_config(codex_home: Path) -> None:
@@ -157,9 +180,9 @@ def prepare_codex_worker_home(
             credential_id or "<unknown>",
         )
     else:
-        _copy_codex_file_if_missing(path, "auth.json")
+        _copy_codex_file(path, "auth.json", overwrite=not _codex_auth_has_id_token(path))
 
-    _copy_codex_file_if_missing(path, "credentials.json")
+    _copy_codex_file(path, "credentials.json")
     _write_minimal_config(path)
     return credential_id
 
@@ -183,7 +206,8 @@ def sync_codex_worker_home(
         return
     access_token = str(tokens.get("access_token", "") or "").strip()
     refresh_token = str(tokens.get("refresh_token", "") or "").strip()
-    if not access_token or not refresh_token:
+    id_token = str(tokens.get("id_token", "") or "").strip()
+    if not access_token or not refresh_token or not id_token:
         return
 
     try:
@@ -205,10 +229,16 @@ def sync_codex_worker_home(
                     and getattr(entry, "refresh_token", None) == refresh_token
                 ):
                     return
+                extra = dict(getattr(entry, "extra", {}) or {})
+                extra["id_token"] = id_token
+                account_id = str(tokens.get("account_id", "") or "").strip()
+                if account_id:
+                    extra["account_id"] = account_id
                 updated_entry = replace(
                     entry,
                     access_token=access_token,
                     refresh_token=refresh_token,
+                    extra=extra,
                     last_status=None,
                     last_status_at=None,
                     last_error_code=None,
