@@ -729,7 +729,7 @@ def _terminal_feed_lines(
     codex_log_lines = _codex_app_worker_log_lines(codex_state)
     if codex_log_lines:
         lines.append("")
-        lines.append("# codex app worker log")
+        lines.append(f"# {_worker_state_log_label(codex_state)}")
         lines.extend(codex_log_lines)
     return lines
 
@@ -767,23 +767,51 @@ def _public_worker_log_lines(log_text: Optional[str]) -> list[str]:
         if not line.strip():
             lines.append("")
             continue
-        if "spawning Codex role worker" in line:
-            prefix = line.split("spawning Codex role worker", 1)[0]
-            line = prefix + "spawning Codex role worker: [command hidden]"
+        for label in ("Codex", "OpenCode"):
+            marker = f"spawning {label} role worker"
+            if marker in line:
+                prefix = line.split(marker, 1)[0]
+                line = prefix + f"{marker}: [command hidden]"
+                break
         lines.append(_safe_terminal_text(line, max_chars=1200))
     return lines
+
+
+def _worker_state_backend(state: Optional[dict[str, Any]]) -> str:
+    if not isinstance(state, dict):
+        return "codex"
+    result = state.get("result") if isinstance(state.get("result"), dict) else {}
+    backend = str(result.get("backend") or "").strip().lower()
+    if backend in {"codex", "opencode"}:
+        return backend
+    events = state.get("events") if isinstance(state.get("events"), list) else []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        method = str(event.get("method") or "").strip().lower()
+        if method.startswith("opencode/"):
+            return "opencode"
+    return "codex"
+
+
+def _worker_state_log_label(state: Optional[dict[str, Any]]) -> str:
+    if _worker_state_backend(state) == "opencode":
+        return "opencode worker log"
+    return "codex app worker log"
 
 
 def _codex_app_worker_log_lines(state: Optional[dict[str, Any]]) -> list[str]:
     if not isinstance(state, dict) or not state:
         return []
     lines: list[str] = []
+    backend = _worker_state_backend(state)
+    backend_label = "opencode" if backend == "opencode" else "codex app"
     truncated = int(state.get("truncated_events") or 0)
     if truncated > 0:
-        lines.append(f"... {truncated} older codex app event(s) truncated by retention")
+        lines.append(f"... {truncated} older {backend_label} event(s) truncated by retention")
     events = state.get("events") if isinstance(state.get("events"), list) else []
     for event in events:
-        line = _codex_app_event_line(event)
+        line = _codex_app_event_line(event, backend=backend)
         if line:
             lines.append(line)
     result_line = _codex_app_result_line(state.get("result"))
@@ -792,7 +820,7 @@ def _codex_app_worker_log_lines(state: Optional[dict[str, Any]]) -> list[str]:
     return lines
 
 
-def _codex_app_event_line(event: Any) -> str:
+def _codex_app_event_line(event: Any, *, backend: str = "codex") -> str:
     if not isinstance(event, dict):
         return ""
     method = str(event.get("method") or "").strip()
@@ -804,7 +832,8 @@ def _codex_app_event_line(event: Any) -> str:
     item = params.get("item") if isinstance(params.get("item"), dict) else {}
     item_type = str(event.get("item_type") or item.get("type") or "").strip()
     item_label = item_type or _codex_method_item_label(method)
-    parts = [f"[{created}] codex {method}"]
+    backend_label = "opencode" if backend == "opencode" else "codex"
+    parts = [f"[{created}] {backend_label} {method}"]
     if item_label:
         parts.append(item_label)
 
@@ -888,7 +917,9 @@ def _codex_file_change_summary(item: dict[str, Any]) -> str:
 def _codex_app_result_line(result: Any) -> str:
     if not isinstance(result, dict):
         return ""
-    bits = ["codex result"]
+    backend = str(result.get("backend") or "codex").strip().lower()
+    label = "opencode" if backend == "opencode" else "codex"
+    bits = [f"{label} result"]
     if result.get("error"):
         bits.append(f"error={_safe_terminal_text(result.get('error'), max_chars=260)}")
     if result.get("interrupted"):

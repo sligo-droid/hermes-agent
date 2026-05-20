@@ -355,6 +355,55 @@ def run_opencode_task(
     return build
 
 
+def run_opencode_single_pass(
+    prompt: str,
+    workspace: str,
+    *,
+    timeout: float,
+    agent: str,
+    reasoning_level: str,
+    title: str = "",
+    config: Optional[dict[str, Any]] = None,
+    worker_config: Optional[dict[str, Any]] = None,
+    on_event: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> OpenCodeRunResult:
+    cfg = load_opencode_config(config, worker_config=worker_config)
+    selected_agent = str(agent or cfg["build_agent"]).strip() or cfg["build_agent"]
+    selected_reasoning = _normalize_reasoning_level(reasoning_level)
+    started = time.monotonic()
+    events: list[dict[str, Any]] = []
+
+    def _capture(event: dict[str, Any]) -> None:
+        events.append(event)
+        if on_event is not None:
+            on_event(event)
+
+    result = _run_opencode_once(
+        prompt=prompt,
+        workspace=workspace,
+        timeout=max(30.0, timeout),
+        cfg=cfg,
+        agent=selected_agent,
+        reasoning_level=selected_reasoning,
+        title=title,
+        on_event=_capture,
+    )
+    result.backend = BACKEND_OPENCODE
+    result.agents = [selected_agent]
+    if events:
+        result.events = events
+    result.tool_iterations = len(result.events)
+    result.duration_seconds = round(time.monotonic() - started, 2)
+    if result.error is None and not result.final_text.strip():
+        result.error = "OpenCode completed without producing final text."
+    if result.thread_id is None:
+        result.thread_id = _last_session_id(result.events)
+    result.turn_id = result.thread_id
+    result.stdout = result.stdout.strip()
+    result.stderr = result.stderr.strip()
+    return result
+
+
 def _run_opencode_once(
     *,
     prompt: str,

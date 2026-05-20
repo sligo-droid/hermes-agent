@@ -9,7 +9,9 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from hermes_cli.discord_worker_boards import ROLE_ASSIGNEES
+from hermes_cli.discord_worker_boards import ROLE_ASSIGNEES, ROLE_DEV, ROLE_PLANNER
+
+_OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV}
 
 _ROLE_DEFAULT_REASONING = {
     "planner": "high",
@@ -47,6 +49,12 @@ def _coding_backend(cfg: dict[str, Any]) -> str:
         return "codex"
 
 
+def _role_backend(role: str, configured_backend: str) -> str:
+    if configured_backend == "opencode" and role in _OPENCODE_ROLES:
+        return "opencode"
+    return "codex"
+
+
 def _role_runtime_settings(role: str, cfg: dict[str, Any]) -> dict[str, str]:
     roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
     role_cfg = roles.get(role) if isinstance(roles.get(role), dict) else {}
@@ -72,6 +80,36 @@ def _role_runtime_settings(role: str, cfg: dict[str, Any]) -> dict[str, str]:
     )
     tier = _normalize_service_tier(raw_tier)
     return {"reasoning": reasoning, "service_tier": tier, "mode": tier}
+
+
+def _role_log_settings(
+    role: str,
+    cfg: dict[str, Any],
+    *,
+    backend: str,
+    settings: dict[str, str],
+) -> dict[str, str]:
+    if backend != "opencode":
+        return settings
+    try:
+        from agent.opencode_worker import load_coding_worker_pass_config
+
+        pass_cfg = load_coding_worker_pass_config(worker_config=cfg)
+    except Exception:
+        return settings
+    if role == ROLE_PLANNER:
+        reasoning = pass_cfg["complex_plan_reasoning_level"]
+    else:
+        reasoning = (
+            f"simple={pass_cfg['simple_build_reasoning_level']},"
+            f"plan={pass_cfg['complex_plan_reasoning_level']},"
+            f"build={pass_cfg['complex_build_reasoning_level']}"
+        )
+    return {
+        "reasoning": reasoning,
+        "service_tier": settings.get("service_tier", "normal"),
+        "mode": settings.get("mode", "normal"),
+    }
 
 
 def _normalize_service_tier(value: Any) -> str:
@@ -103,8 +141,10 @@ def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None
     if role not in ROLE_ASSIGNEES:
         return None
     cfg = _worker_config()
-    backend = _coding_backend(cfg)
+    configured_backend = _coding_backend(cfg)
+    backend = _role_backend(role, configured_backend)
     settings = _role_runtime_settings(role, cfg)
+    log_settings = _role_log_settings(role, cfg, backend=backend, settings=settings)
     if backend == "opencode":
         try:
             from agent.opencode_worker import check_opencode_binary
@@ -120,8 +160,24 @@ def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None
             "set kanban.discord_worker.runner=host or coding_worker.backend=codex."
         )
     if _runner_kind(cfg) == "docker":
-        return _spawn_docker_worker(task, workspace, cfg=cfg, settings=settings, backend=backend, board=board)
-    return _spawn_host_worker(task, workspace, cfg=cfg, settings=settings, backend=backend, board=board)
+        return _spawn_docker_worker(
+            task,
+            workspace,
+            cfg=cfg,
+            settings=settings,
+            log_settings=log_settings,
+            backend=backend,
+            board=board,
+        )
+    return _spawn_host_worker(
+        task,
+        workspace,
+        cfg=cfg,
+        settings=settings,
+        log_settings=log_settings,
+        backend=backend,
+        board=board,
+    )
 
 
 def _spawn_host_worker(
@@ -130,14 +186,18 @@ def _spawn_host_worker(
     *,
     cfg: dict[str, Any],
     settings: dict[str, str],
+    log_settings: dict[str, str],
     backend: str,
     board: Optional[str],
 ) -> Optional[int]:
     workspace_path = Path(workspace).expanduser().resolve()
     workspace_path.mkdir(parents=True, exist_ok=True)
 
-    codex_home = _codex_home(task, cfg)
-    inherited_credential_id = _write_minimal_codex_home(codex_home)
+    codex_home = None
+    inherited_credential_id = None
+    if backend == "codex":
+        codex_home = _codex_home(task, cfg)
+        inherited_credential_id = _write_minimal_codex_home(codex_home)
 
     from hermes_cli import kanban_db
 
@@ -155,7 +215,6 @@ def _spawn_host_worker(
             "HERMES_CODEX_WORKER_REASONING": settings["reasoning"],
             "HERMES_CODEX_WORKER_SERVICE_TIER": settings["service_tier"],
             "HERMES_CODING_WORKER_BACKEND": backend,
-            "CODEX_HOME": str(codex_home),
             "PYTHONPATH": (
                 f"{_repo_root()}{os.pathsep}{existing_pythonpath}"
                 if existing_pythonpath else str(_repo_root())
@@ -166,6 +225,8 @@ def _spawn_host_worker(
         env["HERMES_KANBAN_CLAIM_LOCK"] = str(task.claim_lock)
     if getattr(task, "current_run_id", None) is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    if codex_home is not None:
+        env["CODEX_HOME"] = str(codex_home)
     if inherited_credential_id:
         env["HERMES_CODEX_WORKER_CREDENTIAL_ID"] = inherited_credential_id
     gh_config_dir = _github_cli_config_dir(env)
@@ -173,7 +234,15 @@ def _spawn_host_worker(
         env["GH_CONFIG_DIR"] = gh_config_dir
 
     cmd = [sys.executable, "-m", "hermes_cli.kanban_codex_worker"]
-    return _spawn_logged_process(task, cmd, str(workspace_path), env, settings=settings, backend=backend, board=board)
+    return _spawn_logged_process(
+        task,
+        cmd,
+        str(workspace_path),
+        env,
+        settings=log_settings,
+        backend=backend,
+        board=board,
+    )
 
 
 def _spawn_docker_worker(
@@ -182,6 +251,7 @@ def _spawn_docker_worker(
     *,
     cfg: dict[str, Any],
     settings: dict[str, str],
+    log_settings: dict[str, str],
     backend: str,
     board: Optional[str],
 ) -> Optional[int]:
@@ -252,7 +322,15 @@ def _spawn_docker_worker(
             cmd.extend(["-e", f"{key}={value}"])
     cmd.extend([image, "python", "-m", "hermes_cli.kanban_codex_worker"])
 
-    return _spawn_logged_process(task, cmd, str(workspace_path), env, settings=settings, backend=backend, board=board)
+    return _spawn_logged_process(
+        task,
+        cmd,
+        str(workspace_path),
+        env,
+        settings=log_settings,
+        backend=backend,
+        board=board,
+    )
 
 
 def _codex_home(task: Any, cfg: dict[str, Any]) -> Path:

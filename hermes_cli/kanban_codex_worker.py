@@ -19,6 +19,8 @@ from hermes_cli.discord_worker_boards import (
     record_codex_worker_result,
 )
 
+_OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV}
+
 
 def main() -> int:
     task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
@@ -112,9 +114,13 @@ def _configured_backend() -> str:
 
 
 def _backend_label(role: str) -> str:
-    if role == ROLE_DEV and _configured_backend() == "opencode":
+    if _role_uses_opencode(role):
         return "OpenCode"
     return "Codex"
+
+
+def _role_uses_opencode(role: str) -> bool:
+    return role in _OPENCODE_ROLES and _configured_backend() == "opencode"
 
 
 def _run_role_backend(
@@ -126,7 +132,7 @@ def _run_role_backend(
     task_id: str,
     board: Optional[str],
 ):
-    if role == ROLE_DEV and _configured_backend() == "opencode":
+    if _role_uses_opencode(role):
         return _run_opencode(prompt, workspace, role, task=task, task_id=task_id, board=board)
     return _run_codex(prompt, workspace, role, task_id=task_id, board=board)
 
@@ -199,7 +205,11 @@ def _run_opencode(
         except Exception:
             pass
 
-    from agent.opencode_worker import run_opencode_task
+    from agent.opencode_worker import (
+        load_opencode_config,
+        run_opencode_single_pass,
+        run_opencode_task,
+    )
 
     context = "\n".join(
         str(part or "")
@@ -209,14 +219,26 @@ def _run_opencode(
             prompt,
         )
     )
-    result = run_opencode_task(
-        prompt,
-        workspace,
-        timeout=_role_timeout(role),
-        context_for_classification=context,
-        title=f"kanban {task_id}",
-        on_event=on_event,
-    )
+    if role == ROLE_PLANNER:
+        cfg = load_opencode_config()
+        result = run_opencode_single_pass(
+            prompt,
+            workspace,
+            timeout=_role_timeout(role),
+            agent=cfg["plan_agent"],
+            reasoning_level=cfg["complex_plan_reasoning_level"],
+            title=f"kanban {task_id}",
+            on_event=on_event,
+        )
+    else:
+        result = run_opencode_task(
+            prompt,
+            workspace,
+            timeout=_role_timeout(role),
+            context_for_classification=context,
+            title=f"kanban {task_id}",
+            on_event=on_event,
+        )
     try:
         record_codex_worker_result(task_id, board=board, result=result)
     except Exception:
