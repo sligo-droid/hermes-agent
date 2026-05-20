@@ -12,6 +12,7 @@ from tools import coding_worker_tool as cwt
 
 class FakeSession:
     instances = []
+    results = []
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -27,6 +28,8 @@ class FakeSession:
 
     def run_turn(self, **kwargs):
         self.run_calls.append(kwargs)
+        if FakeSession.results:
+            return FakeSession.results.pop(0)
         return TurnResult(
             final_text="Changed src/app.py and ran pytest.",
             thread_id="thread-1",
@@ -60,6 +63,7 @@ def test_unavailable_inside_codex_app_server(tmp_path):
 
 def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     FakeSession.instances = []
+    FakeSession.results = []
     monkeypatch.setattr(
         "agent.transports.codex_app_server_session.CodexAppServerSession",
         FakeSession,
@@ -78,10 +82,104 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     assert result["summary"] == "Changed src/app.py and ran pytest."
     assert result["cwd"] == str(tmp_path)
     assert FakeSession.instances[0].kwargs["cwd"] == str(tmp_path)
+    assert FakeSession.instances[0].kwargs["extra_args"] == [
+        "-c",
+        'model_reasoning_effort="high"',
+    ]
     assert FakeSession.instances[0].run_calls[0]["turn_timeout"] == 123.0
     prompt = FakeSession.instances[0].run_calls[0]["user_input"]
     assert "fix the parser" in prompt
     assert "focus on src/parser.py" in prompt
+    assert result["agents"] == ["build"]
+    assert result["plan_used"] is False
+
+
+def test_codex_backend_runs_plan_then_build_for_complex_task(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = [
+        TurnResult(
+            final_text="Plan: inspect auth boundary, patch parser, run tests.",
+            thread_id="thread-plan",
+            turn_id="turn-plan",
+            tool_iterations=1,
+        ),
+        TurnResult(
+            final_text="Implemented the auth fix and ran pytest.",
+            thread_id="thread-build",
+            turn_id="turn-build",
+            tool_iterations=3,
+        ),
+    ]
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix production auth race",
+            context="focus on src/auth.py",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert result["backend"] == "codex"
+    assert result["agents"] == ["plan", "build"]
+    assert result["plan_used"] is True
+    assert result["summary"] == "Implemented the auth fix and ran pytest."
+    assert result["thread_id"] == "thread-build"
+    assert result["tool_iterations"] == 4
+    assert FakeSession.instances[0].kwargs["extra_args"] == [
+        "-c",
+        'model_reasoning_effort="xhigh"',
+    ]
+    assert FakeSession.instances[1].kwargs["extra_args"] == [
+        "-c",
+        'model_reasoning_effort="medium"',
+    ]
+    assert "Do not edit repository files" in FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "Codex plan to follow:" in FakeSession.instances[1].run_calls[0]["user_input"]
+
+
+def test_codex_backend_uses_configured_reasoning_levels(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    FakeSession.instances = []
+    FakeSession.results = [
+        TurnResult(final_text="Plan", thread_id="thread-plan", turn_id="turn-plan"),
+        TurnResult(final_text="Built", thread_id="thread-build", turn_id="turn-build"),
+    ]
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    monkeypatch.setattr(
+        ow,
+        "load_coding_worker_pass_config",
+        lambda: {
+            "simple_build_reasoning_level": "low",
+            "complex_plan_reasoning_level": "max",
+            "complex_build_reasoning_level": "high",
+        },
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix production auth race",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert FakeSession.instances[0].kwargs["extra_args"] == [
+        "-c",
+        'model_reasoning_effort="max"',
+    ]
+    assert FakeSession.instances[1].kwargs["extra_args"] == [
+        "-c",
+        'model_reasoning_effort="high"',
+    ]
 
 
 def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
@@ -122,6 +220,7 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
 
 def test_runs_with_available_codex_pool_credential(monkeypatch, tmp_path):
     FakeSession.instances = []
+    FakeSession.results = []
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir()
     (hermes_home / "auth.json").write_text(

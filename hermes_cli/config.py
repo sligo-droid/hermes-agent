@@ -1281,14 +1281,14 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "backend": "codex",  # codex | opencode
         "turn_timeout_seconds": 1800,
+        "simple_build_reasoning_level": "high",
+        "complex_plan_reasoning_level": "xhigh",
+        "complex_build_reasoning_level": "medium",
         "opencode": {
             "binary": "opencode",
             "model": "",
             "plan_agent": "plan",
             "build_agent": "build",
-            "simple_build_reasoning_level": "high",
-            "complex_plan_reasoning_level": "xhigh",
-            "complex_build_reasoning_level": "medium",
             "dangerously_skip_permissions": False,
         },
     },

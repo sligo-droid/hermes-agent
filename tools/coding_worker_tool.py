@@ -47,6 +47,13 @@ def _load_coding_worker_timeout() -> float:
     return max(30.0, timeout)
 
 
+def _codex_reasoning_args(reasoning_level: str) -> list[str]:
+    level = str(reasoning_level or "").strip().lower()
+    if not level:
+        return []
+    return ["-c", f'model_reasoning_effort="{level}"']
+
+
 def _resolve_cwd(cwd: Optional[str], parent_agent: Any) -> str:
     raw = cwd or getattr(parent_agent, "session_cwd", None) or os.getcwd()
     path = Path(str(raw)).expanduser()
@@ -110,6 +117,8 @@ def delegate_coding_task(
         worker_prompt_parts.extend(["", "Context from Hermes:", str(context).strip()])
     worker_prompt = "\n".join(worker_prompt_parts)
 
+    classification_context = f"{task_text}\n{context or ''}"
+
     if backend == BACKEND_OPENCODE:
         try:
             from agent.opencode_worker import run_opencode_task
@@ -121,7 +130,7 @@ def delegate_coding_task(
             worker_prompt,
             workdir,
             timeout=timeout,
-            context_for_classification=f"{task_text}\n{context or ''}",
+            context_for_classification=classification_context,
             title="Hermes delegated coding task",
         )
         duration = round(time.monotonic() - started, 2)
@@ -146,6 +155,11 @@ def delegate_coding_task(
         )
 
     try:
+        from agent.opencode_worker import (
+            _plan_prompt,
+            load_coding_worker_pass_config,
+            looks_complex_or_risky,
+        )
         from agent.transports.codex_app_server_session import CodexAppServerSession
     except Exception as exc:
         return tool_error(f"could not import Codex app-server session: {exc}")
@@ -187,17 +201,78 @@ def delegate_coding_task(
             pass
 
     started = time.monotonic()
+    needs_plan = looks_complex_or_risky(worker_prompt, classification_context)
+    agents: list[str] = []
+    plan_text = ""
+    turns = []
+
     try:
+        pass_cfg = load_coding_worker_pass_config()
+
+        if needs_plan:
+            agents.append("plan")
+            with CodexAppServerSession(
+                cwd=workdir,
+                codex_home=str(codex_home) if codex_home is not None else None,
+                extra_args=_codex_reasoning_args(
+                    pass_cfg["complex_plan_reasoning_level"]
+                ),
+                approval_callback=approval_callback,
+                on_event=_touch_codex_activity,
+            ) as session:
+                plan_turn = session.run_turn(
+                    user_input=_plan_prompt(worker_prompt),
+                    turn_timeout=timeout,
+                )
+            turns.append(plan_turn)
+            if plan_turn.error or plan_turn.interrupted:
+                duration = round(time.monotonic() - started, 2)
+                return json.dumps(
+                    {
+                        "success": False,
+                        "status": "partial",
+                        "summary": plan_turn.final_text,
+                        "error": plan_turn.error,
+                        "interrupted": plan_turn.interrupted,
+                        "duration_seconds": duration,
+                        "cwd": workdir,
+                        "backend": "codex",
+                        "agents": agents,
+                        "plan_used": True,
+                        "thread_id": plan_turn.thread_id,
+                        "turn_id": plan_turn.turn_id,
+                        "tool_iterations": plan_turn.tool_iterations,
+                        "projected_message_count": len(plan_turn.projected_messages),
+                    },
+                    ensure_ascii=False,
+                )
+            plan_text = plan_turn.final_text.strip()
+
+        agents.append("build")
+        build_prompt = worker_prompt
+        if plan_text:
+            build_prompt = (
+                f"{worker_prompt.rstrip()}\n\n"
+                "Codex plan to follow:\n"
+                f"{plan_text}\n"
+            )
+        reasoning_level = (
+            pass_cfg["complex_build_reasoning_level"]
+            if needs_plan
+            else pass_cfg["simple_build_reasoning_level"]
+        )
         with CodexAppServerSession(
             cwd=workdir,
             codex_home=str(codex_home) if codex_home is not None else None,
+            extra_args=_codex_reasoning_args(reasoning_level),
             approval_callback=approval_callback,
             on_event=_touch_codex_activity,
         ) as session:
             turn = session.run_turn(
-                user_input=worker_prompt,
+                user_input=build_prompt,
                 turn_timeout=timeout,
             )
+        turns.append(turn)
     finally:
         if codex_home is not None and inherited_credential_id:
             try:
@@ -209,6 +284,10 @@ def delegate_coding_task(
 
     duration = round(time.monotonic() - started, 2)
     success = bool(turn.final_text) and not turn.error and not turn.interrupted
+    tool_iterations = sum(getattr(item, "tool_iterations", 0) or 0 for item in turns)
+    projected_message_count = sum(
+        len(getattr(item, "projected_messages", []) or []) for item in turns
+    )
     return json.dumps(
         {
             "success": success,
@@ -219,10 +298,12 @@ def delegate_coding_task(
             "duration_seconds": duration,
             "cwd": workdir,
             "backend": "codex",
+            "agents": agents,
+            "plan_used": bool(plan_text),
             "thread_id": turn.thread_id,
             "turn_id": turn.turn_id,
-            "tool_iterations": turn.tool_iterations,
-            "projected_message_count": len(turn.projected_messages),
+            "tool_iterations": tool_iterations,
+            "projected_message_count": projected_message_count,
         },
         ensure_ascii=False,
     )
