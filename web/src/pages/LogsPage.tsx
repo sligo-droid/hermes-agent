@@ -18,7 +18,7 @@ import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 
-const FILES = ["agent", "errors", "gateway"] as const;
+const FILES = ["live", "workers", "gateway", "agent", "errors"] as const;
 const LEVELS = ["ALL", "DEBUG", "INFO", "WARNING", "ERROR"] as const;
 const COMPONENTS = ["all", "gateway", "agent", "tools", "cli", "cron"] as const;
 const LINE_COUNTS = [50, 100, 200, 500] as const;
@@ -53,7 +53,7 @@ const segmentedClass =
   "w-fit max-w-full flex-wrap justify-start self-start";
 
 export default function LogsPage() {
-  const [file, setFile] = useState<(typeof FILES)[number]>("agent");
+  const [file, setFile] = useState<(typeof FILES)[number]>("live");
   const [level, setLevel] = useState<(typeof LEVELS)[number]>("ALL");
   const [component, setComponent] =
     useState<(typeof COMPONENTS)[number]>("all");
@@ -65,12 +65,17 @@ export default function LogsPage() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const { t } = useI18n();
   const { setAfterTitle, setEnd } = usePageHeader();
+  const isVirtualLog = file === "live" || file === "workers";
 
   const fetchLogs = useCallback(() => {
     setLoading(true);
     setError(null);
     api
-      .getLogs({ file, lines: lineCount, level, component })
+      .getLogs(
+        isVirtualLog
+          ? { file, lines: lineCount }
+          : { file, lines: lineCount, level, component },
+      )
       .then((resp) => {
         setLines(resp.lines);
         setTimeout(() => {
@@ -81,14 +86,14 @@ export default function LogsPage() {
       })
       .catch((err) => setError(String(err)))
       .finally(() => setLoading(false));
-  }, [file, lineCount, level, component]);
+  }, [component, file, isVirtualLog, level, lineCount]);
 
   useLayoutEffect(() => {
     setAfterTitle(
       <span className="flex items-center gap-2">
         {loading && <Spinner className="shrink-0 text-base text-primary" />}
         <Badge tone="secondary" className="text-[10px]">
-          {file} · {level} · {component}
+          {isVirtualLog ? file : `${file} · ${level} · ${component}`}
         </Badge>
       </span>,
     );
@@ -130,6 +135,7 @@ export default function LogsPage() {
     autoRefresh,
     component,
     file,
+    isVirtualLog,
     level,
     loading,
     setAfterTitle,
@@ -167,23 +173,27 @@ export default function LogsPage() {
           />
         </FilterGroup>
 
-        <FilterGroup label={t.logs.level} className={filterGroupClass}>
-          <Segmented
-            className={segmentedClass}
-            value={level}
-            onChange={setLevel}
-            options={toOptions(LEVELS)}
-          />
-        </FilterGroup>
+        {!isVirtualLog && (
+          <FilterGroup label={t.logs.level} className={filterGroupClass}>
+            <Segmented
+              className={segmentedClass}
+              value={level}
+              onChange={setLevel}
+              options={toOptions(LEVELS)}
+            />
+          </FilterGroup>
+        )}
 
-        <FilterGroup label={t.logs.component} className={filterGroupClass}>
-          <Segmented
-            className={segmentedClass}
-            value={component}
-            onChange={setComponent}
-            options={toOptions(COMPONENTS)}
-          />
-        </FilterGroup>
+        {!isVirtualLog && (
+          <FilterGroup label={t.logs.component} className={filterGroupClass}>
+            <Segmented
+              className={segmentedClass}
+              value={component}
+              onChange={setComponent}
+              options={toOptions(COMPONENTS)}
+            />
+          </FilterGroup>
+        )}
 
         <FilterGroup label={t.logs.lines} className={filterGroupClass}>
           <Segmented
@@ -204,7 +214,7 @@ export default function LogsPage() {
         <CardHeader className="py-3 px-4">
           <CardTitle className="text-sm flex items-center gap-2">
             <FileText className="h-4 w-4" />
-            {file}.log
+            {isVirtualLog ? file : `${file}.log`}
           </CardTitle>
         </CardHeader>
         <CardContent className="p-0">

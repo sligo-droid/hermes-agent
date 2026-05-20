@@ -603,6 +603,102 @@ class TestNewEndpoints:
         assert "lines" in data
         assert isinstance(data["lines"], list)
 
+    def test_get_logs_live_includes_gateway_and_active_worker_without_filters(self):
+        from hermes_constants import get_hermes_home
+        from hermes_cli import kanban_db as kb
+
+        logs_dir = get_hermes_home() / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        (logs_dir / "gateway.log").write_text(
+            "2026-05-20 00:00:00 INFO gateway.run: gateway visible\n",
+            encoding="utf-8",
+        )
+
+        conn = kb.connect()
+        try:
+            task_id = kb.create_task(conn, title="live worker", assignee="alice")
+            conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, status, worker_pid, started_at) "
+                "VALUES (?, 'running', ?, ?)",
+                (task_id, 12345, 1),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        worker_log = kb.worker_log_path(task_id, board="default")
+        worker_log.parent.mkdir(parents=True, exist_ok=True)
+        worker_log.write_text("worker visible\n", encoding="utf-8")
+
+        resp = self.client.get(
+            "/api/logs?file=live&lines=5&level=ERROR&component=agent",
+        )
+        assert resp.status_code == 200
+        body = "\n".join(resp.json()["lines"])
+        assert "gateway visible" in body
+        assert "worker visible" in body
+        assert f"task={task_id}" in body
+
+    def test_get_logs_workers_includes_all_active_boards(self):
+        from hermes_cli import kanban_db as kb
+
+        def _active_worker(board, title, pid, content):
+            kb.create_board(board)
+            conn = kb.connect(board=board)
+            try:
+                task_id = kb.create_task(conn, title=title, assignee="worker")
+                conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+                conn.execute(
+                    "INSERT INTO task_runs "
+                    "(task_id, status, worker_pid, started_at) "
+                    "VALUES (?, 'running', ?, ?)",
+                    (task_id, pid, pid),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            log_path = kb.worker_log_path(task_id, board=board)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(content, encoding="utf-8")
+            return task_id
+
+        default_task = _active_worker("default", "default board", 11111, "default worker\n")
+        other_task = _active_worker("other", "other board", 22222, "other worker\n")
+
+        resp = self.client.get("/api/logs?file=workers&lines=10")
+        assert resp.status_code == 200
+        body = "\n".join(resp.json()["lines"])
+        assert "board=default" in body
+        assert f"task={default_task}" in body
+        assert "default worker" in body
+        assert "board=other" in body
+        assert f"task={other_task}" in body
+        assert "other worker" in body
+
+    def test_get_logs_workers_missing_log_file_is_visible(self):
+        from hermes_cli import kanban_db as kb
+
+        conn = kb.connect()
+        try:
+            task_id = kb.create_task(conn, title="missing log", assignee="worker")
+            conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, status, worker_pid, started_at) "
+                "VALUES (?, 'running', 33333, 1)",
+                (task_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        resp = self.client.get("/api/logs?file=workers&lines=10")
+        assert resp.status_code == 200
+        body = "\n".join(resp.json()["lines"])
+        assert f"task={task_id}" in body
+        assert "(no worker log file yet)" in body
+
     def test_get_logs_invalid_file(self):
         resp = self.client.get("/api/logs?file=nonexistent")
         assert resp.status_code == 400

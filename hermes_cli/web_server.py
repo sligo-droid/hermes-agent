@@ -2656,15 +2656,22 @@ async def delete_session_endpoint(session_id: str):
 # Log viewer endpoint
 # ---------------------------------------------------------------------------
 
+_WORKER_LOG_TAIL_BYTES = 100_000
 
-@app.get("/api/logs")
-async def get_logs(
-    file: str = "agent",
-    lines: int = 100,
-    level: Optional[str] = None,
-    component: Optional[str] = None,
-    search: Optional[str] = None,
-):
+
+def _bounded_log_lines(value: int) -> int:
+    """Clamp dashboard log line counts to the range the UI exposes."""
+    return max(1, min(value, 500))
+
+
+def _read_standard_log_lines(
+    *,
+    file: str,
+    lines: int,
+    level: Optional[str],
+    component: Optional[str],
+    search: Optional[str],
+) -> List[str]:
     from hermes_cli.logs import _read_tail, LOG_FILES
 
     log_name = LOG_FILES.get(file)
@@ -2672,7 +2679,7 @@ async def get_logs(
         raise HTTPException(status_code=400, detail=f"Unknown log file: {file}")
     log_path = get_hermes_home() / "logs" / log_name
     if not log_path.exists():
-        return {"file": file, "lines": []}
+        return []
 
     try:
         from hermes_logging import COMPONENT_PREFIXES
@@ -2696,7 +2703,7 @@ async def get_logs(
 
     has_filters = bool(min_level or comp_prefixes or search)
     result = _read_tail(
-        log_path, min(lines, 500) if not search else 2000,
+        log_path, _bounded_log_lines(lines) if not search else 2000,
         has_filters=has_filters,
         min_level=min_level,
         component_prefixes=comp_prefixes,
@@ -2706,8 +2713,126 @@ async def get_logs(
     # trim to the requested line count afterward.
     if search:
         needle = search.lower()
-        result = [l for l in result if needle in l.lower()][-min(lines, 500):]
-    return {"file": file, "lines": result}
+        result = [l for l in result if needle in l.lower()][-_bounded_log_lines(lines):]
+    return result
+
+
+def _active_worker_log_lines(*, lines_per_source: int) -> List[str]:
+    """Return active Kanban worker log blocks across all non-archived boards."""
+    try:
+        from hermes_cli import kanban_db
+    except Exception as exc:
+        return [f"--- workers unavailable: {exc} ---\n"]
+
+    try:
+        boards = kanban_db.list_boards(include_archived=False)
+    except Exception as exc:
+        return [f"--- workers unavailable: failed to list boards: {exc} ---\n"]
+
+    out: List[str] = []
+    per_worker_lines = _bounded_log_lines(lines_per_source)
+    for board_meta in boards:
+        board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
+        conn = None
+        try:
+            conn = kanban_db.connect(board=board)
+            rows = conn.execute(
+                """
+                SELECT
+                    r.id AS run_id,
+                    r.task_id,
+                    r.profile,
+                    r.worker_pid,
+                    r.started_at,
+                    t.title AS task_title,
+                    t.assignee AS task_assignee
+                FROM task_runs r
+                JOIN tasks t ON t.id = r.task_id
+                WHERE r.ended_at IS NULL
+                  AND r.worker_pid IS NOT NULL
+                  AND t.status = 'running'
+                ORDER BY r.started_at ASC, r.id ASC
+                """
+            ).fetchall()
+        except Exception as exc:
+            out.append(f"--- worker board={board} unavailable: {exc} ---\n")
+            continue
+        finally:
+            if conn is not None:
+                conn.close()
+
+        for row in rows:
+            task_id = row["task_id"]
+            title = str(row["task_title"] or "").replace("\n", " ").strip()
+            assignee = row["task_assignee"] or row["profile"] or "unknown"
+            out.append(
+                "--- worker "
+                f"board={board} task={task_id} run={row['run_id']} "
+                f"pid={row['worker_pid']} assignee={assignee} title={title} ---\n"
+            )
+            content = kanban_db.read_worker_log(
+                task_id,
+                tail_bytes=_WORKER_LOG_TAIL_BYTES,
+                board=board,
+            )
+            if content is None:
+                out.append("(no worker log file yet)\n")
+                continue
+            worker_lines = content.splitlines(keepends=True)
+            if not worker_lines:
+                out.append("(worker log is empty)\n")
+                continue
+            out.extend(worker_lines[-per_worker_lines:])
+    return out
+
+
+def _read_virtual_log_lines(file: str, *, lines: int) -> Optional[List[str]]:
+    if file == "workers":
+        return _active_worker_log_lines(lines_per_source=lines)
+    if file != "live":
+        return None
+
+    out = ["--- gateway.log ---\n"]
+    out.extend(
+        _read_standard_log_lines(
+            file="gateway",
+            lines=lines,
+            level=None,
+            component=None,
+            search=None,
+        )
+    )
+    out.append("--- active workers ---\n")
+    worker_lines = _active_worker_log_lines(lines_per_source=lines)
+    if worker_lines:
+        out.extend(worker_lines)
+    else:
+        out.append("(no active worker logs)\n")
+    return out
+
+
+@app.get("/api/logs")
+async def get_logs(
+    file: str = "agent",
+    lines: int = 100,
+    level: Optional[str] = None,
+    component: Optional[str] = None,
+    search: Optional[str] = None,
+):
+    virtual_lines = _read_virtual_log_lines(file, lines=lines)
+    if virtual_lines is not None:
+        return {"file": file, "lines": virtual_lines}
+
+    return {
+        "file": file,
+        "lines": _read_standard_log_lines(
+            file=file,
+            lines=lines,
+            level=level,
+            component=component,
+            search=search,
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
