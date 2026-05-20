@@ -13,6 +13,10 @@ There are two distinct ways Docker intersects with Hermes Agent:
 
 This page covers option 1. The container stores all user data (config, API keys, sessions, skills, memories) in a single directory mounted from the host at `/opt/data`. The image itself is stateless and can be upgraded by pulling a new version without losing any configuration.
 
+:::warning
+The `docker-compose.yml` in the Hermes source checkout is intentionally inert. Do not run `docker compose up` from the repository root to deploy Hermes; host installs should use the native service, and Docker deployments should use an explicit compose file outside the checkout.
+:::
+
 ## Quick start
 
 If this is your first time running Hermes Agent, create a data directory on the host and start the container interactively to run the setup wizard:
@@ -200,9 +204,9 @@ Direct `-e` flags override values from `.env`. This is useful for CI/CD or secre
 This page covers running Hermes itself inside Docker. If you want Hermes to execute the agent's `terminal` / `execute_code` calls inside a Docker sandbox container (one persistent container per Hermes process), that's a separate config block — `terminal.backend: docker` plus `terminal.docker_image`, `terminal.docker_volumes`, `terminal.docker_forward_env`, `terminal.docker_run_as_host_user`, and `terminal.docker_extra_args`. See [Configuration → Docker Backend](configuration.md#docker-backend) for the full set.
 :::
 
-## Docker Compose example
+## External Docker Compose example
 
-For persistent deployment with both the gateway and dashboard, a `docker-compose.yaml` is convenient:
+The source checkout no longer ships an active Compose deployment because it is too easy to start accidentally on host-based installs. If you intentionally run Hermes in Docker, keep a deployment-specific `docker-compose.yaml` outside the repo checkout:
 
 ```yaml
 services:
@@ -229,7 +233,7 @@ services:
           cpus: "2.0"
 ```
 
-Start with `docker compose up -d` and view logs with `docker compose logs -f`. Dashboard output is prefixed with `[dashboard]` so it's easy to filter from gateway logs.
+Start that external stack with `docker compose up -d` from its own directory and view logs with `docker compose logs -f`. Dashboard output is prefixed with `[dashboard]` so it's easy to filter from gateway logs.
 
 ## Resource limits
 
@@ -293,7 +297,7 @@ docker run -d \
   nousresearch/hermes-agent gateway run
 ```
 
-Or with Docker Compose:
+If you maintain your own Docker Compose deployment, pull and recreate that stack from the directory containing your deployment-specific compose file:
 
 ```sh
 docker compose pull
