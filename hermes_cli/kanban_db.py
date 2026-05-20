@@ -3560,6 +3560,11 @@ _RESPAWN_BLOCKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Within this window a quota/auth failure is treated as a temporary blocker.
+# After it expires, the dispatcher retries so the normal failure counter can
+# either recover or trip the gave_up circuit breaker.
+_RESPAWN_GUARD_AUTH_WINDOW = 5 * 60  # 5 minutes
+
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
@@ -3569,6 +3574,12 @@ _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 # Pattern matching a GitHub PR URL in task comments.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
+    re.IGNORECASE,
+)
+
+_LOCAL_PERMISSION_FAILURE_RE = re.compile(
+    r"(\berrno\s+13\b|workspace:\s*\[errno\s+13\]|"
+    r"permission denied:\s*['\"]?[/~A-Za-z])",
     re.IGNORECASE,
 )
 
@@ -3603,7 +3614,7 @@ class DispatchResult:
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
-    Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
+    Reasons: ``"blocker_auth"`` (quota/auth error — temporarily guarded),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
 
@@ -4481,12 +4492,14 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     ``"blocker_auth"``
         The task's last failure error matches a quota / authentication
         pattern. Retrying immediately is unlikely to help (rate limits
-        reset on a timer; auth needs human action), so we defer to the
-        next tick. The existing ``consecutive_failures`` counter still
-        trips the auto-block circuit breaker after ``failure_limit``
-        consecutive failures, so a persistent auth error eventually
-        blocks via the normal path — but a transient 429 gets a few
-        ticks of recovery first.
+        reset on a timer; auth needs human action), so we defer briefly.
+        Once the cooldown expires, the existing
+        ``consecutive_failures`` counter still trips the auto-block
+        circuit breaker after ``failure_limit`` consecutive failures,
+        so a persistent auth error eventually blocks via the normal
+        path — but a transient 429 gets a few ticks of recovery first.
+        Local filesystem permission failures are not auth blockers and
+        must not be guarded forever.
 
     ``"recent_success"``
         A completed run exists within ``_RESPAWN_GUARD_SUCCESS_WINDOW``
@@ -4512,8 +4525,17 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     # 1. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
-    if err and _RESPAWN_BLOCKER_RE.search(err):
-        return "blocker_auth"
+    if (
+        err
+        and _RESPAWN_BLOCKER_RE.search(err)
+        and not _is_local_permission_failure(err)
+    ):
+        failure_at = _last_failure_at(conn, task_id)
+        if (
+            failure_at is None
+            or int(time.time()) - failure_at < _RESPAWN_GUARD_AUTH_WINDOW
+        ):
+            return "blocker_auth"
 
     now = int(time.time())
 
@@ -4536,6 +4558,29 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "active_pr"
 
     return None
+
+
+def _is_local_permission_failure(error: str) -> bool:
+    """True for filesystem/workspace permission failures, not provider auth."""
+    return bool(_LOCAL_PERMISSION_FAILURE_RE.search(str(error or "")))
+
+
+def _last_failure_at(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """Return the latest non-success run end time for ``task_id``."""
+    row = conn.execute(
+        "SELECT ended_at FROM task_runs "
+        "WHERE task_id = ? "
+        "  AND ended_at IS NOT NULL "
+        "  AND outcome IN ('spawn_failed', 'crashed', 'timed_out', 'gave_up') "
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["ended_at"] is None:
+        return None
+    try:
+        return int(row["ended_at"])
+    except (TypeError, ValueError):
+        return None
 
 
 def has_spawnable_ready(
@@ -4781,10 +4826,17 @@ def dispatch_once(
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
             if not dry_run:
+                payload = {"reason": guard_reason}
+                if guard_reason == "blocker_auth":
+                    failure_at = _last_failure_at(conn, row["id"])
+                    payload["cooldown_seconds"] = _RESPAWN_GUARD_AUTH_WINDOW
+                    if failure_at is not None:
+                        payload["failure_at"] = failure_at
+                        payload["guard_until"] = failure_at + _RESPAWN_GUARD_AUTH_WINDOW
                 with write_txn(conn):
                     _append_event(
                         conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
+                        payload,
                     )
             continue
         if dry_run:
