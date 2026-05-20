@@ -149,6 +149,118 @@ async def test_mentioned_meeting_command_with_audio_canonicalizes_after_mention_
 
 
 @pytest.mark.asyncio
+async def test_mentioned_audio_without_meeting_command_triggers_meeting_intake(adapter, monkeypatch):
+    import discord
+
+    captured = []
+
+    async def fake_cache(att, ext):
+        assert att.filename == "meeting.ogg"
+        assert ext == ".ogg"
+        return "/tmp/uploaded-meeting.ogg"
+
+    async def fake_handle(event):
+        captured.append(event)
+
+    monkeypatch.setattr(adapter, "_cache_discord_audio", fake_cache)
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    classifier = AsyncMock(return_value=False)
+    monkeypatch.setattr(adapter, "_classify_discord_feature_request", classifier)
+    feature_summary = AsyncMock()
+    feature_summary.return_value = {"thread_id": "778", "message_id": "summary-2"}
+    monkeypatch.setattr(adapter, "initialize_feature_summary", feature_summary)
+
+    guild = SimpleNamespace(id=42, name="Guild")
+    channel = SimpleNamespace(id=12345, name="general", guild=guild)
+    thread = SimpleNamespace(id=778, name="Meeting notes — 2026-05-19 — client kickoff", parent=channel, guild=guild)
+    create_thread = AsyncMock(return_value=thread)
+    bot_user = adapter._client.user
+    message = SimpleNamespace(
+        id=558,
+        content=f"<@{bot_user.id}> client kickoff",
+        clean_content="@Sligo Labs client kickoff",
+        type=discord.MessageType.default,
+        channel=channel,
+        author=SimpleNamespace(id=100200300, display_name="tbrent", name="tbrent", bot=False),
+        mentions=[bot_user],
+        attachments=[SimpleNamespace(filename="meeting.ogg", content_type="audio/ogg", url="https://cdn.discordapp.example/meeting.ogg", size=123)],
+        message_snapshots=[],
+        flags=SimpleNamespace(value=0, voice=False),
+        guild=guild,
+        created_at=datetime(2026, 5, 19, 4, 0, 0),
+        reference=None,
+        create_thread=create_thread,
+        thread=None,
+    )
+
+    await adapter._handle_message(message)
+
+    create_thread.assert_awaited_once()
+    assert create_thread.call_args.kwargs["name"] == "Meeting notes — 2026-05-19 — client kickoff"
+    feature_summary.assert_awaited_once()
+    _, summary_kwargs = feature_summary.await_args
+    assert feature_summary.await_args.args == (thread,)
+    assert summary_kwargs["initial_request"] == "/meeting client kickoff"
+    classifier.assert_not_awaited()
+
+    assert len(captured) == 1
+    event = captured[0]
+    assert event.text == "/meeting client kickoff"
+    assert event.message_type == MessageType.COMMAND
+    assert event.media_urls == ["/tmp/uploaded-meeting.ogg"]
+    assert event.media_types == ["audio/ogg"]
+    assert event.source.thread_id == "778"
+    assert event.feature_summary == {"thread_id": "778", "message_id": "summary-2"}
+
+
+@pytest.mark.asyncio
+async def test_mentioned_text_without_audio_does_not_trigger_meeting_intake(adapter, monkeypatch):
+    import discord
+
+    captured = []
+
+    async def fake_handle(event):
+        captured.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    classifier = AsyncMock(return_value=False)
+    monkeypatch.setattr(adapter, "_classify_discord_feature_request", classifier)
+    adapter._text_batch_delay_seconds = 0
+
+    guild = SimpleNamespace(id=42, name="Guild")
+    channel = SimpleNamespace(id=12345, name="general", guild=guild)
+    create_thread = AsyncMock()
+    bot_user = adapter._client.user
+    message = SimpleNamespace(
+        id=559,
+        content=f"<@{bot_user.id}> client kickoff",
+        clean_content="@Sligo Labs client kickoff",
+        type=discord.MessageType.default,
+        channel=channel,
+        author=SimpleNamespace(id=100200300, display_name="tbrent", name="tbrent", bot=False),
+        mentions=[bot_user],
+        attachments=[],
+        message_snapshots=[],
+        flags=SimpleNamespace(value=0, voice=False),
+        guild=guild,
+        created_at=datetime(2026, 5, 19, 4, 0, 0),
+        reference=None,
+        create_thread=create_thread,
+        thread=None,
+    )
+
+    await adapter._handle_message(message)
+
+    create_thread.assert_not_awaited()
+    assert len(captured) == 1
+    event = captured[0]
+    assert event.text == "client kickoff"
+    assert event.message_type == MessageType.TEXT
+    assert event.media_urls == []
+    classifier.assert_awaited_once_with("client kickoff")
+
+
+@pytest.mark.asyncio
 async def test_bare_text_meeting_command_reuses_existing_recording_thread(adapter, monkeypatch):
     import discord
 
