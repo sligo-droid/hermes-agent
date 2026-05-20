@@ -904,7 +904,7 @@ def test_worker_ticket_state_endpoint_returns_redacted_state(monkeypatch, tmp_pa
     assert missing.status_code == 404
 
 
-def test_worker_ticket_terminal_endpoint_returns_sanitized_feed(monkeypatch, tmp_path):
+def test_worker_ticket_terminal_endpoint_returns_auth_scoped_feed(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from fastapi.testclient import TestClient
     from hermes_cli import discord_worker_boards as dwb
@@ -929,6 +929,8 @@ def test_worker_ticket_terminal_endpoint_returns_sanitized_feed(monkeypatch, tmp
         conn.close()
     log_path = kanban_db.worker_log_path(task.id, board=board.slug)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    for i in range(85):
+        kanban_db._append_worker_log_line(log_path, f"[codex worker] retained full log line {i}")
     kanban_db._append_worker_log_line(
         log_path,
         "[kanban dispatcher] scheduled Codex role worker: role=planner reasoning=high mode=fast",
@@ -939,7 +941,7 @@ def test_worker_ticket_terminal_endpoint_returns_sanitized_feed(monkeypatch, tmp
     )
     kanban_db._append_worker_log_line(
         log_path,
-        "ran cat /home/droid/private/config.yaml with key sk-proj-A1B2C3D4E5F6G7H8I9J0",
+        "worker saw /home/droid/private/config.yaml with key sk-proj-A1B2C3D4E5F6G7H8I9J0",
     )
     dwb.record_codex_worker_event(
         task.id,
@@ -950,9 +952,41 @@ def test_worker_ticket_terminal_endpoint_returns_sanitized_feed(monkeypatch, tmp
                 "item": {
                     "type": "commandExecution",
                     "cwd": "/home/droid/private",
+                    "command": "cat /home/droid/private/config.yaml",
+                    "status": "completed",
+                    "exitCode": 0,
+                    "durationMs": 123,
                     "aggregatedOutput": "token sk-proj-A1B2C3D4E5F6G7H8I9J0",
                 }
             },
+        },
+    )
+    dwb.record_codex_worker_event(
+        task.id,
+        board=board.slug,
+        event={
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "fileChange",
+                    "status": "completed",
+                    "changes": [
+                        {
+                            "path": "/home/droid/private/app.py",
+                            "kind": {"type": "update", "content": "def leaked(): pass"},
+                            "diff": "+def leaked(): pass",
+                        }
+                    ],
+                }
+            },
+        },
+    )
+    dwb.record_codex_worker_event(
+        task.id,
+        board=board.slug,
+        event={
+            "method": "item/commandExecution/outputDelta",
+            "params": {"delta": "def leaked(): pass\nprint('token')"},
         },
     )
 
@@ -967,15 +1001,19 @@ def test_worker_ticket_terminal_endpoint_returns_sanitized_feed(monkeypatch, tmp
     assert data["task"]["id"] == task.id
     assert data["current_run"]["id"] == claimed.current_run_id
     assert data["lines"][0] == f"$ ticket {task.id}"
+    assert "[codex worker] retained full log line 0" in "\n".join(data["lines"])
     assert "scheduled Codex role worker: role=planner reasoning=high mode=fast" in "\n".join(data["lines"])
-    assert "completed: Read [REDACTED_PATH]" in "\n".join(data["lines"])
+    assert "completed: Read /home/droid/private/config.yaml" in "\n".join(data["lines"])
+    assert data["lines"].index("# worker terminal") < data["lines"].index("# codex app worker log")
+    assert "commandExecution status=completed cwd=/home/droid/private exit=0 duration=123ms output hidden" in "\n".join(data["lines"])
+    assert "fileChange status=completed changes=1 update:/home/droid/private/app.py" in "\n".join(data["lines"])
+    assert "item/commandExecution/outputDelta: commandExecution output hidden" in "\n".join(data["lines"])
     assert "codex_state" not in data
     assert "events" not in data
     assert "aggregatedOutput" not in rendered
-    assert "commandExecution" not in rendered
-    assert "spawning Codex role worker" not in rendered
     assert "secret prompt" not in rendered
-    assert "/home/droid/private" not in rendered
+    assert "cat /home/droid/private/config.yaml" not in rendered
+    assert "def leaked(): pass" not in rendered
     assert "sk-proj-A1B2C3D4E5F6G7H8I9J0" not in rendered
     assert missing.status_code == 404
 

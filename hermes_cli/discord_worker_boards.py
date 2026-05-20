@@ -612,15 +612,18 @@ def _ticket_terminal_feed_for_board(
         runs = kanban_db.list_runs(conn, task_id)
         events = kanban_db.list_events(conn, task_id)
         current_run = _current_run_state(task, runs)
-        log_text = kanban_db.read_worker_log(
-            task_id,
-            tail_bytes=CODEX_STATE_LOG_TAIL_BYTES,
-            board=board,
-        )
+        log_text = kanban_db.read_worker_log(task_id, board=board)
+        codex_state = _read_codex_worker_state(task_id, board=board)
     finally:
         conn.close()
 
-    lines = _terminal_feed_lines(task, current_run=current_run, events=events, log_text=log_text)
+    lines = _terminal_feed_lines(
+        task,
+        current_run=current_run,
+        events=events,
+        log_text=log_text,
+        codex_state=codex_state,
+    )
     payload = {
         "board": board,
         "worker": _public_worker_meta(worker or _read_worker_meta(board)),
@@ -634,7 +637,7 @@ def _ticket_terminal_feed_for_board(
         "updated_at": _now(),
         "lines": lines,
     }
-    return _redact_public_state(payload)
+    return _redact_terminal_state(payload)
 
 
 def _public_terminal_run(run: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -651,12 +654,26 @@ def _safe_terminal_text(value: Any, *, max_chars: int = 240) -> str:
     return text
 
 
+def _redact_terminal_state(value: Any) -> Any:
+    """Redact credentials for authenticated operator terminal views."""
+    if isinstance(value, str):
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(value, force=True)
+    if isinstance(value, list):
+        return [_redact_terminal_state(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _redact_terminal_state(item) for key, item in value.items()}
+    return value
+
+
 def _terminal_feed_lines(
     task: Any,
     *,
     current_run: Optional[dict[str, Any]],
     events: list[Any],
     log_text: Optional[str],
+    codex_state: Optional[dict[str, Any]],
 ) -> list[str]:
     lines = [
         f"$ ticket {task.id}",
@@ -703,7 +720,12 @@ def _terminal_feed_lines(
     elif log_text:
         lines.append("")
         lines.append("# worker terminal")
-        lines.append("(worker process output hidden in public view)")
+        lines.append("(worker process output hidden)")
+    codex_log_lines = _codex_app_worker_log_lines(codex_state)
+    if codex_log_lines:
+        lines.append("")
+        lines.append("# codex app worker log")
+        lines.extend(codex_log_lines)
     return lines
 
 
@@ -735,16 +757,146 @@ def _public_worker_log_lines(log_text: Optional[str]) -> list[str]:
     if not log_text:
         return []
     lines: list[str] = []
-    for raw in str(log_text).splitlines()[-80:]:
-        line = raw.strip()
-        if not line.startswith("[kanban dispatcher]"):
+    for raw in str(log_text).splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            lines.append("")
             continue
         if "spawning Codex role worker" in line:
-            continue
-        lines.append(_safe_terminal_text(line, max_chars=260))
-        if len(lines) >= 20:
-            break
+            prefix = line.split("spawning Codex role worker", 1)[0]
+            line = prefix + "spawning Codex role worker: [command hidden]"
+        lines.append(_safe_terminal_text(line, max_chars=1200))
     return lines
+
+
+def _codex_app_worker_log_lines(state: Optional[dict[str, Any]]) -> list[str]:
+    if not isinstance(state, dict) or not state:
+        return []
+    lines: list[str] = []
+    truncated = int(state.get("truncated_events") or 0)
+    if truncated > 0:
+        lines.append(f"... {truncated} older codex app event(s) truncated by retention")
+    events = state.get("events") if isinstance(state.get("events"), list) else []
+    for event in events:
+        line = _codex_app_event_line(event)
+        if line:
+            lines.append(line)
+    result_line = _codex_app_result_line(state.get("result"))
+    if result_line:
+        lines.append(result_line)
+    return lines
+
+
+def _codex_app_event_line(event: Any) -> str:
+    if not isinstance(event, dict):
+        return ""
+    method = str(event.get("method") or "").strip()
+    if not method:
+        return ""
+    created = _format_public_timestamp(event.get("ts")) or "time unknown"
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    item = params.get("item") if isinstance(params.get("item"), dict) else {}
+    item_type = str(event.get("item_type") or item.get("type") or "").strip()
+    item_label = item_type or _codex_method_item_label(method)
+    parts = [f"[{created}] codex {method}"]
+    if item_label:
+        parts.append(item_label)
+
+    if method.endswith("/outputDelta") or method.endswith("/delta"):
+        parts.append("output hidden")
+        return _codex_log_line(parts)
+
+    turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+    status = item.get("status") or turn.get("status")
+    if status:
+        parts.append(f"status={_safe_terminal_text(status, max_chars=80)}")
+    if item_type == "commandExecution":
+        cwd = item.get("cwd")
+        exit_code = item.get("exitCode")
+        duration = item.get("durationMs")
+        if cwd:
+            parts.append(f"cwd={_safe_terminal_text(cwd, max_chars=260)}")
+        if exit_code is not None:
+            parts.append(f"exit={exit_code}")
+        if duration is not None:
+            parts.append(f"duration={duration}ms")
+        if item.get("aggregatedOutput"):
+            parts.append("output hidden")
+    elif item_type == "fileChange":
+        summary = _codex_file_change_summary(item)
+        if summary:
+            parts.append(summary)
+    elif item_type in {"agentMessage", "reasoning", "userMessage"}:
+        parts.append("content hidden")
+    elif item_type in {"mcpToolCall", "dynamicToolCall"}:
+        tool = item.get("tool") or item.get("name")
+        server = item.get("server")
+        if server:
+            parts.append(f"server={_safe_terminal_text(server, max_chars=80)}")
+        if tool:
+            parts.append(f"tool={_safe_terminal_text(tool, max_chars=120)}")
+        parts.append("result hidden")
+
+    error_obj = turn.get("error")
+    if isinstance(error_obj, dict):
+        message = error_obj.get("message") or error_obj.get("code")
+        if message:
+            parts.append(f"error={_safe_terminal_text(message, max_chars=260)}")
+    return _codex_log_line(parts)
+
+
+def _codex_log_line(parts: list[Any]) -> str:
+    if len(parts) <= 1:
+        return str(parts[0]) if parts else ""
+    return ": ".join([str(parts[0]), " ".join(str(part) for part in parts[1:])])
+
+
+def _codex_method_item_label(method: str) -> str:
+    if method.startswith("item/"):
+        bits = [bit for bit in method.split("/") if bit]
+        if len(bits) >= 2:
+            return bits[1]
+    return ""
+
+
+def _codex_file_change_summary(item: dict[str, Any]) -> str:
+    changes = item.get("changes") if isinstance(item.get("changes"), list) else []
+    if not changes:
+        return "changes=0"
+    labels: list[str] = []
+    for change in changes[:12]:
+        if not isinstance(change, dict):
+            continue
+        kind_obj = change.get("kind") if isinstance(change.get("kind"), dict) else {}
+        kind = str(kind_obj.get("type") or change.get("type") or "update")
+        path = str(change.get("path") or "")
+        labels.append(f"{kind}:{path}" if path else kind)
+    if len(changes) > len(labels):
+        labels.append(f"+{len(changes) - len(labels)} more")
+    return _safe_terminal_text(
+        f"changes={len(changes)} " + ", ".join(labels),
+        max_chars=1200,
+    )
+
+
+def _codex_app_result_line(result: Any) -> str:
+    if not isinstance(result, dict):
+        return ""
+    bits = ["codex result"]
+    if result.get("error"):
+        bits.append(f"error={_safe_terminal_text(result.get('error'), max_chars=260)}")
+    if result.get("interrupted"):
+        bits.append("interrupted=true")
+    if result.get("timed_out"):
+        bits.append("timed_out=true")
+    if result.get("tool_iterations") not in (None, ""):
+        bits.append(f"tool_iterations={result.get('tool_iterations')}")
+    if result.get("turn_id"):
+        bits.append(f"turn={_safe_terminal_text(result.get('turn_id'), max_chars=80)}")
+    if result.get("thread_id"):
+        bits.append(f"thread={_safe_terminal_text(result.get('thread_id'), max_chars=80)}")
+    return " ".join(bits) if len(bits) > 1 else ""
 
 
 def _task_state_dict(task: Any) -> dict[str, Any]:
