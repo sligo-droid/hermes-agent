@@ -512,7 +512,7 @@ def test_public_board_index_lists_newest_sessions_first(monkeypatch, tmp_path):
     assert html.index("Newer worker") < html.index("Older worker")
 
 
-def test_public_session_board_auto_refreshes(monkeypatch, tmp_path):
+def test_public_session_board_does_not_auto_refresh(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_db
@@ -526,7 +526,7 @@ def test_public_session_board_auto_refreshes(monkeypatch, tmp_path):
 
     html = dwb.render_public_session_board_html("6160")
 
-    assert '<meta http-equiv="refresh" content="15">' in html
+    assert 'http-equiv="refresh"' not in html
     assert html.count('data-ticket-terminal-url="/workers/6160/tickets/') == 2
     assert html.count('data-ticket-move-url="/workers/6160/tickets/') == 2
     assert html.count('class="ticket-card"') == 2
@@ -539,7 +539,7 @@ def test_public_session_board_auto_refreshes(monkeypatch, tmp_path):
         assert f'data-status="{status}"' in html
     assert 'id="ticket-modal"' in html
     assert "Terminal Log" in html
-    assert "setInterval" in html
+    assert "setInterval" not in html
     assert "Unable to load ticket terminal" in html
     assert '<a class="brand" href="/workers">Hermes<br>Kanban</a>' in html
     assert "Codex result" not in html

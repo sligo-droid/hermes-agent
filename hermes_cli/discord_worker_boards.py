@@ -1537,7 +1537,6 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="15">
   <title>{esc(snapshot["name"])}</title>
   <style>
 {_workers_page_css()}
@@ -1587,8 +1586,6 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
       const body = document.getElementById("ticket-modal-body");
       const close = document.getElementById("ticket-modal-close");
       const moveError = document.getElementById("ticket-move-error");
-      let refreshTimer = null;
-      let activeUrl = "";
       let draggingItem = null;
       let touchState = null;
       let suppressClickUntil = 0;
@@ -1660,11 +1657,6 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
         }}
       }};
       const hide = () => {{
-        if (refreshTimer) {{
-          clearInterval(refreshTimer);
-          refreshTimer = null;
-        }}
-        activeUrl = "";
         modal.setAttribute("aria-hidden", "true");
         body.textContent = "";
       }};
@@ -1775,17 +1767,8 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
       document.querySelectorAll("[data-ticket-terminal-url]").forEach((button) => {{
         button.addEventListener("click", async () => {{
           show(button.dataset.ticketTitle || button.dataset.ticketId || "Ticket State");
-          activeUrl = button.dataset.ticketTerminalUrl;
-          if (refreshTimer) clearInterval(refreshTimer);
           try {{
-            await loadTerminal(activeUrl);
-            refreshTimer = setInterval(() => {{
-              if (activeUrl && modal.getAttribute("aria-hidden") === "false") {{
-                loadTerminal(activeUrl).catch((error) => {{
-                  body.textContent = `Unable to load ticket terminal: ${{error}}`;
-                }});
-              }}
-            }}, 2000);
+            await loadTerminal(button.dataset.ticketTerminalUrl);
           }} catch (error) {{
             body.textContent = `Unable to load ticket terminal: ${{error}}`;
           }}
