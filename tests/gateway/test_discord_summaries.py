@@ -914,25 +914,23 @@ def test_runner_summarizes_long_discord_feature_outcome():
     assert "few concise sentences" in prompt
 
 
-def test_runner_generates_and_persists_discord_kanban_title(monkeypatch, tmp_path):
+def test_runner_persists_discord_kanban_fallback_title(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb
 
     board = dwb.set_goal(thread_id="200", goal="Ship the deploy dashboard")
     runner = object.__new__(gateway_run.GatewayRunner)
 
-    with patch("agent.title_generator.generate_title", return_value="Deploy Dashboard") as generate_title:
-        title = runner._generate_discord_kanban_feature_title(
-            {
-                "board": board.slug,
-                "fallback_title": "Ship the deploy dashboard",
-                "outcome": "In progress. Planner created implementation tickets.",
-            }
-        )
+    title = runner._discord_kanban_feature_title(
+        {
+            "board": board.slug,
+            "fallback_title": "Ship the deploy dashboard",
+            "outcome": "In progress. Planner created implementation tickets.",
+        }
+    )
 
-    assert title == "Deploy Dashboard"
-    assert dwb.feature_summary_snapshot(board.slug)["title"] == "Deploy Dashboard"
-    generate_title.assert_called_once()
+    assert title == "Ship the deploy dashboard"
+    assert dwb.feature_summary_snapshot(board.slug)["title"] == "Ship the deploy dashboard"
 
 
 @pytest.mark.asyncio
