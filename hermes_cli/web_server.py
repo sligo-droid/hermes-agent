@@ -397,6 +397,22 @@ async def worker_ticket_state(session_id: str, task_id: str):
         raise HTTPException(status_code=500, detail="Ticket state unavailable")
 
 
+@app.get("/workers/{session_id}/tickets/{task_id}/terminal", response_class=JSONResponse)
+async def worker_ticket_terminal(session_id: str, task_id: str):
+    """Sanitized live terminal feed for one Discord worker ticket."""
+    try:
+        from hermes_cli.discord_worker_boards import ticket_terminal_feed_for_session
+
+        return JSONResponse(ticket_terminal_feed_for_session(session_id, task_id))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Ticket terminal not found")
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Ticket terminal not found")
+    except Exception as exc:
+        _log.warning("worker ticket terminal render failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Ticket terminal unavailable")
+
+
 @app.get("/{session_id:int}", response_class=HTMLResponse)
 async def public_worker_session_board_root_legacy(session_id: int):
     """Backward-compatible redirect for old /<session_id> worker board links."""
