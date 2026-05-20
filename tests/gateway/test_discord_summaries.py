@@ -1,6 +1,7 @@
 """Tests for Discord project and feature summary surfaces."""
 
 import inspect
+import json
 import sys
 import types
 from datetime import datetime, timezone
@@ -521,6 +522,39 @@ async def test_feature_summary_uses_absolute_kanban_board_url(adapter, monkeypat
     sent_embed = thread.sent[0][0]["embed"]
     fields = {field.name: field.value for field in sent_embed.fields}
     assert fields["Kanban Board"] == "https://hermes.sligolabs.com/workers/200"
+
+
+@pytest.mark.asyncio
+async def test_feature_summary_starts_session_kanban_planner(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="Build the drilldown page",
+    )
+
+    assert handle is not None
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.board_slug_for_discord_thread("200")
+    meta = kanban_db.read_board_metadata(board)
+    worker = meta["discord_worker"]
+    conn = kanban_db.connect(board=board)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+
+    assert worker["execution_mode"] == "kanban_pipeline"
+    assert worker["goal_status"] == "active"
+    assert len(tasks) == 1
+    assert tasks[0].assignee == "planner"
+    assert tasks[0].created_by == "discord-feature-request"
+    assert json.loads(tasks[0].body or "{}")["request"] == "Build the drilldown page"
 
 
 @pytest.mark.asyncio

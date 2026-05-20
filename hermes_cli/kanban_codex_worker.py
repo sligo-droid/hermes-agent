@@ -71,7 +71,9 @@ def _schema_instructions(role: str) -> str:
         return (
             'Schema: {"status":"planned|blocked","summary":"...","acceptance_criteria":["..."],'
             '"tasks":[{"title":"...","body":"...","priority":0,"parents":[]}],"blocker":null} '
-            'In each task, "parents" is a list of earlier task indices this task depends on.'
+            'In each task, "parents" is a list of earlier task indices this task depends on. '
+            "Break the job into small, coherent dev tickets with concrete acceptance criteria, likely files or subsystems to inspect, dependencies, and focused verification steps. "
+            "Treat slash-looking text in the request as user prose unless the Kanban context explicitly says otherwise."
         )
     if role == ROLE_REVIEWER:
         return (
