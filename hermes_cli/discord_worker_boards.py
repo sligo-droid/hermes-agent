@@ -1553,7 +1553,6 @@ def _render_public_board_html(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="15">
   <title>{esc(snapshot["name"])}</title>
   <style>
 {_workers_page_css()}
@@ -1603,8 +1602,6 @@ def _render_public_board_html(
       const body = document.getElementById("ticket-modal-body");
       const close = document.getElementById("ticket-modal-close");
       const moveError = document.getElementById("ticket-move-error");
-      let refreshTimer = null;
-      let activeUrl = "";
       let draggingItem = null;
       let touchState = null;
       let suppressClickUntil = 0;
@@ -1700,11 +1697,6 @@ def _render_public_board_html(
         }}
       }};
       const hide = (options = {{}}) => {{
-        if (refreshTimer) {{
-          clearInterval(refreshTimer);
-          refreshTimer = null;
-        }}
-        activeUrl = "";
         modal.setAttribute("aria-hidden", "true");
         body.textContent = "";
         if (options.updateUrl !== false) setPageUrl(boardUrl, options.replaceUrl === true);
@@ -1732,18 +1724,10 @@ def _render_public_board_html(
         if (!cleanTicketId) return;
         const ticketUrl = options.ticketUrl || ticketUrlFor(cleanTicketId);
         show(label || labelForTicket(cleanTicketId));
-        activeUrl = options.terminalUrl || terminalUrlFor(cleanTicketId);
+        const terminalUrl = options.terminalUrl || terminalUrlFor(cleanTicketId);
         if (options.updateUrl !== false) setPageUrl(ticketUrl, options.replaceUrl === true);
-        if (refreshTimer) clearInterval(refreshTimer);
         try {{
-          await loadTerminal(activeUrl);
-          refreshTimer = setInterval(() => {{
-            if (activeUrl && modal.getAttribute("aria-hidden") === "false") {{
-              loadTerminal(activeUrl).catch((error) => {{
-                body.textContent = `Unable to load ticket terminal: ${{error}}`;
-              }});
-            }}
-          }}, 2000);
+          await loadTerminal(terminalUrl);
         }} catch (error) {{
           body.textContent = `Unable to load ticket terminal: ${{error}}`;
         }}
