@@ -1389,9 +1389,13 @@ def render_public_board_html(token: str) -> str:
     return _render_public_board_html(snapshot)
 
 
-def render_public_session_board_html(session_id: str) -> str:
+def render_public_session_board_html(
+    session_id: str,
+    *,
+    active_ticket_id: Optional[str] = None,
+) -> str:
     snapshot = public_board_snapshot_for_session(session_id)
-    return _render_public_board_html(snapshot)
+    return _render_public_board_html(snapshot, active_ticket_id=active_ticket_id)
 
 
 def _workers_page_css() -> str:
@@ -1467,7 +1471,11 @@ def _workers_page_css() -> str:
     """
 
 
-def _render_public_board_html(snapshot: dict[str, Any]) -> str:
+def _render_public_board_html(
+    snapshot: dict[str, Any],
+    *,
+    active_ticket_id: Optional[str] = None,
+) -> str:
     worker = snapshot["worker"]
     tasks = snapshot["tasks"]
     runtime = snapshot.get("runtime") or {"state": "idle", "reason": "no active tickets"}
@@ -1480,6 +1488,10 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
     def esc(value: Any) -> str:
         return html.escape(str(value or ""))
 
+    board_url = f"/workers/{quote(session_id, safe='')}"
+    board_url_json = json.dumps(board_url).replace("</", "<\\/")
+    active_ticket_json = json.dumps(str(active_ticket_id or "")).replace("</", "<\\/")
+
     cards = []
     for status in columns:
         items = by_status.get(status, [])
@@ -1488,18 +1500,22 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
             "data-ticket-id=\"{id}\" data-ticket-status=\"{status}\" "
             "data-ticket-move-url=\"{move_url}\">"
             "<button type=\"button\" class=\"ticket\" data-ticket-id=\"{id}\" "
-            "data-ticket-title=\"{title}\" data-ticket-terminal-url=\"{terminal_url}\">"
+            "data-ticket-title=\"{title}\" data-ticket-url=\"{ticket_url}\" "
+            "data-ticket-terminal-url=\"{terminal_url}\">"
             "<strong>{title}</strong><br><code>{id}</code> {assignee}<p>{summary}</p>"
             "</button></li>".format(
                 title=esc(item["title"]),
                 id=esc(item["id"]),
                 status=esc(status),
+                ticket_url=esc(
+                    f"{board_url}/tickets/{quote(str(item['id']), safe='')}"
+                ),
                 terminal_url=esc(
-                    f"/workers/{quote(session_id, safe='')}/tickets/"
+                    f"{board_url}/tickets/"
                     f"{quote(str(item['id']), safe='')}/terminal"
                 ),
                 move_url=esc(
-                    f"/workers/{quote(session_id, safe='')}/tickets/"
+                    f"{board_url}/tickets/"
                     f"{quote(str(item['id']), safe='')}/move"
                 ),
                 assignee=esc(item["assignee"] or ""),
@@ -1530,7 +1546,7 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
     runtime_action = _runtime_action_form_html(
         session_id,
         runtime,
-        return_to=f"/workers/{quote(session_id, safe='')}",
+        return_to=board_url,
     )
     return f"""<!doctype html>
 <html>
@@ -1589,7 +1605,31 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
       let draggingItem = null;
       let touchState = null;
       let suppressClickUntil = 0;
+      const boardUrl = {board_url_json};
+      const initialTicketId = {active_ticket_json};
       const columns = Array.from(document.querySelectorAll("[data-column]"));
+      const ticketUrlFor = (ticketId) => boardUrl + "/tickets/" + encodeURIComponent(ticketId || "");
+      const terminalUrlFor = (ticketId) => ticketUrlFor(ticketId) + "/terminal";
+      const ticketIdFromPath = () => {{
+        const prefix = boardUrl + "/tickets/";
+        if (!window.location.pathname.startsWith(prefix)) return "";
+        const encoded = window.location.pathname.slice(prefix.length).split("/")[0];
+        if (!encoded) return "";
+        try {{ return decodeURIComponent(encoded); }} catch (_error) {{ return encoded; }}
+      }};
+      const labelForTicket = (ticketId) => {{
+        for (const button of document.querySelectorAll("[data-ticket-terminal-url]")) {{
+          if (button.dataset.ticketId === ticketId) return button.dataset.ticketTitle || ticketId;
+        }}
+        return ticketId || "Ticket State";
+      }};
+      const setPageUrl = (url, replace) => {{
+        if (!url || !window.history || typeof window.history.pushState !== "function") return;
+        if (window.location.pathname === url && !window.location.search && !window.location.hash) return;
+        const state = url === boardUrl ? {{}} : {{ ticketId: url.slice(url.lastIndexOf("/") + 1) }};
+        if (replace && typeof window.history.replaceState === "function") window.history.replaceState(state, "", url);
+        else window.history.pushState(state, "", url);
+      }};
       const clearColumnDrops = () => {{
         columns.forEach((column) => column.classList.remove("column-drop"));
       }};
@@ -1656,9 +1696,10 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
           showMoveError(`Move failed: ${{error?.message || error}}`);
         }}
       }};
-      const hide = () => {{
+      const hide = (options = {{}}) => {{
         modal.setAttribute("aria-hidden", "true");
         body.textContent = "";
+        if (options.updateUrl !== false) setPageUrl(boardUrl, options.replaceUrl === true);
       }};
       const show = (label) => {{
         title.textContent = label ? label + " - Terminal Log" : "Terminal Log";
@@ -1677,6 +1718,19 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
         const feed = await response.json();
         body.textContent = renderTerminal(feed);
         body.scrollTop = body.scrollHeight;
+      }};
+      const openTicket = async (ticketId, label, options = {{}}) => {{
+        const cleanTicketId = ticketId || "";
+        if (!cleanTicketId) return;
+        const ticketUrl = options.ticketUrl || ticketUrlFor(cleanTicketId);
+        show(label || labelForTicket(cleanTicketId));
+        const terminalUrl = options.terminalUrl || terminalUrlFor(cleanTicketId);
+        if (options.updateUrl !== false) setPageUrl(ticketUrl, options.replaceUrl === true);
+        try {{
+          await loadTerminal(terminalUrl);
+        }} catch (error) {{
+          body.textContent = `Unable to load ticket terminal: ${{error}}`;
+        }}
       }};
       document.querySelectorAll("[data-ticket-item]").forEach((item) => {{
         item.addEventListener("dragstart", (event) => {{
@@ -1765,13 +1819,12 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
         }}
       }}, true);
       document.querySelectorAll("[data-ticket-terminal-url]").forEach((button) => {{
-        button.addEventListener("click", async () => {{
-          show(button.dataset.ticketTitle || button.dataset.ticketId || "Ticket State");
-          try {{
-            await loadTerminal(button.dataset.ticketTerminalUrl);
-          }} catch (error) {{
-            body.textContent = `Unable to load ticket terminal: ${{error}}`;
-          }}
+        button.addEventListener("click", () => {{
+          openTicket(
+            button.dataset.ticketId || "",
+            button.dataset.ticketTitle || button.dataset.ticketId || "Ticket State",
+            {{ ticketUrl: button.dataset.ticketUrl, terminalUrl: button.dataset.ticketTerminalUrl }},
+          );
         }});
       }});
       close.addEventListener("click", hide);
@@ -1781,6 +1834,13 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
       document.addEventListener("keydown", (event) => {{
         if (event.key === "Escape") hide();
       }});
+      window.addEventListener("popstate", () => {{
+        const ticketId = ticketIdFromPath();
+        if (ticketId) openTicket(ticketId, labelForTicket(ticketId), {{ updateUrl: false }});
+        else hide({{ updateUrl: false }});
+      }});
+      const startupTicketId = initialTicketId || ticketIdFromPath();
+      if (startupTicketId) openTicket(startupTicketId, labelForTicket(startupTicketId), {{ updateUrl: false }});
     }})();
   </script>
 </body>
