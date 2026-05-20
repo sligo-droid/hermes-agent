@@ -58,7 +58,7 @@ class TestModuleSurface:
         from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
         for agent_loop_tool in (
             "delegate_task",
-            "delegate_codex_coding_task",
+            "delegate_coding_task",
             "memory",
             "session_search",
             "todo",

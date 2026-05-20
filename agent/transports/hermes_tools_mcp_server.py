@@ -29,7 +29,7 @@ What we DO NOT expose:
   - read_file / write_file / patch       — codex's apply_patch + shell
   - search_files / process               — codex's shell
   - clarify                              — codex's own UX
-  - delegate_task / delegate_codex_coding_task /
+  - delegate_task / delegate_coding_task /
     memory / session_search / todo       — `_AGENT_LOOP_TOOLS` in Hermes
                                            (model_tools.py). They require
                                            the running AIAgent context to
@@ -65,7 +65,7 @@ logger = logging.getLogger(__name__)
 #   - terminal / shell / read_file / write_file / patch / search_files /
 #     process — codex's built-ins cover these and approval routes through
 #     codex's own UI.
-#   - delegate_task / delegate_codex_coding_task / memory / session_search /
+#   - delegate_task / delegate_coding_task / memory / session_search /
 #     todo — these are
 #     `_AGENT_LOOP_TOOLS` in Hermes (model_tools.py:493). They require
 #     the running AIAgent context to dispatch (mid-loop state), so a

@@ -497,7 +497,7 @@ _AGENT_LOOP_TOOLS = {
     "memory",
     "session_search",
     "delegate_task",
-    "delegate_codex_coding_task",
+    "delegate_coding_task",
 }
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 

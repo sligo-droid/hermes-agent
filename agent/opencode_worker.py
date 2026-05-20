@@ -56,8 +56,7 @@ def load_coding_worker_backend(
       1. HERMES_CODING_WORKER_BACKEND
       2. kanban.discord_worker.backend (passed as worker_config)
       3. coding_worker.backend
-      4. legacy codex_worker.backend, for early adopters only
-      5. codex
+      4. codex
     """
     raw_env = os.getenv("HERMES_CODING_WORKER_BACKEND")
     if raw_env:
@@ -78,9 +77,6 @@ def load_coding_worker_backend(
         coding_cfg = cfg.get("coding_worker") if isinstance(cfg.get("coding_worker"), dict) else {}
         if coding_cfg.get("backend"):
             return normalize_coding_worker_backend(coding_cfg.get("backend"))
-        legacy_cfg = cfg.get("codex_worker") if isinstance(cfg.get("codex_worker"), dict) else {}
-        if legacy_cfg.get("backend"):
-            return normalize_coding_worker_backend(legacy_cfg.get("backend"))
     return BACKEND_CODEX
 
 
@@ -114,20 +110,14 @@ def load_opencode_config(
         "build_agent": str(opencode_cfg.get("build_agent") or "build").strip() or "build",
         "simple_build_reasoning_level": _normalize_reasoning_level(
             opencode_cfg.get("simple_build_reasoning_level")
-            or opencode_cfg.get("build_variant")
-            or opencode_cfg.get("simple_variant")
             or "high"
         ),
         "complex_plan_reasoning_level": _normalize_reasoning_level(
             opencode_cfg.get("complex_plan_reasoning_level")
-            or opencode_cfg.get("plan_variant")
-            or opencode_cfg.get("complex_variant")
             or "xhigh"
         ),
         "complex_build_reasoning_level": _normalize_reasoning_level(
             opencode_cfg.get("complex_build_reasoning_level")
-            or opencode_cfg.get("build_variant")
-            or opencode_cfg.get("complex_variant")
             or "medium"
         ),
         "dangerously_skip_permissions": bool(opencode_cfg.get("dangerously_skip_permissions", False)),

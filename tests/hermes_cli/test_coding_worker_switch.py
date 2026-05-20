@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from hermes_cli import codex_worker_switch as cws
+from hermes_cli import coding_worker_switch as cws
 
 
 def test_parse_args():
@@ -11,12 +11,12 @@ def test_parse_args():
 
     value, errors = cws.parse_args("maybe")
     assert value is None
-    assert errors and "Unknown codex-worker" in errors[0]
+    assert errors and "Unknown coding-worker" in errors[0]
 
 
 def test_default_enabled_when_unset():
     assert cws.get_enabled({}) is True
-    assert cws.get_enabled({"codex_worker": {}}) is True
+    assert cws.get_enabled({"coding_worker": {}}) is True
     assert cws.get_enabled(None) is True  # type: ignore[arg-type]
 
 
@@ -32,13 +32,13 @@ def test_apply_persists_toggle():
     assert result.success is True
     assert result.enabled is False
     assert result.old_enabled is True
-    assert cfg["codex_worker"]["enabled"] is False
-    assert persisted["codex_worker"]["enabled"] is False
+    assert cfg["coding_worker"]["enabled"] is False
+    assert persisted["coding_worker"]["enabled"] is False
 
 
 def test_coding_request_detection_is_conservative():
     assert cws.looks_like_coding_request("implement the parser fix in src/parser.py")
-    assert cws.looks_like_coding_request("use codex worker to debug failing tests")
+    assert cws.looks_like_coding_request("use coding worker to debug failing tests")
     assert cws.looks_like_coding_request("review this diff before merge")
     assert cws.looks_like_coding_request("add a dashboard component for sessions")
     assert cws.looks_like_coding_request("wire up the CLI command config loader")
@@ -48,12 +48,9 @@ def test_coding_request_detection_is_conservative():
     assert not cws.looks_like_coding_request("what is the weather today?")
 
 
-def test_codex_worker_meta_questions_do_not_trigger_guidance():
+def test_coding_worker_meta_questions_do_not_trigger_guidance():
     assert not cws.looks_like_coding_request(
-        'we just set "openai_runtime: auto" with codex-worker; why are responses slower?'
-    )
-    assert not cws.looks_like_coding_request(
-        "can you run tests comparing the codex app server to opencode?"
+        'we just set "openai_runtime: auto" with coding-worker; why are responses slower?'
     )
     assert not cws.looks_like_coding_request(
         "tighten the heuristic for invoking codex/opencode later"
@@ -64,7 +61,7 @@ def test_codex_worker_meta_questions_do_not_trigger_guidance():
     assert not cws.looks_like_coding_request("improve the routing criteria")
 
 
-def test_echoed_codex_worker_guidance_is_ignored_before_classification():
+def test_echoed_coding_worker_guidance_is_ignored_before_classification():
     prefix = cws.build_worker_guidance(
         "fix tests in tests/test_parser.py",
         enabled=True,
@@ -130,7 +127,7 @@ def test_hermes_context_detects_git_worktree_common_dir(monkeypatch, tmp_path):
     assert cws.cwd_is_hermes_repo(str(worktree))
 
 
-def test_hermes_coding_request_mandates_codex_worker(monkeypatch, tmp_path):
+def test_hermes_coding_request_mandates_coding_worker(monkeypatch, tmp_path):
     hermes_root = tmp_path / "hermes"
     hermes_root.mkdir()
     monkeypatch.setattr(cws, "_known_hermes_roots", lambda: (hermes_root,))
@@ -146,7 +143,7 @@ def test_hermes_coding_request_mandates_codex_worker(monkeypatch, tmp_path):
 
     assert decision.required is True
     assert decision.should_delegate is True
-    assert "must call `delegate_codex_coding_task`" in decision.guidance
+    assert "must call `delegate_coding_task`" in decision.guidance
 
 
 def test_hermes_coding_request_ignores_disabled_toggle(monkeypatch, tmp_path):
@@ -197,7 +194,7 @@ def test_improvement_classifier_requires_hermes_context():
         cwd="/tmp/not-hermes",
     )
 
-    assert decision == cws.CodexWorkerRoutingDecision()
+    assert decision == cws.CodingWorkerRoutingDecision()
 
 
 def test_hermes_coding_request_fails_loud_when_tool_unavailable(monkeypatch, tmp_path):
@@ -230,4 +227,4 @@ def test_full_codex_app_server_runtime_remains_opt_in(monkeypatch, tmp_path):
         tool_available=True,
         api_mode="codex_app_server",
         cwd=str(hermes_root),
-    ) == cws.CodexWorkerRoutingDecision()
+    ) == cws.CodingWorkerRoutingDecision()

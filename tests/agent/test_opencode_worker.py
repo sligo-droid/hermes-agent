@@ -138,35 +138,6 @@ def test_reasoning_levels_are_configurable_by_mode(monkeypatch, tmp_path):
     assert [_option(cmd, "--variant") for cmd in calls] == ["max", "low"]
 
 
-def test_legacy_variant_keys_still_configure_reasoning_levels(monkeypatch, tmp_path):
-    calls = []
-
-    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
-
-    def fake_run(cmd, **_kwargs):
-        calls.append(cmd)
-        return SimpleNamespace(
-            returncode=0,
-            stdout=json.dumps(
-                {"type": "message", "sessionID": "ses-build", "message": "done"}
-            )
-            + "\n",
-            stderr="",
-        )
-
-    monkeypatch.setattr(ow.subprocess, "run", fake_run)
-
-    result = ow.run_opencode_task(
-        "fix production auth race",
-        str(tmp_path),
-        timeout=60,
-        config=_cfg(plan_variant="high", complex_variant="max"),
-    )
-
-    assert result.error is None
-    assert [_option(cmd, "--variant") for cmd in calls] == ["high", "max"]
-
-
 def test_auth_error_is_classified(monkeypatch, tmp_path):
     monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
 
@@ -238,10 +209,7 @@ def test_missing_binary_becomes_worker_error(monkeypatch, tmp_path):
     assert "not found" in result.error.lower()
 
 
-def test_backend_prefers_coding_worker_key_over_legacy_codex_worker():
-    cfg = {
-        "coding_worker": {"backend": "opencode"},
-        "codex_worker": {"backend": "codex"},
-    }
+def test_backend_ignores_removed_codex_worker_config_key():
+    cfg = {"codex_worker": {"backend": "opencode"}}
 
-    assert ow.load_coding_worker_backend(cfg) == "opencode"
+    assert ow.load_coding_worker_backend(cfg) == "codex"

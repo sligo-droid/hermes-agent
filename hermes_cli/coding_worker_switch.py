@@ -1,8 +1,8 @@
-"""Shared logic for the /codex-worker slash command.
+"""Shared logic for the /coding-worker slash command.
 
-The codex worker mode keeps Hermes on the normal tool-calling runtime, but
-nudges coding-shaped requests toward the internal delegate_codex_coding_task
-tool. That tool drives Codex through the app-server transport directly.
+Coding worker mode keeps Hermes on the normal tool-calling runtime, but
+nudges coding-shaped requests toward the internal delegate_coding_task tool.
+The delegate tool runs whichever coding backend is configured.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import Optional
 
 
 @dataclass
-class CodexWorkerStatus:
+class CodingWorkerStatus:
     success: bool
     enabled: bool
     old_enabled: Optional[bool] = None
@@ -23,7 +23,7 @@ class CodexWorkerStatus:
 
 
 @dataclass
-class CodexWorkerRoutingDecision:
+class CodingWorkerRoutingDecision:
     guidance: str = ""
     required: bool = False
     should_delegate: bool = False
@@ -41,14 +41,14 @@ def parse_args(arg_string: str) -> tuple[Optional[bool], list[str]]:
         return True, []
     if raw in ("off", "disable", "disabled", "false", "no"):
         return False, []
-    return None, ["Unknown codex-worker value {!r}. Use: on, off, status".format(raw)]
+    return None, ["Unknown coding-worker value {!r}. Use: on, off, status".format(raw)]
 
 
 def get_enabled(config: dict) -> bool:
-    """Read codex_worker.enabled. Defaults to True for new configs."""
+    """Read coding_worker.enabled. Defaults to True for new configs."""
     if not isinstance(config, dict):
         return True
-    worker_cfg = config.get("codex_worker")
+    worker_cfg = config.get("coding_worker")
     if not isinstance(worker_cfg, dict):
         return True
     value = worker_cfg.get("enabled")
@@ -59,34 +59,35 @@ def get_enabled(config: dict) -> bool:
 
 def set_enabled(config: dict, enabled: bool) -> bool:
     old = get_enabled(config)
-    if not isinstance(config.get("codex_worker"), dict):
-        config["codex_worker"] = {}
-    config["codex_worker"]["enabled"] = bool(enabled)
+    if not isinstance(config.get("coding_worker"), dict):
+        config["coding_worker"] = {}
+    config["coding_worker"]["enabled"] = bool(enabled)
     return old
 
 
-def apply(config: dict, new_enabled: Optional[bool], *, persist_callback=None) -> CodexWorkerStatus:
+def apply(config: dict, new_enabled: Optional[bool], *, persist_callback=None) -> CodingWorkerStatus:
     current = get_enabled(config)
     if new_enabled is None:
         state = "on" if current else "off"
-        return CodexWorkerStatus(
+        return CodingWorkerStatus(
             success=True,
             enabled=current,
             old_enabled=current,
             message=(
-                f"codex_worker.enabled: {state}\n"
+                f"coding_worker.enabled: {state}\n"
                 "Normal Hermes runtime will delegate coding-shaped requests "
-                "to Codex when the delegate_codex_coding_task tool is available."
+                "to the configured coding backend when the delegate_coding_task "
+                "tool is available."
             ),
         )
 
     if new_enabled == current:
         state = "on" if current else "off"
-        return CodexWorkerStatus(
+        return CodingWorkerStatus(
             success=True,
             enabled=current,
             old_enabled=current,
-            message=f"codex_worker.enabled already {state}",
+            message=f"coding_worker.enabled already {state}",
         )
 
     old = set_enabled(config, new_enabled)
@@ -94,7 +95,7 @@ def apply(config: dict, new_enabled: Optional[bool], *, persist_callback=None) -
         try:
             persist_callback(config)
         except Exception as exc:
-            return CodexWorkerStatus(
+            return CodingWorkerStatus(
                 success=False,
                 enabled=new_enabled,
                 old_enabled=old,
@@ -103,16 +104,16 @@ def apply(config: dict, new_enabled: Optional[bool], *, persist_callback=None) -
 
     old_state = "on" if old else "off"
     new_state = "on" if new_enabled else "off"
-    return CodexWorkerStatus(
+    return CodingWorkerStatus(
         success=True,
         enabled=new_enabled,
         old_enabled=old,
-        message=f"codex_worker.enabled: {old_state} -> {new_state}",
+        message=f"coding_worker.enabled: {old_state} -> {new_state}",
     )
 
 
 def looks_like_coding_request(message: str) -> bool:
-    """Conservative heuristic for Codex worker guidance."""
+    """Conservative heuristic for coding worker guidance."""
     if not isinstance(message, str):
         return False
     text = message.strip()
@@ -127,7 +128,7 @@ def looks_like_coding_request(message: str) -> bool:
     # inside the guidance make every echoed turn look coding-shaped.
     if text.startswith(
         (
-            "[Codex worker mode is enabled.",
+            "[Coding worker mode is enabled.",
             "[Hermes codebase coding request detected.",
         )
     ):
@@ -140,11 +141,11 @@ def looks_like_coding_request(message: str) -> bool:
     lower = text.lower()
 
     # Meta/config/performance questions about the worker itself should stay in
-    # Hermes-land. A bare mention of codex-worker is not a request to delegate.
+    # Hermes-land. A bare mention of the worker is not a request to delegate.
     worker_terms = (
-        "codex worker",
-        "codex-worker",
-        "delegate_codex_coding_task",
+        "coding worker",
+        "coding-worker",
+        "delegate_coding_task",
         "codex app-server",
         "codex app server",
         "openai_runtime",
@@ -188,10 +189,10 @@ def looks_like_coding_request(message: str) -> bool:
         return False
 
     explicit_phrases = (
-        "use codex worker",
-        "with codex worker",
-        "delegate to codex",
-        "codex coding task",
+        "use coding worker",
+        "with coding worker",
+        "delegate to coding worker",
+        "coding worker task",
     )
     if any(phrase in lower for phrase in explicit_phrases):
         return True
@@ -351,11 +352,11 @@ def assess_worker_routing(
     tool_available: bool,
     api_mode: str,
     cwd: Optional[str] = None,
-) -> CodexWorkerRoutingDecision:
-    """Classify whether this turn should receive Codex worker guidance."""
+) -> CodingWorkerRoutingDecision:
+    """Classify whether this turn should receive coding worker guidance."""
     mode = str(api_mode or "").strip().lower()
     if mode == "codex_app_server":
-        return CodexWorkerRoutingDecision()
+        return CodingWorkerRoutingDecision()
 
     hermes_context = cwd_is_hermes_repo(cwd) or message_references_hermes_repo(message)
     coding_request = looks_like_coding_request(message) or (
@@ -364,10 +365,10 @@ def assess_worker_routing(
     required = bool(coding_request and hermes_context)
 
     if required and not tool_available:
-        return CodexWorkerRoutingDecision(
+        return CodingWorkerRoutingDecision(
             guidance=(
                 "[Hermes codebase coding request detected. This turn requires "
-                "`delegate_codex_coding_task`, but that tool is unavailable. "
+                "`delegate_coding_task`, but that tool is unavailable. "
                 "Do not implement with normal mutation tools; report this "
                 "tool-availability blocker to the user.]\n\n"
             ),
@@ -379,14 +380,14 @@ def assess_worker_routing(
         )
 
     if required:
-        return CodexWorkerRoutingDecision(
+        return CodingWorkerRoutingDecision(
             guidance=(
                 "[Hermes codebase coding request detected. You must call "
-                "`delegate_codex_coding_task` for the coding-heavy worker step. "
+                "`delegate_coding_task` for the coding-heavy worker step. "
                 "Hermes remains the orchestrator: inspect enough context to "
                 "prepare a bounded worker brief, then review the changed files "
                 "and focused tests after the worker returns. Do not use direct "
-                "mutation tools before the Codex worker has run.]\n\n"
+                "mutation tools before the coding worker has run.]\n\n"
             ),
             required=True,
             should_delegate=True,
@@ -395,20 +396,20 @@ def assess_worker_routing(
         )
 
     if not enabled or not tool_available or not coding_request:
-        return CodexWorkerRoutingDecision(
+        return CodingWorkerRoutingDecision(
             hermes_context=hermes_context,
             coding_request=coding_request,
         )
-    return CodexWorkerRoutingDecision(
+    return CodingWorkerRoutingDecision(
         guidance=(
-            "[Codex worker mode is enabled. For implementation, debugging, "
+            "[Coding worker mode is enabled. For implementation, debugging, "
             "test-fixing, refactor, and code-review requests, prefer "
-            "`delegate_codex_coding_task` for the coding-heavy worker step when "
+            "`delegate_coding_task` for the coding-heavy worker step when "
             "the task is concrete enough to hand off. Hermes remains the "
             "orchestrator: inspect context, prepare a bounded worker brief, review "
             "the changed files and tests after the worker returns, and report any "
-            "blocker. If the request is not actually a coding task or Codex is a "
-            "worse fit, continue with normal Hermes tools.]\n\n"
+            "blocker. If the request is not actually a coding task or the "
+            "configured backend is a worse fit, continue with normal Hermes tools.]\n\n"
         ),
         should_delegate=True,
         hermes_context=hermes_context,
@@ -435,14 +436,14 @@ def build_worker_guidance(
     return decision.guidance
 
 
-def requires_hermes_codex_worker(
+def requires_hermes_coding_worker(
     message: str,
     *,
     enabled: bool,
     api_mode: str,
     cwd: Optional[str] = None,
 ) -> bool:
-    """Return True when direct mutation should wait for Codex delegation."""
+    """Return True when direct mutation should wait for worker delegation."""
     return assess_worker_routing(
         message,
         enabled=enabled,

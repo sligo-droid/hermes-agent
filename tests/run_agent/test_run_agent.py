@@ -2646,22 +2646,22 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
-    def test_hermes_codex_worker_guardrail_blocks_direct_mutation(
+    def test_hermes_coding_worker_guardrail_blocks_direct_mutation(
         self, agent, monkeypatch, tmp_path
     ):
         self._setup_agent(agent)
         hermes_root = tmp_path / "hermes"
         hermes_root.mkdir()
         monkeypatch.setattr(
-            "hermes_cli.codex_worker_switch._known_hermes_roots",
+            "hermes_cli.coding_worker_switch._known_hermes_roots",
             lambda: (hermes_root,),
         )
         monkeypatch.setattr(
-            "hermes_cli.codex_worker_switch._git_common_dir",
+            "hermes_cli.coding_worker_switch._git_common_dir",
             lambda cwd: None,
         )
         agent.session_cwd = str(hermes_root)
-        agent.valid_tool_names.update({"patch", "delegate_codex_coding_task"})
+        agent.valid_tool_names.update({"patch", "delegate_coding_task"})
 
         tc = _mock_tool_call(
             name="patch",
@@ -2687,27 +2687,27 @@ class TestRunConversation:
         assert mock_handle_function_call.call_count == 0
         tool_messages = [m for m in result["messages"] if m.get("role") == "tool"]
         assert tool_messages
-        assert "delegate_codex_coding_task first" in tool_messages[0]["content"]
+        assert "delegate_coding_task first" in tool_messages[0]["content"]
 
-    def test_hermes_codex_worker_guardrail_stays_after_partial_delegate(
+    def test_hermes_coding_worker_guardrail_stays_after_partial_delegate(
         self, agent, monkeypatch, tmp_path
     ):
         self._setup_agent(agent)
         hermes_root = tmp_path / "hermes"
         hermes_root.mkdir()
         monkeypatch.setattr(
-            "hermes_cli.codex_worker_switch._known_hermes_roots",
+            "hermes_cli.coding_worker_switch._known_hermes_roots",
             lambda: (hermes_root,),
         )
         monkeypatch.setattr(
-            "hermes_cli.codex_worker_switch._git_common_dir",
+            "hermes_cli.coding_worker_switch._git_common_dir",
             lambda cwd: None,
         )
         agent.session_cwd = str(hermes_root)
-        agent.valid_tool_names.update({"patch", "delegate_codex_coding_task"})
+        agent.valid_tool_names.update({"patch", "delegate_coding_task"})
 
         delegate_tc = _mock_tool_call(
-            name="delegate_codex_coding_task",
+            name="delegate_coding_task",
             arguments='{"task":"tighten the heuristic"}',
             call_id="c1",
         )
@@ -2732,7 +2732,7 @@ class TestRunConversation:
         with (
             patch.object(
                 agent,
-                "_dispatch_codex_coding_task",
+                "_dispatch_coding_task",
                 return_value=json.dumps({"summary": "partial result"}),
             ),
             patch(
@@ -2750,7 +2750,7 @@ class TestRunConversation:
         tool_messages = [m for m in result["messages"] if m.get("role") == "tool"]
         assert len(tool_messages) >= 2
         assert "success" not in json.loads(tool_messages[0]["content"])
-        assert "delegate_codex_coding_task first" in tool_messages[1]["content"]
+        assert "delegate_coding_task first" in tool_messages[1]["content"]
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)

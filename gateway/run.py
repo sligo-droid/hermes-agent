@@ -7536,8 +7536,8 @@ class GatewayRunner:
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
 
-        if canonical == "codex-worker":
-            return await self._handle_codex_worker_command(event)
+        if canonical == "coding-worker":
+            return await self._handle_coding_worker_command(event)
 
         if canonical == "personality":
             return await self._handle_personality_command(event)
@@ -10723,9 +10723,9 @@ class GatewayRunner:
         prefix = "✓" if result.success else "✗"
         return f"{prefix} {result.message}"
 
-    async def _handle_codex_worker_command(self, event: MessageEvent) -> str:
-        """Handle /codex-worker command in the gateway."""
-        from hermes_cli import codex_worker_switch as cws
+    async def _handle_coding_worker_command(self, event: MessageEvent) -> str:
+        """Handle /coding-worker command in the gateway."""
+        from hermes_cli import coding_worker_switch as cws
 
         raw_args = event.get_command_args().strip() if event else ""
         new_enabled, errors = cws.parse_args(raw_args)
@@ -10749,7 +10749,7 @@ class GatewayRunner:
                 session_key = self._session_key_for_source(event.source)
                 self._evict_cached_agent(session_key)
             except Exception:
-                logger.debug("could not evict cached agent after codex-worker change",
+                logger.debug("could not evict cached agent after coding-worker change",
                              exc_info=True)
 
         prefix = "✓" if result.success else "✗"
