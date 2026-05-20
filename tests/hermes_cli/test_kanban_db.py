@@ -1994,6 +1994,7 @@ class TestSharedBoardPaths:
 
     def test_systemd_worker_env_filters_secrets(self):
         env = {
+            "GH_CONFIG_DIR": "/home/droid/.config/gh",
             "HERMES_HOME": "/home/droid/.hermes/profiles/coder",
             "HERMES_PROFILE": "coder",
             "HERMES_KANBAN_TASK": "t_demo",
@@ -2006,6 +2007,7 @@ class TestSharedBoardPaths:
         out = kb._systemd_worker_env(env)
 
         assert out["HERMES_HOME"] == "/home/droid/.hermes/profiles/coder"
+        assert out["GH_CONFIG_DIR"] == "/home/droid/.config/gh"
         assert out["HERMES_KANBAN_TASK"] == "t_demo"
         assert out["PATH"] == "/usr/bin"
         assert "OPENAI_API_KEY" not in out
@@ -2036,6 +2038,7 @@ class TestSharedBoardPaths:
             cmd=["/usr/bin/hermes", "-p", "coder", "chat", "-q", "work kanban task t_demo"],
             workspace=str(tmp_path),
             env={
+                "GH_CONFIG_DIR": "/home/droid/.config/gh",
                 "HERMES_HOME": "/home/droid/.hermes/profiles/coder",
                 "HERMES_KANBAN_TASK": "t_demo",
                 "OPENAI_API_KEY": "secret",
@@ -2056,6 +2059,7 @@ class TestSharedBoardPaths:
         assert f"StandardOutput=append:{tmp_path / 'worker.log'}" in systemd_args
         assert f"StandardError=append:{tmp_path / 'worker.log'}" in systemd_args
         assert f"WorkingDirectory={tmp_path}" in systemd_args
+        assert "--setenv=GH_CONFIG_DIR=/home/droid/.config/gh" in systemd_args
         assert "--setenv=HERMES_KANBAN_TASK=t_demo" in systemd_args
         assert all("OPENAI_API_KEY" not in arg for arg in systemd_args)
         assert systemd_args[-6:] == [

@@ -261,6 +261,43 @@ def get_subprocess_home() -> str | None:
     return None
 
 
+def get_github_cli_config_dir(env: dict | None = None) -> str | None:
+    """Return a ``GH_CONFIG_DIR`` value when an authenticated gh config exists.
+
+    Hermes terminal subprocesses may rewrite ``HOME`` to ``HERMES_HOME/home``
+    for profile isolation.  GitHub CLI auth, however, commonly lives in the
+    real user's ``~/.config/gh``.  Prefer an explicit ``GH_CONFIG_DIR`` or an
+    already-authenticated child ``HOME`` first, then fall back to the Python
+    process user's gh config.
+    """
+    source_env = os.environ if env is None else env
+
+    explicit = str(source_env.get("GH_CONFIG_DIR", "") or "").strip()
+    if explicit:
+        return explicit
+
+    candidates: list[Path] = []
+    xdg_config_home = str(source_env.get("XDG_CONFIG_HOME", "") or "").strip()
+    if xdg_config_home:
+        candidates.append(Path(xdg_config_home).expanduser() / "gh")
+
+    child_home = str(source_env.get("HOME", "") or "").strip()
+    if child_home:
+        candidates.append(Path(child_home).expanduser() / ".config" / "gh")
+
+    candidates.append(Path.home() / ".config" / "gh")
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if (candidate / "hosts.yml").is_file():
+            return key
+    return None
+
+
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 
