@@ -17,7 +17,7 @@ from typing import Any, Callable, Optional
 BACKEND_CODEX = "codex"
 BACKEND_OPENCODE = "opencode"
 _VALID_BACKENDS = {BACKEND_CODEX, BACKEND_OPENCODE}
-_VALID_VARIANTS = {"minimal", "high", "max"}
+_VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max"}
 
 
 @dataclass
@@ -112,10 +112,24 @@ def load_opencode_config(
         "model": str(opencode_cfg.get("model") or "").strip(),
         "plan_agent": str(opencode_cfg.get("plan_agent") or "plan").strip() or "plan",
         "build_agent": str(opencode_cfg.get("build_agent") or "build").strip() or "build",
-        "plan_variant": _normalize_variant(opencode_cfg.get("plan_variant")),
-        "build_variant": _normalize_variant(opencode_cfg.get("build_variant")),
-        "simple_variant": _normalize_variant(opencode_cfg.get("simple_variant")),
-        "complex_variant": _normalize_variant(opencode_cfg.get("complex_variant")),
+        "simple_build_reasoning_level": _normalize_reasoning_level(
+            opencode_cfg.get("simple_build_reasoning_level")
+            or opencode_cfg.get("build_variant")
+            or opencode_cfg.get("simple_variant")
+            or "high"
+        ),
+        "complex_plan_reasoning_level": _normalize_reasoning_level(
+            opencode_cfg.get("complex_plan_reasoning_level")
+            or opencode_cfg.get("plan_variant")
+            or opencode_cfg.get("complex_variant")
+            or "xhigh"
+        ),
+        "complex_build_reasoning_level": _normalize_reasoning_level(
+            opencode_cfg.get("complex_build_reasoning_level")
+            or opencode_cfg.get("build_variant")
+            or opencode_cfg.get("complex_variant")
+            or "medium"
+        ),
         "dangerously_skip_permissions": bool(opencode_cfg.get("dangerously_skip_permissions", False)),
     }
 
@@ -266,7 +280,7 @@ def run_opencode_task(
             timeout=max(30.0, timeout),
             cfg=cfg,
             agent=cfg["plan_agent"],
-            variant=cfg["plan_variant"] or cfg["complex_variant"] or "high",
+            reasoning_level=cfg["complex_plan_reasoning_level"],
             title=title,
             on_event=_capture,
         )
@@ -293,9 +307,10 @@ def run_opencode_task(
         timeout=max(30.0, timeout),
         cfg=cfg,
         agent=cfg["build_agent"],
-        variant=(
-            cfg["build_variant"]
-            or (cfg["complex_variant"] if needs_plan else cfg["simple_variant"])
+        reasoning_level=(
+            cfg["complex_build_reasoning_level"]
+            if needs_plan
+            else cfg["simple_build_reasoning_level"]
         ),
         title=title,
         on_event=_capture,
@@ -326,7 +341,7 @@ def _run_opencode_once(
     timeout: float,
     cfg: dict[str, Any],
     agent: str,
-    variant: str,
+    reasoning_level: str,
     title: str,
     on_event: Callable[[dict[str, Any]], None],
 ) -> OpenCodeRunResult:
@@ -348,8 +363,8 @@ def _run_opencode_once(
     ]
     if cfg.get("model"):
         cmd.extend(["--model", str(cfg["model"])])
-    if variant:
-        cmd.extend(["--variant", variant])
+    if reasoning_level:
+        cmd.extend(["--variant", reasoning_level])
     if title:
         cmd.extend(["--title", title])
     if cfg.get("dangerously_skip_permissions"):
@@ -475,9 +490,9 @@ def _plan_prompt(prompt: str) -> str:
     )
 
 
-def _normalize_variant(value: Any) -> str:
+def _normalize_reasoning_level(value: Any) -> str:
     raw = str(value or "").strip().lower()
-    return raw if raw in _VALID_VARIANTS else ""
+    return raw if raw in _VALID_REASONING_LEVELS else ""
 
 
 def _contains_signal(text: str, signal: str) -> bool:
