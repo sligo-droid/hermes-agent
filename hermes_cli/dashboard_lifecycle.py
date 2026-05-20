@@ -43,6 +43,16 @@ def dashboard_log_path() -> Path:
     return get_hermes_home() / "logs" / _LOG_FILENAME
 
 
+def _restartable_argv(argv: list[str]) -> list[str]:
+    """Return an argv suitable for subprocess.Popen."""
+    if not argv:
+        return []
+    first = argv[0].lower()
+    if first.endswith((".py", ".pyw")):
+        return [sys.executable, *argv]
+    return list(argv)
+
+
 def _command_matches_dashboard(command: str) -> bool:
     return any(pattern in command for pattern in _DASHBOARD_PATTERNS)
 
@@ -181,7 +191,7 @@ def record_dashboard_runtime(
     runtime_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "pid": os.getpid(),
-        "argv": argv,
+        "argv": _restartable_argv(argv),
         "cwd": cwd,
         "host": host,
         "port": port,
@@ -322,7 +332,7 @@ def _spawn_dashboard(launch: DashboardLaunch) -> subprocess.Popen[Any]:
             )
         else:
             popen_kwargs["start_new_session"] = True
-        return subprocess.Popen(launch.argv, **popen_kwargs)
+        return subprocess.Popen(_restartable_argv(launch.argv), **popen_kwargs)
 
 
 def restart_dashboard_if_running(
