@@ -1216,6 +1216,36 @@ def test_respawn_guard_blocker_auth_on_authorization_error(kanban_home):
     assert reason == "blocker_auth"
 
 
+def test_respawn_guard_ignores_workspace_permission_error(kanban_home):
+    """Local filesystem permission failures must retry through dispatch."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="workspace-perm", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("workspace: [Errno 13] Permission denied: '/home/droid'", t),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_blocker_auth_cooldown_expires(kanban_home):
+    """Old auth/quota failures eventually retry instead of guarding forever."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="old-quota", assignee="alice")
+        old_end = int(time.time()) - kb._RESPAWN_GUARD_AUTH_WINDOW - 60
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("rate limit exceeded: 429 Too Many Requests", t),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'spawn_failed', 'spawn_failed', ?, ?)",
+            (t, old_end - 30, old_end),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
 def test_respawn_guard_recent_success(kanban_home):
     """A completed run within the guard window triggers recent_success."""
     with kb.connect() as conn:
@@ -1314,6 +1344,40 @@ def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
     # retry without manual unblock.
     with kb.connect() as conn:
         assert kb.get_task(conn, t).status == "ready"
+
+
+def test_dispatch_retries_stale_workspace_permission_error(
+    kanban_home, all_assignees_spawnable
+):
+    """Stale local permission failures must not be respawn-guarded forever."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="stale-perm", assignee="alice")
+        old_end = int(time.time()) - kb._RESPAWN_GUARD_AUTH_WINDOW - 60
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ?, consecutive_failures = 1 "
+            "WHERE id = ?",
+            ("workspace: [Errno 13] Permission denied: '/home/droid'", t),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at, error) "
+            "VALUES (?, 'spawn_failed', 'spawn_failed', ?, ?, ?)",
+            (
+                t,
+                old_end - 30,
+                old_end,
+                "workspace: [Errno 13] Permission denied: '/home/droid'",
+            ),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert spawned_ids == [t]
+    assert not res.respawn_guarded
+    assert t not in res.auto_blocked
 
 
 def test_dispatch_respawn_guard_skips_recent_success(
