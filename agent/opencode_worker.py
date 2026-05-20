@@ -424,6 +424,7 @@ def _run_opencode_once(
     cmd = [
         binary_or_error,
         "run",
+        "Read the attached Hermes worker brief and follow it exactly.",
         "--format",
         "json",
         "--agent",
@@ -439,7 +440,7 @@ def _run_opencode_once(
         cmd.extend(["--title", title])
     if cfg.get("dangerously_skip_permissions"):
         cmd.append("--dangerously-skip-permissions")
-    cmd.extend(["--file", str(brief_path), "Read the attached Hermes worker brief and follow it exactly."])
+    cmd.extend(["--file", str(brief_path)])
 
     try:
         proc = subprocess.run(

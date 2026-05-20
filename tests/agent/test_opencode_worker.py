@@ -48,6 +48,8 @@ def test_simple_task_runs_build_only(monkeypatch, tmp_path):
     assert result.agents == ["build"]
     assert _option(calls[0], "--agent") == "build"
     assert _option(calls[0], "--variant") == "high"
+    assert calls[0][2] == "Read the attached Hermes worker brief and follow it exactly."
+    assert calls[0].index("--file") == len(calls[0]) - 2
 
 
 def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
