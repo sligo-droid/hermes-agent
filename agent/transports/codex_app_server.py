@@ -79,6 +79,14 @@ class CodexAppServerClient:
             spawn_env.update(env)
         if codex_home:
             spawn_env["CODEX_HOME"] = codex_home
+        try:
+            from hermes_constants import get_github_cli_config_dir
+
+            gh_config_dir = get_github_cli_config_dir(spawn_env)
+            if gh_config_dir:
+                spawn_env["GH_CONFIG_DIR"] = gh_config_dir
+        except Exception:
+            pass
 
         app_server_args = list(extra_args or [])
         # Kanban workers must be able to write both their project workspace

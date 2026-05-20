@@ -388,6 +388,12 @@ class TestWorkerSpawnEnv:
 
     def test_default_spawn_sets_env_vars(self, fresh_home, monkeypatch):
         captured = {}
+        real_home = fresh_home / "real_home"
+        gh_dir = real_home / ".config" / "gh"
+        gh_dir.mkdir(parents=True)
+        (gh_dir / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
+        monkeypatch.setenv("HOME", str(real_home))
+        monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
 
         class FakeProc:
             pid = 12345
@@ -428,6 +434,7 @@ class TestWorkerSpawnEnv:
         assert env["HERMES_KANBAN_DB"] == str(expected_db)
         expected_ws = fresh_home / "kanban" / "boards" / "spawntest" / "workspaces"
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
+        assert env["GH_CONFIG_DIR"] == str(gh_dir)
 
     def test_default_board_spawn_keeps_legacy_paths(self, fresh_home, monkeypatch):
         captured = {}

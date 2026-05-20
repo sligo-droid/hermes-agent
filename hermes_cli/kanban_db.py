@@ -5438,6 +5438,7 @@ def _worker_terminal_timeout_env(
 
 
 _SYSTEMD_WORKER_ENV_EXACT = frozenset({
+    "GH_CONFIG_DIR",
     "HOME",
     "HERMES_HOME",
     "HERMES_PROFILE",
@@ -5658,6 +5659,14 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+    try:
+        from hermes_constants import get_github_cli_config_dir
+
+        gh_config_dir = get_github_cli_config_dir(env)
+        if gh_config_dir:
+            env["GH_CONFIG_DIR"] = gh_config_dir
+    except Exception:
+        pass
 
     cmd = [
         *_resolve_hermes_argv(),

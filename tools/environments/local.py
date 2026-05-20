@@ -183,6 +183,18 @@ def _inject_context_hermes_home(env: dict) -> None:
         pass
 
 
+def _inject_github_cli_config_dir(env: dict) -> None:
+    """Expose gh's config dir when HOME isolation would otherwise hide it."""
+    try:
+        from hermes_constants import get_github_cli_config_dir
+
+        value = get_github_cli_config_dir(env)
+        if value:
+            env["GH_CONFIG_DIR"] = value
+    except Exception:
+        pass
+
+
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
@@ -212,6 +224,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     _profile_home = get_subprocess_home()
     if _profile_home:
         sanitized["HOME"] = _profile_home
+
+    _inject_github_cli_config_dir(sanitized)
 
     return sanitized
 
@@ -316,6 +330,8 @@ def _make_run_env(env: dict) -> dict:
     _profile_home = get_subprocess_home()
     if _profile_home:
         run_env["HOME"] = _profile_home
+
+    _inject_github_cli_config_dir(run_env)
 
     # Inject ContextVar-based session vars into subprocess env.
     # ContextVars don't propagate to child processes, so we bridge them here.

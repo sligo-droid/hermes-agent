@@ -83,6 +83,15 @@ def _normalize_service_tier(value: Any) -> str:
     return "normal"
 
 
+def _github_cli_config_dir(env: dict[str, str]) -> Optional[str]:
+    try:
+        from hermes_constants import get_github_cli_config_dir
+
+        return get_github_cli_config_dir(env)
+    except Exception:
+        return None
+
+
 def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
     """Spawn a Codex worker for planner/dev/reviewer tasks.
 
@@ -159,6 +168,9 @@ def _spawn_host_worker(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if inherited_credential_id:
         env["HERMES_CODEX_WORKER_CREDENTIAL_ID"] = inherited_credential_id
+    gh_config_dir = _github_cli_config_dir(env)
+    if gh_config_dir:
+        env["GH_CONFIG_DIR"] = gh_config_dir
 
     cmd = [sys.executable, "-m", "hermes_cli.kanban_codex_worker"]
     return _spawn_logged_process(task, cmd, str(workspace_path), env, settings=settings, backend=backend, board=board)
@@ -206,6 +218,7 @@ def _spawn_docker_worker(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if inherited_credential_id:
         env["HERMES_CODEX_WORKER_CREDENTIAL_ID"] = inherited_credential_id
+    host_gh_config_dir = _github_cli_config_dir(env)
 
     from hermes_cli import kanban_db
 
@@ -229,6 +242,9 @@ def _spawn_docker_worker(
         "-w",
         "/workspace",
     ]
+    if host_gh_config_dir and Path(host_gh_config_dir).is_dir():
+        env["GH_CONFIG_DIR"] = "/gh-config"
+        cmd.extend(["-v", f"{Path(host_gh_config_dir).resolve()}:/gh-config:ro"])
     for key, value in env.items():
         if key.startswith(
             ("HERMES_", "CODEX_", "OPENAI_", "ANTHROPIC_", "GH_", "GITHUB_")

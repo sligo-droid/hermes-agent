@@ -114,6 +114,45 @@ class TestGetSubprocessHome:
         assert get_hermes_home() == root
 
 
+class TestGetGitHubCliConfigDir:
+    """Unit tests for gh config discovery under subprocess HOME isolation."""
+
+    def test_returns_explicit_gh_config_dir(self, monkeypatch):
+        monkeypatch.setenv("GH_CONFIG_DIR", "/custom/gh")
+
+        from hermes_constants import get_github_cli_config_dir
+
+        assert get_github_cli_config_dir() == "/custom/gh"
+
+    def test_falls_back_to_real_home_gh_config(self, tmp_path, monkeypatch):
+        real_home = tmp_path / "real-home"
+        gh_dir = real_home / ".config" / "gh"
+        gh_dir.mkdir(parents=True)
+        (gh_dir / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
+        monkeypatch.setenv("HOME", str(real_home))
+        monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+
+        from hermes_constants import get_github_cli_config_dir
+
+        assert get_github_cli_config_dir() == str(gh_dir)
+
+    def test_prefers_child_home_gh_config_when_present(self, tmp_path, monkeypatch):
+        real_home = tmp_path / "real-home"
+        child_home = tmp_path / "child-home"
+        real_gh = real_home / ".config" / "gh"
+        child_gh = child_home / ".config" / "gh"
+        real_gh.mkdir(parents=True)
+        child_gh.mkdir(parents=True)
+        (real_gh / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
+        (child_gh / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
+        monkeypatch.setenv("HOME", str(real_home))
+        monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+
+        from hermes_constants import get_github_cli_config_dir
+
+        assert get_github_cli_config_dir({"HOME": str(child_home)}) == str(child_gh)
+
+
 # ---------------------------------------------------------------------------
 # _make_run_env() injection
 # ---------------------------------------------------------------------------
@@ -179,6 +218,27 @@ class TestMakeRunEnvHomeInjection:
         assert result["HERMES_HOME"] == str(profile)
         assert result["HOME"] == str(profile / "home")
 
+    def test_injects_gh_config_dir_when_home_is_isolated(self, tmp_path, monkeypatch):
+        real_home = tmp_path / "real-home"
+        hermes_home = tmp_path / "hermes"
+        gh_dir = real_home / ".config" / "gh"
+        gh_dir.mkdir(parents=True)
+        (gh_dir / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
+        hermes_home.mkdir()
+        (hermes_home / "home").mkdir()
+        monkeypatch.setenv("HOME", str(real_home))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+
+        from tools.environments.local import _make_run_env
+        result = _make_run_env({})
+
+        assert result["HOME"] == str(hermes_home / "home")
+        assert result["GH_CONFIG_DIR"] == str(gh_dir)
+        assert "GH_TOKEN" not in result
+        assert "GITHUB_TOKEN" not in result
+
 
 # ---------------------------------------------------------------------------
 # _sanitize_subprocess_env() injection
@@ -230,6 +290,34 @@ class TestSanitizeSubprocessEnvHomeInjection:
 
         assert result["HERMES_HOME"] == str(profile)
         assert result["HOME"] == str(profile / "home")
+
+    def test_injects_gh_config_dir_when_background_home_is_isolated(
+        self, tmp_path, monkeypatch
+    ):
+        real_home = tmp_path / "real-home"
+        hermes_home = tmp_path / "hermes"
+        gh_dir = real_home / ".config" / "gh"
+        gh_dir.mkdir(parents=True)
+        (gh_dir / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
+        hermes_home.mkdir()
+        (hermes_home / "home").mkdir()
+        monkeypatch.setenv("HOME", str(real_home))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+
+        base_env = {
+            "HOME": str(real_home),
+            "PATH": "/usr/bin",
+            "GH_TOKEN": "gho_secret",
+            "GITHUB_TOKEN": "ghp_secret",
+        }
+        from tools.environments.local import _sanitize_subprocess_env
+        result = _sanitize_subprocess_env(base_env)
+
+        assert result["HOME"] == str(hermes_home / "home")
+        assert result["GH_CONFIG_DIR"] == str(gh_dir)
+        assert "GH_TOKEN" not in result
+        assert "GITHUB_TOKEN" not in result
 
 
 # ---------------------------------------------------------------------------
