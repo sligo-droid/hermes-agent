@@ -10998,6 +10998,7 @@ class GatewayRunner:
                     chat_id=str(getattr(source, "chat_id", "") or ""),
                     guild_id=str(getattr(source, "guild_id", "") or ""),
                     parent_channel_id=str(getattr(source, "parent_chat_id", "") or ""),
+                    request_id=str(getattr(event, "message_id", "") or ""),
                     project_context={
                         k: v for k, v in {
                             "project_name": getattr(source, "project_name", None),
@@ -11084,7 +11085,7 @@ class GatewayRunner:
         try:
             from hermes_cli import discord_worker_boards as _dwb
 
-            board = _dwb.board_for_gateway_event(event, create=False)
+            board = _dwb.board_for_gateway_event(event, create=bool(args))
             if board is not None:
                 if not args:
                     return _dwb.status_line(board.slug) + "\n" + _dwb.list_subgoals(board.slug)

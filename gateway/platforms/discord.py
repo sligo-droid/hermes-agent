@@ -1396,10 +1396,10 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         board_handle: Optional[Dict[str, Any]] = None
         try:
-            from hermes_cli.discord_worker_boards import ensure_discord_thread_board
+            from hermes_cli.discord_worker_boards import start_planner_request
 
             guild = getattr(thread_channel, "guild", None)
-            board = ensure_discord_thread_board(
+            board = start_planner_request(
                 thread_id=str(getattr(thread_channel, "id", "") or ""),
                 chat_id=str(
                     getattr(parent_channel, "id", "")
@@ -1408,8 +1408,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 ),
                 guild_id=str(getattr(guild, "id", "") or ""),
                 parent_channel_id=str(getattr(parent_channel, "id", "") or ""),
-                initial_request=initial_request,
+                request=initial_request,
                 project_context=project_context,
+                created_by="discord-feature-request",
             )
             board_handle = {
                 "slug": board.slug,

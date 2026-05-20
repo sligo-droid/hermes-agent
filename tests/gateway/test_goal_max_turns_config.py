@@ -115,6 +115,51 @@ async def test_gateway_goal_kickoff_wraps_nested_slash_body(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_discord_subgoal_without_board_creates_dev_ticket(tmp_path, monkeypatch):
+    kanban_home = tmp_path / "kanban-home"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+
+    event = MessageEvent(
+        text="/subgoal Add regression tests",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="parent-channel",
+            chat_type="thread",
+            thread_id="thread-100",
+            parent_chat_id="parent-channel",
+            user_id="user-goal-config",
+        ),
+        message_id="msg-subgoal",
+    )
+
+    response = await GatewayRunner._handle_subgoal_command(runner, event)
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.board_slug_for_discord_thread("thread-100")
+    meta = kanban_db.read_board_metadata(board)
+    worker = meta["discord_worker"]
+    conn = kanban_db.connect(board=board)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+
+    assert response == "Added subgoal 1: Add regression tests"
+    assert worker["execution_mode"] == "kanban_pipeline"
+    assert worker["goal_status"] == "active"
+    assert len(tasks) == 1
+    assert tasks[0].assignee == "dev"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("pause_first", [False, True])
 async def test_gateway_goal_resume_queues_continuation_turn(tmp_path, monkeypatch, pause_first):
     """Regression: /goal resume must wake the gateway loop, not just report state."""
