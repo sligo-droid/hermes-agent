@@ -91,15 +91,27 @@ def select_codex_worker_credential(parent_agent: Any = None) -> tuple[Any, Any]:
     return pool, None
 
 
-def _copy_codex_file_if_missing(codex_home: Path, name: str) -> None:
+def _copy_codex_file(codex_home: Path, name: str, *, overwrite: bool = False) -> None:
     source_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
     src = source_home / name
     dst = codex_home / name
-    if src.exists() and not dst.exists():
+    if src.exists() and (overwrite or not dst.exists()):
         try:
             shutil.copy2(src, dst)
         except OSError:
             pass
+
+
+def _codex_auth_has_id_token(codex_home: Path) -> bool:
+    auth_path = codex_home / "auth.json"
+    if not auth_path.is_file():
+        return False
+    try:
+        payload = json.loads(auth_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    return isinstance(tokens, dict) and bool(str(tokens.get("id_token", "") or "").strip())
 
 
 def _write_minimal_config(codex_home: Path) -> None:
@@ -168,9 +180,9 @@ def prepare_codex_worker_home(
             credential_id or "<unknown>",
         )
     else:
-        _copy_codex_file_if_missing(path, "auth.json")
+        _copy_codex_file(path, "auth.json", overwrite=not _codex_auth_has_id_token(path))
 
-    _copy_codex_file_if_missing(path, "credentials.json")
+    _copy_codex_file(path, "credentials.json")
     _write_minimal_config(path)
     return credential_id
 

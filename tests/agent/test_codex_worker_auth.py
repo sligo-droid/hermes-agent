@@ -80,9 +80,12 @@ def test_prepare_worker_home_falls_back_when_pool_auth_is_incomplete(tmp_path, m
     )
     monkeypatch.setattr(credential_pool, "load_pool", lambda provider: FakePool(entry))
 
-    credential_id = prepare_codex_worker_home(tmp_path / "worker-codex")
+    worker_home = tmp_path / "worker-codex"
+    _write_codex_auth(worker_home, access="stale-access", refresh="stale-refresh", id_token="")
 
-    payload = json.loads((tmp_path / "worker-codex" / "auth.json").read_text(encoding="utf-8"))
+    credential_id = prepare_codex_worker_home(worker_home)
+
+    payload = json.loads((worker_home / "auth.json").read_text(encoding="utf-8"))
     assert credential_id is None
     assert payload["tokens"]["access_token"] == "cli-access"
     assert payload["tokens"]["refresh_token"] == "cli-refresh"
