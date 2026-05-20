@@ -612,6 +612,44 @@ def test_discord_worker_dispatch_skips_intake_board(monkeypatch, tmp_path):
     assert spawned == []
 
 
+def test_running_worker_thread_targets_returns_running_role_boards(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(
+        thread_id="2401",
+        goal="Ship typed workers",
+        chat_id="parent-1",
+    )
+    other = dwb.set_goal(thread_id="2402", goal="Idle board", chat_id="parent-2")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        role_task = _create_ready_dev_task(board.slug)
+        non_role_task = kanban_db.create_task(
+            conn,
+            title="Running non-role task",
+            assignee="ordinary-worker",
+            tenant=board.slug,
+        )
+        kanban_db.claim_task(conn, role_task)
+        kanban_db.claim_task(conn, non_role_task)
+    finally:
+        conn.close()
+
+    targets = dwb.running_worker_thread_targets()
+
+    assert targets == [
+        {
+            "board": board.slug,
+            "thread_id": "2401",
+            "chat_id": "parent-1",
+            "running": 1,
+        }
+    ]
+    assert other.slug not in {target["board"] for target in targets}
+
+
 def test_discord_worker_dispatch_spawns_across_two_boards(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards

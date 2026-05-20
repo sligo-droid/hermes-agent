@@ -43,6 +43,7 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from gateway.platforms.discord import DiscordAdapter  # noqa: E402
+import gateway.platforms.discord as discord_adapter_module  # noqa: E402
 
 
 @pytest.mark.asyncio
@@ -408,6 +409,60 @@ async def test_typing_task_removed_after_api_error():
 
     assert "12345" not in adapter._typing_tasks, \
         "Stale task should be removed after API error"
+
+
+@pytest.mark.asyncio
+async def test_send_typing_once_routes_to_metadata_thread(monkeypatch):
+    """One-shot Discord typing should target the thread, not the parent channel."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    routes = []
+
+    def fake_route(method, path, **kwargs):
+        routes.append({"method": method, "path": path, **kwargs})
+        return SimpleNamespace()
+
+    monkeypatch.setattr(discord_adapter_module.discord.http, "Route", fake_route)
+    adapter._client = SimpleNamespace(http=SimpleNamespace(request=AsyncMock()))
+    adapter._typing_tasks = {}
+
+    await adapter.send_typing_once("parent-123", metadata={"thread_id": "thread-456"})
+
+    assert routes == [
+        {
+            "method": "POST",
+            "path": "/channels/{channel_id}/typing",
+            "channel_id": "thread-456",
+        }
+    ]
+    adapter._client.http.request.assert_awaited_once()
+    assert adapter._typing_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_persistent_typing_uses_thread_key_and_parent_alias(monkeypatch):
+    """Persistent typing loops route to metadata thread and remain stoppable by parent."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    routes = []
+
+    def fake_route(method, path, **kwargs):
+        routes.append({"method": method, "path": path, **kwargs})
+        return SimpleNamespace()
+
+    monkeypatch.setattr(discord_adapter_module.discord.http, "Route", fake_route)
+    adapter._client = SimpleNamespace(http=SimpleNamespace(request=AsyncMock()))
+    adapter._typing_tasks = {}
+    adapter._typing_aliases = {}
+
+    await adapter.send_typing("parent-123", metadata={"thread_id": "thread-456"})
+    await asyncio.sleep(0.05)
+
+    assert "thread-456" in adapter._typing_tasks
+    assert "parent-123" not in adapter._typing_tasks
+    assert routes[0]["channel_id"] == "thread-456"
+
+    await adapter.stop_typing("parent-123")
+
+    assert adapter._typing_tasks == {}
 
 
 @pytest.mark.asyncio

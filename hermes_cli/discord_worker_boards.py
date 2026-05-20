@@ -1362,6 +1362,42 @@ def is_paused_or_cancelled(board: str) -> bool:
     return bool(worker.get("paused") or worker.get("cancelled"))
 
 
+def running_worker_thread_targets() -> list[dict[str, Any]]:
+    """Return Discord thread targets whose worker board is actively running."""
+    targets: list[dict[str, Any]] = []
+    for board_meta in kanban_db.list_boards(include_archived=False):
+        board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
+        worker = _read_worker_meta(board)
+        if worker.get("kind") != "discord_worker_board":
+            continue
+        thread_id = str(worker.get("thread_id") or "").strip()
+        if not thread_id:
+            continue
+        conn = kanban_db.connect(board=board)
+        try:
+            placeholders = ",".join("?" for _ in ROLE_ASSIGNEES)
+            row = conn.execute(
+                "SELECT COUNT(*) FROM tasks "
+                "WHERE status = 'running' AND lower(assignee) IN "
+                f"({placeholders})",
+                tuple(sorted(ROLE_ASSIGNEES)),
+            ).fetchone()
+            running = int(row[0] or 0) if row else 0
+        finally:
+            conn.close()
+        if running <= 0:
+            continue
+        targets.append(
+            {
+                "board": board,
+                "thread_id": thread_id,
+                "chat_id": str(worker.get("chat_id") or thread_id),
+                "running": running,
+            }
+        )
+    return targets
+
+
 def _cancel_unstarted_task(board: str, task_id: str) -> None:
     if not task_id:
         return
