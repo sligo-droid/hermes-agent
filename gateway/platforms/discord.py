@@ -1551,7 +1551,10 @@ class DiscordAdapter(BasePlatformAdapter):
         if command.lower() != "goal":
             return False
         lower_args = args.strip().lower()
-        return bool(lower_args and lower_args not in {"status", "pause", "resume", "clear", "stop", "done"})
+        return bool(
+            lower_args
+            and lower_args not in {"status", "pause", "resume", "clear", "stop", "done"}
+        )
 
     async def _classify_discord_feature_request(self, text: str) -> bool:
         if not str(text or "").strip():
@@ -6050,13 +6053,24 @@ class DiscordAdapter(BasePlatformAdapter):
 
         all_attachments = list(message.attachments) + snapshot_attachments
         message_is_voice = self._message_has_voice_flag(message)
-        is_slash_command_message = normalized_content.startswith("/")
-        slash_command_starts_threaded_work = self._slash_command_starts_threaded_work(normalized_content)
-        is_meeting_command_message = self._is_meeting_command_text(normalized_content)
-        meeting_audio_attachments = [
+        all_audio_attachments = [
             att for att in all_attachments
             if self._is_audio_attachment(att, message_is_voice=message_is_voice)
-        ] if is_meeting_command_message else []
+        ]
+        is_slash_command_message = normalized_content.startswith("/")
+        is_meeting_command_message = self._is_meeting_command_text(normalized_content)
+        if (
+            not is_meeting_command_message
+            and mention_prefix
+            and all_audio_attachments
+            and not is_slash_command_message
+        ):
+            normalized_content = f"/meeting {normalized_content}".strip()
+            message.content = normalized_content
+            is_slash_command_message = True
+            is_meeting_command_message = True
+        meeting_audio_attachments = all_audio_attachments if is_meeting_command_message else []
+        slash_command_starts_threaded_work = self._slash_command_starts_threaded_work(normalized_content)
 
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
