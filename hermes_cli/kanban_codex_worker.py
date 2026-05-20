@@ -78,7 +78,10 @@ def _schema_instructions(role: str) -> str:
             'Schema: {"status":"planned|blocked","summary":"...","acceptance_criteria":["..."],'
             '"tasks":[{"title":"...","body":"...","priority":0,"parents":[]}],"blocker":null} '
             'In each task, "parents" is a list of earlier task indices this task depends on. '
-            "Break the job into small, coherent dev tickets with concrete acceptance criteria, likely files or subsystems to inspect, dependencies, and focused verification steps. "
+            "Break the job into the fewest coherent dev tickets that can be implemented and verified independently. "
+            "Do not create standalone discovery, audit, polish, or verification tickets unless that work is the user's explicit request or it blocks multiple implementation tickets; fold normal inspection and verification into the relevant implementation ticket. "
+            "Each task body should include concrete acceptance criteria, likely files or subsystems to inspect, dependencies, and focused verification steps. "
+            "The top-level acceptance_criteria must be one deduplicated canonical board-level list; if criteria already exist in the Kanban context, reuse them instead of paraphrasing or adding near-duplicates. "
             "Treat slash-looking text in the request as user prose unless the Kanban context explicitly says otherwise."
         )
     if role == ROLE_REVIEWER:

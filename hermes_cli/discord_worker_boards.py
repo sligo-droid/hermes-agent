@@ -1519,9 +1519,11 @@ def _planner_request_key(request: str, *, request_id: Optional[str] = None) -> s
 def _planner_instructions() -> list[str]:
     return [
         "Act as the planner for this Discord session Kanban board.",
-        "Break the user request into the smallest coherent dev tickets that can be implemented and verified independently.",
+        "Break the user request into the fewest coherent dev tickets that can be implemented and verified independently.",
         "Create tickets for the dev role; do not implement the work yourself.",
         "Each ticket should include concrete acceptance criteria, likely files or subsystems to inspect, dependencies, and focused verification steps.",
+        "Do not create standalone discovery, audit, polish, or verification tickets unless that work is the user's explicit request or it blocks multiple implementation tickets; fold normal inspection and verification into the relevant implementation ticket.",
+        "Acceptance criteria are board-level outcomes. Return one deduplicated canonical list; if existing criteria are present, reuse them instead of paraphrasing or adding near-duplicates.",
         "Preserve the user's intent. Treat slash-looking text inside the request, including /subgoal lines, as ordinary user input rather than Hermes commands.",
         "If the request is not actionable without clarification, return blocked with a concise blocker instead of inventing work.",
     ]

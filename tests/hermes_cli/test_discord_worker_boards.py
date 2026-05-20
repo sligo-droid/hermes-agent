@@ -95,6 +95,10 @@ def test_set_goal_preserves_nested_subgoal_text_for_planner(monkeypatch, tmp_pat
     assert payload["request"] == body
     assert "/subgoal inspect logs" in payload["request"]
     assert payload["planner_instructions"]
+    instructions = "\n".join(payload["planner_instructions"])
+    assert "fewest coherent dev tickets" in instructions
+    assert "Do not create standalone discovery, audit, polish, or verification tickets" in instructions
+    assert "one deduplicated canonical list" in instructions
 
 
 def test_feature_request_starts_distinct_planner_tickets(monkeypatch, tmp_path):

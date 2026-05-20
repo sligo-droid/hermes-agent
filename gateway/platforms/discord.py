@@ -1397,22 +1397,34 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         board_handle: Optional[Dict[str, Any]] = None
         try:
-            from hermes_cli.discord_worker_boards import start_planner_request
+            from hermes_cli.discord_worker_boards import (
+                ensure_discord_thread_board,
+                start_planner_request,
+            )
 
             guild = getattr(thread_channel, "guild", None)
-            board = start_planner_request(
-                thread_id=str(getattr(thread_channel, "id", "") or ""),
-                chat_id=str(
+            board_kwargs = {
+                "thread_id": str(getattr(thread_channel, "id", "") or ""),
+                "chat_id": str(
                     getattr(parent_channel, "id", "")
                     or getattr(thread_channel, "id", "")
                     or ""
                 ),
-                guild_id=str(getattr(guild, "id", "") or ""),
-                parent_channel_id=str(getattr(parent_channel, "id", "") or ""),
-                request=initial_request,
-                project_context=project_context,
-                created_by="discord-feature-request",
-            )
+                "guild_id": str(getattr(guild, "id", "") or ""),
+                "parent_channel_id": str(getattr(parent_channel, "id", "") or ""),
+                "project_context": project_context,
+            }
+            if self._slash_command_starts_threaded_work(initial_request):
+                board = ensure_discord_thread_board(
+                    initial_request=initial_request,
+                    **board_kwargs,
+                )
+            else:
+                board = start_planner_request(
+                    request=initial_request,
+                    created_by="discord-feature-request",
+                    **board_kwargs,
+                )
             board_handle = {
                 "slug": board.slug,
                 "public_url": board.public_url,
