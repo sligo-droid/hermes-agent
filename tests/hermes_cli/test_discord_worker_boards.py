@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def _home(monkeypatch, tmp_path: Path) -> Path:
@@ -1017,6 +1018,71 @@ def test_worker_ticket_terminal_endpoint_returns_auth_scoped_feed(monkeypatch, t
     assert "def leaked(): pass" not in rendered
     assert "sk-proj-A1B2C3D4E5F6G7H8I9J0" not in rendered
     assert missing.status_code == 404
+
+
+def test_worker_ticket_terminal_labels_opencode_state(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    board = dwb.set_goal(thread_id="8184", goal="Plan with OpenCode")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        claimed = kanban_db.claim_task(conn, task.id)
+        assert claimed is not None
+    finally:
+        conn.close()
+    kanban_db._append_worker_log_line(
+        kanban_db.worker_log_path(task.id, board=board.slug),
+        "[kanban dispatcher] spawning OpenCode role worker: opencode secret prompt",
+    )
+    dwb.record_codex_worker_event(
+        task.id,
+        board=board.slug,
+        event={
+            "method": "opencode/message",
+            "params": {"item": {"type": "message", "text": "hidden"}},
+        },
+    )
+    dwb.record_codex_worker_result(
+        task.id,
+        board=board.slug,
+        result=SimpleNamespace(
+            backend="opencode",
+            final_text='{"status":"planned"}',
+            error=None,
+            interrupted=False,
+            timed_out=False,
+            should_retire=False,
+            tool_iterations=1,
+            turn_id="ses-plan",
+            thread_id="ses-plan",
+            agents=["plan"],
+            plan_text="",
+            exit_code=0,
+            duration_seconds=1.0,
+        ),
+    )
+
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    resp = client.get(f"/workers/8184/tickets/{task.id}/terminal")
+
+    assert resp.status_code == 200
+    terminal = "\n".join(resp.json()["lines"])
+    assert "# opencode worker log" in terminal
+    assert "# codex app worker log" not in terminal
+    assert "opencode result tool_iterations=1 turn=ses-plan thread=ses-plan" in terminal
+    public_log = "\n".join(
+        dwb._public_worker_log_lines(
+            "[kanban dispatcher] spawning OpenCode role worker: opencode secret prompt"
+        )
+    )
+    assert "spawning OpenCode role worker: [command hidden]" in public_log
+    assert "opencode secret prompt" not in public_log
 
 
 def test_worker_ticket_state_endpoint_reports_empty_codex_state(monkeypatch, tmp_path):
