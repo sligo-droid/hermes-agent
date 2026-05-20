@@ -485,6 +485,18 @@ def test_patch_status_running_rejected(client):
     assert statuses.get(t["id"]) != "running"
 
 
+def test_patch_drag_drop_move_to_review(client):
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={"status": "review"},
+    )
+
+    assert r.status_code == 200
+    assert r.json()["task"]["status"] == "review"
+
+
 # ---------------------------------------------------------------------------
 # DELETE /tasks/:id
 # ---------------------------------------------------------------------------

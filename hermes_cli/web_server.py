@@ -395,6 +395,28 @@ async def pause_worker_session_board(session_id: str, return_to: Optional[str] =
         raise HTTPException(status_code=500, detail="Kanban board unavailable")
 
 
+class WorkerTicketMove(BaseModel):
+    status: str
+
+
+@app.post("/workers/{session_id}/tickets/{task_id}/move", response_class=JSONResponse)
+async def worker_ticket_move(session_id: str, task_id: str, payload: WorkerTicketMove):
+    """Move one Discord worker ticket to another status column."""
+    try:
+        from hermes_cli.discord_worker_boards import move_ticket_for_session
+
+        return JSONResponse(move_ticket_for_session(session_id, task_id, payload.status))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        _log.warning("worker ticket move failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Ticket move unavailable")
+
+
 @app.get("/workers/{session_id}/tickets/{task_id}/state", response_class=JSONResponse)
 async def worker_ticket_state(session_id: str, task_id: str):
     """Detailed read-only state for one Discord worker ticket."""
