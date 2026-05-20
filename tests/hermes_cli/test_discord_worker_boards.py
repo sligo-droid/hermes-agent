@@ -533,6 +533,7 @@ def test_public_session_board_auto_refreshes(monkeypatch, tmp_path):
     assert 'data-drop-disabled="true"' in html
     assert "Workers can only enter running through the dispatcher." in html
     assert "JSON.stringify({ status })" in html
+    assert 'event.pointerType === "mouse"' not in html
     for status in dwb.PUBLIC_BOARD_COLUMNS:
         assert f'data-status="{status}"' in html
     assert 'id="ticket-modal"' in html

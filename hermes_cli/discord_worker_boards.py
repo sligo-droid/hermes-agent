@@ -1665,7 +1665,7 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
           clearColumnDrops();
         }});
         item.addEventListener("pointerdown", (event) => {{
-          if (event.pointerType === "mouse" || event.button !== 0) return;
+          if (event.button !== 0) return;
           touchState = {{
             item,
             pointerId: event.pointerId,
@@ -1674,7 +1674,7 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
             targetColumn: null,
             started: false,
           }};
-          if (item.setPointerCapture) item.setPointerCapture(event.pointerId);
+          if (event.pointerType !== "mouse" && item.setPointerCapture) item.setPointerCapture(event.pointerId);
         }});
       }});
       columns.forEach((column) => {{
