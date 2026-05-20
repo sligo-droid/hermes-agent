@@ -12,6 +12,9 @@ Verifies that:
 
 from __future__ import annotations
 
+import json
+import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -70,6 +73,43 @@ def _make_codex_agent(max_iterations: int = 1000):
     return agent
 
 
+def _write_codex_pool_with_exhausted_primary(hermes_home: Path) -> None:
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credential_pool": {
+                    "openai-codex": [
+                        {
+                            "id": "cred-1",
+                            "label": "primary",
+                            "auth_type": "oauth",
+                            "priority": 0,
+                            "source": "manual:device_code",
+                            "access_token": "access-1",
+                            "refresh_token": "refresh-1",
+                            "last_status": "exhausted",
+                            "last_status_at": time.time(),
+                            "last_error_code": 429,
+                            "last_error_reset_at": time.time() + 5 * 3600,
+                        },
+                        {
+                            "id": "cred-2",
+                            "label": "secondary",
+                            "auth_type": "oauth",
+                            "priority": 1,
+                            "source": "manual:device_code",
+                            "access_token": "access-2",
+                            "refresh_token": "refresh-2",
+                        },
+                    ]
+                },
+            }
+        )
+    )
+
+
 class RecordingSessionDB:
     def __init__(self):
         self.created_sessions = []
@@ -101,6 +141,25 @@ class TestRunConversationCodexPath:
         assert result["api_calls"] == 1
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
+
+    def test_codex_app_server_uses_available_pool_credential(
+        self, fake_session, monkeypatch, tmp_path
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        _write_codex_pool_with_exhausted_primary(hermes_home)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        agent = _make_codex_agent()
+        agent.provider = "openai-codex"
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello there")
+
+        assert result["completed"] is True
+        codex_home = Path(agent._codex_session._codex_home)
+        payload = json.loads((codex_home / "auth.json").read_text())
+        assert agent._codex_worker_credential_id == "cred-2"
+        assert payload["tokens"]["access_token"] == "access-2"
+        assert payload["tokens"]["refresh_token"] == "refresh-2"
 
     def test_activity_summary_tracks_codex_runtime(self, monkeypatch):
         """Gateway long-running notices use get_activity_summary().

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import time
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from agent.transports.codex_app_server_session import TurnResult
 from tools import codex_worker_tool as cwt
@@ -79,3 +82,85 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     prompt = FakeSession.instances[0].run_calls[0]["user_input"]
     assert "fix the parser" in prompt
     assert "focus on src/parser.py" in prompt
+
+
+def test_runs_with_available_codex_pool_credential(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credential_pool": {
+                    "openai-codex": [
+                        {
+                            "id": "cred-1",
+                            "label": "primary",
+                            "auth_type": "oauth",
+                            "priority": 0,
+                            "source": "manual:device_code",
+                            "access_token": "access-1",
+                            "refresh_token": "refresh-1",
+                            "last_status": "exhausted",
+                            "last_status_at": time.time(),
+                            "last_error_code": 429,
+                            "last_error_reset_at": time.time() + 5 * 3600,
+                        },
+                        {
+                            "id": "cred-2",
+                            "label": "secondary",
+                            "auth_type": "oauth",
+                            "priority": 1,
+                            "source": "manual:device_code",
+                            "access_token": "access-2",
+                            "refresh_token": "refresh-2",
+                        },
+                    ]
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_codex_coding_task(
+            task="fix the parser",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    codex_home = FakeSession.instances[0].kwargs["codex_home"]
+    assert codex_home
+    payload = json.loads((Path(codex_home) / "auth.json").read_text())
+    assert payload["tokens"]["access_token"] == "access-2"
+    assert payload["tokens"]["refresh_token"] == "refresh-2"
+
+
+def test_codex_worker_home_prefers_parent_current_credential(tmp_path):
+    from agent.codex_worker_auth import prepare_codex_worker_home
+
+    current_entry = SimpleNamespace(
+        id="cred-current",
+        access_token="access-current",
+        refresh_token="refresh-current",
+        last_status=None,
+    )
+    pool = SimpleNamespace(
+        current=lambda: current_entry,
+        select=MagicMock(),
+    )
+    parent = SimpleNamespace(provider="openai-codex", _credential_pool=pool)
+
+    credential_id = prepare_codex_worker_home(tmp_path / "codex-home", parent_agent=parent)
+
+    payload = json.loads((tmp_path / "codex-home" / "auth.json").read_text())
+    assert credential_id == "cred-current"
+    assert payload["tokens"]["access_token"] == "access-current"
+    assert payload["tokens"]["refresh_token"] == "refresh-current"
+    pool.select.assert_not_called()
