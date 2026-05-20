@@ -677,12 +677,18 @@ def test_worker_ticket_terminal_endpoint_returns_sanitized_feed(monkeypatch, tmp
         )
     finally:
         conn.close()
+    log_path = kanban_db.worker_log_path(task.id, board=board.slug)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     kanban_db._append_worker_log_line(
-        kanban_db.worker_log_path(task.id, board=board.slug),
+        log_path,
+        "[kanban dispatcher] scheduled Codex role worker: role=planner reasoning=high mode=fast",
+    )
+    kanban_db._append_worker_log_line(
+        log_path,
         "[kanban dispatcher] spawning Codex role worker: hermes chat -q secret prompt",
     )
     kanban_db._append_worker_log_line(
-        kanban_db.worker_log_path(task.id, board=board.slug),
+        log_path,
         "ran cat /home/droid/private/config.yaml with key sk-proj-A1B2C3D4E5F6G7H8I9J0",
     )
     dwb.record_codex_worker_event(
@@ -711,6 +717,7 @@ def test_worker_ticket_terminal_endpoint_returns_sanitized_feed(monkeypatch, tmp
     assert data["task"]["id"] == task.id
     assert data["current_run"]["id"] == claimed.current_run_id
     assert data["lines"][0] == f"$ ticket {task.id}"
+    assert "scheduled Codex role worker: role=planner reasoning=high mode=fast" in "\n".join(data["lines"])
     assert "completed: Read [REDACTED_PATH]" in "\n".join(data["lines"])
     assert "codex_state" not in data
     assert "events" not in data

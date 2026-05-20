@@ -133,12 +133,20 @@ def _run_codex(
 
 
 def _role_extra_args(role: str) -> list[str]:
-    effort = "medium"
-    if role in {ROLE_PLANNER, ROLE_REVIEWER}:
-        effort = "high"
+    effort = str(os.environ.get("HERMES_CODEX_WORKER_REASONING") or "").strip().lower()
+    if effort not in {"minimal", "low", "medium", "high", "xhigh"}:
+        effort = "medium"
+        if role in {ROLE_PLANNER, ROLE_REVIEWER}:
+            effort = "high"
+    service_tier = str(os.environ.get("HERMES_CODEX_WORKER_SERVICE_TIER") or "normal").strip().lower()
+    if service_tier not in {"fast", "normal"}:
+        service_tier = "normal"
     # Codex accepts arbitrary config overrides through -c. Unknown keys are
     # ignored by older versions, so this remains forward-compatible.
-    return ["-c", f'model_reasoning_effort="{effort}"']
+    return [
+        "-c", f'model_reasoning_effort="{effort}"',
+        "-c", f'service_tier="{service_tier}"',
+    ]
 
 
 def _role_timeout(role: str) -> float:

@@ -1591,9 +1591,9 @@ DEFAULT_CONFIG = {
             "max_workers_per_board": 1,
             "review_loop_limit": 5,
             "roles": {
-                "planner": {"reasoning": "high", "max_runtime_seconds": 1800},
-                "dev": {"reasoning": "medium", "max_runtime_seconds": 3600},
-                "reviewer": {"reasoning": "high", "max_runtime_seconds": 1800},
+                "planner": {"reasoning": "high", "service_tier": "normal", "max_runtime_seconds": 1800},
+                "dev": {"reasoning": "medium", "service_tier": "normal", "max_runtime_seconds": 3600},
+                "reviewer": {"reasoning": "high", "service_tier": "normal", "max_runtime_seconds": 1800},
             },
         },
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
