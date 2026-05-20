@@ -441,6 +441,7 @@ def _ticket_state_for_board(
             "board": board,
             "worker": _public_worker_meta(worker or _read_worker_meta(board)),
             "task": _task_state_dict(task),
+            "current_run": _current_run_state(task, runs),
             "runs": [_run_state_dict(run) for run in runs],
             "events": [_event_state_dict(event) for event in events[-200:]],
             "worker_log_tail": kanban_db.read_worker_log(
@@ -448,7 +449,7 @@ def _ticket_state_for_board(
                 tail_bytes=CODEX_STATE_LOG_TAIL_BYTES,
                 board=board,
             ),
-            "codex_state": _read_codex_worker_state(task_id, board=board) or None,
+            "codex_state": _ticket_codex_state(task_id, board=board),
         }
     finally:
         conn.close()
@@ -589,6 +590,22 @@ def _public_count_text(counts: dict[str, Any]) -> str:
     return " ".join(f"{key}:{counts.get(key) or 0}" for key in keys)
 
 
+def _board_runtime_state(
+    worker: dict[str, Any],
+    *,
+    running_count: int,
+) -> str:
+    if worker.get("cancelled") or worker.get("goal_status") == "cancelled":
+        return "cancelled"
+    if worker.get("paused") or worker.get("goal_status") == "paused" or worker.get("phase") == "paused":
+        return "paused"
+    if str(worker.get("blocked_reason") or "").strip():
+        return "blocked"
+    if running_count > 0:
+        return "running"
+    return "idle"
+
+
 def _running_ticket_snapshot(conn: Any) -> list[dict[str, Any]]:
     running = [
         task for task in kanban_db.list_tasks(conn, include_archived=False)
@@ -630,6 +647,32 @@ def _running_status_text(items: list[dict[str, Any]]) -> str:
     if len(items) >= 5:
         parts.append("...")
     return "; ".join(parts)
+
+
+def _current_run_state(task: Any, runs: list[Any]) -> Optional[dict[str, Any]]:
+    current_run_id = getattr(task, "current_run_id", None)
+    if current_run_id is not None:
+        for run in runs:
+            if getattr(run, "id", None) == current_run_id:
+                return _run_state_dict(run)
+    for run in reversed(runs):
+        if getattr(run, "ended_at", None) is None or getattr(run, "status", "") == "running":
+            return _run_state_dict(run)
+    if runs:
+        return _run_state_dict(runs[-1])
+    return None
+
+
+def _ticket_codex_state(task_id: str, *, board: str) -> dict[str, Any]:
+    state = _read_codex_worker_state(task_id, board=board)
+    if not state:
+        return {
+            "available": False,
+            "message": "No Codex app-server internals captured for this ticket yet.",
+        }
+    state = dict(state)
+    state["available"] = True
+    return state
 
 
 def render_public_board_html(token: str) -> str:
@@ -742,12 +785,13 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
       const title = document.getElementById("ticket-modal-title");
       const body = document.getElementById("ticket-modal-body");
       const close = document.getElementById("ticket-modal-close");
+      const emptyCodexMessage = "No Codex app-server internals captured for this ticket yet.";
       const hide = () => {{
         modal.setAttribute("aria-hidden", "true");
         body.textContent = "";
       }};
       const show = (label) => {{
-        title.textContent = label || "Ticket State";
+        title.textContent = label ? label + " - Worker Internals" : "Worker Internals";
         body.textContent = "Loading...";
         modal.setAttribute("aria-hidden", "false");
       }};
@@ -762,7 +806,10 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
               throw new Error(`HTTP ${{response.status}}`);
             }}
             const state = await response.json();
-            body.textContent = JSON.stringify(state, null, 2);
+            const rendered = JSON.stringify(state, null, 2);
+            body.textContent = state?.codex_state?.available === false
+              ? (state.codex_state.message || emptyCodexMessage) + "\\n\\n" + rendered
+              : rendered;
           }} catch (error) {{
             body.textContent = `Unable to load ticket state: ${{error}}`;
           }}
@@ -838,6 +885,7 @@ def render_public_board_index_html() -> str:
         running = board.get("running") if isinstance(board.get("running"), list) else []
         count_text = _public_count_text(counts)
         running_text = _running_status_text(running)
+        runtime = _board_runtime_state(worker, running_count=len(running))
         title = esc(worker.get("root_goal") or worker.get("initial_request") or board.get("name"))
         link = f'<a href="{href}">{title}</a>' if href else title
         status = _public_status_text(worker)
@@ -868,7 +916,12 @@ def render_public_board_index_html() -> str:
         if blocked_reason:
             flags.append(f"blocked: {blocked_reason}")
         flags_text = " ".join(flags)
-        if worker.get("paused") or worker.get("cancelled") or worker.get("goal_status") in {"paused", "unset", "cancelled"}:
+        if worker.get("paused") or worker.get("goal_status") == "paused" or worker.get("phase") == "paused":
+            primary_action = (
+                f'<form method="post" action="/workers/{quote(session_id, safe="")}/start">'
+                '<button type="submit">Resume</button></form>'
+            )
+        elif worker.get("cancelled") or worker.get("goal_status") in {"unset", "cancelled"}:
             primary_action = (
                 f'<form method="post" action="/workers/{quote(session_id, safe="")}/start">'
                 '<button type="submit">Start</button></form>'
@@ -881,6 +934,7 @@ def render_public_board_index_html() -> str:
         items.append(
             "<li><strong>{link}</strong><br>"
             "<code>{session}</code> {status}"
+            '<p>Runtime: <strong class="runtime runtime-{runtime_class}">{runtime}</strong></p>'
             "<p>{counts}</p>"
             "<p>Running: {running}</p>"
             "<p>{branch}{mode}{pr}{review}</p>"
@@ -890,6 +944,8 @@ def render_public_board_index_html() -> str:
                 link=link,
                 session=esc(session_id),
                 status=esc(status),
+                runtime=esc(runtime),
+                runtime_class=runtime,
                 counts=esc(count_text),
                 running=esc(running_text),
                 branch=f"Branch: {esc(branch)}" if branch else "Branch: pending",
@@ -919,6 +975,11 @@ def render_public_board_index_html() -> str:
     p {{ margin: 8px 0 0; color: #52606d; font-size: 13px; }}
     a {{ color: #1d4ed8; text-decoration: none; }}
     a:hover {{ text-decoration: underline; }}
+    .runtime {{ text-transform: uppercase; }}
+    .runtime-running {{ color: #047857; }}
+    .runtime-idle {{ color: #475569; }}
+    .runtime-paused {{ color: #b45309; }}
+    .runtime-blocked, .runtime-cancelled {{ color: #b91c1c; }}
     .actions {{ margin-top: 10px; }}
     form {{ display: inline; margin: 0; }}
     button {{ background: #1f2933; border: 1px solid #1f2933; border-radius: 6px; color: #fff; cursor: pointer; font: inherit; padding: 6px 10px; }}

@@ -247,6 +247,7 @@ def test_public_board_index_lists_operational_row_data(monkeypatch, tmp_path):
     html = dwb.render_public_board_index_html()
 
     assert "active / dev" in html
+    assert 'Runtime: <strong class="runtime runtime-paused">paused</strong>' in html
     assert "ready:1 running:1" in html
     assert "Running: Running task" in html
     assert "Branch: discord/5152" in html
@@ -256,6 +257,7 @@ def test_public_board_index_lists_operational_row_data(monkeypatch, tmp_path):
     assert "Updated: 1970-01-01 00:03:20 UTC" in html
     assert "paused blocked: waiting for review" in html
     assert 'action="/workers/5152/start"' in html
+    assert ">Resume</button>" in html
     assert "/repo/app" not in html
     assert "app-discord-5152" not in html
     assert "share_token" not in html
@@ -269,9 +271,31 @@ def test_public_board_index_shows_pause_control_for_active_board(monkeypatch, tm
 
     html = dwb.render_public_board_index_html()
 
+    assert 'Runtime: <strong class="runtime runtime-idle">idle</strong>' in html
     assert "Running: idle" in html
     assert 'action="/workers/5153/pause"' in html
     assert ">Pause</button>" in html
+
+
+def test_public_board_index_shows_running_runtime(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(thread_id="5154", goal="Run the thing")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(conn, title="Active dev ticket")
+        conn.execute("UPDATE tasks SET status='running', worker_pid=123 WHERE id=?", (task_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    html = dwb.render_public_board_index_html()
+
+    assert 'Runtime: <strong class="runtime runtime-running">running</strong>' in html
+    assert "Running: Active dev ticket" in html
+    assert "pid=123" in html
 
 
 def test_public_board_index_lists_newest_sessions_first(monkeypatch, tmp_path):
@@ -296,14 +320,22 @@ def test_public_board_index_lists_newest_sessions_first(monkeypatch, tmp_path):
 def test_public_session_board_auto_refreshes(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
 
-    dwb.set_goal(thread_id="6160", goal="Watch the board")
+    board = dwb.set_goal(thread_id="6160", goal="Watch the board")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        kanban_db.create_task(conn, title="Second ticket")
+    finally:
+        conn.close()
 
     html = dwb.render_public_session_board_html("6160")
 
     assert '<meta http-equiv="refresh" content="15">' in html
-    assert 'data-ticket-state-url="/workers/6160/tickets/' in html
+    assert html.count('data-ticket-state-url="/workers/6160/tickets/') == 2
     assert 'id="ticket-modal"' in html
+    assert "Worker Internals" in html
+    assert "No Codex app-server internals captured for this ticket yet." in html
     assert "Unable to load ticket state" in html
 
 
@@ -471,12 +503,43 @@ def test_worker_ticket_state_endpoint_returns_redacted_state(monkeypatch, tmp_pa
     data = resp.json()
     rendered = json.dumps(data)
     assert data["task"]["id"] == task.id
+    assert data["current_run"]["id"] == claimed.current_run_id
     assert data["runs"][0]["summary"] == "Read [REDACTED_PATH]"
     assert "[REDACTED_PATH]" in rendered
     assert "/home/droid/private" not in rendered
     assert "sk-proj-A1B2C3D4E5F6G7H8I9J0" not in rendered
+    assert data["codex_state"]["available"] is True
     assert data["codex_state"]["events"][0]["item_type"] == "commandExecution"
     assert missing.status_code == 404
+
+
+def test_worker_ticket_state_endpoint_reports_empty_codex_state(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    board = dwb.set_goal(thread_id="8182", goal="Inspect empty internals")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        claimed = kanban_db.claim_task(conn, task.id)
+        assert claimed is not None
+    finally:
+        conn.close()
+
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    resp = client.get(f"/workers/8182/tickets/{task.id}/state")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["current_run"]["id"] == claimed.current_run_id
+    assert data["codex_state"] == {
+        "available": False,
+        "message": "No Codex app-server internals captured for this ticket yet.",
+    }
 
 
 def test_subgoal_remove_deactivates_and_archives_unstarted_task(monkeypatch, tmp_path):
