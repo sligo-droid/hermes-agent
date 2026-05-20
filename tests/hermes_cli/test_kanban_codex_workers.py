@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -154,3 +155,62 @@ def test_planner_schema_uses_parents_not_depends_on():
     schema = worker._schema_instructions(ROLE_PLANNER)
     assert '"parents"' in schema
     assert "depends_on" not in schema
+
+
+def test_run_codex_records_app_server_state(monkeypatch, tmp_path):
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_PLANNER
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            self.on_event = kwargs["on_event"]
+
+        def run_turn(self, prompt, turn_timeout):
+            self.on_event(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "commandExecution",
+                            "cwd": "/home/droid/secret",
+                            "command": "cat /home/droid/secret/.env",
+                        }
+                    },
+                }
+            )
+            return SimpleNamespace(
+                final_text='{"status":"planned","summary":"ok","tasks":[]}',
+                error=None,
+                interrupted=False,
+                timed_out=False,
+                should_retire=False,
+                tool_iterations=1,
+                turn_id="turn-1",
+                thread_id="thread-1",
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(worker, "CodexAppServerSession", FakeSession)
+
+    result = worker._run_codex(
+        "prompt",
+        str(workspace),
+        ROLE_PLANNER,
+        task_id=task.id,
+        board=board.slug,
+    )
+
+    assert result.turn_id == "turn-1"
+    state = dwb.ticket_state_for_session("9001", task.id)["codex_state"]
+    rendered = str(state)
+    assert state["result"]["thread_id"] == "thread-1"
+    assert state["events"][0]["item_type"] == "commandExecution"
+    assert "/home/droid/secret" not in rendered
+    assert "[REDACTED_PATH]" in rendered

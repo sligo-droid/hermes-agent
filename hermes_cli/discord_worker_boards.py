@@ -30,6 +30,14 @@ ROLE_PLANNER = "planner"
 ROLE_DEV = "dev"
 ROLE_REVIEWER = "reviewer"
 ROLE_ASSIGNEES = frozenset({ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER})
+CODEX_STATE_MAX_EVENTS = 200
+CODEX_STATE_MAX_TEXT_BYTES = 24_000
+CODEX_STATE_LOG_TAIL_BYTES = 64_000
+_POSIX_PATH_RE = re.compile(
+    r"(?<![\w:/.-])/(?:home|Users|tmp|var|etc|opt|private|workspace|workspaces|mnt|srv|repo|root)"
+    r"(?:/[^\s\"'<>),;{}\[\]]*)?"
+)
+_WINDOWS_PATH_RE = re.compile(r"(?<![\w:/.-])[A-Za-z]:\\[^\s\"'<>),;{}\[\]]+")
 
 
 def board_slug_for_discord_thread(thread_id: str) -> str:
@@ -56,6 +64,109 @@ def _write_metadata(board: str, metadata: dict[str, Any]) -> dict[str, Any]:
     atomic_json_write(path, payload, indent=2)
     payload["db_path"] = str(kanban_db.kanban_db_path(board))
     return payload
+
+
+def codex_worker_state_path(task_id: str, *, board: Optional[str] = None) -> Path:
+    """Return the per-ticket Codex app-server state sidecar path."""
+    log_path = kanban_db.worker_log_path(str(task_id or ""), board=board)
+    return log_path.with_name(f"{log_path.stem}.codex-state.json")
+
+
+def _read_codex_worker_state(task_id: str, *, board: Optional[str] = None) -> dict[str, Any]:
+    path = codex_worker_state_path(task_id, board=board)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"error": "codex state sidecar could not be read"}
+    return data if isinstance(data, dict) else {}
+
+
+def _cap_state_value(value: Any, *, max_text: int = CODEX_STATE_MAX_TEXT_BYTES) -> Any:
+    if isinstance(value, str):
+        encoded = value.encode("utf-8", errors="replace")
+        if len(encoded) <= max_text:
+            return value
+        clipped = encoded[:max_text].decode("utf-8", errors="replace")
+        return f"{clipped}\n...[truncated {len(encoded) - max_text} bytes]"
+    if isinstance(value, list):
+        return [_cap_state_value(item, max_text=max_text) for item in value[:80]]
+    if isinstance(value, dict):
+        return {
+            str(key): _cap_state_value(item, max_text=max_text)
+            for key, item in list(value.items())[:80]
+        }
+    return value
+
+
+def _write_codex_worker_state(
+    task_id: str,
+    *,
+    board: Optional[str],
+    update: dict[str, Any],
+) -> dict[str, Any]:
+    path = codex_worker_state_path(task_id, board=board)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    current = _read_codex_worker_state(task_id, board=board)
+    current.update(update)
+    current["task_id"] = str(task_id)
+    current["board"] = str(board or "")
+    current["updated_at"] = _now()
+    atomic_json_write(path, current, indent=2)
+    return current
+
+
+def record_codex_worker_event(
+    task_id: str,
+    *,
+    board: Optional[str],
+    event: dict[str, Any],
+) -> None:
+    """Append one raw Codex app-server notification to a bounded sidecar."""
+    current = _read_codex_worker_state(task_id, board=board)
+    events = current.get("events") if isinstance(current.get("events"), list) else []
+    item = ((event.get("params") or {}).get("item") or {}) if isinstance(event, dict) else {}
+    events.append(
+        {
+            "ts": _now(),
+            "method": event.get("method") if isinstance(event, dict) else "",
+            "item_type": item.get("type") if isinstance(item, dict) else "",
+            "payload": _cap_state_value(event),
+        }
+    )
+    truncated = int(current.get("truncated_events") or 0)
+    if len(events) > CODEX_STATE_MAX_EVENTS:
+        truncated += len(events) - CODEX_STATE_MAX_EVENTS
+        events = events[-CODEX_STATE_MAX_EVENTS:]
+    _write_codex_worker_state(
+        task_id,
+        board=board,
+        update={"events": events, "truncated_events": truncated},
+    )
+
+
+def record_codex_worker_result(
+    task_id: str,
+    *,
+    board: Optional[str],
+    result: Any,
+) -> None:
+    payload = {
+        "final_text": getattr(result, "final_text", ""),
+        "error": getattr(result, "error", None),
+        "interrupted": bool(getattr(result, "interrupted", False)),
+        "timed_out": bool(getattr(result, "timed_out", False)),
+        "should_retire": bool(getattr(result, "should_retire", False)),
+        "tool_iterations": int(getattr(result, "tool_iterations", 0) or 0),
+        "turn_id": getattr(result, "turn_id", None),
+        "thread_id": getattr(result, "thread_id", None),
+    }
+    _write_codex_worker_state(
+        task_id,
+        board=board,
+        update={"result": _cap_state_value(payload)},
+    )
 
 
 def _read_worker_meta(board: str) -> dict[str, Any]:
@@ -294,9 +405,128 @@ def _public_board_snapshot_for_board(board: str) -> dict[str, Any]:
         "board": board,
         "name": metadata.get("name") or board,
         "description": metadata.get("description") or "",
+        "session_id": str(worker.get("thread_id") or ""),
         "worker": _public_worker_meta(worker),
         "tasks": rows,
     }
+
+
+def ticket_state_for_session(session_id: str, task_id: str) -> dict[str, Any]:
+    board = board_slug_for_discord_thread(session_id)
+    if not kanban_db.board_exists(board):
+        raise KeyError("unknown board session")
+    worker = _read_worker_meta(board)
+    if worker.get("kind") != "discord_worker_board":
+        raise KeyError("unknown board session")
+    return _ticket_state_for_board(board, task_id, worker=worker)
+
+
+def _ticket_state_for_board(
+    board: str,
+    task_id: str,
+    *,
+    worker: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        raise KeyError("unknown ticket")
+    conn = kanban_db.connect(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            raise KeyError("unknown ticket")
+        runs = kanban_db.list_runs(conn, task_id)
+        events = kanban_db.list_events(conn, task_id)
+        payload = {
+            "board": board,
+            "worker": _public_worker_meta(worker or _read_worker_meta(board)),
+            "task": _task_state_dict(task),
+            "runs": [_run_state_dict(run) for run in runs],
+            "events": [_event_state_dict(event) for event in events[-200:]],
+            "worker_log_tail": kanban_db.read_worker_log(
+                task_id,
+                tail_bytes=CODEX_STATE_LOG_TAIL_BYTES,
+                board=board,
+            ),
+            "codex_state": _read_codex_worker_state(task_id, board=board) or None,
+        }
+    finally:
+        conn.close()
+    return _redact_public_state(payload)
+
+
+def _task_state_dict(task: Any) -> dict[str, Any]:
+    return {
+        "id": task.id,
+        "title": task.title,
+        "body": task.body,
+        "assignee": task.assignee,
+        "status": task.status,
+        "priority": task.priority,
+        "created_by": task.created_by,
+        "created_at": task.created_at,
+        "started_at": task.started_at,
+        "completed_at": task.completed_at,
+        "workspace_kind": task.workspace_kind,
+        "workspace_path": task.workspace_path,
+        "branch_name": task.branch_name,
+        "result": task.result,
+        "claim_lock": task.claim_lock,
+        "claim_expires": task.claim_expires,
+        "worker_pid": task.worker_pid,
+        "last_failure_error": task.last_failure_error,
+        "max_runtime_seconds": task.max_runtime_seconds,
+        "last_heartbeat_at": task.last_heartbeat_at,
+        "current_run_id": task.current_run_id,
+        "model_override": task.model_override,
+        "session_id": task.session_id,
+    }
+
+
+def _run_state_dict(run: Any) -> dict[str, Any]:
+    return {
+        "id": run.id,
+        "task_id": run.task_id,
+        "profile": run.profile,
+        "step_key": run.step_key,
+        "status": run.status,
+        "claim_lock": run.claim_lock,
+        "claim_expires": run.claim_expires,
+        "worker_pid": run.worker_pid,
+        "max_runtime_seconds": run.max_runtime_seconds,
+        "last_heartbeat_at": run.last_heartbeat_at,
+        "started_at": run.started_at,
+        "ended_at": run.ended_at,
+        "outcome": run.outcome,
+        "summary": run.summary,
+        "metadata": run.metadata,
+        "error": run.error,
+    }
+
+
+def _event_state_dict(event: Any) -> dict[str, Any]:
+    return {
+        "id": event.id,
+        "task_id": event.task_id,
+        "run_id": event.run_id,
+        "kind": event.kind,
+        "payload": event.payload,
+        "created_at": event.created_at,
+    }
+
+
+def _redact_public_state(value: Any) -> Any:
+    if isinstance(value, str):
+        from agent.redact import redact_sensitive_text
+
+        text = _WINDOWS_PATH_RE.sub("[REDACTED_PATH]", value)
+        text = _POSIX_PATH_RE.sub("[REDACTED_PATH]", text)
+        return redact_sensitive_text(text, force=True)
+    if isinstance(value, list):
+        return [_redact_public_state(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _redact_public_state(item) for key, item in value.items()}
+    return value
 
 
 def _public_worker_meta(worker: dict[str, Any]) -> dict[str, Any]:
@@ -359,6 +589,49 @@ def _public_count_text(counts: dict[str, Any]) -> str:
     return " ".join(f"{key}:{counts.get(key) or 0}" for key in keys)
 
 
+def _running_ticket_snapshot(conn: Any) -> list[dict[str, Any]]:
+    running = [
+        task for task in kanban_db.list_tasks(conn, include_archived=False)
+        if task.status == "running"
+    ]
+    rows = []
+    for task in running[:5]:
+        rows.append(
+            {
+                "id": task.id,
+                "title": task.title,
+                "assignee": task.assignee,
+                "worker_pid": task.worker_pid,
+                "started_at": task.started_at,
+                "last_heartbeat_at": task.last_heartbeat_at,
+                "current_run_id": task.current_run_id,
+            }
+        )
+    return rows
+
+
+def _running_status_text(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return "idle"
+    parts = []
+    for item in items:
+        label = str(item.get("title") or item.get("id") or "ticket")
+        assignee = str(item.get("assignee") or "").strip()
+        pid = item.get("worker_pid")
+        bits = [label]
+        if assignee:
+            bits.append(f"assignee={assignee}")
+        if pid:
+            bits.append(f"pid={pid}")
+        heartbeat = _format_public_timestamp(item.get("last_heartbeat_at"))
+        if heartbeat:
+            bits.append(f"heartbeat={heartbeat}")
+        parts.append(" (".join([bits[0], ", ".join(bits[1:]) + ")"]) if len(bits) > 1 else bits[0])
+    if len(items) >= 5:
+        parts.append("...")
+    return "; ".join(parts)
+
+
 def render_public_board_html(token: str) -> str:
     snapshot = public_board_snapshot(token)
     return _render_public_board_html(snapshot)
@@ -372,6 +645,7 @@ def render_public_session_board_html(session_id: str) -> str:
 def _render_public_board_html(snapshot: dict[str, Any]) -> str:
     worker = snapshot["worker"]
     tasks = snapshot["tasks"]
+    session_id = str(snapshot.get("session_id") or worker.get("thread_id") or "")
     columns = ["triage", "todo", "ready", "running", "blocked", "done"]
     by_status = {status: [] for status in columns}
     for task in tasks:
@@ -384,9 +658,16 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
     for status in columns:
         items = by_status.get(status, [])
         body = "\n".join(
-            "<li><strong>{title}</strong><br><code>{id}</code> {assignee}<p>{summary}</p></li>".format(
+            "<li><button type=\"button\" class=\"ticket\" data-ticket-id=\"{id}\" "
+            "data-ticket-title=\"{title}\" data-ticket-state-url=\"{url}\">"
+            "<strong>{title}</strong><br><code>{id}</code> {assignee}<p>{summary}</p>"
+            "</button></li>".format(
                 title=esc(item["title"]),
                 id=esc(item["id"]),
+                url=esc(
+                    f"/workers/{quote(session_id, safe='')}/tickets/"
+                    f"{quote(str(item['id']), safe='')}/state"
+                ),
                 assignee=esc(item["assignee"] or ""),
                 summary=esc(item["latest_summary"] or ""),
             )
@@ -417,8 +698,18 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
     h2 {{ margin: 0; padding: 12px; font-size: 14px; text-transform: uppercase; border-bottom: 1px solid #e6e6e2; display: flex; justify-content: space-between; }}
     ul {{ list-style: none; margin: 0; padding: 10px; }}
     li {{ border: 1px solid #e6e6e2; border-radius: 6px; padding: 10px; margin-bottom: 8px; background: #fbfbfa; }}
+    .ticket {{ appearance: none; border: 0; background: transparent; color: inherit; cursor: pointer; display: block; font: inherit; padding: 0; text-align: left; width: 100%; }}
+    .ticket:hover strong {{ color: #1d4ed8; text-decoration: underline; }}
+    .ticket:focus-visible {{ outline: 2px solid #5965f2; outline-offset: 3px; }}
     code {{ color: #5965f2; }}
     p {{ margin: 8px 0 0; color: #52606d; font-size: 13px; }}
+    .modal {{ align-items: center; background: rgba(15, 23, 42, 0.54); display: none; inset: 0; justify-content: center; padding: 20px; position: fixed; z-index: 10; }}
+    .modal[aria-hidden="false"] {{ display: flex; }}
+    .modal-panel {{ background: #fff; border: 1px solid #d7d7d2; border-radius: 8px; box-shadow: 0 24px 60px rgba(15, 23, 42, 0.28); max-height: min(86vh, 900px); max-width: min(920px, 96vw); min-width: min(720px, 96vw); overflow: hidden; }}
+    .modal-head {{ align-items: center; border-bottom: 1px solid #e6e6e2; display: flex; gap: 16px; justify-content: space-between; padding: 14px 16px; }}
+    .modal-head h2 {{ border: 0; font-size: 16px; padding: 0; text-transform: none; }}
+    .modal-close {{ background: #f3f4f6; border: 1px solid #d7d7d2; border-radius: 6px; cursor: pointer; padding: 6px 10px; }}
+    .modal-body {{ background: #0f172a; color: #e5e7eb; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 0; max-height: calc(min(86vh, 900px) - 58px); overflow: auto; padding: 14px; white-space: pre-wrap; word-break: break-word; }}
   </style>
 </head>
 <body>
@@ -436,6 +727,56 @@ def _render_public_board_html(snapshot: dict[str, Any]) -> str:
     <div class="criteria"><strong>Acceptance Criteria</strong><ol>{criteria}</ol></div>
     <div class="board">{''.join(cards)}</div>
   </main>
+  <div class="modal" id="ticket-modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="ticket-modal-title">
+    <div class="modal-panel">
+      <div class="modal-head">
+        <h2 id="ticket-modal-title">Ticket State</h2>
+        <button class="modal-close" type="button" id="ticket-modal-close">Close</button>
+      </div>
+      <pre class="modal-body" id="ticket-modal-body">Loading...</pre>
+    </div>
+  </div>
+  <script>
+    (() => {{
+      const modal = document.getElementById("ticket-modal");
+      const title = document.getElementById("ticket-modal-title");
+      const body = document.getElementById("ticket-modal-body");
+      const close = document.getElementById("ticket-modal-close");
+      const hide = () => {{
+        modal.setAttribute("aria-hidden", "true");
+        body.textContent = "";
+      }};
+      const show = (label) => {{
+        title.textContent = label || "Ticket State";
+        body.textContent = "Loading...";
+        modal.setAttribute("aria-hidden", "false");
+      }};
+      document.querySelectorAll("[data-ticket-state-url]").forEach((button) => {{
+        button.addEventListener("click", async () => {{
+          show(button.dataset.ticketTitle || button.dataset.ticketId || "Ticket State");
+          try {{
+            const response = await fetch(button.dataset.ticketStateUrl, {{
+              headers: {{ "Accept": "application/json" }},
+            }});
+            if (!response.ok) {{
+              throw new Error(`HTTP ${{response.status}}`);
+            }}
+            const state = await response.json();
+            body.textContent = JSON.stringify(state, null, 2);
+          }} catch (error) {{
+            body.textContent = `Unable to load ticket state: ${{error}}`;
+          }}
+        }});
+      }});
+      close.addEventListener("click", hide);
+      modal.addEventListener("click", (event) => {{
+        if (event.target === modal) hide();
+      }});
+      document.addEventListener("keydown", (event) => {{
+        if (event.key === "Escape") hide();
+      }});
+    }})();
+  </script>
 </body>
 </html>"""
 
@@ -462,6 +803,7 @@ def public_board_index_snapshot() -> dict[str, Any]:
         conn = kanban_db.connect(board=slug)
         try:
             counts = kanban_db.board_stats(conn).get("by_status", {})
+            running = _running_ticket_snapshot(conn)
         finally:
             conn.close()
         session_id = str(worker.get("thread_id") or "")
@@ -474,6 +816,7 @@ def public_board_index_snapshot() -> dict[str, Any]:
                 "public_url": public_session_board_url(session_id),
                 "worker": _public_worker_meta(worker),
                 "counts": counts,
+                "running": running,
             }
         )
     boards.sort(key=newest_sort_key, reverse=True)
@@ -492,7 +835,9 @@ def render_public_board_index_html() -> str:
         session_id = str(board.get("session_id") or "")
         href = f"/workers/{quote(session_id, safe='')}" if session_id else ""
         counts = board.get("counts") or {}
+        running = board.get("running") if isinstance(board.get("running"), list) else []
         count_text = _public_count_text(counts)
+        running_text = _running_status_text(running)
         title = esc(worker.get("root_goal") or worker.get("initial_request") or board.get("name"))
         link = f'<a href="{href}">{title}</a>' if href else title
         status = _public_status_text(worker)
@@ -523,23 +868,37 @@ def render_public_board_index_html() -> str:
         if blocked_reason:
             flags.append(f"blocked: {blocked_reason}")
         flags_text = " ".join(flags)
+        if worker.get("paused") or worker.get("cancelled") or worker.get("goal_status") in {"paused", "unset", "cancelled"}:
+            primary_action = (
+                f'<form method="post" action="/workers/{quote(session_id, safe="")}/start">'
+                '<button type="submit">Start</button></form>'
+            )
+        else:
+            primary_action = (
+                f'<form method="post" action="/workers/{quote(session_id, safe="")}/pause">'
+                '<button type="submit">Pause</button></form>'
+            )
         items.append(
             "<li><strong>{link}</strong><br>"
             "<code>{session}</code> {status}"
             "<p>{counts}</p>"
+            "<p>Running: {running}</p>"
             "<p>{branch}{mode}{pr}{review}</p>"
             "<p>{timestamps}</p>"
-            "{flags}</li>".format(
+            "{flags}"
+            '<div class="actions">{action}</div></li>'.format(
                 link=link,
                 session=esc(session_id),
                 status=esc(status),
                 counts=esc(count_text),
+                running=esc(running_text),
                 branch=f"Branch: {esc(branch)}" if branch else "Branch: pending",
                 mode=f" Mode: {esc(execution_mode)}" if execution_mode else "",
                 pr=f" PR: {pr_text}",
                 review=f" Review: {esc(_public_review_text(worker))}",
                 timestamps=timestamps,
                 flags=f"<p>{esc(flags_text)}</p>" if flags_text else "",
+                action=primary_action,
             )
         )
     body = "\n".join(items) or "<li>No public Discord Kanban boards yet.</li>"
@@ -560,6 +919,10 @@ def render_public_board_index_html() -> str:
     p {{ margin: 8px 0 0; color: #52606d; font-size: 13px; }}
     a {{ color: #1d4ed8; text-decoration: none; }}
     a:hover {{ text-decoration: underline; }}
+    .actions {{ margin-top: 10px; }}
+    form {{ display: inline; margin: 0; }}
+    button {{ background: #1f2933; border: 1px solid #1f2933; border-radius: 6px; color: #fff; cursor: pointer; font: inherit; padding: 6px 10px; }}
+    button:hover {{ background: #374151; }}
   </style>
 </head>
 <body>
@@ -782,6 +1145,9 @@ def status_line(board: str) -> str:
 
 def pause_board(board: str, *, reason: str = "user-paused") -> None:
     worker = _read_worker_meta(board)
+    phase = str(worker.get("phase") or "").strip()
+    if phase and phase != "paused":
+        worker["phase_before_pause"] = phase
     worker.update({"goal_status": "paused", "phase": "paused", "paused": True, "paused_reason": reason})
     _update_worker_meta(board, worker)
 
@@ -789,6 +1155,25 @@ def pause_board(board: str, *, reason: str = "user-paused") -> None:
 def resume_board(board: str) -> None:
     worker = _read_worker_meta(board)
     worker.update({"goal_status": "active", "phase": worker.get("phase_before_pause") or "planning", "paused": False})
+    _update_worker_meta(board, worker)
+
+
+def start_board(board: str) -> None:
+    worker = _read_worker_meta(board)
+    phase = worker.get("phase_before_pause") or worker.get("phase")
+    if not phase or phase in {"paused", "cancelled", "intake"}:
+        phase = "dev"
+    worker.update(
+        {
+            "goal_status": "active",
+            "phase": phase,
+            "execution_mode": worker.get("execution_mode") or "kanban_pipeline",
+            "root_goal": worker.get("root_goal") or worker.get("initial_request") or "",
+            "paused": False,
+            "cancelled": False,
+        }
+    )
+    worker.pop("paused_reason", None)
     _update_worker_meta(board, worker)
 
 

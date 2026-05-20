@@ -248,15 +248,30 @@ def test_public_board_index_lists_operational_row_data(monkeypatch, tmp_path):
 
     assert "active / dev" in html
     assert "ready:1 running:1" in html
+    assert "Running: Running task" in html
     assert "Branch: discord/5152" in html
     assert 'PR: <a href="https://github.example/pull/42">#42</a>' in html
     assert "Review: 2/5" in html
     assert "Created: 1970-01-01 00:01:40 UTC" in html
     assert "Updated: 1970-01-01 00:03:20 UTC" in html
     assert "paused blocked: waiting for review" in html
+    assert 'action="/workers/5152/start"' in html
     assert "/repo/app" not in html
     assert "app-discord-5152" not in html
     assert "share_token" not in html
+
+
+def test_public_board_index_shows_pause_control_for_active_board(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    dwb.set_goal(thread_id="5153", goal="Build the thing")
+
+    html = dwb.render_public_board_index_html()
+
+    assert "Running: idle" in html
+    assert 'action="/workers/5153/pause"' in html
+    assert ">Pause</button>" in html
 
 
 def test_public_board_index_lists_newest_sessions_first(monkeypatch, tmp_path):
@@ -287,6 +302,9 @@ def test_public_session_board_auto_refreshes(monkeypatch, tmp_path):
     html = dwb.render_public_session_board_html("6160")
 
     assert '<meta http-equiv="refresh" content="15">' in html
+    assert 'data-ticket-state-url="/workers/6160/tickets/' in html
+    assert 'id="ticket-modal"' in html
+    assert "Unable to load ticket state" in html
 
 
 def test_public_kanban_web_routes(monkeypatch, tmp_path):
@@ -325,20 +343,27 @@ def test_public_kanban_web_routes(monkeypatch, tmp_path):
     assert missing.status_code == 404
 
 
-def test_public_worker_routes_do_not_require_dashboard_auth(monkeypatch, tmp_path):
+def test_worker_routes_require_dashboard_auth(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from fastapi.testclient import TestClient
     from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
     from hermes_cli.web_server import app
 
     board = dwb.set_goal(thread_id="7171", goal="Public workers stay public")
     token = board.worker["share_token"]
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.list_tasks(conn, include_archived=False)[0].id
+    finally:
+        conn.close()
     client = TestClient(app)
 
     dashboard = client.get("/")
     dashboard_kanban = client.get("/kanban")
     index = client.get("/workers")
     session = client.get("/workers/7171")
+    ticket_state = client.get(f"/workers/7171/tickets/{task_id}/state")
     root_legacy = client.get("/7171", follow_redirects=False)
     kanban_legacy = client.get("/kanban/7171", follow_redirects=False)
     token_resp = client.get(f"/workers/public/kanban/{token}")
@@ -346,22 +371,112 @@ def test_public_worker_routes_do_not_require_dashboard_auth(monkeypatch, tmp_pat
     nested_worker = client.get("/workers/7171/extra")
     nested_kanban = client.get("/kanban/7171/extra")
     nested_token = client.get(f"/workers/public/kanban/{token}/extra")
+    start = client.post("/workers/7171/start", follow_redirects=False)
+    pause = client.post("/workers/7171/pause", follow_redirects=False)
 
     assert dashboard.status_code == 401
     assert dashboard_kanban.status_code == 401
-    assert index.status_code == 200
-    assert "/workers/7171" in index.text
-    assert session.status_code == 200
-    assert "Discord 7171" in session.text
-    assert root_legacy.status_code == 307
-    assert root_legacy.headers["location"] == "/workers/7171"
-    assert kanban_legacy.status_code == 307
-    assert kanban_legacy.headers["location"] == "/workers/7171"
-    assert token_resp.status_code == 200
-    assert old_token_resp.status_code == 200
+    assert index.status_code == 401
+    assert session.status_code == 401
+    assert ticket_state.status_code == 401
+    assert root_legacy.status_code == 401
+    assert kanban_legacy.status_code == 401
+    assert token_resp.status_code == 401
+    assert old_token_resp.status_code == 401
+    assert start.status_code == 401
+    assert pause.status_code == 401
     assert nested_worker.status_code == 401
     assert nested_kanban.status_code == 401
     assert nested_token.status_code == 401
+
+
+def test_worker_index_start_and_pause_actions(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    board = dwb.set_goal(thread_id="7272", goal="Toggle board")
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+
+    pause_resp = client.post("/workers/7272/pause", follow_redirects=False)
+    paused = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    start_resp = client.post("/workers/7272/start", follow_redirects=False)
+    started = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    missing = client.post("/workers/missing/start", follow_redirects=False)
+
+    assert pause_resp.status_code == 303
+    assert pause_resp.headers["location"] == "/workers"
+    assert paused["paused"] is True
+    assert paused["goal_status"] == "paused"
+    assert paused["phase"] == "paused"
+    assert paused["phase_before_pause"] == "planning"
+    assert start_resp.status_code == 303
+    assert started["paused"] is False
+    assert started["cancelled"] is False
+    assert started["goal_status"] == "active"
+    assert started["phase"] == "planning"
+    assert missing.status_code == 404
+
+
+def test_worker_ticket_state_endpoint_returns_redacted_state(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    board = dwb.set_goal(thread_id="8181", goal="Inspect state")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        claimed = kanban_db.claim_task(conn, task.id)
+        assert claimed is not None
+        kanban_db.complete_task(
+            conn,
+            task.id,
+            summary="Read /home/droid/private/config.yaml",
+            metadata={"path": "/home/droid/private/config.yaml"},
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+    kanban_db._append_worker_log_line(
+        kanban_db.worker_log_path(task.id, board=board.slug),
+        "ran cat /home/droid/private/config.yaml with key sk-proj-A1B2C3D4E5F6G7H8I9J0",
+    )
+    dwb.record_codex_worker_event(
+        task.id,
+        board=board.slug,
+        event={
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "commandExecution",
+                    "cwd": "/home/droid/private",
+                    "aggregatedOutput": "token sk-proj-A1B2C3D4E5F6G7H8I9J0",
+                }
+            },
+        },
+    )
+
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    resp = client.get(f"/workers/8181/tickets/{task.id}/state")
+    missing = client.get("/workers/8181/tickets/t_missing/state")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    rendered = json.dumps(data)
+    assert data["task"]["id"] == task.id
+    assert data["runs"][0]["summary"] == "Read [REDACTED_PATH]"
+    assert "[REDACTED_PATH]" in rendered
+    assert "/home/droid/private" not in rendered
+    assert "sk-proj-A1B2C3D4E5F6G7H8I9J0" not in rendered
+    assert data["codex_state"]["events"][0]["item_type"] == "commandExecution"
+    assert missing.status_code == 404
 
 
 def test_subgoal_remove_deactivates_and_archives_unstarted_task(monkeypatch, tmp_path):
