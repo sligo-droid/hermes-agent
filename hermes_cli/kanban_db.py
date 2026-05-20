@@ -4428,6 +4428,44 @@ def _record_spawn_failure(
     *,
     failure_limit: int = None,
 ) -> bool:
+    if _is_local_permission_failure(error):
+        capped_error = error[:500]
+        with write_txn(conn):
+            row = conn.execute(
+                "SELECT consecutive_failures FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            failures = int(row["consecutive_failures"] or 0)
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
+                "last_failure_error = ? "
+                "WHERE id = ? AND status = 'running'",
+                (capped_error, task_id),
+            )
+            if cur.rowcount == 1:
+                metadata = {
+                    "failures": failures,
+                    "failure_budget_counted": False,
+                }
+                run_id = _end_run(
+                    conn, task_id,
+                    outcome="spawn_failed", status="spawn_failed",
+                    error=capped_error,
+                    metadata=metadata,
+                )
+                _append_event(
+                    conn, task_id, "spawn_failed",
+                    {
+                        "error": capped_error,
+                        "failures": failures,
+                        "failure_budget_counted": False,
+                    },
+                    run_id=run_id,
+                )
+        return False
     return _record_task_failure(
         conn, task_id, error,
         outcome="spawn_failed",

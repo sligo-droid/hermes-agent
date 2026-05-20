@@ -1310,6 +1310,8 @@ class DiscordAdapter(BasePlatformAdapter):
         lower = str(status or "").strip().lower()
         if lower in {"complete", "completed", "done", "success", "succeeded"}:
             return "✅ Done"
+        if lower in {"blocked", "question", "needs_input", "needs input"}:
+            return "❓ Blocked"
         if lower in {"failed", "failure", "error", "errored", "interrupted"}:
             return "❌ Failed"
         return "👀 In progress"
@@ -1324,6 +1326,47 @@ class DiscordAdapter(BasePlatformAdapter):
             return discord.Color.blue()
         except Exception:
             return None
+
+    def _feature_kanban_board_slug(self, handle: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not isinstance(handle, dict):
+            return None
+        board = handle.get("kanban_board")
+        if not isinstance(board, dict):
+            return None
+        slug = str(board.get("slug") or "").strip()
+        return slug or None
+
+    def _feature_kanban_reaction_state(self, handle: Optional[Dict[str, Any]]) -> Optional[str]:
+        slug = self._feature_kanban_board_slug(handle)
+        if not slug:
+            return None
+        try:
+            from hermes_cli.discord_worker_boards import board_thread_state
+
+            return board_thread_state(slug)
+        except Exception as exc:
+            logger.debug("[%s] Failed to read Discord kanban board state: %s", self.name, exc)
+            return None
+
+    def _feature_kanban_summary_status(self, handle: Optional[Dict[str, Any]]) -> Optional[str]:
+        state = self._feature_kanban_reaction_state(handle)
+        if state == "done":
+            return "Complete"
+        if state == "blocked":
+            return "Blocked"
+        if state == "errored":
+            return "Failed"
+        if state == "active":
+            return "Running"
+        return None
+
+    def _feature_kanban_reaction_emoji(self, state: Optional[str]) -> Optional[str]:
+        return {
+            "done": "✅",
+            "active": "👀",
+            "blocked": "❓",
+            "errored": "❌",
+        }.get(str(state or ""))
 
     def _build_feature_summary_embed(
         self,
@@ -1474,6 +1517,7 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> bool:
         if not handle:
             return False
+        status = self._feature_kanban_summary_status(handle) or status
         thread = await self._resolve_summary_channel(
             str(handle.get("thread_id") or ""),
             fallback=handle.get("_thread_obj"),
@@ -2494,6 +2538,31 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.debug("[%s] Failed to reopen Discord feature summary: %s", self.name, exc)
 
+    async def _set_message_reaction_state(self, message: Any, emoji: Optional[str]) -> None:
+        for existing in ("✅", "❌", "👀", "❓"):
+            await self._remove_reaction(message, existing)
+        if emoji:
+            await self._add_reaction(message, emoji)
+
+    async def sync_kanban_thread_reaction(self, target: Dict[str, Any]) -> Optional[str]:
+        """Synchronize a Discord worker thread's origin-message reaction."""
+        state = str(target.get("state") or "").strip() or None
+        if state is None:
+            slug = str(target.get("board") or "").strip()
+            if slug:
+                state = self._feature_kanban_reaction_state({"kanban_board": {"slug": slug}})
+        emoji = self._feature_kanban_reaction_emoji(state)
+        if not emoji:
+            return None
+        thread = await self._resolve_summary_channel(str(target.get("thread_id") or ""))
+        if thread is None:
+            return None
+        message = await self._thread_origin_message(thread)
+        if message is None:
+            return None
+        await self._set_message_reaction_state(message, emoji)
+        return state
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Mark a Discord turn as in-progress.
 
@@ -2506,8 +2575,12 @@ class DiscordAdapter(BasePlatformAdapter):
             return
         await self._mark_feature_summary_running(event)
         messages = await self._processing_reaction_messages(event)
+        has_kanban_board = self._feature_kanban_board_slug(getattr(event, "feature_summary", None)) is not None
         for message in messages:
             if not hasattr(message, "add_reaction"):
+                continue
+            if has_kanban_board:
+                await self._set_message_reaction_state(message, "👀")
                 continue
             await self._remove_reaction(message, "✅")
             await self._remove_reaction(message, "❌")
@@ -2517,9 +2590,14 @@ class DiscordAdapter(BasePlatformAdapter):
         """Swap the in-progress reaction for a final success/failure reaction."""
         if not self._reactions_enabled():
             return
+        kanban_state = self._feature_kanban_reaction_state(getattr(event, "feature_summary", None))
+        kanban_emoji = self._feature_kanban_reaction_emoji(kanban_state)
         messages = await self._processing_reaction_messages(event)
         for message in messages:
             if not hasattr(message, "add_reaction"):
+                continue
+            if kanban_emoji:
+                await self._set_message_reaction_state(message, kanban_emoji)
                 continue
             await self._remove_reaction(message, "👀")
             if outcome == ProcessingOutcome.SUCCESS:

@@ -5646,30 +5646,60 @@ class GatewayRunner:
             try:
                 adapter = self.adapters.get(Platform.DISCORD)
                 sender = getattr(adapter, "send_typing_once", None) if adapter else None
-                if adapter is not None and callable(sender):
+                reaction_sync = getattr(adapter, "sync_kanban_thread_reaction", None) if adapter else None
+                if adapter is not None and (callable(sender) or callable(reaction_sync)):
                     try:
-                        from hermes_cli.discord_worker_boards import running_worker_thread_targets
+                        from hermes_cli.discord_worker_boards import (
+                            running_worker_thread_targets,
+                            thread_status_targets,
+                        )
                     except Exception:
                         logger.debug(
                             "discord kanban typing: worker board helper unavailable",
                             exc_info=True,
                         )
                         targets = []
+                        reaction_targets = []
                     else:
-                        targets = await asyncio.to_thread(running_worker_thread_targets)
-                    for target in targets:
-                        thread_id = str(target.get("thread_id") or "").strip()
-                        if not thread_id:
-                            continue
-                        chat_id = str(target.get("chat_id") or thread_id)
-                        try:
-                            await sender(chat_id, metadata={"thread_id": thread_id})
-                        except Exception as exc:
-                            logger.debug(
-                                "discord kanban typing: heartbeat failed for thread %s: %s",
-                                thread_id,
-                                exc,
-                            )
+                        targets, reaction_targets = await asyncio.gather(
+                            asyncio.to_thread(running_worker_thread_targets),
+                            asyncio.to_thread(thread_status_targets),
+                        )
+                    if callable(sender):
+                        for target in targets:
+                            thread_id = str(target.get("thread_id") or "").strip()
+                            if not thread_id:
+                                continue
+                            chat_id = str(target.get("chat_id") or thread_id)
+                            try:
+                                await sender(chat_id, metadata={"thread_id": thread_id})
+                            except Exception as exc:
+                                logger.debug(
+                                    "discord kanban typing: heartbeat failed for thread %s: %s",
+                                    thread_id,
+                                    exc,
+                                )
+                    if callable(reaction_sync):
+                        reaction_cache = getattr(self, "_discord_kanban_reaction_states", None)
+                        if not isinstance(reaction_cache, dict):
+                            reaction_cache = {}
+                            self._discord_kanban_reaction_states = reaction_cache
+                        for target in reaction_targets:
+                            board = str(target.get("board") or "")
+                            state = str(target.get("state") or "")
+                            if not board or not state or reaction_cache.get(board) == state:
+                                continue
+                            try:
+                                synced_state = await reaction_sync(target)
+                            except Exception as exc:
+                                logger.debug(
+                                    "discord kanban reaction: sync failed for board %s: %s",
+                                    board,
+                                    exc,
+                                )
+                                continue
+                            if synced_state:
+                                reaction_cache[board] = str(synced_state)
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 logger.debug("discord kanban typing: cancelled")

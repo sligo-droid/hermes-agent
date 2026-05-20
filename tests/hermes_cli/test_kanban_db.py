@@ -1228,6 +1228,58 @@ def test_respawn_guard_ignores_workspace_permission_error(kanban_home):
     assert reason is None
 
 
+def test_workspace_permission_spawn_failure_does_not_spend_failure_budget(
+    kanban_home, all_assignees_spawnable
+):
+    """Local workspace permission errors are dispatcher setup issues, not task strikes."""
+
+    def fake_spawn(_task, _workspace):
+        raise PermissionError(13, "Permission denied", "/home/droid")
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="workspace-perm-budget", assignee="alice")
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, failure_limit=2)
+
+        task = kb.get_task(conn, t)
+        events = kb.list_events(conn, t)
+
+    assert res.auto_blocked == []
+    assert task.status == "ready"
+    assert task.consecutive_failures == 0
+    assert task.last_failure_error and "Permission denied" in task.last_failure_error
+    spawn_failed = [e for e in events if e.kind == "spawn_failed"][-1]
+    assert spawn_failed.payload["failure_budget_counted"] is False
+
+
+def test_workspace_permission_spawn_failure_does_not_make_next_crash_block(
+    kanban_home, all_assignees_spawnable
+):
+    """An old local permission failure must not combine with one worker crash."""
+
+    def fake_spawn(_task, _workspace):
+        raise PermissionError(13, "Permission denied", "/home/droid")
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="workspace-perm-then-crash", assignee="alice")
+        kb.dispatch_once(conn, spawn_fn=fake_spawn, failure_limit=2)
+
+        blocked = kb._record_task_failure(
+            conn,
+            t,
+            "pid 123 not alive",
+            outcome="crashed",
+            failure_limit=2,
+            release_claim=False,
+            end_run=False,
+        )
+        task = kb.get_task(conn, t)
+
+    assert blocked is False
+    assert task.status == "ready"
+    assert task.consecutive_failures == 1
+    assert task.last_failure_error == "pid 123 not alive"
+
+
 def test_respawn_guard_blocker_auth_cooldown_expires(kanban_home):
     """Old auth/quota failures eventually retry instead of guarding forever."""
     with kb.connect() as conn:

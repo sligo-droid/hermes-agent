@@ -812,6 +812,64 @@ def _active_role_count_across_boards() -> int:
     return total
 
 
+def board_thread_state(board: str) -> str:
+    """Return the Discord thread-facing state for a worker board."""
+    worker = _read_worker_meta(board)
+    if worker.get("cancelled") or worker.get("goal_status") == "cancelled":
+        return "errored"
+    if str(worker.get("blocked_reason") or "").strip() or worker.get("goal_status") == "blocked":
+        return "blocked"
+
+    conn = kanban_db.connect(board=board)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+        if tasks:
+            blocked_tasks = [task for task in tasks if task.status == "blocked"]
+            for task in blocked_tasks:
+                latest = kanban_db.latest_run(conn, task.id)
+                if (
+                    (latest and latest.outcome in {"spawn_failed", "crashed", "timed_out", "gave_up"})
+                    or (latest is None and task.last_failure_error)
+                ):
+                    return "errored"
+            if blocked_tasks:
+                return "blocked"
+            if (
+                all(task.status == "done" for task in tasks)
+                and (worker.get("goal_status") == "done" or worker.get("phase") == "complete")
+            ):
+                return "done"
+            return "active"
+    finally:
+        conn.close()
+
+    if worker.get("goal_status") == "done" or worker.get("phase") == "complete":
+        return "done"
+    return "active"
+
+
+def thread_status_targets() -> list[dict[str, Any]]:
+    """Return Discord thread targets with their current board state."""
+    targets: list[dict[str, Any]] = []
+    for board_meta in kanban_db.list_boards(include_archived=False):
+        board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
+        worker = _read_worker_meta(board)
+        if worker.get("kind") != "discord_worker_board":
+            continue
+        thread_id = str(worker.get("thread_id") or "").strip()
+        if not thread_id:
+            continue
+        targets.append(
+            {
+                "board": board,
+                "thread_id": thread_id,
+                "chat_id": str(worker.get("chat_id") or thread_id),
+                "state": board_thread_state(board),
+            }
+        )
+    return targets
+
+
 def _board_runtime_snapshot(
     worker: dict[str, Any],
     *,
