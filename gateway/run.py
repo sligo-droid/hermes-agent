@@ -11139,6 +11139,8 @@ class GatewayRunner:
                         }.items() if v is not None
                     },
                 )
+                if getattr(event, "feature_summary", None):
+                    return None
                 return f"Kanban goal set. Board: {board.public_url or board.slug}"
         except Exception as exc:
             logger.debug("Discord Kanban goal backend unavailable; falling back to legacy goal loop: %s", exc)
