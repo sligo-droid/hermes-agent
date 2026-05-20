@@ -185,6 +185,9 @@ def test_set_goal_preserves_nested_subgoal_text_for_planner(monkeypatch, tmp_pat
     instructions = "\n".join(payload["planner_instructions"])
     assert "fewest coherent dev tickets" in instructions
     assert "Do not create standalone discovery, audit, polish, or verification tickets" in instructions
+    assert "detailed, self-contained implementation brief" in instructions
+    assert "Ticket-specific acceptance criteria" in instructions
+    assert "do not copy the whole board-level list into every task" in instructions
     assert "one deduplicated canonical list" in instructions
 
 

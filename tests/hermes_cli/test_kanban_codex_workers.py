@@ -551,6 +551,9 @@ def test_planner_schema_uses_parents_not_depends_on():
     assert "depends_on" not in schema
     assert "fewest coherent dev tickets" in schema
     assert "Do not create standalone discovery, audit, polish, or verification tickets" in schema
+    assert "detailed, self-contained implementation brief" in schema
+    assert "Ticket-specific acceptance criteria" in schema
+    assert "do not copy the whole board-level list into every task" in schema
     assert "deduplicated canonical board-level list" in schema
 
 

@@ -89,7 +89,9 @@ def _schema_instructions(role: str) -> str:
             'In each task, "parents" is a list of earlier task indices this task depends on. '
             "Break the job into the fewest coherent dev tickets that can be implemented and verified independently. "
             "Do not create standalone discovery, audit, polish, or verification tickets unless that work is the user's explicit request or it blocks multiple implementation tickets; fold normal inspection and verification into the relevant implementation ticket. "
-            "Each task body should include concrete acceptance criteria, likely files or subsystems to inspect, dependencies, and focused verification steps. "
+            "Each dev task body must be a detailed, self-contained implementation brief with these labeled sections: Goal, Scope, Implementation notes, Ticket-specific acceptance criteria, Likely files/subsystems, Dependencies or handoffs, Verification, and Out of scope. "
+            "Write acceptance criteria for the specific slice owned by that dev ticket; do not copy the whole board-level list into every task unless that ticket owns the whole outcome. "
+            "Include enough surrounding context from the overall request for a fresh dev worker to execute the ticket without guessing, but keep the scope tight to the ticket. "
             "The top-level acceptance_criteria must be one deduplicated canonical board-level list; if criteria already exist in the Kanban context, reuse them instead of paraphrasing or adding near-duplicates. "
             "Treat slash-looking text in the request as user prose unless the Kanban context explicitly says otherwise."
         )
