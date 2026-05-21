@@ -475,6 +475,7 @@ def _public_board_snapshot_for_board(board: str) -> dict[str, Any]:
                     "priority": task.priority,
                     "created_at": task.created_at,
                     "completed_at": task.completed_at,
+                    "body_preview": _public_task_body_preview(task.body),
                     "latest_summary": summaries.get(task.id),
                 }
             )
@@ -1006,6 +1007,19 @@ def _codex_app_result_line(result: Any) -> str:
     if result.get("thread_id"):
         bits.append(f"thread={_safe_terminal_text(result.get('thread_id'), max_chars=80)}")
     return " ".join(bits) if len(bits) > 1 else ""
+
+
+def _public_task_body_preview(value: Any, *, max_chars: int = 420) -> str:
+    """Return a compact, public-safe ticket brief for board cards."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    redacted = _redact_public_state(text)
+    text = str(redacted or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    if len(text) > max_chars:
+        return f"{text[:max_chars].rstrip()}..."
+    return text
 
 
 def _task_state_dict(task: Any) -> dict[str, Any]:
@@ -1782,37 +1796,49 @@ def _render_public_board_html(
     board_url_json = json.dumps(board_url).replace("</", "<\\/")
     active_ticket_json = json.dumps(str(active_ticket_id or "")).replace("</", "<\\/")
 
-    cards = []
-    for status in columns:
-        items = by_status.get(status, [])
-        body = "\n".join(
+    def render_ticket_card(item: dict[str, Any], status: str) -> str:
+        ticket_id = str(item["id"])
+        quoted_ticket = quote(ticket_id, safe="")
+        ticket_url = f"{board_url}/tickets/{quoted_ticket}"
+        body_preview = str(item.get("body_preview") or "").strip()
+        summary = str(item.get("latest_summary") or "").strip()
+        brief_html = (
+            f'<p class="ticket-brief"><b>Brief:</b> {esc(body_preview)}</p>'
+            if body_preview else ""
+        )
+        summary_html = (
+            f'<p class="ticket-summary"><b>Latest:</b> {esc(summary)}</p>'
+            if summary else ""
+        )
+        return (
             "<li class=\"ticket-card\" draggable=\"true\" data-ticket-item "
             "data-ticket-id=\"{id}\" data-ticket-status=\"{status}\" "
             "data-ticket-move-url=\"{move_url}\">"
             "<button type=\"button\" class=\"ticket\" data-ticket-id=\"{id}\" "
             "data-ticket-title=\"{title}\" data-ticket-url=\"{ticket_url}\" "
+            "data-ticket-state-url=\"{state_url}\" "
+            "data-ticket-terminal-page-url=\"{terminal_page_url}\" "
             "data-ticket-terminal-url=\"{terminal_url}\">"
-            "<strong>{title}</strong><br><code>{id}</code> {assignee}<p>{summary}</p>"
+            "<strong>{title}</strong><br><code>{id}</code> {assignee}{brief}{summary}"
             "</button></li>".format(
                 title=esc(item["title"]),
-                id=esc(item["id"]),
+                id=esc(ticket_id),
                 status=esc(status),
-                ticket_url=esc(
-                    f"{board_url}/tickets/{quote(str(item['id']), safe='')}"
-                ),
-                terminal_url=esc(
-                    f"{board_url}/tickets/"
-                    f"{quote(str(item['id']), safe='')}/terminal.json"
-                ),
-                move_url=esc(
-                    f"{board_url}/tickets/"
-                    f"{quote(str(item['id']), safe='')}/move"
-                ),
+                ticket_url=esc(ticket_url),
+                state_url=esc(f"{ticket_url}/state"),
+                terminal_page_url=esc(f"{ticket_url}/terminal"),
+                terminal_url=esc(f"{ticket_url}/terminal.json"),
+                move_url=esc(f"{ticket_url}/move"),
                 assignee=esc(item["assignee"] or ""),
-                summary=esc(item["latest_summary"] or ""),
+                brief=brief_html,
+                summary=summary_html,
             )
-            for item in items
         )
+
+    cards = []
+    for status in columns:
+        items = by_status.get(status, [])
+        body = "\n".join(render_ticket_card(item, status) for item in items)
         disabled = " column-disabled" if status == "running" else ""
         drop_disabled = "true" if status == "running" else "false"
         cards.append(
@@ -1899,7 +1925,8 @@ def _render_public_board_html(
       const initialTicketId = {active_ticket_json};
       const columns = Array.from(document.querySelectorAll("[data-column]"));
       const ticketUrlFor = (ticketId) => boardUrl + "/tickets/" + encodeURIComponent(ticketId || "");
-      const terminalUrlFor = (ticketId) => ticketUrlFor(ticketId) + "/terminal.json";
+      const stateUrlFor = (ticketId) => ticketUrlFor(ticketId) + "/state";
+      const terminalPageUrlFor = (ticketId) => ticketUrlFor(ticketId) + "/terminal";
       const ticketIdFromPath = () => {{
         const prefix = boardUrl + "/tickets/";
         if (!window.location.pathname.startsWith(prefix)) return "";
@@ -1908,7 +1935,7 @@ def _render_public_board_html(
         try {{ return decodeURIComponent(encoded); }} catch (_error) {{ return encoded; }}
       }};
       const labelForTicket = (ticketId) => {{
-        for (const button of document.querySelectorAll("[data-ticket-terminal-url]")) {{
+        for (const button of document.querySelectorAll("[data-ticket-state-url]")) {{
           if (button.dataset.ticketId === ticketId) return button.dataset.ticketTitle || ticketId;
         }}
         return ticketId || "Ticket State";
@@ -1992,34 +2019,62 @@ def _render_public_board_html(
         if (options.updateUrl !== false) setPageUrl(boardUrl, options.replaceUrl === true);
       }};
       const show = (label) => {{
-        title.textContent = label ? label + " - Terminal Log" : "Terminal Log";
+        title.textContent = label ? label + " - Details" : "Ticket Details";
         body.textContent = "Loading...";
         modal.setAttribute("aria-hidden", "false");
       }};
-      const renderTerminal = (feed) => {{
-        const lines = Array.isArray(feed?.lines) ? feed.lines : [];
-        return lines.length ? lines.join("\\n") : "(no terminal activity yet)";
+      const renderTicketState = (state, terminalPageUrl) => {{
+        const task = state?.task || {{}};
+        const currentRun = state?.current_run || null;
+        const runs = Array.isArray(state?.runs) ? state.runs : [];
+        const latestRun = runs.length ? runs[runs.length - 1] : null;
+        const lines = [
+          `$ ticket ${{task.id || ""}}`,
+          `title: ${{task.title || ""}}`,
+          `status: ${{task.status || "unknown"}}`,
+          `assignee: ${{task.assignee || "unassigned"}}`,
+          `terminal: ${{terminalPageUrl || ""}}`,
+          "",
+          "# brief",
+          task.body || "(no ticket body provided)",
+        ];
+        if (currentRun) {{
+          lines.push("", "# current run");
+          lines.push(`run=${{currentRun.id || "-"}} status=${{currentRun.status || currentRun.outcome || "-"}}`);
+        }}
+        if (latestRun?.summary) {{
+          lines.push("", "# latest worker summary", latestRun.summary);
+        }}
+        if (task.result) {{
+          lines.push("", "# result", task.result);
+        }}
+        if (task.last_failure_error) {{
+          lines.push("", "# last failure", task.last_failure_error);
+        }}
+        return lines.join("\\n");
       }};
-      const loadTerminal = async (url) => {{
+      const loadTicketState = async (url, terminalPageUrl) => {{
         const response = await fetch(url, {{ headers: {{ "Accept": "application/json" }} }});
         if (!response.ok) {{
           throw new Error(`HTTP ${{response.status}}`);
         }}
-        const feed = await response.json();
-        body.textContent = renderTerminal(feed);
-        body.scrollTop = body.scrollHeight;
+        const state = await response.json();
+        body.textContent = renderTicketState(state, terminalPageUrl);
+        body.scrollTop = 0;
       }};
       const openTicket = async (ticketId, label, options = {{}}) => {{
         const cleanTicketId = ticketId || "";
         if (!cleanTicketId) return;
         const ticketUrl = options.ticketUrl || ticketUrlFor(cleanTicketId);
         show(label || labelForTicket(cleanTicketId));
-        const terminalUrl = options.terminalUrl || terminalUrlFor(cleanTicketId);
         if (options.updateUrl !== false) setPageUrl(ticketUrl, options.replaceUrl === true);
         try {{
-          await loadTerminal(terminalUrl);
+          await loadTicketState(
+            options.stateUrl || stateUrlFor(cleanTicketId),
+            options.terminalPageUrl || terminalPageUrlFor(cleanTicketId),
+          );
         }} catch (error) {{
-          body.textContent = `Unable to load ticket terminal: ${{error}}`;
+          body.textContent = `Unable to load ticket details: ${{error}}`;
         }}
       }};
       document.querySelectorAll("[data-ticket-item]").forEach((item) => {{
@@ -2108,12 +2163,16 @@ def _render_public_board_html(
           event.stopPropagation();
         }}
       }}, true);
-      document.querySelectorAll("[data-ticket-terminal-url]").forEach((button) => {{
+      document.querySelectorAll("[data-ticket-state-url]").forEach((button) => {{
         button.addEventListener("click", () => {{
           openTicket(
             button.dataset.ticketId || "",
             button.dataset.ticketTitle || button.dataset.ticketId || "Ticket State",
-            {{ ticketUrl: button.dataset.ticketUrl, terminalUrl: button.dataset.ticketTerminalUrl }},
+            {{
+              ticketUrl: button.dataset.ticketUrl,
+              stateUrl: button.dataset.ticketStateUrl,
+              terminalPageUrl: button.dataset.ticketTerminalPageUrl,
+            }},
           );
         }});
       }});
@@ -2432,6 +2491,7 @@ def _planner_instructions() -> list[str]:
         "Act as the planner for this Discord session Kanban board.",
         "Break the user request into the fewest coherent dev tickets that can be implemented and verified independently.",
         "Create tickets for the dev role; do not implement the work yourself.",
+        "When you call kanban_create for a dev ticket, pass that brief in the kanban_create body argument; do not rely on the title, parent ticket, comments, or acceptance_criteria metadata alone.",
         "Each dev ticket body must be a detailed, self-contained implementation brief with labeled sections: Goal, Scope, Implementation notes, Ticket-specific acceptance criteria, Likely files/subsystems, Dependencies or handoffs, Verification, and Out of scope.",
         "Write acceptance criteria for the specific slice owned by that dev ticket; do not copy the whole board-level list into every task unless that ticket owns the whole outcome.",
         "Include enough surrounding context from the overall request for a fresh dev worker to execute the ticket without guessing, but keep the scope tight to the ticket.",

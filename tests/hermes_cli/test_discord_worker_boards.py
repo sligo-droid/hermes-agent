@@ -185,6 +185,7 @@ def test_set_goal_preserves_nested_subgoal_text_for_planner(monkeypatch, tmp_pat
     instructions = "\n".join(payload["planner_instructions"])
     assert "fewest coherent dev tickets" in instructions
     assert "Do not create standalone discovery, audit, polish, or verification tickets" in instructions
+    assert "pass that brief in the kanban_create body argument" in instructions
     assert "detailed, self-contained implementation brief" in instructions
     assert "Ticket-specific acceptance criteria" in instructions
     assert "do not copy the whole board-level list into every task" in instructions
@@ -575,8 +576,8 @@ def test_public_session_board_does_not_auto_refresh(monkeypatch, tmp_path):
 
     assert 'http-equiv="refresh"' not in html
     assert html.count('data-ticket-terminal-url="/workers/6160/tickets/') == 2
-    assert 'data-ticket-terminal-url="/workers/6160/tickets/' in html
-    assert 'const terminalUrlFor = (ticketId) => ticketUrlFor(ticketId) + "/terminal.json";' in html
+    assert html.count('data-ticket-state-url="/workers/6160/tickets/') == 2
+    assert 'data-ticket-terminal-page-url="/workers/6160/tickets/' in html
     assert html.count('data-ticket-url="/workers/6160/tickets/') == 2
     assert html.count('data-ticket-move-url="/workers/6160/tickets/') == 2
     assert html.count('class="ticket-card"') == 2
@@ -588,15 +589,54 @@ def test_public_session_board_does_not_auto_refresh(monkeypatch, tmp_path):
     for status in dwb.PUBLIC_BOARD_COLUMNS:
         assert f'data-status="{status}"' in html
     assert 'id="ticket-modal"' in html
-    assert "Terminal Log" in html
+    assert "Ticket Details" in html
     assert "setInterval" not in html
     assert "window.history.pushState" in html
     assert "const startupTicketId = initialTicketId || ticketIdFromPath();" in html
-    assert "Unable to load ticket terminal" in html
+    assert "Unable to load ticket details" in html
     assert '<a class="brand" href="/workers">Hermes<br>Kanban</a>' in html
     assert "Codex result" not in html
     assert "Recent internals" not in html
     assert "codex_state" not in html
+
+
+def test_public_session_board_surfaces_dev_ticket_brief(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(thread_id="6165", goal="Make worker tickets readable")
+    dev_body = """Goal: Show ticket details in the worker UI.
+Scope: Render the implementation brief directly on each dev card.
+Implementation notes: Use the task body, not a worker summary.
+Ticket-specific acceptance criteria: A dev can understand what to do without opening Discord.
+Likely files/subsystems: hermes_cli/discord_worker_boards.py
+Dependencies or handoffs: none
+Verification: render the worker board HTML and inspect the card.
+Out of scope: changing dispatcher behavior."""
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Render dev ticket details",
+            body=dev_body,
+            assignee=dwb.ROLE_DEV,
+            tenant=board.slug,
+        )
+    finally:
+        conn.close()
+
+    snapshot = dwb.public_board_snapshot_for_session("6165")
+    dev_row = next(task for task in snapshot["tasks"] if task["id"] == task_id)
+    html = dwb.render_public_session_board_html("6165")
+    state = dwb.ticket_state_for_session("6165", task_id)
+
+    assert "Goal: Show ticket details in the worker UI." in dev_row["body_preview"]
+    assert '<p class="ticket-brief"><b>Brief:</b> Goal: Show ticket details in the worker UI.' in html
+    assert "Ticket-specific acceptance criteria" in html
+    assert f'data-ticket-state-url="/workers/6165/tickets/{task_id}/state"' in html
+    assert f'terminal: ${{terminalPageUrl || ""}}' in html
+    assert state["task"]["body"] == dev_body
 
 
 def test_public_session_ticket_deep_link_opens_modal(monkeypatch, tmp_path):
