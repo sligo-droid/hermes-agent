@@ -637,7 +637,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
         self._voice_locks: Dict[int, asyncio.Lock] = {}  # guild_id -> serialize join/leave
         # Text batching: merge rapid successive messages (Telegram-style)
-        self._text_batch_delay_seconds = float(os.getenv("HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS", "0.6"))
+        self._text_batch_delay_seconds = float(os.getenv("HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS", "0.15"))
         self._text_batch_split_delay_seconds = float(os.getenv("HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0"))
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
@@ -671,6 +671,51 @@ class DiscordAdapter(BasePlatformAdapter):
         # history backfill to skip the full scan on hot paths.  Falls back to
         # scanning channel.history() on cache miss (cold start / restart).
         self._last_self_message_id: Dict[str, str] = {}
+
+    def _new_discord_intake_timing(self, message: Any) -> Dict[str, Any]:
+        return {
+            "started": time.perf_counter(),
+            "stages": {},
+            "message_id": str(getattr(message, "id", "") or ""),
+            "channel_id": str(getattr(getattr(message, "channel", None), "id", "") or ""),
+        }
+
+    @staticmethod
+    def _mark_discord_stage(timing: Optional[Dict[str, Any]], name: str, started: float) -> None:
+        if timing is None:
+            return
+        timing.setdefault("stages", {})[name] = int((time.perf_counter() - started) * 1000)
+
+    def _log_discord_intake_timing(
+        self,
+        timing: Optional[Dict[str, Any]],
+        *,
+        source: Any = None,
+        batched: bool = False,
+    ) -> None:
+        if timing is None:
+            return
+        total_ms = int((time.perf_counter() - float(timing.get("started") or time.perf_counter())) * 1000)
+        stages = timing.get("stages") if isinstance(timing.get("stages"), dict) else {}
+        fields = [
+            "discord_intake_timing",
+            f"total_ms={total_ms}",
+            f"batched={str(bool(batched)).lower()}",
+            f"message_id={timing.get('message_id') or ''}",
+            f"channel_id={timing.get('channel_id') or ''}",
+        ]
+        if source is not None:
+            fields.extend(
+                [
+                    f"chat_id={getattr(source, 'chat_id', '') or ''}",
+                    f"thread_id={getattr(source, 'thread_id', '') or ''}",
+                    f"user_id={getattr(source, 'user_id', '') or ''}",
+                ]
+            )
+        for name in ("triage", "thread_create", "feature_summary", "attachment_cache", "history_backfill"):
+            if name in stages:
+                fields.append(f"{name}_ms={stages[name]}")
+        logger.info(" ".join(fields))
 
     # ------------------------------------------------------------------
     # Project / feature summary surfaces
@@ -1814,11 +1859,17 @@ class DiscordAdapter(BasePlatformAdapter):
             "build", "create", "add", "implement", "fix", "change", "update",
             "remove", "delete", "ship", "deploy", "make", "refactor", "wire",
             "integrate", "set up", "setup", "turn on", "enable", "disable",
+            "support", "replace", "migrate", "simplify", "clean up",
         )
         feature_phrases = (
             "please build", "please create", "please add", "please implement",
+            "please fix", "please update", "please change", "please remove",
             "can you build", "can you create", "can you add", "can you implement",
-            "we need to build", "we need a", "i need you to build",
+            "can we add", "can we make", "can we support", "could we add",
+            "could we make", "could you add", "could you fix", "could you update",
+            "we need to build", "we need to add", "we need to fix", "we need to update",
+            "we need a", "we should add", "we should make", "we should support",
+            "i need you to build", "i need you to add", "i need you to fix",
             "feature request", "new feature", "bug fix", "make the app",
         )
         direct_starts = (
@@ -1890,7 +1941,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 ],
                 max_tokens=8,
                 temperature=0,
-                timeout=8,
+                timeout=self._feature_triage_timeout_seconds(),
             )
             verdict = (response.choices[0].message.content or "").strip().lower()
             if verdict.startswith("feature"):
@@ -4573,6 +4624,11 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_background(interaction: discord.Interaction, prompt: str):
             await self._run_simple_slash(interaction, f"/background {prompt}", "Background task started~")
 
+        @tree.command(name="goal", description="Start or manage a durable /goal worker")
+        @discord.app_commands.describe(args="Goal text, or status/pause/resume/clear/stop/done")
+        async def slash_goal(interaction: discord.Interaction, args: str = ""):
+            await self._handle_goal_slash(interaction, args)
+
         # ── Auto-register any gateway-available commands not yet on the tree ──
         # This ensures new commands added to COMMAND_REGISTRY in
         # hermes_cli/commands.py automatically appear as Discord slash
@@ -5216,6 +5272,7 @@ class DiscordAdapter(BasePlatformAdapter):
         thread_id: str,
         thread_name: str,
         text: str,
+        feature_summary: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Build a MessageEvent pointing at a thread and send it through handle_message."""
         guild_name = ""
@@ -5254,8 +5311,129 @@ class DiscordAdapter(BasePlatformAdapter):
             raw_message=interaction,
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
+            feature_summary=feature_summary,
         )
         await self.handle_message(event)
+
+    def _schedule_discord_background(self, coro: Any, *, label: str) -> None:
+        try:
+            task = asyncio.create_task(coro)
+        except RuntimeError:
+            logger.debug("[%s] Could not schedule Discord background task %s", self.name, label, exc_info=True)
+            return
+
+        def _done(done_task: asyncio.Task) -> None:
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("[%s] Discord background task failed: %s", self.name, label)
+
+        task.add_done_callback(_done)
+
+    async def _resolve_channel_by_id(self, channel_id: str) -> Optional[Any]:
+        if not self._client or not channel_id:
+            return None
+        try:
+            channel = self._client.get_channel(int(channel_id))
+            if channel is not None:
+                return channel
+            return await self._client.fetch_channel(int(channel_id))
+        except Exception:
+            return None
+
+    def _goal_thread_name(self, text: str) -> str:
+        cleaned = re.sub(r"`([^`]*)`", r"\1", str(text or ""))
+        cleaned = re.sub(r"[*_>#-]+", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+        if not cleaned:
+            cleaned = "Hermes Goal"
+        return cleaned[:80] if len(cleaned) <= 80 else cleaned[:77].rstrip() + "..."
+
+    async def _handle_goal_slash(
+        self,
+        interaction: discord.Interaction,
+        args: str = "",
+    ) -> None:
+        """Fast-path Discord /goal so acknowledgement is not tied to worker startup."""
+        args = (args or "").strip()
+        lower = args.lower()
+        command_text = f"/goal {args}".strip()
+        control = not args or lower in {"status", "pause", "resume", "clear", "stop", "done"}
+        if control:
+            await self._run_simple_slash(interaction, command_text)
+            return
+
+        if not await self._check_slash_authorization(interaction, command_text):
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        channel = await self._resolve_interaction_channel(interaction)
+        if channel is None or isinstance(channel, discord.DMChannel):
+            event = self._build_slash_event(interaction, command_text)
+            await self.handle_message(event)
+            try:
+                await interaction.edit_original_response(content="Goal started.")
+            except Exception:
+                pass
+            return
+
+        is_thread = isinstance(channel, discord.Thread)
+        parent_channel = self._thread_parent_channel(channel)
+        if is_thread:
+            thread_id = str(getattr(channel, "id", None) or getattr(interaction, "channel_id", "") or "")
+            thread_name = getattr(channel, "name", None) or self._goal_thread_name(args)
+            thread_channel = channel
+        else:
+            result = await self._create_thread(
+                interaction,
+                name=self._goal_thread_name(args),
+                message="",
+                auto_archive_duration=1440,
+            )
+            if not result.get("success"):
+                await interaction.edit_original_response(
+                    content=f"Failed to create goal thread: {result.get('error', 'unknown error')}"
+                )
+                return
+            thread_id = str(result.get("thread_id") or "")
+            thread_name = str(result.get("thread_name") or self._goal_thread_name(args))
+            thread_channel = await self._resolve_channel_by_id(thread_id)
+
+        link = f"<#{thread_id}>" if thread_id else f"**{thread_name}**"
+        feature_summary_handle = None
+        if thread_channel is not None:
+            project_context = self._resolve_project_context_for_channel(parent_channel)
+            feature_summary_handle = await self.initialize_feature_summary(
+                thread_channel,
+                parent_channel=parent_channel,
+                initial_request=command_text,
+                project_context=project_context,
+            )
+        board_url = ""
+        if isinstance(feature_summary_handle, dict):
+            board_url = str(
+                ((feature_summary_handle.get("kanban_board") or {}).get("public_url"))
+                or ""
+            )
+        content = f"Goal started in {link}."
+        if board_url:
+            content = f"{content} Board: {board_url}"
+        await interaction.edit_original_response(content=content)
+
+        if thread_id:
+            self._threads.mark(thread_id)
+            self._schedule_discord_background(
+                self._dispatch_thread_session(
+                    interaction,
+                    thread_id,
+                    thread_name,
+                    command_text,
+                    feature_summary=feature_summary_handle,
+                ),
+                label=f"/goal {thread_id}",
+            )
 
     def _resolve_channel_skills(self, channel_id: str, parent_id: str | None = None) -> list[str] | None:
         """Look up auto-skill bindings for a Discord channel/forum thread.
@@ -5342,6 +5520,38 @@ class DiscordAdapter(BasePlatformAdapter):
         if s:
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
+
+    def _discord_feature_request_channels(self) -> set:
+        """Return channel IDs where incoming asks should skip LLM triage."""
+        raw = self.config.extra.get("feature_request_channels")
+        if raw is None:
+            raw = os.getenv("DISCORD_FEATURE_REQUEST_CHANNELS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        s = str(raw).strip() if raw is not None else ""
+        if s:
+            return {part.strip() for part in s.split(",") if part.strip()}
+        return set()
+
+    def _discord_history_backfill_feature_channels(self) -> bool:
+        """Return whether known feature channels should fetch mention history."""
+        configured = self.config.extra.get("history_backfill_feature_channels")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("DISCORD_HISTORY_BACKFILL_FEATURE_CHANNELS", "false").lower() in {
+            "true", "1", "yes", "on",
+        }
+
+    def _feature_triage_timeout_seconds(self) -> float:
+        raw = self.config.extra.get("feature_summary_triage_timeout")
+        if raw is None:
+            raw = os.getenv("DISCORD_FEATURE_SUMMARY_TRIAGE_TIMEOUT", "4")
+        try:
+            return max(0.5, float(raw))
+        except (TypeError, ValueError):
+            return 4.0
 
     def _discord_thread_require_mention(self) -> bool:
         """Return whether thread participation requires @mention to follow up.
@@ -6390,6 +6600,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 hard_ignore_reason,
             )
             return
+        _intake_timing = self._new_discord_intake_timing(message)
 
         thread_id = None
         parent_channel_id = None
@@ -6465,8 +6676,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 return
 
             free_channels = self._discord_free_response_channels()
+            feature_channels = self._discord_feature_request_channels()
             if parent_channel_id:
                 channel_ids.add(parent_channel_id)
+            is_feature_request_channel = (
+                "*" in feature_channels or bool(channel_ids & feature_channels)
+            )
 
             require_mention = self._discord_require_mention()
             # Voice-linked text channels act as free-response while voice is active.
@@ -6546,6 +6761,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 and (not is_slash_command_message or slash_command_starts_threaded_work)
             )
             if should_consider_auto_thread:
+                _stage_started = time.perf_counter()
                 triage_text = normalized_content
                 if message_is_voice and not triage_text.strip():
                     preprocessed_attachment_media, voice_triage_text = await self._preprocess_voice_for_feature_triage(
@@ -6556,9 +6772,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     voice_feature_transcript = voice_triage_text
                 feature_request_intent = (
                     True
-                    if has_discord_message_link or slash_command_starts_threaded_work
+                    if has_discord_message_link or slash_command_starts_threaded_work or is_feature_request_channel
                     else await self._classify_discord_feature_request(triage_text)
                 )
+                self._mark_discord_stage(_intake_timing, "triage", _stage_started)
                 direct_question_prompt = not feature_request_intent
 
             should_auto_thread_direct_question = bool(
@@ -6568,7 +6785,9 @@ class DiscordAdapter(BasePlatformAdapter):
             if should_consider_auto_thread and (
                 feature_request_intent or should_auto_thread_direct_question
             ):
+                _stage_started = time.perf_counter()
                 thread = await self._auto_create_thread(message)
+                self._mark_discord_stage(_intake_timing, "thread_create", _stage_started)
                 if thread:
                     parent_channel_id = str(message.channel.id)
                     is_thread = True
@@ -6585,7 +6804,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 or (is_thread and (mention_prefix or replies_to_self))
             )
         ):
-            feature_request_intent = await self._classify_discord_feature_request(normalized_content)
+            _stage_started = time.perf_counter()
+            feature_request_intent = (
+                True
+                if is_feature_request_channel
+                else await self._classify_discord_feature_request(normalized_content)
+            )
+            self._mark_discord_stage(_intake_timing, "triage", _stage_started)
             direct_question_prompt = not feature_request_intent
 
         project_summary_handle = None
@@ -6604,6 +6829,7 @@ class DiscordAdapter(BasePlatformAdapter):
             and not is_meeting_command_message
             and not auto_threaded_direct_question
         ):
+            _stage_started = time.perf_counter()
             feature_summary_handle = await self.initialize_feature_summary(
                 auto_threaded_channel,
                 parent_channel=message.channel,
@@ -6611,6 +6837,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 project_context=project_context,
                 transcript_quote=voice_feature_transcript if message_is_voice else None,
             )
+            self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
         elif is_thread:
             feature_summary_handle = self._load_feature_summary_handle_for_thread(
                 message.channel,
@@ -6696,6 +6923,7 @@ class DiscordAdapter(BasePlatformAdapter):
         pending_text_injection: Optional[str] = None
         text_document_inlined = False
         inlined_text_document_names: list[str] = []
+        _stage_started = time.perf_counter()
         for att in all_attachments:
             content_type = getattr(att, "content_type", None) or "unknown"
             if content_type.startswith("image/"):
@@ -6812,6 +7040,7 @@ class DiscordAdapter(BasePlatformAdapter):
                                 "[Discord] Failed to cache document %s: %s",
                                 att.filename, e, exc_info=True,
                             )
+        self._mark_discord_stage(_intake_timing, "attachment_cache", _stage_started)
 
         # Use normalized_content (saved before auto-threading) instead of message.content,
         # to detect /slash commands in channel messages.
@@ -6851,10 +7080,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not in_bot_thread
             )
             _backfill_enabled = self._discord_history_backfill()
-            if _needed_mention and _backfill_enabled:
+            _skip_feature_channel_backfill = (
+                is_feature_request_channel
+                and not self._discord_history_backfill_feature_channels()
+            )
+            if _needed_mention and _backfill_enabled and not _skip_feature_channel_backfill:
+                _stage_started = time.perf_counter()
                 _backfill_text = await self._fetch_channel_context(
                     message.channel, before=message,
                 )
+                self._mark_discord_stage(_intake_timing, "history_backfill", _stage_started)
                 if _backfill_text:
                     _channel_context = _backfill_text
 
@@ -6903,8 +7138,10 @@ class DiscordAdapter(BasePlatformAdapter):
         # Only batch plain text messages — commands, media, etc. dispatch
         # immediately since they won't be split by the Discord client.
         if msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
+            self._log_discord_intake_timing(_intake_timing, source=source, batched=True)
             self._enqueue_text_event(event)
         else:
+            self._log_discord_intake_timing(_intake_timing, source=source, batched=False)
             await self.handle_message(event)
 
     # ------------------------------------------------------------------

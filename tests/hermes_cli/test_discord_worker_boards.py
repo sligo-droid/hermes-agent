@@ -33,6 +33,55 @@ def test_ensure_discord_thread_board_creates_public_metadata(monkeypatch, tmp_pa
     assert worker["thread_id"] == "12345"
     assert worker["initial_request"] == "Build the thing"
     assert worker["worktree_path"].endswith("app-discord-12345")
+    assert worker["code_island_pending"] is False
+
+
+def test_ensure_discord_thread_board_defers_code_island(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    project = tmp_path / "repo"
+    project.mkdir()
+
+    def fail_if_called(_worker):
+        raise AssertionError("_ensure_code_island should not block intake")
+
+    monkeypatch.setattr(dwb, "_ensure_code_island", fail_if_called)
+    board = dwb.ensure_discord_thread_board(
+        thread_id="12346",
+        initial_request="/goal Ship it",
+        project_context={"project_path": str(project)},
+    )
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["code_island_pending"] is True
+    assert worker["code_island_ready"] is False
+
+
+def test_ensure_code_island_for_board_runs_deferred_setup(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    board = dwb.ensure_discord_thread_board(
+        thread_id="12347",
+        initial_request="/goal Ship it",
+        project_context={"project_path": str(project)},
+    )
+
+    def fake_ensure(worker):
+        worker["code_island_ready"] = True
+        worker["code_island_pending"] = False
+
+    monkeypatch.setattr(dwb, "_ensure_code_island", fake_ensure)
+    assert dwb.ensure_code_island_for_board(board.slug) is True
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["code_island_ready"] is True
+    assert worker["code_island_pending"] is False
 
 
 def test_set_goal_creates_planner_task_for_role_lane(monkeypatch, tmp_path):

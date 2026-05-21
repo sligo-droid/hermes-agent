@@ -971,7 +971,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
-            "timeout": 8,
+            "timeout": 4,
             "extra_body": {},
         },
         # Triage specifier — flesh out a rough one-liner in the Kanban
@@ -1099,6 +1099,18 @@ DEFAULT_CONFIG = {
             "fields": ["model", "context_pct", "cwd"],  # Order shown; drop any to hide
         },
         "copy_shortcut": "auto",  # "auto" (platform default) | "ctrl_c" | "ctrl_shift_c" | "disabled"
+    },
+
+    # Gateway response streaming. Keep CLI rendering under display.streaming;
+    # Discord and other edit-capable gateway platforms read this top-level
+    # block through gateway.config.StreamingConfig.
+    "streaming": {
+        "enabled": True,
+        "transport": "edit",
+        "edit_interval": 0.8,
+        "buffer_threshold": 24,
+        "cursor": " ▉",
+        "fresh_final_after_seconds": 60.0,
     },
 
     # Web dashboard settings
@@ -1399,12 +1411,15 @@ DEFAULT_CONFIG = {
         "require_mention": True,       # Require @mention to respond in server channels
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
+        "feature_request_channels": "", # Channel IDs where @mention asks skip LLM feature triage
         "project_channel_cwd": "",     # Cwd for mapped project channels; project_path still injects mapped repo context
         "channel_cwds": {},            # Per-channel cwd overrides keyed by Discord channel ID
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
         "thread_require_mention": False,  # If True, require @mention in threads too (multi-bot threads)
         "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
+        "history_backfill_feature_channels": False, # Skip scrollback in known feature-request channels by default
+        "feature_summary_triage_timeout": 4, # Seconds for ambiguous feature-request classifier calls
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-channel ephemeral system prompts (forum parents apply to child threads)
         # Opt-in DM role-based auth (#12136). By default, DISCORD_ALLOWED_ROLES
@@ -1563,7 +1578,7 @@ DEFAULT_CONFIG = {
 
     # Kanban multi-agent coordination — controls the dispatcher loop that
     # spawns workers for ready tasks. The dispatcher ticks every N seconds
-    # (default 60), reclaims stale claims, promotes dependency-satisfied
+    # (default 10), reclaims stale claims, promotes dependency-satisfied
     # todos to ready, and fires `hermes -p <assignee> chat -q ...` for
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
@@ -1576,7 +1591,7 @@ DEFAULT_CONFIG = {
         "dispatch_in_gateway": True,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
-        "dispatch_interval_seconds": 60,
+        "dispatch_interval_seconds": 10,
         # Auto-block after this many consecutive non-success attempts for the
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.

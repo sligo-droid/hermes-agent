@@ -87,6 +87,9 @@ def dispatch_discord_worker_boards(
             if not dwb.is_discord_worker_board(board):
                 continue
             dwb.reconcile_board(board)
+            if not dwb.ensure_code_island_for_board(board):
+                out.append((board, None))
+                continue
             if not dwb.is_executable_worker_board(board):
                 out.append((board, None))
                 continue

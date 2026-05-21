@@ -354,7 +354,7 @@ DEFAULT_STREAMING_CURSOR: str = " ▉"
 @dataclass
 class StreamingConfig:
     """Configuration for real-time token streaming to messaging platforms."""
-    enabled: bool = False
+    enabled: bool = True
     # Transport selection:
     #   "auto"  — prefer native streaming-draft updates when the platform
     #             supports them (Telegram sendMessageDraft, Bot API 9.5+);
@@ -392,7 +392,7 @@ class StreamingConfig:
         if not data:
             return cls()
         return cls(
-            enabled=_coerce_bool(data.get("enabled"), False),
+            enabled=_coerce_bool(data.get("enabled"), True),
             transport=data.get("transport", "edit"),
             edit_interval=_coerce_float(
                 data.get("edit_interval"), DEFAULT_STREAMING_EDIT_INTERVAL,
@@ -950,6 +950,12 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(ac, list):
                         ac = ",".join(str(v) for v in ac)
                     os.environ["DISCORD_ALLOWED_CHANNELS"] = str(ac)
+                # feature_request_channels: skip LLM triage in known request lanes
+                frc2 = discord_cfg.get("feature_request_channels")
+                if frc2 is not None and not os.getenv("DISCORD_FEATURE_REQUEST_CHANNELS"):
+                    if isinstance(frc2, list):
+                        frc2 = ",".join(str(v) for v in frc2)
+                    os.environ["DISCORD_FEATURE_REQUEST_CHANNELS"] = str(frc2)
                 # no_thread_channels: channels where bot responds directly without creating thread
                 ntc = discord_cfg.get("no_thread_channels")
                 if ntc is not None and not os.getenv("DISCORD_NO_THREAD_CHANNELS"):
@@ -964,6 +970,11 @@ def load_gateway_config() -> GatewayConfig:
                 hbl = discord_cfg.get("history_backfill_limit")
                 if hbl is not None and not os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT"):
                     os.environ["DISCORD_HISTORY_BACKFILL_LIMIT"] = str(hbl)
+                if "history_backfill_feature_channels" in discord_cfg and not os.getenv("DISCORD_HISTORY_BACKFILL_FEATURE_CHANNELS"):
+                    os.environ["DISCORD_HISTORY_BACKFILL_FEATURE_CHANNELS"] = str(discord_cfg["history_backfill_feature_channels"]).lower()
+                fst = discord_cfg.get("feature_summary_triage_timeout")
+                if fst is not None and not os.getenv("DISCORD_FEATURE_SUMMARY_TRIAGE_TIMEOUT"):
+                    os.environ["DISCORD_FEATURE_SUMMARY_TRIAGE_TIMEOUT"] = str(fst)
                 # allow_mentions: granular control over what the bot can ping.
                 # Safe defaults (no @everyone/roles) are applied in the adapter;
                 # these YAML keys only override when set and let users opt back
