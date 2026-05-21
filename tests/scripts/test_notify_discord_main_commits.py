@@ -107,6 +107,84 @@ def test_generic_merge_commit_uses_associated_pr_body_and_field():
     } in embed["fields"]
 
 
+def test_pr_description_strips_tests_section():
+    mod = _load_module()
+    commit = _commit(7, "Merge pull request #82 from sligo-droid/example")
+    pull_request = {
+        "number": 82,
+        "title": "Link Discord feature summary branch field",
+        "body": (
+            "Summary\n"
+            "render the Discord feature-summary Branch field as a GitHub branch link\n"
+            "remove the separate Feature Branch URL embed field\n"
+            "\n"
+            "Tests\n"
+            "./scripts/run_tests.sh tests/gateway/test_discord_summaries.py"
+        ),
+        "html_url": "https://github.com/NousResearch/hermes-agent/pull/82",
+    }
+
+    payload = mod.build_webhook_payloads(
+        _event([commit]),
+        pull_request_lookup=lambda _sha: pull_request,
+    )[0]
+
+    description = payload["embeds"][0]["description"]
+    assert "render the Discord feature-summary Branch field" in description
+    assert "Feature Branch URL" in description
+    assert "Tests" not in description
+    assert "run_tests.sh" not in description
+
+
+def test_pr_merge_push_suppresses_intermediate_commits_from_same_payload():
+    mod = _load_module()
+    commits = [
+        _commit(10, "fix: link Discord summary branch field"),
+        _commit(11, "Merge branch 'main' into fix/discord-summary-branch-link"),
+        _commit(
+            12,
+            "Merge pull request #82 from sligo-droid/fix/discord-summary-branch-link\n\n"
+            "Link Discord feature summary branch field",
+        ),
+    ]
+    pull_request = {
+        "number": 82,
+        "title": "Link Discord feature summary branch field",
+        "body": "Summary\nUse the PR body once.",
+        "html_url": "https://github.com/NousResearch/hermes-agent/pull/82",
+    }
+
+    payloads = mod.build_webhook_payloads(
+        _event(commits),
+        pull_request_lookup=lambda _sha: pull_request,
+    )
+
+    assert len(payloads) == 1
+    assert len(payloads[0]["embeds"]) == 1
+    embed = payloads[0]["embeds"][0]
+    assert embed["title"] == "0000000 pushed to main"
+    assert embed["url"].endswith("000000000000000000000000000000000000000c")
+    assert embed["description"] == "Summary\nUse the PR body once."
+    assert payloads[0]["content"] == "1 commit(s) landed on `NousResearch/hermes-agent` `main`."
+
+
+def test_direct_multi_commit_push_still_posts_each_commit():
+    mod = _load_module()
+
+    payloads = mod.build_webhook_payloads(
+        _event([
+            _commit(20, "feat: direct one"),
+            _commit(21, "fix: direct two"),
+        ])
+    )
+
+    assert len(payloads) == 1
+    assert [embed["description"] for embed in payloads[0]["embeds"]] == [
+        "feat: direct one",
+        "fix: direct two",
+    ]
+
+
 def test_generic_merge_commit_falls_back_to_pr_title_when_body_empty():
     mod = _load_module()
     commit = _commit(5, "Merge pull request #82 from sligo-droid/example")
