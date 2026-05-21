@@ -41,6 +41,7 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from gateway.platforms.discord import DiscordAdapter  # noqa: E402
+import gateway.platforms.discord as discord_platform  # noqa: E402
 from gateway.platforms.discord import discord as discord_module  # noqa: E402
 
 
@@ -698,6 +699,18 @@ async def test_ship_reaction_routes_thread_session(adapter, monkeypatch):
     payload = _ship_payload(channel_id=777)
     payload.member = SimpleNamespace(id=42, name="jezza", display_name="Jezza", roles=[])
     adapter.handle_message = AsyncMock()
+    project_context = {
+        "project_channel_id": "55",
+        "project_name": "Hermes",
+        "project_path": "/home/droid/hermes",
+        "project_mapping_source": "configured_channel_cwd",
+        "project_mapping_resolved": True,
+    }
+    monkeypatch.setattr(
+        discord_platform,
+        "resolve_discord_project_context",
+        lambda channel: SimpleNamespace(to_dict=lambda: dict(project_context)),
+    )
 
     await adapter._handle_raw_reaction_add(payload)
 
@@ -708,6 +721,8 @@ async def test_ship_reaction_routes_thread_session(adapter, monkeypatch):
     assert event.source.chat_type == "thread"
     assert event.source.thread_id == "777"
     assert event.source.parent_chat_id == "55"
+    assert event.source.project_path == "/home/droid/hermes"
+    assert event.source.project_channel_id == "55"
 
 
 @pytest.mark.asyncio
