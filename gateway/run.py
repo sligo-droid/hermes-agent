@@ -64,6 +64,7 @@ _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+_DISCORD_KANBAN_REACTION_RESYNC_SECS = 30.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _TRUTHY_ENV_VALUES = {"true", "1", "yes", "on"}
 _CODEX_APP_SERVER_ACTIVITY_PREFIX = "Codex app-server event:"
@@ -5867,6 +5868,25 @@ class GatewayRunner:
             separators=(",", ":"),
         )
 
+    def _discord_kanban_reaction_sync_due(
+        self,
+        cache_entry: Any,
+        state: str,
+        now: float,
+    ) -> bool:
+        if not state:
+            return False
+        if not isinstance(cache_entry, dict):
+            return True
+        cached_state = str(cache_entry.get("state") or "")
+        if cached_state != state:
+            return True
+        try:
+            synced_at = float(cache_entry.get("synced_at") or 0.0)
+        except (TypeError, ValueError):
+            synced_at = 0.0
+        return now - synced_at >= _DISCORD_KANBAN_REACTION_RESYNC_SECS
+
     async def _discord_kanban_typing_watcher(self, interval: float = 8.0) -> None:
         """Keep Discord thread typing visible while thread workers are running."""
         interval = max(float(interval or 8.0), 1.0)
@@ -5913,10 +5933,18 @@ class GatewayRunner:
                         if not isinstance(reaction_cache, dict):
                             reaction_cache = {}
                             self._discord_kanban_reaction_states = reaction_cache
+                        now = time.monotonic()
                         for target in reaction_targets:
                             board = str(target.get("board") or "")
                             state = str(target.get("state") or "")
-                            if not board or not state or reaction_cache.get(board) == state:
+                            if (
+                                not board
+                                or not self._discord_kanban_reaction_sync_due(
+                                    reaction_cache.get(board),
+                                    state,
+                                    now,
+                                )
+                            ):
                                 continue
                             try:
                                 synced_state = await reaction_sync(target)
@@ -5928,7 +5956,10 @@ class GatewayRunner:
                                 )
                                 continue
                             if synced_state:
-                                reaction_cache[board] = str(synced_state)
+                                reaction_cache[board] = {
+                                    "state": str(synced_state),
+                                    "synced_at": now,
+                                }
                     if callable(summary_sync):
                         summary_cache = getattr(self, "_discord_kanban_summary_states", None)
                         if not isinstance(summary_cache, dict):
