@@ -95,6 +95,26 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
             created_at INTEGER NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE task_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            profile TEXT,
+            step_key TEXT,
+            status TEXT NOT NULL,
+            claim_lock TEXT,
+            claim_expires INTEGER,
+            worker_pid INTEGER,
+            max_runtime_seconds INTEGER,
+            last_heartbeat_at INTEGER,
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER,
+            outcome TEXT,
+            summary TEXT,
+            metadata TEXT,
+            error TEXT
+        )
+    """)
     conn.execute(
         "INSERT INTO tasks (id, title, status, created_at) "
         "VALUES ('legacy', 'old board task', 'ready', 1)"
@@ -110,6 +130,10 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
             row["name"]
             for row in migrated.execute("PRAGMA table_info(task_events)")
         }
+        run_columns = {
+            row["name"]
+            for row in migrated.execute("PRAGMA table_info(task_runs)")
+        }
         indexes = {
             row["name"]
             for row in migrated.execute(
@@ -121,7 +145,9 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    assert "worker_unit" in task_columns
     assert "run_id" in event_columns
+    assert "worker_unit" in run_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes
@@ -430,6 +456,58 @@ def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
         assert "reclaimed" not in kinds
 
 
+def test_stale_claim_with_active_unit_extends_and_adopts_pid(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_handle(
+            conn,
+            t,
+            kb._SpawnHandle(unit="hermes-kanban-worker-default-t-r1.service"),
+        )
+
+        old_expires = int(time.time()) - 60
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, worker_pid = NULL WHERE id = ?",
+            (old_expires, t),
+        )
+        conn.execute(
+            "UPDATE task_runs SET claim_expires = ?, worker_pid = NULL WHERE task_id = ?",
+            (old_expires, t),
+        )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(
+            _kb,
+            "_systemd_unit_status",
+            lambda _unit: _kb._SystemdUnitStatus(active=True, pid=24680),
+        )
+
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+
+        assert reclaimed == 0
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+        assert task.worker_pid == 24680
+        assert task.worker_unit == "hermes-kanban-worker-default-t-r1.service"
+        run = kb.latest_run(conn, t)
+        assert run.worker_pid == 24680
+        assert run.worker_unit == "hermes-kanban-worker-default-t-r1.service"
+
+        payload = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'claim_extended' ORDER BY id DESC LIMIT 1",
+            (t,),
+        ).fetchone()["payload"]
+        assert '"reason": "unit_active"' in payload
+        assert '"worker_unit": "hermes-kanban-worker-default-t-r1.service"' in payload
+
+
 def test_stale_claim_with_live_pid_uses_env_ttl_override(
     kanban_home, monkeypatch,
 ):
@@ -555,6 +633,37 @@ def test_detect_crashed_workers_isolated_failure_normal_retry(
             assert task.status == "ready", (
                 f"task {tid} should stay ready (isolated), got {task.status}"
             )
+
+
+def test_detect_crashed_workers_skips_active_unit_with_dead_pid(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        _kb,
+        "_systemd_unit_status",
+        lambda _unit: _kb._SystemdUnitStatus(active=True, pid=22222),
+    )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="adopt", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, tid, claimer=f"{host}:w")
+        kb._set_worker_handle(
+            conn,
+            tid,
+            kb._SpawnHandle(pid=11111, unit="hermes-kanban-worker-default-adopt-r1"),
+        )
+
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert crashed == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.worker_pid == 22222
+        assert task.worker_unit == "hermes-kanban-worker-default-adopt-r1.service"
 
 
 def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch):
@@ -1079,6 +1188,32 @@ def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable
     # c is now running
     with kb.connect() as conn:
         assert kb.get_task(conn, c).status == "running"
+
+
+def test_dispatch_records_spawn_handle_pid_and_unit(
+    kanban_home, all_assignees_spawnable,
+):
+    def fake_spawn(task, workspace):
+        return kb._SpawnHandle(pid=4242, unit="hermes-kanban-worker-default-demo-r1")
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="demo", assignee="alice")
+        kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+        task = kb.get_task(conn, t)
+        run = kb.latest_run(conn, t)
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'spawned'",
+            (t,),
+        ).fetchone()
+
+    assert task.worker_pid == 4242
+    assert task.worker_unit == "hermes-kanban-worker-default-demo-r1.service"
+    assert run.worker_pid == 4242
+    assert run.worker_unit == "hermes-kanban-worker-default-demo-r1.service"
+    assert event is not None
+    assert '"pid": 4242' in event["payload"]
+    assert '"unit": "hermes-kanban-worker-default-demo-r1.service"' in event["payload"]
 
 
 def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawnable):
@@ -2034,7 +2169,7 @@ class TestSharedBoardPaths:
         monkeypatch.setattr(kb.shutil, "which", _which)
         monkeypatch.setattr(kb.subprocess, "run", _run)
 
-        pid = kb._spawn_systemd_worker(
+        handle = kb._spawn_systemd_worker(
             cmd=["/usr/bin/hermes", "-p", "coder", "chat", "-q", "work kanban task t_demo"],
             workspace=str(tmp_path),
             env={
@@ -2047,7 +2182,8 @@ class TestSharedBoardPaths:
             unit_name="hermes-kanban-worker-default-t_demo-r1",
         )
 
-        assert pid == 4321
+        assert handle.pid == 4321
+        assert handle.unit == "hermes-kanban-worker-default-t_demo-r1.service"
         systemd_args = calls[0][0]
         assert systemd_args[:4] == [
             "/usr/bin/systemd-run",
@@ -2319,6 +2455,7 @@ def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home
             branch_name TEXT,
             consecutive_failures INTEGER NOT NULL DEFAULT 0,
             worker_pid INTEGER,
+            worker_unit TEXT,
             last_failure_error TEXT,
             max_runtime_seconds INTEGER,
             last_heartbeat_at INTEGER,
