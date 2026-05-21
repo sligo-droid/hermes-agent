@@ -23,6 +23,13 @@ GENERIC_MERGE_PREFIXES = (
     "merge remote-tracking branch",
     "merge branch",
 )
+PR_MERGE_PREFIX = "merge pull request"
+TEST_SECTION_NAMES = {
+    "test",
+    "tests",
+    "testing",
+    "test plan",
+}
 
 
 def _truncate(value: str, limit: int) -> str:
@@ -60,8 +67,29 @@ def _is_generic_merge_message(message: str) -> bool:
     return message.strip().lower().startswith(GENERIC_MERGE_PREFIXES)
 
 
+def _is_pull_request_merge_message(message: str) -> bool:
+    return message.strip().lower().startswith(PR_MERGE_PREFIX)
+
+
+def _section_name(line: str) -> str:
+    stripped = line.strip().strip("*_")
+    if stripped.startswith("#"):
+        stripped = stripped.lstrip("#").strip()
+    return stripped.rstrip(":").strip().lower()
+
+
+def _strip_test_section(text: str) -> str:
+    lines = text.replace("\r\n", "\n").split("\n")
+    kept = []
+    for line in lines:
+        if _section_name(line) in TEST_SECTION_NAMES:
+            break
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
 def _pull_request_description(pull_request: dict[str, Any]) -> str:
-    body = str(pull_request.get("body") or "").strip()
+    body = _strip_test_section(str(pull_request.get("body") or ""))
     if body:
         return _truncate(body, DISCORD_EMBED_DESCRIPTION_LIMIT)
 
@@ -176,8 +204,9 @@ def build_webhook_payloads(
     if not isinstance(commits, list) or not commits:
         return []
 
+    filtered_commits = _collapse_pull_request_push_commits(commits)
     embeds = []
-    for commit in commits:
+    for commit in filtered_commits:
         if not isinstance(commit, dict):
             continue
         sha = str(commit.get("id") or "").strip()
@@ -204,6 +233,23 @@ def build_webhook_payloads(
             }
         )
     return payloads
+
+
+def _collapse_pull_request_push_commits(commits: list[Any]) -> list[Any]:
+    """Keep only final PR merge commits when a push payload contains them.
+
+    GitHub push events for PR merges can include branch commits, a branch-sync
+    merge commit, and the final "Merge pull request" commit. Posting only the
+    final merge commit keeps #logs to one rich PR message while direct
+    multi-commit pushes still show each commit.
+    """
+    merge_commits = [
+        commit
+        for commit in commits
+        if isinstance(commit, dict)
+        and _is_pull_request_merge_message(str(commit.get("message") or ""))
+    ]
+    return merge_commits or commits
 
 
 def fetch_pull_request_for_commit(
