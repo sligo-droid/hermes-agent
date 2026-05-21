@@ -1776,15 +1776,32 @@ class DiscordAdapter(BasePlatformAdapter):
             "any update", "any updates", "can i get an update",
             "can you summarize", "catch me up",
         )
+        feature_intent = cleaned.startswith(feature_starts) or any(p in cleaned for p in feature_phrases)
+        if not feature_intent:
+            feature_intent = bool(
+                re.search(
+                    r"(?:\b(?:and|then|also)\s+|[?!.;:,]\s+)"
+                    r"(?:build|create|add|implement|fix|change|update|remove|delete|ship|"
+                    r"deploy|make|refactor|wire|integrate|set up|setup|turn on|enable|disable)\b",
+                    cleaned,
+                )
+            )
 
-        if cleaned.endswith("?") or cleaned.startswith(question_starts):
-            if not cleaned.startswith(feature_starts) and not any(p in cleaned for p in feature_phrases):
-                return False
-        if any(p in cleaned for p in question_phrases):
-            if not cleaned.startswith(feature_starts) and not any(p in cleaned for p in feature_phrases):
-                return False
-        if cleaned.startswith(feature_starts) or any(p in cleaned for p in feature_phrases):
+        if feature_intent:
             return True
+        if cleaned.endswith("?") or cleaned.startswith(question_starts):
+            return False
+        if any(
+            cleaned == p
+            or cleaned.startswith(f"{p}?")
+            or cleaned.startswith(f"{p} on ")
+            or cleaned.startswith(f"{p} about ")
+            or cleaned.startswith(f"{p} for ")
+            or cleaned.startswith(f"{p} with ")
+            or cleaned.startswith(f"{p} regarding ")
+            for p in question_phrases
+        ):
+            return False
         if cleaned in direct_starts or cleaned.startswith(tuple(f"{p} " for p in direct_starts)):
             return False
         return None

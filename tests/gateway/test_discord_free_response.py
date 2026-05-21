@@ -506,6 +506,39 @@ async def test_discord_obvious_question_does_not_call_auxiliary_classifier(adapt
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        "catch me up, then implement the API retry fix",
+        "any updates? also fix the dashboard reload bug",
+    ],
+)
+async def test_discord_qna_phrase_implementation_requests_auto_thread(adapter, monkeypatch, content):
+    from agent import auxiliary_client
+
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setattr(
+        auxiliary_client,
+        "call_llm",
+        MagicMock(side_effect=AssertionError("implementation requests should use the local heuristic")),
+    )
+    fake_thread = FakeThread(channel_id=999, name="auto-thread")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+    message = make_message(channel=FakeTextChannel(channel_id=123), content=content)
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once_with(message)
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "999"
+    assert not event.channel_prompt or "classified as a direct question/request" not in event.channel_prompt
+
+
+@pytest.mark.asyncio
 async def test_discord_auto_thread_enabled_by_default_for_feature_requests(adapter, monkeypatch):
     """Auto-threading is enabled by default for feature requests."""
     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
