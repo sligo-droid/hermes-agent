@@ -1109,6 +1109,44 @@ class TestWhatsAppSessionKeyConsistency:
         assert build_session_key(first, group_sessions_per_user=False) == "agent:main:discord:group:guild-123"
         assert build_session_key(second, group_sessions_per_user=False) == "agent:main:discord:group:guild-123"
 
+    def test_runner_session_key_uses_platform_extra_override(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.adapters = {}
+        runner.config = GatewayConfig(
+            group_sessions_per_user=True,
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    extra={"group_sessions_per_user": False},
+                )
+            },
+        )
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="guild-123",
+            chat_type="group",
+            user_id="alice",
+        )
+
+        assert runner._session_key_for_source(source) == "agent:main:discord:group:guild-123"
+
+    def test_runner_session_key_falls_back_to_global_config(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.adapters = {}
+        runner.config = GatewayConfig(group_sessions_per_user=False)
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="guild-123",
+            chat_type="group",
+            user_id="alice",
+        )
+
+        assert runner._session_key_for_source(source) == "agent:main:discord:group:guild-123"
+
     def test_group_thread_includes_thread_id(self):
         """Forum-style threads need a distinct session key within one group."""
         source = SessionSource(

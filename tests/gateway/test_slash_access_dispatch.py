@@ -395,6 +395,24 @@ async def test_running_agent_fastpath_status_always_works():
     assert "⛔" not in (result or "")
 
 
+@pytest.mark.asyncio
+async def test_running_agent_fastpath_allows_footer_command():
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": [],
+        }
+    )
+    src = _make_source(user_id="111")
+    sk = build_session_key(src)
+    runner._running_agents[sk] = MagicMock()
+    runner._running_agents_ts[sk] = 0
+    runner._handle_footer_command = AsyncMock(return_value="footer-handled")
+
+    result = await runner._handle_message(_make_event("/footer status", src))
+    assert result == "footer-handled"
+
+
 # ---------------------------------------------------------------------------
 # Alias resolution — /h aliases to /help; the gate must canonicalize before
 # checking access. /hist (history alias) is a real one to exercise.
