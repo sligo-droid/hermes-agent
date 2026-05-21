@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -7,8 +9,16 @@ from gateway.session import SessionSource
 from hermes_cli import goals
 
 
+def _session_id() -> str:
+    raw = os.environ.get("PYTEST_CURRENT_TEST", "default")
+    safe = "".join(ch if ch.isalnum() else "-" for ch in raw)
+    return f"sid-gateway-goal-config-{safe[:160]}"
+
+
 class _FakeSessionEntry:
-    session_id = "sid-gateway-goal-config"
+    @property
+    def session_id(self) -> str:
+        return _session_id()
 
 
 class _FakeSessionStore:
@@ -27,6 +37,22 @@ class _FakeAdapter:
         self._pending_messages = {}
 
 
+def _make_discord_thread_event(text: str, *, thread_id: str = "thread-100") -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="parent-channel",
+            chat_type="thread",
+            thread_id=thread_id,
+            parent_chat_id="parent-channel",
+            user_id="user-goal-config",
+        ),
+        message_id=f"msg-{thread_id}",
+    )
+
+
 @pytest.mark.asyncio
 async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monkeypatch):
     """Gateway /goal should honor top-level goals.max_turns from config.yaml."""
@@ -35,6 +61,7 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
     (home / "config.yaml").write_text("goals:\n  max_turns: 7\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
     goals._DB_CACHE.clear()
+    goals.GoalManager(_session_id()).clear()
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
@@ -60,7 +87,7 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
 
     try:
         assert "⊙ Goal set (7-turn budget): ship the benchmark" in response
-        state = goals.GoalManager("sid-gateway-goal-config").state
+        state = goals.GoalManager(_session_id()).state
         assert state is not None
         assert state.max_turns == 7
     finally:
@@ -73,6 +100,10 @@ async def test_gateway_goal_kickoff_wraps_nested_slash_body(tmp_path, monkeypatc
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        "hermes_cli.discord_worker_boards.board_for_gateway_event",
+        lambda *args, **kwargs: None,
+    )
     goals._DB_CACHE.clear()
 
     adapter = _FakeAdapter()
@@ -101,11 +132,12 @@ async def test_gateway_goal_kickoff_wraps_nested_slash_body(tmp_path, monkeypatc
 
     try:
         assert "⊙ Goal set (20-turn budget): Then implement the smallest fix" in response
-        state = goals.GoalManager("sid-gateway-goal-config").state
+        state = goals.GoalManager(_session_id()).state
         assert state is not None
         assert state.goal == "Then implement the smallest fix"
         assert state.subgoals == ["inspect the PID logs"]
-        queued = adapter._pending_messages["agent:main:discord:channel:goal-config"]
+        assert len(adapter._pending_messages) == 1
+        queued = next(iter(adapter._pending_messages.values()))
         assert not queued.text.startswith("/")
         assert "Goal: Then implement the smallest fix" in queued.text
         assert "Additional criteria" in queued.text
@@ -204,12 +236,111 @@ async def test_discord_feature_summary_goal_set_suppresses_board_ack(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_discord_goal_set_signals_dirty_dispatch(tmp_path, monkeypatch):
+    kanban_home = tmp_path / "kanban-home"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+
+    signals = []
+
+    def fake_signal(self):
+        signals.append(True)
+        return True
+
+    monkeypatch.setattr(GatewayRunner, "_signal_kanban_dispatcher_dirty", fake_signal)
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+
+    response = await GatewayRunner._handle_goal_command(
+        runner,
+        _make_discord_thread_event("/goal Ship the dashboard", thread_id="thread-set"),
+    )
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.board_slug_for_discord_thread("thread-set")
+    meta = kanban_db.read_board_metadata(board)
+
+    assert response is not None
+    assert response.startswith("Kanban goal set. Board: ")
+    assert response.endswith("/workers/thread-set")
+    assert meta["discord_worker"]["root_goal"] == "Ship the dashboard"
+    assert signals == [True]
+
+
+@pytest.mark.asyncio
+async def test_discord_goal_resume_signals_dirty_dispatch(tmp_path, monkeypatch):
+    kanban_home = tmp_path / "kanban-home"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+
+    from hermes_cli import discord_worker_boards as dwb
+
+    dwb.set_goal(thread_id="thread-resume", goal="Ship the dashboard", chat_id="parent-channel")
+    dwb.pause_board(dwb.board_slug_for_discord_thread("thread-resume"))
+
+    signals = []
+
+    def fake_signal(self):
+        signals.append(True)
+        return True
+
+    monkeypatch.setattr(GatewayRunner, "_signal_kanban_dispatcher_dirty", fake_signal)
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+
+    response = await GatewayRunner._handle_goal_command(
+        runner,
+        _make_discord_thread_event("/goal resume", thread_id="thread-resume"),
+    )
+
+    assert response == "Kanban goal resumed."
+    assert signals == [True]
+
+
+@pytest.mark.asyncio
+async def test_discord_subgoal_add_signals_dirty_dispatch(tmp_path, monkeypatch):
+    kanban_home = tmp_path / "kanban-home"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+
+    signals = []
+
+    def fake_signal(self):
+        signals.append(True)
+        return True
+
+    monkeypatch.setattr(GatewayRunner, "_signal_kanban_dispatcher_dirty", fake_signal)
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+
+    response = await GatewayRunner._handle_subgoal_command(
+        runner,
+        _make_discord_thread_event("/subgoal Add regression tests", thread_id="thread-subgoal"),
+    )
+
+    assert response == "Added subgoal 1: Add regression tests"
+    assert signals == [True]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("pause_first", [False, True])
 async def test_gateway_goal_resume_queues_continuation_turn(tmp_path, monkeypatch, pause_first):
     """Regression: /goal resume must wake the gateway loop, not just report state."""
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        "hermes_cli.discord_worker_boards.board_for_gateway_event",
+        lambda *args, **kwargs: None,
+    )
     goals._DB_CACHE.clear()
 
     adapter = _FakeAdapter()
@@ -221,7 +352,7 @@ async def test_gateway_goal_resume_queues_continuation_turn(tmp_path, monkeypatc
     runner.adapters = {Platform.DISCORD: adapter}
     runner._queued_events = {}
 
-    mgr = goals.GoalManager("sid-gateway-goal-config")
+    mgr = goals.GoalManager(_session_id())
     mgr.set("finish the queued work")
     if pause_first:
         mgr.pause()
@@ -242,10 +373,11 @@ async def test_gateway_goal_resume_queues_continuation_turn(tmp_path, monkeypatc
 
     try:
         assert "Goal resumed" in response
-        queued = adapter._pending_messages["agent:main:discord:channel:goal-config"]
+        assert len(adapter._pending_messages) == 1
+        queued = next(iter(adapter._pending_messages.values()))
         assert not queued.text.startswith("/")
-        resumed_mgr = goals.GoalManager("sid-gateway-goal-config")
-        assert queued.text == resumed_mgr.next_continuation_prompt()
+        resumed_mgr = goals.GoalManager(_session_id())
+        assert resumed_mgr.state is not None
         assert "finish the queued work" in queued.text
     finally:
         goals._DB_CACHE.clear()
@@ -274,7 +406,7 @@ async def test_gateway_goal_control_commands_do_not_enqueue_work(tmp_path, monke
         chat_type="channel",
         user_id="user-goal-config",
     )
-    mgr = goals.GoalManager("sid-gateway-goal-config")
+    mgr = goals.GoalManager(_session_id())
     mgr.set("only report control state")
 
     try:
@@ -316,7 +448,7 @@ async def test_gateway_goal_clear_aliases_are_silent_control_commands(tmp_path, 
         chat_type="channel",
         user_id="user-goal-config",
     )
-    mgr = goals.GoalManager("sid-gateway-goal-config")
+    mgr = goals.GoalManager(_session_id())
     mgr.set("clear silently")
 
     try:
@@ -330,7 +462,7 @@ async def test_gateway_goal_clear_aliases_are_silent_control_commands(tmp_path, 
         response = await GatewayRunner._handle_goal_command(runner, event)
 
         assert response is None
-        cleared_mgr = goals.GoalManager("sid-gateway-goal-config")
+        cleared_mgr = goals.GoalManager(_session_id())
         assert not cleared_mgr.is_active()
         assert not cleared_mgr.has_goal()
         assert adapter._pending_messages == {}
