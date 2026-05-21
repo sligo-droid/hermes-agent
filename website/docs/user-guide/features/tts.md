@@ -8,13 +8,17 @@ description: "Text-to-speech and voice message transcription across all platform
 
 Hermes Agent supports both text-to-speech output and voice message transcription across all messaging platforms.
 
+:::warning Mistral Voxtral temporarily disabled
+Mistral Voxtral TTS and STT are currently disabled in Hermes because the `mistralai` PyPI package was quarantined on 2026-05-12. Config values such as `tts.provider: mistral` or `stt.provider: mistral` return a clear error until the package is un-quarantined and Hermes re-enables the provider.
+:::
+
 :::tip Nous Subscribers
 If you have a paid [Nous Portal](https://portal.nousresearch.com) subscription, OpenAI TTS is available through the **[Tool Gateway](tool-gateway.md)** without a separate OpenAI API key. Run `hermes model` or `hermes tools` to enable it.
 :::
 
 ## Text-to-Speech
 
-Convert text to speech with ten providers:
+Convert text to speech with nine currently enabled providers:
 
 | Provider | Quality | Cost | API Key |
 |----------|---------|------|---------|
@@ -22,7 +26,6 @@ Convert text to speech with ten providers:
 | **ElevenLabs** | Excellent | Paid | `ELEVENLABS_API_KEY` |
 | **OpenAI TTS** | Good | Paid | `VOICE_TOOLS_OPENAI_KEY` |
 | **MiniMax TTS** | Excellent | Paid | `MINIMAX_API_KEY` |
-| **Mistral (Voxtral TTS)** | Excellent | Paid | `MISTRAL_API_KEY` |
 | **Google Gemini TTS** | Excellent | Free tier | `GEMINI_API_KEY` |
 | **xAI TTS** | Excellent | Paid | `XAI_API_KEY` |
 | **NeuTTS** | Good | Free (local) | None needed |
@@ -43,7 +46,7 @@ Convert text to speech with ten providers:
 ```yaml
 # In ~/.hermes/config.yaml
 tts:
-  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "neutts" | "kittentts" | "piper"
+  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "gemini" | "xai" | "neutts" | "kittentts" | "piper"
   speed: 1.0                    # Global speed multiplier (provider-specific settings override this)
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
@@ -62,9 +65,6 @@ tts:
     speed: 1                    # 0.5 - 2.0
     vol: 1                      # 0 - 10
     pitch: 0                    # -12 - 12
-  mistral:
-    model: "voxtral-mini-tts-2603"
-    voice_id: "c69964a6-ab8b-4f8a-9465-ec0925096ec8"  # Paul - Neutral (default)
   gemini:
     model: "gemini-2.5-flash-preview-tts"  # or gemini-2.5-pro-preview-tts
     voice: "Kore"               # 30 prebuilt voices: Zephyr, Puck, Kore, Enceladus, Gacrux, etc.
@@ -108,7 +108,6 @@ Each provider has a documented per-request input-character cap. Hermes truncates
 | OpenAI | 4096 |
 | xAI | 15000 |
 | MiniMax | 10000 |
-| Mistral | 4000 |
 | Google Gemini | 5000 |
 | ElevenLabs | Model-aware (see below) |
 | NeuTTS | 2000 |
@@ -138,7 +137,7 @@ Only positive integers are honored. Zero, negative, non-numeric, or boolean valu
 
 Telegram voice bubbles require Opus/OGG audio format:
 
-- **OpenAI, ElevenLabs, and Mistral** produce Opus natively — no extra setup
+- **OpenAI and ElevenLabs** produce Opus natively — no extra setup
 - **Edge TTS** (default) outputs MP3 and needs **ffmpeg** to convert:
 - **MiniMax TTS** outputs MP3 and needs **ffmpeg** to convert for Telegram voice bubbles
 - **Google Gemini TTS** outputs raw PCM and uses **ffmpeg** to encode Opus directly for Telegram voice bubbles
@@ -161,7 +160,7 @@ sudo dnf install ffmpeg
 Without ffmpeg, Edge TTS, MiniMax TTS, NeuTTS, KittenTTS, and Piper audio are sent as regular audio files (playable, but shown as a rectangular player instead of a voice bubble).
 
 :::tip
-If you want voice bubbles without installing ffmpeg, switch to the OpenAI, ElevenLabs, or Mistral provider.
+If you want voice bubbles without installing ffmpeg, switch to the OpenAI or ElevenLabs provider.
 :::
 
 ### xAI Custom Voices (voice cloning)
@@ -316,13 +315,11 @@ Local transcription works out of the box when `faster-whisper` is installed. If 
 ```yaml
 # In ~/.hermes/config.yaml
 stt:
-  provider: "local"           # "local" | "groq" | "openai" | "mistral" | "xai"
+  provider: "local"           # "local" | "groq" | "openai" | "xai"
   local:
     model: "base"             # tiny, base, small, medium, large-v3
   openai:
     model: "whisper-1"        # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe
-  mistral:
-    model: "voxtral-mini-latest"  # voxtral-mini-latest, voxtral-mini-2602
   xai:
     model: "grok-stt"         # xAI Grok STT
 ```
@@ -343,7 +340,7 @@ stt:
 
 **OpenAI API** — Accepts `VOICE_TOOLS_OPENAI_KEY` first and falls back to `OPENAI_API_KEY`. Supports `whisper-1`, `gpt-4o-mini-transcribe`, and `gpt-4o-transcribe`.
 
-**Mistral API (Voxtral Transcribe)** — Requires `MISTRAL_API_KEY`. Uses Mistral's [Voxtral Transcribe](https://docs.mistral.ai/capabilities/audio/speech_to_text/) models. Supports 13 languages, speaker diarization, and word-level timestamps. Install with `pip install hermes-agent[mistral]`.
+**Mistral API (Voxtral Transcribe)** — Temporarily disabled while the `mistralai` PyPI package is quarantined. `MISTRAL_API_KEY` is not used for STT until Hermes re-enables this provider.
 
 **xAI Grok STT** — Requires `XAI_API_KEY`. Posts to `https://api.x.ai/v1/stt` as multipart/form-data. Good choice if you're already using xAI for chat or TTS and want one API key for everything. Auto-detection order puts it after Groq — explicitly set `stt.provider: xai` to force it.
 
@@ -373,5 +370,5 @@ If your configured provider isn't available, Hermes automatically falls back:
 - **Local faster-whisper unavailable** → Tries a local `whisper` CLI or `HERMES_LOCAL_STT_COMMAND` before cloud providers
 - **Groq key not set** → Falls back to local transcription, then OpenAI
 - **OpenAI key not set** → Falls back to local transcription, then Groq
-- **Mistral key/SDK not set** → Skipped in auto-detect; falls through to next available provider
+- **Mistral selected** → Temporarily disabled while `mistralai` is quarantined; choose Local, Groq, OpenAI, or xAI instead
 - **Nothing available** → Voice messages pass through with an accurate note to the user

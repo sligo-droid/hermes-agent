@@ -4,6 +4,7 @@ import time
 import pytest
 from pathlib import Path
 
+from agent.message_sanitization import IMAGE_HISTORY_PLACEHOLDER
 from hermes_state import SessionDB
 
 
@@ -213,10 +214,12 @@ class TestMessageStorage:
         messages = db.get_messages("s1")
         assert messages[0]["tool_calls"] == tool_calls
 
-    def test_multimodal_list_content_round_trip(self, db):
-        """Multimodal ``content`` (list of parts) must survive the SQLite
-        round-trip.  sqlite3 cannot bind Python lists directly, so the DB
-        layer JSON-encodes structured content on write and decodes on read.
+    def test_multimodal_list_content_persists_without_image_bytes(self, db):
+        """Multimodal ``content`` must persist without replaying image bytes.
+
+        sqlite3 cannot bind Python lists directly, so the DB layer still accepts
+        structured content. Image data URLs are turn-scoped, though, and must be
+        collapsed before they become resumable session history.
 
         Regression test for the "Error binding parameter 3: type 'list' is
         not supported" crash users hit when pasting screenshots into the
@@ -234,15 +237,18 @@ class TestMessageStorage:
         # Write must not raise
         db.append_message("s1", role="user", content=content)
 
-        # get_messages decodes back to the original list
+        expected = f"describe this screenshot\n{IMAGE_HISTORY_PLACEHOLDER}"
+
+        # get_messages decodes sanitized content, not the original data URL.
         msgs = db.get_messages("s1")
         assert len(msgs) == 1
-        assert msgs[0]["content"] == content
+        assert msgs[0]["content"] == expected
+        assert "data:image" not in msgs[0]["content"]
 
-        # get_messages_as_conversation decodes back to the original list
+        # get_messages_as_conversation is the replay boundary.
         conv = db.get_messages_as_conversation("s1")
         assert len(conv) == 1
-        assert conv[0] == {"role": "user", "content": content}
+        assert conv[0] == {"role": "user", "content": expected}
 
     def test_dict_content_round_trip(self, db):
         """Dict-shaped content (e.g. provider wrappers) also round-trips."""
@@ -303,7 +309,8 @@ class TestMessageStorage:
 
         msgs = db.get_messages("s1")
         assert len(msgs) == 2
-        assert msgs[0]["content"] == content
+        assert msgs[0]["content"] == f"look at this\n{IMAGE_HISTORY_PLACEHOLDER}"
+        assert "data:image" not in msgs[0]["content"]
         assert msgs[1]["content"] == "I see a screenshot."
 
     def test_get_messages_as_conversation(self, db):

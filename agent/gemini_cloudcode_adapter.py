@@ -28,6 +28,7 @@ reverse-engineered from the opencode-gemini-auth and clawdbot implementations.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import time
@@ -81,6 +82,49 @@ def _coerce_content_to_text(content: Any) -> str:
                     logger.debug("Dropping multimodal part (not yet supported): %s", p.get("type"))
         return "\n".join(pieces)
     return str(content)
+
+
+def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
+    """OpenAI content parts -> Gemini parts, preserving data-URL images."""
+    if not isinstance(content, list):
+        text = _coerce_content_to_text(content)
+        return [{"text": text}] if text else []
+
+    parts: List[Dict[str, Any]] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append({"text": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        ptype = item.get("type")
+        if ptype == "text":
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                parts.append({"text": text})
+        elif ptype == "image_url":
+            url = ((item.get("image_url") or {}).get("url") or "")
+            if not isinstance(url, str) or not url.startswith("data:"):
+                logger.warning("Dropping non-data image_url part for google-gemini-cli")
+                continue
+            try:
+                header, encoded = url.split(",", 1)
+                mime = header.split(":", 1)[1].split(";", 1)[0]
+                raw = base64.b64decode(encoded)
+            except Exception:
+                logger.warning("Dropping invalid image_url part for google-gemini-cli")
+                continue
+            parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": mime,
+                        "data": base64.b64encode(raw).decode("ascii"),
+                    }
+                }
+            )
+        elif ptype == "input_audio":
+            logger.warning("Dropping unsupported input_audio part for google-gemini-cli")
+    return parts
 
 
 def _translate_tool_call_to_gemini(tool_call: Dict[str, Any]) -> Dict[str, Any]:
@@ -157,9 +201,7 @@ def _build_gemini_contents(
         gemini_role = _ROLE_MAP_OPENAI_TO_GEMINI.get(role, "user")
         parts: List[Dict[str, Any]] = []
 
-        text = _coerce_content_to_text(msg.get("content"))
-        if text:
-            parts.append({"text": text})
+        parts.extend(_extract_multimodal_parts(msg.get("content")))
 
         # Assistant messages can carry tool_calls
         tool_calls = msg.get("tool_calls") or []

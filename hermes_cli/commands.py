@@ -343,6 +343,7 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "background",
         "commands",
         "deny",
+        "footer",
         "help",
         "new",
         "profile",
@@ -352,6 +353,8 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "steer",
         "stop",
         "update",
+        "verbose",
+        "yolo",
     }
 )
 

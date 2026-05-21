@@ -64,6 +64,7 @@ from .whatsapp_identity import (
     canonical_whatsapp_identifier,
     normalize_whatsapp_identifier,  # noqa: F401 - re-exported for gateway.session callers
 )
+from agent.message_sanitization import sanitize_history_message, sanitize_history_messages
 from utils import atomic_replace
 
 
@@ -1333,21 +1334,23 @@ class SessionStore:
                      via its own _flush_messages_to_session_db(), preventing
                      the duplicate-write bug (#860).
         """
+        safe_message = sanitize_history_message(message)
+
         # Write to SQLite (unless the agent already handled it)
         if self._db and not skip_db:
             try:
                 self._db.append_message(
                     session_id=session_id,
-                    role=message.get("role", "unknown"),
-                    content=message.get("content"),
-                    tool_name=message.get("tool_name"),
-                    tool_calls=message.get("tool_calls"),
-                    tool_call_id=message.get("tool_call_id"),
-                    reasoning=message.get("reasoning") if message.get("role") == "assistant" else None,
-                    reasoning_content=message.get("reasoning_content") if message.get("role") == "assistant" else None,
-                    reasoning_details=message.get("reasoning_details") if message.get("role") == "assistant" else None,
-                    codex_reasoning_items=message.get("codex_reasoning_items") if message.get("role") == "assistant" else None,
-                    codex_message_items=message.get("codex_message_items") if message.get("role") == "assistant" else None,
+                    role=safe_message.get("role", "unknown"),
+                    content=safe_message.get("content"),
+                    tool_name=safe_message.get("tool_name"),
+                    tool_calls=safe_message.get("tool_calls"),
+                    tool_call_id=safe_message.get("tool_call_id"),
+                    reasoning=safe_message.get("reasoning") if safe_message.get("role") == "assistant" else None,
+                    reasoning_content=safe_message.get("reasoning_content") if safe_message.get("role") == "assistant" else None,
+                    reasoning_details=safe_message.get("reasoning_details") if safe_message.get("role") == "assistant" else None,
+                    codex_reasoning_items=safe_message.get("codex_reasoning_items") if safe_message.get("role") == "assistant" else None,
+                    codex_message_items=safe_message.get("codex_message_items") if safe_message.get("role") == "assistant" else None,
                 )
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)
@@ -1357,7 +1360,7 @@ class SessionStore:
         try:
             with self._lock:
                 with open(transcript_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(message, ensure_ascii=False) + "\n")
+                    f.write(json.dumps(safe_message, ensure_ascii=False) + "\n")
         except OSError as e:
             # Disk full / read-only fs / permission errors must not crash the
             # message handler — the SQLite write above is the primary store.
@@ -1369,18 +1372,20 @@ class SessionStore:
         Used by /retry, /undo, and /compress to persist modified conversation history.
         Rewrites both SQLite and legacy JSONL storage.
         """
+        safe_messages = sanitize_history_messages(messages)
+
         # SQLite: replace atomically so a mid-rewrite failure doesn't leave
         # the session half-empty in the DB while JSONL still has history.
         if self._db:
             try:
-                self._db.replace_messages(session_id, messages)
+                self._db.replace_messages(session_id, safe_messages)
             except Exception as e:
                 logger.debug("Failed to rewrite transcript in DB: %s", e)
         
         # JSONL: overwrite the file
         transcript_path = self.get_transcript_path(session_id)
         with open(transcript_path, "w", encoding="utf-8") as f:
-            for msg in messages:
+            for msg in safe_messages:
                 f.write(json.dumps(msg, ensure_ascii=False) + "\n")
 
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
@@ -1404,7 +1409,9 @@ class SessionStore:
                         line = line.strip()
                         if line:
                             try:
-                                jsonl_messages.append(json.loads(line))
+                                jsonl_messages.append(
+                                    sanitize_history_message(json.loads(line))
+                                )
                             except json.JSONDecodeError:
                                 logger.warning(
                                     "Skipping corrupt line in transcript %s: %s",

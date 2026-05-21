@@ -5,6 +5,7 @@ import json
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+from agent.message_sanitization import IMAGE_HISTORY_PLACEHOLDER
 from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import (
@@ -731,6 +732,23 @@ class TestLoadTranscriptCorruptLines:
         assert messages[0]["content"] == "a"
         assert messages[1]["content"] == "b"
 
+    def test_jsonl_transcript_sanitizes_native_image_bytes(self, store):
+        session_id = "image_history_test"
+        content = [
+            {"type": "text", "text": "analyze this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+        ]
+
+        store.append_to_transcript(session_id, {"role": "user", "content": content})
+
+        raw = store.get_transcript_path(session_id).read_text(encoding="utf-8")
+        messages = store.load_transcript(session_id)
+
+        assert "data:image" not in raw
+        assert messages == [
+            {"role": "user", "content": f"analyze this\n{IMAGE_HISTORY_PLACEHOLDER}"}
+        ]
+
 
 class TestLoadTranscriptPreferLongerSource:
     """Regression: load_transcript must return whichever source (SQLite or JSONL)
@@ -1108,6 +1126,44 @@ class TestWhatsAppSessionKeyConsistency:
 
         assert build_session_key(first, group_sessions_per_user=False) == "agent:main:discord:group:guild-123"
         assert build_session_key(second, group_sessions_per_user=False) == "agent:main:discord:group:guild-123"
+
+    def test_runner_session_key_uses_platform_extra_override(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.adapters = {}
+        runner.config = GatewayConfig(
+            group_sessions_per_user=True,
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=True,
+                    extra={"group_sessions_per_user": False},
+                )
+            },
+        )
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="guild-123",
+            chat_type="group",
+            user_id="alice",
+        )
+
+        assert runner._session_key_for_source(source) == "agent:main:discord:group:guild-123"
+
+    def test_runner_session_key_falls_back_to_global_config(self):
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.adapters = {}
+        runner.config = GatewayConfig(group_sessions_per_user=False)
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="guild-123",
+            chat_type="group",
+            user_id="alice",
+        )
+
+        assert runner._session_key_for_source(source) == "agent:main:discord:group:guild-123"
 
     def test_group_thread_includes_thread_id(self):
         """Forum-style threads need a distinct session key within one group."""

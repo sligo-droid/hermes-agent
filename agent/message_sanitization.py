@@ -21,6 +21,12 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+IMAGE_HISTORY_PLACEHOLDER = "[image omitted from session history]"
+_IMAGE_PART_TYPES = {"image", "image_url", "input_image"}
+_IMAGE_DATA_URL_RE = re.compile(
+    r"data:image/[A-Za-z0-9.+-]+;base64,[^\s\"')>},]+"
+)
+
 # Lone surrogate code points are invalid in UTF-8 and crash json.dumps
 # inside the OpenAI SDK.  Used by every surrogate-sanitization helper
 # below as well as by run_agent and the CLI for paste-from-clipboard
@@ -400,6 +406,104 @@ def _strip_images_from_messages(messages: list) -> bool:
     return found
 
 
+def _history_image_part(part: dict[str, Any]) -> bool:
+    """Return True for OpenAI-style image content parts."""
+    part_type = part.get("type")
+    if part_type in _IMAGE_PART_TYPES:
+        return True
+    image_url = part.get("image_url")
+    if isinstance(image_url, str):
+        return bool(_IMAGE_DATA_URL_RE.search(image_url))
+    if isinstance(image_url, dict):
+        url = image_url.get("url")
+        return isinstance(url, str) and bool(_IMAGE_DATA_URL_RE.search(url))
+    return False
+
+
+def _sanitize_history_node(value: Any) -> tuple[Any, bool]:
+    """Scrub image data URLs from nested persisted history values."""
+    if isinstance(value, str):
+        sanitized = _IMAGE_DATA_URL_RE.sub(IMAGE_HISTORY_PLACEHOLDER, value)
+        return sanitized, sanitized != value
+    if isinstance(value, list):
+        changed = False
+        sanitized_items = []
+        for item in value:
+            sanitized, item_changed = _sanitize_history_node(item)
+            sanitized_items.append(sanitized)
+            changed = changed or item_changed
+        return sanitized_items, changed
+    if isinstance(value, dict):
+        if _history_image_part(value):
+            return {"type": "text", "text": IMAGE_HISTORY_PLACEHOLDER}, True
+        changed = False
+        sanitized_dict = {}
+        for key, item in value.items():
+            sanitized, item_changed = _sanitize_history_node(item)
+            sanitized_dict[key] = sanitized
+            changed = changed or item_changed
+        return sanitized_dict, changed
+    return value, False
+
+
+def sanitize_history_content(content: Any) -> Any:
+    """Return content safe to persist and replay from session history.
+
+    Native image inputs are turn-scoped.  Persisting their base64 data URLs in
+    DB/JSONL/TUI memory bloats future prompts and repeatedly replays pixels the
+    user only attached to one turn, so image parts are collapsed into text
+    placeholders while ordinary text and non-image structured content remain.
+    """
+    if not isinstance(content, list):
+        sanitized, _ = _sanitize_history_node(content)
+        return sanitized
+
+    text_parts: list[str] = []
+    sanitized_parts: list[Any] = []
+    redacted_media = False
+
+    for part in content:
+        if isinstance(part, dict) and _history_image_part(part):
+            redacted_media = True
+            text_parts.append(IMAGE_HISTORY_PLACEHOLDER)
+            continue
+
+        if isinstance(part, dict) and part.get("type") == "text":
+            text = part.get("text", "")
+            sanitized_text, text_changed = _sanitize_history_node(str(text))
+            sanitized_parts.append({**part, "text": sanitized_text})
+            if sanitized_text:
+                text_parts.append(str(sanitized_text))
+            redacted_media = redacted_media or text_changed
+            continue
+
+        sanitized, part_changed = _sanitize_history_node(part)
+        sanitized_parts.append(sanitized)
+        redacted_media = redacted_media or part_changed
+        if part_changed and isinstance(sanitized, str) and sanitized:
+            text_parts.append(sanitized)
+
+    if redacted_media:
+        joined = "\n".join(p for p in text_parts if p)
+        return joined or IMAGE_HISTORY_PLACEHOLDER
+    return sanitized_parts
+
+
+def sanitize_history_message(message: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``message`` with replay-unsafe content scrubbed."""
+    if not isinstance(message, dict):
+        return message
+    sanitized = dict(message)
+    if "content" in sanitized:
+        sanitized["content"] = sanitize_history_content(sanitized.get("content"))
+    return sanitized
+
+
+def sanitize_history_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return copies of messages with replay-unsafe content scrubbed."""
+    return [sanitize_history_message(msg) for msg in messages]
+
+
 def _sanitize_structure_non_ascii(payload: Any) -> bool:
     """Strip non-ASCII characters from nested dict/list payloads in-place."""
     found = False
@@ -440,5 +544,9 @@ __all__ = [
     "_sanitize_messages_non_ascii",
     "_sanitize_tools_non_ascii",
     "_strip_images_from_messages",
+    "sanitize_history_content",
+    "sanitize_history_message",
+    "sanitize_history_messages",
+    "IMAGE_HISTORY_PLACEHOLDER",
     "_sanitize_structure_non_ascii",
 ]

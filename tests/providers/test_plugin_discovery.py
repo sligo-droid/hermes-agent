@@ -24,6 +24,9 @@ def _clear_provider_caches():
     _pkg._REGISTRY.clear()
     _pkg._ALIASES.clear()
     _pkg._discovered = False
+    _pkg._discovered_user_plugins_dir = None
+    _pkg._baseline_registry = None
+    _pkg._baseline_aliases = None
     # Evict any cached plugin modules so the next import re-executes.
     for mod in list(sys.modules.keys()):
         if (
@@ -106,6 +109,46 @@ def test_user_plugin_overrides_bundled(tmp_path, monkeypatch):
     assert "gmi-user-override-test" in gmi.aliases
 
     # Clean up: reset discovery state so other tests see the bundled version
+    _clear_provider_caches()
+
+
+def test_user_provider_plugins_refresh_when_hermes_home_changes(tmp_path, monkeypatch):
+    """Changing HERMES_HOME in-process must not keep prior profile providers."""
+    home_a = tmp_path / "home-a"
+    home_b = tmp_path / "home-b"
+
+    for home, label in ((home_a, "a"), (home_b, "b")):
+        plugin_dir = home / "plugins" / "model-providers" / "gmi"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "__init__.py").write_text(
+            "from providers import register_provider\n"
+            "from providers.base import ProviderProfile\n"
+            "register_provider(ProviderProfile(\n"
+            "    name='gmi',\n"
+            f"    aliases=('profile-{label}-alias',),\n"
+            "    env_vars=('GMI_API_KEY',),\n"
+            f"    base_url='https://profile-{label}.example.com/v1',\n"
+            "    auth_type='api_key',\n"
+            "))\n",
+            encoding="utf-8",
+        )
+        (plugin_dir / "plugin.yaml").write_text(
+            "name: gmi-profile-test\nkind: model-provider\nversion: 0.0.1\n",
+            encoding="utf-8",
+        )
+
+    _clear_provider_caches()
+    from providers import get_provider_profile
+
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    assert get_provider_profile("gmi").base_url == "https://profile-a.example.com/v1"
+    assert get_provider_profile("profile-a-alias").name == "gmi"
+
+    monkeypatch.setenv("HERMES_HOME", str(home_b))
+    assert get_provider_profile("gmi").base_url == "https://profile-b.example.com/v1"
+    assert get_provider_profile("profile-b-alias").name == "gmi"
+    assert get_provider_profile("profile-a-alias") is None
+
     _clear_provider_caches()
 
 

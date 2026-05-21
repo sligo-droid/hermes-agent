@@ -23,6 +23,7 @@ import threading
 import time
 from pathlib import Path
 
+from agent.message_sanitization import sanitize_history_content
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
@@ -1488,7 +1489,7 @@ class SessionDB:
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
         # cannot bind list/dict parameters directly.
-        stored_content = self._encode_content(content)
+        stored_content = self._encode_content(sanitize_history_content(content))
 
         # Pre-compute tool call count
         num_tool_calls = 0
@@ -1588,7 +1589,7 @@ class SessionDB:
                     (
                         session_id,
                         role,
-                        self._encode_content(msg.get("content")),
+                        self._encode_content(sanitize_history_content(msg.get("content"))),
                         msg.get("tool_call_id"),
                         tool_calls_json,
                         msg.get("tool_name"),
@@ -1628,7 +1629,9 @@ class SessionDB:
         for row in rows:
             msg = dict(row)
             if "content" in msg:
-                msg["content"] = self._decode_content(msg["content"])
+                msg["content"] = sanitize_history_content(
+                    self._decode_content(msg["content"])
+                )
             if msg.get("tool_calls"):
                 try:
                     msg["tool_calls"] = json.loads(msg["tool_calls"])
@@ -1924,7 +1927,7 @@ class SessionDB:
 
         messages = []
         for row in rows:
-            content = self._decode_content(row["content"])
+            content = sanitize_history_content(self._decode_content(row["content"]))
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}

@@ -4,14 +4,11 @@ Specifically tests that top-level `cwd:` and `backend:` in config.yaml
 are correctly bridged to TERMINAL_CWD / TERMINAL_ENV env vars as
 convenience aliases for `terminal.cwd` / `terminal.backend`.
 
-The bridge logic is module-level code in gateway/run.py, so we test
-the semantics by reimplementing the relevant config bridge snippet and
-asserting the expected env var outcomes.
+The bridge logic is module-level code in gateway/run.py, exposed through
+``_bridge_gateway_config_to_env`` so tests exercise the real behavior.
 """
 
 import os
-import json
-import pytest
 from pathlib import Path
 
 
@@ -20,66 +17,11 @@ def _simulate_config_bridge(
     initial_env: dict | None = None,
     hermes_home: str = "/root/.hermes",
 ):
-    """Simulate the gateway config bridge logic from gateway/run.py.
+    """Run the real gateway config bridge helper against an isolated env."""
+    from gateway.run import _bridge_gateway_config_to_env
 
-    Returns the resulting env dict (only TERMINAL_* and MESSAGING_CWD keys).
-    """
     env = dict(initial_env or {})
-
-    # --- Replicate lines 54-56: generic top-level bridge (for context) ---
-    for key, val in cfg.items():
-        if isinstance(val, (str, int, float, bool)) and key not in env:
-            env[key] = str(val)
-
-    # --- Replicate lines 59-87: terminal config bridge ---
-    terminal_cfg = cfg.get("terminal", {})
-    if terminal_cfg and isinstance(terminal_cfg, dict):
-        terminal_env_map = {
-            "backend": "TERMINAL_ENV",
-            "cwd": "TERMINAL_CWD",
-            "timeout": "TERMINAL_TIMEOUT",
-            "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
-            "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
-            "container_cpu": "TERMINAL_CONTAINER_CPU",
-            "container_memory": "TERMINAL_CONTAINER_MEMORY",
-            "container_disk": "TERMINAL_CONTAINER_DISK",
-        }
-        for cfg_key, env_var in terminal_env_map.items():
-            if cfg_key in terminal_cfg:
-                val = terminal_cfg[cfg_key]
-                # Skip cwd placeholder values — don't overwrite already-resolved
-                # TERMINAL_CWD.  Mirrors the fix in gateway/run.py.
-                if cfg_key == "cwd" and str(val) in {".", "auto", "cwd"}:
-                    continue
-                # Expand shell tilde so subprocess.Popen never receives a literal
-                # "~/" which the kernel rejects.
-                if cfg_key == "cwd" and isinstance(val, str):
-                    val = os.path.expanduser(val)
-                if isinstance(val, list):
-                    env[env_var] = json.dumps(val)
-                else:
-                    env[env_var] = str(val)
-
-    # --- NEW: top-level aliases (the fix being tested) ---
-    top_level_aliases = {
-        "cwd": "TERMINAL_CWD",
-        "backend": "TERMINAL_ENV",
-    }
-    for alias_key, alias_env in top_level_aliases.items():
-        if alias_env not in env:
-            alias_val = cfg.get(alias_key)
-            if isinstance(alias_val, str) and alias_val.strip():
-                if alias_key == "cwd":
-                    alias_val = os.path.expanduser(alias_val)
-                env[alias_env] = alias_val.strip()
-
-    # --- Replicate gateway cwd fallback ---
-    configured_cwd = env.get("TERMINAL_CWD", "")
-    if not configured_cwd or configured_cwd in (".", "auto", "cwd"):
-        messaging_cwd = env.get("MESSAGING_CWD") or hermes_home
-        env["TERMINAL_CWD"] = messaging_cwd
-
-    return env
+    return _bridge_gateway_config_to_env(cfg, env, hermes_home)
 
 
 class TestTopLevelCwdAlias:
@@ -115,6 +57,21 @@ class TestTopLevelCwdAlias:
             "backend": "should-not-use",
             "terminal": {"backend": "docker"},
         }
+        result = _simulate_config_bridge(cfg)
+        assert result["TERMINAL_ENV"] == "docker"
+
+    def test_terminal_env_type_legacy_backend_alias(self):
+        cfg = {"terminal": {"env_type": "docker"}}
+        result = _simulate_config_bridge(cfg)
+        assert result["TERMINAL_ENV"] == "docker"
+
+    def test_terminal_backend_takes_precedence_over_env_type(self):
+        cfg = {"terminal": {"backend": "local", "env_type": "docker"}}
+        result = _simulate_config_bridge(cfg)
+        assert result["TERMINAL_ENV"] == "local"
+
+    def test_terminal_env_type_takes_precedence_over_top_level_backend(self):
+        cfg = {"backend": "local", "terminal": {"env_type": "docker"}}
         result = _simulate_config_bridge(cfg)
         assert result["TERMINAL_ENV"] == "docker"
 

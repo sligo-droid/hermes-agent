@@ -267,6 +267,12 @@ class TestGatewayRuntimeStatus:
             )
         ]
 
+    def test_read_json_file_ignores_invalid_utf8(self, tmp_path):
+        state_path = tmp_path / "gateway_state.json"
+        state_path.write_bytes(b'{"gateway_state":"running",\xc1}')
+
+        assert status._read_json_file(state_path) is None
+
     def test_write_runtime_status_overwrites_stale_pid_on_restart(self, tmp_path, monkeypatch):
         """Regression: setdefault() preserved stale PID from previous process (#1631)."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
