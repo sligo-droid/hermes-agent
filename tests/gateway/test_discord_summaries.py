@@ -26,6 +26,8 @@ def _ensure_discord_mock():
     discord_mod.DMChannel = type("DMChannel", (), {})
     discord_mod.Thread = type("Thread", (), {})
     discord_mod.ForumChannel = type("ForumChannel", (), {})
+    discord_mod.NotFound = type("NotFound", (Exception,), {})
+    discord_mod.Forbidden = type("Forbidden", (Exception,), {})
     discord_mod.MessageType = SimpleNamespace(default=0, reply=1)
     discord_mod.Color = SimpleNamespace(
         blue=lambda: "blue",
@@ -124,6 +126,8 @@ def adapter(monkeypatch):
     monkeypatch.setattr(discord_platform.discord, "DMChannel", FakeDMChannel, raising=False)
     monkeypatch.setattr(discord_platform.discord, "Thread", FakeThread, raising=False)
     monkeypatch.setattr(discord_platform.discord, "Embed", FakeEmbed, raising=False)
+    monkeypatch.setattr(discord_platform.discord, "NotFound", type("NotFound", (Exception,), {}), raising=False)
+    monkeypatch.setattr(discord_platform.discord, "Forbidden", type("Forbidden", (Exception,), {}), raising=False)
     monkeypatch.setattr(
         discord_platform.discord,
         "Color",
@@ -658,6 +662,138 @@ async def test_sync_kanban_feature_summary_reopens_persisted_handle(adapter, mon
     fields = {field.name: field.value for field in edited_embed.fields}
     assert edited_embed.title == "Dashboard Shipment"
     assert fields["Branch"] == "discord/200"
+
+
+@pytest.mark.asyncio
+async def test_sync_kanban_feature_summary_circuits_permanent_fetch_failure(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 200 else None
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="/goal Ship the dashboard",
+    )
+    assert handle is not None
+    handle.pop("_message_obj", None)
+    thread.fetch_message = AsyncMock(side_effect=discord_platform.discord.NotFound("unknown message"))
+
+    target = {
+        "board": "discord-200",
+        "thread_id": "200",
+        "state": "active",
+        "sync_key": "sync-1",
+    }
+    assert await adapter.sync_kanban_feature_summary(target) == "sync-1"
+    assert thread.fetch_message.await_count == 1
+
+    assert await adapter.sync_kanban_feature_summary(target) == "sync-1"
+    assert thread.fetch_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_kanban_feature_summary_transient_failure_remains_retriable(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 200 else None
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="/goal Ship the dashboard",
+    )
+    assert handle is not None
+    handle.pop("_message_obj", None)
+    thread.fetch_message = AsyncMock(side_effect=RuntimeError("temporary discord outage"))
+
+    target = {
+        "board": "discord-200",
+        "thread_id": "200",
+        "state": "active",
+        "sync_key": "sync-1",
+    }
+    assert await adapter.sync_kanban_feature_summary(target) is None
+    assert await adapter.sync_kanban_feature_summary(target) is None
+    assert thread.fetch_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_sync_kanban_feature_summary_circuits_archived_edit_failure(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 200 else None
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="/goal Ship the dashboard",
+    )
+    assert handle is not None
+    handle.pop("_message_obj", None)
+    archived_message = SimpleNamespace(id=300, edit=AsyncMock(side_effect=RuntimeError("thread is archived")))
+    thread.fetch_message = AsyncMock(return_value=archived_message)
+
+    target = {
+        "board": "discord-200",
+        "thread_id": "200",
+        "state": "active",
+        "sync_key": "sync-1",
+    }
+    assert await adapter.sync_kanban_feature_summary(target) == "sync-1"
+    archived_message.edit.assert_awaited_once()
+
+    assert await adapter.sync_kanban_feature_summary(target) == "sync-1"
+    archived_message.edit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sync_kanban_feature_summary_circuit_is_scoped_to_message(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 200 else None
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="/goal Ship the dashboard",
+    )
+    assert handle is not None
+    handle.pop("_message_obj", None)
+    thread.fetch_message = AsyncMock(side_effect=discord_platform.discord.Forbidden("missing permissions"))
+
+    target = {
+        "board": "discord-200",
+        "thread_id": "200",
+        "state": "active",
+        "sync_key": "sync-1",
+    }
+    assert await adapter.sync_kanban_feature_summary(target) == "sync-1"
+
+    repaired = SimpleNamespace(id=301, edit=AsyncMock())
+    thread._messages[301] = repaired
+    adapter._persist_feature_summary_handle(
+        thread,
+        {
+            "thread_id": "200",
+            "message_id": "301",
+            "parent_channel_id": "100",
+            "initial_request": "/goal Ship the dashboard",
+            "kanban_board": {"slug": "discord-200"},
+        },
+    )
+
+    async def fetch_repaired(message_id):
+        return thread._messages[int(message_id)]
+
+    thread.fetch_message = AsyncMock(side_effect=fetch_repaired)
+
+    assert await adapter.sync_kanban_feature_summary(target) == "sync-1"
+    repaired.edit.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -742,6 +742,68 @@ class DiscordAdapter(BasePlatformAdapter):
         state[_DISCORD_FEATURE_SUMMARY_STATE_BUCKET] = bucket
         self._write_project_summary_state(state)
 
+    def _feature_summary_handle_scope(self, handle: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        thread_id = str(handle.get("thread_id") or "").strip()
+        message_id = str(handle.get("message_id") or "").strip()
+        if not thread_id or not message_id:
+            return None
+        return {"thread_id": thread_id, "message_id": message_id}
+
+    def _feature_summary_circuit_matches(self, handle: Dict[str, Any]) -> bool:
+        scope = self._feature_summary_handle_scope(handle)
+        marker = handle.get("kanban_sync_circuit")
+        if not scope or not isinstance(marker, dict):
+            return False
+        return (
+            str(marker.get("thread_id") or "") == scope["thread_id"]
+            and str(marker.get("message_id") or "") == scope["message_id"]
+        )
+
+    def _mark_feature_summary_kanban_sync_circuit(self, handle: Dict[str, Any], reason: str) -> None:
+        scope = self._feature_summary_handle_scope(handle)
+        if not scope:
+            return
+        state = self._read_project_summary_state()
+        bucket = state.get(_DISCORD_FEATURE_SUMMARY_STATE_BUCKET)
+        if not isinstance(bucket, dict):
+            return
+        for stored in bucket.values():
+            if not isinstance(stored, dict):
+                continue
+            if (
+                str(stored.get("thread_id") or "") == scope["thread_id"]
+                and str(stored.get("message_id") or "") == scope["message_id"]
+            ):
+                marker = dict(scope)
+                marker["reason"] = reason
+                marker["opened_at"] = time.time()
+                stored["kanban_sync_circuit"] = marker
+                self._write_project_summary_state(state)
+                handle["kanban_sync_circuit"] = marker
+                return
+
+    def _is_permanent_feature_summary_error(self, exc: BaseException) -> bool:
+        if discord is not None:
+            for attr_name in ("NotFound", "Forbidden"):
+                exc_type = getattr(discord, attr_name, None)
+                if isinstance(exc_type, type) and isinstance(exc, exc_type):
+                    return True
+        status = getattr(exc, "status", None)
+        if status in {403, 404}:
+            return True
+        text = str(exc).lower()
+        return any(
+            phrase in text
+            for phrase in (
+                "403 forbidden",
+                "404 not found",
+                "missing permissions",
+                "unknown channel",
+                "unknown message",
+                "archived",
+            )
+        )
+
     def _load_feature_summary_handle_for_thread(
         self,
         thread_channel: Any,
@@ -1243,7 +1305,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 return match.group(1).strip(), match.group(2).strip()
         return None, None
 
-    async def _resolve_summary_channel(self, channel_id: Optional[str], fallback: Any = None) -> Optional[Any]:
+    async def _resolve_summary_channel(
+        self,
+        channel_id: Optional[str],
+        fallback: Any = None,
+        *,
+        raise_errors: bool = False,
+    ) -> Optional[Any]:
         if fallback is not None:
             return fallback
         if not self._client or not channel_id:
@@ -1254,6 +1322,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel = await self._client.fetch_channel(int(channel_id))
             return channel
         except Exception:
+            if raise_errors:
+                raise
             return None
 
     async def _edit_project_summary_topic(self, channel: Any, metadata: Dict[str, Optional[str]]) -> bool:
@@ -1535,6 +1605,7 @@ class DiscordAdapter(BasePlatformAdapter):
         final_response: str = "",
         status: str = "Complete",
         title: Optional[str] = None,
+        kanban_sync: bool = False,
     ) -> bool:
         if not handle:
             return False
@@ -1553,20 +1624,40 @@ class DiscordAdapter(BasePlatformAdapter):
             title = str(title or kanban_snapshot.get("title") or "") or None
         else:
             status = self._feature_kanban_summary_status(handle) or status
-        thread = await self._resolve_summary_channel(
-            str(handle.get("thread_id") or ""),
-            fallback=handle.get("_thread_obj"),
-        )
+        try:
+            thread = await self._resolve_summary_channel(
+                str(handle.get("thread_id") or ""),
+                fallback=handle.get("_thread_obj"),
+                raise_errors=kanban_sync,
+            )
+        except Exception as exc:
+            if kanban_sync and self._is_permanent_feature_summary_error(exc):
+                self._mark_feature_summary_kanban_sync_circuit(handle, "resolve_failed")
+                logger.info("[%s] Disabled Discord Kanban feature-summary sync for inaccessible handle", self.name)
+            else:
+                logger.debug("[%s] Discord feature summary channel resolve failed", self.name, exc_info=True)
+            return False
         if thread is None:
+            if kanban_sync:
+                self._mark_feature_summary_kanban_sync_circuit(handle, "resolve_failed")
+                logger.info("[%s] Disabled Discord Kanban feature-summary sync for missing handle", self.name)
             return False
         msg = handle.get("_message_obj")
         if msg is None:
             fetch = getattr(thread, "fetch_message", None)
             if fetch is None:
+                if kanban_sync:
+                    self._mark_feature_summary_kanban_sync_circuit(handle, "fetch_unavailable")
+                    logger.info("[%s] Disabled Discord Kanban feature-summary sync for unfetchable handle", self.name)
                 return False
             try:
                 msg = await fetch(int(handle.get("message_id")))
-            except Exception:
+            except Exception as exc:
+                if kanban_sync and self._is_permanent_feature_summary_error(exc):
+                    self._mark_feature_summary_kanban_sync_circuit(handle, "message_fetch_failed")
+                    logger.info("[%s] Disabled Discord Kanban feature-summary sync for inaccessible message", self.name)
+                else:
+                    logger.debug("[%s] Discord feature summary message fetch failed", self.name, exc_info=True)
                 return False
         try:
             embed = self._build_feature_summary_embed(
@@ -1586,7 +1677,11 @@ class DiscordAdapter(BasePlatformAdapter):
             await msg.edit(embed=embed)
             return True
         except Exception as exc:
-            logger.warning("[%s] Failed to update Discord feature summary: %s", self.name, exc)
+            if kanban_sync and self._is_permanent_feature_summary_error(exc):
+                self._mark_feature_summary_kanban_sync_circuit(handle, "message_edit_failed")
+                logger.info("[%s] Disabled Discord Kanban feature-summary sync for inaccessible message", self.name)
+            else:
+                logger.warning("[%s] Failed to update Discord feature summary: %s", self.name, exc)
             return False
 
     def _feature_summary_metadata(
@@ -1635,12 +1730,17 @@ class DiscordAdapter(BasePlatformAdapter):
         if target.get("public_url"):
             board_handle["public_url"] = target.get("public_url")
         handle["kanban_board"] = board_handle
+        if self._feature_summary_circuit_matches(handle):
+            return str(target.get("sync_key") or board)
         ok = await self.update_feature_summary(
             handle,
             status=str(target.get("state") or "Running"),
             title=str(target.get("title") or "") or None,
+            kanban_sync=True,
         )
         if not ok:
+            if self._feature_summary_circuit_matches(handle):
+                return str(target.get("sync_key") or board)
             return None
         return str(target.get("sync_key") or board)
 

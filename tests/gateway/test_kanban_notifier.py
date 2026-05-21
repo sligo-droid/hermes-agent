@@ -232,6 +232,26 @@ def test_discord_kanban_typing_watcher_syncs_feature_summary(tmp_path, monkeypat
     assert target["sync_key"]
 
 
+def test_discord_kanban_typing_watcher_suppresses_repeated_summary_sync(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    dwb.set_goal(
+        thread_id="99003",
+        goal="Sync the feature summary card once",
+        chat_id="parent-992",
+    )
+
+    adapter = FeatureSummarySyncAdapter()
+    runner = _make_discord_runner(adapter)
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+    runner._running = True
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert len(adapter.synced) == 1
+
+
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):
     db_path = tmp_path / "single-owner.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
