@@ -213,7 +213,9 @@ const TABLE_PADDING_LEFT = 2 // paddingLeft={2} on the outer <Box>
 
 const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
   // Guard: empty table
-  if (rows.length === 0 || rows[0]!.length === 0) return null
+  if (rows.length === 0 || rows[0]!.length === 0) {
+    return null
+  }
 
   const cellDisplayWidth = (raw: string) => stringWidth(stripInlineMarkup(raw))
 
@@ -221,7 +223,9 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
   const minCellWidth = (raw: string) => {
     const text = stripInlineMarkup(raw)
     const words = text.split(/\s+/).filter(w => w.length > 0)
-    if (words.length === 0) return MIN_COL_WIDTH
+    if (words.length === 0) {
+      return MIN_COL_WIDTH
+    }
     return Math.max(...words.map(w => stringWidth(w)), MIN_COL_WIDTH)
   }
 
@@ -229,7 +233,9 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
 
   // Normalize ragged rows: ensure every row has exactly numCols cells
   const normalizedRows = rows.map(row => {
-    if (row.length >= numCols) return row.slice(0, numCols)
+    if (row.length >= numCols) {
+      return row.slice(0, numCols)
+    }
     return [...row, ...Array<string>(numCols - row.length).fill('')]
   })
 
@@ -278,7 +284,9 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
       const fracs = rawAlloc.map((v, i) => ({ i, frac: v - Math.floor(v) }))
         .sort((a, b) => b.frac - a.frac)
       for (const { i } of fracs) {
-        if (remainder <= 0) break
+        if (remainder <= 0) {
+          break
+        }
         columnWidths[i]!++
         remainder--
       }
@@ -295,7 +303,9 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
     const fracs = rawAlloc.map((v, i) => ({ i, frac: v - Math.floor(v) }))
       .sort((a, b) => b.frac - a.frac)
     for (const { i } of fracs) {
-      if (remainder <= 0) break
+      if (remainder <= 0) {
+        break
+      }
       columnWidths[i]!++
       remainder--
     }
@@ -311,66 +321,123 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
       ? [...segmenter.segment(s)].map((seg: { segment: string }) => seg.segment)
       : [...s]
 
-  // Word-wrap plain text to fit within `width` display columns.
-  // Operates on stripped text for correct width measurement.
-  const wrapCell = (raw: string, width: number, hard: boolean): string[] => {
-    const text = stripInlineMarkup(raw)
-    if (width <= 0) return [text]
-    if (stringWidth(text) <= width) return [text]
+  type WrapUnit = { raw: string; plain: string; space: boolean }
 
-    const words = text.split(/\s+/).filter(w => w.length > 0)
+  const wrapUnits = (raw: string): WrapUnit[] => {
+    const units: WrapUnit[] = []
+
+    const appendPlain = (chunk: string) => {
+      for (const part of chunk.split(/(\s+)/).filter(Boolean)) {
+        units.push({ raw: part, plain: part, space: /^\s+$/.test(part) })
+      }
+    }
+
+    let last = 0
+    for (const match of raw.matchAll(INLINE_RE)) {
+      const i = match.index ?? 0
+      if (i > last) {
+        appendPlain(raw.slice(last, i))
+      }
+      const token = match[0]
+      units.push({ raw: token, plain: stripInlineMarkup(token), space: false })
+      last = i + token.length
+    }
+    if (last < raw.length) {
+      appendPlain(raw.slice(last))
+    }
+
+    return units
+  }
+
+  const wrapCell = (raw: string, width: number, hard: boolean): string[] => {
+    const units = wrapUnits(raw)
+    const text = units.map(u => u.plain).join('')
+    if (width <= 0) {
+      return [raw]
+    }
+    if (stringWidth(text) <= width) {
+      return [raw]
+    }
+
     const lines: string[] = []
     let current = ''
     let currentWidth = 0
+    let pendingSpace = false
 
-    for (const word of words) {
-      const w = stringWidth(word)
-      if (currentWidth === 0) {
-        if (hard && w > width) {
-          for (const ch of graphemes(word)) {
-            const cw = stringWidth(ch)
-            if (currentWidth + cw > width && current) {
-              lines.push(current)
-              current = ''
-              currentWidth = 0
-            }
-            current += ch
-            currentWidth += cw
-          }
-        } else {
-          current = word
-          currentWidth = w
+    const hardAppendPlain = (text: string) => {
+      for (const ch of graphemes(text)) {
+        const cw = stringWidth(ch)
+        if (currentWidth + cw > width && current) {
+          lines.push(current)
+          current = ''
+          currentWidth = 0
         }
-      } else if (currentWidth + 1 + w <= width) {
-        current += ' ' + word
-        currentWidth += 1 + w
+        current += ch
+        currentWidth += cw
+      }
+    }
+
+    const startLineWith = (unit: WrapUnit) => {
+      const w = stringWidth(unit.plain)
+      if (hard && w > width) {
+        hardAppendPlain(unit.plain)
       } else {
-        lines.push(current)
-        current = word
+        current = unit.raw
         currentWidth = w
       }
     }
-    if (current) lines.push(current)
+
+    for (const unit of units) {
+      if (unit.space) {
+        if (currentWidth > 0) {
+          pendingSpace = true
+        }
+        continue
+      }
+
+      const w = stringWidth(unit.plain)
+      if (currentWidth === 0) {
+        startLineWith(unit)
+      } else if (currentWidth + (pendingSpace ? 1 : 0) + w <= width) {
+        if (pendingSpace) {
+          current += ' '
+          currentWidth += 1
+        }
+        current += unit.raw
+        currentWidth += w
+      } else {
+        lines.push(current)
+        current = ''
+        currentWidth = 0
+        startLineWith(unit)
+      }
+      pendingSpace = false
+    }
+    if (current) {
+      lines.push(current)
+    }
     return lines.length > 0 ? lines : ['']
   }
 
   const isHard = totalMin > availableWidth // tier 3 needs hard word breaks
   const sep = columnWidths.map(w => '─'.repeat(Math.max(1, w))).join('  ')
 
-  // When wrapping isn't needed, build single-line strings per row.
-  // All cells render as plain text via stripInlineMarkup.
-  // TODO: preserve inline markdown by formatting cells before wrapping them.
-  // Keep the fix local to ui-tui/src/components/markdown.tsx; no shared table
-  // helper exists in this repository today.
-  if (!needsWrap) {
-    const buildRowString = (row: string[]): string =>
-      row.map((cell, ci) => {
-        const text = stripInlineMarkup(cell)
-        const pad = ' '.repeat(Math.max(0, columnWidths[ci]! - stringWidth(text)))
-        const gap = ci < numCols - 1 ? '  ' : ''
-        return text + pad + gap
-      }).join('')
+  const renderRowCells = (row: string[]) => row.map((cell, ci) => {
+    const text = stripInlineMarkup(cell)
+    const pad = ' '.repeat(Math.max(0, columnWidths[ci]! - stringWidth(text)))
+    const gap = ci < numCols - 1 ? '  ' : ''
 
+    return (
+      <Fragment key={ci}>
+        <MdInline t={t} text={cell} />
+        {pad}{gap}
+      </Fragment>
+    )
+  })
+
+  // When wrapping isn't needed, build single-line rows while preserving inline
+  // markdown inside each cell.
+  if (!needsWrap) {
     return (
       <Box flexDirection="column" key={k} paddingLeft={TABLE_PADDING_LEFT}>
         {normalizedRows.map((row, ri) => (
@@ -380,7 +447,7 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
               color={ri === 0 ? t.color.accent : undefined}
               wrap="truncate-end"
             >
-              {buildRowString(row)}
+              {renderRowCells(row)}
             </Text>
             {ri === 0 && normalizedRows.length > 1 ? (
               <Text color={t.color.muted} dimColor wrap="truncate-end">{sep}</Text>
@@ -408,7 +475,9 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
         const cellText = li < cl.length ? cl[li]! : ''
         const pad = ' '.repeat(Math.max(0, columnWidths[ci]! - stringWidth(cellText)))
         line += cellText + pad
-        if (ci < numCols - 1) line += '  '
+        if (ci < numCols - 1) {
+          line += '  '
+        }
       }
       result.push(line)
     }
@@ -422,7 +491,9 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
     const kind = ri === 0 ? 'header' as const : 'body' as const
     const rowLines = buildRowLines(row)
     rowLines.forEach(text => allEntries.push({ text, kind }))
-    if (ri > 0) tallestBodyRow = Math.max(tallestBodyRow, rowLines.length)
+    if (ri > 0) {
+      tallestBodyRow = Math.max(tallestBodyRow, rowLines.length)
+    }
     if (ri === 0 && normalizedRows.length > 1) {
       allEntries.push({ text: sep, kind: 'separator' })
     }
@@ -443,7 +514,11 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
       return (
         <Box flexDirection="column" key={k} paddingLeft={TABLE_PADDING_LEFT}>
           <Text bold color={t.color.accent} wrap="wrap-trim">
-            {normalizedRows[0]!.map(h => stripInlineMarkup(h)).join(' · ')}
+            {normalizedRows[0]!.map((h, hi) => (
+              <Fragment key={hi}>
+                {hi > 0 ? ' · ' : ''}<MdInline t={t} text={h} />
+              </Fragment>
+            ))}
           </Text>
         </Box>
       )
@@ -466,7 +541,7 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
               return (
                 <Text key={ci} wrap="wrap-trim">
                   <Text bold color={t.color.accent}>{label}:</Text>
-                  {' '}{stripInlineMarkup(cell)}
+                  {' '}<MdInline t={t} text={cell} />
                 </Text>
               )
             })}
@@ -487,7 +562,7 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
           key={i}
           wrap="truncate-end"
         >
-          {entry.text}
+          {entry.kind === 'separator' ? entry.text : <MdInline t={t} text={entry.text} />}
         </Text>
       ))}
     </Box>

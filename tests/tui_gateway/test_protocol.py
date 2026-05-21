@@ -670,6 +670,54 @@ def test_command_dispatch_retry_handles_multipart_content(server):
     assert result["message"] == "analyze this"
 
 
+def test_prompt_submit_sanitizes_native_image_history(server, monkeypatch):
+    """TUI in-memory history must not replay turn-scoped base64 images."""
+    from agent.message_sanitization import IMAGE_HISTORY_PLACEHOLDER
+
+    sid = "test-session"
+
+    class FakeAgent:
+        model = "test-model"
+
+        def run_conversation(self, message, conversation_history=None, stream_callback=None):
+            return {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "analyze this"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,AAA"},
+                            },
+                        ],
+                    },
+                    {"role": "assistant", "content": "done"},
+                ],
+                "final_response": "done",
+            }
+
+    session = {
+        "session_key": sid,
+        "agent": FakeAgent(),
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": True,
+    }
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+
+    server._run_prompt_submit("r7", sid, session, "hello")
+    deadline = time.time() + 2
+    while session.get("running") and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert session["running"] is False
+    assert session["history"][0]["content"] == f"analyze this\n{IMAGE_HISTORY_PLACEHOLDER}"
+    assert "data:image" not in json.dumps(session["history"])
+
+
 def test_command_dispatch_returns_skill_payload(server):
     """command.dispatch returns structured skill payload for the TUI to send()."""
     sid = "test-session"

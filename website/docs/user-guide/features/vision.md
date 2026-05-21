@@ -201,7 +201,7 @@ When a user attaches an image — from the CLI clipboard, the gateway (Telegram/
 
 You don't configure this — Hermes looks up your current model's capability in the provider metadata and picks the right path automatically. The practical effect: you can switch between vision and non-vision models mid-session and image handling "just works" without changing your workflow. Text-only models get coherent context about the image rather than a broken multimodal payload they'd have to reject.
 
-Native image parts can remain in persisted session history as base64 data URLs, especially when resuming CLI/TUI sessions. Provider adapters and context compression prune or summarize old image parts where supported, but the persisted session record may still carry recent image bytes until normal history cleanup. Avoid pasting images that contain secrets unless you are comfortable with them being stored in your local Hermes session database.
+Native image bytes are turn-scoped. Hermes may send a base64 data URL to the current model call, but session history stores text and local-path placeholders rather than replayable base64 image bytes. Avoid pasting images that contain secrets unless you are comfortable with them being processed for that turn and represented by non-image metadata in your local transcript.
 
 Which auxiliary model handles the text-description path is configurable under `auxiliary.vision` — see [Auxiliary Models](/docs/user-guide/configuration#auxiliary-models).
 

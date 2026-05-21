@@ -14,13 +14,13 @@ const ESC = String.fromCharCode(27)
 const CSI_RE = new RegExp(`${ESC}\\[[0-?]*[ -/]*[@-~]`, 'g')
 const OSC_RE = new RegExp(`${ESC}\\][\\s\\S]*?(?:${BEL}|${ESC}\\\\)`, 'g')
 
-const renderPlain = (node: React.ReactNode) => {
+const renderRaw = (node: React.ReactNode, isTTY = false) => {
   const stdout = new PassThrough()
   const stdin = new PassThrough()
   const stderr = new PassThrough()
   let output = ''
 
-  Object.assign(stdout, { columns: 80, isTTY: false, rows: 24 })
+  Object.assign(stdout, { columns: 80, isTTY, rows: 24 })
   Object.assign(stdin, { isTTY: false })
   Object.assign(stderr, { isTTY: false })
   stdout.on('data', chunk => {
@@ -38,6 +38,10 @@ const renderPlain = (node: React.ReactNode) => {
   instance.cleanup()
 
   return output
+}
+
+const renderPlain = (node: React.ReactNode) => {
+  return renderRaw(node)
     .replace(OSC_RE, '')
     .split('\n')
     .map(line => stripAnsi(line).replace(CSI_RE, '').trimEnd())
@@ -327,5 +331,24 @@ describe('renderTable CJK width alignment', () => {
     // The CJK row is the one that drifted before the fix.  It must
     // align with the rest now.
     expect(qwenCol2).toBe(headerCol2)
+  })
+
+  it('preserves inline formatting inside table cells', () => {
+    const md = [
+      '| Name | Note |',
+      '|------|------|',
+      '| plain | **BodyBold** and $\\mathbb{Z}$ |'
+    ].join('\n')
+
+    const node = React.createElement(
+      Box,
+      { width: 120 },
+      React.createElement(Md, { compact: true, t: DEFAULT_THEME, text: md })
+    )
+    const plain = renderPlain(node).join('\n')
+
+    expect(plain).toContain('BodyBold and ℤ')
+    expect(plain).not.toContain('**BodyBold**')
+    expect(plain).not.toContain('\\mathbb')
   })
 })

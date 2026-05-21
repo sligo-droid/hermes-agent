@@ -44,6 +44,9 @@ logger = logging.getLogger(__name__)
 _REGISTRY: dict[str, ProviderProfile] = {}
 _ALIASES: dict[str, str] = {}
 _discovered = False
+_discovered_user_plugins_dir: str | None = None
+_baseline_registry: dict[str, ProviderProfile] | None = None
+_baseline_aliases: dict[str, str] | None = None
 
 # Repo-root ``plugins/model-providers/`` — populated at discovery time.
 _BUNDLED_PLUGINS_DIR = (
@@ -68,16 +71,14 @@ def get_provider_profile(name: str) -> ProviderProfile | None:
 
     Returns None if the provider has no profile (falls back to generic).
     """
-    if not _discovered:
-        _discover_providers()
+    _discover_providers()
     canonical = _ALIASES.get(name, name)
     return _REGISTRY.get(canonical)
 
 
 def list_providers() -> list[ProviderProfile]:
     """Return all registered provider profiles (one per canonical name)."""
-    if not _discovered:
-        _discover_providers()
+    _discover_providers()
     # Deduplicate: _REGISTRY has canonical names; _ALIASES points to same objects
     seen: set[int] = set()
     result: list[ProviderProfile] = []
@@ -126,7 +127,10 @@ def _import_plugin_dir(plugin_dir: Path, source: str) -> None:
         module_name = f"_hermes_user_provider_{home_key}_{safe_name}"
 
     if module_name in sys.modules:
-        return  # already imported
+        if source == "user":
+            sys.modules.pop(module_name, None)
+        else:
+            return  # already imported
 
     try:
         spec = importlib.util.spec_from_file_location(
@@ -149,50 +153,65 @@ def _discover_providers() -> None:
 
     Order:
       1. Bundled plugins at ``<repo>/plugins/model-providers/<name>/``
-      2. User plugins at ``$HERMES_HOME/plugins/model-providers/<name>/``
-      3. Legacy per-file modules at ``providers/<name>.py`` (back-compat)
+      2. Legacy per-file modules at ``providers/<name>.py`` (back-compat)
+      3. User plugins at ``$HERMES_HOME/plugins/model-providers/<name>/``
 
-    Each step imports its plugins, which call ``register_provider()`` at
-    module-level. Later steps win on name collision.
+    Bundled + legacy profiles form the process baseline. User plugins are
+    re-applied when ``HERMES_HOME`` changes so profiles do not leak across
+    in-process profile switches.
     """
-    global _discovered
-    if _discovered:
+    global _baseline_aliases, _baseline_registry, _discovered, _discovered_user_plugins_dir
+    user_dir = _user_plugins_dir()
+    user_key = str(user_dir.resolve()) if user_dir is not None else ""
+
+    if _discovered and _discovered_user_plugins_dir == user_key:
         return
-    _discovered = True
 
-    # 1. Bundled plugins — shipped with hermes-agent.
-    if _BUNDLED_PLUGINS_DIR.is_dir():
-        for child in sorted(_BUNDLED_PLUGINS_DIR.iterdir()):
-            if not child.is_dir() or child.name.startswith(("_", ".")):
-                continue
-            _import_plugin_dir(child, "bundled")
+    if _discovered:
+        _REGISTRY.clear()
+        _REGISTRY.update(_baseline_registry or {})
+        _ALIASES.clear()
+        _ALIASES.update(_baseline_aliases or {})
+    else:
+        _discovered = True
 
-    # 2. User plugins — under $HERMES_HOME/plugins/model-providers/<name>/.
+        # 1. Bundled plugins — shipped with hermes-agent.
+        if _BUNDLED_PLUGINS_DIR.is_dir():
+            for child in sorted(_BUNDLED_PLUGINS_DIR.iterdir()):
+                if not child.is_dir() or child.name.startswith(("_", ".")):
+                    continue
+                _import_plugin_dir(child, "bundled")
+
+        # 2. Legacy single-file profiles at providers/<name>.py. Kept for
+        #    back-compat — if someone drops a ``providers/foo.py`` into an
+        #    editable install, it still works without the plugin layout.
+        try:
+            import pkgutil
+
+            import providers as _pkg
+
+            for _importer, modname, _ispkg in pkgutil.iter_modules(_pkg.__path__):
+                if modname.startswith("_") or modname == "base":
+                    continue
+                try:
+                    importlib.import_module(f"providers.{modname}")
+                except ImportError as exc:
+                    logger.warning(
+                        "Failed to import legacy provider module %s: %s", modname, exc
+                    )
+        except Exception:
+            pass
+
+        _baseline_registry = dict(_REGISTRY)
+        _baseline_aliases = dict(_ALIASES)
+
+    # 3. User plugins — under $HERMES_HOME/plugins/model-providers/<name>/.
     #    These can override any bundled profile of the same name (last-writer-wins
     #    in register_provider()).
-    user_dir = _user_plugins_dir()
     if user_dir is not None:
         for child in sorted(user_dir.iterdir()):
             if not child.is_dir() or child.name.startswith(("_", ".")):
                 continue
             _import_plugin_dir(child, "user")
 
-    # 3. Legacy single-file profiles at providers/<name>.py. Kept for
-    #    back-compat — if someone drops a ``providers/foo.py`` into an
-    #    editable install, it still works without the plugin layout.
-    try:
-        import pkgutil
-
-        import providers as _pkg
-
-        for _importer, modname, _ispkg in pkgutil.iter_modules(_pkg.__path__):
-            if modname.startswith("_") or modname == "base":
-                continue
-            try:
-                importlib.import_module(f"providers.{modname}")
-            except ImportError as exc:
-                logger.warning(
-                    "Failed to import legacy provider module %s: %s", modname, exc
-                )
-    except Exception:
-        pass
+    _discovered_user_plugins_dir = user_key
