@@ -115,6 +115,53 @@ def _coding_worker_result_succeeded(result: object) -> bool:
     return isinstance(payload, dict) and payload.get("success") is True
 
 
+def apply_tool_result_hooks(
+    function_name: str,
+    function_args: dict,
+    function_result: Any,
+    *,
+    task_id: str = "",
+    session_id: str = "",
+    tool_call_id: str = "",
+    duration_ms: int = 0,
+) -> Any:
+    """Run observational and transform hooks for a completed tool result."""
+    try:
+        from hermes_cli.plugins import invoke_hook
+        invoke_hook(
+            "post_tool_call",
+            tool_name=function_name,
+            args=function_args,
+            result=function_result,
+            task_id=task_id or "",
+            session_id=session_id or "",
+            tool_call_id=tool_call_id or "",
+            duration_ms=duration_ms,
+        )
+    except Exception as _hook_err:
+        logger.debug("post_tool_call hook error: %s", _hook_err)
+
+    try:
+        from hermes_cli.plugins import invoke_hook
+        hook_results = invoke_hook(
+            "transform_tool_result",
+            tool_name=function_name,
+            args=function_args,
+            result=function_result,
+            task_id=task_id or "",
+            session_id=session_id or "",
+            tool_call_id=tool_call_id or "",
+            duration_ms=duration_ms,
+        )
+        for hook_result in hook_results:
+            if isinstance(hook_result, str):
+                return hook_result
+    except Exception as _hook_err:
+        logger.debug("transform_tool_result hook error: %s", _hook_err)
+
+    return function_result
+
+
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
@@ -648,6 +695,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 pass  # never block tool execution
 
         tool_start_time = time.time()
+        _hooks_applied_by_dispatch = False
 
         if _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
@@ -849,6 +897,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
+            else:
+                _hooks_applied_by_dispatch = True
             finally:
                 tool_duration = time.time() - tool_start_time
                 cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_spinner_result)
@@ -868,7 +918,20 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
+            else:
+                _hooks_applied_by_dispatch = True
             tool_duration = time.time() - tool_start_time
+
+        if not _execution_blocked and not _hooks_applied_by_dispatch:
+            function_result = apply_tool_result_hooks(
+                function_name,
+                function_args,
+                function_result,
+                task_id=effective_task_id or "",
+                session_id=agent.session_id or "",
+                tool_call_id=tool_call.id,
+                duration_ms=int(tool_duration * 1000),
+            )
 
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (

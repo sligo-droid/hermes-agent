@@ -1,5 +1,7 @@
 """Tests for the provider module registry and profiles."""
 
+import sys
+
 import pytest
 from providers import get_provider_profile, _REGISTRY
 from providers.base import ProviderProfile, OMIT_TEMPERATURE
@@ -27,6 +29,28 @@ class TestRegistry:
         get_provider_profile("nvidia")  # trigger discovery
         for name, profile in _REGISTRY.items():
             assert profile.name == name
+
+    def test_user_provider_module_name_includes_hermes_home_hash(self, tmp_path, monkeypatch):
+        from providers import _import_plugin_dir
+
+        home_a = tmp_path / "home_a"
+        home_b = tmp_path / "home_b"
+        plugin_dir = home_a / "plugins" / "model-providers" / "same-name"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+        before = set(sys.modules)
+        monkeypatch.setenv("HERMES_HOME", str(home_a))
+        _import_plugin_dir(plugin_dir, "user")
+        after_a = set(sys.modules) - before
+
+        monkeypatch.setenv("HERMES_HOME", str(home_b))
+        _import_plugin_dir(plugin_dir, "user")
+        after_b = set(sys.modules) - before
+
+        imported = [name for name in after_b if name.startswith("_hermes_user_provider_")]
+        assert len(imported) == 2
+        assert any(name.endswith("_same_name") for name in after_a)
 
 
 class TestNvidiaProfile:

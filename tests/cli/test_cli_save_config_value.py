@@ -19,7 +19,7 @@ class TestSaveConfigValueAtomic:
             "model": {"default": "test-model", "provider": "openrouter"},
             "display": {"skin": "default"},
         }))
-        monkeypatch.setattr("cli._hermes_home", hermes_home)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         return config_path
 
     def test_calls_roundtrip_yaml_update(self, config_env, monkeypatch):
@@ -132,3 +132,15 @@ class TestSaveConfigValueAtomic:
 
         assert result is False
         assert config_env.read_text() == original_content
+
+    def test_creates_active_hermes_home_config_when_absent(self, tmp_path, monkeypatch):
+        """Persistent writes must create HERMES_HOME/config.yaml, not repo cli-config.yaml."""
+        hermes_home = tmp_path / "profile_home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        from cli import save_config_value
+        assert save_config_value("display.skin", "slate") is True
+
+        config_path = hermes_home / "config.yaml"
+        assert config_path.exists()
+        assert yaml.safe_load(config_path.read_text())["display"]["skin"] == "slate"

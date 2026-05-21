@@ -2224,6 +2224,96 @@ class TestConcurrentToolExecution:
             mock_todo.assert_called_once()
         assert "ok" in result
 
+    def test_invoke_tool_runs_post_and_transform_hooks_for_agent_level_tool(self, agent, monkeypatch):
+        """Agent-level tools bypass registry dispatch but still run plugin result hooks."""
+        observed = []
+
+        def _hook(hook_name, **kwargs):
+            observed.append((hook_name, kwargs["tool_name"], kwargs["result"]))
+            if hook_name == "transform_tool_result":
+                return ["rewritten"]
+            return []
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook)
+        with patch("tools.todo_tool.todo_tool", return_value='{"ok":true}'):
+            result = agent._invoke_tool("todo", {"todos": []}, "task-1", tool_call_id="tc1")
+
+        assert result == "rewritten"
+        assert observed == [
+            ("post_tool_call", "todo", '{"ok":true}'),
+            ("transform_tool_result", "todo", '{"ok":true}'),
+        ]
+
+    def test_invoke_tool_runs_hooks_for_context_engine_tool(self, agent, monkeypatch):
+        observed = []
+
+        class _Compressor:
+            def handle_tool_call(self, name, args, messages=None):
+                return '{"context": true}'
+
+        def _hook(hook_name, **kwargs):
+            observed.append((hook_name, kwargs["tool_name"], kwargs["result"]))
+            return []
+
+        agent._context_engine_tool_names = {"lcm_grep"}
+        agent.context_compressor = _Compressor()
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook)
+
+        result = agent._invoke_tool("lcm_grep", {"query": "x"}, "task-1", messages=[])
+
+        assert result == '{"context": true}'
+        assert observed == [
+            ("post_tool_call", "lcm_grep", '{"context": true}'),
+            ("transform_tool_result", "lcm_grep", '{"context": true}'),
+        ]
+
+    def test_invoke_tool_runs_hooks_for_memory_provider_tool(self, agent, monkeypatch):
+        observed = []
+
+        class _MemoryManager:
+            def has_tool(self, name):
+                return name == "provider_memory_search"
+
+            def handle_tool_call(self, name, args):
+                return '{"memory": true}'
+
+        def _hook(hook_name, **kwargs):
+            observed.append((hook_name, kwargs["tool_name"], kwargs["result"]))
+            return []
+
+        agent._memory_manager = _MemoryManager()
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook)
+
+        result = agent._invoke_tool("provider_memory_search", {"query": "x"}, "task-1")
+
+        assert result == '{"memory": true}'
+        assert observed == [
+            ("post_tool_call", "provider_memory_search", '{"memory": true}'),
+            ("transform_tool_result", "provider_memory_search", '{"memory": true}'),
+        ]
+
+    def test_sequential_agent_level_tool_result_hooks_update_tool_message(self, agent, monkeypatch):
+        tool_call = _mock_tool_call(name="todo", arguments='{"todos": []}', call_id="tc1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+        observed = []
+
+        def _hook(hook_name, **kwargs):
+            observed.append((hook_name, kwargs["tool_name"], kwargs["result"]))
+            if hook_name == "transform_tool_result":
+                return ["rewritten"]
+            return []
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook)
+        with patch("tools.todo_tool.todo_tool", return_value='{"ok":true}'):
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        assert messages[0]["content"] == "rewritten"
+        assert observed == [
+            ("post_tool_call", "todo", '{"ok":true}'),
+            ("transform_tool_result", "todo", '{"ok":true}'),
+        ]
+
     def test_invoke_tool_blocked_returns_error_and_skips_execution(self, agent, monkeypatch):
         """_invoke_tool should return error JSON when a plugin blocks the tool."""
         monkeypatch.setattr(
