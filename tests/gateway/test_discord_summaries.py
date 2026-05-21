@@ -358,6 +358,73 @@ def test_project_description_contract_contains_static_project_access(adapter):
     assert len(topic) <= 1024
 
 
+def test_load_feature_summary_repairs_missing_project_context(adapter):
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._persist_feature_summary_handle(
+        thread,
+        {
+            "thread_id": "200",
+            "message_id": "300",
+            "parent_channel_id": "100",
+            "initial_request": "/goal speed up q&a",
+            "project_context": None,
+        },
+    )
+    adapter._write_project_summary_state.reset_mock()
+    project_context = {
+        "project_channel_id": "100",
+        "project_name": "Hermes",
+        "project_path": "/home/droid/hermes",
+        "project_github_url": "https://github.com/sligo-droid/hermes-agent",
+        "project_mapping_source": "configured_channel_cwd",
+        "project_mapping_resolved": True,
+    }
+
+    handle = adapter._load_feature_summary_handle_for_thread(
+        thread,
+        project_context=project_context,
+    )
+
+    assert handle["project_context"] == project_context
+    adapter._write_project_summary_state.assert_called_once()
+
+
+def test_load_feature_summary_keeps_existing_project_path(adapter):
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    existing_context = {
+        "project_channel_id": "999",
+        "project_name": "Existing",
+        "project_path": "/repo/existing",
+        "project_mapping_resolved": True,
+    }
+    adapter._persist_feature_summary_handle(
+        thread,
+        {
+            "thread_id": "200",
+            "message_id": "300",
+            "parent_channel_id": "100",
+            "initial_request": "/goal speed up q&a",
+            "project_context": existing_context,
+        },
+    )
+    adapter._write_project_summary_state.reset_mock()
+
+    handle = adapter._load_feature_summary_handle_for_thread(
+        thread,
+        project_context={
+            "project_channel_id": "100",
+            "project_name": "Hermes",
+            "project_path": "/home/droid/hermes",
+            "project_mapping_resolved": True,
+        },
+    )
+
+    assert handle["project_context"] == existing_context
+    adapter._write_project_summary_state.assert_not_called()
+
+
 def test_project_description_omits_unparseable_app_access(adapter):
     topic = adapter._render_project_summary_line(
         {

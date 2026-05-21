@@ -804,6 +804,41 @@ class DiscordAdapter(BasePlatformAdapter):
             )
         )
 
+    def _resolve_project_context_for_channel(self, channel: Any) -> Optional[Dict[str, Any]]:
+        if channel is None:
+            return None
+        try:
+            context = resolve_discord_project_context(channel)
+        except Exception as exc:
+            logger.debug("[%s] Failed to resolve Discord project context: %s", self.name, exc)
+            return None
+        return context.to_dict() if context else None
+
+    @staticmethod
+    def _project_context_source_kwargs(project_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not project_context:
+            return {}
+        resolved = project_context.get("project_mapping_resolved")
+        return {
+            "project_name": str(project_context.get("project_name") or "") or None,
+            "project_path": str(project_context.get("project_path") or "") or None,
+            "project_github_url": str(project_context.get("project_github_url") or "") or None,
+            "project_channel_id": str(project_context.get("project_channel_id") or "") or None,
+            "project_mapping_source": str(project_context.get("project_mapping_source") or "") or None,
+            "project_mapping_resolved": bool(resolved) if resolved is not None else None,
+        }
+
+    @staticmethod
+    def _should_repair_feature_summary_project_context(
+        existing: Any,
+        incoming: Optional[Dict[str, Any]],
+    ) -> bool:
+        if not isinstance(incoming, dict) or not str(incoming.get("project_path") or "").strip():
+            return False
+        if not isinstance(existing, dict):
+            return True
+        return not str(existing.get("project_path") or "").strip()
+
     def _load_feature_summary_handle_for_thread(
         self,
         thread_channel: Any,
@@ -822,7 +857,12 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         handle = dict(stored)
         handle.setdefault("thread_id", thread_id)
-        handle.setdefault("project_context", project_context)
+        if self._should_repair_feature_summary_project_context(handle.get("project_context"), project_context):
+            handle["project_context"] = project_context
+            stored["project_context"] = project_context
+            self._write_project_summary_state(state)
+        else:
+            handle.setdefault("project_context", project_context)
         handle["_thread_obj"] = thread_channel
         return handle
 
@@ -4873,8 +4913,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _build_slash_event(self, interaction: discord.Interaction, text: str) -> MessageEvent:
         """Build a MessageEvent from a Discord slash command interaction."""
-        is_dm = isinstance(interaction.channel, discord.DMChannel)
-        is_thread = isinstance(interaction.channel, discord.Thread)
+        channel = getattr(interaction, "channel", None)
+        is_dm = isinstance(channel, discord.DMChannel)
+        is_thread = isinstance(channel, discord.Thread)
         thread_id = None
         parent_chat_id = None
 
@@ -4883,20 +4924,21 @@ class DiscordAdapter(BasePlatformAdapter):
         elif is_thread:
             chat_type = "thread"
             thread_id = str(interaction.channel_id)
-            parent_chat_id = self._get_parent_channel_id(interaction.channel)
+            parent_chat_id = self._get_parent_channel_id(channel)
         else:
             chat_type = "group"
 
         chat_name = ""
-        if not is_dm and hasattr(interaction.channel, "name"):
-            chat_name = interaction.channel.name
-            if hasattr(interaction.channel, "guild") and interaction.channel.guild:
-                chat_name = f"{interaction.channel.guild.name} / #{chat_name}"
+        if not is_dm and hasattr(channel, "name"):
+            chat_name = channel.name
+            if hasattr(channel, "guild") and channel.guild:
+                chat_name = f"{channel.guild.name} / #{chat_name}"
 
         # Get channel topic (if available).
         # For forum threads, inherit the parent forum's topic.
-        chat_topic = self._get_effective_topic(interaction.channel, is_thread=is_thread)
-        guild = getattr(interaction, "guild", None) or getattr(interaction.channel, "guild", None)
+        chat_topic = self._get_effective_topic(channel, is_thread=is_thread)
+        guild = getattr(interaction, "guild", None) or getattr(channel, "guild", None)
+        project_context = self._resolve_project_context_for_channel(channel)
 
         source = self.build_source(
             chat_id=str(interaction.channel_id),
@@ -4908,11 +4950,12 @@ class DiscordAdapter(BasePlatformAdapter):
             chat_topic=chat_topic,
             guild_id=str(guild.id) if guild and getattr(guild, "id", None) else None,
             parent_chat_id=parent_chat_id,
+            **self._project_context_source_kwargs(project_context),
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
         channel_id = str(interaction.channel_id)
-        parent_id = str(getattr(getattr(interaction, "channel", None), "parent_id", "") or "")
+        parent_id = str(getattr(channel, "parent_id", "") or "")
         return MessageEvent(
             text=text,
             message_type=msg_type,
@@ -5012,6 +5055,7 @@ class DiscordAdapter(BasePlatformAdapter):
         channel_id = str(getattr(channel, "id", getattr(payload, "channel_id", "")))
         parent_id = str(parent_chat_id or "")
         message_id = str(getattr(payload, "message_id", ""))
+        project_context = self._resolve_project_context_for_channel(channel)
         source = self.build_source(
             chat_id=channel_id,
             chat_name=chat_name,
@@ -5023,6 +5067,7 @@ class DiscordAdapter(BasePlatformAdapter):
             guild_id=str(getattr(guild, "id", "")) if guild and getattr(guild, "id", None) else None,
             parent_chat_id=parent_chat_id,
             message_id=message_id,
+            **self._project_context_source_kwargs(project_context),
         )
         return MessageEvent(
             text="ship it",
@@ -5172,6 +5217,7 @@ class DiscordAdapter(BasePlatformAdapter):
         _parent_channel = self._thread_parent_channel(_chan)
         _parent_id = str(getattr(_parent_channel, "id", "") or "")
         _guild = getattr(interaction, "guild", None) or getattr(_parent_channel, "guild", None)
+        project_context = self._resolve_project_context_for_channel(_parent_channel)
 
         source = self.build_source(
             chat_id=thread_id,
@@ -5183,6 +5229,7 @@ class DiscordAdapter(BasePlatformAdapter):
             chat_topic=chat_topic,
             guild_id=str(_guild.id) if _guild and getattr(_guild, "id", None) else None,
             parent_chat_id=_parent_id or None,
+            **self._project_context_source_kwargs(project_context),
         )
 
         _skills = self._resolve_channel_skills(thread_id, _parent_id or None)

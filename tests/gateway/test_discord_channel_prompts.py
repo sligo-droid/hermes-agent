@@ -29,6 +29,7 @@ def _ensure_discord_mock():
 
 
 import gateway.run as gateway_run
+import gateway.platforms.discord as discord_platform
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
@@ -156,6 +157,45 @@ class TestResolveChannelPrompts:
 
         assert event.channel_prompt == "Command prompt"
 
+    def test_build_slash_event_sets_project_context(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter.platform = Platform.DISCORD
+        adapter._get_effective_topic = MagicMock(return_value=None)
+        guild = SimpleNamespace(id="guild-1", name="Sligo Labs")
+        parent = SimpleNamespace(id="1504252294495998043", name="dev", guild=guild)
+        thread = discord_platform.discord.Thread()
+        thread.id = "1507120148299907082"
+        thread.name = "feature"
+        thread.guild = guild
+        thread.parent = parent
+        thread.parent_id = parent.id
+        project_context = {
+            "project_channel_id": str(parent.id),
+            "project_name": "Hermes",
+            "project_path": "/home/droid/hermes",
+            "project_github_url": "https://github.com/sligo-droid/hermes-agent",
+            "project_mapping_source": "configured_channel_cwd",
+            "project_mapping_resolved": True,
+        }
+        monkeypatch.setattr(
+            discord_platform,
+            "resolve_discord_project_context",
+            lambda channel: SimpleNamespace(to_dict=lambda: dict(project_context)),
+        )
+        interaction = SimpleNamespace(
+            channel_id=thread.id,
+            channel=thread,
+            guild=guild,
+            user=SimpleNamespace(id=1, display_name="Brenner"),
+        )
+
+        event = adapter._build_slash_event(interaction, "/goal minimize response time")
+
+        assert event.source.project_path == "/home/droid/hermes"
+        assert event.source.project_channel_id == "1504252294495998043"
+        assert event.source.project_mapping_source == "configured_channel_cwd"
+        assert event.source.project_mapping_resolved is True
+
     @pytest.mark.asyncio
     async def test_dispatch_thread_session_inherits_parent_channel_prompt(self):
         adapter = _make_adapter()
@@ -174,6 +214,40 @@ class TestResolveChannelPrompts:
 
         dispatched_event = adapter.handle_message.await_args.args[0]
         assert dispatched_event.channel_prompt == "Parent prompt"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_thread_session_inherits_parent_project_context(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter.platform = Platform.DISCORD
+        adapter._get_effective_topic = MagicMock(return_value=None)
+        adapter.handle_message = AsyncMock()
+        guild = SimpleNamespace(id="guild-1", name="Sligo Labs")
+        parent = SimpleNamespace(id="1504252294495998043", name="dev", guild=guild)
+        project_context = {
+            "project_channel_id": str(parent.id),
+            "project_name": "Hermes",
+            "project_path": "/home/droid/hermes",
+            "project_github_url": "https://github.com/sligo-droid/hermes-agent",
+            "project_mapping_source": "configured_channel_cwd",
+            "project_mapping_resolved": True,
+        }
+        monkeypatch.setattr(
+            discord_platform,
+            "resolve_discord_project_context",
+            lambda channel: SimpleNamespace(to_dict=lambda: dict(project_context)),
+        )
+        interaction = SimpleNamespace(
+            guild=guild,
+            channel=parent,
+            user=SimpleNamespace(id=1, display_name="Brenner"),
+        )
+
+        await adapter._dispatch_thread_session(interaction, "999", "new-thread", "hello")
+
+        dispatched_event = adapter.handle_message.await_args.args[0]
+        assert dispatched_event.source.project_path == "/home/droid/hermes"
+        assert dispatched_event.source.project_channel_id == "1504252294495998043"
+        assert dispatched_event.source.project_mapping_source == "configured_channel_cwd"
 
     def test_blank_prompts_are_ignored(self):
         adapter = _make_adapter()
