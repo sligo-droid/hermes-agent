@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   notify:
@@ -19,4 +20,5 @@ jobs:
       - name: Post commits to Discord logs
         env:
           DISCORD_LOGS_WEBHOOK_URL: ${{ secrets.DISCORD_LOGS_WEBHOOK_URL }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: python scripts/notify_discord_main_commits.py

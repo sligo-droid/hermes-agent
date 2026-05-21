@@ -6,16 +6,23 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError
 from urllib import request
+from urllib.error import HTTPError
+from urllib.parse import quote
 
 
 MAX_EMBEDS_PER_MESSAGE = 10
 DISCORD_EMBED_DESCRIPTION_LIMIT = 4096
 DISCORD_EMBED_TITLE_LIMIT = 256
 DISCORD_FIELD_VALUE_LIMIT = 1024
+GENERIC_MERGE_PREFIXES = (
+    "merge pull request",
+    "merge remote-tracking branch",
+    "merge branch",
+)
 
 
 def _truncate(value: str, limit: int) -> str:
@@ -42,11 +49,47 @@ def _commit_description(message: str) -> str:
         return "Commit pushed to main."
 
     subject = non_empty[0]
-    if subject.lower().startswith(("merge pull request", "merge branch")):
+    if _is_generic_merge_message(subject):
         for line in non_empty[1:]:
             if not line.lower().startswith(("*", "from ")):
                 return _truncate(line, DISCORD_EMBED_DESCRIPTION_LIMIT)
     return _truncate(subject, DISCORD_EMBED_DESCRIPTION_LIMIT)
+
+
+def _is_generic_merge_message(message: str) -> bool:
+    return message.strip().lower().startswith(GENERIC_MERGE_PREFIXES)
+
+
+def _pull_request_description(pull_request: dict[str, Any]) -> str:
+    body = str(pull_request.get("body") or "").strip()
+    if body:
+        return _truncate(body, DISCORD_EMBED_DESCRIPTION_LIMIT)
+
+    title = str(pull_request.get("title") or "").strip()
+    if title:
+        return _truncate(title, DISCORD_EMBED_DESCRIPTION_LIMIT)
+
+    number = pull_request.get("number")
+    if number:
+        return f"Pull request #{number} merged."
+    return "Pull request merged."
+
+
+def _pull_request_field_value(pull_request: dict[str, Any]) -> str:
+    number = pull_request.get("number")
+    title = str(pull_request.get("title") or "").strip()
+    url = str(pull_request.get("html_url") or "").strip()
+
+    label_parts = []
+    if number:
+        label_parts.append(f"#{number}")
+    if title:
+        label_parts.append(title)
+    label = " ".join(label_parts) or "Pull request"
+
+    if url:
+        return _truncate(f"[{label}]({url})", DISCORD_FIELD_VALUE_LIMIT)
+    return _truncate(label, DISCORD_FIELD_VALUE_LIMIT)
 
 
 def _commit_url(event: dict[str, Any], commit: dict[str, Any]) -> str:
@@ -61,20 +104,28 @@ def _commit_url(event: dict[str, Any], commit: dict[str, Any]) -> str:
     return ""
 
 
-def _commit_embed(event: dict[str, Any], commit: dict[str, Any]) -> dict[str, Any]:
+def _commit_embed(
+    event: dict[str, Any],
+    commit: dict[str, Any],
+    pull_request: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     sha = str(commit.get("id") or "").strip()
     short_sha = sha[:7] if sha else "unknown"
     branch = _branch_name(str(event.get("ref") or "refs/heads/main"))
     author = (commit.get("author") or {}).get("name") or "unknown"
+    message = str(commit.get("message") or "")
     pusher = (
         (event.get("pusher") or {}).get("name")
         or (event.get("sender") or {}).get("login")
         or "unknown"
     )
+    description = _commit_description(message)
+    if pull_request and _is_generic_merge_message(message):
+        description = _pull_request_description(pull_request)
 
     embed: dict[str, Any] = {
         "title": _truncate(f"{short_sha} pushed to {branch}", DISCORD_EMBED_TITLE_LIMIT),
-        "description": _commit_description(str(commit.get("message") or "")),
+        "description": description,
         "color": 0x2F81F7,
         "fields": [
             {
@@ -94,6 +145,14 @@ def _commit_embed(event: dict[str, Any], commit: dict[str, Any]) -> dict[str, An
             },
         ],
     }
+    if pull_request and _is_generic_merge_message(message):
+        embed["fields"].append(
+            {
+                "name": "Pull Request",
+                "value": _pull_request_field_value(pull_request),
+                "inline": False,
+            }
+        )
 
     url = _commit_url(event, commit)
     if url:
@@ -104,7 +163,11 @@ def _commit_embed(event: dict[str, Any], commit: dict[str, Any]) -> dict[str, An
     return embed
 
 
-def build_webhook_payloads(event: dict[str, Any]) -> list[dict[str, Any]]:
+def build_webhook_payloads(
+    event: dict[str, Any],
+    *,
+    pull_request_lookup: Callable[[str], dict[str, Any] | None] | None = None,
+) -> list[dict[str, Any]]:
     """Return Discord webhook payloads for a GitHub push event."""
     if event.get("deleted"):
         return []
@@ -113,11 +176,16 @@ def build_webhook_payloads(event: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(commits, list) or not commits:
         return []
 
-    embeds = [
-        _commit_embed(event, commit)
-        for commit in commits
-        if isinstance(commit, dict)
-    ]
+    embeds = []
+    for commit in commits:
+        if not isinstance(commit, dict):
+            continue
+        sha = str(commit.get("id") or "").strip()
+        message = str(commit.get("message") or "")
+        pull_request = None
+        if pull_request_lookup and sha and _is_generic_merge_message(message):
+            pull_request = pull_request_lookup(sha)
+        embeds.append(_commit_embed(event, commit, pull_request))
     payloads: list[dict[str, Any]] = []
     repo_name = str(
         (event.get("repository") or {}).get("full_name")
@@ -136,6 +204,56 @@ def build_webhook_payloads(event: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return payloads
+
+
+def fetch_pull_request_for_commit(
+    repository: str,
+    commit_sha: str,
+    token: str,
+    api_url: str = "https://api.github.com",
+) -> dict[str, Any] | None:
+    """Return the first PR associated with a commit, or None on lookup failure."""
+    repository = repository.strip()
+    commit_sha = commit_sha.strip()
+    token = token.strip()
+    if not repository or not commit_sha or not token:
+        return None
+
+    quoted_repo = quote(repository, safe="/")
+    url = f"{api_url.rstrip('/')}/repos/{quoted_repo}/commits/{commit_sha}/pulls"
+    req = request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "hermes-main-commit-logs",
+        },
+        method="GET",
+    )
+    try:
+        with request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        print(
+            f"Warning: PR lookup for {commit_sha[:7]} failed with "
+            f"HTTP {exc.code}: {body}",
+            file=sys.stderr,
+        )
+        return None
+    except Exception as exc:
+        print(
+            f"Warning: PR lookup for {commit_sha[:7]} failed: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+    if isinstance(data, list) and data:
+        first = data[0]
+        if isinstance(first, dict):
+            return first
+    return None
 
 
 def post_payload(webhook_url: str, payload: dict[str, Any]) -> None:
@@ -184,7 +302,26 @@ def main() -> int:
         return 2
 
     event = load_event(event_path)
-    payloads = build_webhook_payloads(event)
+    repository = str(
+        (event.get("repository") or {}).get("full_name")
+        or os.getenv("GITHUB_REPOSITORY")
+        or ""
+    )
+    github_token = os.getenv("GITHUB_TOKEN", "").strip()
+    github_api_url = os.getenv("GITHUB_API_URL", "https://api.github.com").strip()
+    pull_request_lookup = None
+    if repository and github_token:
+        pull_request_lookup = lambda sha: fetch_pull_request_for_commit(
+            repository,
+            sha,
+            github_token,
+            github_api_url,
+        )
+
+    payloads = build_webhook_payloads(
+        event,
+        pull_request_lookup=pull_request_lookup,
+    )
     if not payloads:
         print("No main-branch commit notifications to send.")
         return 0
