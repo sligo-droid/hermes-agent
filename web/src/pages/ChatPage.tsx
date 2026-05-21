@@ -166,7 +166,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // treat the current resume target as part of the PTY identity and rebuild the
   // terminal session when it changes.
   const resumeParam = searchParams.get("resume");
-  const channel = useMemo(() => generateChannelId(), [resumeParam]);
+  const channel = useMemo(
+    () => `${resumeParam ? "resume" : "fresh"}-${generateChannelId()}`,
+    [resumeParam],
+  );
 
   useEffect(() => {
     if (!resumeParam) return;
