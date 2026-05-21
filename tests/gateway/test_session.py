@@ -5,6 +5,7 @@ import json
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+from agent.message_sanitization import IMAGE_HISTORY_PLACEHOLDER
 from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import (
@@ -730,6 +731,23 @@ class TestLoadTranscriptCorruptLines:
         assert len(messages) == 2
         assert messages[0]["content"] == "a"
         assert messages[1]["content"] == "b"
+
+    def test_jsonl_transcript_sanitizes_native_image_bytes(self, store):
+        session_id = "image_history_test"
+        content = [
+            {"type": "text", "text": "analyze this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+        ]
+
+        store.append_to_transcript(session_id, {"role": "user", "content": content})
+
+        raw = store.get_transcript_path(session_id).read_text(encoding="utf-8")
+        messages = store.load_transcript(session_id)
+
+        assert "data:image" not in raw
+        assert messages == [
+            {"role": "user", "content": f"analyze this\n{IMAGE_HISTORY_PLACEHOLDER}"}
+        ]
 
 
 class TestLoadTranscriptPreferLongerSource:

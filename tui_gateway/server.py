@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
+from agent.message_sanitization import sanitize_history_messages
 from utils import is_truthy_value
 from tui_gateway.transport import (
     StdioTransport,
@@ -3320,7 +3321,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     with session["history_lock"]:
                         current_version = int(session.get("history_version", 0))
                         if current_version == history_version:
-                            session["history"] = result["messages"]
+                            session["history"] = sanitize_history_messages(result["messages"])
                             session["history_version"] = history_version + 1
                         else:
                             # History mutated externally during the turn

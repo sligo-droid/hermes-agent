@@ -40,8 +40,8 @@ Media attachments are handled as turn-scoped inputs:
 - Text documents can have their extracted text included; other document types
   are usually represented by a saved local path and a short note.
 - Attachment paths and extracted/derived text can appear in the transcript, but
-  the raw image, audio, or binary file bytes are not repeatedly copied into
-  future prompts.
+  raw image, audio, or binary file bytes are collapsed to text placeholders
+  before session history is persisted or replayed into future prompts.
 
 For example, if a user sends an image and asks Hermes to make a meme from it,
 Hermes may inspect that image once with vision and run an image-processing

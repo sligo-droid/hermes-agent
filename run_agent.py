@@ -182,6 +182,7 @@ from agent.message_sanitization import (
     _sanitize_messages_non_ascii,
     _sanitize_tools_non_ascii,
     _strip_images_from_messages,
+    sanitize_history_content,
     _sanitize_structure_non_ascii,
 )
 from agent.tool_dispatch_helpers import (
@@ -1261,15 +1262,8 @@ class AIAgent:
                 # for cross-session replay.
                 if _is_multimodal_tool_result(content):
                     content = _multimodal_text_summary(content)
-                elif isinstance(content, list):
-                    # List of OpenAI-style content parts: strip images, keep text.
-                    _txt = []
-                    for p in content:
-                        if isinstance(p, dict) and p.get("type") == "text":
-                            _txt.append(str(p.get("text", "")))
-                        elif isinstance(p, dict) and p.get("type") in {"image", "image_url", "input_image"}:
-                            _txt.append("[screenshot]")
-                    content = "\n".join(_txt) if _txt else None
+                else:
+                    content = sanitize_history_content(content)
                 tool_calls_data = None
                 if hasattr(msg, "tool_calls") and isinstance(msg.tool_calls, list) and msg.tool_calls:
                     tool_calls_data = [
