@@ -753,6 +753,97 @@ def _reload_runtime_env_preserving_config_authority() -> None:
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
 _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
+
+def _bridge_gateway_config_to_env(
+    cfg: dict,
+    env: Optional[dict] = None,
+    hermes_home: Optional[Path | str] = None,
+) -> dict:
+    """Bridge gateway config values into environment variables.
+
+    ``config.yaml`` is authoritative for terminal settings.  Top-level
+    ``cwd``/``backend`` are convenience aliases, but nested ``terminal``
+    values take precedence when present.
+    """
+    target_env = env if env is not None else os.environ
+
+    # Top-level simple values (fallback only — don't override .env)
+    for key, val in cfg.items():
+        if isinstance(val, (str, int, float, bool)) and key not in target_env:
+            target_env[key] = str(val)
+
+    terminal_cfg = cfg.get("terminal", {})
+    if terminal_cfg and isinstance(terminal_cfg, dict):
+        terminal_env_map = {
+            "backend": "TERMINAL_ENV",
+            "cwd": "TERMINAL_CWD",
+            "timeout": "TERMINAL_TIMEOUT",
+            "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
+            "docker_image": "TERMINAL_DOCKER_IMAGE",
+            "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
+            "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
+            "modal_image": "TERMINAL_MODAL_IMAGE",
+            "daytona_image": "TERMINAL_DAYTONA_IMAGE",
+            "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
+            "ssh_host": "TERMINAL_SSH_HOST",
+            "ssh_user": "TERMINAL_SSH_USER",
+            "ssh_port": "TERMINAL_SSH_PORT",
+            "ssh_key": "TERMINAL_SSH_KEY",
+            "container_cpu": "TERMINAL_CONTAINER_CPU",
+            "container_memory": "TERMINAL_CONTAINER_MEMORY",
+            "container_disk": "TERMINAL_CONTAINER_DISK",
+            "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
+            "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
+            "docker_env": "TERMINAL_DOCKER_ENV",
+            "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
+            "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
+            "sandbox_dir": "TERMINAL_SANDBOX_DIR",
+            "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
+        }
+        for cfg_key, env_var in terminal_env_map.items():
+            if cfg_key in terminal_cfg:
+                val = terminal_cfg[cfg_key]
+                if cfg_key == "cwd" and str(val) in {".", "auto", "cwd"}:
+                    continue
+                if cfg_key == "cwd" and isinstance(val, str):
+                    val = os.path.expanduser(val)
+                if isinstance(val, (list, dict)):
+                    target_env[env_var] = json.dumps(val)
+                else:
+                    target_env[env_var] = str(val)
+
+        # Legacy nested spelling used by older gateway configs.
+        if "backend" not in terminal_cfg and "env_type" in terminal_cfg:
+            val = terminal_cfg["env_type"]
+            if isinstance(val, (list, dict)):
+                target_env["TERMINAL_ENV"] = json.dumps(val)
+            else:
+                target_env["TERMINAL_ENV"] = str(val)
+
+    # Top-level aliases are fallback config spellings.  Nested terminal.* wins
+    # even over stale env values, so only apply aliases when the nested key is
+    # absent (including legacy terminal.env_type for backend).
+    terminal_has_cwd = isinstance(terminal_cfg, dict) and "cwd" in terminal_cfg
+    terminal_has_backend = isinstance(terminal_cfg, dict) and (
+        "backend" in terminal_cfg or "env_type" in terminal_cfg
+    )
+    if not terminal_has_cwd:
+        alias_val = cfg.get("cwd")
+        if isinstance(alias_val, str) and alias_val.strip():
+            target_env["TERMINAL_CWD"] = os.path.expanduser(alias_val.strip())
+    if not terminal_has_backend:
+        alias_val = cfg.get("backend")
+        if isinstance(alias_val, str) and alias_val.strip():
+            target_env["TERMINAL_ENV"] = alias_val.strip()
+
+    configured_cwd = str(target_env.get("TERMINAL_CWD", "")).strip()
+    if not configured_cwd or configured_cwd in {".", "auto", "cwd"}:
+        fallback = target_env.get("MESSAGING_CWD") or str(hermes_home or get_hermes_home())
+        target_env["TERMINAL_CWD"] = str(fallback)
+
+    return target_env
+
+
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
 _config_path = _hermes_home / 'config.yaml'
@@ -764,57 +855,7 @@ if _config_path.exists():
         # Expand ${ENV_VAR} references before bridging to env vars.
         from hermes_cli.config import _expand_env_vars
         _cfg = _expand_env_vars(_cfg)
-        # Top-level simple values (fallback only — don't override .env)
-        for _key, _val in _cfg.items():
-            if isinstance(_val, (str, int, float, bool)) and _key not in os.environ:
-                os.environ[_key] = str(_val)
-        # Terminal config is nested — bridge to TERMINAL_* env vars.
-        # config.yaml overrides .env for these since it's the documented config path.
-        _terminal_cfg = _cfg.get("terminal", {})
-        if _terminal_cfg and isinstance(_terminal_cfg, dict):
-            _terminal_env_map = {
-                "backend": "TERMINAL_ENV",
-                "cwd": "TERMINAL_CWD",
-                "timeout": "TERMINAL_TIMEOUT",
-                "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
-                "docker_image": "TERMINAL_DOCKER_IMAGE",
-                "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
-                "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
-                "modal_image": "TERMINAL_MODAL_IMAGE",
-                "daytona_image": "TERMINAL_DAYTONA_IMAGE",
-                "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
-                "ssh_host": "TERMINAL_SSH_HOST",
-                "ssh_user": "TERMINAL_SSH_USER",
-                "ssh_port": "TERMINAL_SSH_PORT",
-                "ssh_key": "TERMINAL_SSH_KEY",
-                "container_cpu": "TERMINAL_CONTAINER_CPU",
-                "container_memory": "TERMINAL_CONTAINER_MEMORY",
-                "container_disk": "TERMINAL_CONTAINER_DISK",
-                "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
-                "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
-                "docker_env": "TERMINAL_DOCKER_ENV",
-                "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
-                "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
-                "sandbox_dir": "TERMINAL_SANDBOX_DIR",
-                "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
-            }
-            for _cfg_key, _env_var in _terminal_env_map.items():
-                if _cfg_key in _terminal_cfg:
-                    _val = _terminal_cfg[_cfg_key]
-                    # Skip cwd placeholder values (".", "auto", "cwd") — the
-                    # gateway resolves these to Path.home() later (line ~255).
-                    # Writing the raw placeholder here would just be noise.
-                    # Only bridge explicit absolute paths from config.yaml.
-                    if _cfg_key == "cwd" and str(_val) in {".", "auto", "cwd"}:
-                        continue
-                    # Expand shell tilde in cwd so subprocess.Popen never
-                    # receives a literal "~/" which the kernel rejects.
-                    if _cfg_key == "cwd" and isinstance(_val, str):
-                        _val = os.path.expanduser(_val)
-                    if isinstance(_val, (list, dict)):
-                        os.environ[_env_var] = json.dumps(_val)
-                    else:
-                        os.environ[_env_var] = str(_val)
+        _bridge_gateway_config_to_env(_cfg, os.environ, _hermes_home)
         # Compression config is read directly from config.yaml by run_agent.py
         # and auxiliary_client.py — no env var bridging needed.
         # Auxiliary model/direct-endpoint overrides (vision, web_extract).
@@ -2163,18 +2204,29 @@ class GatewayRunner:
 
     def _session_key_for_source(self, source: SessionSource) -> str:
         """Resolve the current session key for a source, honoring gateway config when available."""
-        if hasattr(self, "session_store") and self.session_store is not None:
-            try:
-                session_key = self.session_store._generate_session_key(source)
-                if isinstance(session_key, str) and session_key:
-                    return session_key
-            except Exception:
-                pass
         config = getattr(self, "config", None)
+        group_sessions_per_user = getattr(config, "group_sessions_per_user", True)
+        thread_sessions_per_user = getattr(config, "thread_sessions_per_user", False)
+
+        platform_cfg = None
+        if config is not None:
+            try:
+                platform_cfg = getattr(config, "platforms", {}).get(source.platform)
+            except Exception:
+                platform_cfg = None
+        if platform_cfg is None:
+            adapter = getattr(self, "adapters", {}).get(source.platform)
+            platform_cfg = getattr(adapter, "config", None)
+
+        extra = getattr(platform_cfg, "extra", None)
+        if isinstance(extra, dict):
+            group_sessions_per_user = extra.get("group_sessions_per_user", group_sessions_per_user)
+            thread_sessions_per_user = extra.get("thread_sessions_per_user", thread_sessions_per_user)
+
         return build_session_key(
             source,
-            group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+            group_sessions_per_user=group_sessions_per_user,
+            thread_sessions_per_user=thread_sessions_per_user,
         )
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
@@ -7442,13 +7494,14 @@ class GatewayRunner:
 
             # Session-level toggles that are safe to run mid-agent —
             # /yolo can unblock a pending approval prompt, /verbose cycles
-            # the tool-progress display mode for the ongoing stream.
+            # the tool-progress display mode for the ongoing stream, and
+            # /footer toggles runtime metadata on later final replies.
             # Both modify session state without needing agent interaction
             # and must not be queued (the safety net would discard them).
             # /fast and /reasoning are config-only and take effect next
             # message, so they fall through to the catch-all busy response
             # below — users should wait and set them between turns.
-            if _cmd_def_inner and _cmd_def_inner.name in {"yolo", "verbose"}:
+            if _cmd_def_inner and _cmd_def_inner.name in {"yolo", "verbose", "footer"}:
                 if _cmd_def_inner.name == "yolo":
                     return await self._handle_yolo_command(event)
                 if _cmd_def_inner.name == "verbose":
