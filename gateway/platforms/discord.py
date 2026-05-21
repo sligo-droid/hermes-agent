@@ -1274,9 +1274,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         production_url = self._production_url_from_env()
 
-        branch_url = None
-        if repo_url and branch and branch not in {"main", "master"}:
-            branch_url = f"{repo_url}/tree/{quote(branch, safe='/._-')}"
+        branch_url = self._github_branch_url(repo_url, branch)
 
         pr_url = None
         if branch:
@@ -1305,6 +1303,22 @@ class DiscordAdapter(BasePlatformAdapter):
         if len(text) <= limit:
             return text
         return text[: limit - 3] + "..."
+
+    def _github_branch_url(self, repo_url: Optional[str], branch: Optional[str]) -> Optional[str]:
+        repo = self._normalize_github_remote_url(str(repo_url or ""))
+        branch_name = str(branch or "").strip()
+        if not repo or not branch_name or branch_name in {"main", "master"}:
+            return None
+        return f"{repo}/tree/{quote(branch_name, safe='/._-')}"
+
+    def _format_feature_summary_branch(self, metadata: Dict[str, Optional[str]]) -> str:
+        branch = str(metadata.get("branch") or "").strip()
+        if not branch:
+            return ""
+        branch_url = self._normalize_absolute_public_url(metadata.get("branch_url"))
+        if branch_url:
+            return f"[{branch}]({branch_url})"
+        return branch
 
     def _render_project_summary_line(self, metadata: Dict[str, Optional[str]]) -> str:
         repo = self._truncate_summary_value(metadata.get("repo_url"), limit=260)
@@ -1533,12 +1547,11 @@ class DiscordAdapter(BasePlatformAdapter):
             ("Status", self._summary_status_label(status), True),
             ("Concise Outcome", self._clean_summary_text(outcome, limit=420, default="Pending"), False),
         ]
-        if metadata.get("branch"):
-            fields.append(("Branch", metadata["branch"], True))
+        branch = self._format_feature_summary_branch(metadata)
+        if branch:
+            fields.append(("Branch", branch, True))
         if metadata.get("pr_url"):
             fields.append(("GitHub PR", metadata["pr_url"], False))
-        if metadata.get("branch_url"):
-            fields.append(("Feature Branch URL", metadata["branch_url"], False))
         kanban_url = self._normalize_absolute_public_url(kanban_url)
         if kanban_url:
             fields.append(("Kanban Board", kanban_url, False))
@@ -1736,7 +1749,7 @@ class DiscordAdapter(BasePlatformAdapter):
         branch = str(kanban_snapshot.get("branch") or "").strip()
         if branch:
             metadata["branch"] = branch
-            metadata["branch_url"] = None
+            metadata["branch_url"] = self._github_branch_url(metadata.get("repo_url"), branch)
         pr_url = str(kanban_snapshot.get("pr_url") or "").strip()
         if pr_url:
             metadata["pr_url"] = pr_url

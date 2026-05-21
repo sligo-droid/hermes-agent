@@ -222,6 +222,8 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
     assert sent_embed.description is None
     fields = {field.name: field.value for field in sent_embed.fields}
     assert fields["Status"] == "👀 In progress"
+    assert fields["Branch"] == "[feature/summary](https://github.com/acme/hermes-project/tree/feature/summary)"
+    assert "Feature Branch URL" not in fields
     assert all(field.name != "Generated Title" for field in sent_embed.fields)
 
     adapter.handle_message.assert_awaited_once()
@@ -617,7 +619,8 @@ async def test_feature_summary_update_edits_initial_message(adapter, monkeypatch
     assert "Generated Title" not in fields
     assert fields["Status"] == "✅ Done"
     assert fields["Concise Outcome"].startswith("Done.")
-    assert fields["Branch"] == "feature/summary"
+    assert fields["Branch"] == "[feature/summary](https://github.com/acme/hermes-project/tree/feature/summary)"
+    assert "Feature Branch URL" not in fields
 
 
 def test_feature_summary_kanban_status_labels(adapter):
@@ -689,7 +692,7 @@ async def test_kanban_feature_summary_update_uses_board_snapshot(adapter, monkey
     assert fields["Status"] == "👀 In progress"
     assert fields["Concise Outcome"] != "Pending"
     assert "Kanban" in fields["Concise Outcome"] or "ticket" in fields["Concise Outcome"]
-    assert fields["Branch"] == "discord/200"
+    assert fields["Branch"] == "[discord/200](https://github.com/acme/hermes-project/tree/discord/200)"
     assert fields["Kanban Board"] == "https://hermes.sligolabs.com/workers/200"
     assert "Feature Branch URL" not in fields
 
@@ -728,7 +731,7 @@ async def test_sync_kanban_feature_summary_reopens_persisted_handle(adapter, mon
     edited_embed = message.edit.await_args.kwargs["embed"]
     fields = {field.name: field.value for field in edited_embed.fields}
     assert edited_embed.title == "Dashboard Shipment"
-    assert fields["Branch"] == "discord/200"
+    assert fields["Branch"] == "[discord/200](https://github.com/acme/hermes-project/tree/discord/200)"
 
 
 @pytest.mark.asyncio
