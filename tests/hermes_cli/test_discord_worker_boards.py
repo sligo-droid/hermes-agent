@@ -420,7 +420,7 @@ def test_public_board_index_lists_operational_row_data(monkeypatch, tmp_path):
     html = dwb.render_public_board_index_html()
 
     assert "active / dev" in html
-    assert 'class="runtime runtime-paused">paused</strong>' in html
+    assert 'class="runtime runtime-blocked">blocked</strong>' in html
     assert "ready:1" in html
     assert "running:1" in html
     assert "Running: idle" in html
@@ -430,8 +430,9 @@ def test_public_board_index_lists_operational_row_data(monkeypatch, tmp_path):
     assert "Created: 1970-01-01 00:01:40 UTC" in html
     assert "Updated: 1970-01-01 00:03:20 UTC" in html
     assert "paused blocked: waiting for review" in html
-    assert 'action="/workers/5152/start"' in html
-    assert ">Resume</button>" in html
+    assert "Status: waiting for review" in html
+    assert 'action="/workers/5152/start"' not in html
+    assert ">Resume</button>" not in html
     assert "/repo/app" not in html
     assert "app-discord-5152" not in html
     assert "share_token" not in html
@@ -497,6 +498,31 @@ def test_public_board_index_live_worker_overrides_stale_blocked_meta(monkeypatch
     assert "Status: Live worker ticket" in html
 
 
+def test_public_board_index_blocked_task_sets_blocked_runtime(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(thread_id="5158", goal="Wait for input")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(conn, title="Needs operator decision")
+        conn.execute(
+            "UPDATE tasks SET status='blocked', "
+            "last_failure_error='missing credentials' WHERE id=?",
+            (task_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    html = dwb.render_public_board_index_html()
+
+    assert 'class="runtime runtime-blocked">blocked</strong>' in html
+    assert "Status: missing credentials" in html
+    assert 'action="/workers/5158/pause"' not in html
+
+
 def test_public_board_index_does_not_show_dead_pid_as_running(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -514,7 +540,7 @@ def test_public_board_index_does_not_show_dead_pid_as_running(monkeypatch, tmp_p
 
     html = dwb.render_public_board_index_html()
 
-    assert 'class="runtime runtime-stale">stale</strong>' in html
+    assert 'class="runtime runtime-stalled">stalled</strong>' in html
     assert "running ticket has no live worker" in html
     assert "Pause</button>" not in html
 
@@ -1123,6 +1149,7 @@ def test_worker_ticket_terminal_endpoint_returns_auth_scoped_feed(monkeypatch, t
     resp = client.get(f"/workers/8183/tickets/{task.id}/terminal.json")
     page = client.get(f"/workers/8183/tickets/{task.id}/terminal")
     missing = client.get("/workers/8183/tickets/t_missing/terminal.json")
+    missing_page = client.get("/workers/8183/tickets/t_missing/terminal")
 
     assert resp.status_code == 200
     assert page.status_code == 200
@@ -1150,6 +1177,7 @@ def test_worker_ticket_terminal_endpoint_returns_auth_scoped_feed(monkeypatch, t
     assert "def leaked(): pass" not in rendered
     assert "sk-proj-A1B2C3D4E5F6G7H8I9J0" not in rendered
     assert missing.status_code == 404
+    assert missing_page.status_code == 404
 
 
 def test_worker_ticket_terminal_labels_opencode_state(monkeypatch, tmp_path):

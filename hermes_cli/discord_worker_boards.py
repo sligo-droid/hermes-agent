@@ -1485,21 +1485,29 @@ def _board_runtime_snapshot(
     if worker.get("cancelled") or worker.get("goal_status") == "cancelled":
         state = "cancelled"
         reason = "cancelled"
-    elif worker.get("paused") or worker.get("goal_status") == "paused" or worker.get("phase") == "paused":
-        state = "paused"
-        reason = str(worker.get("paused_reason") or "queue paused")
     elif running_count > 0:
         state = "running"
         reason = _running_status_text(running)
+    elif (
+        str(worker.get("blocked_reason") or "").strip()
+        or worker.get("goal_status") == "blocked"
+        or int(counts.get("blocked") or 0) > 0
+    ):
+        state = "blocked"
+        reason = _blocked_runtime_reason(worker, conn=conn)
     elif int(counts.get("running") or 0) > 0:
-        state = "stale"
+        state = "stalled"
         reason = "running ticket has no live worker"
+    elif (
+        worker.get("paused")
+        or worker.get("goal_status") == "paused"
+        or worker.get("phase") == "paused"
+    ):
+        state = "paused"
+        reason = str(worker.get("paused_reason") or "queue paused")
     elif worker.get("goal_status") == "done" or worker.get("phase") == "complete":
         state = "done"
         reason = "complete"
-    elif str(worker.get("blocked_reason") or "").strip() or worker.get("goal_status") == "blocked":
-        state = "blocked"
-        reason = str(worker.get("blocked_reason") or "blocked")
     elif queued_total > 0:
         state = "queued"
         reason = _queue_reason(worker, counts=counts, running_count=running_count, conn=conn)
@@ -1537,6 +1545,33 @@ def _board_runtime_snapshot(
         "control": control,
         "control_label": control_label,
     }
+
+
+def _blocked_runtime_reason(worker: dict[str, Any], *, conn: Any) -> str:
+    reason = _public_runtime_reason(
+        worker.get("blocked_reason"),
+        max_chars=240,
+    )
+    if reason:
+        return reason
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    except Exception:
+        tasks = []
+    for task in tasks:
+        if getattr(task, "status", "") != "blocked":
+            continue
+        detail = _public_runtime_reason(
+            getattr(task, "last_failure_error", None) or getattr(task, "title", ""),
+            max_chars=240,
+        )
+        return detail or "blocked ticket needs attention"
+    return "blocked"
+
+
+def _public_runtime_reason(value: Any, *, max_chars: int = 240) -> str:
+    text = _clean_feature_summary_text(value, max_chars=max_chars, default="")
+    return str(_redact_public_state(text) or "").strip() if text else ""
 
 
 def _runtime_action_form_html(
