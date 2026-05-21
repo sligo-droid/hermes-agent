@@ -78,6 +78,71 @@ def test_merge_commit_description_prefers_meaningful_body_line():
     assert payload["embeds"][0]["description"] == "Add main commit notifications"
 
 
+def test_generic_merge_commit_uses_associated_pr_body_and_field():
+    mod = _load_module()
+    commit = _commit(4, "Merge remote-tracking branch 'origin/main'")
+    pull_request = {
+        "number": 81,
+        "title": "Show worker run profile on tickets",
+        "body": "Expose model, sandbox, and runtime settings on worker tickets.",
+        "html_url": "https://github.com/NousResearch/hermes-agent/pull/81",
+    }
+
+    payload = mod.build_webhook_payloads(
+        _event([commit]),
+        pull_request_lookup=lambda _sha: pull_request,
+    )[0]
+
+    embed = payload["embeds"][0]
+    assert embed["description"] == (
+        "Expose model, sandbox, and runtime settings on worker tickets."
+    )
+    assert {
+        "name": "Pull Request",
+        "value": (
+            "[#81 Show worker run profile on tickets]"
+            "(https://github.com/NousResearch/hermes-agent/pull/81)"
+        ),
+        "inline": False,
+    } in embed["fields"]
+
+
+def test_generic_merge_commit_falls_back_to_pr_title_when_body_empty():
+    mod = _load_module()
+    commit = _commit(5, "Merge pull request #82 from sligo-droid/example")
+    pull_request = {
+        "number": 82,
+        "title": "Improve Discord commit messages",
+        "body": "",
+        "html_url": "https://github.com/NousResearch/hermes-agent/pull/82",
+    }
+
+    payload = mod.build_webhook_payloads(
+        _event([commit]),
+        pull_request_lookup=lambda _sha: pull_request,
+    )[0]
+
+    assert payload["embeds"][0]["description"] == "Improve Discord commit messages"
+
+
+def test_direct_commit_keeps_commit_message_even_when_pr_is_associated():
+    mod = _load_module()
+
+    def fail_lookup(_sha):
+        raise AssertionError("direct commits should not need PR lookup")
+
+    payload = mod.build_webhook_payloads(
+        _event([_commit(6, "feat: direct commit detail")]),
+        pull_request_lookup=fail_lookup,
+    )[0]
+
+    assert payload["embeds"][0]["description"] == "feat: direct commit detail"
+    assert all(
+        field["name"] != "Pull Request"
+        for field in payload["embeds"][0]["fields"]
+    )
+
+
 def test_deleted_branch_and_empty_commits_are_noops():
     mod = _load_module()
 
@@ -128,6 +193,41 @@ def test_post_payload_raises_on_non_2xx_response(monkeypatch):
 
     with pytest.raises(RuntimeError, match="HTTP 500"):
         mod.post_payload("https://discord.example/webhook", {"embeds": []})
+
+
+def test_fetch_pull_request_for_commit_returns_first_pr(monkeypatch):
+    mod = _load_module()
+    seen = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps([{"number": 84, "body": "PR detail"}]).encode()
+
+    def fake_urlopen(req, timeout):
+        seen["url"] = req.full_url
+        seen["headers"] = dict(req.header_items())
+        seen["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(mod.request, "urlopen", fake_urlopen)
+
+    pr = mod.fetch_pull_request_for_commit(
+        "NousResearch/hermes-agent",
+        "abc123",
+        "token",
+    )
+
+    assert pr == {"number": 84, "body": "PR detail"}
+    assert seen["url"].endswith("/repos/NousResearch/hermes-agent/commits/abc123/pulls")
+    assert seen["headers"]["Authorization"] == "Bearer token"
+    assert seen["headers"]["Accept"] == "application/vnd.github+json"
+    assert seen["timeout"] == 15
 
 
 def test_main_posts_all_payload_chunks(tmp_path, monkeypatch):
