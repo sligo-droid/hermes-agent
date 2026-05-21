@@ -39,6 +39,15 @@ class FeatureSummarySyncAdapter:
         return target.get("sync_key") or target.get("board")
 
 
+class ReactionSyncAdapter:
+    def __init__(self):
+        self.synced = []
+
+    async def sync_kanban_thread_reaction(self, target):
+        self.synced.append(dict(target))
+        return target.get("state")
+
+
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
 
@@ -250,6 +259,80 @@ def test_discord_kanban_typing_watcher_suppresses_repeated_summary_sync(tmp_path
     asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
 
     assert len(adapter.synced) == 1
+
+
+def test_discord_kanban_typing_watcher_resyncs_stale_reaction_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setattr("gateway.run.time.monotonic", lambda: 100.0)
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(
+        thread_id="99004",
+        goal="Repair stale Discord reaction",
+        chat_id="parent-993",
+    )
+
+    adapter = ReactionSyncAdapter()
+    runner = _make_discord_runner(adapter)
+    runner._discord_kanban_reaction_states = {
+        board.slug: {"state": "active", "synced_at": 10.0},
+    }
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert len(adapter.synced) == 1
+    assert adapter.synced[0]["board"] == board.slug
+    assert adapter.synced[0]["thread_id"] == "99004"
+    assert runner._discord_kanban_reaction_states[board.slug] == {
+        "state": "active",
+        "synced_at": 100.0,
+    }
+
+
+def test_discord_kanban_typing_watcher_upgrades_state_only_reaction_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setattr("gateway.run.time.monotonic", lambda: 200.0)
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(
+        thread_id="99006",
+        goal="Repair same-state Discord reaction drift",
+        chat_id="parent-995",
+    )
+
+    adapter = ReactionSyncAdapter()
+    runner = _make_discord_runner(adapter)
+    runner._discord_kanban_reaction_states = {board.slug: "active"}
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert len(adapter.synced) == 1
+    assert runner._discord_kanban_reaction_states[board.slug] == {
+        "state": "active",
+        "synced_at": 200.0,
+    }
+
+
+def test_discord_kanban_typing_watcher_keeps_recent_reaction_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setattr("gateway.run.time.monotonic", lambda: 100.0)
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(
+        thread_id="99005",
+        goal="Avoid excessive Discord reaction sync",
+        chat_id="parent-994",
+    )
+
+    adapter = ReactionSyncAdapter()
+    runner = _make_discord_runner(adapter)
+    runner._discord_kanban_reaction_states = {
+        board.slug: {"state": "active", "synced_at": 90.0},
+    }
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert adapter.synced == []
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):
