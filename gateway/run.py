@@ -5804,7 +5804,6 @@ class GatewayRunner:
     def _discord_kanban_summary_sync_key(self, target: Dict[str, Any]) -> str:
         return json.dumps(
             {
-                "sync_key": str(target.get("sync_key") or ""),
                 "state": str(target.get("state") or ""),
                 "title": str(target.get("title") or ""),
                 "outcome": str(target.get("outcome") or ""),
