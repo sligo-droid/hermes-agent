@@ -245,8 +245,11 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
-    ):
+    ) -> bool:
         """Register a tool.  Called at module-import time by each tool file.
+
+        Returns True when registration succeeds and False when it is rejected.
+        Existing callers may ignore the return value.
 
         ``override=True`` is an explicit opt-in for plugins that intend to
         replace an existing built-in tool implementation (e.g. swap the
@@ -286,7 +289,7 @@ class ToolRegistry:
                         "intentional, or deregister the existing tool first.",
                         name, toolset, existing.toolset,
                     )
-                    return
+                    return False
             self._tools[name] = ToolEntry(
                 name=name,
                 toolset=toolset,
@@ -303,6 +306,7 @@ class ToolRegistry:
             if check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
             self._generation += 1
+            return True
 
     def deregister(self, name: str) -> None:
         """Remove a tool from the registry.

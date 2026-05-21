@@ -336,7 +336,7 @@ class PluginContext:
         """
         from tools.registry import registry
 
-        registry.register(
+        registered = registry.register(
             name=name,
             toolset=toolset,
             schema=schema,
@@ -348,6 +348,13 @@ class PluginContext:
             emoji=emoji,
             override=override,
         )
+        if not registered:
+            logger.debug(
+                "Plugin %s tool registration rejected: %s",
+                self.manifest.name,
+                name,
+            )
+            return
         self._manager._plugin_tool_names.add(name)
         logger.debug(
             "Plugin %s registered tool: %s%s",

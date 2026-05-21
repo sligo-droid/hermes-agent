@@ -701,6 +701,7 @@ class TestPluginContext:
             # Original handler must still be in place — registration was rejected.
             assert registry._tools["shadow_target"].handler is original_handler
             assert registry._tools["shadow_target"].toolset == "terminal"
+            assert "shadow_target" not in mgr._plugin_tool_names
             # And an ERROR was logged explaining why and how to opt in.
             assert any("override=True" in r.message for r in caplog.records)
         finally:

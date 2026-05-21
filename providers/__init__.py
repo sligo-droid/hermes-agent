@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import hashlib
 import logging
 import sys
 from pathlib import Path
@@ -116,7 +117,13 @@ def _import_plugin_dir(plugin_dir: Path, source: str) -> None:
     if source == "bundled":
         module_name = f"plugins.model_providers.{safe_name}"
     else:
-        module_name = f"_hermes_user_provider_{safe_name}"
+        try:
+            from hermes_constants import get_hermes_home
+
+            home_key = hashlib.sha256(str(get_hermes_home()).encode("utf-8")).hexdigest()[:12]
+        except Exception:
+            home_key = "unknown"
+        module_name = f"_hermes_user_provider_{home_key}_{safe_name}"
 
     if module_name in sys.modules:
         return  # already imported
