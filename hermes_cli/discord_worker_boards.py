@@ -513,6 +513,66 @@ def ticket_terminal_feed_for_session(session_id: str, task_id: str) -> dict[str,
     return _ticket_terminal_feed_for_board(board, task_id, worker=worker)
 
 
+def render_public_session_ticket_terminal_html(session_id: str, task_id: str) -> str:
+    """Render a shareable, sanitized terminal page for one worker ticket."""
+    feed = ticket_terminal_feed_for_session(session_id, task_id)
+    worker = feed.get("worker") if isinstance(feed.get("worker"), dict) else {}
+    task = feed.get("task") if isinstance(feed.get("task"), dict) else {}
+
+    def esc(value: Any) -> str:
+        return html.escape(str(value or ""))
+
+    quoted_session = quote(str(session_id or ""), safe="")
+    quoted_task = quote(str(task_id or ""), safe="")
+    board_url = f"/workers/{quoted_session}"
+    ticket_url = f"{board_url}/tickets/{quoted_task}"
+    json_url = f"{ticket_url}/terminal.json"
+    title = task.get("title") or task_id
+    lines = feed.get("lines") if isinstance(feed.get("lines"), list) else []
+    body = "\n".join(str(line) for line in lines) if lines else "(no terminal activity yet)"
+    updated = _format_public_timestamp(feed.get("updated_at")) or "now"
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{esc(title)} - Terminal</title>
+  <style>
+{_workers_page_css()}
+    .terminal-page {{ margin: 0 auto; max-width: 1040px; }}
+    .terminal-head {{ align-items: flex-start; display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; margin-bottom: 12px; }}
+    .terminal-log {{ background: #111827; border: 1px solid #374151; border-radius: 8px; color: #f9fafb; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow: auto; padding: 16px; white-space: pre-wrap; word-break: break-word; }}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="top-nav">
+      <a class="brand" href="/workers">Hermes<br>Kanban</a>
+      <a class="back-link" href="{esc(ticket_url)}">Back to Ticket</a>
+    </div>
+    <div class="hero">
+      <h1>{esc(title)}</h1>
+      <div class="meta">
+        <span>Ticket: <code>{esc(task.get("id") or task_id)}</code></span>
+        <span>Status: {esc(task.get("status") or "unknown")}</span>
+        <span>Assignee: {esc(task.get("assignee") or "unassigned")}</span>
+        <span>Session: <code>{esc(worker.get("thread_id") or session_id)}</code></span>
+        <span>Updated: {esc(updated)}</span>
+      </div>
+    </div>
+  </header>
+  <main class="terminal-page">
+    <div class="terminal-head">
+      <a class="button-link" href="{esc(board_url)}">Board</a>
+      <a class="button-link" href="{esc(ticket_url)}">Ticket Modal</a>
+      <a class="button-link" href="{esc(json_url)}">JSON Feed</a>
+    </div>
+    <pre class="terminal-log">{esc(body)}</pre>
+  </main>
+</body>
+</html>"""
+
+
 def move_ticket_for_session(session_id: str, task_id: str, status: str) -> dict[str, Any]:
     """Move one public worker-board ticket to another visible status column."""
     board = board_slug_for_discord_thread(session_id)
@@ -731,6 +791,19 @@ def _terminal_feed_lines(
         lines.append("")
         lines.append(f"# {_worker_state_log_label(codex_state)}")
         lines.extend(codex_log_lines)
+    else:
+        diagnostics: list[str] = []
+        if not current_run:
+            diagnostics.append("worker run has not started yet")
+        if not public_log_lines and not log_text:
+            diagnostics.append("no worker stdout/stderr log has been captured yet")
+        diagnostics.append(
+            "no Codex app-server internals, state, or event log has been captured yet"
+        )
+        if diagnostics:
+            lines.append("")
+            lines.append("# diagnostics")
+            lines.extend(f"- {line}" for line in diagnostics)
     return lines
 
 
@@ -1729,7 +1802,7 @@ def _render_public_board_html(
                 ),
                 terminal_url=esc(
                     f"{board_url}/tickets/"
-                    f"{quote(str(item['id']), safe='')}/terminal"
+                    f"{quote(str(item['id']), safe='')}/terminal.json"
                 ),
                 move_url=esc(
                     f"{board_url}/tickets/"
@@ -1826,7 +1899,7 @@ def _render_public_board_html(
       const initialTicketId = {active_ticket_json};
       const columns = Array.from(document.querySelectorAll("[data-column]"));
       const ticketUrlFor = (ticketId) => boardUrl + "/tickets/" + encodeURIComponent(ticketId || "");
-      const terminalUrlFor = (ticketId) => ticketUrlFor(ticketId) + "/terminal";
+      const terminalUrlFor = (ticketId) => ticketUrlFor(ticketId) + "/terminal.json";
       const ticketIdFromPath = () => {{
         const prefix = boardUrl + "/tickets/";
         if (!window.location.pathname.startsWith(prefix)) return "";

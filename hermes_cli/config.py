@@ -1598,10 +1598,11 @@ DEFAULT_CONFIG = {
             "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
             "docker_bin": "docker",
             "codex_home_root": "",
-            # Discord worker boards stay serial by default, but separate
-            # Discord threads may make progress concurrently.
+            # Allow limited per-board parallelism so independent dev-lane
+            # tickets from one /goal can move together. Planner/reviewer
+            # ordering is still enforced by ticket dependencies.
             "max_global_workers": 4,
-            "max_workers_per_board": 1,
+            "max_workers_per_board": 2,
             "review_loop_limit": 5,
             "roles": {
                 "planner": {"reasoning": "high", "service_tier": "normal", "max_runtime_seconds": 1800},

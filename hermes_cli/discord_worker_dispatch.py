@@ -60,19 +60,19 @@ def dispatch_discord_worker_boards(
     boards: list[str],
     *,
     max_global_workers: int = 4,
-    max_workers_per_board: int = 1,
+    max_workers_per_board: int = 2,
     failure_limit: int = kanban_db.DEFAULT_FAILURE_LIMIT,
     spawn_fn: Optional[Callable] = None,
 ) -> list[tuple[str, Optional[kanban_db.DispatchResult]]]:
     """Run one Discord worker-board dispatch pass.
 
-    The board-local invariant stays serial by default: one planner/dev/reviewer
-    task may run on a given Discord board at a time. The global pool allows
-    independent Discord threads to progress in parallel without one active board
-    monopolizing the dispatcher loop.
+    Each board gets a small live-concurrency cap by default so independent
+    dev-lane tickets from one Discord /goal can progress together. Planner /
+    reviewer ordering is still enforced by task dependencies, while the global
+    pool prevents one busy board from monopolizing the dispatcher loop.
     """
     max_global_workers = _coerce_positive_int(max_global_workers, 4)
-    max_workers_per_board = _coerce_positive_int(max_workers_per_board, 1)
+    max_workers_per_board = _coerce_positive_int(max_workers_per_board, 2)
     if spawn_fn is None:
         from hermes_cli.kanban_codex_workers import spawn_or_default
 

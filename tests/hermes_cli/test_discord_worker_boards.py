@@ -575,6 +575,8 @@ def test_public_session_board_does_not_auto_refresh(monkeypatch, tmp_path):
 
     assert 'http-equiv="refresh"' not in html
     assert html.count('data-ticket-terminal-url="/workers/6160/tickets/') == 2
+    assert 'data-ticket-terminal-url="/workers/6160/tickets/' in html
+    assert 'const terminalUrlFor = (ticketId) => ticketUrlFor(ticketId) + "/terminal.json";' in html
     assert html.count('data-ticket-url="/workers/6160/tickets/') == 2
     assert html.count('data-ticket-move-url="/workers/6160/tickets/') == 2
     assert html.count('class="ticket-card"') == 2
@@ -1078,10 +1080,16 @@ def test_worker_ticket_terminal_endpoint_returns_auth_scoped_feed(monkeypatch, t
 
     client = TestClient(app)
     client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
-    resp = client.get(f"/workers/8183/tickets/{task.id}/terminal")
-    missing = client.get("/workers/8183/tickets/t_missing/terminal")
+    resp = client.get(f"/workers/8183/tickets/{task.id}/terminal.json")
+    page = client.get(f"/workers/8183/tickets/{task.id}/terminal")
+    missing = client.get("/workers/8183/tickets/t_missing/terminal.json")
 
     assert resp.status_code == 200
+    assert page.status_code == 200
+    assert "Terminal</title>" in page.text
+    assert f'href="/workers/8183/tickets/{task.id}"' in page.text
+    assert f'href="/workers/8183/tickets/{task.id}/terminal.json"' in page.text
+    assert "# codex app worker log" in page.text
     data = resp.json()
     rendered = json.dumps(data)
     assert data["task"]["id"] == task.id
@@ -1153,7 +1161,7 @@ def test_worker_ticket_terminal_labels_opencode_state(monkeypatch, tmp_path):
 
     client = TestClient(app)
     client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
-    resp = client.get(f"/workers/8184/tickets/{task.id}/terminal")
+    resp = client.get(f"/workers/8184/tickets/{task.id}/terminal.json")
 
     assert resp.status_code == 200
     terminal = "\n".join(resp.json()["lines"])
@@ -1167,6 +1175,35 @@ def test_worker_ticket_terminal_labels_opencode_state(monkeypatch, tmp_path):
     )
     assert "spawning OpenCode role worker: [command hidden]" in public_log
     assert "opencode secret prompt" not in public_log
+
+
+def test_worker_ticket_terminal_page_explains_sparse_feed(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    board = dwb.set_goal(thread_id="8185", goal="Inspect sparse terminal")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+    finally:
+        conn.close()
+
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    json_resp = client.get(f"/workers/8185/tickets/{task.id}/terminal.json")
+    page_resp = client.get(f"/workers/8185/tickets/{task.id}/terminal")
+
+    assert json_resp.status_code == 200
+    terminal = "\n".join(json_resp.json()["lines"])
+    assert "# diagnostics" in terminal
+    assert "worker run has not started yet" in terminal
+    assert "no worker stdout/stderr log has been captured yet" in terminal
+    assert "no Codex app-server internals, state, or event log has been captured yet" in terminal
+    assert page_resp.status_code == 200
+    assert "no Codex app-server internals, state, or event log has been captured yet" in page_resp.text
 
 
 def test_worker_ticket_state_endpoint_reports_empty_codex_state(monkeypatch, tmp_path):

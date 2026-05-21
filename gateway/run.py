@@ -70,6 +70,89 @@ _CODEX_APP_SERVER_ACTIVITY_PREFIX = "Codex app-server event:"
 _MEETING_GOAL_SKILL_NAMES = {"meeting", "discord-meeting-intake"}
 
 
+def _gateway_flow_route_type(event: Any, command: Optional[str] = None) -> str:
+    """Classify a gateway turn for low-cardinality flow telemetry."""
+    cmd = str(command or "").strip().lstrip("/").replace("_", "-").lower()
+    if cmd == "goal":
+        return "slash_goal"
+    text = str(getattr(event, "text", "") or "")
+    if text.startswith(
+        (
+            "[Starting work toward your standing goal]\nGoal",
+            "[Continuing toward your standing goal]\nGoal:",
+        )
+    ):
+        return "slash_goal"
+    return "mainline"
+
+
+def _gateway_flow_telemetry_fields(
+    *,
+    route_type: str,
+    source: Any = None,
+    session_id: Optional[str] = None,
+    admission_ts: Optional[float] = None,
+    dispatch_start_ts: Optional[float] = None,
+    finished_ts: Optional[float] = None,
+) -> dict[str, Any]:
+    """Build sanitized flow telemetry fields without user content."""
+    fields: dict[str, Any] = {"route_type": str(route_type or "mainline")}
+    if session_id:
+        fields["session_id"] = str(session_id)
+    if source is not None:
+        for key in ("chat_id", "thread_id", "user_id"):
+            value = getattr(source, key, None)
+            if value not in (None, ""):
+                fields[key] = str(value)
+        platform = getattr(source, "platform", None)
+        if platform is not None:
+            fields["platform"] = platform.value if hasattr(platform, "value") else str(platform)
+    if admission_ts is not None:
+        fields["admission_ts"] = round(float(admission_ts), 3)
+    if dispatch_start_ts is not None:
+        fields["dispatch_start_ts"] = round(float(dispatch_start_ts), 3)
+    if finished_ts is not None:
+        fields["finished_ts"] = round(float(finished_ts), 3)
+    if admission_ts is not None and dispatch_start_ts is not None:
+        fields["admission_to_dispatch_ms"] = max(
+            0,
+            int((float(dispatch_start_ts) - float(admission_ts)) * 1000),
+        )
+    if dispatch_start_ts is not None and finished_ts is not None:
+        fields["dispatch_to_finish_ms"] = max(
+            0,
+            int((float(finished_ts) - float(dispatch_start_ts)) * 1000),
+        )
+    if admission_ts is not None and finished_ts is not None:
+        fields["total_ms"] = max(0, int((float(finished_ts) - float(admission_ts)) * 1000))
+    return fields
+
+
+def _format_gateway_flow_telemetry(fields: dict[str, Any]) -> str:
+    """Render deterministic key=value telemetry for logs/tests."""
+    ordered = [
+        "route_type",
+        "platform",
+        "session_id",
+        "chat_id",
+        "thread_id",
+        "user_id",
+        "admission_ts",
+        "dispatch_start_ts",
+        "finished_ts",
+        "admission_to_dispatch_ms",
+        "dispatch_to_finish_ms",
+        "total_ms",
+    ]
+    parts = []
+    for key in ordered:
+        if key in fields:
+            parts.append(f"{key}={fields[key]}")
+    for key in sorted(set(fields) - set(ordered)):
+        parts.append(f"{key}={fields[key]}")
+    return "gateway flow " + " ".join(parts)
+
+
 def _discord_live_voice_enabled() -> bool:
     """Return whether Discord voice-channel join/listen support is enabled."""
     return (
@@ -1616,6 +1699,7 @@ class GatewayRunner:
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
+        self._kanban_dispatch_dirty_event = asyncio.Event()
         self._exit_cleanly = False
         self._exit_with_failure = False
         self._exit_reason: Optional[str] = None
@@ -5142,6 +5226,60 @@ class GatewayRunner:
                     path, exc,
                 )
 
+    def _ensure_kanban_dispatch_dirty_event(self) -> asyncio.Event:
+        event = getattr(self, "_kanban_dispatch_dirty_event", None)
+        if event is None:
+            event = asyncio.Event()
+            self._kanban_dispatch_dirty_event = event
+        return event
+
+    def _signal_kanban_dispatcher_dirty(self) -> bool:
+        """Wake the embedded kanban dispatcher after new gateway-created work."""
+        try:
+            self._ensure_kanban_dispatch_dirty_event().set()
+            return True
+        except Exception:
+            logger.debug("kanban dispatcher: dirty signal failed", exc_info=True)
+            return False
+
+    async def _sleep_until_kanban_dispatch_due(self, interval: float) -> bool:
+        """Sleep until the next dispatcher tick or an explicit dirty signal.
+
+        Returns True when a dirty signal woke the sleep early, False on timeout.
+        """
+        event = self._ensure_kanban_dispatch_dirty_event()
+        remaining = max(float(interval or 0), 0.0)
+        while getattr(self, "_running", True) and remaining > 0:
+            step = min(1.0, remaining)
+            try:
+                await asyncio.wait_for(event.wait(), timeout=step)
+            except asyncio.TimeoutError:
+                remaining -= step
+                continue
+            event.clear()
+            return True
+        return False
+
+    def _log_gateway_flow_telemetry(
+        self,
+        *,
+        route_type: str,
+        source: Any = None,
+        session_id: Optional[str] = None,
+        admission_ts: Optional[float] = None,
+        dispatch_start_ts: Optional[float] = None,
+        finished_ts: Optional[float] = None,
+    ) -> None:
+        fields = _gateway_flow_telemetry_fields(
+            route_type=route_type,
+            source=source,
+            session_id=session_id,
+            admission_ts=admission_ts,
+            dispatch_start_ts=dispatch_start_ts,
+            finished_ts=finished_ts,
+        )
+        logger.info(_format_gateway_flow_telemetry(fields))
+
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
 
@@ -5219,7 +5357,7 @@ class GatewayRunner:
         )
         discord_max_workers_per_board = _positive_int_config(
             discord_worker_cfg.get("max_workers_per_board"),
-            1,
+            2,
         )
         logger.info(
             "kanban dispatcher: Discord worker pool max_global_workers=%d max_workers_per_board=%d",
@@ -5589,6 +5727,7 @@ class GatewayRunner:
         )
         while self._running:
             try:
+                self._ensure_kanban_dispatch_dirty_event().clear()
                 if auto_decompose_enabled:
                     await asyncio.to_thread(_auto_decompose_tick)
                 results = await asyncio.to_thread(_tick_once)
@@ -5632,12 +5771,8 @@ class GatewayRunner:
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
 
-            # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
-            # waits up to `interval` seconds for the current sleep to finish.
-            slept = 0.0
-            while slept < interval and self._running:
-                await asyncio.sleep(min(1.0, interval - slept))
-                slept += 1.0
+            if self._running:
+                await self._sleep_until_kanban_dispatch_due(interval)
 
     def _fallback_discord_kanban_feature_title(self, target: Dict[str, Any]) -> str:
         text = str(target.get("fallback_title") or "").strip()
@@ -7887,6 +8022,8 @@ class GatewayRunner:
                 return self._telegram_topic_root_lobby_message()
             return None
 
+        _flow_admission_ts = time.time()
+        _flow_route_type = _gateway_flow_route_type(event, command)
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
         # are numerous await points (hooks, vision enrichment, STT,
@@ -7899,7 +8036,16 @@ class GatewayRunner:
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
+            _flow_dispatch_start_ts = time.time()
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            self._log_gateway_flow_telemetry(
+                route_type=_flow_route_type,
+                source=source,
+                session_id=_quick_key,
+                admission_ts=_flow_admission_ts,
+                dispatch_start_ts=_flow_dispatch_start_ts,
+                finished_ts=time.time(),
+            )
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -11061,6 +11207,8 @@ class GatewayRunner:
                 try:
                     from hermes_cli import discord_worker_boards as _dwb
 
+                    admission_ts = time.time()
+                    dispatch_start_ts = time.time()
                     board = _dwb.start_direct_goal(
                         thread_id=thread_id,
                         goal="Follow up on the todos from this meeting.",
@@ -11087,6 +11235,15 @@ class GatewayRunner:
                             logger.debug("meeting auto-goal: Kanban add_subgoal failed: %s", exc)
 
                     if added > 0:
+                        self._signal_kanban_dispatcher_dirty()
+                        self._log_gateway_flow_telemetry(
+                            route_type="discord_worker_goal",
+                            source=source,
+                            session_id=thread_id,
+                            admission_ts=admission_ts,
+                            dispatch_start_ts=dispatch_start_ts,
+                            finished_ts=time.time(),
+                        )
                         try:
                             event.skip_post_turn_goal_once = True
                         except Exception:
@@ -11204,6 +11361,7 @@ class GatewayRunner:
         a deterministic control-plane mutation, not something that should
         clutter chat or create a response that can be misread as an agent turn.
         """
+        admission_ts = time.time()
         args = (event.get_command_args() or "").strip()
         lower = args.lower()
 
@@ -11220,11 +11378,13 @@ class GatewayRunner:
                     return "Kanban goal paused."
                 if lower == "resume":
                     _dwb.resume_board(board.slug)
+                    self._signal_kanban_dispatcher_dirty()
                     return "Kanban goal resumed."
                 if lower in {"clear", "stop", "done"}:
                     _dwb.clear_board_goal(board.slug)
                     return None
                 source = event.source
+                dispatch_start_ts = time.time()
                 board = _dwb.set_goal(
                     thread_id=str(getattr(source, "thread_id", "") or getattr(source, "chat_id", "") or ""),
                     goal=args,
@@ -11242,6 +11402,15 @@ class GatewayRunner:
                             "project_mapping_resolved": getattr(source, "project_mapping_resolved", None),
                         }.items() if v is not None
                     },
+                )
+                self._signal_kanban_dispatcher_dirty()
+                self._log_gateway_flow_telemetry(
+                    route_type="discord_worker_goal",
+                    source=source,
+                    session_id=board.slug,
+                    admission_ts=admission_ts,
+                    dispatch_start_ts=dispatch_start_ts,
+                    finished_ts=time.time(),
                 )
                 if getattr(event, "feature_summary", None):
                     return None
@@ -11293,6 +11462,7 @@ class GatewayRunner:
 
         # Otherwise — treat the remaining text as the new goal.
         try:
+            dispatch_start_ts = time.time()
             state = mgr.set(args)
         except ValueError as exc:
             return t("gateway.goal.invalid", error=str(exc))
@@ -11303,6 +11473,14 @@ class GatewayRunner:
             self._enqueue_goal_work(
                 event,
                 mgr.initial_work_prompt() or self._goal_kickoff_prompt(state.goal),
+            )
+            self._log_gateway_flow_telemetry(
+                route_type="slash_goal",
+                source=event.source,
+                session_id=getattr(session_entry, "session_id", None),
+                admission_ts=admission_ts,
+                dispatch_start_ts=dispatch_start_ts,
+                finished_ts=time.time(),
             )
         except Exception as exc:
             logger.debug("goal kickoff enqueue failed: %s", exc)
@@ -11339,6 +11517,7 @@ class GatewayRunner:
                     count = _dwb.clear_subgoals(board.slug)
                     return f"Cleared {count} subgoal{'s' if count != 1 else ''}."
                 idx, text = _dwb.add_subgoal(board.slug, args)
+                self._signal_kanban_dispatcher_dirty()
                 return f"Added subgoal {idx}: {text}"
         except Exception as exc:
             logger.debug("Discord Kanban subgoal backend unavailable; falling back to legacy goal loop: %s", exc)
