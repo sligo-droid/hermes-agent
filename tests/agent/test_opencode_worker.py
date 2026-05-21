@@ -46,6 +46,13 @@ def test_simple_task_runs_build_only(monkeypatch, tmp_path):
     assert result.error is None
     assert result.final_text == "done"
     assert result.agents == ["build"]
+    assert result.run_profile == {
+        "kind": "one_pass_simple_build",
+        "label": "1-pass simple build",
+        "pass_count": 1,
+        "plan_used": False,
+        "passes": [{"name": "build", "agent": "build", "reasoning": "high"}],
+    }
     assert _option(calls[0], "--agent") == "build"
     assert _option(calls[0], "--variant") == "high"
     assert calls[0][2] == "Read the attached Hermes worker brief and follow it exactly."
@@ -87,6 +94,16 @@ def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
     assert result.error is None
     assert result.agents == ["plan", "build"]
     assert result.plan_text.startswith("Plan:")
+    assert result.run_profile == {
+        "kind": "two_pass_plan_build",
+        "label": "2-pass plan+build",
+        "pass_count": 2,
+        "plan_used": True,
+        "passes": [
+            {"name": "plan", "agent": "plan", "reasoning": "xhigh"},
+            {"name": "build", "agent": "build", "reasoning": "medium"},
+        ],
+    }
     assert [_option(cmd, "--agent") for cmd in calls] == ["plan", "build"]
     assert [_option(cmd, "--variant") for cmd in calls] == ["xhigh", "medium"]
     assert "OpenCode plan to follow:" in briefs[1]
@@ -127,6 +144,13 @@ def test_nested_text_part_is_used_as_final_text(monkeypatch, tmp_path):
     assert result.backend == "opencode"
     assert result.final_text == '{"status":"planned","tasks":[]}'
     assert result.thread_id == "ses-plan"
+    assert result.run_profile == {
+        "kind": "single_pass",
+        "label": "1-pass plan",
+        "pass_count": 1,
+        "plan_used": False,
+        "passes": [{"name": "plan", "agent": "plan", "reasoning": "xhigh"}],
+    }
 
 
 def test_reasoning_levels_are_configurable_by_mode(monkeypatch, tmp_path):
@@ -161,6 +185,9 @@ def test_reasoning_levels_are_configurable_by_mode(monkeypatch, tmp_path):
     )
 
     assert simple.error is None
+    assert simple.run_profile["passes"] == [
+        {"name": "build", "agent": "build", "reasoning": "medium"}
+    ]
     assert [_option(cmd, "--agent") for cmd in calls] == ["build"]
     assert [_option(cmd, "--variant") for cmd in calls] == ["medium"]
 
@@ -174,6 +201,10 @@ def test_reasoning_levels_are_configurable_by_mode(monkeypatch, tmp_path):
     )
 
     assert complex_result.error is None
+    assert complex_result.run_profile["passes"] == [
+        {"name": "plan", "agent": "plan", "reasoning": "max"},
+        {"name": "build", "agent": "build", "reasoning": "low"},
+    ]
     assert [_option(cmd, "--agent") for cmd in calls] == ["plan", "build"]
     assert [_option(cmd, "--variant") for cmd in calls] == ["max", "low"]
 

@@ -115,6 +115,33 @@ async def test_process_message_background_adds_and_swaps_reactions(adapter):
 
 
 @pytest.mark.asyncio
+async def test_direct_question_thread_uses_normal_lifecycle_reactions(adapter):
+    raw_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    event = _make_event("1", raw_message)
+    event.source.chat_type = "thread"
+    event.source.chat_id = "200"
+    event.source.thread_id = "200"
+    event.source.parent_chat_id = "100"
+    event.feature_summary = None
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    assert [call.args for call in raw_message.remove_reaction.await_args_list] == [
+        ("✅", adapter._client.user),
+        ("❌", adapter._client.user),
+        ("👀", adapter._client.user),
+    ]
+    assert [call.args for call in raw_message.add_reaction.await_args_list] == [
+        ("👀",),
+        ("✅",),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_reaction_completion_waits_for_queued_follow_up(adapter):
     first_message = SimpleNamespace(
         add_reaction=AsyncMock(),

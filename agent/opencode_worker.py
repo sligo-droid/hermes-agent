@@ -38,6 +38,7 @@ class OpenCodeRunResult:
     duration_seconds: float = 0.0
     stdout: str = ""
     stderr: str = ""
+    run_profile: dict[str, Any] = field(default_factory=dict)
 
 
 def normalize_coding_worker_backend(value: Any) -> str:
@@ -286,6 +287,7 @@ def run_opencode_task(
     started = time.monotonic()
     events: list[dict[str, Any]] = []
     agents: list[str] = []
+    run_profile = _task_run_profile(cfg, needs_plan)
 
     def _capture(event: dict[str, Any]) -> None:
         events.append(event)
@@ -311,6 +313,7 @@ def run_opencode_task(
             plan.events = events
             plan.plan_text = plan.final_text
             plan.duration_seconds = round(time.monotonic() - started, 2)
+            plan.run_profile = run_profile
             return plan
         plan_text = plan.final_text.strip()
 
@@ -340,6 +343,7 @@ def run_opencode_task(
     build.agents = agents
     build.plan_text = plan_text
     build.events = events
+    build.run_profile = run_profile
     build.tool_iterations = len(events)
     build.timed_out = bool(build.timed_out)
     if build.error is None and not build.final_text.strip():
@@ -390,6 +394,19 @@ def run_opencode_single_pass(
     )
     result.backend = BACKEND_OPENCODE
     result.agents = [selected_agent]
+    result.run_profile = {
+        "kind": "single_pass",
+        "label": f"1-pass {selected_agent}",
+        "pass_count": 1,
+        "plan_used": False,
+        "passes": [
+            {
+                "name": selected_agent,
+                "agent": selected_agent,
+                "reasoning": selected_reasoning,
+            }
+        ],
+    }
     if events:
         result.events = events
     result.tool_iterations = len(result.events)
@@ -402,6 +419,41 @@ def run_opencode_single_pass(
     result.stdout = result.stdout.strip()
     result.stderr = result.stderr.strip()
     return result
+
+
+def _task_run_profile(cfg: dict[str, Any], needs_plan: bool) -> dict[str, Any]:
+    if needs_plan:
+        return {
+            "kind": "two_pass_plan_build",
+            "label": "2-pass plan+build",
+            "pass_count": 2,
+            "plan_used": True,
+            "passes": [
+                {
+                    "name": "plan",
+                    "agent": cfg["plan_agent"],
+                    "reasoning": cfg["complex_plan_reasoning_level"],
+                },
+                {
+                    "name": "build",
+                    "agent": cfg["build_agent"],
+                    "reasoning": cfg["complex_build_reasoning_level"],
+                },
+            ],
+        }
+    return {
+        "kind": "one_pass_simple_build",
+        "label": "1-pass simple build",
+        "pass_count": 1,
+        "plan_used": False,
+        "passes": [
+            {
+                "name": "build",
+                "agent": cfg["build_agent"],
+                "reasoning": cfg["simple_build_reasoning_level"],
+            }
+        ],
+    }
 
 
 def _run_opencode_once(

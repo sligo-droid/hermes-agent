@@ -168,6 +168,7 @@ def _run_codex(
     )
     try:
         result = session.run_turn(prompt, turn_timeout=_role_timeout(role))
+        _attach_scheduled_runtime(result, role)
         try:
             record_codex_worker_result(task_id, board=board, result=result)
         except Exception:
@@ -242,6 +243,7 @@ def _run_opencode(
             title=f"kanban {task_id}",
             on_event=on_event,
         )
+    _attach_scheduled_runtime(result, role)
     try:
         record_codex_worker_result(task_id, board=board, result=result)
     except Exception:
@@ -250,20 +252,60 @@ def _run_opencode(
 
 
 def _role_extra_args(role: str) -> list[str]:
-    effort = str(os.environ.get("HERMES_CODEX_WORKER_REASONING") or "").strip().lower()
-    if effort not in {"minimal", "low", "medium", "high", "xhigh"}:
-        effort = "medium"
-        if role in {ROLE_PLANNER, ROLE_REVIEWER}:
-            effort = "high"
-    service_tier = str(os.environ.get("HERMES_CODEX_WORKER_SERVICE_TIER") or "normal").strip().lower()
-    if service_tier not in {"fast", "normal"}:
-        service_tier = "normal"
+    effort = _worker_reasoning_effort(role)
+    service_tier = _worker_service_tier()
     # Codex accepts arbitrary config overrides through -c. Unknown keys are
     # ignored by older versions, so this remains forward-compatible.
     return [
         "-c", f'model_reasoning_effort="{effort}"',
         "-c", f'service_tier="{service_tier}"',
     ]
+
+
+def _worker_reasoning_effort(role: str) -> str:
+    effort = str(os.environ.get("HERMES_CODEX_WORKER_REASONING") or "").strip().lower()
+    if effort in {"minimal", "low", "medium", "high", "xhigh"}:
+        return effort
+    if role in {ROLE_PLANNER, ROLE_REVIEWER}:
+        return "high"
+    return "medium"
+
+
+def _worker_service_tier() -> str:
+    service_tier = str(os.environ.get("HERMES_CODEX_WORKER_SERVICE_TIER") or "normal").strip().lower()
+    return service_tier if service_tier in {"fast", "normal"} else "normal"
+
+
+def _attach_scheduled_runtime(result: Any, role: str) -> None:
+    service_tier = _worker_service_tier()
+    try:
+        setattr(result, "service_tier", service_tier)
+        setattr(result, "fast_mode", service_tier == "fast")
+        if not getattr(result, "run_profile", None):
+            name = "build"
+            if role == ROLE_PLANNER:
+                name = "plan"
+            elif role == ROLE_REVIEWER:
+                name = "review"
+            setattr(
+                result,
+                "run_profile",
+                {
+                    "kind": f"one_pass_{name}",
+                    "label": f"1-pass {name}",
+                    "pass_count": 1,
+                    "plan_used": False,
+                    "passes": [
+                        {
+                            "name": name,
+                            "agent": role,
+                            "reasoning": _worker_reasoning_effort(role),
+                        }
+                    ],
+                },
+            )
+    except Exception:
+        pass
 
 
 def _role_timeout(role: str) -> float:

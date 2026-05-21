@@ -6498,10 +6498,12 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # Auto-thread: when enabled, automatically create a thread for feature
         # requests in text channels so each implementation conversation is
-        # isolated. Direct questions stay in the parent channel.
+        # isolated. Explicitly tagged direct questions also get a thread, but
+        # skip the feature-summary embed.
         # Messages already inside threads or DMs are unaffected.
         # no_thread_channels: channels where bot responds directly without thread.
         auto_threaded_channel = None
+        auto_threaded_direct_question = False
         if is_parent_channel_message and is_meeting_command_message and meeting_audio_attachments:
             thread = await self._create_meeting_thread(message)
             if thread:
@@ -6516,7 +6518,10 @@ class DiscordAdapter(BasePlatformAdapter):
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
             has_discord_message_link = self._contains_discord_message_link(normalized_content)
             skip_thread = bool(channel_ids & no_thread_channels) or (
-                is_free_channel and not has_discord_message_link and not slash_command_starts_threaded_work
+                is_free_channel
+                and not mention_prefix
+                and not has_discord_message_link
+                and not slash_command_starts_threaded_work
             )
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
@@ -6543,13 +6548,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 direct_question_prompt = not feature_request_intent
 
-            if should_consider_auto_thread and feature_request_intent:
+            should_auto_thread_direct_question = bool(
+                direct_question_prompt
+                and mention_prefix
+            )
+            if should_consider_auto_thread and (
+                feature_request_intent or should_auto_thread_direct_question
+            ):
                 thread = await self._auto_create_thread(message)
                 if thread:
                     parent_channel_id = str(message.channel.id)
                     is_thread = True
                     thread_id = str(thread.id)
                     auto_threaded_channel = thread
+                    auto_threaded_direct_question = should_auto_thread_direct_question
                     self._threads.mark(thread_id)
 
         if (
@@ -6574,7 +6586,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 message.channel,
                 project_context=project_context,
             )
-        if auto_threaded_channel is not None and not is_meeting_command_message:
+        if (
+            auto_threaded_channel is not None
+            and not is_meeting_command_message
+            and not auto_threaded_direct_question
+        ):
             feature_summary_handle = await self.initialize_feature_summary(
                 auto_threaded_channel,
                 parent_channel=message.channel,

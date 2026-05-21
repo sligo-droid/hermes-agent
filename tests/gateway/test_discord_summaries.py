@@ -966,14 +966,63 @@ async def test_feature_summary_omits_relative_kanban_board_path(adapter, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_tagged_question_answers_in_place_without_feature_summary(adapter, monkeypatch):
+async def test_tagged_question_answers_in_thread_without_feature_summary(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
-    adapter._auto_create_thread = AsyncMock()
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
 
     await adapter._handle_message(
         _make_message(adapter, channel=parent, content="<@999> What is the repo URL?")
     )
+
+    parent.edit.assert_not_awaited()
+    adapter._auto_create_thread.assert_awaited_once()
+    assert thread.sent == []
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.feature_summary is None
+    assert event.project_summary is None
+    assert event.source.chat_id == "200"
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "200"
+    assert event.source.parent_chat_id == "100"
+    assert "classified as a direct question/request" in event.channel_prompt
+
+
+@pytest.mark.asyncio
+async def test_tagged_free_response_question_starts_thread_without_feature_summary(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "100")
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+
+    await adapter._handle_message(
+        _make_message(adapter, channel=parent, content="<@999> What is the repo URL?")
+    )
+
+    parent.edit.assert_not_awaited()
+    adapter._auto_create_thread.assert_awaited_once()
+    assert thread.sent == []
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.feature_summary is None
+    assert event.project_summary is None
+    assert event.source.chat_id == "200"
+    assert event.source.chat_type == "thread"
+    assert "classified as a direct question/request" in event.channel_prompt
+
+
+@pytest.mark.asyncio
+async def test_tagged_reply_question_stays_inline_without_feature_summary(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    adapter._auto_create_thread = AsyncMock()
+    message = _make_message(adapter, channel=parent, content="<@999> What is the repo URL?")
+    message.type = discord_platform.discord.MessageType.reply
+
+    await adapter._handle_message(message)
 
     parent.edit.assert_not_awaited()
     adapter._auto_create_thread.assert_not_awaited()
@@ -990,7 +1039,8 @@ async def test_tagged_question_answers_in_place_without_feature_summary(adapter,
 async def test_tagged_priority_change_does_not_refresh_project_description(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
-    adapter._auto_create_thread = AsyncMock()
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
     adapter._classify_discord_feature_request = AsyncMock(return_value=False)
 
     await adapter._handle_message(
@@ -998,11 +1048,14 @@ async def test_tagged_priority_change_does_not_refresh_project_description(adapt
     )
 
     parent.edit.assert_not_awaited()
-    adapter._auto_create_thread.assert_not_awaited()
+    adapter._auto_create_thread.assert_awaited_once()
+    assert thread.sent == []
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.feature_summary is None
     assert event.project_summary is None
+    assert event.source.chat_id == "200"
+    assert event.source.chat_type == "thread"
     assert "classified as a direct question/request" in event.channel_prompt
 
 
