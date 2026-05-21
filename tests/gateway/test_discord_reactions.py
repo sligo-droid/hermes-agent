@@ -500,6 +500,31 @@ async def test_thread_followup_reactions_target_origin_message(adapter):
 
 
 @pytest.mark.asyncio
+async def test_thread_origin_message_fetches_missing_parent_from_parent_id(adapter):
+    origin_message = SimpleNamespace(
+        id=1000,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    parent = SimpleNamespace(
+        id=55,
+        fetch_message=AsyncMock(return_value=origin_message),
+    )
+    thread = _StatusThread(thread_id=1000, name="Build dashboard")
+    thread.parent = None
+    thread.parent_id = parent.id
+    thread.fetch_message = AsyncMock(side_effect=LookupError("thread fetch unavailable"))
+    adapter._client.get_channel = lambda _id: None
+    adapter._client.fetch_channel = AsyncMock(return_value=parent)
+
+    resolved = await adapter._thread_origin_message(thread)
+
+    assert resolved is origin_message
+    adapter._client.fetch_channel.assert_awaited_once_with(parent.id)
+    parent.fetch_message.assert_awaited_once_with(thread.id)
+
+
+@pytest.mark.asyncio
 async def test_batched_thread_followup_reactions_target_origin_message(adapter):
     origin_message = SimpleNamespace(
         id=1000,
@@ -623,6 +648,7 @@ def _thread_status_event(message_id: str, thread: _StatusThread) -> MessageEvent
 async def test_processing_lifecycle_does_not_rename_discord_thread(adapter):
     thread = _StatusThread(name="Build dashboard")
     event = _thread_status_event("1", thread)
+    adapter._client.fetch_channel = AsyncMock(side_effect=LookupError("parent unavailable"))
 
     await adapter.on_processing_start(event)
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)

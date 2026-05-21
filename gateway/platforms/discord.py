@@ -2745,7 +2745,26 @@ class DiscordAdapter(BasePlatformAdapter):
             if value is not None and str(value) not in candidate_ids:
                 candidate_ids.append(str(value))
 
-        for source in (thread_channel, getattr(thread_channel, "parent", None)):
+        sources = [thread_channel]
+        parent = getattr(thread_channel, "parent", None)
+        if parent is None:
+            parent_id = getattr(thread_channel, "parent_id", None)
+            if parent_id is not None and self._client is not None:
+                try:
+                    parent = self._client.get_channel(int(parent_id))
+                except Exception:
+                    parent = None
+                if parent is None:
+                    fetch_channel = getattr(self._client, "fetch_channel", None)
+                    if callable(fetch_channel):
+                        try:
+                            parent = await fetch_channel(int(parent_id))
+                        except Exception:
+                            parent = None
+        if parent is not None:
+            sources.append(parent)
+
+        for source in sources:
             fetch_message = getattr(source, "fetch_message", None)
             if not callable(fetch_message):
                 continue
