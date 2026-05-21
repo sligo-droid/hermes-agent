@@ -455,9 +455,25 @@ async def worker_ticket_state(session_id: str, task_id: str):
         raise HTTPException(status_code=500, detail="Ticket state unavailable")
 
 
-@app.get("/workers/{session_id}/tickets/{task_id}/terminal", response_class=JSONResponse)
-async def worker_ticket_terminal(session_id: str, task_id: str):
-    """Sanitized live terminal feed for one Discord worker ticket."""
+@app.get("/workers/{session_id}/tickets/{task_id}/terminal", response_class=HTMLResponse)
+async def public_worker_ticket_terminal(session_id: str, task_id: str):
+    """Shareable sanitized terminal page for one Discord worker ticket."""
+    try:
+        from hermes_cli.discord_worker_boards import render_public_session_ticket_terminal_html
+
+        return HTMLResponse(render_public_session_ticket_terminal_html(session_id, task_id))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Ticket terminal not found")
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Ticket terminal not found")
+    except Exception as exc:
+        _log.warning("worker ticket terminal render failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Ticket terminal unavailable")
+
+
+@app.get("/workers/{session_id}/tickets/{task_id}/terminal.json", response_class=JSONResponse)
+async def worker_ticket_terminal_json(session_id: str, task_id: str):
+    """Sanitized live terminal JSON feed for one Discord worker ticket."""
     try:
         from hermes_cli.discord_worker_boards import ticket_terminal_feed_for_session
 

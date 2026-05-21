@@ -1,10 +1,16 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from gateway.config import Platform
-from gateway.run import GatewayRunner
+from gateway.run import (
+    GatewayRunner,
+    _format_gateway_flow_telemetry,
+    _gateway_flow_route_type,
+    _gateway_flow_telemetry_fields,
+)
 from hermes_cli import kanban_db as kb
 
 
@@ -77,6 +83,49 @@ def _make_discord_runner(adapter):
     runner._running = True
     runner.adapters = {Platform.DISCORD: adapter}
     return runner
+
+
+def test_gateway_flow_telemetry_formats_ids_and_durations_only():
+    source = SimpleNamespace(
+        platform=Platform.DISCORD,
+        chat_id="chat-1",
+        thread_id="thread-2",
+        user_id="user-3",
+    )
+
+    fields = _gateway_flow_telemetry_fields(
+        route_type="discord_worker_goal",
+        source=source,
+        session_id="session-4",
+        admission_ts=10.0,
+        dispatch_start_ts=10.25,
+        finished_ts=11.0,
+    )
+    line = _format_gateway_flow_telemetry(fields)
+
+    assert _gateway_flow_route_type(SimpleNamespace(text="hello"), None) == "mainline"
+    assert _gateway_flow_route_type(SimpleNamespace(text="/goal ship"), "goal") == "slash_goal"
+    assert "route_type=discord_worker_goal" in line
+    assert "platform=discord" in line
+    assert "chat_id=chat-1" in line
+    assert "thread_id=thread-2" in line
+    assert "user_id=user-3" in line
+    assert "session_id=session-4" in line
+    assert "admission_to_dispatch_ms=250" in line
+    assert "dispatch_to_finish_ms=750" in line
+    assert "ship" not in line
+
+
+def test_kanban_dispatch_dirty_signal_wakes_sleep():
+    async def run():
+        runner = GatewayRunner.__new__(GatewayRunner)
+        assert runner._signal_kanban_dispatcher_dirty() is True
+        assert runner._kanban_dispatch_dirty_event.is_set()
+        woke = await runner._sleep_until_kanban_dispatch_due(1.0)
+        assert woke is True
+        assert not runner._kanban_dispatch_dirty_event.is_set()
+
+    asyncio.run(run())
 
 
 def _create_completed_subscription(summary="done once"):
