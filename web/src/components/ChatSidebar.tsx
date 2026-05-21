@@ -6,10 +6,9 @@
  *
  *   1. **JSON-RPC sidecar** (`GatewayClient` → /api/ws) — drives the
  *      sidebar's own slot of the dashboard's in-process gateway.  Owns
- *      the model badge / picker / connection state / error banner.
- *      Independent of the PTY pane's session by design — those are the
- *      pieces the sidebar needs to be able to drive directly (model
- *      switch via slash.exec, etc.).
+ *      option loading / connection state / error banner. It is not the
+ *      visible PTY session; slash commands that should affect the visible
+ *      chat are injected into /api/pty as terminal input.
  *
  *   2. **Event subscriber** (/api/events?channel=…) — passive, receives
  *      every dispatcher emit from the PTY-side `tui_gateway.entry` that
@@ -71,10 +70,17 @@ const STATE_TONE: Record<
 
 interface ChatSidebarProps {
   channel: string;
+  ptyConnected: boolean;
+  onVisibleTuiSlash(slashCommand: string): boolean;
   className?: string;
 }
 
-export function ChatSidebar({ channel, className }: ChatSidebarProps) {
+export function ChatSidebar({
+  channel,
+  ptyConnected,
+  onVisibleTuiSlash,
+  className,
+}: ChatSidebarProps) {
   // `version` bumps on reconnect; gw is derived so we never call setState
   // for it inside an effect (React 19's set-state-in-effect rule). The
   // counter is the dependency on purpose — it's not read in the memo body,
@@ -112,9 +118,8 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
       }
     });
 
-    // Adopt whichever session the gateway hands us. session.create on the
-    // sidecar is independent of the PTY pane's session by design — we
-    // only need a sid to drive the model picker's slash.exec calls.
+    // Adopt whichever session the sidecar hands us. This is deliberately not
+    // the visible PTY session; it only supports metadata/options loading.
     gw.connect()
       .then(() => {
         if (cancelled) {
@@ -280,25 +285,24 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
   }, []);
 
   // Picker hands us a fully-formed slash command (e.g. "/model anthropic/...").
-  // Fire-and-forget through `slash.exec`; the TUI pane will render the result
-  // via PTY, so the sidebar doesn't need to surface output of its own.
+  // Send it into the visible PTY so the rendered TUI session owns the mutation.
   const onModelSubmit = useCallback(
     (slashCommand: string) => {
-      if (!sessionId) {
+      if (!ptyConnected || !onVisibleTuiSlash(slashCommand)) {
+        setError(
+          "visible chat is not connected — reload the Chat tab before switching models",
+        );
         return;
       }
-
-      void gw.request("slash.exec", {
-        session_id: sessionId,
-        command: slashCommand,
-      });
       setModelOpen(false);
     },
-    [gw, sessionId],
+    [onVisibleTuiSlash, ptyConnected],
   );
 
-  const canPickModel = state === "open" && !!sessionId;
-  const modelLabel = (info.model ?? "—").split("/").slice(-1)[0] ?? "—";
+  const canPickModel = state === "open" && !!sessionId && ptyConnected;
+  const modelTitle = ptyConnected
+    ? "Switch the visible TUI chat model"
+    : "Visible TUI chat is not connected";
   const banner = error ?? info.credential_warning ?? null;
 
   return (
@@ -311,7 +315,7 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
       <Card className="flex items-center justify-between gap-2 px-3 py-2">
         <div className="min-w-0">
           <div className="text-xs uppercase tracking-wider text-muted-foreground">
-            model
+            visible TUI model
           </div>
 
           <Button
@@ -325,9 +329,9 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
               ) : undefined
             }
             className="self-start min-w-0 px-0 py-0 normal-case tracking-normal text-sm font-medium hover:underline disabled:no-underline"
-            title={info.model ?? "switch model"}
+            title={modelTitle}
           >
-            <span className="truncate">{modelLabel}</span>
+            <span className="truncate">switch model</span>
           </Button>
         </div>
 

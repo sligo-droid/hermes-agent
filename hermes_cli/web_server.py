@@ -3753,6 +3753,11 @@ def _build_sidecar_url(channel: str) -> Optional[str]:
     if not host or not port:
         return None
 
+    if host == "0.0.0.0":
+        host = "127.0.0.1"
+    elif host == "::":
+        host = "::1"
+
     netloc = f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
     qs = urllib.parse.urlencode({"token": _SESSION_TOKEN, "channel": channel})
 
@@ -3891,13 +3896,11 @@ async def pty_ws(ws: WebSocket) -> None:
 
 
 # ---------------------------------------------------------------------------
-# /api/ws — JSON-RPC WebSocket sidecar for the dashboard "Chat" tab.
+# /api/ws — JSON-RPC WebSocket sidecar for dashboard metadata.
 #
-# Drives the same `tui_gateway.dispatch` surface Ink uses over stdio, so the
-# dashboard can render structured metadata (model badge, tool-call sidebar,
-# slash launcher, session info) alongside the xterm.js terminal that PTY
-# already paints. Both transports bind to the same session id when one is
-# active, so a tool.start emitted by the agent fans out to both sinks.
+# This is a separate tui_gateway transport from the visible PTY child. The
+# sidebar uses it for structured metadata and option loading; commands that
+# must affect the visible TUI are sent through /api/pty as terminal input.
 # ---------------------------------------------------------------------------
 
 
