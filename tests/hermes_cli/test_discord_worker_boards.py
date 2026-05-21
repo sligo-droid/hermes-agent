@@ -1224,18 +1224,36 @@ def test_worker_ticket_terminal_labels_opencode_state(monkeypatch, tmp_path):
             plan_text="",
             exit_code=0,
             duration_seconds=1.0,
+            run_profile={
+                "kind": "two_pass_plan_build",
+                "label": "2-pass plan+build",
+                "pass_count": 2,
+                "plan_used": True,
+                "passes": [
+                    {"name": "plan", "agent": "plan", "reasoning": "xhigh"},
+                    {"name": "build", "agent": "build", "reasoning": "medium"},
+                ],
+            },
+            service_tier="fast",
+            fast_mode=True,
         ),
     )
 
     client = TestClient(app)
     client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
     resp = client.get(f"/workers/8184/tickets/{task.id}/terminal.json")
+    state_resp = client.get(f"/workers/8184/tickets/{task.id}/state")
 
     assert resp.status_code == 200
+    assert state_resp.status_code == 200
     terminal = "\n".join(resp.json()["lines"])
     assert "# opencode worker log" in terminal
     assert "# codex app worker log" not in terminal
+    assert "worker_run: 2-pass plan+build; plan reasoning=x-high; build reasoning=medium; fast mode=on" in terminal
     assert "opencode result tool_iterations=1 turn=ses-plan thread=ses-plan" in terminal
+    assert state_resp.json()["worker_run"]["summary"] == (
+        "2-pass plan+build; plan reasoning=x-high; build reasoning=medium; fast mode=on"
+    )
     public_log = "\n".join(
         dwb._public_worker_log_lines(
             "[kanban dispatcher] spawning OpenCode role worker: opencode secret prompt"
@@ -1243,6 +1261,43 @@ def test_worker_ticket_terminal_labels_opencode_state(monkeypatch, tmp_path):
     )
     assert "spawning OpenCode role worker: [command hidden]" in public_log
     assert "opencode secret prompt" not in public_log
+
+
+def test_worker_run_profile_renders_without_fastapi():
+    from hermes_cli import discord_worker_boards as dwb
+
+    result = {
+        "backend": "opencode",
+        "run_profile": {
+            "kind": "one_pass_simple_build",
+            "label": "1-pass simple build",
+            "pass_count": 1,
+            "plan_used": False,
+            "passes": [{"name": "build", "agent": "build", "reasoning": "high"}],
+        },
+        "service_tier": "normal",
+        "fast_mode": False,
+    }
+    task = SimpleNamespace(
+        id="t_1234",
+        title="Fix typo",
+        status="running",
+        assignee="dev",
+    )
+
+    line = dwb._worker_run_profile_line(result)
+    state = dwb._worker_run_profile_state(result)
+    feed = dwb._terminal_feed_lines(
+        task,
+        current_run=None,
+        events=[],
+        log_text=None,
+        codex_state={"result": result},
+    )
+
+    assert line == "1-pass simple build; build reasoning=high; fast mode=off"
+    assert state["summary"] == line
+    assert "worker_run: 1-pass simple build; build reasoning=high; fast mode=off" in feed
 
 
 def test_worker_ticket_terminal_page_explains_sparse_feed(monkeypatch, tmp_path):

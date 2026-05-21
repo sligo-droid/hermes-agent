@@ -172,6 +172,9 @@ def record_codex_worker_result(
         "plan_text": getattr(result, "plan_text", ""),
         "exit_code": getattr(result, "exit_code", None),
         "duration_seconds": getattr(result, "duration_seconds", None),
+        "run_profile": getattr(result, "run_profile", {}),
+        "service_tier": getattr(result, "service_tier", None),
+        "fast_mode": getattr(result, "fast_mode", None),
     }
     _write_codex_worker_state(
         task_id,
@@ -642,10 +645,14 @@ def _ticket_state_for_board(
             raise KeyError("unknown ticket")
         runs = kanban_db.list_runs(conn, task_id)
         events = kanban_db.list_events(conn, task_id)
+        codex_state = _ticket_codex_state(task_id, board=board)
         payload = {
             "board": board,
             "worker": _public_worker_meta(worker or _read_worker_meta(board)),
             "task": _task_state_dict(task),
+            "worker_run": _worker_run_profile_state(
+                codex_state.get("result") if isinstance(codex_state, dict) else None
+            ),
             "current_run": _current_run_state(task, runs),
             "runs": [_run_state_dict(run) for run in runs],
             "events": [_event_state_dict(event) for event in events[-200:]],
@@ -654,7 +661,7 @@ def _ticket_state_for_board(
                 tail_bytes=CODEX_STATE_LOG_TAIL_BYTES,
                 board=board,
             ),
-            "codex_state": _ticket_codex_state(task_id, board=board),
+            "codex_state": codex_state,
         }
     finally:
         conn.close()
@@ -748,6 +755,11 @@ def _terminal_feed_lines(
     ]
     if task.assignee:
         lines.append(f"assignee: {_safe_terminal_text(task.assignee)}")
+    worker_run = _worker_run_profile_line(
+        (codex_state or {}).get("result") if isinstance(codex_state, dict) else None
+    )
+    if worker_run:
+        lines.append(f"worker_run: {worker_run}")
     if current_run:
         run_bits = [
             f"run={current_run.get('id') or '-'}",
@@ -1007,6 +1019,70 @@ def _codex_app_result_line(result: Any) -> str:
     if result.get("thread_id"):
         bits.append(f"thread={_safe_terminal_text(result.get('thread_id'), max_chars=80)}")
     return " ".join(bits) if len(bits) > 1 else ""
+
+
+def _worker_run_profile_state(result: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(result, dict):
+        return None
+    summary = _worker_run_profile_line(result)
+    if not summary:
+        return None
+    return {
+        "summary": summary,
+        "profile": result.get("run_profile") if isinstance(result.get("run_profile"), dict) else {},
+        "service_tier": result.get("service_tier"),
+        "fast_mode": result.get("fast_mode"),
+    }
+
+
+def _worker_run_profile_line(result: Any) -> str:
+    if not isinstance(result, dict):
+        return ""
+    profile = result.get("run_profile") if isinstance(result.get("run_profile"), dict) else {}
+    passes = profile.get("passes") if isinstance(profile.get("passes"), list) else []
+    label = str(profile.get("label") or "").strip()
+    if not label and passes:
+        names = [str(item.get("name") or "").strip() for item in passes if isinstance(item, dict)]
+        names = [name for name in names if name]
+        if len(names) == 2 and names == ["plan", "build"]:
+            label = "2-pass plan+build"
+        elif len(names) == 1 and names[0] == "build":
+            label = "1-pass simple build"
+        elif len(names) == 1:
+            label = f"1-pass {names[0]}"
+    if not label:
+        return ""
+
+    bits = [label]
+    for item in passes:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("agent") or "").strip()
+        reasoning = _format_worker_reasoning(item.get("reasoning"))
+        if name and reasoning:
+            bits.append(f"{name} reasoning={reasoning}")
+
+    service_tier = str(result.get("service_tier") or "").strip().lower()
+    fast_raw = result.get("fast_mode")
+    fast_mode: Optional[bool]
+    if isinstance(fast_raw, bool):
+        fast_mode = fast_raw
+    elif service_tier:
+        fast_mode = service_tier == "fast"
+    else:
+        fast_mode = None
+    if fast_mode is not None:
+        bits.append(f"fast mode={'on' if fast_mode else 'off'}")
+    return _safe_terminal_text("; ".join(bits), max_chars=400)
+
+
+def _format_worker_reasoning(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if raw == "xhigh":
+        return "x-high"
+    return raw
 
 
 def _public_task_body_preview(value: Any, *, max_chars: int = 420) -> str:
@@ -2060,6 +2136,7 @@ def _render_public_board_html(
       }};
       const renderTicketState = (state, terminalPageUrl) => {{
         const task = state?.task || {{}};
+        const workerRun = state?.worker_run || null;
         const currentRun = state?.current_run || null;
         const runs = Array.isArray(state?.runs) ? state.runs : [];
         const latestRun = runs.length ? runs[runs.length - 1] : null;
@@ -2073,6 +2150,9 @@ def _render_public_board_html(
           "# brief",
           task.body || "(no ticket body provided)",
         ];
+        if (workerRun?.summary) {{
+          lines.splice(4, 0, `worker_run: ${{workerRun.summary}}`);
+        }}
         if (currentRun) {{
           lines.push("", "# current run");
           lines.push(`run=${{currentRun.id || "-"}} status=${{currentRun.status || currentRun.outcome || "-"}}`);

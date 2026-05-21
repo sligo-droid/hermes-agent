@@ -230,6 +230,27 @@ def test_role_extra_args_use_scheduled_runtime_env(monkeypatch):
     ]
 
 
+def test_scheduled_runtime_metadata_attaches_to_worker_result(monkeypatch):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+
+    result = SimpleNamespace()
+    monkeypatch.setenv("HERMES_CODEX_WORKER_REASONING", "low")
+    monkeypatch.setenv("HERMES_CODEX_WORKER_SERVICE_TIER", "fast")
+
+    worker._attach_scheduled_runtime(result, ROLE_DEV)
+
+    assert result.service_tier == "fast"
+    assert result.fast_mode is True
+    assert result.run_profile == {
+        "kind": "one_pass_build",
+        "label": "1-pass build",
+        "pass_count": 1,
+        "plan_used": False,
+        "passes": [{"name": "build", "agent": "dev", "reasoning": "low"}],
+    }
+
+
 def test_dev_role_uses_opencode_backend(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli.discord_worker_boards import ROLE_DEV
