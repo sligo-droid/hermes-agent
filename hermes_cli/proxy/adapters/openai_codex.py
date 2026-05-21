@@ -23,7 +23,11 @@ from agent.codex_responses_adapter import (
     _normalize_codex_response,
     _responses_tools,
 )
-from hermes_cli.auth import resolve_codex_runtime_credentials
+from hermes_cli.auth import (
+    DEFAULT_CODEX_BASE_URL,
+    get_codex_auth_status,
+    resolve_codex_runtime_credentials,
+)
 from hermes_cli.codex_models import get_codex_model_ids
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
 
@@ -50,6 +54,39 @@ def _chat_json_error(status: int, message: str, code: str = "proxy_error") -> we
     )
 
 
+def _resolve_codex_proxy_credentials(*, refresh_if_expiring: bool) -> dict[str, Any]:
+    """Resolve Codex credentials for the proxy, preferring the credential pool.
+
+    ``hermes auth add openai-codex`` stores device-code credentials in the
+    provider pool.  The older ``resolve_codex_runtime_credentials`` path reads
+    only legacy provider state, so a proxy service should check the same pooled
+    status that ``hermes auth list`` and normal model routing use before falling
+    back to legacy tokens.
+    """
+    status = get_codex_auth_status()
+    if status.get("logged_in"):
+        token = str(status.get("api_key") or "").strip()
+        if token:
+            base_url = str(status.get("base_url") or "").strip().rstrip("/")
+            if not base_url:
+                import os
+
+                base_url = (
+                    os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+                    or DEFAULT_CODEX_BASE_URL
+                )
+            return {
+                "api_key": token,
+                "base_url": base_url,
+                "last_refresh": status.get("last_refresh"),
+                "source": status.get("source"),
+            }
+
+    return resolve_codex_runtime_credentials(
+        refresh_if_expiring=refresh_if_expiring,
+    )
+
+
 class OpenAICodexAdapter(UpstreamAdapter):
     """Proxy upstream for OpenAI Codex OAuth credentials."""
 
@@ -67,13 +104,13 @@ class OpenAICodexAdapter(UpstreamAdapter):
 
     def is_authenticated(self) -> bool:
         try:
-            creds = resolve_codex_runtime_credentials(refresh_if_expiring=False)
+            creds = _resolve_codex_proxy_credentials(refresh_if_expiring=False)
         except Exception:
             return False
         return bool(str(creds.get("api_key") or "").strip())
 
     def get_credential(self) -> UpstreamCredential:
-        creds = resolve_codex_runtime_credentials(refresh_if_expiring=True)
+        creds = _resolve_codex_proxy_credentials(refresh_if_expiring=True)
         token = str(creds.get("api_key") or "").strip()
         base_url = str(creds.get("base_url") or "").strip().rstrip("/")
         if not token or not base_url:

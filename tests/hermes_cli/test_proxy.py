@@ -72,13 +72,45 @@ def test_codex_adapter_metadata():
 
 def test_codex_adapter_not_authenticated_when_credentials_missing(monkeypatch):
     monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.get_codex_auth_status",
+        MagicMock(return_value={"logged_in": False}),
+    )
+    monkeypatch.setattr(
         "hermes_cli.proxy.adapters.openai_codex.resolve_codex_runtime_credentials",
         MagicMock(side_effect=RuntimeError("missing")),
     )
     assert not OpenAICodexAdapter().is_authenticated()
 
 
+def test_codex_adapter_uses_pooled_credentials_before_legacy(monkeypatch):
+    legacy_resolver = MagicMock(side_effect=RuntimeError("legacy missing"))
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.get_codex_auth_status",
+        MagicMock(return_value={
+            "logged_in": True,
+            "api_key": "pool-token",
+            "source": "pool:secondary",
+        }),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.resolve_codex_runtime_credentials",
+        legacy_resolver,
+    )
+
+    adapter = OpenAICodexAdapter()
+
+    assert adapter.is_authenticated()
+    cred = adapter.get_credential()
+    assert cred.bearer == "pool-token"
+    assert cred.base_url == "https://chatgpt.com/backend-api/codex"
+    legacy_resolver.assert_not_called()
+
+
 def test_codex_adapter_get_credential(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.get_codex_auth_status",
+        MagicMock(return_value={"logged_in": False}),
+    )
     monkeypatch.setattr(
         "hermes_cli.proxy.adapters.openai_codex.resolve_codex_runtime_credentials",
         MagicMock(return_value={
