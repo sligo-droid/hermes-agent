@@ -2565,15 +2565,18 @@ class DiscordAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
-    async def _processing_reaction_message(self, event: MessageEvent) -> Any:
-        """Return the user Discord message whose reactions represent this turn."""
-        raw_message = getattr(event, "raw_message", None)
+    async def _processing_reaction_message_for_raw(self, raw_message: Any) -> Any:
+        """Return the Discord message whose reactions represent ``raw_message``."""
         channel = getattr(raw_message, "channel", None)
         if channel is not None and self._get_parent_channel_id(channel):
             origin = await self._thread_origin_message(channel)
             if origin is not None:
                 return origin
         return raw_message
+
+    async def _processing_reaction_message(self, event: MessageEvent) -> Any:
+        """Return the user Discord message whose reactions represent this turn."""
+        return await self._processing_reaction_message_for_raw(getattr(event, "raw_message", None))
 
     async def _thread_origin_message(self, thread_channel: Any) -> Optional[Any]:
         """Resolve the message that started a Discord thread, when possible."""
@@ -2613,10 +2616,14 @@ class DiscordAdapter(BasePlatformAdapter):
 
         result = []
         seen = set()
-        for message in messages:
+        for raw_message in messages:
+            if raw_message is None:
+                continue
+            message = await self._processing_reaction_message_for_raw(raw_message)
             if message is None:
                 continue
-            identity = id(message)
+            message_id = getattr(message, "id", None)
+            identity = ("id", str(message_id)) if message_id is not None else ("obj", id(message))
             if identity in seen:
                 continue
             seen.add(identity)
