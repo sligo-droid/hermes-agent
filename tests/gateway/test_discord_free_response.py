@@ -1,5 +1,6 @@
 """Tests for Discord free-response defaults and mention gating."""
 
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -408,6 +409,100 @@ async def test_discord_dms_ignore_mention_requirement(adapter, monkeypatch):
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "dm without mention"
     assert event.source.chat_type == "dm"
+
+
+@pytest.mark.asyncio
+async def test_discord_short_direct_question_skips_text_batch_delay(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    adapter._text_batch_delay_seconds = 999
+    adapter._enqueue_text_event = MagicMock(side_effect=AssertionError("direct Q&A should not batch"))
+
+    message = make_message(channel=FakeDMChannel(channel_id=654), content="what is the status?")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "what is the status?"
+    assert adapter._pending_text_batches == {}
+
+
+@pytest.mark.asyncio
+async def test_discord_near_split_text_still_waits_for_batch_delay(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    adapter._text_batch_delay_seconds = 999
+    adapter._text_batch_split_delay_seconds = 999
+    text = "what " + ("x" * adapter._SPLIT_THRESHOLD)
+
+    message = make_message(channel=FakeDMChannel(channel_id=654), content=text)
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+    assert len(adapter._pending_text_batches) == 1
+    pending = next(iter(adapter._pending_text_batches.values()))
+    assert pending.text == text
+
+    for task in list(adapter._pending_text_batch_tasks.values()):
+        task.cancel()
+    await asyncio.gather(*adapter._pending_text_batch_tasks.values(), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_discord_direct_question_merges_when_batch_pending(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    adapter._text_batch_delay_seconds = 999
+    adapter._text_batch_split_delay_seconds = 999
+    channel = FakeDMChannel(channel_id=654)
+
+    await adapter._handle_message(make_message(channel=channel, content="ambiguous opener"))
+    await adapter._handle_message(make_message(channel=channel, content="what is the status?"))
+
+    adapter.handle_message.assert_not_awaited()
+    assert len(adapter._pending_text_batches) == 1
+    pending = next(iter(adapter._pending_text_batches.values()))
+    assert pending.text == "ambiguous opener\nwhat is the status?"
+
+    for task in list(adapter._pending_text_batch_tasks.values()):
+        task.cancel()
+    await asyncio.gather(*adapter._pending_text_batch_tasks.values(), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_discord_feature_request_still_routes_to_thread_with_batching(adapter, monkeypatch):
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    adapter._text_batch_delay_seconds = 999
+    adapter._text_batch_split_delay_seconds = 999
+    fake_thread = FakeThread(channel_id=999, name="auto-thread")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+    message = make_message(channel=FakeTextChannel(channel_id=123), content="build a dashboard")
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once_with(message)
+    adapter.handle_message.assert_not_awaited()
+    pending = next(iter(adapter._pending_text_batches.values()))
+    assert pending.source.chat_type == "thread"
+    assert pending.source.thread_id == "999"
+
+    for task in list(adapter._pending_text_batch_tasks.values()):
+        task.cancel()
+    await asyncio.gather(*adapter._pending_text_batch_tasks.values(), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_discord_obvious_question_does_not_call_auxiliary_classifier(adapter, monkeypatch):
+    from agent import auxiliary_client
+
+    monkeypatch.setattr(
+        auxiliary_client,
+        "call_llm",
+        MagicMock(side_effect=AssertionError("obvious questions should use the local heuristic")),
+    )
+
+    assert await adapter._classify_discord_feature_request("can you summarize the current status") is False
 
 
 @pytest.mark.asyncio

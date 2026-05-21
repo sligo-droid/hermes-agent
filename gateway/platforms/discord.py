@@ -1772,8 +1772,15 @@ class DiscordAdapter(BasePlatformAdapter):
             "hello", "hi", "hey", "thanks", "thank you", "ok", "okay",
             "quick question", "question:",
         )
+        question_phrases = (
+            "any update", "any updates", "can i get an update",
+            "can you summarize", "catch me up",
+        )
 
         if cleaned.endswith("?") or cleaned.startswith(question_starts):
+            if not cleaned.startswith(feature_starts) and not any(p in cleaned for p in feature_phrases):
+                return False
+        if any(p in cleaned for p in question_phrases):
             if not cleaned.startswith(feature_starts) and not any(p in cleaned for p in feature_phrases):
                 return False
         if cleaned.startswith(feature_starts) or any(p in cleaned for p in feature_phrases):
@@ -6827,7 +6834,14 @@ class DiscordAdapter(BasePlatformAdapter):
         # Only batch plain text messages — commands, media, etc. dispatch
         # immediately since they won't be split by the Discord client.
         if msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
-            self._enqueue_text_event(event)
+            if self._should_dispatch_text_event_immediately(
+                event,
+                direct_question_prompt=direct_question_prompt,
+                has_attachments=bool(all_attachments),
+            ):
+                await self.handle_message(event)
+            else:
+                self._enqueue_text_event(event)
         else:
             await self.handle_message(event)
 
@@ -6843,6 +6857,26 @@ class DiscordAdapter(BasePlatformAdapter):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
+
+    def _should_dispatch_text_event_immediately(
+        self,
+        event: MessageEvent,
+        *,
+        direct_question_prompt: bool = False,
+        has_attachments: bool = False,
+    ) -> bool:
+        """Skip Discord split batching for short, clearly direct Q&A."""
+        if event.message_type != MessageType.TEXT:
+            return False
+        if has_attachments:
+            return False
+        if len(event.text or "") >= self._SPLIT_THRESHOLD:
+            return False
+        if self._text_batch_key(event) in self._pending_text_batches:
+            return False
+        if direct_question_prompt:
+            return True
+        return self._heuristic_feature_request_intent(event.text or "") is False
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
