@@ -629,6 +629,7 @@ class Task:
     # (Pre-rename column: ``spawn_failures``.)
     consecutive_failures: int = 0
     worker_pid: Optional[int] = None
+    worker_unit: Optional[str] = None
     # Short excerpt of the last failure's error text (any outcome, not
     # just spawn). Pre-rename column: ``last_spawn_error``.
     last_failure_error: Optional[str] = None
@@ -698,6 +699,7 @@ class Task:
                 else (row["spawn_failures"] if "spawn_failures" in keys else 0)
             ),
             worker_pid=row["worker_pid"] if "worker_pid" in keys else None,
+            worker_unit=row["worker_unit"] if "worker_unit" in keys else None,
             last_failure_error=(
                 row["last_failure_error"] if "last_failure_error" in keys
                 # Same belt-and-suspenders fallback as consecutive_failures above.
@@ -748,6 +750,7 @@ class Run:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     worker_pid: Optional[int]
+    worker_unit: Optional[str]
     max_runtime_seconds: Optional[int]
     last_heartbeat_at: Optional[int]
     started_at: int
@@ -759,8 +762,13 @@ class Run:
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
+        keys = set(row.keys())
         try:
-            meta = json.loads(row["metadata"]) if row["metadata"] else None
+            meta = (
+                json.loads(row["metadata"])
+                if "metadata" in keys and row["metadata"]
+                else None
+            )
         except Exception:
             meta = None
         return cls(
@@ -771,15 +779,20 @@ class Run:
             status=row["status"],
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
-            worker_pid=row["worker_pid"],
-            max_runtime_seconds=row["max_runtime_seconds"],
-            last_heartbeat_at=row["last_heartbeat_at"],
+            worker_pid=row["worker_pid"] if "worker_pid" in keys else None,
+            worker_unit=row["worker_unit"] if "worker_unit" in keys else None,
+            max_runtime_seconds=(
+                row["max_runtime_seconds"] if "max_runtime_seconds" in keys else None
+            ),
+            last_heartbeat_at=(
+                row["last_heartbeat_at"] if "last_heartbeat_at" in keys else None
+            ),
             started_at=int(row["started_at"]),
             ended_at=(int(row["ended_at"]) if row["ended_at"] is not None else None),
-            outcome=row["outcome"],
-            summary=row["summary"],
+            outcome=row["outcome"] if "outcome" in keys else None,
+            summary=row["summary"] if "summary" in keys else None,
             metadata=meta,
-            error=row["error"],
+            error=row["error"] if "error" in keys else None,
         )
 
 
@@ -832,6 +845,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- exceeds DEFAULT_FAILURE_LIMIT consecutive non-successes.
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     worker_pid           INTEGER,
+    worker_unit          TEXT,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
@@ -906,6 +920,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    worker_unit         TEXT,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
@@ -1115,6 +1130,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             )
     if "worker_pid" not in cols:
         _add_column_if_missing(conn, "tasks", "worker_pid", "worker_pid INTEGER")
+    if "worker_unit" not in cols:
+        _add_column_if_missing(conn, "tasks", "worker_unit", "worker_unit TEXT")
     if "last_failure_error" not in cols:
         added = _add_column_if_missing(
             conn, "tasks", "last_failure_error", "last_failure_error TEXT"
@@ -1221,9 +1238,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
     if runs_exist:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        if "worker_unit" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "worker_unit", "worker_unit TEXT"
+            )
         with write_txn(conn):
             inflight = conn.execute(
-                "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
+                "SELECT id, assignee, claim_lock, claim_expires, worker_pid, worker_unit, "
                 "       max_runtime_seconds, last_heartbeat_at, started_at "
                 "FROM tasks "
                 "WHERE status = 'running' AND current_run_id IS NULL"
@@ -1234,14 +1258,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                     """
                     INSERT INTO task_runs (
                         task_id, profile, status,
-                        claim_lock, claim_expires, worker_pid,
+                        claim_lock, claim_expires, worker_pid, worker_unit,
                         max_runtime_seconds, last_heartbeat_at,
                         started_at
-                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         row["id"], row["assignee"], row["claim_lock"],
                         row["claim_expires"], row["worker_pid"],
+                        row["worker_unit"],
                         row["max_runtime_seconds"], row["last_heartbeat_at"],
                         started,
                     ),
@@ -1931,7 +1956,8 @@ def _end_run(
                ended_at      = ?,
                claim_lock    = NULL,
                claim_expires = NULL,
-               worker_pid    = NULL
+               worker_pid    = NULL,
+               worker_unit   = NULL
          WHERE id = ?
            AND ended_at IS NULL
         """,
@@ -2252,7 +2278,7 @@ def claim_task(
                    SET status = 'reclaimed', outcome = 'reclaimed',
                        summary = COALESCE(summary, 'invariant recovery on re-claim'),
                        ended_at = ?,
-                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_unit = NULL
                  WHERE id = ? AND ended_at IS NULL
                 """,
                 (now, int(stale["current_run_id"])),
@@ -2440,7 +2466,7 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
+        "SELECT id, claim_lock, worker_pid, worker_unit, claim_expires, last_heartbeat_at "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
@@ -2486,13 +2512,54 @@ def release_stale_claims(
                 )
             continue
 
+        if host_local and row["worker_unit"]:
+            unit_status = _systemd_unit_status(row["worker_unit"])
+            if unit_status.active:
+                new_expires = now + _resolve_claim_ttl_seconds()
+                pid = unit_status.pid
+                with write_txn(conn):
+                    cur = conn.execute(
+                        "UPDATE tasks SET claim_expires = ?, worker_pid = COALESCE(?, worker_pid) "
+                        "WHERE id = ? AND status = 'running' "
+                        "  AND claim_lock IS ? "
+                        "  AND claim_expires IS NOT NULL "
+                        "  AND claim_expires < ?",
+                        (new_expires, pid, row["id"], row["claim_lock"], now),
+                    )
+                    if cur.rowcount != 1:
+                        continue
+                    run_id = _current_run_id(conn, row["id"])
+                    if run_id is not None:
+                        conn.execute(
+                            "UPDATE task_runs SET claim_expires = ?, "
+                            "worker_pid = COALESCE(?, worker_pid) WHERE id = ?",
+                            (new_expires, pid, run_id),
+                        )
+                    payload = {
+                        "reason": "unit_active",
+                        "worker_pid": int(pid) if pid is not None else None,
+                        "worker_unit": _normalize_systemd_unit_ref(row["worker_unit"]),
+                        "claim_lock": row["claim_lock"],
+                        "claim_expires_was": int(row["claim_expires"]),
+                        "claim_expires_now": new_expires,
+                        "last_heartbeat_at": (
+                            int(row["last_heartbeat_at"])
+                            if row["last_heartbeat_at"] is not None
+                            else None
+                        ),
+                    }
+                    _append_event(
+                        conn, row["id"], "claim_extended", payload, run_id=run_id,
+                    )
+                continue
+
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
         )
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
+                "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
                 (row["id"], row["claim_lock"], now),
@@ -2511,6 +2578,7 @@ def release_stale_claims(
                     int(row["worker_pid"])
                     if row["worker_pid"] is not None else None
                 ),
+                "worker_unit": _normalize_systemd_unit_ref(row["worker_unit"]),
                 "claim_expires": int(row["claim_expires"]),
                 "last_heartbeat_at": (
                     int(row["last_heartbeat_at"])
@@ -2563,7 +2631,7 @@ def reclaim_task(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL "
+            "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?",
             (task_id, prev_lock),
@@ -2838,7 +2906,8 @@ def complete_task(
                        completed_at = ?,
                        claim_lock   = NULL,
                        claim_expires= NULL,
-                       worker_pid   = NULL
+                       worker_pid   = NULL,
+                       worker_unit  = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                 """,
@@ -2853,7 +2922,8 @@ def complete_task(
                        completed_at = ?,
                        claim_lock   = NULL,
                        claim_expires= NULL,
-                       worker_pid   = NULL
+                       worker_pid   = NULL,
+                       worker_unit  = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
@@ -3087,7 +3157,8 @@ def block_task(
                    SET status       = 'blocked',
                        claim_lock   = NULL,
                        claim_expires= NULL,
-                       worker_pid   = NULL
+                       worker_pid   = NULL,
+                       worker_unit  = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """,
@@ -3100,7 +3171,8 @@ def block_task(
                    SET status       = 'blocked',
                        claim_lock   = NULL,
                        claim_expires= NULL,
-                       worker_pid   = NULL
+                       worker_pid   = NULL,
+                       worker_unit  = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                    AND current_run_id = ?
@@ -3149,7 +3221,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                    SET status = 'reclaimed', outcome = 'reclaimed',
                        summary = COALESCE(summary, 'invariant recovery on unblock'),
                        ended_at = ?,
-                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_unit = NULL
                  WHERE id = ? AND ended_at IS NULL
                 """,
                 (now, int(stale["current_run_id"])),
@@ -3478,7 +3550,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
-            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_unit = NULL "
             "WHERE id = ? AND status != 'archived'",
             (task_id,),
         )
@@ -3648,7 +3720,8 @@ def schedule_task(
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
-                   worker_pid   = NULL
+                   worker_pid   = NULL,
+                   worker_unit  = NULL
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """
@@ -4082,7 +4155,7 @@ def enforce_max_runtime(
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running'",
                 (tid,),
@@ -4199,7 +4272,7 @@ def detect_stale_running(
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running'",
                 (tid,),
@@ -4303,8 +4376,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "SELECT id, worker_pid, worker_unit, claim_lock FROM tasks "
+            "WHERE status = 'running' "
+            "AND (worker_pid IS NOT NULL OR worker_unit IS NOT NULL)"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -4312,10 +4386,27 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
                 continue
-            if _pid_alive(row["worker_pid"]):
+            if row["worker_pid"] is not None and _pid_alive(row["worker_pid"]):
                 continue
 
-            pid = int(row["worker_pid"])
+            unit = _normalize_systemd_unit_ref(row["worker_unit"])
+            if unit:
+                unit_status = _systemd_unit_status(unit)
+                if unit_status.active:
+                    if unit_status.pid is not None and unit_status.pid != row["worker_pid"]:
+                        conn.execute(
+                            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+                            (unit_status.pid, row["id"]),
+                        )
+                        run_id = _current_run_id(conn, row["id"])
+                        if run_id is not None:
+                            conn.execute(
+                                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
+                                (unit_status.pid, run_id),
+                            )
+                    continue
+
+            pid = int(row["worker_pid"] or 0)
             kind, code = _classify_worker_exit(pid)
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
@@ -4329,8 +4420,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 )
                 event_kind = "protocol_violation"
                 event_payload = {
-                    "pid": pid,
+                    "pid": pid if pid > 0 else None,
                     "claimer": row["claim_lock"],
+                    "unit": unit,
                     "exit_code": code,
                 }
             else:
@@ -4342,14 +4434,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 else:
                     error_text = f"pid {pid} not alive"
                 event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
+                event_payload = {
+                    "pid": pid if pid > 0 else None,
+                    "claimer": row["claim_lock"],
+                    "unit": unit,
+                }
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
+                "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL "
                 "WHERE id = ? AND status = 'running'",
                 (row["id"],),
             )
@@ -4488,7 +4584,7 @@ def _record_task_failure(
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('running', 'ready')",
                     (failures, error[:500], task_id),
@@ -4536,7 +4632,7 @@ def _record_task_failure(
                 # Spawn path: transition running → ready + clear claim.
                 conn.execute(
                     "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
                     (failures, error[:500], task_id),
@@ -4587,7 +4683,7 @@ def _record_spawn_failure(
             failures = int(row["consecutive_failures"] or 0)
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL, "
                 "last_failure_error = ? "
                 "WHERE id = ? AND status = 'running'",
                 (capped_error, task_id),
@@ -4622,25 +4718,43 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event.
+def _set_worker_handle(
+    conn: sqlite3.Connection,
+    task_id: str,
+    handle: _SpawnHandle,
+) -> None:
+    """Record the spawned child's durable process identity.
 
-    The event's payload carries the pid so a human reading ``hermes kanban
-    tail`` can correlate log lines with OS-level traces without opening
-    the drawer.
+    The event payload carries the pid and systemd unit when present so a
+    human reading ``hermes kanban tail`` can correlate a run with OS-level
+    traces without opening the drawer.
     """
+    pid = int(handle.pid) if handle.pid is not None else None
+    unit = _normalize_systemd_unit_ref(handle.unit)
+    if pid is None and unit is None:
+        return
     with write_txn(conn):
         conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+            "UPDATE tasks SET worker_pid = ?, worker_unit = ? WHERE id = ?",
+            (pid, unit, task_id),
         )
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
+                "UPDATE task_runs SET worker_pid = ?, worker_unit = ? WHERE id = ?",
+                (pid, unit, run_id),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        payload: dict[str, Any] = {}
+        if pid is not None:
+            payload["pid"] = pid
+        if unit is not None:
+            payload["unit"] = unit
+        _append_event(conn, task_id, "spawned", payload, run_id=run_id)
+
+
+def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+    """Backward-compatible wrapper for callers that only know the pid."""
+    _set_worker_handle(conn, task_id, _SpawnHandle(pid=int(pid)))
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -5056,8 +5170,9 @@ def dispatch_once(
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            handle = _coerce_spawn_handle(pid)
+            if handle.pid is not None or handle.unit is not None:
+                _set_worker_handle(conn, claimed.id, handle)
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -5137,8 +5252,9 @@ def dispatch_once(
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            handle = _coerce_spawn_handle(pid)
+            if handle.pid is not None or handle.unit is not None:
+                _set_worker_handle(conn, claimed.id, handle)
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
@@ -5385,6 +5501,87 @@ def _append_env_path(value: Optional[str], path: Path) -> str:
     return os.pathsep.join(parts)
 
 
+@dataclass(frozen=True)
+class _SpawnHandle:
+    pid: Optional[int] = None
+    unit: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _SystemdUnitStatus:
+    active: bool
+    pid: Optional[int] = None
+
+
+def _normalize_systemd_unit_ref(unit: Optional[str]) -> Optional[str]:
+    if not unit:
+        return None
+    value = str(unit).strip()
+    if not value:
+        return None
+    return value if value.endswith(".service") else f"{value}.service"
+
+
+def _coerce_spawn_handle(value: Any) -> _SpawnHandle:
+    if isinstance(value, _SpawnHandle):
+        return value
+    if value is None:
+        return _SpawnHandle()
+    if isinstance(value, int):
+        return _SpawnHandle(pid=value)
+    return _SpawnHandle(pid=int(value))
+
+
+def _systemd_unit_status(unit: Optional[str]) -> _SystemdUnitStatus:
+    unit_ref = _normalize_systemd_unit_ref(unit)
+    if not unit_ref:
+        return _SystemdUnitStatus(active=False)
+    systemctl = shutil.which("systemctl") or "systemctl"
+    try:
+        show = subprocess.run(
+            [
+                systemctl,
+                "--user",
+                "show",
+                unit_ref,
+                "--property",
+                "ActiveState",
+                "--property",
+                "SubState",
+                "--property",
+                "MainPID",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return _SystemdUnitStatus(active=False)
+    if show.returncode != 0:
+        return _SystemdUnitStatus(active=False)
+
+    values: dict[str, str] = {}
+    for line in (show.stdout or "").splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    try:
+        pid = int(values.get("MainPID") or "0")
+    except ValueError:
+        pid = 0
+    active_state = values.get("ActiveState", "")
+    sub_state = values.get("SubState", "")
+    active = active_state in {"active", "activating"} or sub_state in {
+        "running",
+        "start",
+        "start-post",
+    }
+    return _SystemdUnitStatus(active=active, pid=pid if pid > 0 else None)
+
+
 def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
     """True if the bundled ``kanban-worker`` skill resolves for the home the
     spawned worker will run under.
@@ -5510,8 +5707,8 @@ def _spawn_systemd_worker(
     env: dict[str, str],
     log_path: Path,
     unit_name: str,
-) -> Optional[int]:
-    """Start a worker as a transient user service and return MainPID.
+) -> _SpawnHandle:
+    """Start a worker as a transient user service and return its handle.
 
     The important bit is ownership: systemd owns the worker unit, not the
     gateway service cgroup, so ``hermes-gateway.service`` can restart without
@@ -5519,6 +5716,7 @@ def _spawn_systemd_worker(
     """
     systemd_run = shutil.which("systemd-run") or "systemd-run"
     systemctl = shutil.which("systemctl") or "systemctl"
+    unit_ref = _normalize_systemd_unit_ref(unit_name) or f"{unit_name}.service"
     args = [
         systemd_run,
         "--user",
@@ -5546,7 +5744,6 @@ def _spawn_systemd_worker(
         detail = (proc.stderr or proc.stdout or "systemd-run failed").strip()
         raise RuntimeError(detail[:500])
 
-    unit_ref = unit_name if unit_name.endswith(".service") else f"{unit_name}.service"
     for _ in range(10):
         show = subprocess.run(
             [systemctl, "--user", "show", unit_ref, "--property", "MainPID", "--value"],
@@ -5561,9 +5758,9 @@ def _spawn_systemd_worker(
         except ValueError:
             pid = 0
         if show.returncode == 0 and pid > 0:
-            return pid
+            return _SpawnHandle(pid=pid, unit=unit_ref)
         time.sleep(0.1)
-    return None
+    return _SpawnHandle(unit=unit_ref)
 
 
 def _default_spawn(
@@ -5571,7 +5768,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
-) -> Optional[int]:
+) -> Optional[int | _SpawnHandle]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
     Returns the spawned child's PID so the dispatcher can detect crashes
