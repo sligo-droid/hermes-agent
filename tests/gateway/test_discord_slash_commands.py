@@ -158,6 +158,19 @@ async def test_registers_native_restart_slash_command(adapter):
     )
 
 
+@pytest.mark.asyncio
+async def test_registers_native_goal_slash_command(adapter):
+    adapter._handle_goal_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    assert "goal" in adapter._client.tree.commands
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands["goal"](interaction, args="Ship faster")
+
+    adapter._handle_goal_slash.assert_awaited_once_with(interaction, "Ship faster")
+
+
 # ------------------------------------------------------------------
 # Auto-registration from COMMAND_REGISTRY
 # ------------------------------------------------------------------
@@ -723,6 +736,46 @@ class _FakeThreadChannel(_discord_mod.Thread):
         self.guild = SimpleNamespace(name=guild_name, id=1)
         self.topic = None
         self.parent = SimpleNamespace(id=parent_id, name="general", guild=SimpleNamespace(name=guild_name, id=1))
+
+
+@pytest.mark.asyncio
+async def test_goal_slash_acks_thread_before_background_dispatch(adapter):
+    parent = _FakeTextChannel(channel_id=123, name="features")
+    thread = _FakeThreadChannel(channel_id=555, name="Ship faster", parent_id=123)
+    interaction = SimpleNamespace(
+        channel=parent,
+        channel_id=123,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+        guild=SimpleNamespace(name="TestGuild", id=1),
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    adapter._create_thread = AsyncMock(
+        return_value={"success": True, "thread_id": "555", "thread_name": "Ship faster"}
+    )
+    adapter._resolve_channel_by_id = AsyncMock(return_value=thread)
+    adapter.initialize_feature_summary = AsyncMock(
+        return_value={"kanban_board": {"public_url": "https://example.test/workers/555"}}
+    )
+    adapter._dispatch_thread_session = AsyncMock()
+    scheduled = []
+
+    def capture_background(coro, *, label):
+        scheduled.append((coro, label))
+        coro.close()
+
+    adapter._schedule_discord_background = capture_background
+
+    await adapter._handle_goal_slash(interaction, "Ship faster")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    interaction.edit_original_response.assert_awaited_once()
+    content = interaction.edit_original_response.await_args.kwargs["content"]
+    assert "<#555>" in content
+    assert "https://example.test/workers/555" in content
+    assert scheduled and scheduled[0][1] == "/goal 555"
+    adapter._dispatch_thread_session.assert_not_awaited()
 
 
 def _fake_message(channel, *, content="Hello", author_id=42, display_name="Jezza"):

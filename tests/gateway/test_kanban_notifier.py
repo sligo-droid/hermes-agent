@@ -137,6 +137,22 @@ def test_kanban_dispatch_dirty_signal_wakes_sleep():
     asyncio.run(run())
 
 
+def test_discord_worker_dirty_marker_wakes_dispatch_sleep(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+
+    async def run():
+        from hermes_cli import discord_worker_boards as dwb
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._running = True
+        runner._kanban_dispatch_dirty_marker_ns = dwb.dispatch_dirty_marker_mtime_ns()
+        dwb.mark_dispatch_dirty(board="discord-1", reason="test")
+        woke = await runner._sleep_until_kanban_dispatch_due(1.0)
+        assert woke is True
+
+    asyncio.run(run())
+
+
 def _create_completed_subscription(summary="done once"):
     conn = kb.connect()
     try:

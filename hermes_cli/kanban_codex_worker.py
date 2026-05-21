@@ -16,6 +16,7 @@ from hermes_cli.discord_worker_boards import (
     ROLE_DEV,
     ROLE_PLANNER,
     ROLE_REVIEWER,
+    mark_dispatch_dirty,
     record_codex_worker_event,
     record_codex_worker_result,
 )
@@ -66,6 +67,11 @@ def main() -> int:
         return 1
     finally:
         conn.close()
+        if board:
+            try:
+                mark_dispatch_dirty(board=board, reason=f"{role}-worker-finished")
+            except Exception:
+                pass
 
 
 def _build_prompt(conn: Any, task_id: str, role: str) -> str:

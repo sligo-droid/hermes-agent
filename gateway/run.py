@@ -5295,6 +5295,20 @@ class GatewayRunner:
             logger.debug("kanban dispatcher: dirty signal failed", exc_info=True)
             return False
 
+    def _discord_worker_dispatch_marker_changed(self) -> bool:
+        """Return True when a Discord role subprocess requested dispatch."""
+        try:
+            from hermes_cli import discord_worker_boards as _dwb
+
+            marker = _dwb.dispatch_dirty_marker_mtime_ns()
+        except Exception:
+            return False
+        last = int(getattr(self, "_kanban_dispatch_dirty_marker_ns", 0) or 0)
+        if marker <= 0 or marker <= last:
+            return False
+        self._kanban_dispatch_dirty_marker_ns = marker
+        return True
+
     async def _sleep_until_kanban_dispatch_due(self, interval: float) -> bool:
         """Sleep until the next dispatcher tick or an explicit dirty signal.
 
@@ -5303,6 +5317,8 @@ class GatewayRunner:
         event = self._ensure_kanban_dispatch_dirty_event()
         remaining = max(float(interval or 0), 0.0)
         while getattr(self, "_running", True) and remaining > 0:
+            if self._discord_worker_dispatch_marker_changed():
+                return True
             step = min(1.0, remaining)
             try:
                 await asyncio.wait_for(event.wait(), timeout=step)
@@ -5310,6 +5326,8 @@ class GatewayRunner:
                 remaining -= step
                 continue
             event.clear()
+            return True
+        if self._discord_worker_dispatch_marker_changed():
             return True
         return False
 
@@ -5383,7 +5401,7 @@ class GatewayRunner:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
             return
 
-        interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
+        interval = float(kanban_cfg.get("dispatch_interval_seconds", 10) or 10)
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
         # Read max_spawn config to limit concurrent kanban tasks

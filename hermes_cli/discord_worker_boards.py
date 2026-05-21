@@ -10,6 +10,7 @@ from __future__ import annotations
 import html
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -24,7 +25,9 @@ from hermes_cli import kanban_db
 from utils import atomic_json_write
 
 
+logger = logging.getLogger(__name__)
 DISCORD_WORKER_META_KEY = "discord_worker"
+DISCORD_WORKER_DISPATCH_DIRTY_FILENAME = "discord-worker-dispatch.dirty.json"
 PUBLIC_TOKEN_BYTES = 24
 ROLE_PLANNER = "planner"
 ROLE_DEV = "dev"
@@ -70,6 +73,39 @@ def _write_metadata(board: str, metadata: dict[str, Any]) -> dict[str, Any]:
     atomic_json_write(path, payload, indent=2)
     payload["db_path"] = str(kanban_db.kanban_db_path(board))
     return payload
+
+
+def dispatch_dirty_marker_path() -> Path:
+    """Return the cross-process marker used to wake gateway dispatch."""
+    return kanban_db.kanban_home() / "kanban" / DISCORD_WORKER_DISPATCH_DIRTY_FILENAME
+
+
+def mark_dispatch_dirty(*, board: Optional[str] = None, reason: str = "") -> Path:
+    """Signal that Discord worker dispatch should run soon.
+
+    Gateway-created work can use an in-process event, but role workers are
+    subprocesses. This tiny marker gives those subprocesses a safe way to wake
+    the embedded dispatcher without sharing an event loop.
+    """
+    path = dispatch_dirty_marker_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json_write(
+        path,
+        {
+            "updated_at": _now(),
+            "board": str(board or ""),
+            "reason": str(reason or ""),
+        },
+        indent=2,
+    )
+    return path
+
+
+def dispatch_dirty_marker_mtime_ns() -> int:
+    try:
+        return dispatch_dirty_marker_path().stat().st_mtime_ns
+    except OSError:
+        return 0
 
 
 def codex_worker_state_path(task_id: str, *, board: Optional[str] = None) -> Path:
@@ -289,6 +325,7 @@ def ensure_discord_thread_board(
     project_context: Optional[dict[str, Any]] = None,
 ) -> DiscordBoard:
     """Create or update the board backing a Discord thread."""
+    started = time.time()
     slug = board_slug_for_discord_thread(thread_id)
     worker = _read_worker_meta(slug)
     existing_context = worker.get("project_context")
@@ -340,7 +377,7 @@ def ensure_discord_thread_board(
             "created_at": worker.get("created_at") or _now(),
         }
     )
-    _ensure_code_island(worker)
+    _mark_code_island_deferred(worker)
     metadata[DISCORD_WORKER_META_KEY] = worker
     metadata = _write_metadata(slug, metadata)
     if previous_worktree_path != str(worker.get("worktree_path") or ""):
@@ -349,6 +386,14 @@ def ensure_discord_thread_board(
             old_path=previous_worktree_path,
             new_path=str(worker.get("worktree_path") or ""),
         )
+    elapsed_ms = int((time.time() - started) * 1000)
+    logger.info(
+        "discord_worker_board_setup board=%s deferred_code_island=%s ready=%s total_ms=%d",
+        slug,
+        bool(worker.get("code_island_pending")),
+        bool(worker.get("code_island_ready")),
+        elapsed_ms,
+    )
     return DiscordBoard(slug=slug, metadata=metadata)
 
 
@@ -381,16 +426,43 @@ def _sync_role_task_workspaces(board: str, *, old_path: str, new_path: str) -> N
         conn.close()
 
 
+def _code_island_configured(worker: dict[str, Any]) -> bool:
+    project_path = str(worker.get("project_path") or "").strip()
+    worktree_path = str(worker.get("worktree_path") or "").strip()
+    branch = str(worker.get("worker_branch") or "").strip()
+    return bool(project_path and worktree_path and branch and os.path.isdir(project_path))
+
+
+def _mark_code_island_deferred(worker: dict[str, Any]) -> None:
+    if not _code_island_configured(worker):
+        worker["code_island_pending"] = False
+        return
+    worktree_path = str(worker.get("worktree_path") or "").strip()
+    if os.path.isdir(worktree_path):
+        worker["code_island_ready"] = True
+        worker["code_island_pending"] = False
+        worker.pop("code_island_error", None)
+        return
+    worker["code_island_ready"] = False
+    worker["code_island_pending"] = True
+    worker["code_island_requested_at"] = worker.get("code_island_requested_at") or _now()
+
+
 def _ensure_code_island(worker: dict[str, Any]) -> None:
     project_path = str(worker.get("project_path") or "").strip()
     worktree_path = str(worker.get("worktree_path") or "").strip()
     branch = str(worker.get("worker_branch") or "").strip()
     base_branch = str(worker.get("base_branch") or "main").strip() or "main"
     if not project_path or not worktree_path or not branch or not os.path.isdir(project_path):
+        worker["code_island_pending"] = False
         return
     if os.path.isdir(worktree_path):
         worker["code_island_ready"] = True
+        worker["code_island_pending"] = False
+        worker.pop("code_island_error", None)
         return
+    worker["code_island_ready"] = False
+    worker["code_island_pending"] = True
     try:
         root = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -416,11 +488,45 @@ def _ensure_code_island(worker: dict[str, Any]) -> None:
         result = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True, timeout=120)
         if result.returncode == 0:
             worker["code_island_ready"] = True
+            worker["code_island_pending"] = False
             worker.pop("code_island_error", None)
         else:
+            worker["code_island_ready"] = False
+            worker["code_island_pending"] = True
             worker["code_island_error"] = (result.stderr or result.stdout or "git worktree add failed").strip()
     except Exception as exc:
+        worker["code_island_ready"] = False
+        worker["code_island_pending"] = True
         worker["code_island_error"] = str(exc)
+
+
+def ensure_code_island_for_board(board: str) -> bool:
+    """Prepare a Discord worker board workspace before dispatch spawns roles."""
+    started = time.time()
+    metadata = kanban_db.read_board_metadata(board)
+    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    if worker.get("kind") != "discord_worker_board":
+        return True
+    previous_worktree_path = str(worker.get("worktree_path") or "").strip()
+    _ensure_code_island(worker)
+    metadata[DISCORD_WORKER_META_KEY] = worker
+    _write_metadata(board, metadata)
+    if previous_worktree_path != str(worker.get("worktree_path") or ""):
+        _sync_role_task_workspaces(
+            board,
+            old_path=previous_worktree_path,
+            new_path=str(worker.get("worktree_path") or ""),
+        )
+    elapsed_ms = int((time.time() - started) * 1000)
+    logger.info(
+        "discord_worker_code_island board=%s ready=%s pending=%s elapsed_ms=%d error=%s",
+        board,
+        bool(worker.get("code_island_ready")),
+        bool(worker.get("code_island_pending")),
+        elapsed_ms,
+        bool(worker.get("code_island_error")),
+    )
+    return bool(worker.get("code_island_ready") or not _code_island_configured(worker))
 
 
 def find_board_by_share_token(token: str) -> Optional[str]:

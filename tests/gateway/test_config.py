@@ -433,6 +433,29 @@ class TestLoadGatewayConfig:
         assert os.getenv("DISCORD_HISTORY_BACKFILL") == "true"
         assert os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT") == "17"
 
+    def test_bridges_discord_feature_request_latency_settings_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  feature_request_channels: [\"111\", \"222\"]\n"
+            "  history_backfill_feature_channels: false\n"
+            "  feature_summary_triage_timeout: 3\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("DISCORD_FEATURE_REQUEST_CHANNELS", raising=False)
+        monkeypatch.delenv("DISCORD_HISTORY_BACKFILL_FEATURE_CHANNELS", raising=False)
+        monkeypatch.delenv("DISCORD_FEATURE_SUMMARY_TRIAGE_TIMEOUT", raising=False)
+
+        load_gateway_config()
+
+        assert os.getenv("DISCORD_FEATURE_REQUEST_CHANNELS") == "111,222"
+        assert os.getenv("DISCORD_HISTORY_BACKFILL_FEATURE_CHANNELS") == "false"
+        assert os.getenv("DISCORD_FEATURE_SUMMARY_TRIAGE_TIMEOUT") == "3"
+
     def test_bridges_telegram_channel_prompts_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
