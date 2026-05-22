@@ -1,5 +1,6 @@
 import asyncio
 import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -65,6 +66,37 @@ def test_ledger_skips_completed_and_expires_stale_items(tmp_path):
     assert ledger.get(fresh["id"])["result_message_id"] == "result-1"
 
 
+def test_ledger_keeps_finished_delivery_phases_incomplete_until_completed(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="m1")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+
+    assert item is not None
+    ledger.claim(item["id"])
+    ledger.mark_agent_running(item["id"], session_id="session-1")
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="normal final answer",
+        session_id="session-1",
+        summary_status="Complete",
+        feature_summary={"message_id": "summary-1"},
+    )
+    assert ledger.get(item["id"])["status"] == "agent_done"
+    assert ledger.incomplete_items()[0]["final_response"] == "normal final answer"
+
+    ledger.mark_response_delivered(item["id"], result_message_id="result-1")
+    assert ledger.get(item["id"])["status"] == "response_delivered"
+    assert ledger.incomplete_items()[0]["result_message_id"] == "result-1"
+
+    ledger.mark_summary_updated(item["id"])
+    assert ledger.get(item["id"])["status"] == "summary_updated"
+    assert ledger.incomplete_items()[0]["status"] == "summary_updated"
+
+    ledger.mark_completed(item["id"])
+    assert ledger.incomplete_items() == []
+
+
 @pytest.mark.asyncio
 async def test_startup_replays_only_incomplete_discord_work(tmp_path):
     runner = object.__new__(GatewayRunner)
@@ -93,6 +125,45 @@ async def test_startup_replays_only_incomplete_discord_work(tmp_path):
     assert replay.work_replay is True
     assert replay.work_item_id == item["id"]
     assert replay.text == "do the work"
+
+
+@pytest.mark.asyncio
+async def test_startup_delivers_agent_done_work_without_rerunning_agent(tmp_path):
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    runner._background_tasks = set()
+    runner._session_db = None
+    adapter = SimpleNamespace(
+        handle_message=AsyncMock(),
+        _send_with_retry=AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="result-1")
+        ),
+        update_feature_summary=AsyncMock(return_value=True),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+
+    event = _discord_event(message_id="m1")
+    session_key = build_session_key(event.source)
+    item = runner.work_ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+    runner.work_ledger.mark_agent_done(
+        item["id"],
+        final_response="normal final answer",
+        session_id="session-1",
+        summary_status="Complete",
+        feature_summary={"message_id": "summary-1"},
+    )
+
+    scheduled = runner._schedule_incomplete_discord_work_items()
+    if runner._background_tasks:
+        await asyncio.gather(*runner._background_tasks)
+
+    assert scheduled == 1
+    adapter.handle_message.assert_not_called()
+    adapter._send_with_retry.assert_awaited_once()
+    assert adapter._send_with_retry.await_args.kwargs["content"] == "normal final answer"
+    adapter.update_feature_summary.assert_awaited_once()
+    assert runner.work_ledger.get(item["id"])["status"] == "completed"
 
 
 def test_discord_worker_reference_context_resolves_bare_message_ids(monkeypatch):

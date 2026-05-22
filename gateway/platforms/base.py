@@ -3205,6 +3205,21 @@ class BasePlatformAdapter(ABC):
         except Exception as exc:
             logger.warning("[%s] Failed to mark work item completed: %s", self.name, exc)
 
+    def _mark_work_item_response_delivered(self, event: MessageEvent, result=None) -> None:
+        work_item_id = getattr(event, "work_item_id", None)
+        if not work_item_id or getattr(event, "defer_work_completion", False):
+            return
+        try:
+            from gateway.work_ledger import GatewayWorkLedger
+
+            result_message_id = getattr(result, "message_id", None)
+            GatewayWorkLedger().mark_response_delivered(
+                str(work_item_id),
+                result_message_id=str(result_message_id) if result_message_id else None,
+            )
+        except Exception as exc:
+            logger.warning("[%s] Failed to mark work item response delivered: %s", self.name, exc)
+
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
@@ -3213,6 +3228,7 @@ class BasePlatformAdapter(ABC):
         processing_outcome: Optional[ProcessingOutcome] = None
         completion_deferred = False
         handoff_spawned = False
+        post_delivery_ok = True
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -3221,7 +3237,7 @@ class BasePlatformAdapter(ABC):
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
-                self._mark_work_item_completed(event, result)
+                self._mark_work_item_response_delivered(event, result)
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -3612,13 +3628,22 @@ class BasePlatformAdapter(ABC):
                 )
             else:
                 _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
-            if callable(_post_cb):
+            post_delivery_callback_present = callable(_post_cb)
+            if (
+                not post_delivery_callback_present
+                and getattr(event, "work_item_id", None)
+                and (getattr(event, "feature_summary", None) or getattr(event, "project_summary", None))
+            ):
+                post_delivery_ok = False
+            if post_delivery_callback_present:
                 try:
                     _post_result = _post_cb()
                     if inspect.isawaitable(_post_result):
-                        await _post_result
+                        _post_result = await _post_result
+                    if _post_result is False:
+                        post_delivery_ok = False
                 except Exception:
-                    pass
+                    post_delivery_ok = False
             # Stop typing indicator
             await _stop_typing_task()
             # Also cancel any platform-level persistent typing tasks (e.g. Discord)
@@ -3682,6 +3707,13 @@ class BasePlatformAdapter(ABC):
                 if (
                     processing_outcome == ProcessingOutcome.SUCCESS
                     and not delivery_attempted
+                    and not getattr(event, "defer_work_completion", False)
+                ):
+                    self._mark_work_item_completed(event)
+                elif (
+                    processing_outcome == ProcessingOutcome.SUCCESS
+                    and delivery_succeeded
+                    and post_delivery_ok
                     and not getattr(event, "defer_work_completion", False)
                 ):
                     self._mark_work_item_completed(event)
