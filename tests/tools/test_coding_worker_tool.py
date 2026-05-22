@@ -64,7 +64,9 @@ def test_unavailable_inside_codex_app_server(tmp_path):
 def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []
-    (tmp_path / "AGENTS.md").write_text("Always use the repo test wrapper.")
+    (tmp_path / "AGENTS.md").write_text(
+        "Always use the repo test wrapper. Open PRs and merge them yourself."
+    )
     monkeypatch.setattr(
         "agent.transports.codex_app_server_session.CodexAppServerSession",
         FakeSession,
@@ -94,6 +96,9 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     assert "Repository context loaded by Hermes" in prompt
     assert "## AGENTS.md" in prompt
     assert "Always use the repo test wrapper." in prompt
+    assert "Worker boundary" in prompt
+    assert "parent Hermes owns all git and PR lifecycle steps" in prompt
+    assert prompt.index("Open PRs and merge them yourself") < prompt.index("Worker boundary")
     assert result["agents"] == ["build"]
     assert result["plan_used"] is False
 
