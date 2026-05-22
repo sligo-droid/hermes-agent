@@ -189,6 +189,7 @@ class GatewayWorkLedger:
             "reply_to_text": getattr(event, "reply_to_text", None),
             "channel_prompt": getattr(event, "channel_prompt", None),
             "channel_context": getattr(event, "channel_context", None),
+            "goal_thread_context": getattr(event, "goal_thread_context", None),
             "feature_summary": _durable_metadata(getattr(event, "feature_summary", None)),
             "project_summary": _durable_metadata(getattr(event, "project_summary", None)),
             "claim_pid": None,
@@ -357,6 +358,7 @@ class GatewayWorkLedger:
             feature_summary=item.get("feature_summary"),
             project_summary=item.get("project_summary"),
             channel_context=item.get("channel_context"),
+            goal_thread_context=item.get("goal_thread_context"),
         )
         event.work_item_id = item.get("id")
         event.work_replay = True

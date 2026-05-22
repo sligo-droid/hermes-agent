@@ -455,7 +455,13 @@ async def test_dispatch_thread_session_builds_thread_event(adapter):
 
     adapter.handle_message = capture_handle
 
-    await adapter._dispatch_thread_session(interaction, "555", "Planning", "Hello!")
+    await adapter._dispatch_thread_session(
+        interaction,
+        "555",
+        "Planning",
+        "Hello!",
+        goal_thread_context="[Goal thread context]\n[Alice] prior detail",
+    )
 
     assert len(captured_events) == 1
     event = captured_events[0]
@@ -464,6 +470,7 @@ async def test_dispatch_thread_session_builds_thread_event(adapter):
     assert event.source.chat_type == "thread"
     assert event.source.thread_id == "555"
     assert "TestGuild" in event.source.chat_name
+    assert event.goal_thread_context == "[Goal thread context]\n[Alice] prior detail"
 
 
 # ------------------------------------------------------------------
@@ -804,6 +811,7 @@ async def test_goal_slash_from_thread_uses_thread_parent_for_project_context(ada
     project_context = {"project_path": "/home/droid/hermes", "source": "configured_channel_cwd"}
     adapter._resolve_project_context_for_channel = MagicMock(return_value=project_context)
     adapter.initialize_feature_summary = AsyncMock(return_value={})
+    adapter._fetch_goal_thread_context = AsyncMock(return_value="[Goal thread context]\n[Alice] prior detail")
     adapter._dispatch_thread_session = AsyncMock()
     scheduled = []
 
@@ -824,8 +832,32 @@ async def test_goal_slash_from_thread_uses_thread_parent_for_project_context(ada
     assert feature_kwargs["parent_channel"] is thread.parent
     assert feature_kwargs["project_context"] == project_context
     assert feature_kwargs["initial_request"] == "/goal Ship faster"
+    adapter._fetch_goal_thread_context.assert_awaited_once_with(thread)
+    assert adapter._dispatch_thread_session.call_args.kwargs["goal_thread_context"] == (
+        "[Goal thread context]\n[Alice] prior detail"
+    )
     assert scheduled and scheduled[0][1] == "/goal 555"
     adapter._dispatch_thread_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_text_goal_in_existing_thread_captures_planner_context(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    thread = _FakeThreadChannel(channel_id=556, name="Existing work", parent_id=123)
+    adapter._fetch_goal_thread_context = AsyncMock(return_value="[Goal thread context]\n[Alice] prior detail")
+
+    captured_events = []
+
+    async def capture_handle(event):
+        captured_events.append(event)
+
+    adapter.handle_message = capture_handle
+
+    await adapter._handle_message(_fake_message(thread, content="/goal Ship faster"))
+
+    adapter._fetch_goal_thread_context.assert_awaited_once()
+    assert len(captured_events) == 1
+    assert captured_events[0].goal_thread_context == "[Goal thread context]\n[Alice] prior detail"
 
 
 def _fake_message(channel, *, content="Hello", author_id=42, display_name="Jezza"):

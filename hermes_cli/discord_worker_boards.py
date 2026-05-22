@@ -37,6 +37,7 @@ CODEX_STATE_MAX_EVENTS = 200
 CODEX_STATE_MAX_TEXT_BYTES = 24_000
 CODEX_STATE_LOG_TAIL_BYTES = 64_000
 GOAL_CONTROL_COMMANDS = frozenset({"status", "pause", "resume", "clear", "stop", "done"})
+TERMINAL_GOAL_STATUSES = frozenset({"done", "blocked", "cancelled"})
 _DISCORD_MESSAGE_URL_RE = re.compile(
     r"https?://(?:canary\.|ptb\.)?discord(?:app)?\.com/channels/"
     r"(?P<guild>\d+)/(?P<channel>\d+)/(?P<message>\d+)"
@@ -2711,6 +2712,7 @@ def set_goal(
     parent_channel_id: Optional[str] = None,
     project_context: Optional[dict[str, Any]] = None,
     request_id: Optional[str] = None,
+    thread_context: Optional[str] = None,
 ) -> DiscordBoard:
     return start_planner_request(
         thread_id=thread_id,
@@ -2720,6 +2722,7 @@ def set_goal(
         parent_channel_id=parent_channel_id,
         project_context=project_context,
         request_id=request_id,
+        thread_context=thread_context,
         created_by="discord-goal",
     )
 
@@ -2767,6 +2770,7 @@ def start_planner_request(
     parent_channel_id: Optional[str] = None,
     project_context: Optional[dict[str, Any]] = None,
     request_id: Optional[str] = None,
+    thread_context: Optional[str] = None,
     created_by: str = "discord-feature-request",
 ) -> DiscordBoard:
     raw_request = _canonical_planner_request_text(request)
@@ -2779,7 +2783,14 @@ def start_planner_request(
         project_context=project_context,
     )
     worker = board.worker
-    planner_key = _planner_request_key(raw_request, request_id=request_id)
+    previous_goal_status = str(worker.get("goal_status") or "").strip().lower()
+    starts_new_goal_run = previous_goal_status in TERMINAL_GOAL_STATUSES
+    planner_key = _planner_request_key(
+        raw_request,
+        request_id=request_id,
+        include_request_id=starts_new_goal_run,
+    )
+    thread_context_text = str(thread_context or "").strip()
     worker.update(
         {
             "root_goal": raw_request,
@@ -2792,6 +2803,10 @@ def start_planner_request(
             "cancelled": False,
         }
     )
+    if thread_context_text:
+        worker["latest_goal_thread_context"] = thread_context_text
+    else:
+        worker.pop("latest_goal_thread_context", None)
     metadata = _update_worker_meta(board.slug, worker)
     _ensure_planner_task(
         board.slug,
@@ -2799,6 +2814,8 @@ def start_planner_request(
         request=raw_request,
         request_key=planner_key,
         created_by=created_by,
+        thread_context=thread_context_text,
+        allow_existing=not starts_new_goal_run,
     )
     return DiscordBoard(slug=board.slug, metadata=metadata)
 
@@ -2818,14 +2835,22 @@ def _planner_request_fingerprint(request: str) -> str:
     return re.sub(r"\s+", " ", _canonical_planner_request_text(request)).strip().casefold()
 
 
-def _planner_request_key(request: str, *, request_id: Optional[str] = None) -> str:
+def _planner_request_key(
+    request: str,
+    *,
+    request_id: Optional[str] = None,
+    include_request_id: bool = False,
+) -> str:
     normalized = re.sub(r"\s+", " ", _canonical_planner_request_text(request)).strip()
+    explicit = re.sub(r"[^0-9A-Za-z_.:-]+", "-", str(request_id or "").strip())[:80]
     if normalized:
         digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        if include_request_id:
+            suffix = explicit or f"run-{int(time.time())}"
+            return f"request-{digest}-{suffix}"
         return f"request-{digest}"
-    explicit = str(request_id or "").strip()
     if explicit:
-        return re.sub(r"[^0-9A-Za-z_.:-]+", "-", explicit)[:80] or "request"
+        return explicit or "request"
     return "request-empty"
 
 
@@ -2963,6 +2988,8 @@ def _ensure_planner_task(
     *,
     request: Optional[str] = None,
     request_key: Optional[str] = None,
+    thread_context: Optional[str] = None,
+    allow_existing: bool = True,
     created_by: str = "discord-goal",
 ) -> str:
     conn = kanban_db.connect(board=board)
@@ -2971,14 +2998,20 @@ def _ensure_planner_task(
             str(request or worker.get("root_goal") or worker.get("initial_request") or "")
         )
         planner_key = request_key or _planner_request_key(planner_request)
-        existing = _find_existing_planner_task(conn, planner_request)
-        if existing:
-            return existing
+        thread_context_text = str(
+            thread_context or worker.get("latest_goal_thread_context") or ""
+        ).strip()
+        if allow_existing:
+            existing = _find_existing_planner_task(conn, planner_request)
+            if existing:
+                _set_planner_thread_context(conn, existing, thread_context_text)
+                return existing
         body = json.dumps(
             {
                 "role": ROLE_PLANNER,
                 "root_goal": worker.get("root_goal") or worker.get("initial_request") or "",
                 "request": planner_request,
+                "discord_thread_context": thread_context_text,
                 "discord_references": _discord_reference_context(planner_request, worker),
                 "planner_instructions": _planner_instructions(),
                 "acceptance_criteria": worker.get("criteria") or [],
@@ -3004,6 +3037,26 @@ def _ensure_planner_task(
         )
     finally:
         conn.close()
+
+
+def _set_planner_thread_context(conn, task_id: str, thread_context: str) -> None:
+    if not thread_context:
+        return
+    row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if not row:
+        return
+    try:
+        payload = json.loads(row["body"] or "{}")
+    except Exception:
+        return
+    if not isinstance(payload, dict) or str(payload.get("discord_thread_context") or "").strip():
+        return
+    payload["discord_thread_context"] = thread_context
+    conn.execute(
+        "UPDATE tasks SET body = ? WHERE id = ?",
+        (json.dumps(payload, indent=2, ensure_ascii=False), task_id),
+    )
+    conn.commit()
 
 
 def _find_existing_planner_task(conn, planner_request: str) -> Optional[str]:
