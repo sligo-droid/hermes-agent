@@ -47,6 +47,34 @@ def test_ledger_deduplicates_discord_message_ids(tmp_path):
     assert len(ledger.incomplete_items()) == 1
 
 
+def test_ledger_strips_transient_summary_objects(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="m1")
+    event.feature_summary = {
+        "thread_id": "thread-1",
+        "message_id": "summary-1",
+        "kanban_board": {"slug": "discord-thread-1", "public_url": "https://example.test/board"},
+        "_thread_obj": object(),
+        "_message_obj": object(),
+    }
+    event.project_summary = {
+        "channel_id": "channel-1",
+        "_channel_obj": object(),
+    }
+    session_key = build_session_key(event.source)
+
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+
+    assert item is not None
+    stored = ledger.get(item["id"])
+    assert stored["feature_summary"] == {
+        "thread_id": "thread-1",
+        "message_id": "summary-1",
+        "kanban_board": {"slug": "discord-thread-1", "public_url": "https://example.test/board"},
+    }
+    assert stored["project_summary"] == {"channel_id": "channel-1"}
+
+
 def test_ledger_skips_completed_and_expires_stale_items(tmp_path):
     now = 1000.0
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: now)
@@ -80,9 +108,10 @@ def test_ledger_keeps_finished_delivery_phases_incomplete_until_completed(tmp_pa
         final_response="normal final answer",
         session_id="session-1",
         summary_status="Complete",
-        feature_summary={"message_id": "summary-1"},
+        feature_summary={"message_id": "summary-1", "_message_obj": object()},
     )
     assert ledger.get(item["id"])["status"] == "agent_done"
+    assert ledger.get(item["id"])["feature_summary"] == {"message_id": "summary-1"}
     assert ledger.incomplete_items()[0]["final_response"] == "normal final answer"
 
     ledger.mark_response_delivered(item["id"], result_message_id="result-1")
