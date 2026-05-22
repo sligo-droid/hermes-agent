@@ -218,6 +218,48 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
     assert result["summary"] == "Changed src/parser.py and ran pytest."
 
 
+def test_prepare_pnpm_dependency_links_reuses_matching_worktree(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    package = repo / "dashboard"
+    source_package = worktree / "dashboard"
+    package.mkdir(parents=True)
+    source_package.mkdir(parents=True)
+    for root in (package, source_package):
+        (root / "package.json").write_text('{"name":"dashboard"}')
+        (root / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+    (source_package / "node_modules").mkdir()
+
+    monkeypatch.setattr(cwt, "_repo_root_for_path", lambda path: repo)
+    monkeypatch.setattr(cwt, "_git_worktree_paths", lambda root: [repo, worktree])
+
+    notes = cwt._prepare_pnpm_dependency_links(str(repo))
+
+    assert notes == [f"linked {package / 'node_modules'} -> {source_package / 'node_modules'}"]
+    assert (package / "node_modules").is_symlink()
+    assert (package / "node_modules").resolve() == (source_package / "node_modules").resolve()
+
+
+def test_prepare_pnpm_dependency_links_requires_matching_lock(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    package = repo / "dashboard"
+    source_package = worktree / "dashboard"
+    package.mkdir(parents=True)
+    source_package.mkdir(parents=True)
+    (package / "package.json").write_text('{"name":"dashboard"}')
+    (package / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+    (source_package / "package.json").write_text('{"name":"dashboard"}')
+    (source_package / "pnpm-lock.yaml").write_text("lockfileVersion: '8.0'\n")
+    (source_package / "node_modules").mkdir()
+
+    monkeypatch.setattr(cwt, "_repo_root_for_path", lambda path: repo)
+    monkeypatch.setattr(cwt, "_git_worktree_paths", lambda root: [repo, worktree])
+
+    assert cwt._prepare_pnpm_dependency_links(str(repo)) == []
+    assert not (package / "node_modules").exists()
+
+
 def test_runs_with_available_codex_pool_credential(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []
