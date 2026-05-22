@@ -1737,6 +1737,8 @@ class GatewayRunner:
             self.config.sessions_dir, self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
         )
+        from gateway.work_ledger import GatewayWorkLedger
+        self.work_ledger = GatewayWorkLedger()
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -3119,6 +3121,57 @@ class GatewayRunner:
             return
         merge_pending_message_event(adapter._pending_messages, session_key, event)
 
+    def _ledger(self):
+        ledger = getattr(self, "work_ledger", None)
+        if ledger is None:
+            from gateway.work_ledger import GatewayWorkLedger
+
+            ledger = GatewayWorkLedger()
+            self.work_ledger = ledger
+        return ledger
+
+    def _accept_discord_work_item(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        defer_completion: bool = False,
+    ) -> Optional[dict]:
+        if getattr(event, "internal", False):
+            return None
+        if getattr(event.source, "platform", None) != Platform.DISCORD:
+            return None
+        ledger = self._ledger()
+        item = ledger.accept_event(
+            event,
+            session_key=session_key,
+            freshness_seconds=_auto_continue_freshness_window(),
+        )
+        if not item:
+            return None
+        event.work_item_id = item.get("id")
+        event.defer_work_completion = defer_completion
+        status = str(item.get("status") or "")
+        if status in {"completed", "blocked", "cancelled", "expired"}:
+            return item
+        if not getattr(event, "work_replay", False):
+            ledger.claim(str(item["id"]))
+        return item
+
+    def _record_discord_work_for_drain(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> Optional[dict]:
+        item = self._accept_discord_work_item(
+            event,
+            session_key,
+            defer_completion=True,
+        )
+        if item and item.get("id"):
+            self._ledger().claim(str(item["id"]))
+        return item
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -3145,6 +3198,7 @@ class GatewayRunner:
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled():
+                self._record_discord_work_for_drain(event, session_key)
                 self._queue_or_replace_pending_event(session_key, event)
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
             else:
@@ -3850,6 +3904,44 @@ class GatewayRunner:
             )
         return scheduled
 
+    def _schedule_incomplete_discord_work_items(self) -> int:
+        """Replay accepted Discord work that never reached completion.
+
+        This is intentionally ledger-driven.  We do not scan historical
+        sessions, feature summaries, or Discord thread caches, so old threads
+        cannot be resurrected unless a fresh accepted work item exists.
+        """
+        ledger = self._ledger()
+        scheduled = 0
+        for item in ledger.incomplete_items():
+            work_id = str(item.get("id") or "")
+            if not work_id:
+                continue
+            status = str(item.get("status") or "")
+            lease_until = float(item.get("lease_until") or 0)
+            if status == "claimed" and lease_until > time.time() and ledger.claim_pid_alive(item):
+                continue
+            try:
+                event = ledger.event_from_item(item)
+            except Exception as exc:
+                logger.warning("Failed to rebuild Discord work item %s: %s", work_id, exc)
+                ledger.mark_expired(work_id)
+                continue
+            source = event.source
+            adapter = self.adapters.get(source.platform)
+            if adapter is None:
+                logger.debug("Skipping Discord work item %s: adapter not ready", work_id)
+                continue
+            ledger.claim(work_id)
+            task = asyncio.create_task(adapter.handle_message(event))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            scheduled += 1
+
+        if scheduled:
+            logger.info("Scheduled replay for %d incomplete Discord work item(s)", scheduled)
+        return scheduled
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -4343,6 +4435,7 @@ class GatewayRunner:
         # by the normal successful-turn path, so a failed auto-resume remains
         # visible for manual recovery on the next user message.
         self._schedule_resume_pending_sessions()
+        self._schedule_incomplete_discord_work_items()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -6223,23 +6316,6 @@ class GatewayRunner:
 
             timeout = self._restart_drain_timeout
 
-            # Pre-mark sessions as resume_pending BEFORE the drain wait.
-            # If the process is killed by the service manager during the
-            # drain, the durable marker is already written so the next
-            # gateway boot can recover in-flight sessions (#27856).
-            _pre_drain_keys: list[str] = []
-            for _sk, _agent in list(self._running_agents.items()):
-                if _agent is _AGENT_PENDING_SENTINEL:
-                    continue
-                try:
-                    self.session_store.mark_resume_pending(
-                        _sk,
-                        "restart_timeout" if self._restart_requested else "shutdown_timeout",
-                    )
-                    _pre_drain_keys.append(_sk)
-                except Exception as _e:
-                    logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
-
             _drain_started_at = time.monotonic()
             active_agents, timed_out = await self._drain_active_agents(timeout)
             logger.info(
@@ -6251,20 +6327,6 @@ class GatewayRunner:
                 len(active_agents),
                 self._running_agent_count(),
             )
-
-            if not timed_out:
-                # Drain completed gracefully — all running sessions finished.
-                # Clear the pre-drain resume_pending markers so sessions that
-                # completed during the drain window don't carry a stale flag.
-                for _sk in _pre_drain_keys:
-                    if _sk not in self._running_agents:
-                        try:
-                            self.session_store.clear_resume_pending(_sk)
-                        except Exception as _e:
-                            logger.debug(
-                                "clear_resume_pending after drain failed for %s: %s",
-                                _sk, _e,
-                            )
 
             if timed_out:
                 logger.warning(
@@ -7148,6 +7210,18 @@ class GatewayRunner:
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+        _work_item = self._accept_discord_work_item(event, _quick_key)
+        if (
+            _work_item
+            and _work_item.get("_existing")
+            and not getattr(event, "work_replay", False)
+        ):
+            logger.info(
+                "Ignoring duplicate Discord work item %s with status=%s",
+                _work_item.get("id"),
+                _work_item.get("status"),
+            )
+            return None
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -7639,6 +7713,7 @@ class GatewayRunner:
                 return None
             if self._draining:
                 if self._queue_during_drain_enabled():
+                    self._record_discord_work_for_drain(event, _quick_key)
                     self._queue_or_replace_pending_event(_quick_key, event)
                 return (
                     f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
@@ -7939,6 +8014,8 @@ class GatewayRunner:
             return await self._handle_voice_command(event)
 
         if self._draining:
+            if self._record_discord_work_for_drain(event, _quick_key):
+                return f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
 
         # User-defined quick commands (bypass agent loop, no LLM call)

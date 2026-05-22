@@ -32,6 +32,8 @@ from gateway.platforms.base import (
     SessionSource,
     build_session_key,
 )
+from gateway.config import Platform
+from gateway.work_ledger import GatewayWorkLedger
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +417,79 @@ class TestBusySessionAck:
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content", "")
         assert "restarting" in content
+
+    @pytest.mark.asyncio
+    async def test_draining_discord_busy_message_is_durably_recorded(self, tmp_path):
+        runner, sentinel = _make_runner()
+        runner._draining = True
+        runner._busy_input_mode = "interrupt"
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+        adapter = _make_adapter(platform_val="discord")
+
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-1",
+            chat_type="thread",
+            user_id="user-1",
+            thread_id="thread-1",
+            guild_id="guild-1",
+            parent_chat_id="channel-1",
+            message_id="msg-1",
+        )
+        event = MessageEvent(
+            text="keep going after restart",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="msg-1",
+        )
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+        runner._queue_during_drain_enabled = lambda: True
+        runner._status_action_gerund = lambda: "restarting"
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        items = runner.work_ledger.incomplete_items()
+        assert len(items) == 1
+        assert items[0]["text"] == "keep going after restart"
+        assert items[0]["status"] == "claimed"
+        assert items[0]["session_key"] == sk
+        assert sk in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_draining_discord_cold_message_is_durably_recorded(self, tmp_path):
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        runner._draining = True
+        runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="thread-2",
+            chat_type="thread",
+            user_id="user-1",
+            thread_id="thread-2",
+            guild_id="guild-1",
+            parent_chat_id="channel-1",
+            message_id="msg-2",
+        )
+        event = MessageEvent(
+            text="start this after restart",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="msg-2",
+        )
+
+        response = await GatewayRunner._handle_message(runner, event)
+
+        assert "queued for the next turn" in response
+        items = runner.work_ledger.incomplete_items()
+        assert len(items) == 1
+        assert items[0]["text"] == "start this after restart"
+        assert items[0]["status"] == "claimed"
+        assert event.defer_work_completion is True
 
     @pytest.mark.asyncio
     async def test_pending_sentinel_no_interrupt(self):

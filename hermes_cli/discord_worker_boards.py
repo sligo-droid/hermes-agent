@@ -37,6 +37,14 @@ CODEX_STATE_MAX_EVENTS = 200
 CODEX_STATE_MAX_TEXT_BYTES = 24_000
 CODEX_STATE_LOG_TAIL_BYTES = 64_000
 GOAL_CONTROL_COMMANDS = frozenset({"status", "pause", "resume", "clear", "stop", "done"})
+_DISCORD_MESSAGE_URL_RE = re.compile(
+    r"https?://(?:canary\.|ptb\.)?discord(?:app)?\.com/channels/"
+    r"(?P<guild>\d+)/(?P<channel>\d+)/(?P<message>\d+)"
+)
+_DISCORD_MESSAGE_ID_RE = re.compile(
+    r"\b(?:message|msg)\s+(?P<message>\d{16,24})\b",
+    re.IGNORECASE,
+)
 PUBLIC_BOARD_COLUMNS = ("triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done")
 _POSIX_PATH_RE = re.compile(
     r"(?<![\w:/.-])/(?:home|Users|tmp|var|etc|opt|private|workspace|workspaces|mnt|srv|repo|root)"
@@ -2726,6 +2734,118 @@ def _planner_instructions() -> list[str]:
     ]
 
 
+def _message_summary_from_discord_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    author = payload.get("author") if isinstance(payload.get("author"), dict) else {}
+    return {
+        "id": str(payload.get("id") or ""),
+        "content": str(payload.get("content") or ""),
+        "author": {
+            "id": author.get("id"),
+            "username": author.get("username"),
+            "display_name": author.get("global_name"),
+            "bot": author.get("bot"),
+        },
+        "timestamp": payload.get("timestamp"),
+        "attachments": [
+            {
+                "filename": item.get("filename"),
+                "url": item.get("url"),
+                "size": item.get("size"),
+            }
+            for item in (payload.get("attachments") or [])
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def _fetch_discord_message_reference(channel_id: str, message_id: str) -> Optional[dict[str, Any]]:
+    token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+    if not token or not channel_id or not message_id:
+        return None
+    try:
+        from tools.discord_tool import _discord_request
+
+        payload = _discord_request(
+            "GET",
+            f"/channels/{channel_id}/messages/{message_id}",
+            token,
+            timeout=10,
+        )
+        if isinstance(payload, dict):
+            return _message_summary_from_discord_payload(payload)
+    except Exception as exc:
+        logger.info(
+            "discord_worker_reference_fetch_failed channel=%s message=%s error=%s",
+            channel_id,
+            message_id,
+            exc,
+        )
+    return None
+
+
+def _discord_reference_context(request: str, worker: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve Discord message links/ids into planner-visible read context."""
+    text = str(request or "")
+    exact_candidates: list[tuple[str, str]] = []
+    fallback_candidates: list[tuple[str, list[str]]] = []
+    seen_exact: set[tuple[str, str]] = set()
+    seen_message_ids: set[str] = set()
+
+    for match in _DISCORD_MESSAGE_URL_RE.finditer(text):
+        pair = (match.group("channel"), match.group("message"))
+        if pair not in seen_exact:
+            seen_exact.add(pair)
+            exact_candidates.append(pair)
+            seen_message_ids.add(pair[1])
+
+    fallback_channels = [
+        str(worker.get("chat_id") or "").strip(),
+        str(worker.get("parent_channel_id") or "").strip(),
+    ]
+    for match in _DISCORD_MESSAGE_ID_RE.finditer(text):
+        message_id = match.group("message")
+        if message_id in seen_message_ids:
+            continue
+        channels = [channel for channel in fallback_channels if channel]
+        if channels:
+            fallback_candidates.append((message_id, channels))
+            seen_message_ids.add(message_id)
+
+    references: list[dict[str, Any]] = []
+    for channel_id, message_id in exact_candidates[:8]:
+        fetched = _fetch_discord_message_reference(channel_id, message_id)
+        if fetched:
+            fetched["channel_id"] = channel_id
+            references.append(fetched)
+        else:
+            references.append(
+                {
+                    "id": message_id,
+                    "channel_id": channel_id,
+                    "unresolved": True,
+                    "content": "",
+                }
+            )
+    for message_id, channels in fallback_candidates[: max(0, 8 - len(references))]:
+        unresolved_channel = channels[0]
+        for channel_id in channels:
+            fetched = _fetch_discord_message_reference(channel_id, message_id)
+            if fetched:
+                fetched["channel_id"] = channel_id
+                references.append(fetched)
+                break
+        else:
+            references.append(
+                {
+                    "id": message_id,
+                    "channel_id": unresolved_channel,
+                    "unresolved": True,
+                    "content": "",
+                }
+            )
+    return references
+
+
 def _ensure_planner_task(
     board: str,
     worker: dict[str, Any],
@@ -2748,6 +2868,7 @@ def _ensure_planner_task(
                 "role": ROLE_PLANNER,
                 "root_goal": worker.get("root_goal") or worker.get("initial_request") or "",
                 "request": planner_request,
+                "discord_references": _discord_reference_context(planner_request, worker),
                 "planner_instructions": _planner_instructions(),
                 "acceptance_criteria": worker.get("criteria") or [],
                 "project_path": worker.get("project_path"),
