@@ -64,6 +64,16 @@ def _resolve_cwd(cwd: Optional[str], parent_agent: Any) -> str:
     return str(path.resolve())
 
 
+def _worker_project_context(workdir: str) -> str:
+    """Load the project context block Hermes would use for this repository."""
+    try:
+        from agent.prompt_builder import build_context_files_prompt
+
+        return build_context_files_prompt(cwd=workdir, skip_soul=True).strip()
+    except Exception:
+        return ""
+
+
 _PNPM_SCAN_SKIP_DIRS = {
     ".git",
     ".hermes",
@@ -247,6 +257,7 @@ def delegate_coding_task(
     workdir = _resolve_cwd(cwd, parent_agent)
     if not Path(workdir).exists():
         return tool_error(f"cwd does not exist: {workdir}")
+    project_context = _worker_project_context(workdir)
     dependency_notes = _prepare_pnpm_dependency_links(workdir)
 
     timeout = (
@@ -271,10 +282,16 @@ def delegate_coding_task(
         "Do not create commits or pull requests.",
         "Final response must summarize changed files, checks run, and any "
         "remaining blockers.",
-        "",
-        "Task:",
-        task_text,
     ]
+    if project_context:
+        worker_prompt_parts.extend(
+            [
+                "",
+                "Repository context loaded by Hermes. Follow it throughout this worker task:",
+                project_context,
+            ]
+        )
+    worker_prompt_parts.extend(["", "Task:", task_text])
     if context and str(context).strip():
         worker_prompt_parts.extend(["", "Context from Hermes:", str(context).strip()])
     if dependency_notes:
