@@ -77,7 +77,7 @@ def test_echoed_coding_worker_guidance_is_ignored_before_classification():
 
 
 def test_worker_guidance_requires_enabled_tool_and_normal_runtime():
-    msg = "fix tests in tests/test_parser.py"
+    msg = "debug the failing tests in tests/test_parser.py"
 
     assert cws.build_worker_guidance(
         msg,
@@ -103,6 +103,51 @@ def test_worker_guidance_requires_enabled_tool_and_normal_runtime():
         tool_available=True,
         api_mode="codex_app_server",
     ) == ""
+
+
+def test_simple_non_hermes_ui_edits_do_not_delegate():
+    decision = cws.assess_worker_routing(
+        'remove the three header pills from the dashboard page',
+        enabled=True,
+        tool_available=True,
+        api_mode="chat_completions",
+        cwd="/tmp/client-app",
+    )
+
+    assert decision.coding_request is True
+    assert decision.should_delegate is False
+    assert decision.guidance == ""
+
+
+def test_explicit_worker_request_still_delegates_simple_edit():
+    decision = cws.assess_worker_routing(
+        'use coding worker to remove the three header pills from the dashboard page',
+        enabled=True,
+        tool_available=True,
+        api_mode="chat_completions",
+        cwd="/tmp/client-app",
+    )
+
+    assert decision.should_delegate is True
+    assert "Small localized edits" in decision.guidance
+
+
+def test_parent_guidance_keeps_post_worker_checks_minimal(monkeypatch, tmp_path):
+    hermes_root = tmp_path / "hermes"
+    hermes_root.mkdir()
+    monkeypatch.setattr(cws, "_known_hermes_roots", lambda: (hermes_root,))
+    monkeypatch.setattr(cws, "_git_common_dir", lambda cwd: None)
+
+    guidance = cws.build_worker_guidance(
+        "add a gateway regression test",
+        enabled=True,
+        tool_available=True,
+        api_mode="chat_completions",
+        cwd=str(hermes_root),
+    )
+
+    assert "minimal sanity check" in guidance
+    assert "comprehensive testing belongs to the worker" in guidance
 
 
 def test_hermes_context_detects_prompt_references_and_cwd(monkeypatch, tmp_path):

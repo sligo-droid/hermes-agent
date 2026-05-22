@@ -75,9 +75,9 @@ def apply(config: dict, new_enabled: Optional[bool], *, persist_callback=None) -
             old_enabled=current,
             message=(
                 f"coding_worker.enabled: {state}\n"
-                "Normal Hermes runtime will delegate coding-shaped requests "
-                "to the configured coding backend when the delegate_coding_task "
-                "tool is available."
+                "Normal Hermes runtime will delegate complex or risky coding "
+                "requests to the configured coding backend when the "
+                "delegate_coding_task tool is available."
             ),
         )
 
@@ -261,6 +261,77 @@ def looks_like_coding_request(message: str) -> bool:
     return False
 
 
+def explicitly_requests_coding_worker(message: str) -> bool:
+    if not isinstance(message, str):
+        return False
+    lower = message.lower()
+    explicit_phrases = (
+        "use coding worker",
+        "with coding worker",
+        "delegate to coding worker",
+        "coding worker task",
+    )
+    return any(phrase in lower for phrase in explicit_phrases)
+
+
+def looks_worker_worthy_non_hermes_request(message: str) -> bool:
+    """Return True when optional worker routing is worth its overhead.
+
+    Hermes-repo work is handled separately and remains mandatory. This helper
+    only gates optional delegation for application/client repos, where a small
+    UI copy or CSS removal is usually faster and safer in the parent turn.
+    """
+    if not isinstance(message, str):
+        return False
+    lower = message.strip().lower()
+    if not lower:
+        return False
+    if explicitly_requests_coding_worker(lower):
+        return True
+
+    worker_worthy_terms = (
+        "auth",
+        "backend",
+        "code review",
+        "database",
+        "debug",
+        "diagnose",
+        "e2e",
+        "failing test",
+        "failing tests",
+        "gateway",
+        "integration",
+        "migration",
+        "performance",
+        "plugin",
+        "production",
+        "provider",
+        "race condition",
+        "refactor",
+        "regression test",
+        "regression tests",
+        "schema",
+        "security",
+        "test failure",
+        "tests failing",
+        "tool",
+        "worker",
+    )
+    if any(term in lower for term in worker_worthy_terms):
+        return True
+
+    broad_scope_patterns = (
+        r"\bacross\b",
+        r"\ball\s+(?:files|routes|pages|components|usages|occurrences)\b",
+        r"\bcomplex\b",
+        r"\blarge\b",
+        r"\bmajor\b",
+        r"\broot cause\b",
+        r"\bsystematic\b",
+    )
+    return any(re.search(pattern, lower) for pattern in broad_scope_patterns)
+
+
 def looks_like_hermes_coding_improvement_request(message: str) -> bool:
     """Hermes-only classifier for terse code-quality routing requests."""
     if not isinstance(message, str):
@@ -386,8 +457,10 @@ def assess_worker_routing(
                 "`delegate_coding_task` for the coding-heavy worker step. "
                 "Hermes remains the orchestrator: inspect enough context to "
                 "prepare a bounded worker brief, then review the changed files "
-                "and focused tests after the worker returns. Do not use direct "
-                "mutation tools before the coding worker has run.]\n\n"
+                "after the worker returns. Run only a minimal sanity check unless "
+                "the worker skipped verification; comprehensive testing belongs "
+                "to the worker. Do not use direct mutation tools before the coding "
+                "worker has run.]\n\n"
             ),
             required=True,
             should_delegate=True,
@@ -400,16 +473,23 @@ def assess_worker_routing(
             hermes_context=hermes_context,
             coding_request=coding_request,
         )
+    if not looks_worker_worthy_non_hermes_request(message):
+        return CodingWorkerRoutingDecision(
+            hermes_context=hermes_context,
+            coding_request=True,
+        )
     return CodingWorkerRoutingDecision(
         guidance=(
-            "[Coding worker mode is enabled. For implementation, debugging, "
+            "[Coding worker mode is enabled. For complex, risky, debugging, "
             "test-fixing, refactor, and code-review requests, prefer "
             "`delegate_coding_task` for the coding-heavy worker step when "
-            "the task is concrete enough to hand off. Hermes remains the "
+            "the task is concrete enough to hand off. Small localized edits "
+            "should stay in Hermes' normal tools. Hermes remains the "
             "orchestrator: inspect context, prepare a bounded worker brief, review "
-            "the changed files and tests after the worker returns, and report any "
-            "blocker. If the request is not actually a coding task or the "
-            "configured backend is a worse fit, continue with normal Hermes tools.]\n\n"
+            "the changed files after the worker returns, run only a minimal sanity "
+            "check unless the worker skipped verification, and report any blocker. "
+            "If the request is not actually a coding task or the configured backend "
+            "is a worse fit, continue with normal Hermes tools.]\n\n"
         ),
         should_delegate=True,
         hermes_context=hermes_context,

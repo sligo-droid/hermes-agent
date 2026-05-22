@@ -1,7 +1,7 @@
 ---
 name: github-pr-workflow
 description: "GitHub PR lifecycle: branch, commit, open, CI, merge."
-version: 1.1.0
+version: 1.1.2
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -19,6 +19,19 @@ Complete guide for managing the PR lifecycle. Each section shows the `gh` way fi
 
 - Authenticated with GitHub (see `github-auth` skill)
 - Inside a git repository with a GitHub remote
+
+## Default PR Merge Policy
+
+For Sligo Labs coding work, **opening a PR is not the stopping point**. Unless the user explicitly asks for review-only/draft-only behavior, or a repo/client policy truly blocks merging, the agent owns the full lifecycle: open the PR, merge it to the default branch as soon as GitHub says it is mergeable, and delete the feature branch.
+
+Treat phrases like "open a PR," "make a PR," "ship this," "continue this work," and ordinary implementation requests as permission to merge the PR yourself once it has no merge conflicts. Do not wait for CI/status checks before merging; trust the worker or local verification already performed during implementation.
+
+Operational rule:
+1. After creating/updating a PR, refresh against the current remote base, push, and perform only the agreed local/worker verification for the task.
+2. Inspect mergeability with `gh pr view ... --json mergeStateStatus,isDraft,state`. If the PR is open, non-draft, and not conflicted, merge immediately with squash merge + branch deletion (`gh pr merge --squash --delete-branch`).
+3. Do not enable auto-merge just to wait for pending checks. If branch protection requires checks or review before merging, report that policy blocker clearly instead of waiting silently.
+4. After merge, verify terminal state explicitly: `gh pr view ... --json state,mergedAt,mergeCommit` and fetch/pull the target branch. Poll deployment status only when deployment verification is part of the task.
+5. Only leave the PR unmerged when blocked by policy or missing permissions (required human review, branch protection, merge conflicts that require product judgment, unavailable merge permissions, or explicit user instruction). Report that blocker clearly and include the exact command/status that failed.
 
 ### Quick Auth Detection
 
@@ -281,9 +294,6 @@ When asked to auto-fix CI, follow this loop:
 ```bash
 # Squash merge + delete branch (cleanest for feature branches)
 gh pr merge --squash --delete-branch
-
-# Enable auto-merge (merges when all checks pass)
-gh pr merge --auto --squash --delete-branch
 ```
 
 **With git + curl:**
@@ -311,22 +321,6 @@ git branch -d $BRANCH
 
 Merge methods: `"merge"` (merge commit), `"squash"`, `"rebase"`
 
-### Enable Auto-Merge (curl)
-
-```bash
-# Auto-merge requires the repo to have it enabled in settings.
-# This uses the GraphQL API since REST doesn't support auto-merge.
-PR_NODE_ID=$(curl -s \
-  -H "Authorization: token $GITHUB_TOKEN" \
-  https://api.github.com/repos/$OWNER/$REPO/pulls/$PR_NUMBER \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)['node_id'])")
-
-curl -s -X POST \
-  -H "Authorization: token $GITHUB_TOKEN" \
-  https://api.github.com/graphql \
-  -d "{\"query\": \"mutation { enablePullRequestAutoMerge(input: {pullRequestId: \\\"$PR_NODE_ID\\\", mergeMethod: SQUASH}) { clientMutationId } }\"}"
-```
-
 ## 7. Complete Workflow Example
 
 ```bash
@@ -350,9 +344,7 @@ git push -u origin HEAD
 # 6. Create PR (picks gh or curl based on what's available)
 # ... (see Section 3)
 
-# 7. Monitor CI (see Section 4)
-
-# 8. Merge when green (see Section 6)
+# 7. Merge immediately if GitHub reports no merge conflicts (see Section 6)
 ```
 
 ## Useful PR Commands Reference

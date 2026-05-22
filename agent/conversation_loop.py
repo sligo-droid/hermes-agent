@@ -73,6 +73,114 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+def _new_turn_runtime_stats(started_at: float) -> dict[str, Any]:
+    return {
+        "started_at": started_at,
+        "api_calls": 0,
+        "api_duration_s": 0.0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "max_prompt_tokens": 0,
+        "last_prompt_tokens": 0,
+        "tool_calls": 0,
+        "tool_duration_s": 0.0,
+        "tool_errors": 0,
+        "tool_blocked": 0,
+        "tool_chars": 0,
+        "tools": {},
+    }
+
+
+def _record_turn_api_runtime(agent: Any, api_duration: float, canonical_usage: Any, prompt_tokens: int) -> None:
+    stats = getattr(agent, "_turn_runtime_stats", None)
+    if not isinstance(stats, dict):
+        return
+    try:
+        stats["api_calls"] = int(stats.get("api_calls") or 0) + 1
+        stats["api_duration_s"] = float(stats.get("api_duration_s") or 0.0) + float(api_duration or 0.0)
+        stats["input_tokens"] = int(stats.get("input_tokens") or 0) + int(getattr(canonical_usage, "input_tokens", 0) or 0)
+        stats["output_tokens"] = int(stats.get("output_tokens") or 0) + int(getattr(canonical_usage, "output_tokens", 0) or 0)
+        stats["total_tokens"] = int(stats.get("total_tokens") or 0) + int(getattr(canonical_usage, "total_tokens", 0) or 0)
+        stats["cache_read_tokens"] = int(stats.get("cache_read_tokens") or 0) + int(getattr(canonical_usage, "cache_read_tokens", 0) or 0)
+        stats["cache_write_tokens"] = int(stats.get("cache_write_tokens") or 0) + int(getattr(canonical_usage, "cache_write_tokens", 0) or 0)
+        stats["reasoning_tokens"] = int(stats.get("reasoning_tokens") or 0) + int(getattr(canonical_usage, "reasoning_tokens", 0) or 0)
+        stats["last_prompt_tokens"] = int(prompt_tokens or 0)
+        stats["max_prompt_tokens"] = max(int(stats.get("max_prompt_tokens") or 0), int(prompt_tokens or 0))
+    except Exception:
+        logger.debug("turn API runtime accounting failed", exc_info=True)
+
+
+def _top_turn_tools(stats: dict[str, Any], limit: int = 5) -> list[dict[str, Any]]:
+    tools = stats.get("tools") if isinstance(stats.get("tools"), dict) else {}
+    rows = []
+    for name, item in tools.items():
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "name": str(name),
+                "count": int(item.get("count") or 0),
+                "duration_ms": int(round(float(item.get("duration_s") or 0.0) * 1000)),
+                "errors": int(item.get("errors") or 0),
+                "blocked": int(item.get("blocked") or 0),
+                "chars": int(item.get("chars") or 0),
+            }
+        )
+    rows.sort(key=lambda item: item["duration_ms"], reverse=True)
+    return rows[:limit]
+
+
+def _log_turn_runtime_summary(
+    agent: Any,
+    *,
+    total_elapsed_s: float,
+    exit_reason: str,
+    interrupted: bool,
+    response_len: int,
+) -> None:
+    stats = getattr(agent, "_turn_runtime_stats", None)
+    if not isinstance(stats, dict):
+        return
+    try:
+        api_ms = int(round(float(stats.get("api_duration_s") or 0.0) * 1000))
+        tool_ms = int(round(float(stats.get("tool_duration_s") or 0.0) * 1000))
+        total_ms = int(round(float(total_elapsed_s or 0.0) * 1000))
+        overhead_ms = max(0, total_ms - api_ms - tool_ms)
+        payload = {
+            "session": agent.session_id or "none",
+            "model": agent.model,
+            "provider": agent.provider or "unknown",
+            "platform": getattr(agent, "platform", None) or "",
+            "exit_reason": exit_reason,
+            "interrupted": bool(interrupted),
+            "response_len": int(response_len or 0),
+            "total_ms": total_ms,
+            "api_ms": api_ms,
+            "tool_ms": tool_ms,
+            "overhead_ms": overhead_ms,
+            "api_calls": int(stats.get("api_calls") or 0),
+            "tool_calls": int(stats.get("tool_calls") or 0),
+            "tool_errors": int(stats.get("tool_errors") or 0),
+            "tool_blocked": int(stats.get("tool_blocked") or 0),
+            "input_tokens": int(stats.get("input_tokens") or 0),
+            "output_tokens": int(stats.get("output_tokens") or 0),
+            "total_tokens": int(stats.get("total_tokens") or 0),
+            "cache_read_tokens": int(stats.get("cache_read_tokens") or 0),
+            "cache_write_tokens": int(stats.get("cache_write_tokens") or 0),
+            "reasoning_tokens": int(stats.get("reasoning_tokens") or 0),
+            "max_prompt_tokens": int(stats.get("max_prompt_tokens") or 0),
+            "last_prompt_tokens": int(stats.get("last_prompt_tokens") or 0),
+            "top_tools": _top_turn_tools(stats),
+        }
+        logger.info("turn_runtime_summary %s", json.dumps(payload, sort_keys=True))
+    except Exception:
+        logger.debug("turn runtime summary log failed", exc_info=True)
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.handle_function_call`` / ``run_agent._set_interrupt`` /
@@ -560,6 +668,8 @@ def run_conversation(
         logger.warning("pre_llm_call hook failed: %s", exc)
 
     # Main conversation loop
+    _turn_runtime_started_at = time.perf_counter()
+    agent._turn_runtime_stats = _new_turn_runtime_stats(_turn_runtime_started_at)
     api_call_count = 0
     final_response = None
     interrupted = False
@@ -1601,6 +1711,7 @@ def run_conversation(
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
                     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
                     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+                    _record_turn_api_runtime(agent, api_duration, canonical_usage, prompt_tokens)
 
                     # Log API call details for debugging/observability
                     _cache_pct = ""
@@ -3949,6 +4060,13 @@ def run_conversation(
         )
     else:
         logger.info(_diag_msg, *_diag_args)
+    _log_turn_runtime_summary(
+        agent,
+        total_elapsed_s=time.perf_counter() - _turn_runtime_started_at,
+        exit_reason=_turn_exit_reason,
+        interrupted=interrupted,
+        response_len=_resp_len,
+    )
 
     # File-mutation verifier footer.
     # If one or more ``write_file`` / ``patch`` calls failed during this
