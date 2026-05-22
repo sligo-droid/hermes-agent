@@ -532,6 +532,125 @@ def test_feature_summary_snapshot_uses_kanban_branch_and_outcome(monkeypatch, tm
     assert snapshot["sync_key"]
 
 
+def test_persisted_board_run_summary_drives_terminal_surfaces(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(dwb, "_now", lambda: 200)
+    board = dwb.start_direct_goal(thread_id="5164", goal="Ship terminal summaries")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Implement summary",
+            assignee=dwb.ROLE_DEV,
+            tenant=board.slug,
+        )
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+        kanban_db.complete_task(
+            conn,
+            task_id,
+            summary="Implemented summary sidecar.",
+            metadata={
+                "tests": [
+                    {
+                        "command": "scripts/run_tests.sh tests/hermes_cli/test_discord_worker_boards.py -q",
+                        "result": "passed",
+                        "output": "ok",
+                    }
+                ]
+            },
+            expected_run_id=claimed.current_run_id,
+        )
+        review_id = kanban_db.create_task(
+            conn,
+            title="Review implementation",
+            assignee=dwb.ROLE_REVIEWER,
+            tenant=board.slug,
+        )
+        claimed_review = kanban_db.claim_task(conn, review_id)
+        assert claimed_review is not None
+        kanban_db.complete_task(
+            conn,
+            review_id,
+            summary="Approved terminal summary.",
+            metadata={"raw": {"status": "approved"}},
+            expected_run_id=claimed_review.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "pr_url": "https://github.com/acme/hermes/pull/12",
+            "pr_number": "12",
+            "pr_merge_state": "CLEAN",
+            "pr_checks_status": "passed",
+            "pr_checks_total": 3,
+            "deployment_status": "not checked",
+        },
+    )
+
+    summary = dwb.persist_board_run_summary(board.slug)
+
+    assert summary["goal_status"] == "done"
+    assert summary["phase"] == "complete"
+    assert summary["task_counts"]["done"] == 2
+    assert summary["run_counts"]["by_outcome"]["completed"] == 2
+    assert summary["review"]["final_verdict"]["status"] == "approved"
+    assert summary["pr"]["checks_status"] == "passed"
+    assert summary["verification_commands"][0]["command"].startswith("scripts/run_tests.sh")
+    assert dwb.board_run_summary_path(board.slug).exists()
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert meta["board_summary_updated_at"] == 200
+    assert meta["board_summary"]["board"] == board.slug
+
+    status = dwb.status_line(board.slug)
+    assert "PR merge: CLEAN; checks: passed" in status
+    assert "Verification: scripts/run_tests.sh" in status
+
+    snapshot = dwb.feature_summary_snapshot(board.slug)
+    assert "Checks: passed" in snapshot["outcome"]
+
+    html = dwb.render_public_session_board_html("5164")
+    assert "Terminal Summary" in html
+    assert "PR merge: CLEAN; checks: passed" in html
+
+
+def test_new_goal_clears_stale_terminal_summary_and_pr(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="5165", goal="First goal")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "pr_url": "https://github.com/acme/hermes/pull/22",
+            "pr_checks_status": "passed",
+        },
+    )
+    dwb.persist_board_run_summary(board.slug)
+    assert dwb.read_board_run_summary(board.slug)
+
+    refreshed = dwb.set_goal(thread_id="5165", goal="Second goal", request_id="second")
+
+    worker = kanban_db.read_board_metadata(refreshed.slug)["discord_worker"]
+    assert "board_summary" not in worker
+    assert "board_summary_updated_at" not in worker
+    assert "pr_url" not in worker
+    assert "pr_checks_status" not in worker
+    assert not dwb.board_run_summary_path(refreshed.slug).exists()
+
+
 def test_public_board_index_lists_operational_row_data(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

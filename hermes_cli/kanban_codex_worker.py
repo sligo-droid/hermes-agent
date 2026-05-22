@@ -574,6 +574,147 @@ def _resolve_github_repo(worker: dict[str, Any], root: Path) -> Optional[str]:
     return _github_repo_from_url(remote.stdout)
 
 
+def _pr_number_from_url(url: str) -> str:
+    match = re.search(r"/pull/(\d+)(?:\D.*)?$", str(url or "").strip())
+    return match.group(1) if match else ""
+
+
+def _reset_pr_status_fields(worker: dict[str, Any]) -> None:
+    for key in (
+        "pr_error",
+        "pr_status_error",
+        "pr_state",
+        "pr_merge_state",
+        "pr_mergeable",
+        "pr_is_draft",
+        "pr_review_decision",
+        "pr_checks_status",
+        "pr_checks_total",
+        "pr_checks_failed",
+        "pr_blocker",
+    ):
+        worker.pop(key, None)
+
+
+def _check_rollup_summary(items: Any) -> tuple[str, int, list[str]]:
+    if not isinstance(items, list) or not items:
+        return "not checked", 0, []
+    failed: list[str] = []
+    pending = 0
+    total = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        total += 1
+        name = str(
+            item.get("name")
+            or item.get("context")
+            or item.get("workflowName")
+            or item.get("__typename")
+            or "check"
+        )
+        status = str(item.get("status") or item.get("state") or "").strip().upper()
+        conclusion = str(item.get("conclusion") or item.get("conclusionState") or "").strip().upper()
+        if conclusion in {"FAILURE", "FAILED", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"} or status in {"FAILURE", "FAILED"}:
+            failed.append(name)
+        elif conclusion in {"SUCCESS", "NEUTRAL", "SKIPPED"} or status in {"COMPLETED", "SUCCESS"}:
+            continue
+        else:
+            pending += 1
+    if failed:
+        return "failed", total, failed[:8]
+    if pending:
+        return "pending", total, []
+    return "passed", total, []
+
+
+def _pr_blocker(worker: dict[str, Any]) -> str:
+    if worker.get("pr_error"):
+        return str(worker.get("pr_error") or "")
+    if worker.get("pr_status_error"):
+        return str(worker.get("pr_status_error") or "")
+    if not worker.get("pr_url"):
+        return "PR not opened"
+    if worker.get("pr_is_draft") is True:
+        return "PR is draft"
+    review_decision = str(worker.get("pr_review_decision") or "").strip().upper()
+    if review_decision == "CHANGES_REQUESTED":
+        return "review changes requested"
+    checks_status = str(worker.get("pr_checks_status") or "not checked")
+    if checks_status == "failed":
+        failed = ", ".join(str(item) for item in (worker.get("pr_checks_failed") or []) if item)
+        return f"checks failed: {failed}" if failed else "checks failed"
+    if checks_status == "pending":
+        return "checks pending"
+    merge_state = str(worker.get("pr_merge_state") or "unknown").strip().upper()
+    if merge_state and merge_state not in {"CLEAN", "HAS_HOOKS", "UNKNOWN"}:
+        return f"merge state: {merge_state}"
+    return ""
+
+
+def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None:
+    pr_ref = str(worker.get("pr_url") or worker.get("pr_number") or "").strip()
+    if not pr_ref:
+        worker.setdefault("pr_checks_status", "not checked")
+        worker.setdefault("pr_merge_state", "unknown")
+        worker["pr_blocker"] = _pr_blocker(worker)
+        return
+    if not worker.get("pr_number") and worker.get("pr_url"):
+        number = _pr_number_from_url(str(worker.get("pr_url") or ""))
+        if number:
+            worker["pr_number"] = number
+    viewed = subprocess.run(
+        [
+            "gh",
+            "pr",
+            "view",
+            pr_ref,
+            "--repo",
+            repo,
+            "--json",
+            "number,url,state,mergeStateStatus,mergeable,isDraft,reviewDecision,statusCheckRollup",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if viewed.returncode != 0:
+        worker["pr_status_error"] = (viewed.stderr or viewed.stdout or "gh pr view failed").strip()
+        worker.setdefault("pr_checks_status", "not checked")
+        worker.setdefault("pr_merge_state", "unknown")
+        worker["pr_blocker"] = _pr_blocker(worker)
+        return
+    try:
+        data = json.loads(viewed.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        worker["pr_status_error"] = f"gh pr view returned invalid JSON: {exc}"
+        worker.setdefault("pr_checks_status", "not checked")
+        worker.setdefault("pr_merge_state", "unknown")
+        worker["pr_blocker"] = _pr_blocker(worker)
+        return
+    if not isinstance(data, dict):
+        worker["pr_status_error"] = "gh pr view returned non-object JSON"
+        worker.setdefault("pr_checks_status", "not checked")
+        worker.setdefault("pr_merge_state", "unknown")
+        worker["pr_blocker"] = _pr_blocker(worker)
+        return
+    if data.get("url"):
+        worker["pr_url"] = str(data.get("url") or "")
+    if data.get("number") is not None:
+        worker["pr_number"] = str(data.get("number"))
+    worker["pr_state"] = str(data.get("state") or "unknown")
+    worker["pr_merge_state"] = str(data.get("mergeStateStatus") or "unknown")
+    worker["pr_mergeable"] = data.get("mergeable") if data.get("mergeable") is not None else "unknown"
+    worker["pr_is_draft"] = bool(data.get("isDraft"))
+    worker["pr_review_decision"] = str(data.get("reviewDecision") or "").strip() or "unknown"
+    checks_status, checks_total, failed = _check_rollup_summary(data.get("statusCheckRollup"))
+    worker["pr_checks_status"] = checks_status
+    worker["pr_checks_total"] = checks_total
+    worker["pr_checks_failed"] = failed
+    worker["pr_blocker"] = _pr_blocker(worker)
+
+
 def _ensure_pr(board: Optional[str], workspace: str) -> None:
     if not board:
         return
@@ -586,6 +727,7 @@ def _ensure_pr(board: Optional[str], workspace: str) -> None:
     branch = str(worker.get("worker_branch") or "").strip()
     base = str(worker.get("base_branch") or "main").strip() or "main"
     repo = _resolve_github_repo(worker, root)
+    _reset_pr_status_fields(worker)
     try:
         missing = []
         if not repo:
@@ -594,6 +736,9 @@ def _ensure_pr(board: Optional[str], workspace: str) -> None:
             missing.append("worker branch")
         if missing:
             worker["pr_error"] = f"Cannot create PR: missing {', '.join(missing)}"
+            worker["pr_checks_status"] = "not checked"
+            worker["pr_merge_state"] = "unknown"
+            worker["pr_blocker"] = worker["pr_error"]
             raise RuntimeError(worker["pr_error"])
         existing = subprocess.run(
             [
@@ -658,8 +803,17 @@ def _ensure_pr(board: Optional[str], workspace: str) -> None:
                 worker["pr_url"] = created.stdout.strip()
             else:
                 worker["pr_error"] = (created.stderr or created.stdout or "gh pr create failed").strip()
+        if worker.get("pr_url"):
+            _refresh_pr_status(worker, root=root, repo=repo)
+        else:
+            worker.setdefault("pr_checks_status", "not checked")
+            worker.setdefault("pr_merge_state", "unknown")
+            worker["pr_blocker"] = _pr_blocker(worker)
     except Exception as exc:
         worker.setdefault("pr_error", str(exc))
+        worker.setdefault("pr_checks_status", "not checked")
+        worker.setdefault("pr_merge_state", "unknown")
+        worker["pr_blocker"] = _pr_blocker(worker)
     metadata[DISCORD_WORKER_META_KEY] = worker
     metadata.pop("db_path", None)
     atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
@@ -706,6 +860,13 @@ def _update_phase(board: Optional[str], phase: str, *, goal_status: str) -> None
     metadata[DISCORD_WORKER_META_KEY] = worker
     metadata.pop("db_path", None)
     atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
+    if goal_status in {"done", "blocked"}:
+        try:
+            from hermes_cli.discord_worker_boards import persist_board_run_summary
+
+            persist_board_run_summary(board)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

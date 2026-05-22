@@ -952,6 +952,63 @@ def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeyp
     assert meta["pr_url"] == "https://github.com/sligo-labs/PID/pull/123"
 
 
+def test_ensure_pr_records_merge_checks_and_blocker(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="blocked-pr",
+        goal="Ship PR blocker facts",
+        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
+    )
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/125\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "number": 125,
+                        "url": "https://github.com/sligo-labs/PID/pull/125",
+                        "state": "OPEN",
+                        "mergeStateStatus": "BLOCKED",
+                        "mergeable": "CONFLICTING",
+                        "isDraft": False,
+                        "reviewDecision": "REVIEW_REQUIRED",
+                        "statusCheckRollup": [
+                            {"name": "unit", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                            {"name": "lint", "status": "COMPLETED", "conclusion": "FAILURE"},
+                        ],
+                    }
+                ),
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    worker._ensure_pr(board.slug, str(workspace))
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert meta["pr_url"] == "https://github.com/sligo-labs/PID/pull/125"
+    assert meta["pr_number"] == "125"
+    assert meta["pr_state"] == "OPEN"
+    assert meta["pr_merge_state"] == "BLOCKED"
+    assert meta["pr_mergeable"] == "CONFLICTING"
+    assert meta["pr_checks_status"] == "failed"
+    assert meta["pr_checks_total"] == 2
+    assert meta["pr_checks_failed"] == ["lint"]
+    assert meta["pr_blocker"] == "checks failed: lint"
+
+
 def test_ensure_pr_falls_back_to_origin_remote_for_repo(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -1011,4 +1068,7 @@ def test_ensure_pr_records_error_when_repo_or_head_missing(monkeypatch, tmp_path
 
     meta = kanban_db.read_board_metadata(board.slug)[DISCORD_WORKER_META_KEY]
     assert meta["pr_error"] == "Cannot create PR: missing GitHub repository, worker branch"
+    assert meta["pr_blocker"] == meta["pr_error"]
+    assert meta["pr_checks_status"] == "not checked"
+    assert meta["pr_merge_state"] == "unknown"
     assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd in calls)

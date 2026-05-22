@@ -752,6 +752,66 @@ async def test_sync_kanban_feature_summary_reopens_persisted_handle(adapter, mon
 
 
 @pytest.mark.asyncio
+async def test_sync_kanban_feature_summary_uses_persisted_terminal_summary(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://hermes.sligolabs.com")
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 200 else None
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="/goal Ship the dashboard",
+    )
+    assert handle is not None
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="200", goal="Ship the dashboard")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(conn, title="Build dashboard", assignee=dwb.ROLE_DEV, tenant=board.slug)
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+        kanban_db.complete_task(conn, task_id, summary="Dashboard built.", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "pr_url": "https://github.com/acme/hermes-project/pull/44",
+            "pr_checks_status": "passed",
+            "pr_merge_state": "CLEAN",
+            "terminal_summary_sync_pending": True,
+        },
+    )
+    dwb.persist_board_run_summary(board.slug)
+
+    synced = await adapter.sync_kanban_feature_summary(
+        {
+            "board": board.slug,
+            "thread_id": "200",
+            "state": "done",
+            "sync_key": "terminal-sync",
+        }
+    )
+
+    assert synced == "terminal-sync"
+    message = handle["_message_obj"]
+    edited_embed = message.edit.await_args.kwargs["embed"]
+    fields = {field.name: field.value for field in edited_embed.fields}
+    assert fields["Status"] == "✅ Done"
+    assert "Checks: passed" in fields["Concise Outcome"]
+    assert "Deployment: not checked" in fields["Concise Outcome"]
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "terminal_summary_sync_pending" not in worker
+
+
+@pytest.mark.asyncio
 async def test_sync_kanban_feature_summary_refuses_mismatched_board(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     parent = FakeTextChannel(channel_id=100)
