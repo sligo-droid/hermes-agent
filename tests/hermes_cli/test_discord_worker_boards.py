@@ -1463,12 +1463,8 @@ def test_dispatch_once_allows_explicit_role_lane_assignees(monkeypatch, tmp_path
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_db
 
-    project_context = {"project_path": str(tmp_path / "repo")}
-    board = dwb.set_goal(
-        thread_id="role-lane-skip",
-        goal="Plan work",
-        project_context=project_context,
-    )
+    workspace = tmp_path / "repo"
+    board = dwb.ensure_discord_thread_board(thread_id="role-lane-skip")
     spawned = []
 
     def fake_spawn(task, workspace, board=None):
@@ -1477,17 +1473,29 @@ def test_dispatch_once_allows_explicit_role_lane_assignees(monkeypatch, tmp_path
 
     conn = kanban_db.connect(board=board.slug)
     try:
+        kanban_db.create_task(
+            conn,
+            title="Plan Discord implementation work",
+            assignee=dwb.ROLE_PLANNER,
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+            tenant=board.slug,
+        )
         without_extra = kanban_db.dispatch_once(conn, dry_run=True, board=board.slug)
     finally:
         conn.close()
 
-    spawn_board = dwb.set_goal(
-        thread_id="role-lane-spawn",
-        goal="Plan work",
-        project_context=project_context,
-    )
+    spawn_board = dwb.ensure_discord_thread_board(thread_id="role-lane-spawn")
     conn = kanban_db.connect(board=spawn_board.slug)
     try:
+        kanban_db.create_task(
+            conn,
+            title="Plan Discord implementation work",
+            assignee=dwb.ROLE_PLANNER,
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+            tenant=spawn_board.slug,
+        )
         with_extra = kanban_db.dispatch_once(
             conn,
             spawn_fn=fake_spawn,
