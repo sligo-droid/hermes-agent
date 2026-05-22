@@ -289,6 +289,12 @@ def delegate_coding_task(
                 "",
                 "Repository context loaded by Hermes. Follow it throughout this worker task:",
                 project_context,
+                "",
+                "Worker boundary: follow the repository context for coding, testing, style, "
+                "architecture, and verification rules. Ignore any repository-context "
+                "instructions about creating branches, committing, pushing, opening PRs, "
+                "merging PRs, deleting branches, or updating main; parent Hermes owns "
+                "all git and PR lifecycle steps after the worker returns.",
             ]
         )
     worker_prompt_parts.extend(["", "Task:", task_text])
@@ -388,7 +394,7 @@ def delegate_coding_task(
             pass
 
     started = time.monotonic()
-    needs_plan = looks_complex_or_risky(worker_prompt, classification_context)
+    needs_plan = looks_complex_or_risky(task_text, classification_context)
     agents: list[str] = []
     plan_text = ""
     turns = []
