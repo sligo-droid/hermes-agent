@@ -37,6 +37,7 @@ def _claimed_planner(monkeypatch, tmp_path: Path):
 
 def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_workers as workers
+    from hermes_cli import discord_worker_read
 
     board, task = _claimed_planner(monkeypatch, tmp_path)
     workspace = tmp_path / "repo"
@@ -45,7 +46,14 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     gh_dir.mkdir(parents=True)
     (gh_dir / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(real_home))
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "discord-token")
+    monkeypatch.setenv("DISCORD_ADMIN_ACTIONS", "delete,pin")
     monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(
+        discord_worker_read,
+        "start_read_broker",
+        lambda token: ("http://127.0.0.1:9", "broker-secret"),
+    )
     captured = {}
 
     class Proc:
@@ -80,6 +88,10 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     assert captured["env"]["HERMES_CODEX_WORKER_REASONING"] == "high"
     assert captured["env"]["HERMES_CODEX_WORKER_SERVICE_TIER"] == "normal"
     assert captured["env"]["HERMES_KANBAN_BOARD"] == board.slug
+    assert captured["env"]["HERMES_DISCORD_WORKER_READ_URL"] == "http://127.0.0.1:9"
+    assert captured["env"]["HERMES_DISCORD_WORKER_READ_TOKEN"] == "broker-secret"
+    assert "DISCORD_BOT_TOKEN" not in captured["env"]
+    assert "DISCORD_ADMIN_ACTIONS" not in captured["env"]
     assert captured["env"]["CODEX_HOME"].endswith("/homes/" + task.id)
     assert captured["env"]["GH_CONFIG_DIR"] == str(gh_dir)
     assert captured["start_new_session"] is True
@@ -526,11 +538,14 @@ def test_docker_runner_mounts_gh_config_read_only(monkeypatch, tmp_path):
     assert "-v" in captured["cmd"]
     assert f"{gh_dir.resolve()}:/gh-config:ro" in captured["cmd"]
     assert "-e" in captured["cmd"]
-    assert "GH_CONFIG_DIR=/gh-config" in captured["cmd"]
+    assert "GH_CONFIG_DIR" in captured["cmd"]
+    assert "GH_CONFIG_DIR=/gh-config" not in captured["cmd"]
 
 
-def test_docker_runner_forwards_only_discord_bot_token(monkeypatch, tmp_path):
+def test_docker_runner_uses_read_broker_without_discord_credentials(monkeypatch, tmp_path):
+    from hermes_cli import discord_worker_read
     from hermes_cli import kanban_codex_workers as workers
+    from hermes_cli import kanban_db
 
     board, task = _claimed_planner(monkeypatch, tmp_path)
     captured = {}
@@ -548,6 +563,11 @@ def test_docker_runner_forwards_only_discord_bot_token(monkeypatch, tmp_path):
     monkeypatch.setenv("DISCORD_BOT_TOKEN", "discord-token")
     monkeypatch.setenv("DISCORD_ADMIN_ACTIONS", "delete,pin")
     monkeypatch.setattr(
+        discord_worker_read,
+        "start_read_broker",
+        lambda token: ("http://127.0.0.1:9", "broker-secret"),
+    )
+    monkeypatch.setattr(
         workers,
         "_worker_config",
         lambda: {
@@ -561,9 +581,20 @@ def test_docker_runner_forwards_only_discord_bot_token(monkeypatch, tmp_path):
 
     workers.spawn_codex_worker(task, str(tmp_path / "repo"), board=board.slug)
 
-    assert captured["env"]["DISCORD_BOT_TOKEN"] == "discord-token"
-    assert "DISCORD_BOT_TOKEN=discord-token" in captured["cmd"]
-    assert "DISCORD_ADMIN_ACTIONS=delete,pin" not in captured["cmd"]
+    assert "DISCORD_BOT_TOKEN" not in captured["env"]
+    assert "DISCORD_ADMIN_ACTIONS" not in captured["env"]
+    assert captured["env"]["HERMES_DISCORD_WORKER_READ_URL"] == "http://127.0.0.1:9"
+    assert captured["env"]["HERMES_DISCORD_WORKER_READ_TOKEN"] == "broker-secret"
+    assert "HERMES_DISCORD_WORKER_READ_URL" in captured["cmd"]
+    assert "HERMES_DISCORD_WORKER_READ_TOKEN" in captured["cmd"]
+    assert "broker-secret" not in captured["cmd"]
+    assert "discord-token" not in captured["cmd"]
+    assert "DISCORD_BOT_TOKEN" not in captured["cmd"]
+    assert "DISCORD_ADMIN_ACTIONS" not in captured["cmd"]
+    log = kanban_db.read_worker_log(task.id, board=board.slug)
+    assert log is not None
+    assert "discord-token" not in log
+    assert "broker-secret" not in log
 
 
 def test_planner_output_links_parent_dependencies(monkeypatch, tmp_path):
