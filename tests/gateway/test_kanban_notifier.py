@@ -245,6 +245,8 @@ def test_discord_kanban_typing_watcher_syncs_feature_summary(tmp_path, monkeypat
         thread_id="99002",
         goal="Sync the feature summary card",
         chat_id="parent-991",
+        guild_id="guild-991",
+        parent_channel_id="parent-991",
     )
 
     adapter = FeatureSummarySyncAdapter()
@@ -256,6 +258,8 @@ def test_discord_kanban_typing_watcher_syncs_feature_summary(tmp_path, monkeypat
     target = adapter.synced[0]
     assert target["board"] == board.slug
     assert target["thread_id"] == "99002"
+    assert target["guild_id"] == "guild-991"
+    assert target["parent_channel_id"] == "parent-991"
     assert target["state"] == "active"
     assert target["fallback_title"] == "Sync the feature summary card"
     assert target["outcome"]
@@ -280,6 +284,29 @@ def test_discord_kanban_typing_watcher_suppresses_repeated_summary_sync(tmp_path
     asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
 
     assert len(adapter.synced) == 1
+
+
+def test_discord_kanban_target_cache_key_includes_thread_identity():
+    runner = GatewayRunner.__new__(GatewayRunner)
+
+    first = runner._discord_kanban_target_cache_key(
+        {
+            "board": "discord-99002",
+            "thread_id": "99002",
+            "guild_id": "guild-1",
+            "parent_channel_id": "parent-1",
+        }
+    )
+    second = runner._discord_kanban_target_cache_key(
+        {
+            "board": "discord-99002",
+            "thread_id": "99002",
+            "guild_id": "guild-2",
+            "parent_channel_id": "parent-1",
+        }
+    )
+
+    assert first != second
 
 
 def test_discord_kanban_typing_watcher_skips_completed_status_sync(tmp_path, monkeypatch):
@@ -416,10 +443,12 @@ def test_discord_kanban_typing_watcher_resyncs_stale_reaction_state(tmp_path, mo
     assert len(adapter.synced) == 1
     assert adapter.synced[0]["board"] == board.slug
     assert adapter.synced[0]["thread_id"] == "99004"
-    assert runner._discord_kanban_reaction_states[board.slug] == {
+    cache_key = runner._discord_kanban_target_cache_key(adapter.synced[0])
+    assert runner._discord_kanban_reaction_states[cache_key] == {
         "state": "active",
         "synced_at": 100.0,
     }
+    assert board.slug not in runner._discord_kanban_reaction_states
 
 
 def test_discord_kanban_typing_watcher_upgrades_state_only_reaction_cache(tmp_path, monkeypatch):
@@ -440,10 +469,12 @@ def test_discord_kanban_typing_watcher_upgrades_state_only_reaction_cache(tmp_pa
     asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
 
     assert len(adapter.synced) == 1
-    assert runner._discord_kanban_reaction_states[board.slug] == {
+    cache_key = runner._discord_kanban_target_cache_key(adapter.synced[0])
+    assert runner._discord_kanban_reaction_states[cache_key] == {
         "state": "active",
         "synced_at": 200.0,
     }
+    assert board.slug not in runner._discord_kanban_reaction_states
 
 
 def test_discord_kanban_typing_watcher_keeps_recent_reaction_cache(tmp_path, monkeypatch):
@@ -466,6 +497,19 @@ def test_discord_kanban_typing_watcher_keeps_recent_reaction_cache(tmp_path, mon
     asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
 
     assert adapter.synced == []
+    cache_key = runner._discord_kanban_target_cache_key(
+        {
+            "board": board.slug,
+            "thread_id": "99005",
+            "chat_id": "parent-994",
+            "state": "active",
+        }
+    )
+    assert runner._discord_kanban_reaction_states[cache_key] == {
+        "state": "active",
+        "synced_at": 90.0,
+    }
+    assert board.slug not in runner._discord_kanban_reaction_states
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):

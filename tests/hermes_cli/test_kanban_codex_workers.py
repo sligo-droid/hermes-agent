@@ -710,6 +710,18 @@ def test_docker_runner_uses_read_broker_without_discord_credentials(monkeypatch,
     assert "parent-cred" not in log
 
 
+def test_worker_prompt_mentions_read_only_discord_helper(monkeypatch):
+    from hermes_cli import kanban_codex_worker as worker
+
+    monkeypatch.setattr(worker.kanban_db, "build_worker_context", lambda _conn, _task_id: "{}")
+    monkeypatch.setattr(worker, "_git_summary", lambda _workspace: "clean")
+
+    prompt = worker._build_prompt(object(), "task-1", "planner")
+
+    assert "python -m hermes_cli.discord_worker_read fetch-message" in prompt
+    assert "read-only" in prompt.lower()
+
+
 def test_planner_output_links_parent_dependencies(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli import kanban_db

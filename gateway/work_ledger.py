@@ -13,7 +13,16 @@ from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 
 
-INCOMPLETE_STATUSES = frozenset({"accepted", "claimed"})
+INCOMPLETE_STATUSES = frozenset(
+    {
+        "accepted",
+        "claimed",
+        "agent_running",
+        "agent_done",
+        "response_delivered",
+        "summary_updated",
+    }
+)
 TERMINAL_STATUSES = frozenset({"completed", "failed", "blocked", "cancelled", "expired"})
 LEASE_SECONDS = 3600.0
 
@@ -176,6 +185,75 @@ class GatewayWorkLedger:
         item["lease_until"] = now + LEASE_SECONDS
         self._write(data)
         return dict(item)
+
+    def mark_agent_running(self, work_id: str, *, session_id: str | None = None) -> bool:
+        data = self._read()
+        item = data["items"].get(work_id)
+        if not isinstance(item, dict):
+            return False
+        item["status"] = "agent_running"
+        item["updated_at"] = self._now()
+        if session_id:
+            item["session_id"] = str(session_id)
+        self._write(data)
+        return True
+
+    def mark_agent_done(
+        self,
+        work_id: str,
+        *,
+        final_response: str,
+        session_id: str | None = None,
+        summary_status: str | None = None,
+        title: str | None = None,
+        feature_summary: dict[str, Any] | None = None,
+        project_summary: dict[str, Any] | None = None,
+        already_delivered: bool = False,
+    ) -> bool:
+        data = self._read()
+        item = data["items"].get(work_id)
+        if not isinstance(item, dict):
+            return False
+        now = self._now()
+        item["status"] = "response_delivered" if already_delivered else "agent_done"
+        item["updated_at"] = now
+        item["agent_done_at"] = now
+        item["final_response"] = str(final_response or "")
+        if session_id:
+            item["session_id"] = str(session_id)
+        if summary_status:
+            item["summary_status"] = str(summary_status)
+        if title:
+            item["title"] = str(title)
+        if feature_summary is not None:
+            item["feature_summary"] = feature_summary
+        if project_summary is not None:
+            item["project_summary"] = project_summary
+        self._write(data)
+        return True
+
+    def mark_response_delivered(self, work_id: str, *, result_message_id: str | None = None) -> bool:
+        data = self._read()
+        item = data["items"].get(work_id)
+        if not isinstance(item, dict):
+            return False
+        item["status"] = "response_delivered"
+        item["updated_at"] = self._now()
+        if result_message_id:
+            item["result_message_id"] = str(result_message_id)
+        self._write(data)
+        return True
+
+    def mark_summary_updated(self, work_id: str) -> bool:
+        data = self._read()
+        item = data["items"].get(work_id)
+        if not isinstance(item, dict):
+            return False
+        item["status"] = "summary_updated"
+        item["updated_at"] = self._now()
+        item["summary_updated_at"] = item["updated_at"]
+        self._write(data)
+        return True
 
     def mark_completed(self, work_id: str, *, result_message_id: str | None = None) -> bool:
         data = self._read()

@@ -78,11 +78,19 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
     context = kanban_db.build_worker_context(conn, task_id)
     schema = _schema_instructions(role)
     git = _git_summary(os.environ.get("HERMES_KANBAN_WORKSPACE", "") or os.getcwd())
+    discord_read = (
+        "Read-only Discord access:\n"
+        "- You may inspect Discord message context with "
+        "`python -m hermes_cli.discord_worker_read fetch-message --channel-id <id> --message-id <id>`.\n"
+        "- You may inspect recent thread/channel history with "
+        "`python -m hermes_cli.discord_worker_read fetch-messages --channel-id <id> --limit 25`.\n"
+        "- These commands are read-only. Do not attempt Discord mutation or admin actions.\n\n"
+    )
     return (
         f"You are the Discord Kanban {role} worker.\n"
-        "Do not call Hermes tools. Work only from the repository, shell, and files available in this worker environment.\n"
-        "For read-only Discord context, you may use `python -m hermes_cli.discord_worker_read fetch-message --channel-id <id> --message-id <id>` or `python -m hermes_cli.discord_worker_read fetch-messages --channel-id <id> --limit <n> [--before <id>] [--after <id>]`. Do not attempt Discord mutation or admin actions.\n"
+        "Do not call Hermes tools. Work only from the repository, shell, files, and the read-only Discord helper available in this worker environment.\n"
         "Return exactly one JSON object matching the schema below; do not wrap it in Markdown.\n\n"
+        f"{discord_read}"
         f"{schema}\n\n"
         f"Git context:\n{git}\n\n"
         f"Kanban context:\n{context}"
