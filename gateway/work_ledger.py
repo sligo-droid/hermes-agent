@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ INCOMPLETE_STATUSES = frozenset(
 )
 TERMINAL_STATUSES = frozenset({"completed", "failed", "blocked", "cancelled", "expired"})
 LEASE_SECONDS = 3600.0
+_DROP = object()
 
 
 def default_path() -> Path:
@@ -37,6 +39,36 @@ def _now() -> float:
 
 def _platform_value(value: Any) -> str:
     return getattr(value, "value", value) or ""
+
+
+def _durable_json_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        safe: dict[str, Any] = {}
+        for key, item in value.items():
+            key_str = str(key)
+            if key_str.startswith("_"):
+                continue
+            safe_item = _durable_json_value(item)
+            if safe_item is not _DROP:
+                safe[key_str] = safe_item
+        return safe
+    if isinstance(value, (list, tuple, set)):
+        safe_items = []
+        for item in value:
+            safe_item = _durable_json_value(item)
+            if safe_item is not _DROP:
+                safe_items.append(safe_item)
+        return safe_items
+    return _DROP
+
+
+def _durable_metadata(value: Any) -> Any:
+    safe = _durable_json_value(value)
+    return None if safe is _DROP else safe
 
 
 def _item_id(
@@ -157,8 +189,8 @@ class GatewayWorkLedger:
             "reply_to_text": getattr(event, "reply_to_text", None),
             "channel_prompt": getattr(event, "channel_prompt", None),
             "channel_context": getattr(event, "channel_context", None),
-            "feature_summary": getattr(event, "feature_summary", None),
-            "project_summary": getattr(event, "project_summary", None),
+            "feature_summary": _durable_metadata(getattr(event, "feature_summary", None)),
+            "project_summary": _durable_metadata(getattr(event, "project_summary", None)),
             "claim_pid": None,
             "lease_until": None,
             "result_message_id": None,
@@ -226,9 +258,9 @@ class GatewayWorkLedger:
         if title:
             item["title"] = str(title)
         if feature_summary is not None:
-            item["feature_summary"] = feature_summary
+            item["feature_summary"] = _durable_metadata(feature_summary)
         if project_summary is not None:
-            item["project_summary"] = project_summary
+            item["project_summary"] = _durable_metadata(project_summary)
         self._write(data)
         return True
 
