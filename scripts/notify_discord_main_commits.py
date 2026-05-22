@@ -216,18 +216,11 @@ def build_webhook_payloads(
             pull_request = pull_request_lookup(sha)
         embeds.append(_commit_embed(event, commit, pull_request))
     payloads: list[dict[str, Any]] = []
-    repo_name = str(
-        (event.get("repository") or {}).get("full_name")
-        or os.getenv("GITHUB_REPOSITORY")
-        or "repository"
-    )
-
     for index in range(0, len(embeds), MAX_EMBEDS_PER_MESSAGE):
         chunk = embeds[index : index + MAX_EMBEDS_PER_MESSAGE]
         payloads.append(
             {
                 "username": "Hermes Main Logs",
-                "content": f"{len(chunk)} commit(s) landed on `{repo_name}` `main`.",
                 "allowed_mentions": {"parse": []},
                 "embeds": chunk,
             }

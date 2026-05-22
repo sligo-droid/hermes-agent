@@ -51,7 +51,7 @@ def test_single_commit_payload_links_embed_and_disables_mentions():
     assert len(payloads) == 1
     payload = payloads[0]
     assert payload["allowed_mentions"] == {"parse": []}
-    assert payload["content"] == "1 commit(s) landed on `NousResearch/hermes-agent` `main`."
+    assert "content" not in payload
     assert len(payload["embeds"]) == 1
     embed = payload["embeds"][0]
     assert embed["title"] == "0000000 pushed to main"
@@ -165,7 +165,7 @@ def test_pr_merge_push_suppresses_intermediate_commits_from_same_payload():
     assert embed["title"] == "0000000 pushed to main"
     assert embed["url"].endswith("000000000000000000000000000000000000000c")
     assert embed["description"] == "Summary\nUse the PR body once."
-    assert payloads[0]["content"] == "1 commit(s) landed on `NousResearch/hermes-agent` `main`."
+    assert "content" not in payloads[0]
 
 
 def test_direct_multi_commit_push_still_posts_each_commit():
