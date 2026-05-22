@@ -1,7 +1,8 @@
 import type { Msg } from '../types.js'
 
-import { boundedHistoryRenderText } from './text.js'
+import { TERMUX_TUI_MODE } from '../config/env.js'
 import { transcriptBodyWidth } from './inputMetrics.js'
+import { boundedHistoryRenderText } from './text.js'
 
 const hashText = (text: string) => {
   let h = 5381
@@ -99,7 +100,7 @@ export const estimatedMsgHeight = (
     return Math.max(2, msg.todos.length + 2)
   }
 
-  const bodyWidth = transcriptBodyWidth(cols, msg.role, userPrompt)
+  const bodyWidth = transcriptBodyWidth(cols, msg.role, userPrompt, TERMUX_TUI_MODE)
   const text = msg.role === 'assistant' && limitHistory ? boundedHistoryRenderText(msg.text) : msg.text
   let h = wrappedLines(text || ' ', bodyWidth)
 
