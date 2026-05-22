@@ -162,6 +162,13 @@ def _worker_env() -> dict[str, str]:
     return env
 
 
+def _codex_home_source_env() -> dict[str, str]:
+    env = os.environ.copy()
+    if env.get("HERMES_CODEX_WORKER_CREDENTIAL_ID"):
+        _strip_inherited_codex_worker_state(env)
+    return env
+
+
 def _is_sensitive_env_key(key: str) -> bool:
     upper = key.upper()
     return any(fragment in upper for fragment in _SENSITIVE_ENV_FRAGMENTS)
@@ -465,7 +472,7 @@ def _write_minimal_codex_home(path: Path) -> Optional[str]:
     """Create a Codex home with auth but no Hermes MCP/tool bridge."""
     from agent.codex_worker_auth import prepare_codex_worker_home
 
-    return prepare_codex_worker_home(path)
+    return prepare_codex_worker_home(path, source_env=_codex_home_source_env())
 
 
 def spawn_or_default(task: Any, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
