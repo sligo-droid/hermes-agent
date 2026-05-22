@@ -69,6 +69,13 @@ _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-
 _TRUTHY_ENV_VALUES = {"true", "1", "yes", "on"}
 _CODEX_APP_SERVER_ACTIVITY_PREFIX = "Codex app-server event:"
 _MEETING_GOAL_SKILL_NAMES = {"meeting", "discord-meeting-intake"}
+_DISCORD_FEATURE_REQUEST_FAST_PATH_PROMPT = (
+    "Discord feature-request thread guidance: move directly from request to "
+    "implementation and verification. For straightforward code/deploy asks, "
+    "avoid lengthy planning/status narration, make the smallest correct change, "
+    "run focused checks, and report the result concisely with PR/deploy evidence "
+    "when available."
+)
 
 
 def _gateway_flow_route_type(event: Any, command: Optional[str] = None) -> str:
@@ -85,6 +92,21 @@ def _gateway_flow_route_type(event: Any, command: Optional[str] = None) -> str:
     ):
         return "slash_goal"
     return "mainline"
+
+
+def _is_standard_discord_feature_request(
+    source: Any,
+    feature_summary: Optional[Dict[str, Any]],
+) -> bool:
+    """True for ordinary Discord feature threads, excluding /goal worker threads."""
+    if getattr(source, "platform", None) != Platform.DISCORD:
+        return False
+    if not isinstance(feature_summary, dict):
+        return False
+    initial_request = str(feature_summary.get("initial_request") or "").strip()
+    if re.match(r"^/goal(?:\s|$)", initial_request, flags=re.IGNORECASE):
+        return False
+    return not bool(feature_summary.get("kanban_board"))
 
 
 def _gateway_flow_telemetry_fields(
@@ -16829,6 +16851,10 @@ class GatewayRunner:
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
         session_cwd = _resolve_gateway_session_cwd(source, user_config)
+        standard_discord_feature_request = _is_standard_discord_feature_request(
+            source,
+            feature_summary,
+        )
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
@@ -17498,6 +17524,12 @@ class GatewayRunner:
             event_channel_prompt = (channel_prompt or "").strip()
             if event_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
+            if standard_discord_feature_request:
+                combined_ephemeral = (
+                    combined_ephemeral
+                    + "\n\n"
+                    + _DISCORD_FEATURE_REQUEST_FAST_PATH_PROMPT
+                ).strip()
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
@@ -17648,6 +17680,8 @@ class GatewayRunner:
                 cache_keys={
                     **self._extract_cache_busting_config(user_config),
                     "gateway.session_cwd": session_cwd,
+                    "gateway.discord_feature_request_fast_path": standard_discord_feature_request,
+                    "gateway.tool_delay": 0.0 if standard_discord_feature_request else None,
                 },
             )
             agent = None
@@ -17670,37 +17704,40 @@ class GatewayRunner:
 
             if agent is None:
                 # Config changed or first message — create fresh agent
-                agent = AIAgent(
-                    model=turn_route["model"],
+                agent_kwargs = {
+                    "model": turn_route["model"],
                     **turn_route["runtime"],
-                    max_iterations=max_iterations,
-                    quiet_mode=True,
-                    verbose_logging=False,
-                    enabled_toolsets=enabled_toolsets,
-                    disabled_toolsets=disabled_toolsets,
-                    ephemeral_system_prompt=combined_ephemeral or None,
-                    prefill_messages=self._prefill_messages or None,
-                    reasoning_config=reasoning_config,
-                    service_tier=self._service_tier,
-                    request_overrides=turn_route.get("request_overrides"),
-                    providers_allowed=pr.get("only"),
-                    providers_ignored=pr.get("ignore"),
-                    providers_order=pr.get("order"),
-                    provider_sort=pr.get("sort"),
-                    provider_require_parameters=pr.get("require_parameters", False),
-                    provider_data_collection=pr.get("data_collection"),
-                    session_id=session_id,
-                    platform=platform_key,
-                    user_id=source.user_id,
-                    user_name=source.user_name,
-                    chat_id=source.chat_id,
-                    chat_name=source.chat_name,
-                    chat_type=source.chat_type,
-                    thread_id=source.thread_id,
-                    gateway_session_key=session_key,
-                    session_db=self._session_db,
-                    fallback_model=self._fallback_model,
-                )
+                    "max_iterations": max_iterations,
+                    "quiet_mode": True,
+                    "verbose_logging": False,
+                    "enabled_toolsets": enabled_toolsets,
+                    "disabled_toolsets": disabled_toolsets,
+                    "ephemeral_system_prompt": combined_ephemeral or None,
+                    "prefill_messages": self._prefill_messages or None,
+                    "reasoning_config": reasoning_config,
+                    "service_tier": self._service_tier,
+                    "request_overrides": turn_route.get("request_overrides"),
+                    "providers_allowed": pr.get("only"),
+                    "providers_ignored": pr.get("ignore"),
+                    "providers_order": pr.get("order"),
+                    "provider_sort": pr.get("sort"),
+                    "provider_require_parameters": pr.get("require_parameters", False),
+                    "provider_data_collection": pr.get("data_collection"),
+                    "session_id": session_id,
+                    "platform": platform_key,
+                    "user_id": source.user_id,
+                    "user_name": source.user_name,
+                    "chat_id": source.chat_id,
+                    "chat_name": source.chat_name,
+                    "chat_type": source.chat_type,
+                    "thread_id": source.thread_id,
+                    "gateway_session_key": session_key,
+                    "session_db": self._session_db,
+                    "fallback_model": self._fallback_model,
+                }
+                if standard_discord_feature_request:
+                    agent_kwargs["tool_delay"] = 0.0
+                agent = AIAgent(**agent_kwargs)
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         _cache[session_key] = (agent, _sig)
