@@ -63,7 +63,7 @@ _DISCORD_SHIP_REACTION_EMOJIS = frozenset({
     "👍🏾",
     "👍🏿",
 })
-_DISCORD_STATUS_REACTION_EMOJIS = ("✅", "❌", "👀", "❓")
+_DISCORD_STATUS_REACTION_EMOJIS = ("✅", "❌", "👀", "❓", "⏳")
 
 
 def _discord_live_voice_enabled() -> bool:
@@ -1604,6 +1604,8 @@ class DiscordAdapter(BasePlatformAdapter):
             return "❓ Blocked"
         if lower in {"failed", "failure", "error", "errored", "interrupted"}:
             return "❌ Failed"
+        if lower in {"running", "working"}:
+            return "⏳ Running"
         return "👀 In progress"
 
     def _summary_color(self, status: str):
@@ -1676,14 +1678,17 @@ class DiscordAdapter(BasePlatformAdapter):
             return "Blocked"
         if state == "errored":
             return "Failed"
-        if state == "active":
+        if state == "running":
             return "Running"
+        if state == "active":
+            return "In progress"
         return None
 
     def _feature_kanban_reaction_emoji(self, state: Optional[str]) -> Optional[str]:
         return {
             "done": "✅",
             "active": "👀",
+            "running": "⏳",
             "blocked": "❓",
             "errored": "❌",
         }.get(str(state or ""))
@@ -1784,7 +1789,7 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             embed = self._build_feature_summary_embed(
                 initial_request=initial_request,
-                status="Running",
+                status="In progress",
                 metadata=self._collect_discord_project_metadata(project_context),
                 kanban_url=(board_handle or {}).get("public_url"),
             )

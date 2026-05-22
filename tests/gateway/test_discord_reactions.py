@@ -424,6 +424,7 @@ async def test_top_level_feature_summary_reactions_target_triggering_user_messag
     ("state", "emoji"),
     [
         ("active", "👀"),
+        ("running", "⏳"),
         ("done", "✅"),
         ("blocked", "❓"),
         ("errored", "❌"),
@@ -454,7 +455,7 @@ async def test_feature_summary_reactions_follow_kanban_state(adapter, state, emo
     assert (emoji, adapter._client.user) not in completion_removes
     assert completion_removes == [
         (existing, adapter._client.user)
-        for existing in ("✅", "❌", "👀", "❓")
+        for existing in ("✅", "❌", "👀", "❓", "⏳")
         if existing != emoji
     ]
 
@@ -478,12 +479,15 @@ async def test_status_reaction_state_replaces_different_target(adapter):
     raw_message = SimpleNamespace(
         add_reaction=AsyncMock(),
         remove_reaction=AsyncMock(),
-        reactions=[SimpleNamespace(emoji="👀", me=True)],
+        reactions=[SimpleNamespace(emoji="👀", me=True), SimpleNamespace(emoji="⏳", me=True)],
     )
 
     await adapter._set_message_reaction_state(raw_message, "❓")
 
-    raw_message.remove_reaction.assert_awaited_once_with("👀", adapter._client.user)
+    assert [call.args for call in raw_message.remove_reaction.await_args_list] == [
+        ("👀", adapter._client.user),
+        ("⏳", adapter._client.user),
+    ]
     raw_message.add_reaction.assert_awaited_once_with("❓")
 
 

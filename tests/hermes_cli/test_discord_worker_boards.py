@@ -204,6 +204,7 @@ def test_board_thread_state_reflects_kanban_tasks(monkeypatch, tmp_path):
 
         claimed = kanban_db.claim_task(conn, task.id)
         assert claimed is not None
+        assert dwb.board_thread_state(board.slug) == "running"
         kanban_db.block_task(
             conn,
             task.id,

@@ -625,6 +625,22 @@ async def test_feature_summary_update_edits_initial_message(adapter, monkeypatch
 
 
 def test_feature_summary_kanban_status_labels(adapter):
+    adapter._feature_kanban_reaction_state = MagicMock(return_value="active")
+    active_embed = adapter._build_feature_summary_embed(
+        initial_request="",
+        status=adapter._feature_kanban_summary_status({"kanban_board": {"slug": "board"}}) or "Running",
+    )
+    active_fields = {field.name: field.value for field in active_embed.fields}
+    assert active_fields["Status"] == "👀 In progress"
+
+    adapter._feature_kanban_reaction_state = MagicMock(return_value="running")
+    running_embed = adapter._build_feature_summary_embed(
+        initial_request="",
+        status=adapter._feature_kanban_summary_status({"kanban_board": {"slug": "board"}}) or "Running",
+    )
+    running_fields = {field.name: field.value for field in running_embed.fields}
+    assert running_fields["Status"] == "⏳ Running"
+
     adapter._feature_kanban_reaction_state = MagicMock(return_value="done")
     done_embed = adapter._build_feature_summary_embed(
         initial_request="",

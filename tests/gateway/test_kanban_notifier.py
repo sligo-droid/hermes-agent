@@ -236,6 +236,10 @@ def test_discord_kanban_typing_watcher_pulses_running_thread(tmp_path, monkeypat
         }
     ]
 
+    targets = dwb.thread_status_targets()
+    assert [target["board"] for target in targets] == [board.slug]
+    assert targets[0]["state"] == "running"
+
 
 def test_discord_kanban_typing_watcher_syncs_feature_summary(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
