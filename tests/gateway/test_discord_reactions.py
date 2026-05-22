@@ -438,15 +438,53 @@ async def test_feature_summary_reactions_follow_kanban_state(adapter, state, emo
     event.feature_summary = {
         "thread_id": "123",
         "message_id": "456",
-        "kanban_board": {"slug": "discord-thread-123"},
+        "kanban_board": {"slug": "discord-123"},
     }
     adapter._feature_kanban_reaction_state = MagicMock(return_value=state)
 
     await adapter.on_processing_start(event)
+    removed_before_complete = len(raw_message.remove_reaction.await_args_list)
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
     assert raw_message.add_reaction.await_args_list[-1].args == (emoji,)
-    assert ("❓", adapter._client.user) in [call.args for call in raw_message.remove_reaction.await_args_list]
+    completion_removes = [
+        call.args
+        for call in raw_message.remove_reaction.await_args_list[removed_before_complete:]
+    ]
+    assert (emoji, adapter._client.user) not in completion_removes
+    assert completion_removes == [
+        (existing, adapter._client.user)
+        for existing in ("✅", "❌", "👀", "❓")
+        if existing != emoji
+    ]
+
+
+@pytest.mark.asyncio
+async def test_status_reaction_state_preserves_existing_target(adapter):
+    raw_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="👀", me=True)],
+    )
+
+    await adapter._set_message_reaction_state(raw_message, "👀")
+
+    raw_message.remove_reaction.assert_not_awaited()
+    raw_message.add_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_status_reaction_state_replaces_different_target(adapter):
+    raw_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="👀", me=True)],
+    )
+
+    await adapter._set_message_reaction_state(raw_message, "❓")
+
+    raw_message.remove_reaction.assert_awaited_once_with("👀", adapter._client.user)
+    raw_message.add_reaction.assert_awaited_once_with("❓")
 
 
 @pytest.mark.asyncio

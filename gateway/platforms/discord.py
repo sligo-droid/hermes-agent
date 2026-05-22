@@ -63,6 +63,7 @@ _DISCORD_SHIP_REACTION_EMOJIS = frozenset({
     "👍🏾",
     "👍🏿",
 })
+_DISCORD_STATUS_REACTION_EMOJIS = ("✅", "❌", "👀", "❓")
 
 
 def _discord_live_voice_enabled() -> bool:
@@ -2995,10 +2996,27 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.debug("[%s] Failed to reopen Discord feature summary: %s", self.name, exc)
 
     async def _set_message_reaction_state(self, message: Any, emoji: Optional[str]) -> None:
-        for existing in ("✅", "❌", "👀", "❓"):
+        target_present = self._message_has_own_reaction(message, emoji) if emoji else False
+        for existing in _DISCORD_STATUS_REACTION_EMOJIS:
+            if emoji and existing == emoji:
+                continue
+            if self._message_has_own_reaction(message, existing) is False:
+                continue
             await self._remove_reaction(message, existing)
-        if emoji:
+        if emoji and target_present is not True:
             await self._add_reaction(message, emoji)
+
+    def _message_has_own_reaction(self, message: Any, emoji: Optional[str]) -> Optional[bool]:
+        if not emoji:
+            return False
+        reactions = getattr(message, "reactions", None)
+        if reactions is None:
+            return None
+        for reaction in reactions or []:
+            reaction_emoji = getattr(reaction, "emoji", reaction)
+            if str(reaction_emoji) == emoji and bool(getattr(reaction, "me", False)):
+                return True
+        return False
 
     async def sync_kanban_thread_reaction(self, target: Dict[str, Any]) -> Optional[str]:
         """Synchronize a Discord worker thread's origin-message reaction."""
