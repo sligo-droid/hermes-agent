@@ -5557,7 +5557,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return
 
         is_thread = isinstance(channel, discord.Thread)
-        parent_channel = self._thread_parent_channel(channel)
+        parent_channel = self._thread_parent_channel(channel) if is_thread else channel
         if is_thread:
             thread_id = str(getattr(channel, "id", None) or getattr(interaction, "channel_id", "") or "")
             thread_name = getattr(channel, "name", None) or self._goal_thread_name(args)
