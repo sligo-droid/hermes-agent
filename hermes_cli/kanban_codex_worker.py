@@ -534,6 +534,46 @@ def _checkpoint_commit(workspace: str, task_id: str, summary: str) -> None:
         return
 
 
+def _github_repo_from_url(url: str) -> Optional[str]:
+    raw = str(url or "").strip()
+    if not raw:
+        return None
+    raw = re.sub(r"^git\+", "", raw)
+    patterns = (
+        r"^https?://github\.com/([^/]+)/([^/#?]+?)(?:\.git)?/?(?:[#?].*)?$",
+        r"^ssh://git@github\.com/([^/]+)/([^/#?]+?)(?:\.git)?/?(?:[#?].*)?$",
+        r"^git@github\.com:([^/]+)/([^/#?]+?)(?:\.git)?$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, raw)
+        if match:
+            owner, repo = match.groups()
+            return f"{owner}/{repo}"
+    return None
+
+
+def _resolve_github_repo(worker: dict[str, Any], root: Path) -> Optional[str]:
+    context = worker.get("project_context") if isinstance(worker.get("project_context"), dict) else {}
+    for source in (context, worker):
+        for key in ("github_url", "project_github_url", "repo_url", "repository_url"):
+            repo = _github_repo_from_url(str(source.get(key) or ""))
+            if repo:
+                return repo
+    try:
+        remote = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return None
+    if remote.returncode != 0:
+        return None
+    return _github_repo_from_url(remote.stdout)
+
+
 def _ensure_pr(board: Optional[str], workspace: str) -> None:
     if not board:
         return
@@ -544,19 +584,45 @@ def _ensure_pr(board: Optional[str], workspace: str) -> None:
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
     root = Path(workspace)
     branch = str(worker.get("worker_branch") or "").strip()
+    base = str(worker.get("base_branch") or "main").strip() or "main"
+    repo = _resolve_github_repo(worker, root)
     try:
+        missing = []
+        if not repo:
+            missing.append("GitHub repository")
+        if not branch:
+            missing.append("worker branch")
+        if missing:
+            worker["pr_error"] = f"Cannot create PR: missing {', '.join(missing)}"
+            raise RuntimeError(worker["pr_error"])
         existing = subprocess.run(
-            ["gh", "pr", "view", "--json", "url", "--jq", ".url"],
+            [
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--head",
+                branch,
+                "--base",
+                base,
+                "--state",
+                "open",
+                "--json",
+                "url",
+                "--jq",
+                ".[0].url",
+            ],
             cwd=root,
             capture_output=True,
             text=True,
             timeout=20,
         )
-        if existing.returncode == 0 and (existing.stdout or "").strip():
-            worker["pr_url"] = existing.stdout.strip()
+        existing_url = (existing.stdout or "").strip()
+        if existing.returncode == 0 and existing_url and existing_url != "null":
+            worker["pr_url"] = existing_url
         else:
-            if branch:
-                subprocess.run(["git", "push", "-u", "origin", branch], cwd=root, timeout=300)
+            subprocess.run(["git", "push", "-u", "origin", branch], cwd=root, timeout=300)
             title_source = str(
                 worker.get("root_goal")
                 or worker.get("initial_request")
@@ -568,7 +634,21 @@ def _ensure_pr(board: Optional[str], workspace: str) -> None:
                 f"Goal:\n{worker.get('root_goal') or worker.get('initial_request') or ''}"
             )
             created = subprocess.run(
-                ["gh", "pr", "create", "--title", title, "--body", body],
+                [
+                    "gh",
+                    "pr",
+                    "create",
+                    "--repo",
+                    repo,
+                    "--base",
+                    base,
+                    "--head",
+                    branch,
+                    "--title",
+                    title,
+                    "--body",
+                    body,
+                ],
                 cwd=root,
                 capture_output=True,
                 text=True,
@@ -579,7 +659,7 @@ def _ensure_pr(board: Optional[str], workspace: str) -> None:
             else:
                 worker["pr_error"] = (created.stderr or created.stdout or "gh pr create failed").strip()
     except Exception as exc:
-        worker["pr_error"] = str(exc)
+        worker.setdefault("pr_error", str(exc))
     metadata[DISCORD_WORKER_META_KEY] = worker
     metadata.pop("db_path", None)
     atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)

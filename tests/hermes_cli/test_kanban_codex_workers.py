@@ -910,3 +910,105 @@ def test_update_phase_refreshes_worker_updated_at(monkeypatch, tmp_path):
     assert meta["phase"] == "complete"
     assert meta["goal_status"] == "done"
     assert meta["updated_at"] == 12345
+
+
+def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="explicit-pr",
+        goal="Ship explicit PR context",
+        project_context={"github_url": "https://github.com/sligo-labs/PID.git", "base_branch": "develop"},
+    )
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/123\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    worker._ensure_pr(board.slug, str(workspace))
+
+    pr_list = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "list"])
+    pr_create = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "create"])
+    assert pr_list[pr_list.index("--repo") + 1] == "sligo-labs/PID"
+    assert pr_list[pr_list.index("--base") + 1] == "develop"
+    assert pr_list[pr_list.index("--head") + 1] == "discord/explicit-pr"
+    assert pr_create[pr_create.index("--repo") + 1] == "sligo-labs/PID"
+    assert pr_create[pr_create.index("--base") + 1] == "develop"
+    assert pr_create[pr_create.index("--head") + 1] == "discord/explicit-pr"
+    assert ["git", "push", "-u", "origin", "discord/explicit-pr"] in calls
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert meta["pr_url"] == "https://github.com/sligo-labs/PID/pull/123"
+
+
+def test_ensure_pr_falls_back_to_origin_remote_for_repo(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+
+    board = dwb.start_direct_goal(thread_id="remote-pr", goal="Ship remote fallback")
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "remote", "get-url", "origin"]:
+            return SimpleNamespace(returncode=0, stdout="git@github.com:sligo-labs/PID.git\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/124\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    worker._ensure_pr(board.slug, str(workspace))
+
+    pr_create = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "create"])
+    assert pr_create[pr_create.index("--repo") + 1] == "sligo-labs/PID"
+    assert pr_create[pr_create.index("--base") + 1] == "main"
+    assert pr_create[pr_create.index("--head") + 1] == "discord/remote-pr"
+
+
+def test_ensure_pr_records_error_when_repo_or_head_missing(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import DISCORD_WORKER_META_KEY
+    from utils import atomic_json_write
+
+    board = dwb.start_direct_goal(thread_id="missing-pr", goal="Cannot resolve")
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    metadata = kanban_db.read_board_metadata(board.slug)
+    metadata[DISCORD_WORKER_META_KEY]["worker_branch"] = ""
+    metadata.pop("db_path", None)
+    atomic_json_write(kanban_db.board_metadata_path(board.slug), metadata, indent=2)
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "remote", "get-url", "origin"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="no remote")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    worker._ensure_pr(board.slug, str(workspace))
+
+    meta = kanban_db.read_board_metadata(board.slug)[DISCORD_WORKER_META_KEY]
+    assert meta["pr_error"] == "Cannot create PR: missing GitHub repository, worker branch"
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd in calls)
