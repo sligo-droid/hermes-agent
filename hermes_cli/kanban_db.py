@@ -1953,11 +1953,7 @@ def _end_run(
                summary       = ?,
                error         = ?,
                metadata      = ?,
-               ended_at      = ?,
-               claim_lock    = NULL,
-               claim_expires = NULL,
-               worker_pid    = NULL,
-               worker_unit   = NULL
+               ended_at      = ?
          WHERE id = ?
            AND ended_at IS NULL
         """,
@@ -2277,8 +2273,7 @@ def claim_task(
                 UPDATE task_runs
                    SET status = 'reclaimed', outcome = 'reclaimed',
                        summary = COALESCE(summary, 'invariant recovery on re-claim'),
-                       ended_at = ?,
-                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_unit = NULL
+                       ended_at = ?
                  WHERE id = ? AND ended_at IS NULL
                 """,
                 (now, int(stale["current_run_id"])),
@@ -3220,9 +3215,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 UPDATE task_runs
                    SET status = 'reclaimed', outcome = 'reclaimed',
                        summary = COALESCE(summary, 'invariant recovery on unblock'),
-                       ended_at = ?,
-                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_unit = NULL
-                 WHERE id = ? AND ended_at IS NULL
+                       ended_at = ?
+                  WHERE id = ? AND ended_at IS NULL
                 """,
                 (now, int(stale["current_run_id"])),
             )

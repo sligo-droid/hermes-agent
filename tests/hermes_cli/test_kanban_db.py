@@ -1190,6 +1190,136 @@ def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable
         assert kb.get_task(conn, c).status == "running"
 
 
+def test_dispatch_after_reopen_claims_persisted_ready_task(
+    kanban_home, all_assignees_spawnable,
+):
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append((task.id, task.current_run_id, task.claim_lock, board))
+        return 4242
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="survives restart", assignee="alice")
+
+    with kb.connect() as restarted:
+        res = kb.dispatch_once(restarted, spawn_fn=fake_spawn, board="default")
+        task = kb.get_task(restarted, task_id)
+        runs = kb.list_runs(restarted, task_id)
+
+    assert [item[0] for item in res.spawned] == [task_id]
+    assert len(spawns) == 1
+    assert spawns[0][0] == task_id
+    assert spawns[0][1] is not None
+    assert spawns[0][2]
+    assert spawns[0][3] == "default"
+    assert task.status == "running"
+    assert task.current_run_id == runs[0].id
+    assert task.worker_pid == 4242
+    assert len(runs) == 1
+    assert runs[0].claim_lock == task.claim_lock
+    assert runs[0].claim_expires == task.claim_expires
+    assert runs[0].worker_pid == 4242
+
+
+def test_dispatch_after_reopen_extends_live_expired_claim_without_duplicate(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    spawns = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="live after restart", assignee="alice")
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, task_id, claimer=f"{host}:worker", ttl_seconds=60)
+        run_id = kb.latest_run(conn, task_id).id
+        kb._set_worker_pid(conn, task_id, 12345)
+        expired = int(time.time()) - 60
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (expired, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
+            (expired, run_id),
+        )
+
+    with kb.connect() as restarted:
+        res = kb.dispatch_once(
+            restarted,
+            spawn_fn=lambda task, workspace, board=None: spawns.append(task.id),
+        )
+        task = kb.get_task(restarted, task_id)
+        runs = kb.list_runs(restarted, task_id)
+
+    assert res.reclaimed == 0
+    assert res.spawned == []
+    assert spawns == []
+    assert task.status == "running"
+    assert task.current_run_id == run_id
+    assert task.claim_expires is not None and task.claim_expires > expired
+    assert len(runs) == 1
+    assert runs[0].id == run_id
+    assert runs[0].ended_at is None
+    assert runs[0].worker_pid == 12345
+    assert runs[0].claim_expires == task.claim_expires
+
+
+def test_dispatch_after_reopen_extends_active_unit_without_duplicate(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        kb,
+        "_systemd_unit_status",
+        lambda _unit: kb._SystemdUnitStatus(active=True, pid=23456),
+    )
+    spawns = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="unit after restart", assignee="alice")
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, task_id, claimer=f"{host}:worker", ttl_seconds=60)
+        run_id = kb.latest_run(conn, task_id).id
+        kb._set_worker_handle(
+            conn,
+            task_id,
+            kb._SpawnHandle(unit="hermes-kanban-worker-default-unit-r1"),
+        )
+        expired = int(time.time()) - 60
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (expired, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
+            (expired, run_id),
+        )
+
+    with kb.connect() as restarted:
+        res = kb.dispatch_once(
+            restarted,
+            spawn_fn=lambda task, workspace, board=None: spawns.append(task.id),
+        )
+        task = kb.get_task(restarted, task_id)
+        runs = kb.list_runs(restarted, task_id)
+
+    assert res.reclaimed == 0
+    assert res.spawned == []
+    assert spawns == []
+    assert task.status == "running"
+    assert task.current_run_id == run_id
+    assert task.worker_pid == 23456
+    assert task.worker_unit == "hermes-kanban-worker-default-unit-r1.service"
+    assert task.claim_expires is not None and task.claim_expires > expired
+    assert len(runs) == 1
+    assert runs[0].id == run_id
+    assert runs[0].ended_at is None
+    assert runs[0].worker_pid == 23456
+    assert runs[0].worker_unit == task.worker_unit
+    assert runs[0].claim_expires == task.claim_expires
+
+
 def test_dispatch_records_spawn_handle_pid_and_unit(
     kanban_home, all_assignees_spawnable,
 ):
@@ -1289,6 +1419,65 @@ def test_dispatch_reclaims_stale_before_spawning(kanban_home):
         )
         res = kb.dispatch_once(conn, dry_run=True)
     assert res.reclaimed == 1
+
+
+def test_terminal_run_history_preserves_claim_and_worker_identity(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        completed = kb.create_task(conn, title="complete", assignee="alice")
+        kb.claim_task(conn, completed, claimer="host:complete", ttl_seconds=60)
+        completed_run_id = kb.latest_run(conn, completed).id
+        completed_task = kb.get_task(conn, completed)
+        kb._set_worker_handle(
+            conn,
+            completed,
+            kb._SpawnHandle(pid=11111, unit="hermes-kanban-worker-default-complete-r1"),
+        )
+        assert kb.complete_task(conn, completed, result="done")
+
+        reclaimed = kb.create_task(conn, title="reclaim", assignee="alice")
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, reclaimed, claimer=f"{host}:reclaim", ttl_seconds=60)
+        reclaimed_run_id = kb.latest_run(conn, reclaimed).id
+        reclaimed_task = kb.get_task(conn, reclaimed)
+        kb._set_worker_handle(
+            conn,
+            reclaimed,
+            kb._SpawnHandle(pid=22222, unit="hermes-kanban-worker-default-reclaim-r1"),
+        )
+        expired = int(time.time()) - 60
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (expired, reclaimed),
+        )
+        conn.execute(
+            "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
+            (expired, reclaimed_run_id),
+        )
+        assert kb.release_stale_claims(conn, signal_fn=lambda _pid, _sig: None) == 1
+
+        completed_run = conn.execute(
+            "SELECT * FROM task_runs WHERE id = ?",
+            (completed_run_id,),
+        ).fetchone()
+        reclaimed_run = conn.execute(
+            "SELECT * FROM task_runs WHERE id = ?",
+            (reclaimed_run_id,),
+        ).fetchone()
+
+    assert completed_run["ended_at"] is not None
+    assert completed_run["claim_lock"] == completed_task.claim_lock
+    assert completed_run["claim_expires"] == completed_task.claim_expires
+    assert completed_run["worker_pid"] == 11111
+    assert completed_run["worker_unit"] == "hermes-kanban-worker-default-complete-r1.service"
+    assert reclaimed_run["ended_at"] is not None
+    assert reclaimed_run["claim_lock"] == reclaimed_task.claim_lock
+    assert reclaimed_run["claim_expires"] == expired
+    assert reclaimed_run["worker_pid"] == 22222
+    assert reclaimed_run["worker_unit"] == "hermes-kanban-worker-default-reclaim-r1.service"
 
 
 # ---------------------------------------------------------------------------
@@ -2134,6 +2323,8 @@ class TestSharedBoardPaths:
             "HERMES_PROFILE": "coder",
             "HERMES_KANBAN_TASK": "t_demo",
             "HERMES_KANBAN_DB": "/home/droid/.hermes/kanban.db",
+            "HERMES_KANBAN_RUN_ID": "9",
+            "HERMES_KANBAN_CLAIM_LOCK": "host:lock",
             "PATH": "/usr/bin",
             "OPENAI_API_KEY": "secret",
             "ANTHROPIC_API_KEY": "secret",
@@ -2144,6 +2335,8 @@ class TestSharedBoardPaths:
         assert out["HERMES_HOME"] == "/home/droid/.hermes/profiles/coder"
         assert out["GH_CONFIG_DIR"] == "/home/droid/.config/gh"
         assert out["HERMES_KANBAN_TASK"] == "t_demo"
+        assert out["HERMES_KANBAN_RUN_ID"] == "9"
+        assert out["HERMES_KANBAN_CLAIM_LOCK"] == "host:lock"
         assert out["PATH"] == "/usr/bin"
         assert "OPENAI_API_KEY" not in out
         assert "ANTHROPIC_API_KEY" not in out
@@ -2176,6 +2369,8 @@ class TestSharedBoardPaths:
                 "GH_CONFIG_DIR": "/home/droid/.config/gh",
                 "HERMES_HOME": "/home/droid/.hermes/profiles/coder",
                 "HERMES_KANBAN_TASK": "t_demo",
+                "HERMES_KANBAN_RUN_ID": "9",
+                "HERMES_KANBAN_CLAIM_LOCK": "host:lock",
                 "OPENAI_API_KEY": "secret",
             },
             log_path=tmp_path / "worker.log",
@@ -2197,6 +2392,8 @@ class TestSharedBoardPaths:
         assert f"WorkingDirectory={tmp_path}" in systemd_args
         assert "--setenv=GH_CONFIG_DIR=/home/droid/.config/gh" in systemd_args
         assert "--setenv=HERMES_KANBAN_TASK=t_demo" in systemd_args
+        assert "--setenv=HERMES_KANBAN_RUN_ID=9" in systemd_args
+        assert "--setenv=HERMES_KANBAN_CLAIM_LOCK=host:lock" in systemd_args
         assert all("OPENAI_API_KEY" not in arg for arg in systemd_args)
         assert systemd_args[-6:] == [
             "/usr/bin/hermes",

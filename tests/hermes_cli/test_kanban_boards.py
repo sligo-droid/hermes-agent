@@ -337,6 +337,32 @@ class TestConnectionIsolation:
         assert {t.title for t in b} == {"beta-only"}
         assert d == []
 
+    def test_dispatch_one_discord_board_does_not_claim_another(
+        self, fresh_home, all_assignees_spawnable,
+    ):
+        kb.create_board("discord-111")
+        kb.create_board("discord-222")
+        spawns = []
+
+        with kb.connect(board="discord-111") as conn:
+            first = kb.create_task(conn, title="first", assignee="dev")
+        with kb.connect(board="discord-222") as conn:
+            second = kb.create_task(conn, title="second", assignee="dev")
+
+        with kb.connect(board="discord-111") as conn:
+            kb.dispatch_once(
+                conn,
+                board="discord-111",
+                spawn_fn=lambda task, workspace, board=None: spawns.append((task.id, board)),
+            )
+
+        with kb.connect(board="discord-111") as conn:
+            assert kb.get_task(conn, first).status == "running"
+        with kb.connect(board="discord-222") as conn:
+            assert kb.get_task(conn, second).status == "ready"
+            assert kb.list_runs(conn, second) == []
+        assert spawns == [(first, "discord-111")]
+
     def test_connect_without_args_uses_current(self, fresh_home):
         kb.create_board("curr")
         kb.set_current_board("curr")
@@ -422,13 +448,17 @@ class TestWorkerSpawnEnv:
             claim_lock=None,
             claim_expires=None,
             tenant=None,
+            current_run_id=77,
         )
+        task.claim_lock = "host:claim"
 
         kb._default_spawn(task, str(fresh_home / "ws"), board="spawntest")
 
         env = captured["env"]
         assert env["HERMES_KANBAN_BOARD"] == "spawntest"
         assert env["HERMES_KANBAN_TASK"] == "t_abc"
+        assert env["HERMES_KANBAN_RUN_ID"] == "77"
+        assert env["HERMES_KANBAN_CLAIM_LOCK"] == "host:claim"
         # DB path should match the per-board DB, not the legacy default.
         expected_db = fresh_home / "kanban" / "boards" / "spawntest" / "kanban.db"
         assert env["HERMES_KANBAN_DB"] == str(expected_db)
