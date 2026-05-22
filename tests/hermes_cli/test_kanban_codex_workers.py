@@ -13,6 +13,9 @@ def _home(monkeypatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.delenv("HERMES_CODEX_WORKER_RUNNER", raising=False)
+    monkeypatch.delenv("HERMES_CODING_WORKER_BACKEND", raising=False)
+    monkeypatch.delenv("HERMES_CODEX_WORKER_REASONING", raising=False)
+    monkeypatch.delenv("HERMES_CODEX_WORKER_SERVICE_TIER", raising=False)
     return root
 
 
@@ -526,6 +529,43 @@ def test_docker_runner_mounts_gh_config_read_only(monkeypatch, tmp_path):
     assert "GH_CONFIG_DIR=/gh-config" in captured["cmd"]
 
 
+def test_docker_runner_forwards_only_discord_bot_token(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    captured = {}
+
+    class Proc:
+        pid = 9876
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, cwd, stdout, stderr, env, start_new_session):
+        captured.update({"cmd": cmd, "env": env})
+        return Proc()
+
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "discord-token")
+    monkeypatch.setenv("DISCORD_ADMIN_ACTIONS", "delete,pin")
+    monkeypatch.setattr(
+        workers,
+        "_worker_config",
+        lambda: {
+            "runner": "docker",
+            "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
+            "codex_home_root": str(tmp_path / "homes"),
+        },
+    )
+    monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
+
+    workers.spawn_codex_worker(task, str(tmp_path / "repo"), board=board.slug)
+
+    assert captured["env"]["DISCORD_BOT_TOKEN"] == "discord-token"
+    assert "DISCORD_BOT_TOKEN=discord-token" in captured["cmd"]
+    assert "DISCORD_ADMIN_ACTIONS=delete,pin" not in captured["cmd"]
+
+
 def test_planner_output_links_parent_dependencies(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli import kanban_db
@@ -578,6 +618,24 @@ def test_planner_schema_uses_parents_not_depends_on():
     assert "Ticket-specific acceptance criteria" in schema
     assert "do not copy the whole board-level list into every task" in schema
     assert "deduplicated canonical board-level list" in schema
+
+
+def test_worker_prompt_mentions_discord_read_helper(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_PLANNER
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        prompt = worker._build_prompt(conn, task.id, ROLE_PLANNER)
+    finally:
+        conn.close()
+
+    assert "Do not call Hermes tools" in prompt
+    assert "python -m hermes_cli.discord_worker_read fetch-message" in prompt
+    assert "python -m hermes_cli.discord_worker_read fetch-messages" in prompt
+    assert "Do not attempt Discord mutation or admin actions" in prompt
 
 
 def test_run_codex_records_app_server_state(monkeypatch, tmp_path):

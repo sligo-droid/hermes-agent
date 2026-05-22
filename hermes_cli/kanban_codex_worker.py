@@ -81,6 +81,7 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
     return (
         f"You are the Discord Kanban {role} worker.\n"
         "Do not call Hermes tools. Work only from the repository, shell, and files available in this worker environment.\n"
+        "For read-only Discord context, you may use `python -m hermes_cli.discord_worker_read fetch-message --channel-id <id> --message-id <id>` or `python -m hermes_cli.discord_worker_read fetch-messages --channel-id <id> --limit <n> [--before <id>] [--after <id>]`. Do not attempt Discord mutation or admin actions.\n"
         "Return exactly one JSON object matching the schema below; do not wrap it in Markdown.\n\n"
         f"{schema}\n\n"
         f"Git context:\n{git}\n\n"

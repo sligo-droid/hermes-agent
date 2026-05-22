@@ -315,10 +315,11 @@ def _spawn_docker_worker(
     if host_gh_config_dir and Path(host_gh_config_dir).is_dir():
         env["GH_CONFIG_DIR"] = "/gh-config"
         cmd.extend(["-v", f"{Path(host_gh_config_dir).resolve()}:/gh-config:ro"])
+    docker_env_keys = {"DISCORD_BOT_TOKEN"}
     for key, value in env.items():
         if key.startswith(
             ("HERMES_", "CODEX_", "OPENAI_", "ANTHROPIC_", "GH_", "GITHUB_")
-        ) or key in {"PYTHONPATH", "HOME"}:
+        ) or key in {"PYTHONPATH", "HOME"} or key in docker_env_keys:
             cmd.extend(["-e", f"{key}={value}"])
     cmd.extend([image, "python", "-m", "hermes_cli.kanban_codex_worker"])
 
