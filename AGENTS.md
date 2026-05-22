@@ -1019,17 +1019,21 @@ def profile_env(tmp_path, monkeypatch):
 
 ## Testing
 
-**ALWAYS use `scripts/run_tests.sh`** — do not call `pytest` directly. The script enforces
-hermetic environment parity with CI (unset credential vars, TZ=UTC, LANG=C.UTF-8,
-4 xdist workers matching GHA ubuntu-latest). Direct `pytest` on a 16+ core
-developer machine with API keys set diverges from CI in ways that have caused
-multiple "works locally, fails in CI" incidents (and the reverse).
+**ALWAYS use `scripts/run_tests.sh`** — do not call `pytest` directly. By
+default, the script runs the fork-owned smoke suite in
+`scripts/test_suites/smoke.txt`; the inherited upstream non-integration suite is
+available with `--full`. The wrapper enforces hermetic environment parity with CI
+(unset credential vars, TZ=UTC, LANG=C.UTF-8, 4 xdist workers matching GHA
+ubuntu-latest). Direct `pytest` on a 16+ core developer machine with API keys set
+diverges from CI in ways that have caused multiple "works locally, fails in CI"
+incidents (and the reverse).
 
 ```bash
-scripts/run_tests.sh                                  # full suite, CI-parity
+scripts/run_tests.sh                                  # fork smoke suite, CI-parity
+scripts/run_tests.sh --full                           # inherited upstream suite
 scripts/run_tests.sh tests/gateway/                   # one directory
 scripts/run_tests.sh tests/agent/test_foo.py::test_x  # one test
-scripts/run_tests.sh -v --tb=long                     # pass-through pytest flags
+scripts/run_tests.sh -v --tb=long                     # smoke suite with pytest flags
 ```
 
 ### Why the wrapper (and why the old "just call pytest" doesn't work)
@@ -1060,7 +1064,9 @@ python -m pytest tests/ -q -n 4
 
 Worker count above 4 will surface test-ordering flakes that CI never sees.
 
-Always run the full suite before pushing changes.
+Always run the smoke suite before pushing changes. Use `--full` when changing
+inherited upstream surfaces outside the fork-owned smoke suite or when you need
+broader regression confidence.
 
 ### Don't write change-detector tests
 
@@ -1110,4 +1116,3 @@ not the specific names.
 
 Reviewers should reject new change-detector tests; authors should convert
 them into invariants before re-requesting review.
-

@@ -121,11 +121,15 @@ hermes chat -q "Hello"
 ### Run tests
 
 ```bash
-# Preferred — matches CI (hermetic env, 4 xdist workers); see AGENTS.md
+# Preferred — fork smoke suite, matches CI (hermetic env, 4 xdist workers); see AGENTS.md
 scripts/run_tests.sh
 
+# Optional — inherited upstream non-integration suite
+scripts/run_tests.sh --full
+
 # Alternative (activate the venv first). The wrapper is still recommended
-# for parity with GitHub Actions before you open a PR:
+# for parity with GitHub Actions before you open a PR. Bare pytest still runs
+# the inherited upstream test tree, not the fork smoke suite:
 pytest tests/ -v
 ```
 

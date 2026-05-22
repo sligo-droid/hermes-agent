@@ -1,0 +1,86 @@
+# Fork-owned plus core Hermes sanity suite.
+#
+# This is the default suite for sligo-droid/hermes-agent. The inherited
+# upstream non-integration suite remains available with scripts/run_tests.sh --full.
+
+# Core tool plumbing and safe file operations.
+tests/test_model_tools.py
+tests/test_toolsets.py
+tests/tools/test_registry.py
+tests/tools/test_file_tools.py
+
+# Core session and agent sanity checks.
+tests/test_lazy_session_regressions.py
+tests/run_agent/test_session_id_env.py
+tests/run_agent/test_session_meta_filtering.py
+tests/run_agent/test_session_reset_fix.py
+tests/agent/test_turn_runtime_summary.py
+tests/test_hermes_state.py::TestSessionLifecycle::test_create_and_get_session
+tests/test_hermes_state.py::TestMessageStorage::test_append_and_get_messages
+tests/test_hermes_state.py::TestMessageStorage::test_get_messages_as_conversation
+tests/test_hermes_state.py::TestMessageStorage::test_tool_calls_serialization
+tests/test_hermes_state.py::TestMessageStorage::test_reasoning_persisted_and_restored
+tests/test_hermes_state.py::TestFTS5Search::test_search_finds_content
+tests/test_hermes_state.py::TestFTS5Search::test_search_special_chars_do_not_crash
+tests/test_hermes_state.py::TestSearchSessions::test_list_all_sessions
+tests/test_hermes_state.py::TestSearchSessions::test_filter_by_source
+tests/test_hermes_state.py::TestSessionLifecycle::test_update_token_counts
+tests/test_hermes_state.py::TestSessionLifecycle::test_update_system_prompt
+tests/test_hermes_state.py::TestCounts::test_session_count
+tests/agent/test_prompt_builder.py::TestScanContextContent::test_prompt_injection_blocked
+tests/agent/test_prompt_builder.py::TestBuildContextFilesPrompt::test_loads_agents_md
+tests/agent/test_prompt_builder.py::TestBuildContextFilesPrompt::test_blocks_injection_in_agents_md
+tests/agent/test_prompt_builder.py::TestBuildContextFilesPrompt::test_loads_hermes_md
+tests/agent/test_prompt_builder.py::TestBuildContextFilesPrompt::test_hermes_md_parent_dir_discovery
+tests/agent/test_prompt_builder.py::TestBuildContextFilesPrompt::test_hermes_md_stops_at_git_root
+tests/agent/test_prompt_builder.py::TestBuildSkillsSystemPrompt::test_builds_index_with_skills
+tests/agent/test_prompt_builder.py::TestBuildSkillsSystemPrompt::test_deduplicates_skills
+tests/agent/test_prompt_builder.py::TestBuildSkillsSystemPrompt::test_excludes_disabled_skills
+tests/agent/test_prompt_builder.py::TestPromptBuilderImports::test_module_import_does_not_eagerly_import_skills_tool
+tests/agent/test_prompt_builder.py::TestToolUseEnforcementGuidance::test_guidance_mentions_tool_calls
+tests/agent/test_prompt_builder.py::TestToolUseEnforcementGuidance::test_guidance_requires_action
+tests/run_agent/test_run_agent.py::test_default_max_iterations_is_1000
+tests/run_agent/test_run_agent.py::TestInit::test_valid_tool_names_populated
+tests/run_agent/test_run_agent.py::TestInit::test_session_id_auto_generated
+tests/run_agent/test_run_agent.py::TestBuildSystemPrompt::test_includes_system_message
+tests/run_agent/test_run_agent.py::TestExecuteToolCalls::test_single_tool_executed
+tests/run_agent/test_run_agent.py::TestRunConversation::test_tool_calls_then_stop
+tests/run_agent/test_run_agent.py::TestRunConversation::test_context_compression_triggered
+tests/run_agent/test_run_agent.py::TestSystemPromptStability::test_stored_prompt_reused_for_continuing_session
+
+# Fork-owned coding-worker and Discord/Kanban surfaces.
+tests/tools/test_coding_worker_tool.py
+tests/hermes_cli/test_coding_worker_switch.py
+tests/hermes_cli/test_kanban_codex_workers.py
+tests/hermes_cli/test_discord_worker_read.py
+tests/hermes_cli/test_discord_worker_boards.py
+tests/hermes_cli/test_discord_worker_dispatch.py
+tests/gateway/test_discord_summaries.py
+tests/gateway/test_kanban_notifier.py
+tests/gateway/test_work_ledger.py
+tests/gateway/test_session_env.py
+tests/tools/test_kanban_tools.py
+tests/scripts/test_notify_discord_main_commits.py
+
+# Minimal Kanban DB / dispatcher contracts without the whole inherited matrix.
+tests/hermes_cli/test_kanban_db.py::test_init_creates_expected_tables
+tests/hermes_cli/test_kanban_db.py::test_create_task_no_parents_is_ready
+tests/hermes_cli/test_kanban_db.py::test_create_task_with_parent_is_todo_until_parent_done
+tests/hermes_cli/test_kanban_db.py::test_link_detects_cycle
+tests/hermes_cli/test_kanban_db.py::test_claim_once_wins_second_loses
+tests/hermes_cli/test_kanban_db.py::test_complete_records_result
+tests/hermes_cli/test_kanban_db.py::test_block_then_unblock
+tests/hermes_cli/test_kanban_db.py::test_worker_context_includes_parent_results_and_comments
+tests/hermes_cli/test_kanban_db.py::test_dispatch_dry_run_does_not_claim
+tests/hermes_cli/test_kanban_db.py::test_dispatch_promotes_ready_and_spawns
+tests/hermes_cli/test_kanban_db.py::test_dispatch_spawn_failure_releases_claim
+tests/hermes_cli/test_kanban_db.py::test_create_task_stamps_session_id
+tests/hermes_cli/test_kanban_core_functionality.py::test_spawn_failure_auto_blocks_after_limit
+tests/hermes_cli/test_kanban_core_functionality.py::test_successful_completion_resets_failure_counter
+tests/hermes_cli/test_kanban_core_functionality.py::test_run_created_on_claim
+tests/hermes_cli/test_kanban_core_functionality.py::test_run_closed_on_complete_with_summary
+tests/hermes_cli/test_kanban_core_functionality.py::test_stale_run_cannot_complete_new_attempt
+tests/hermes_cli/test_kanban_core_functionality.py::test_build_worker_context_includes_prior_attempts
+tests/hermes_cli/test_kanban_core_functionality.py::test_gateway_dispatcher_watcher_respects_config_flag_off
+tests/hermes_cli/test_kanban_core_functionality.py::test_complete_with_phantom_created_cards_raises_and_audits
+tests/hermes_cli/test_kanban_core_functionality.py::test_reclaim_task_resets_running_to_ready
