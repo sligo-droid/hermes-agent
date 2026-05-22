@@ -392,6 +392,90 @@ async def test_duplicate_redelivery_during_startup_replay_is_not_requeued(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_startup_replays_same_session_discord_work_in_fifo_order(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+    ledger_path = tmp_path / "work_ledger.json"
+    runner = _make_busy_runner(ledger_path)
+    adapter = _LedgerDrainAdapter(PlatformConfig(enabled=True, token="token"), Platform.DISCORD)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner.config = SimpleNamespace(
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+        platforms={},
+        quick_commands={},
+    )
+    runner.session_store = MagicMock()
+    runner._background_tasks = set()
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+    adapter.set_message_handler(runner._handle_message)
+
+    first_event = _discord_event(message_id="replay-1", text="first replay")
+    second_event = _discord_event(message_id="replay-2", text="second replay")
+    session_key = build_session_key(first_event.source)
+    first_item = runner.work_ledger.accept_event(
+        first_event,
+        session_key=session_key,
+        freshness_seconds=60,
+    )
+    second_item = runner.work_ledger.accept_event(
+        second_event,
+        session_key=session_key,
+        freshness_seconds=60,
+    )
+    assert first_item is not None
+    assert second_item is not None
+    runner.work_ledger.claim(first_item["id"])
+    runner.work_ledger.claim(second_item["id"])
+    _mark_claim_stale(runner.work_ledger, first_item["id"])
+    _mark_claim_stale(runner.work_ledger, second_item["id"])
+
+    processed_message_ids = []
+    first_started = asyncio.Event()
+    allow_first_to_finish = asyncio.Event()
+    both_processed = asyncio.Event()
+
+    async def fake_handle_message_with_agent(event, source, _quick_key, _run_generation):
+        processed_message_ids.append(event.message_id)
+        if event.message_id == "replay-1":
+            first_started.set()
+            await asyncio.wait_for(allow_first_to_finish.wait(), timeout=2)
+
+        work_id = getattr(event, "work_item_id", None)
+        assert work_id
+        assert getattr(event, "defer_work_completion", False) is False
+        runner.work_ledger.mark_agent_running(work_id, session_id="session-1")
+        runner.work_ledger.mark_agent_done(
+            work_id,
+            final_response=f"done {event.message_id}",
+            session_id="session-1",
+            summary_status="Complete",
+        )
+        runner.work_ledger.mark_response_delivered(
+            work_id,
+            result_message_id=f"result-{event.message_id}",
+        )
+        runner.work_ledger.mark_summary_updated(work_id)
+        runner.work_ledger.mark_completed(work_id)
+        if len(processed_message_ids) == 2:
+            both_processed.set()
+        return ""
+
+    runner._handle_message_with_agent = fake_handle_message_with_agent
+
+    scheduled = runner._schedule_incomplete_discord_work_items()
+    await asyncio.wait_for(first_started.wait(), timeout=2)
+    await asyncio.sleep(0)
+    allow_first_to_finish.set()
+    await asyncio.wait_for(both_processed.wait(), timeout=2)
+
+    assert scheduled == 2
+    assert processed_message_ids == ["replay-1", "replay-2"]
+    assert runner.work_ledger.get(first_item["id"])["status"] == "completed"
+    assert runner.work_ledger.get(second_item["id"])["status"] == "completed"
+    await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
 async def test_startup_delivers_agent_done_work_without_rerunning_agent(tmp_path):
     runner = object.__new__(GatewayRunner)
     runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")

@@ -3291,6 +3291,10 @@ class GatewayRunner:
         if not steered:
             work_item = self._record_discord_busy_followup(event, session_key)
             if work_item and work_item.get("_existing"):
+                if getattr(event, "work_replay", False):
+                    event.defer_work_completion = False
+                    self._enqueue_fifo(session_key, event, adapter)
+                    return True
                 logger.info(
                     "Ignoring duplicate Discord busy work item %s with status=%s",
                     work_item.get("id"),
