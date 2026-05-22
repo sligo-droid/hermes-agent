@@ -1010,6 +1010,12 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # Durable gateway work tracking.  Discord uses this to make accepted
+    # thread work idempotent across gateway shutdowns/restarts.
+    work_item_id: Optional[str] = None
+    work_replay: bool = False
+    defer_work_completion: bool = False
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     
@@ -2888,6 +2894,8 @@ class BasePlatformAdapter(ABC):
                     reply_to=_reply_anchor_for_event(event),
                     metadata=thread_meta,
                 )
+                if getattr(_r, "success", False):
+                    self._mark_work_item_completed(event, _r)
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
                         chat_id=event.source.chat_id,
@@ -2928,6 +2936,7 @@ class BasePlatformAdapter(ABC):
         response = await self._message_handler(event)
         text, eph_ttl = self._unwrap_ephemeral(response)
         if not text:
+            self._mark_work_item_completed(event)
             return
         result = await self._send_with_retry(
             chat_id=event.source.chat_id,
@@ -2935,6 +2944,8 @@ class BasePlatformAdapter(ABC):
             reply_to=_reply_anchor_for_event(event),
             metadata=thread_meta,
         )
+        if getattr(result, "success", False):
+            self._mark_work_item_completed(event, result)
         if eph_ttl > 0 and getattr(result, "success", False) and getattr(result, "message_id", None):
             self._schedule_ephemeral_delete(
                 chat_id=event.source.chat_id,
@@ -3017,6 +3028,8 @@ class BasePlatformAdapter(ABC):
                             reply_to=_reply_anchor_for_event(event),
                             metadata=_thread_meta,
                         )
+                        if getattr(_r, "success", False):
+                            self._mark_work_item_completed(event, _r)
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
                                 chat_id=event.source.chat_id,
@@ -3066,6 +3079,8 @@ class BasePlatformAdapter(ABC):
                                 reply_to=_reply_anchor_for_event(event),
                                 metadata=_thread_meta,
                             )
+                            if getattr(_r, "success", False):
+                                self._mark_work_item_completed(event, _r)
                             if _eph_ttl > 0 and _r.success and _r.message_id:
                                 self._schedule_ephemeral_delete(
                                     chat_id=event.source.chat_id,
@@ -3175,6 +3190,21 @@ class BasePlatformAdapter(ABC):
             max_ms = 2500
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
+    def _mark_work_item_completed(self, event: MessageEvent, result=None) -> None:
+        work_item_id = getattr(event, "work_item_id", None)
+        if not work_item_id or getattr(event, "defer_work_completion", False):
+            return
+        try:
+            from gateway.work_ledger import GatewayWorkLedger
+
+            result_message_id = getattr(result, "message_id", None)
+            GatewayWorkLedger().mark_completed(
+                str(work_item_id),
+                result_message_id=str(result_message_id) if result_message_id else None,
+            )
+        except Exception as exc:
+            logger.warning("[%s] Failed to mark work item completed: %s", self.name, exc)
+
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
@@ -3191,6 +3221,7 @@ class BasePlatformAdapter(ABC):
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+                self._mark_work_item_completed(event, result)
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -3648,6 +3679,12 @@ class BasePlatformAdapter(ABC):
                 # Leave _active_sessions[session_key] populated — the drain
                 # task's own lifecycle will clean it up.
             else:
+                if (
+                    processing_outcome == ProcessingOutcome.SUCCESS
+                    and not delivery_attempted
+                    and not getattr(event, "defer_work_completion", False)
+                ):
+                    self._mark_work_item_completed(event)
                 if processing_outcome is not None and not handoff_spawned:
                     await self._flush_processing_completions(
                         session_key,
