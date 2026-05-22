@@ -64,6 +64,9 @@ _DISCORD_SHIP_REACTION_EMOJIS = frozenset({
     "👍🏿",
 })
 _DISCORD_STATUS_REACTION_EMOJIS = ("✅", "❌", "👀", "❓", "⏳")
+_DISCORD_GOAL_THREAD_CONTEXT_LIMIT = 25
+_DISCORD_GOAL_THREAD_CONTEXT_MAX_CHARS = 12_000
+_DISCORD_GOAL_THREAD_CONTEXT_MAX_MESSAGE_CHARS = 1_500
 
 
 def _discord_live_voice_enabled() -> bool:
@@ -5455,6 +5458,7 @@ class DiscordAdapter(BasePlatformAdapter):
         thread_name: str,
         text: str,
         feature_summary: Optional[Dict[str, Any]] = None,
+        goal_thread_context: Optional[str] = None,
     ) -> None:
         """Build a MessageEvent pointing at a thread and send it through handle_message."""
         guild_name = ""
@@ -5491,9 +5495,11 @@ class DiscordAdapter(BasePlatformAdapter):
             message_type=MessageType.TEXT,
             source=source,
             raw_message=interaction,
+            message_id=str(getattr(interaction, "id", "") or "") or None,
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
             feature_summary=feature_summary,
+            goal_thread_context=goal_thread_context,
         )
         await self.handle_message(event)
 
@@ -5584,6 +5590,9 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_channel = await self._resolve_channel_by_id(thread_id)
 
         link = f"<#{thread_id}>" if thread_id else f"**{thread_name}**"
+        goal_thread_context = ""
+        if is_thread and thread_channel is not None:
+            goal_thread_context = await self._fetch_goal_thread_context(thread_channel)
         feature_summary_handle = None
         if thread_channel is not None:
             project_context = self._resolve_project_context_for_channel(parent_channel)
@@ -5613,6 +5622,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     thread_name,
                     command_text,
                     feature_summary=feature_summary_handle,
+                    goal_thread_context=goal_thread_context or None,
                 ),
                 label=f"/goal {thread_id}",
             )
@@ -5782,6 +5792,72 @@ class DiscordAdapter(BasePlatformAdapter):
             return int(raw)
         except (ValueError, TypeError):
             return 50
+
+    async def _fetch_goal_thread_context(
+        self,
+        channel: Any,
+        *,
+        before: Any = None,
+    ) -> str:
+        """Fetch bounded recent thread context for a /goal planner ticket."""
+        history = getattr(channel, "history", None)
+        if not callable(history):
+            return ""
+
+        collected: list[str] = []
+        try:
+            kwargs: dict[str, Any] = {
+                "limit": _DISCORD_GOAL_THREAD_CONTEXT_LIMIT,
+                "oldest_first": False,
+            }
+            if before is not None:
+                kwargs["before"] = before
+            async for msg in history(**kwargs):
+                msg_type = getattr(msg, "type", None)
+                if msg_type is not None:
+                    allowed_types = {
+                        getattr(discord.MessageType, "default", None),
+                        getattr(discord.MessageType, "reply", None),
+                    }
+                    allowed_types.discard(None)
+                    if allowed_types and msg_type not in allowed_types:
+                        continue
+
+                author = getattr(msg, "author", None)
+                content = str(getattr(msg, "clean_content", None) or getattr(msg, "content", "") or "").strip()
+                if not content:
+                    attachments = list(getattr(msg, "attachments", []) or [])
+                    names = [str(getattr(att, "filename", "") or "attachment").strip() for att in attachments]
+                    names = [name for name in names if name]
+                    if names:
+                        content = "(attachment: " + ", ".join(names[:5]) + ")"
+                if not content:
+                    continue
+                content = re.sub(r"\s+", " ", content).strip()
+                if len(content) > _DISCORD_GOAL_THREAD_CONTEXT_MAX_MESSAGE_CHARS:
+                    content = content[:_DISCORD_GOAL_THREAD_CONTEXT_MAX_MESSAGE_CHARS].rstrip() + "..."
+
+                name = str(
+                    getattr(author, "display_name", None)
+                    or getattr(author, "global_name", None)
+                    or getattr(author, "name", None)
+                    or getattr(author, "id", "unknown")
+                )
+                if getattr(author, "bot", False):
+                    name = f"{name} [bot]"
+                collected.append(f"[{name}] {content}")
+        except Exception as exc:
+            logger.debug("[%s] Failed to fetch /goal thread context: %s", self.name, exc)
+            return ""
+
+        if not collected:
+            return ""
+        collected.reverse()
+        text = "[Goal thread context]\n" + "\n".join(collected)
+        if len(text) > _DISCORD_GOAL_THREAD_CONTEXT_MAX_CHARS:
+            text = text[-_DISCORD_GOAL_THREAD_CONTEXT_MAX_CHARS:].lstrip()
+            text = "[Goal thread context truncated to recent messages]\n" + text
+        return text
 
     async def _fetch_channel_context(
         self,
@@ -7282,6 +7358,10 @@ class DiscordAdapter(BasePlatformAdapter):
         if (not event_text or not event_text.strip()) and not _channel_context:
             event_text = "(The user sent a message with no text content)"
 
+        _goal_thread_context = None
+        if is_thread and slash_command_starts_threaded_work:
+            _goal_thread_context = await self._fetch_goal_thread_context(message.channel, before=message)
+
         _chan = message.channel
         _parent_id = str(getattr(_chan, "parent_id", "") or "")
         _chan_id = str(getattr(_chan, "id", ""))
@@ -7308,6 +7388,7 @@ class DiscordAdapter(BasePlatformAdapter):
             feature_summary=feature_summary_handle,
             project_summary=project_summary_handle,
             channel_context=_channel_context,
+            goal_thread_context=_goal_thread_context,
             text_document_inlined=text_document_inlined,
             inlined_text_document_names=inlined_text_document_names,
         )

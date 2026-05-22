@@ -11729,6 +11729,7 @@ class GatewayRunner:
                     guild_id=str(getattr(source, "guild_id", "") or ""),
                     parent_channel_id=str(getattr(source, "parent_chat_id", "") or ""),
                     request_id=str(getattr(event, "message_id", "") or ""),
+                    thread_context=str(getattr(event, "goal_thread_context", "") or ""),
                     project_context={
                         k: v for k, v in {
                             "project_name": getattr(source, "project_name", None),

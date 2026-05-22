@@ -285,6 +285,64 @@ def test_set_goal_preserves_nested_subgoal_text_for_planner(monkeypatch, tmp_pat
     assert "one deduplicated canonical list" in instructions
 
 
+def test_set_goal_persists_thread_context_for_planner(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    context = "[Goal thread context]\n[Alice] earlier detail\n[HermesBot [bot]] prior answer"
+    board = dwb.set_goal(
+        thread_id="7791",
+        goal="Use the details above",
+        request_id="msg-7791",
+        thread_context=context,
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+
+    assert len(tasks) == 1
+    payload = json.loads(tasks[0].body or "{}")
+    assert payload["discord_thread_context"] == context
+
+
+def test_completed_goal_thread_same_request_gets_new_planner_context(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(thread_id="7792", goal="Ship the dashboard", request_id="first")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        first_task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        claimed = kanban_db.claim_task(conn, first_task.id)
+        assert claimed is not None
+        kanban_db.complete_task(conn, first_task.id, summary="planned", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+    dwb._update_worker_meta(board.slug, {"goal_status": "done", "phase": "complete"})
+
+    context = "[Goal thread context]\n[Alice] second run should use this"
+    dwb.set_goal(
+        thread_id="7792",
+        goal="Ship the dashboard",
+        request_id="second",
+        thread_context=context,
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+
+    assert len(tasks) == 2
+    payloads = [json.loads(task.body or "{}") for task in tasks]
+    assert payloads[-1]["request"] == "Ship the dashboard"
+    assert payloads[-1]["discord_thread_context"] == context
+
+
 def test_feature_request_starts_distinct_planner_tickets(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

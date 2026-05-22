@@ -992,6 +992,11 @@ class MessageEvent:
     # trigger message alone, then prepend this context afterward.
     channel_context: Optional[str] = None
 
+    # Recent Discord thread context captured specifically for /goal planner
+    # tickets. Unlike ``channel_context``, this is not injected into ordinary
+    # conversation text; it is durable intake metadata for Kanban planning.
+    goal_thread_context: Optional[str] = None
+
     # True when a platform adapter has already decoded an uploaded .txt file
     # directly into ``text``.  The runner uses this to avoid adding document
     # metadata ahead of the text, preserving the same order as if the user had

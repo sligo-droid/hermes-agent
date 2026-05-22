@@ -34,6 +34,7 @@ def _discord_event(message_id="m1", text="do the work"):
 def test_ledger_deduplicates_discord_message_ids(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _discord_event(message_id="m1")
+    event.goal_thread_context = "[Goal thread context]\n[Alice] prior detail"
     session_key = build_session_key(event.source)
 
     first = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
@@ -154,6 +155,7 @@ async def test_startup_replays_only_incomplete_discord_work(tmp_path):
     assert replay.work_replay is True
     assert replay.work_item_id == item["id"]
     assert replay.text == "do the work"
+    assert replay.goal_thread_context == event.goal_thread_context
 
 
 @pytest.mark.asyncio

@@ -1,3 +1,4 @@
+import json
 import os
 
 import pytest
@@ -233,6 +234,38 @@ async def test_discord_feature_summary_goal_set_suppresses_board_ack(tmp_path, m
 
     assert response is None
     assert meta["discord_worker"]["root_goal"] == "Ship the dashboard"
+
+
+@pytest.mark.asyncio
+async def test_discord_goal_set_passes_thread_context_to_planner(tmp_path, monkeypatch):
+    kanban_home = tmp_path / "kanban-home"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+    runner._signal_kanban_dispatcher_dirty = lambda: True
+    runner._log_gateway_flow_telemetry = lambda **kwargs: None
+
+    event = _make_discord_thread_event("/goal Ship the dashboard", thread_id="thread-context")
+    event.goal_thread_context = "[Goal thread context]\n[Alice] important prior detail"
+
+    response = await GatewayRunner._handle_goal_command(runner, event)
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.board_slug_for_discord_thread("thread-context")
+    conn = kanban_db.connect(board=board)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+
+    assert response is not None
+    payload = json.loads(tasks[0].body or "{}")
+    assert payload["discord_thread_context"] == event.goal_thread_context
 
 
 @pytest.mark.asyncio
