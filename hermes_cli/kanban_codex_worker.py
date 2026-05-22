@@ -619,6 +619,9 @@ def _update_phase(board: Optional[str], phase: str, *, goal_status: str) -> None
     worker["phase"] = phase
     worker["goal_status"] = goal_status
     worker["updated_at"] = int(time.time())
+    if goal_status in {"done", "blocked"}:
+        worker["terminal_reaction_sync_pending"] = True
+        worker["terminal_summary_sync_pending"] = True
     metadata[DISCORD_WORKER_META_KEY] = worker
     metadata.pop("db_path", None)
     atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)

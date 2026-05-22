@@ -336,6 +336,44 @@ def test_discord_kanban_typing_watcher_skips_completed_status_sync(tmp_path, mon
     assert adapter.synced == []
 
 
+def test_discord_terminal_status_target_syncs_only_when_pending(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(
+        thread_id="99017",
+        goal="Sync final emoji once",
+        chat_id="parent-99017",
+    )
+    conn = kb.connect(board=board.slug)
+    try:
+        task = kb.list_tasks(conn, include_archived=False)[0]
+        claimed = kb.claim_task(conn, task.id)
+        assert claimed is not None
+        kb.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_reaction_sync_pending": True,
+            "terminal_summary_sync_pending": True,
+        },
+    )
+
+    targets = dwb.thread_status_targets()
+    assert [target["board"] for target in targets] == [board.slug]
+    assert targets[0]["state"] == "done"
+
+    dwb.mark_thread_status_synced(board.slug, reaction=True)
+    assert [target["board"] for target in dwb.thread_status_targets()] == [board.slug]
+
+    dwb.mark_thread_status_synced(board.slug, summary=True)
+    assert dwb.thread_status_targets() == []
+
+
 def test_discord_kanban_typing_watcher_skips_blocked_status_sync(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb

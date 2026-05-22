@@ -1643,7 +1643,11 @@ def thread_status_targets() -> list[dict[str, Any]]:
         except Exception:
             summary = {"state": board_thread_state(board)}
         state = summary.get("state") or board_thread_state(board)
-        if state != "active":
+        terminal_sync_pending = bool(
+            worker.get("terminal_reaction_sync_pending")
+            or worker.get("terminal_summary_sync_pending")
+        )
+        if state != "active" and not (state in {"done", "blocked", "errored"} and terminal_sync_pending):
             continue
         targets.append(
             {
@@ -1661,9 +1665,37 @@ def thread_status_targets() -> list[dict[str, Any]]:
                 "pr_number": summary.get("pr_number") or "",
                 "public_url": summary.get("public_url") or "",
                 "sync_key": summary.get("sync_key") or "",
+                "terminal_reaction_sync_pending": bool(worker.get("terminal_reaction_sync_pending")),
+                "terminal_summary_sync_pending": bool(worker.get("terminal_summary_sync_pending")),
             }
         )
     return targets
+
+
+def mark_thread_status_synced(
+    board: str,
+    *,
+    reaction: bool = False,
+    summary: bool = False,
+) -> None:
+    """Clear one-shot terminal Discord thread sync flags for a board."""
+    if not board or not (reaction or summary):
+        return
+    metadata = kanban_db.read_board_metadata(board)
+    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    if worker.get("kind") != "discord_worker_board":
+        return
+    changed = False
+    if reaction and worker.pop("terminal_reaction_sync_pending", None) is not None:
+        changed = True
+    if summary and worker.pop("terminal_summary_sync_pending", None) is not None:
+        changed = True
+    if not changed:
+        return
+    worker["updated_at"] = _now()
+    metadata[DISCORD_WORKER_META_KEY] = worker
+    metadata.pop("db_path", None)
+    atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
 
 
 def _board_runtime_snapshot(
@@ -3135,7 +3167,13 @@ def reconcile_board(board: str) -> Optional[str]:
 
         loops = int(worker.get("review_loop_count") or 0)
         if loops >= int(worker.get("review_loop_limit") or 5):
-            worker.update({"phase": "blocked", "goal_status": "blocked", "blocked_reason": "review loop limit reached"})
+            worker.update({
+                "phase": "blocked",
+                "goal_status": "blocked",
+                "blocked_reason": "review loop limit reached",
+                "terminal_reaction_sync_pending": True,
+                "terminal_summary_sync_pending": True,
+            })
             _update_worker_meta(board, worker)
             return "blocked_review_loop_limit"
         loops += 1
