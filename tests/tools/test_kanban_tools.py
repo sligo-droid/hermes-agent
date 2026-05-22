@@ -362,6 +362,27 @@ def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
         conn.close()
 
 
+def test_complete_prefers_worker_session_id_from_contextvar(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+    from gateway.session_context import _SESSION_ID
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "session-env")
+    token = _SESSION_ID.set("session-context")
+    try:
+        out = kt._handle_complete({"summary": "done by scoped worker"})
+    finally:
+        _SESSION_ID.reset(token)
+    assert json.loads(out)["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run.metadata == {"worker_session_id": "session-context"}
+    finally:
+        conn.close()
+
+
 def test_complete_does_not_stamp_worker_session_id_without_scoped_task(
     monkeypatch, worker_env
 ):

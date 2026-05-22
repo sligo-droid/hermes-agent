@@ -3919,7 +3919,7 @@ class GatewayRunner:
                 continue
             status = str(item.get("status") or "")
             lease_until = float(item.get("lease_until") or 0)
-            if status == "claimed" and lease_until > time.time() and ledger.claim_pid_alive(item):
+            if status in {"claimed", "agent_running"} and lease_until > time.time() and ledger.claim_pid_alive(item):
                 continue
             try:
                 event = ledger.event_from_item(item)
@@ -3932,8 +3932,11 @@ class GatewayRunner:
             if adapter is None:
                 logger.debug("Skipping Discord work item %s: adapter not ready", work_id)
                 continue
-            ledger.claim(work_id)
-            task = asyncio.create_task(adapter.handle_message(event))
+            if status in {"agent_done", "response_delivered", "summary_updated"}:
+                task = asyncio.create_task(self._resume_finished_discord_work_item(item))
+            else:
+                ledger.claim(work_id)
+                task = asyncio.create_task(adapter.handle_message(event))
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
             scheduled += 1
@@ -3941,6 +3944,77 @@ class GatewayRunner:
         if scheduled:
             logger.info("Scheduled replay for %d incomplete Discord work item(s)", scheduled)
         return scheduled
+
+    async def _resume_finished_discord_work_item(self, item: Dict[str, Any]) -> None:
+        """Finish Discord work after the agent result was durably recorded."""
+        ledger = self._ledger()
+        work_id = str(item.get("id") or "")
+        if not work_id:
+            return
+        try:
+            event = ledger.event_from_item(item)
+        except Exception as exc:
+            logger.warning("Failed to rebuild finished Discord work item %s: %s", work_id, exc)
+            ledger.mark_expired(work_id)
+            return
+        adapter = self.adapters.get(event.source.platform)
+        if adapter is None:
+            logger.debug("Skipping finished Discord work item %s: adapter not ready", work_id)
+            return
+
+        status = str(item.get("status") or "")
+        if status == "agent_done":
+            final_response = str(item.get("final_response") or "")
+            if not final_response:
+                logger.warning("Finished Discord work item %s has no final response", work_id)
+                return
+            try:
+                metadata = {"notify": True}
+                try:
+                    from gateway.platforms.base import _reply_anchor_for_event, _thread_metadata_for_source
+
+                    metadata = _thread_metadata_for_source(
+                        event.source,
+                        _reply_anchor_for_event(event),
+                    ) or {}
+                    metadata = dict(metadata)
+                    metadata["notify"] = True
+                    reply_to = _reply_anchor_for_event(event)
+                except Exception:
+                    reply_to = item.get("reply_to_message_id") or item.get("message_id")
+                result = await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=final_response,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+            except Exception as exc:
+                logger.warning("Failed to deliver finished Discord work item %s: %s", work_id, exc)
+                return
+            if not getattr(result, "success", False):
+                logger.warning(
+                    "Failed to deliver finished Discord work item %s: %s",
+                    work_id,
+                    getattr(result, "error", None),
+                )
+                return
+            ledger.mark_response_delivered(
+                work_id,
+                result_message_id=str(getattr(result, "message_id", "") or "") or None,
+            )
+
+        summary_ok = await self._update_discord_summaries(
+            source=event.source,
+            feature_summary=item.get("feature_summary"),
+            project_summary=item.get("project_summary"),
+            final_response=str(item.get("final_response") or ""),
+            status=str(item.get("summary_status") or "Complete"),
+            session_id=item.get("session_id"),
+            title=item.get("title"),
+        )
+        if summary_ok:
+            ledger.mark_summary_updated(work_id)
+            ledger.mark_completed(work_id)
 
     async def start(self) -> bool:
         """
@@ -5979,6 +6053,18 @@ class GatewayRunner:
             separators=(",", ":"),
         )
 
+    def _discord_kanban_target_cache_key(self, target: Dict[str, Any]) -> str:
+        return json.dumps(
+            {
+                "board": str(target.get("board") or ""),
+                "thread_id": str(target.get("thread_id") or ""),
+                "guild_id": str(target.get("guild_id") or ""),
+                "parent_channel_id": str(target.get("parent_channel_id") or ""),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
     def _discord_kanban_reaction_sync_due(
         self,
         cache_entry: Any,
@@ -6048,10 +6134,15 @@ class GatewayRunner:
                         for target in reaction_targets:
                             board = str(target.get("board") or "")
                             state = str(target.get("state") or "")
+                            cache_key = self._discord_kanban_target_cache_key(target)
+                            cache_entry = reaction_cache.get(cache_key)
+                            if cache_entry is None and board in reaction_cache:
+                                cache_entry = reaction_cache.pop(board)
+                                reaction_cache[cache_key] = cache_entry
                             if (
                                 not board
                                 or not self._discord_kanban_reaction_sync_due(
-                                    reaction_cache.get(board),
+                                    cache_entry,
                                     state,
                                     now,
                                 )
@@ -6067,7 +6158,7 @@ class GatewayRunner:
                                 )
                                 continue
                             if synced_state:
-                                reaction_cache[board] = {
+                                reaction_cache[cache_key] = {
                                     "state": str(synced_state),
                                     "synced_at": now,
                                 }
@@ -6086,7 +6177,12 @@ class GatewayRunner:
                                 if title:
                                     target_for_sync["title"] = title
                             sync_key = self._discord_kanban_summary_sync_key(target_for_sync)
-                            if summary_cache.get(board) == sync_key:
+                            cache_key = self._discord_kanban_target_cache_key(target_for_sync)
+                            cached_sync_key = summary_cache.get(cache_key)
+                            if cached_sync_key is None and board in summary_cache:
+                                cached_sync_key = summary_cache.pop(board)
+                                summary_cache[cache_key] = cached_sync_key
+                            if cached_sync_key == sync_key:
                                 continue
                             try:
                                 synced_key = await summary_sync(target_for_sync)
@@ -6098,7 +6194,7 @@ class GatewayRunner:
                                 )
                                 continue
                             if synced_key:
-                                summary_cache[board] = sync_key
+                                summary_cache[cache_key] = sync_key
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 logger.debug("discord kanban typing: cancelled")
@@ -9231,6 +9327,15 @@ class GatewayRunner:
             await self.hooks.emit("agent:start", hook_ctx)
 
             # Run the agent
+            work_item_id = getattr(event, "work_item_id", None)
+            if work_item_id and source.platform == Platform.DISCORD:
+                try:
+                    self._ledger().mark_agent_running(
+                        str(work_item_id),
+                        session_id=session_entry.session_id,
+                    )
+                except Exception as exc:
+                    logger.debug("Discord work ledger agent_running update failed: %s", exc)
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -9377,6 +9482,29 @@ class GatewayRunner:
                 _footer_line = ""
             if _footer_line and response and not agent_result.get("already_sent"):
                 response = f"{response}\n\n{_footer_line}"
+
+            work_item_id = getattr(event, "work_item_id", None)
+            if work_item_id and source.platform == Platform.DISCORD:
+                try:
+                    title = None
+                    if session_entry.session_id and self._session_db:
+                        try:
+                            title = self._session_db.get_session_title(session_entry.session_id)
+                        except Exception:
+                            title = None
+                    self._ledger().mark_agent_done(
+                        str(work_item_id),
+                        final_response=response,
+                        session_id=session_entry.session_id,
+                        summary_status=self._discord_summary_status(agent_result),
+                        title=title,
+                        feature_summary=getattr(event, "feature_summary", None),
+                        project_summary=getattr(event, "project_summary", None),
+                        already_delivered=bool(agent_result.get("already_sent"))
+                        and not agent_result.get("failed"),
+                    )
+                except Exception as exc:
+                    logger.debug("Discord work ledger agent_done update failed: %s", exc)
 
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
@@ -9592,7 +9720,7 @@ class GatewayRunner:
                 await self._send_voice_reply(event, response)
 
             if _already_sent and not agent_result.get("failed"):
-                await self._update_discord_summaries(
+                summary_ok = await self._update_discord_summaries(
                     source=source,
                     feature_summary=getattr(event, "feature_summary", None),
                     project_summary=getattr(event, "project_summary", None),
@@ -9600,6 +9728,13 @@ class GatewayRunner:
                     status=self._discord_summary_status(agent_result),
                     session_id=session_entry.session_id,
                 )
+                work_item_id = getattr(event, "work_item_id", None)
+                if work_item_id and source.platform == Platform.DISCORD and summary_ok:
+                    try:
+                        self._ledger().mark_summary_updated(str(work_item_id))
+                        self._ledger().mark_completed(str(work_item_id))
+                    except Exception as exc:
+                        logger.debug("Discord work ledger summary completion update failed: %s", exc)
             else:
                 self._register_discord_summary_post_delivery(
                     event=event,
@@ -11888,17 +12023,18 @@ class GatewayRunner:
         status: str = "Complete",
         session_id: Optional[str] = None,
         title: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         if source.platform != Platform.DISCORD:
-            return
+            return True
         if not feature_summary and not project_summary:
-            return
+            return True
         adapter = self.adapters.get(Platform.DISCORD)
         if not adapter:
-            return
-        if not title and session_id and self._session_db:
+            return False
+        session_db = getattr(self, "_session_db", None)
+        if not title and session_id and session_db:
             try:
-                title = self._session_db.get_session_title(session_id)
+                title = session_db.get_session_title(session_id)
             except Exception:
                 title = None
         if feature_summary and hasattr(adapter, "update_feature_summary"):
@@ -11907,14 +12043,17 @@ class GatewayRunner:
                     self._summarize_discord_feature_outcome,
                     final_response,
                 )
-                await adapter.update_feature_summary(
+                result = await adapter.update_feature_summary(
                     feature_summary,
                     final_response=concise_response,
                     status=status,
                     title=title,
                 )
+                return bool(result) if result is not None else True
             except Exception:
                 logger.debug("Discord feature summary update failed", exc_info=True)
+                return False
+        return True
 
     def _register_discord_summary_post_delivery(
         self,
@@ -11935,9 +12074,10 @@ class GatewayRunner:
         if not adapter or not hasattr(adapter, "register_post_delivery_callback"):
             return
         status = self._discord_summary_status(agent_result)
+        work_item_id = getattr(event, "work_item_id", None)
 
-        def _deliver():
-            return self._update_discord_summaries(
+        async def _deliver():
+            summary_ok = await self._update_discord_summaries(
                 source=source,
                 feature_summary=feature_summary,
                 project_summary=project_summary,
@@ -11945,6 +12085,13 @@ class GatewayRunner:
                 status=status,
                 session_id=session_id,
             )
+            if summary_ok and work_item_id:
+                try:
+                    self._ledger().mark_summary_updated(str(work_item_id))
+                    self._ledger().mark_completed(str(work_item_id))
+                except Exception as exc:
+                    logger.debug("Discord work ledger summary completion update failed: %s", exc)
+            return summary_ok
 
         try:
             adapter.register_post_delivery_callback(

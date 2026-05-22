@@ -13,6 +13,9 @@ def _home(monkeypatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.delenv("HERMES_CODEX_WORKER_RUNNER", raising=False)
+    monkeypatch.delenv("HERMES_CODING_WORKER_BACKEND", raising=False)
+    monkeypatch.delenv("HERMES_CODEX_WORKER_REASONING", raising=False)
+    monkeypatch.delenv("HERMES_CODEX_WORKER_SERVICE_TIER", raising=False)
     return root
 
 
@@ -32,8 +35,26 @@ def _claimed_planner(monkeypatch, tmp_path: Path):
     return board, claimed
 
 
+def _write_codex_auth(path: Path, *, access: str, refresh: str, id_token: str) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": access,
+                    "refresh_token": refresh,
+                    "id_token": id_token,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_workers as workers
+    from hermes_cli import discord_worker_read
 
     board, task = _claimed_planner(monkeypatch, tmp_path)
     workspace = tmp_path / "repo"
@@ -42,7 +63,16 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     gh_dir.mkdir(parents=True)
     (gh_dir / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(real_home))
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "discord-token")
+    monkeypatch.setenv("DISCORD_ADMIN_ACTIONS", "delete,pin")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "parent-codex-home"))
+    monkeypatch.setenv("HERMES_CODEX_WORKER_CREDENTIAL_ID", "parent-cred")
     monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(
+        discord_worker_read,
+        "start_read_broker",
+        lambda token: ("http://127.0.0.1:9", "broker-secret"),
+    )
     captured = {}
 
     class Proc:
@@ -77,7 +107,13 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     assert captured["env"]["HERMES_CODEX_WORKER_REASONING"] == "high"
     assert captured["env"]["HERMES_CODEX_WORKER_SERVICE_TIER"] == "normal"
     assert captured["env"]["HERMES_KANBAN_BOARD"] == board.slug
+    assert captured["env"]["HERMES_DISCORD_WORKER_READ_URL"] == "http://127.0.0.1:9"
+    assert captured["env"]["HERMES_DISCORD_WORKER_READ_TOKEN"] == "broker-secret"
+    assert "DISCORD_BOT_TOKEN" not in captured["env"]
+    assert "DISCORD_ADMIN_ACTIONS" not in captured["env"]
     assert captured["env"]["CODEX_HOME"].endswith("/homes/" + task.id)
+    assert captured["env"]["CODEX_HOME"] != str(tmp_path / "parent-codex-home")
+    assert captured["env"].get("HERMES_CODEX_WORKER_CREDENTIAL_ID") != "parent-cred"
     assert captured["env"]["GH_CONFIG_DIR"] == str(gh_dir)
     assert captured["start_new_session"] is True
 
@@ -123,6 +159,8 @@ def test_codex_role_worker_inherits_available_pool_credential(monkeypatch, tmp_p
         )
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "parent-codex-home"))
+    monkeypatch.setenv("HERMES_CODEX_WORKER_CREDENTIAL_ID", "parent-cred")
     board, task = _claimed_planner(monkeypatch, tmp_path)
     workspace = tmp_path / "repo"
     captured = {}
@@ -146,8 +184,90 @@ def test_codex_role_worker_inherits_available_pool_credential(monkeypatch, tmp_p
     codex_home = Path(captured["env"]["CODEX_HOME"])
     payload = json.loads((codex_home / "auth.json").read_text())
     assert captured["env"]["HERMES_CODEX_WORKER_CREDENTIAL_ID"] == "cred-2"
+    assert captured["env"]["CODEX_HOME"] != str(tmp_path / "parent-codex-home")
     assert payload["tokens"]["access_token"] == "access-2"
     assert payload["tokens"]["refresh_token"] == "refresh-2"
+
+
+def test_codex_role_worker_does_not_copy_inherited_worker_codex_home(monkeypatch, tmp_path):
+    from agent import credential_pool
+    from hermes_cli import kanban_codex_workers as workers
+
+    parent_codex_home = tmp_path / "parent-worker-codex-home"
+    _write_codex_auth(
+        parent_codex_home,
+        access="parent-worker-access",
+        refresh="parent-worker-refresh",
+        id_token="parent-worker-id",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "home-without-codex-auth"))
+    monkeypatch.setenv("CODEX_HOME", str(parent_codex_home))
+    monkeypatch.setenv("HERMES_CODEX_WORKER_CREDENTIAL_ID", "parent-worker-cred")
+    monkeypatch.setattr(credential_pool, "load_pool", lambda provider: None)
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    captured = {}
+
+    class Proc:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, cwd, stdout, stderr, env, start_new_session):
+        captured.update({"env": env})
+        return Proc()
+
+    monkeypatch.setattr(workers, "_worker_config", lambda: {"codex_home_root": str(tmp_path / "homes")})
+    monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
+
+    workers.spawn_codex_worker(task, str(tmp_path / "repo"), board=board.slug)
+
+    codex_home = Path(captured["env"]["CODEX_HOME"])
+    assert captured["env"].get("HERMES_CODEX_WORKER_CREDENTIAL_ID") != "parent-worker-cred"
+    assert captured["env"]["CODEX_HOME"] != str(parent_codex_home)
+    assert not (codex_home / "auth.json").exists()
+
+
+def test_codex_role_worker_copies_intentional_non_worker_codex_home(monkeypatch, tmp_path):
+    from agent import credential_pool
+    from hermes_cli import kanban_codex_workers as workers
+
+    source_codex_home = tmp_path / "source-codex-home"
+    _write_codex_auth(
+        source_codex_home,
+        access="source-access",
+        refresh="source-refresh",
+        id_token="source-id",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(source_codex_home))
+    monkeypatch.delenv("HERMES_CODEX_WORKER_CREDENTIAL_ID", raising=False)
+    monkeypatch.setattr(credential_pool, "load_pool", lambda provider: None)
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    captured = {}
+
+    class Proc:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, cwd, stdout, stderr, env, start_new_session):
+        captured.update({"env": env})
+        return Proc()
+
+    monkeypatch.setattr(workers, "_worker_config", lambda: {"codex_home_root": str(tmp_path / "homes")})
+    monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
+
+    workers.spawn_codex_worker(task, str(tmp_path / "repo"), board=board.slug)
+
+    codex_home = Path(captured["env"]["CODEX_HOME"])
+    payload = json.loads((codex_home / "auth.json").read_text(encoding="utf-8"))
+    assert captured["env"].get("HERMES_CODEX_WORKER_CREDENTIAL_ID") is None
+    assert captured["env"]["CODEX_HOME"] != str(source_codex_home)
+    assert payload["tokens"]["access_token"] == "source-access"
+    assert payload["tokens"]["refresh_token"] == "source-refresh"
 
 
 def test_codex_role_worker_logs_scheduled_runtime_settings(monkeypatch, tmp_path):
@@ -187,6 +307,8 @@ def test_planner_worker_env_carries_effective_opencode_backend(monkeypatch, tmp_
 
     board, task = _claimed_planner(monkeypatch, tmp_path)
     workspace = tmp_path / "repo"
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "parent-codex-home"))
+    monkeypatch.setenv("HERMES_CODEX_WORKER_CREDENTIAL_ID", "parent-cred")
     captured = {}
 
     class Proc:
@@ -523,11 +645,14 @@ def test_docker_runner_mounts_gh_config_read_only(monkeypatch, tmp_path):
     assert "-v" in captured["cmd"]
     assert f"{gh_dir.resolve()}:/gh-config:ro" in captured["cmd"]
     assert "-e" in captured["cmd"]
-    assert "GH_CONFIG_DIR=/gh-config" in captured["cmd"]
+    assert "GH_CONFIG_DIR" in captured["cmd"]
+    assert "GH_CONFIG_DIR=/gh-config" not in captured["cmd"]
 
 
-def test_docker_runner_forwards_discord_token_for_read_helper(monkeypatch, tmp_path):
+def test_docker_runner_uses_read_broker_without_discord_credentials(monkeypatch, tmp_path):
+    from hermes_cli import discord_worker_read
     from hermes_cli import kanban_codex_workers as workers
+    from hermes_cli import kanban_db
 
     board, task = _claimed_planner(monkeypatch, tmp_path)
     captured = {}
@@ -543,6 +668,14 @@ def test_docker_runner_forwards_discord_token_for_read_helper(monkeypatch, tmp_p
         return Proc()
 
     monkeypatch.setenv("DISCORD_BOT_TOKEN", "discord-token")
+    monkeypatch.setenv("DISCORD_ADMIN_ACTIONS", "delete,pin")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "parent-codex-home"))
+    monkeypatch.setenv("HERMES_CODEX_WORKER_CREDENTIAL_ID", "parent-cred")
+    monkeypatch.setattr(
+        discord_worker_read,
+        "start_read_broker",
+        lambda token: ("http://127.0.0.1:9", "broker-secret"),
+    )
     monkeypatch.setattr(
         workers,
         "_worker_config",
@@ -557,7 +690,24 @@ def test_docker_runner_forwards_discord_token_for_read_helper(monkeypatch, tmp_p
 
     workers.spawn_codex_worker(task, str(tmp_path / "repo"), board=board.slug)
 
-    assert "DISCORD_BOT_TOKEN=discord-token" in captured["cmd"]
+    assert "DISCORD_BOT_TOKEN" not in captured["env"]
+    assert "DISCORD_ADMIN_ACTIONS" not in captured["env"]
+    assert captured["env"]["CODEX_HOME"] == "/codex-home"
+    assert captured["env"].get("HERMES_CODEX_WORKER_CREDENTIAL_ID") != "parent-cred"
+    assert captured["env"]["HERMES_DISCORD_WORKER_READ_URL"] == "http://127.0.0.1:9"
+    assert captured["env"]["HERMES_DISCORD_WORKER_READ_TOKEN"] == "broker-secret"
+    assert "HERMES_DISCORD_WORKER_READ_URL" in captured["cmd"]
+    assert "HERMES_DISCORD_WORKER_READ_TOKEN" in captured["cmd"]
+    assert "broker-secret" not in captured["cmd"]
+    assert "discord-token" not in captured["cmd"]
+    assert "parent-cred" not in captured["cmd"]
+    assert "DISCORD_BOT_TOKEN" not in captured["cmd"]
+    assert "DISCORD_ADMIN_ACTIONS" not in captured["cmd"]
+    log = kanban_db.read_worker_log(task.id, board=board.slug)
+    assert log is not None
+    assert "discord-token" not in log
+    assert "broker-secret" not in log
+    assert "parent-cred" not in log
 
 
 def test_worker_prompt_mentions_read_only_discord_helper(monkeypatch):
@@ -624,6 +774,24 @@ def test_planner_schema_uses_parents_not_depends_on():
     assert "Ticket-specific acceptance criteria" in schema
     assert "do not copy the whole board-level list into every task" in schema
     assert "deduplicated canonical board-level list" in schema
+
+
+def test_worker_prompt_mentions_discord_read_helper(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_PLANNER
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        prompt = worker._build_prompt(conn, task.id, ROLE_PLANNER)
+    finally:
+        conn.close()
+
+    assert "Do not call Hermes tools" in prompt
+    assert "python -m hermes_cli.discord_worker_read fetch-message" in prompt
+    assert "python -m hermes_cli.discord_worker_read fetch-messages" in prompt
+    assert "Do not attempt Discord mutation or admin actions" in prompt
 
 
 def test_run_codex_records_app_server_state(monkeypatch, tmp_path):

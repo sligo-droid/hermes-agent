@@ -153,6 +153,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_USER_ID,
         _SESSION_USER_NAME,
         _SESSION_KEY,
+        _SESSION_ID,
         _SESSION_CWD,
         _PROJECT_PATH,
         _PROJECT_NAME,

@@ -84,7 +84,7 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
         "`python -m hermes_cli.discord_worker_read fetch-message --channel-id <id> --message-id <id>`.\n"
         "- You may inspect recent thread/channel history with "
         "`python -m hermes_cli.discord_worker_read fetch-messages --channel-id <id> --limit 25`.\n"
-        "- These commands are read-only. Do not attempt Discord mutation/admin actions.\n\n"
+        "- These commands are read-only. Do not attempt Discord mutation or admin actions.\n\n"
     )
     return (
         f"You are the Discord Kanban {role} worker.\n"
