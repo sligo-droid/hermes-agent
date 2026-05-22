@@ -47,14 +47,9 @@ jobs:
           source .venv/bin/activate
           python -m compileall hermes_cli gateway plugins tools agent -q
 
-      - name: Run basic focused tests
+      - name: Run fork smoke suite
         run: |
-          source .venv/bin/activate
-          python -m pytest \
-            tests/hermes_cli/test_kanban_db.py \
-            tests/hermes_cli/test_kanban_core_functionality.py \
-            tests/gateway/test_kanban_notifier.py \
-            -q --tb=short -o addopts=
+          scripts/run_tests.sh --smoke -q --tb=short
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

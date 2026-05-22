@@ -1463,7 +1463,8 @@ def test_dispatch_once_allows_explicit_role_lane_assignees(monkeypatch, tmp_path
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_db
 
-    board = dwb.set_goal(thread_id="123", goal="Plan work")
+    workspace = tmp_path / "repo"
+    board = dwb.ensure_discord_thread_board(thread_id="role-lane-skip")
     spawned = []
 
     def fake_spawn(task, workspace, board=None):
@@ -1472,11 +1473,33 @@ def test_dispatch_once_allows_explicit_role_lane_assignees(monkeypatch, tmp_path
 
     conn = kanban_db.connect(board=board.slug)
     try:
+        kanban_db.create_task(
+            conn,
+            title="Plan Discord implementation work",
+            assignee=dwb.ROLE_PLANNER,
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+            tenant=board.slug,
+        )
         without_extra = kanban_db.dispatch_once(conn, dry_run=True, board=board.slug)
+    finally:
+        conn.close()
+
+    spawn_board = dwb.ensure_discord_thread_board(thread_id="role-lane-spawn")
+    conn = kanban_db.connect(board=spawn_board.slug)
+    try:
+        kanban_db.create_task(
+            conn,
+            title="Plan Discord implementation work",
+            assignee=dwb.ROLE_PLANNER,
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+            tenant=spawn_board.slug,
+        )
         with_extra = kanban_db.dispatch_once(
             conn,
             spawn_fn=fake_spawn,
-            board=board.slug,
+            board=spawn_board.slug,
             additional_spawnable_assignees=dwb.ROLE_ASSIGNEES,
         )
     finally:
@@ -1485,7 +1508,7 @@ def test_dispatch_once_allows_explicit_role_lane_assignees(monkeypatch, tmp_path
     assert without_extra.skipped_nonspawnable
     assert with_extra.spawned
     assert spawned[0][1] == "planner"
-    assert spawned[0][3] == board.slug
+    assert spawned[0][3] == spawn_board.slug
 
 
 def _create_ready_dev_task(board_slug: str, title: str = "Implement task") -> str:

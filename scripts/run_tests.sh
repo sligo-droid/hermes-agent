@@ -3,6 +3,7 @@
 # `pytest` directly to guarantee your local run matches CI behavior.
 #
 # What this script enforces:
+#   * A fork-owned smoke suite by default (use --full for inherited upstream coverage)
 #   * -n 4 xdist workers (CI has 4 cores; -n auto diverges locally)
 #   * TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0 (deterministic)
 #   * Credential env vars blanked (conftest.py also does this, but this
@@ -11,10 +12,12 @@
 #   * Proper venv activation
 #
 # Usage:
-#   scripts/run_tests.sh                     # full suite
+#   scripts/run_tests.sh                     # fork smoke suite
+#   scripts/run_tests.sh --full              # inherited non-integration suite
+#   scripts/run_tests.sh --smoke -q          # explicit smoke suite + pytest flags
 #   scripts/run_tests.sh tests/agent/        # one directory
 #   scripts/run_tests.sh tests/agent/test_foo.py::TestClass::test_method
-#   scripts/run_tests.sh --tb=long -v        # pass-through pytest args
+#   scripts/run_tests.sh --tb=long -v        # smoke suite with pytest flags
 
 set -euo pipefail
 
@@ -52,20 +55,6 @@ if [ -z "$VENV" ]; then
 fi
 
 PYTHON="$VENV/bin/python"
-
-# ── Ensure pytest-split is installed (required for shard-equivalent runs) ──
-if ! "$PYTHON" -c "import pytest_split" 2>/dev/null; then
-  echo "→ installing pytest-split into $VENV"
-  if command -v uv >/dev/null 2>&1; then
-    uv pip install --python "$PYTHON" --quiet "pytest-split>=0.9,<1"
-  elif "$PYTHON" -m pip --version >/dev/null 2>&1; then
-    "$PYTHON" -m pip install --quiet "pytest-split>=0.9,<1"
-  else
-    echo "error: neither uv nor pip is available in $VENV — pytest-split is missing" >&2
-    echo "  fix: run  uv pip install -e \".[dev]\"  from $REPO_ROOT" >&2
-    exit 1
-  fi
-fi
 
 # ── Hermetic environment ────────────────────────────────────────────────────
 # Mirror what CI does in .github/workflows/tests.yml + what conftest.py does.
@@ -126,18 +115,82 @@ WORKERS="${HERMES_TEST_WORKERS:-4}"
 # ── Run pytest ──────────────────────────────────────────────────────────────
 cd "$REPO_ROOT"
 
-# If the first argument starts with `-` treat all args as pytest flags;
-# otherwise treat them as test paths.
-ARGS=("$@")
+# Mode selection:
+#   no args / flags only  -> fork-owned smoke suite
+#   --smoke              -> fork-owned smoke suite
+#   --full               -> inherited non-integration suite
+#   test paths/nodeids    -> targeted run
+MODE="custom"
+if [ "$#" -eq 0 ]; then
+  MODE="smoke"
+elif [ "${1:-}" = "--smoke" ]; then
+  MODE="smoke"
+  shift
+elif [ "${1:-}" = "--full" ]; then
+  MODE="full"
+  shift
+elif [[ "${1:-}" == -* ]]; then
+  MODE="smoke"
+  for arg in "$@"; do
+    case "$arg" in
+      tests/*|*::test_*|*.py)
+        MODE="custom"
+        break
+        ;;
+    esac
+  done
+fi
 
-echo "▶ running pytest with $WORKERS workers, hermetic env, in $REPO_ROOT"
+ARGS=("$@")
+PYTEST_ARGS=(
+  -o "addopts="
+  -n "$WORKERS"
+  --ignore=tests/integration
+  --ignore=tests/e2e
+  -m "not integration"
+)
+
+if [ "$MODE" = "smoke" ]; then
+  SMOKE_SUITE_FILE="$REPO_ROOT/scripts/test_suites/smoke.txt"
+  if [ ! -f "$SMOKE_SUITE_FILE" ]; then
+    echo "error: smoke suite file not found: $SMOKE_SUITE_FILE" >&2
+    exit 1
+  fi
+
+  SMOKE_TARGETS=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ""|\#*) continue ;;
+      *) SMOKE_TARGETS+=("$line") ;;
+    esac
+  done < "$SMOKE_SUITE_FILE"
+
+  if [ "${#SMOKE_TARGETS[@]}" -eq 0 ]; then
+    echo "error: smoke suite file is empty: $SMOKE_SUITE_FILE" >&2
+    exit 1
+  fi
+
+  PYTEST_ARGS+=("${SMOKE_TARGETS[@]}")
+elif [ "$MODE" = "custom" ]; then
+  PYTEST_ARGS+=("${ARGS[@]}")
+elif [ "$MODE" != "full" ]; then
+  echo "error: unknown test mode: $MODE" >&2
+  exit 1
+fi
+
+if [ "$MODE" = "full" ]; then
+  PYTEST_ARGS+=("${ARGS[@]}")
+elif [ "$MODE" = "smoke" ]; then
+  PYTEST_ARGS+=("${ARGS[@]}")
+fi
+
+echo "▶ running $MODE pytest suite with $WORKERS workers, hermetic env, in $REPO_ROOT"
 echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; all credential env vars unset)"
+if [ "$MODE" = "full" ]; then
+  echo "  full mode includes inherited upstream non-integration tests"
+elif [ "$MODE" = "smoke" ]; then
+  echo "  smoke suite: scripts/test_suites/smoke.txt"
+fi
 
 # -o "addopts=" clears pyproject.toml's `-n auto` so our -n wins.
-exec "$PYTHON" -m pytest \
-  -o "addopts=" \
-  -n "$WORKERS" \
-  --ignore=tests/integration \
-  --ignore=tests/e2e \
-  -m "not integration" \
-  "${ARGS[@]}"
+exec "$PYTHON" -m pytest "${PYTEST_ARGS[@]}"
