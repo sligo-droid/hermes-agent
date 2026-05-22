@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 DISCORD_WORKER_META_KEY = "discord_worker"
 DISCORD_WORKER_DISPATCH_DIRTY_FILENAME = "discord-worker-dispatch.dirty.json"
 PUBLIC_TOKEN_BYTES = 24
+REVIEW_LOOP_LIMIT_BLOCKED_REASON = "review loop limit reached"
+REVIEW_LOOP_CONTINUE_EXTRA_LOOPS = 5
 ROLE_PLANNER = "planner"
 ROLE_DEV = "dev"
 ROLE_REVIEWER = "reviewer"
@@ -1835,6 +1837,9 @@ def _board_runtime_snapshot(
     elif state == "queued":
         control = "pause"
         control_label = "Pause Queue"
+    elif state == "blocked" and _is_review_loop_limit_blocker(worker):
+        control = "continue"
+        control_label = f"Continue (+{REVIEW_LOOP_CONTINUE_EXTRA_LOOPS} loops)"
     elif state in {"idle"} and worker.get("goal_status") in {"unset", None, ""}:
         control = "start"
         control_label = "Start"
@@ -1890,6 +1895,9 @@ def _runtime_action_form_html(
     if control in {"resume", "start"}:
         action = "start"
         label = control_label or ("Resume" if control == "resume" else "Start")
+    elif control == "continue":
+        action = "continue"
+        label = control_label or "Continue"
     elif control == "pause":
         action = "pause"
         label = control_label or "Pause"
@@ -3111,6 +3119,14 @@ def _review_loop_limit() -> int:
         return 5
 
 
+def _is_review_loop_limit_blocker(worker: dict[str, Any]) -> bool:
+    reason = str(worker.get("blocked_reason") or "").strip().lower()
+    return (
+        reason == REVIEW_LOOP_LIMIT_BLOCKED_REASON
+        and worker.get("goal_status") == "blocked"
+    )
+
+
 def status_line(board: str) -> str:
     metadata = kanban_db.read_board_metadata(board)
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
@@ -3161,6 +3177,55 @@ def start_board(board: str) -> None:
     )
     worker.pop("paused_reason", None)
     _update_worker_meta(board, worker)
+
+
+def continue_board_after_review_loop_limit(
+    board: str,
+    *,
+    extra_loops: int = REVIEW_LOOP_CONTINUE_EXTRA_LOOPS,
+) -> dict[str, Any]:
+    """Extend a Discord worker board that stopped at the review loop cap."""
+    worker = _read_worker_meta(board)
+    if not _is_review_loop_limit_blocker(worker):
+        raise ValueError("board is not stopped at the review loop limit")
+    try:
+        loops = max(0, int(worker.get("review_loop_count") or 0))
+    except (TypeError, ValueError):
+        loops = 0
+    try:
+        limit = max(0, int(worker.get("review_loop_limit") or _review_loop_limit()))
+    except (TypeError, ValueError):
+        limit = _review_loop_limit()
+    try:
+        extension = max(1, int(extra_loops))
+    except (TypeError, ValueError):
+        extension = REVIEW_LOOP_CONTINUE_EXTRA_LOOPS
+    new_limit = max(limit, loops) + extension
+    worker.update(
+        {
+            "goal_status": "active",
+            "phase": "reviewing",
+            "review_loop_limit": new_limit,
+            "blocked_reason": "",
+            "paused": False,
+            "cancelled": False,
+            "terminal_reaction_sync_pending": True,
+            "terminal_summary_sync_pending": True,
+        }
+    )
+    worker.pop("paused_reason", None)
+    _update_worker_meta(board, worker)
+    reconcile_result = reconcile_board(board)
+    marker_path = mark_dispatch_dirty(board=board, reason="continue-review-loop-limit")
+    updated = _read_worker_meta(board)
+    return {
+        "review_loop_count": updated.get("review_loop_count"),
+        "review_loop_limit": updated.get("review_loop_limit"),
+        "goal_status": updated.get("goal_status"),
+        "phase": updated.get("phase"),
+        "reconcile_result": reconcile_result,
+        "dispatch_dirty_marker": str(marker_path),
+    }
 
 
 def clear_board_goal(board: str) -> None:
