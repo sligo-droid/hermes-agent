@@ -148,7 +148,7 @@ def _commit_embed(
         or "unknown"
     )
     description = _commit_description(message)
-    if pull_request and _is_generic_merge_message(message):
+    if pull_request:
         description = _pull_request_description(pull_request)
 
     embed: dict[str, Any] = {
@@ -173,7 +173,7 @@ def _commit_embed(
             },
         ],
     }
-    if pull_request and _is_generic_merge_message(message):
+    if pull_request:
         embed["fields"].append(
             {
                 "name": "Pull Request",
@@ -212,7 +212,7 @@ def build_webhook_payloads(
         sha = str(commit.get("id") or "").strip()
         message = str(commit.get("message") or "")
         pull_request = None
-        if pull_request_lookup and sha and _is_generic_merge_message(message):
+        if pull_request_lookup and sha:
             pull_request = pull_request_lookup(sha)
         embeds.append(_commit_embed(event, commit, pull_request))
     payloads: list[dict[str, Any]] = []

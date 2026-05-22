@@ -107,6 +107,33 @@ def test_generic_merge_commit_uses_associated_pr_body_and_field():
     } in embed["fields"]
 
 
+def test_non_generic_pr_associated_commit_uses_pr_body_and_field():
+    mod = _load_module()
+    commit = _commit(8, "feat: improve main log notifications")
+    pull_request = {
+        "number": 83,
+        "title": "Improve main log notifications",
+        "body": "Use PR details for squash and rebase merges.",
+        "html_url": "https://github.com/NousResearch/hermes-agent/pull/83",
+    }
+
+    payload = mod.build_webhook_payloads(
+        _event([commit]),
+        pull_request_lookup=lambda _sha: pull_request,
+    )[0]
+
+    embed = payload["embeds"][0]
+    assert embed["description"] == "Use PR details for squash and rebase merges."
+    assert {
+        "name": "Pull Request",
+        "value": (
+            "[#83 Improve main log notifications]"
+            "(https://github.com/NousResearch/hermes-agent/pull/83)"
+        ),
+        "inline": False,
+    } in embed["fields"]
+
+
 def test_pr_description_strips_tests_section():
     mod = _load_module()
     commit = _commit(7, "Merge pull request #82 from sligo-droid/example")
@@ -203,17 +230,21 @@ def test_generic_merge_commit_falls_back_to_pr_title_when_body_empty():
     assert payload["embeds"][0]["description"] == "Improve Discord commit messages"
 
 
-def test_direct_commit_keeps_commit_message_even_when_pr_is_associated():
+def test_direct_commit_keeps_commit_message_when_no_pr_is_associated():
     mod = _load_module()
+    commit = _commit(6, "feat: direct commit detail")
+    seen = []
 
-    def fail_lookup(_sha):
-        raise AssertionError("direct commits should not need PR lookup")
+    def pull_request_lookup(sha):
+        seen.append(sha)
+        return None
 
     payload = mod.build_webhook_payloads(
-        _event([_commit(6, "feat: direct commit detail")]),
-        pull_request_lookup=fail_lookup,
+        _event([commit]),
+        pull_request_lookup=pull_request_lookup,
     )[0]
 
+    assert seen == [commit["id"]]
     assert payload["embeds"][0]["description"] == "feat: direct commit detail"
     assert all(
         field["name"] != "Pull Request"
