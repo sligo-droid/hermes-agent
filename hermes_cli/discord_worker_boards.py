@@ -1632,12 +1632,15 @@ def thread_status_targets() -> list[dict[str, Any]]:
             summary = feature_summary_snapshot(board)
         except Exception:
             summary = {"state": board_thread_state(board)}
+        state = summary.get("state") or board_thread_state(board)
+        if state == "done":
+            continue
         targets.append(
             {
                 "board": board,
                 "thread_id": thread_id,
                 "chat_id": str(worker.get("chat_id") or thread_id),
-                "state": summary.get("state") or board_thread_state(board),
+                "state": state,
                 "title": summary.get("title") or "",
                 "fallback_title": summary.get("fallback_title") or "",
                 "outcome": summary.get("outcome") or "",
