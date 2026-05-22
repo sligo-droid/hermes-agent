@@ -12,6 +12,8 @@ from typing import Any, Optional
 from hermes_cli.discord_worker_boards import ROLE_ASSIGNEES, ROLE_DEV, ROLE_PLANNER
 
 _OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV}
+_SENSITIVE_ENV_FRAGMENTS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "ACCESS_KEY")
+_CODEX_WORKER_ENV_KEYS = ("CODEX_HOME", "HERMES_CODEX_WORKER_CREDENTIAL_ID")
 
 _ROLE_DEFAULT_REASONING = {
     "planner": "high",
@@ -130,6 +132,64 @@ def _github_cli_config_dir(env: dict[str, str]) -> Optional[str]:
         return None
 
 
+def _strip_discord_credentials(env: dict[str, str]) -> None:
+    for key in list(env):
+        if key.startswith("DISCORD_"):
+            env.pop(key, None)
+
+
+def _strip_inherited_codex_worker_state(env: dict[str, str]) -> None:
+    for key in _CODEX_WORKER_ENV_KEYS:
+        env.pop(key, None)
+
+
+def _configure_discord_read_broker(env: dict[str, str]) -> None:
+    token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+    if not token:
+        return
+    from hermes_cli.discord_worker_read import start_read_broker
+
+    base_url, access_token = start_read_broker(token)
+    env["HERMES_DISCORD_WORKER_READ_URL"] = base_url
+    env["HERMES_DISCORD_WORKER_READ_TOKEN"] = access_token
+
+
+def _worker_env() -> dict[str, str]:
+    env = os.environ.copy()
+    _strip_discord_credentials(env)
+    _strip_inherited_codex_worker_state(env)
+    _configure_discord_read_broker(env)
+    return env
+
+
+def _codex_home_source_env() -> dict[str, str]:
+    env = os.environ.copy()
+    if env.get("HERMES_CODEX_WORKER_CREDENTIAL_ID"):
+        _strip_inherited_codex_worker_state(env)
+    return env
+
+
+def _is_sensitive_env_key(key: str) -> bool:
+    upper = key.upper()
+    return any(fragment in upper for fragment in _SENSITIVE_ENV_FRAGMENTS)
+
+
+def _redacted_command(cmd: list[str], env: dict[str, str]) -> str:
+    secret_values = {
+        value
+        for key, value in env.items()
+        if value and _is_sensitive_env_key(key) and len(value) >= 4
+    }
+    rendered = []
+    for item in cmd:
+        redacted = item
+        for value in secret_values:
+            if value in redacted:
+                redacted = redacted.replace(value, "[REDACTED]")
+        rendered.append(redacted)
+    return " ".join(rendered)
+
+
 def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
     """Spawn a Codex worker for planner/dev/reviewer tasks.
 
@@ -202,7 +262,7 @@ def _spawn_host_worker(
     from hermes_cli import kanban_db
 
     board_db = str(kanban_db.kanban_db_path(board=board))
-    env = os.environ.copy()
+    env = _worker_env()
     existing_pythonpath = env.get("PYTHONPATH", "")
     env.update(
         {
@@ -268,7 +328,7 @@ def _spawn_docker_worker(
     codex_home = _codex_home(task, cfg)
     inherited_credential_id = _write_minimal_codex_home(codex_home)
 
-    env = os.environ.copy()
+    env = _worker_env()
     env.update(
         {
             "HERMES_KANBAN_TASK": str(getattr(task, "id", "")),
@@ -315,11 +375,11 @@ def _spawn_docker_worker(
     if host_gh_config_dir and Path(host_gh_config_dir).is_dir():
         env["GH_CONFIG_DIR"] = "/gh-config"
         cmd.extend(["-v", f"{Path(host_gh_config_dir).resolve()}:/gh-config:ro"])
-    for key, value in env.items():
+    for key in env:
         if key.startswith(
             ("HERMES_", "CODEX_", "OPENAI_", "ANTHROPIC_", "GH_", "GITHUB_")
-        ) or key in {"PYTHONPATH", "HOME", "DISCORD_BOT_TOKEN"}:
-            cmd.extend(["-e", f"{key}={value}"])
+        ) or key in {"PYTHONPATH", "HOME"}:
+            cmd.extend(["-e", key])
     cmd.extend([image, "python", "-m", "hermes_cli.kanban_codex_worker"])
 
     return _spawn_logged_process(
@@ -366,7 +426,7 @@ def _spawn_logged_process(
     )
     kanban_db._append_worker_log_line(
         log_path,
-        f"[kanban dispatcher] spawning {label} role worker: {' '.join(cmd)}",
+        f"[kanban dispatcher] spawning {label} role worker: {_redacted_command(cmd, env)}",
     )
     log_f = open(log_path, "ab")
     try:
@@ -412,7 +472,7 @@ def _write_minimal_codex_home(path: Path) -> Optional[str]:
     """Create a Codex home with auth but no Hermes MCP/tool bridge."""
     from agent.codex_worker_auth import prepare_codex_worker_home
 
-    return prepare_codex_worker_home(path)
+    return prepare_codex_worker_home(path, source_env=_codex_home_source_env())
 
 
 def spawn_or_default(task: Any, workspace: str, *, board: Optional[str] = None) -> Optional[int]:

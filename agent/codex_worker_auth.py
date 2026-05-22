@@ -91,8 +91,15 @@ def select_codex_worker_credential(parent_agent: Any = None) -> tuple[Any, Any]:
     return pool, None
 
 
-def _copy_codex_file(codex_home: Path, name: str, *, overwrite: bool = False) -> None:
-    source_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
+def _copy_codex_file(
+    codex_home: Path,
+    name: str,
+    *,
+    source_env: dict[str, str] | None = None,
+    overwrite: bool = False,
+) -> None:
+    env = os.environ if source_env is None else source_env
+    source_home = Path(env.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
     src = source_home / name
     dst = codex_home / name
     if src.exists() and (overwrite or not dst.exists()):
@@ -161,12 +168,14 @@ def prepare_codex_worker_home(
     codex_home: Path | str,
     *,
     parent_agent: Any = None,
+    source_env: dict[str, str] | None = None,
 ) -> Optional[str]:
     """Prepare an isolated Codex home and return inherited credential id.
 
     The active Hermes ``openai-codex`` credential wins. If no pool credential is
     available, this preserves the previous behavior of copying the user's
-    existing Codex auth files when present.
+    existing Codex auth files when present. ``source_env`` lets callers choose
+    the environment used for that fallback without mutating global state.
     """
     path = Path(codex_home).expanduser()
     path.mkdir(parents=True, exist_ok=True)
@@ -180,9 +189,14 @@ def prepare_codex_worker_home(
             credential_id or "<unknown>",
         )
     else:
-        _copy_codex_file(path, "auth.json", overwrite=not _codex_auth_has_id_token(path))
+        _copy_codex_file(
+            path,
+            "auth.json",
+            source_env=source_env,
+            overwrite=not _codex_auth_has_id_token(path),
+        )
 
-    _copy_codex_file(path, "credentials.json")
+    _copy_codex_file(path, "credentials.json", source_env=source_env)
     _write_minimal_config(path)
     return credential_id
 
