@@ -1548,6 +1548,8 @@ def board_thread_state(board: str) -> str:
                 and (worker.get("goal_status") == "done" or worker.get("phase") == "complete")
             ):
                 return "done"
+            if any(task.status == "running" for task in tasks):
+                return "running"
             return "active"
     finally:
         conn.close()
@@ -1720,7 +1722,7 @@ def thread_status_targets() -> list[dict[str, Any]]:
             worker.get("terminal_reaction_sync_pending")
             or worker.get("terminal_summary_sync_pending")
         )
-        if state != "active" and not (state in {"done", "blocked", "errored"} and terminal_sync_pending):
+        if state not in {"active", "running"} and not (state in {"done", "blocked", "errored"} and terminal_sync_pending):
             continue
         targets.append(
             {
