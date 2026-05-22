@@ -3174,7 +3174,9 @@ class GatewayRunner:
         if not item:
             return None
         event.work_item_id = item.get("id")
-        event.defer_work_completion = defer_completion
+        event.defer_work_completion = defer_completion or bool(
+            getattr(event, "defer_work_completion", False)
+        )
         status = str(item.get("status") or "")
         if status in {"completed", "blocked", "cancelled", "expired"}:
             return item
@@ -7352,6 +7354,7 @@ class GatewayRunner:
             _work_item
             and _work_item.get("_existing")
             and not getattr(event, "work_replay", False)
+            and not getattr(event, "defer_work_completion", False)
         ):
             logger.info(
                 "Ignoring duplicate Discord work item %s with status=%s",

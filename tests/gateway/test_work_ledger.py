@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import Platform
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
 from gateway.work_ledger import GatewayWorkLedger
@@ -41,6 +41,20 @@ def _make_busy_runner(ledger_path):
     runner._busy_input_mode = "queue"
     runner._is_user_authorized = lambda _source: True
     return runner
+
+
+class _LedgerDrainAdapter(BasePlatformAdapter):
+    async def connect(self):
+        return True
+
+    async def disconnect(self):
+        return None
+
+    async def send(self, chat_id, content=None, **kwargs):
+        return SendResult(success=True, message_id=f"sent-{chat_id}")
+
+    async def get_chat_info(self, chat_id):
+        return {}
 
 
 def _mark_claim_stale(ledger, work_id):
@@ -265,6 +279,80 @@ async def test_startup_replays_busy_followup_accepted_before_drain(tmp_path, mon
     assert replay.work_replay is True
     assert replay.work_item_id == event.work_item_id
     assert replay.text == "queued before drain"
+
+
+@pytest.mark.asyncio
+async def test_same_process_busy_followup_completion_is_not_replayed_after_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+    ledger_path = tmp_path / "work_ledger.json"
+    runner = _make_busy_runner(ledger_path)
+    adapter = _LedgerDrainAdapter(PlatformConfig(enabled=True, token="token"), Platform.DISCORD)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner.config = SimpleNamespace(
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+        platforms={},
+        quick_commands={},
+    )
+    runner.session_store = MagicMock()
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+
+    initial_event = _discord_event(message_id="initial", text="first turn")
+    busy_event = _discord_event(message_id="busy-1", text="queued while first turn is active")
+    session_key = build_session_key(initial_event.source)
+    processed_message_ids = []
+    followup_finished = asyncio.Event()
+
+    async def fake_handle_message_with_agent(event, source, _quick_key, _run_generation):
+        processed_message_ids.append(event.message_id)
+        if event.message_id == "initial":
+            await adapter.handle_message(busy_event)
+
+        work_id = getattr(event, "work_item_id", None)
+        assert work_id
+        runner.work_ledger.mark_agent_running(work_id, session_id="session-1")
+        runner.work_ledger.mark_agent_done(
+            work_id,
+            final_response="follow-up done",
+            session_id="session-1",
+            summary_status="Complete",
+        )
+        runner.work_ledger.mark_response_delivered(work_id, result_message_id="result-1")
+        runner.work_ledger.mark_summary_updated(work_id)
+        runner.work_ledger.mark_completed(work_id)
+        if event.message_id == "busy-1":
+            followup_finished.set()
+        return ""
+
+    runner._handle_message_with_agent = fake_handle_message_with_agent
+    adapter.set_message_handler(runner._handle_message)
+
+    await adapter.handle_message(initial_event)
+    await asyncio.wait_for(followup_finished.wait(), timeout=2)
+    for _ in range(200):
+        if session_key not in adapter._active_sessions:
+            break
+        await asyncio.sleep(0.01)
+
+    assert processed_message_ids == ["initial", "busy-1"]
+    assert session_key not in adapter._active_sessions
+    stored = runner.work_ledger.get(busy_event.work_item_id)
+    assert stored is not None
+    assert stored["status"] == "completed"
+    assert runner.work_ledger.incomplete_items() == []
+
+    restarted = object.__new__(GatewayRunner)
+    restarted.work_ledger = GatewayWorkLedger(ledger_path)
+    replay_adapter = SimpleNamespace(handle_message=AsyncMock())
+    restarted.adapters = {Platform.DISCORD: replay_adapter}
+    restarted._background_tasks = set()
+
+    scheduled = restarted._schedule_incomplete_discord_work_items()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    replay_adapter.handle_message.assert_not_called()
+    await adapter.cancel_background_tasks()
 
 
 @pytest.mark.asyncio
