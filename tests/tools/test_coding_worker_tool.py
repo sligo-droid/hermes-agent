@@ -64,6 +64,7 @@ def test_unavailable_inside_codex_app_server(tmp_path):
 def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []
+    (tmp_path / "AGENTS.md").write_text("Always use the repo test wrapper.")
     monkeypatch.setattr(
         "agent.transports.codex_app_server_session.CodexAppServerSession",
         FakeSession,
@@ -90,8 +91,35 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     prompt = FakeSession.instances[0].run_calls[0]["user_input"]
     assert "fix the parser" in prompt
     assert "focus on src/parser.py" in prompt
+    assert "Repository context loaded by Hermes" in prompt
+    assert "## AGENTS.md" in prompt
+    assert "Always use the repo test wrapper." in prompt
     assert result["agents"] == ["build"]
     assert result["plan_used"] is False
+
+
+def test_delegate_prefers_hermes_md_context_over_agents(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    (tmp_path / "AGENTS.md").write_text("Agents rules should not be loaded.")
+    (tmp_path / ".hermes.md").write_text("Hermes rules win.")
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the parser",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "Repository context loaded by Hermes" in prompt
+    assert "Hermes rules win." in prompt
+    assert "Agents rules should not be loaded." not in prompt
 
 
 def test_codex_backend_runs_plan_then_build_for_complex_task(monkeypatch, tmp_path):
@@ -185,10 +213,12 @@ def test_codex_backend_uses_configured_reasoning_levels(monkeypatch, tmp_path):
 def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
     from agent import opencode_worker as ow
 
+    (tmp_path / "AGENTS.md").write_text("OpenCode should see repo rules.")
     monkeypatch.setattr(ow, "load_coding_worker_backend", lambda: ow.BACKEND_OPENCODE)
 
     def fake_run(prompt, workspace, **kwargs):
         assert "fix the parser" in prompt
+        assert "OpenCode should see repo rules." in prompt
         assert workspace == str(tmp_path)
         assert kwargs["context_for_classification"]
         return SimpleNamespace(
