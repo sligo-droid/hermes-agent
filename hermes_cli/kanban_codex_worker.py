@@ -460,6 +460,7 @@ def _apply_role_output(
 
     if status == "blocked":
         kanban_db.block_task(conn, task_id, reason=payload.get("blocker") or summary, expected_run_id=expected_run_id)
+        _update_phase(board, "blocked", goal_status="blocked")
         return
     _checkpoint_commit(workspace, task_id, summary)
     kanban_db.complete_task(

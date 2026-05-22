@@ -15,6 +15,7 @@ def _prepare_board(monkeypatch, tmp_path: Path, *, thread_id: str):
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_db
 
+    monkeypatch.setattr(dwb, "ensure_code_island_for_board", lambda _board: True)
     board = dwb.set_goal(thread_id=thread_id, goal=f"Ship worker board {thread_id}")
     conn = kanban_db.connect(board=board.slug)
     try:
