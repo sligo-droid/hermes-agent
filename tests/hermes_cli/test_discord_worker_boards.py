@@ -84,6 +84,49 @@ def test_ensure_code_island_for_board_runs_deferred_setup(monkeypatch, tmp_path)
     assert worker["code_island_pending"] is False
 
 
+def test_ensure_code_island_blocks_active_board_without_project_mapping(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(thread_id="12348", goal="Ship it")
+
+    assert dwb.ensure_code_island_for_board(board.slug) is False
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["goal_status"] == "blocked"
+    assert worker["phase"] == "blocked"
+    assert "No project checkout is mapped" in worker["blocked_reason"]
+
+
+def test_ensure_code_island_blocks_active_board_on_checkout_error(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    board = dwb.set_goal(
+        thread_id="12349",
+        goal="Ship it",
+        project_context={"project_path": str(project)},
+    )
+
+    def fake_ensure(worker):
+        worker["code_island_ready"] = False
+        worker["code_island_pending"] = False
+        worker["code_island_error"] = "not a git repository"
+
+    monkeypatch.setattr(dwb, "_ensure_code_island", fake_ensure)
+
+    assert dwb.ensure_code_island_for_board(board.slug) is False
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["goal_status"] == "blocked"
+    assert worker["phase"] == "blocked"
+    assert "not a git repository" in worker["blocked_reason"]
+
+
 def test_set_goal_creates_planner_task_for_role_lane(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -1545,9 +1588,17 @@ def _make_intake_discord_board(thread_id: str):
     )
 
 
+def _skip_code_island_preflight(monkeypatch):
+    from hermes_cli import discord_worker_boards as dwb
+
+    monkeypatch.setattr(dwb, "ensure_code_island_for_board", lambda _board: True)
+
+
 def test_discord_worker_dispatch_skips_intake_board(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
+
+    _skip_code_island_preflight(monkeypatch)
 
     board = _make_intake_discord_board("1901")
     _create_ready_dev_task(board.slug)
@@ -1605,6 +1656,8 @@ def test_discord_worker_dispatch_spawns_across_two_boards(monkeypatch, tmp_path)
     _home(monkeypatch, tmp_path)
     from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
 
+    _skip_code_island_preflight(monkeypatch)
+
     board_a = _make_discord_board("2001")
     board_b = _make_discord_board("2002")
     _create_ready_dev_task(board_a.slug)
@@ -1630,6 +1683,8 @@ def test_discord_worker_dispatch_respects_global_limit(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
 
+    _skip_code_island_preflight(monkeypatch)
+
     boards = [_make_discord_board(str(2100 + idx)) for idx in range(3)]
     for board in boards:
         _create_ready_dev_task(board.slug)
@@ -1647,6 +1702,8 @@ def test_discord_worker_dispatch_respects_global_limit(monkeypatch, tmp_path):
 def test_discord_worker_dispatch_keeps_each_board_serial(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
+
+    _skip_code_island_preflight(monkeypatch)
 
     board = _make_discord_board("2201")
     _create_ready_dev_task(board.slug, "Implement first task")
@@ -1666,6 +1723,8 @@ def test_discord_worker_dispatch_skips_paused_board(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
+
+    _skip_code_island_preflight(monkeypatch)
 
     paused = _make_discord_board("2301")
     active = _make_discord_board("2302")

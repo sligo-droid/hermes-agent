@@ -441,15 +441,74 @@ def _code_island_configured(worker: dict[str, Any]) -> bool:
     return bool(project_path and worktree_path and branch and os.path.isdir(project_path))
 
 
+def _is_git_worktree(path: str) -> bool:
+    if not path or not os.path.isdir(path):
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0 and (result.stdout or "").strip().lower() == "true"
+
+
+def _code_island_blocker(worker: dict[str, Any]) -> str:
+    project_path = str(worker.get("project_path") or "").strip()
+    worktree_path = str(worker.get("worktree_path") or "").strip()
+    branch = str(worker.get("worker_branch") or "").strip()
+    context = worker.get("project_context") if isinstance(worker.get("project_context"), dict) else {}
+    channel = str(context.get("project_channel_id") or worker.get("parent_channel_id") or "").strip()
+    if not project_path:
+        suffix = f" for Discord channel {channel}" if channel else ""
+        return f"No project checkout is mapped{suffix}; configure discord.channel_cwds before running workers."
+    if not os.path.isdir(project_path):
+        return f"Mapped project checkout does not exist: {project_path}"
+    if not branch:
+        return "Discord worker branch is not configured."
+    if not worktree_path:
+        return "Discord worker worktree path is not configured."
+    if os.path.isdir(worktree_path) and not _is_git_worktree(worktree_path):
+        return f"Worker checkout exists but is not a git repository: {worktree_path}"
+    error = str(worker.get("code_island_error") or "").strip()
+    if error:
+        return f"Could not prepare worker checkout: {error}"
+    return ""
+
+
+def _block_worker_board_for_code_island(board: str, worker: dict[str, Any], reason: str) -> None:
+    worker.update(
+        {
+            "phase": "blocked",
+            "goal_status": "blocked",
+            "blocked_reason": reason,
+            "code_island_pending": False,
+            "terminal_reaction_sync_pending": True,
+            "terminal_summary_sync_pending": True,
+            "updated_at": _now(),
+        }
+    )
+    _update_worker_meta(board, worker)
+
+
 def _mark_code_island_deferred(worker: dict[str, Any]) -> None:
     if not _code_island_configured(worker):
         worker["code_island_pending"] = False
         return
     worktree_path = str(worker.get("worktree_path") or "").strip()
     if os.path.isdir(worktree_path):
-        worker["code_island_ready"] = True
-        worker["code_island_pending"] = False
-        worker.pop("code_island_error", None)
+        if _is_git_worktree(worktree_path):
+            worker["code_island_ready"] = True
+            worker["code_island_pending"] = False
+            worker.pop("code_island_error", None)
+        else:
+            worker["code_island_ready"] = False
+            worker["code_island_pending"] = True
+            worker["code_island_error"] = f"worktree path is not a git repository: {worktree_path}"
         return
     worker["code_island_ready"] = False
     worker["code_island_pending"] = True
@@ -465,9 +524,14 @@ def _ensure_code_island(worker: dict[str, Any]) -> None:
         worker["code_island_pending"] = False
         return
     if os.path.isdir(worktree_path):
-        worker["code_island_ready"] = True
-        worker["code_island_pending"] = False
-        worker.pop("code_island_error", None)
+        if _is_git_worktree(worktree_path):
+            worker["code_island_ready"] = True
+            worker["code_island_pending"] = False
+            worker.pop("code_island_error", None)
+        else:
+            worker["code_island_ready"] = False
+            worker["code_island_pending"] = False
+            worker["code_island_error"] = f"worktree path is not a git repository: {worktree_path}"
         return
     worker["code_island_ready"] = False
     worker["code_island_pending"] = True
@@ -515,6 +579,10 @@ def ensure_code_island_for_board(board: str) -> bool:
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
     if worker.get("kind") != "discord_worker_board":
         return True
+    active_pipeline = (
+        worker.get("execution_mode") == "kanban_pipeline"
+        and worker.get("goal_status") == "active"
+    )
     previous_worktree_path = str(worker.get("worktree_path") or "").strip()
     _ensure_code_island(worker)
     metadata[DISCORD_WORKER_META_KEY] = worker
@@ -526,6 +594,9 @@ def ensure_code_island_for_board(board: str) -> bool:
             new_path=str(worker.get("worktree_path") or ""),
         )
     elapsed_ms = int((time.time() - started) * 1000)
+    blocker = _code_island_blocker(worker) if active_pipeline else ""
+    if blocker:
+        _block_worker_board_for_code_island(board, worker, blocker)
     logger.info(
         "discord_worker_code_island board=%s ready=%s pending=%s elapsed_ms=%d error=%s",
         board,
@@ -534,6 +605,8 @@ def ensure_code_island_for_board(board: str) -> bool:
         elapsed_ms,
         bool(worker.get("code_island_error")),
     )
+    if blocker:
+        return False
     return bool(worker.get("code_island_ready") or not _code_island_configured(worker))
 
 

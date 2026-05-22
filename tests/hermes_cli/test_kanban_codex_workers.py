@@ -761,6 +761,50 @@ def test_planner_output_links_parent_dependencies(monkeypatch, tmp_path):
         conn.close()
 
 
+def test_dev_blocked_output_marks_discord_board_blocked(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+
+    board = dwb.start_direct_goal(thread_id="dev-blocked", goal="Ship it")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Implement change",
+            assignee=ROLE_DEV,
+            tenant=board.slug,
+        )
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+
+        worker._apply_role_output(
+            conn,
+            claimed.id,
+            ROLE_DEV,
+            {
+                "status": "blocked",
+                "summary": "Workspace unavailable.",
+                "blocker": "Workspace is not a git repository.",
+            },
+            board=board.slug,
+            workspace=str(tmp_path / "repo"),
+            expected_run_id=claimed.current_run_id,
+        )
+
+        blocked = kanban_db.get_task(conn, task_id)
+    finally:
+        conn.close()
+
+    worker_meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert blocked is not None
+    assert blocked.status == "blocked"
+    assert worker_meta["goal_status"] == "blocked"
+    assert worker_meta["phase"] == "blocked"
+
+
 def test_planner_schema_uses_parents_not_depends_on():
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli.discord_worker_boards import ROLE_PLANNER
