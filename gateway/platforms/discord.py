@@ -761,14 +761,51 @@ class DiscordAdapter(BasePlatformAdapter):
         thread_id = getattr(thread_channel, "id", "")
         return f"{guild_id or 'dm'}:{thread_id}"
 
+    def _feature_summary_channel_identity(self, thread_channel: Any) -> Dict[str, str]:
+        guild = getattr(thread_channel, "guild", None)
+        parent = getattr(thread_channel, "parent", None)
+        return {
+            "thread_id": str(getattr(thread_channel, "id", "") or ""),
+            "guild_id": str(getattr(guild, "id", "") or ""),
+            "parent_channel_id": str(
+                getattr(parent, "id", "")
+                or getattr(thread_channel, "parent_id", "")
+                or ""
+            ),
+        }
+
+    @staticmethod
+    def _expected_feature_summary_board_slug(thread_id: str) -> Optional[str]:
+        thread_id = str(thread_id or "").strip()
+        return f"discord-{thread_id}" if thread_id else None
+
+    @staticmethod
+    def _raw_feature_kanban_board_slug(handle: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not isinstance(handle, dict):
+            return None
+        board = handle.get("kanban_board")
+        if not isinstance(board, dict):
+            return None
+        slug = str(board.get("slug") or "").strip()
+        return slug or None
+
     def _persist_feature_summary_handle(
         self,
         thread_channel: Any,
         handle: Dict[str, Any],
     ) -> None:
-        thread_id = str(handle.get("thread_id") or "")
+        identity = self._feature_summary_channel_identity(thread_channel)
+        thread_id = str(handle.get("thread_id") or identity.get("thread_id") or "")
         message_id = str(handle.get("message_id") or "")
         if not thread_id or not message_id:
+            return
+        if identity.get("thread_id") and thread_id != identity["thread_id"]:
+            logger.warning(
+                "[%s] Refusing to persist Discord feature summary for mismatched thread: %s != %s",
+                self.name,
+                thread_id,
+                identity["thread_id"],
+            )
             return
         state = self._read_project_summary_state()
         bucket = state.get(_DISCORD_FEATURE_SUMMARY_STATE_BUCKET)
@@ -778,7 +815,10 @@ class DiscordAdapter(BasePlatformAdapter):
         bucket[key] = {
             "thread_id": thread_id,
             "message_id": message_id,
-            "parent_channel_id": str(handle.get("parent_channel_id") or ""),
+            "guild_id": str(handle.get("guild_id") or identity.get("guild_id") or ""),
+            "parent_channel_id": str(
+                handle.get("parent_channel_id") or identity.get("parent_channel_id") or ""
+            ),
             "initial_request": str(handle.get("initial_request") or ""),
             "project_context": handle.get("project_context") or None,
             "kanban_board": handle.get("kanban_board") or None,
@@ -803,6 +843,49 @@ class DiscordAdapter(BasePlatformAdapter):
             str(marker.get("thread_id") or "") == scope["thread_id"]
             and str(marker.get("message_id") or "") == scope["message_id"]
         )
+
+    @staticmethod
+    def _feature_summary_field_conflicts(handle: Dict[str, Any], target: Dict[str, Any], field: str) -> bool:
+        handle_value = str(handle.get(field) or "").strip()
+        target_value = str(target.get(field) or "").strip()
+        return bool(handle_value and target_value and handle_value != target_value)
+
+    def _feature_summary_target_matches_handle(
+        self,
+        handle: Dict[str, Any],
+        target: Dict[str, Any],
+    ) -> bool:
+        thread_id = str(target.get("thread_id") or "").strip()
+        board = str(target.get("board") or "").strip()
+        if not thread_id or not board:
+            return False
+        if str(handle.get("thread_id") or "").strip() != thread_id:
+            return False
+        expected_board = self._expected_feature_summary_board_slug(thread_id)
+        if expected_board and board != expected_board:
+            return False
+        handle_board = self._raw_feature_kanban_board_slug(handle)
+        if handle_board and handle_board != board:
+            return False
+        for field in ("guild_id", "parent_channel_id"):
+            if self._feature_summary_field_conflicts(handle, target, field):
+                return False
+            if not str(handle.get(field) or "").strip() and str(target.get(field) or "").strip():
+                handle[field] = str(target.get(field) or "").strip()
+        return True
+
+    def _feature_summary_snapshot_matches_handle(
+        self,
+        handle: Dict[str, Any],
+        snapshot: Dict[str, Any],
+    ) -> bool:
+        target = {
+            "board": snapshot.get("board"),
+            "thread_id": snapshot.get("thread_id"),
+            "guild_id": snapshot.get("guild_id"),
+            "parent_channel_id": snapshot.get("parent_channel_id"),
+        }
+        return self._feature_summary_target_matches_handle(handle, target)
 
     def _mark_feature_summary_kanban_sync_circuit(self, handle: Dict[str, Any], reason: str) -> None:
         scope = self._feature_summary_handle_scope(handle)
@@ -902,12 +985,31 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         handle = dict(stored)
         handle.setdefault("thread_id", thread_id)
+        identity = self._feature_summary_channel_identity(thread_channel)
+        repaired_identity = False
+        for field in ("guild_id", "parent_channel_id"):
+            value = str(identity.get(field) or "").strip()
+            stored_value = str(handle.get(field) or "").strip()
+            if value and not stored_value:
+                handle[field] = value
+                stored[field] = value
+                repaired_identity = True
+            elif value and stored_value and value != stored_value:
+                logger.warning(
+                    "[%s] Ignoring Discord feature summary with mismatched %s: %s != %s",
+                    self.name,
+                    field,
+                    stored_value,
+                    value,
+                )
+                return None
         if self._should_repair_feature_summary_project_context(handle.get("project_context"), project_context):
             handle["project_context"] = project_context
             stored["project_context"] = project_context
+            repaired_identity = True
+        if repaired_identity:
             self._write_project_summary_state(state)
-        else:
-            handle.setdefault("project_context", project_context)
+        handle.setdefault("project_context", project_context)
         handle["_thread_obj"] = thread_channel
         return handle
 
@@ -1515,13 +1617,20 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
 
     def _feature_kanban_board_slug(self, handle: Optional[Dict[str, Any]]) -> Optional[str]:
-        if not isinstance(handle, dict):
+        slug = self._raw_feature_kanban_board_slug(handle)
+        if not slug:
             return None
-        board = handle.get("kanban_board")
-        if not isinstance(board, dict):
+        thread_id = str((handle or {}).get("thread_id") or "").strip() if isinstance(handle, dict) else ""
+        expected = self._expected_feature_summary_board_slug(thread_id)
+        if expected and slug != expected:
+            logger.warning(
+                "[%s] Ignoring Discord feature summary Kanban board mismatch: %s != %s",
+                self.name,
+                slug,
+                expected,
+            )
             return None
-        slug = str(board.get("slug") or "").strip()
-        return slug or None
+        return slug
 
     def _feature_kanban_reaction_state(self, handle: Optional[Dict[str, Any]]) -> Optional[str]:
         slug = self._feature_kanban_board_slug(handle)
@@ -1545,7 +1654,15 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             from hermes_cli.discord_worker_boards import feature_summary_snapshot
 
-            return feature_summary_snapshot(slug)
+            snapshot = feature_summary_snapshot(slug)
+            if not self._feature_summary_snapshot_matches_handle(handle, snapshot):
+                logger.warning(
+                    "[%s] Ignoring Discord feature summary snapshot for mismatched board identity: %s",
+                    self.name,
+                    slug,
+                )
+                return None
+            return snapshot
         except Exception as exc:
             logger.debug("[%s] Failed to read Discord kanban summary: %s", self.name, exc)
             return None
@@ -1683,6 +1800,7 @@ class DiscordAdapter(BasePlatformAdapter):
         handle = {
             "thread_id": str(getattr(thread_channel, "id", "") or ""),
             "message_id": str(getattr(msg, "id", "") or ""),
+            "guild_id": str(getattr(getattr(thread_channel, "guild", None), "id", "") or ""),
             "parent_channel_id": str(getattr(parent_channel, "id", "") or ""),
             "initial_request": initial_request,
             "project_context": project_context,
@@ -1822,9 +1940,17 @@ class DiscordAdapter(BasePlatformAdapter):
         handle = self._load_feature_summary_handle_by_thread_id(thread_id)
         if not handle:
             return None
+        if not self._feature_summary_target_matches_handle(handle, target):
+            logger.warning(
+                "[%s] Refusing Discord Kanban feature-summary sync for mismatched identity: board=%s thread=%s",
+                self.name,
+                board,
+                thread_id,
+            )
+            return None
         board_handle = handle.get("kanban_board") if isinstance(handle.get("kanban_board"), dict) else {}
         board_handle = dict(board_handle or {})
-        board_handle.setdefault("slug", board)
+        board_handle["slug"] = board
         if target.get("public_url"):
             board_handle["public_url"] = target.get("public_url")
         handle["kanban_board"] = board_handle

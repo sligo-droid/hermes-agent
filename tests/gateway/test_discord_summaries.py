@@ -735,6 +735,76 @@ async def test_sync_kanban_feature_summary_reopens_persisted_handle(adapter, mon
 
 
 @pytest.mark.asyncio
+async def test_sync_kanban_feature_summary_refuses_mismatched_board(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="/goal Ship the dashboard",
+    )
+    assert handle is not None
+    message = handle["_message_obj"]
+
+    synced = await adapter.sync_kanban_feature_summary(
+        {
+            "board": "discord-201",
+            "thread_id": "200",
+            "guild_id": "5",
+            "parent_channel_id": "100",
+            "state": "active",
+            "title": "Wrong Thread Title",
+            "sync_key": "wrong-thread",
+        }
+    )
+
+    assert synced is None
+    message.edit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sync_kanban_feature_summary_refuses_mismatched_discord_scope(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="/goal Ship the dashboard",
+    )
+    assert handle is not None
+    message = handle["_message_obj"]
+
+    assert await adapter.sync_kanban_feature_summary(
+        {
+            "board": "discord-200",
+            "thread_id": "200",
+            "guild_id": "6",
+            "parent_channel_id": "100",
+            "state": "active",
+            "title": "Wrong Guild Title",
+            "sync_key": "wrong-guild",
+        }
+    ) is None
+    assert await adapter.sync_kanban_feature_summary(
+        {
+            "board": "discord-200",
+            "thread_id": "200",
+            "guild_id": "5",
+            "parent_channel_id": "101",
+            "state": "active",
+            "title": "Wrong Parent Title",
+            "sync_key": "wrong-parent",
+        }
+    ) is None
+
+    message.edit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_sync_kanban_feature_summary_circuits_permanent_fetch_failure(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     parent = FakeTextChannel(channel_id=100)
