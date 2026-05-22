@@ -674,6 +674,95 @@ def test_public_board_index_blocked_task_sets_blocked_runtime(monkeypatch, tmp_p
     assert 'action="/workers/5158/pause"' not in html
 
 
+def test_public_session_board_shows_continue_for_review_loop_limit(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(thread_id="5161", goal="Keep reviewing")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "blocked",
+            "phase": "blocked",
+            "review_loop_count": 5,
+            "review_loop_limit": 5,
+            "blocked_reason": dwb.REVIEW_LOOP_LIMIT_BLOCKED_REASON,
+        },
+    )
+
+    html = dwb.render_public_session_board_html("5161")
+
+    assert 'class="runtime runtime-blocked">blocked</strong>' in html
+    assert 'action="/workers/5161/continue?return_to=/workers/5161"' in html
+    assert ">Continue (+5 loops)</button>" in html
+
+
+def test_public_session_board_does_not_show_continue_for_other_blockers(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(thread_id="5162", goal="Wait for input")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "blocked",
+            "phase": "blocked",
+            "review_loop_count": 5,
+            "review_loop_limit": 5,
+            "blocked_reason": "missing credentials",
+        },
+    )
+
+    html = dwb.render_public_session_board_html("5162")
+
+    assert 'class="runtime runtime-blocked">blocked</strong>' in html
+    assert '/workers/5162/continue' not in html
+    assert "Continue (+5 loops)" not in html
+
+
+def test_continue_board_after_review_loop_limit_extends_and_reconciles(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.ensure_discord_thread_board(thread_id="5163", initial_request="Keep reviewing")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        done = kanban_db.create_task(conn, title="Previous work", assignee="dev", tenant=board.slug)
+        claimed = kanban_db.claim_task(conn, done)
+        assert claimed is not None
+        kanban_db.complete_task(conn, done, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "blocked",
+            "phase": "blocked",
+            "execution_mode": "kanban_pipeline",
+            "review_loop_count": 5,
+            "review_loop_limit": 5,
+            "blocked_reason": dwb.REVIEW_LOOP_LIMIT_BLOCKED_REASON,
+        },
+    )
+
+    result = dwb.continue_board_after_review_loop_limit(board.slug)
+
+    assert result["review_loop_count"] == 6
+    assert result["review_loop_limit"] == 10
+    assert result["goal_status"] == "active"
+    assert result["phase"] == "reviewing"
+    assert result["reconcile_result"] == "reviewer_created"
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+    reviewer = [task for task in tasks if task.assignee == "reviewer" and task.status == "ready"]
+    assert len(reviewer) == 1
+    assert reviewer[0].title.endswith("Review Discord implementation (loop 6)")
+
+
 def test_public_board_index_does_not_show_dead_pid_as_running(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

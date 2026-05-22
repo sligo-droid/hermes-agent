@@ -417,6 +417,33 @@ async def pause_worker_session_board(session_id: str, return_to: Optional[str] =
         raise HTTPException(status_code=500, detail="Kanban board unavailable")
 
 
+@app.post("/workers/{session_id}/continue")
+async def continue_worker_session_board(session_id: str, return_to: Optional[str] = None):
+    """Continue a Discord worker session board stopped at its review loop limit."""
+    try:
+        from hermes_cli.discord_worker_boards import (
+            board_slug_for_discord_thread,
+            continue_board_after_review_loop_limit,
+        )
+        from hermes_cli import kanban_db
+
+        board = board_slug_for_discord_thread(session_id)
+        if not kanban_db.board_exists(board):
+            raise KeyError("unknown board session")
+        continue_board_after_review_loop_limit(board)
+        return RedirectResponse(
+            url=_worker_action_redirect_url(session_id, return_to),
+            status_code=303,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Kanban board not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        _log.warning("worker board continue failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Kanban board unavailable")
+
+
 class WorkerTicketMove(BaseModel):
     status: str
 
