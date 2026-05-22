@@ -1,6 +1,7 @@
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -306,6 +307,91 @@ def test_discord_kanban_typing_watcher_skips_completed_status_sync(tmp_path, mon
     asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
 
     assert adapter.synced == []
+
+
+def test_discord_kanban_typing_watcher_skips_blocked_status_sync(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(
+        thread_id="99008",
+        goal="Do not touch blocked Discord thread",
+        chat_id="parent-997",
+    )
+    conn = kb.connect(board=board.slug)
+    try:
+        task = kb.list_tasks(conn, include_archived=False)[0]
+        assert kb.block_task(conn, task.id, reason="waiting for input") is True
+    finally:
+        conn.close()
+
+    adapter = DiscordStatusSyncAdapter()
+    runner = _make_discord_runner(adapter)
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert adapter.synced == []
+
+
+def test_discord_kanban_typing_watcher_skips_errored_status_sync(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(
+        thread_id="99009",
+        goal="Do not touch errored Discord thread",
+        chat_id="parent-998",
+    )
+    conn = kb.connect(board=board.slug)
+    try:
+        task = kb.list_tasks(conn, include_archived=False)[0]
+        claimed = kb.claim_task(conn, task.id)
+        assert claimed is not None
+        blocked = kb._record_spawn_failure(
+            conn,
+            task.id,
+            "worker failed before start",
+            failure_limit=1,
+        )
+        assert blocked is True
+    finally:
+        conn.close()
+
+    adapter = DiscordStatusSyncAdapter()
+    runner = _make_discord_runner(adapter)
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert adapter.synced == []
+
+
+def test_discord_worker_status_sync_is_inference_free(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from agent import auxiliary_client
+    from hermes_cli import discord_worker_boards as dwb
+
+    call_llm = Mock(side_effect=AssertionError("status sync must not call LLM"))
+    async_call_llm = AsyncMock(side_effect=AssertionError("status sync must not call async LLM"))
+    monkeypatch.setattr(auxiliary_client, "call_llm", call_llm)
+    monkeypatch.setattr(auxiliary_client, "async_call_llm", async_call_llm)
+
+    board = dwb.set_goal(
+        thread_id="99010",
+        goal="Check active board without inference",
+        chat_id="parent-999",
+    )
+
+    targets = dwb.thread_status_targets()
+    assert [target["board"] for target in targets] == [board.slug]
+
+    adapter = DiscordStatusSyncAdapter()
+    runner = _make_discord_runner(adapter)
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert len(adapter.synced) == 2
+    call_llm.assert_not_called()
+    async_call_llm.assert_not_called()
 
 
 def test_discord_kanban_typing_watcher_resyncs_stale_reaction_state(tmp_path, monkeypatch):
