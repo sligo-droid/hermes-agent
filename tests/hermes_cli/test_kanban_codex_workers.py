@@ -564,7 +564,7 @@ def test_opencode_planner_output_creates_dev_ticket(monkeypatch, tmp_path):
     finally:
         conn.close()
 
-    assert [item.title for item in dev_tasks] == ["Clean answer box"]
+    assert [item.title for item in dev_tasks] == ["R1: Clean answer box"]
 
 
 def test_docker_runner_logs_immediate_registry_failure(monkeypatch, tmp_path):
@@ -733,7 +733,12 @@ def test_planner_output_links_parent_dependencies(monkeypatch, tmp_path):
         "summary": "Planned two steps.",
         "acceptance_criteria": ["done"],
         "tasks": [
-            {"title": "Build foundation", "body": "Do first.", "priority": 20, "parents": []},
+            {
+                "title": "R1: Build foundation",
+                "body": "Do first.",
+                "priority": 20,
+                "parents": [],
+            },
             {"title": "Wire feature", "body": "Do second.", "priority": 10, "parents": [0]},
         ],
     }
@@ -752,13 +757,58 @@ def test_planner_output_links_parent_dependencies(monkeypatch, tmp_path):
         tasks = kanban_db.list_tasks(conn, include_archived=False)
         dev_tasks = [item for item in tasks if item.assignee == "dev"]
         assert len(dev_tasks) == 2
-        first = next(item for item in dev_tasks if item.title == "Build foundation")
-        second = next(item for item in dev_tasks if item.title == "Wire feature")
+        first = next(item for item in dev_tasks if item.title == "R1: Build foundation")
+        second = next(item for item in dev_tasks if item.title == "R1: Wire feature")
         assert first.status == "ready"
         assert second.status == "todo"
         assert second.id in kanban_db.child_ids(conn, first.id)
     finally:
         conn.close()
+
+
+def test_reviewer_output_creates_next_round_dev_ticket(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+
+    board = dwb.start_direct_goal(thread_id="review-followup", goal="Ship it")
+    dwb._update_worker_meta(board.slug, {**board.worker, "review_loop_count": 1})
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        reviewer_id = kanban_db.create_task(
+            conn,
+            title="R1: Review Discord implementation (loop 1)",
+            assignee=ROLE_REVIEWER,
+            tenant=board.slug,
+        )
+        claimed = kanban_db.claim_task(conn, reviewer_id)
+        assert claimed is not None
+
+        worker._apply_role_output(
+            conn,
+            claimed.id,
+            ROLE_REVIEWER,
+            {
+                "status": "changes_requested",
+                "summary": "Needs follow-up.",
+                "new_tasks": [
+                    {"title": "R1: Fix follow-up", "body": "Do it.", "priority": 10}
+                ],
+            },
+            board=board.slug,
+            workspace=str(tmp_path / "repo"),
+            expected_run_id=claimed.current_run_id,
+        )
+        dev_tasks = [
+            item for item in kanban_db.list_tasks(conn, include_archived=False)
+            if item.assignee == "dev"
+        ]
+    finally:
+        conn.close()
+
+    assert [item.title for item in dev_tasks] == ["R2: Fix follow-up"]
 
 
 def test_dev_blocked_output_marks_discord_board_blocked(monkeypatch, tmp_path):

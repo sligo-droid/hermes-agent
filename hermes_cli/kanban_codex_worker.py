@@ -16,6 +16,8 @@ from hermes_cli.discord_worker_boards import (
     ROLE_DEV,
     ROLE_PLANNER,
     ROLE_REVIEWER,
+    active_dev_round_for_board,
+    format_role_round_title,
     mark_dispatch_dirty,
     record_codex_worker_event,
     record_codex_worker_result,
@@ -370,6 +372,7 @@ def _apply_role_output(
         criteria = _string_list(payload.get("acceptance_criteria"))
         tasks = payload.get("tasks") if isinstance(payload.get("tasks"), list) else []
         created = []
+        dev_round = active_dev_round_for_board(board)
         for idx, spec in enumerate(tasks, start=1):
             if not isinstance(spec, dict):
                 continue
@@ -384,7 +387,7 @@ def _apply_role_output(
             created.append(
                 kanban_db.create_task(
                     conn,
-                    title=title,
+                    title=format_role_round_title(title, dev_round),
                     body=str(spec.get("body") or ""),
                     assignee=ROLE_DEV,
                     parents=parent_ids,
@@ -430,13 +433,14 @@ def _apply_role_output(
             return
         created = []
         new_tasks = payload.get("new_tasks") if isinstance(payload.get("new_tasks"), list) else []
+        dev_round = active_dev_round_for_board(board)
         for idx, spec in enumerate(new_tasks, start=1):
             if not isinstance(spec, dict) or not str(spec.get("title") or "").strip():
                 continue
             created.append(
                 kanban_db.create_task(
                     conn,
-                    title=str(spec.get("title")).strip(),
+                    title=format_role_round_title(str(spec.get("title")).strip(), dev_round),
                     body=str(spec.get("body") or ""),
                     assignee=ROLE_DEV,
                     created_by=ROLE_REVIEWER,

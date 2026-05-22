@@ -140,9 +140,18 @@ def test_set_goal_creates_planner_task_for_role_lane(monkeypatch, tmp_path):
         conn.close()
 
     assert len(tasks) == 1
+    assert tasks[0].title == "R1: Plan Discord implementation work"
     assert tasks[0].assignee == "planner"
     assert tasks[0].status == "ready"
     assert tasks[0].workspace_kind == "dir"
+
+
+def test_role_round_title_prefix_is_idempotent():
+    from hermes_cli import discord_worker_boards as dwb
+
+    assert dwb.format_role_round_title("Implement thing", 1) == "R1: Implement thing"
+    assert dwb.format_role_round_title("R1: Implement thing", 1) == "R1: Implement thing"
+    assert dwb.format_role_round_title("R1: Implement thing", 2) == "R2: Implement thing"
 
 
 def test_set_goal_repairs_unmapped_board_workspace(monkeypatch, tmp_path):
@@ -1764,8 +1773,48 @@ def test_add_subgoal_activates_direct_dev_ticket_board(monkeypatch, tmp_path):
     assert worker["goal_status"] == "active"
     assert worker["phase"] == "dev"
     assert len(tasks) == 1
+    assert tasks[0].title == "R1: User subgoal 1"
     assert tasks[0].assignee == "dev"
     assert tasks[0].created_by == "discord-subgoal"
+
+
+def test_reconcile_board_creates_round_prefixed_reviewer_ticket(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="review-round", goal="Ship it")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        dev_id = kanban_db.create_task(
+            conn,
+            title="R1: Implement task",
+            assignee=dwb.ROLE_DEV,
+            tenant=board.slug,
+        )
+        claimed = kanban_db.claim_task(conn, dev_id)
+        assert claimed is not None
+        kanban_db.complete_task(
+            conn,
+            dev_id,
+            summary="done",
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    assert dwb.reconcile_board(board.slug) == "reviewer_created"
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        reviewer_tasks = [
+            task for task in kanban_db.list_tasks(conn, include_archived=False)
+            if task.assignee == dwb.ROLE_REVIEWER
+        ]
+    finally:
+        conn.close()
+
+    assert len(reviewer_tasks) == 1
+    assert reviewer_tasks[0].title == "R1: Review Discord implementation (loop 1)"
 
 
 def test_dispatch_once_allows_explicit_role_lane_assignees(monkeypatch, tmp_path):

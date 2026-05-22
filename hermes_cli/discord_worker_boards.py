@@ -36,6 +36,7 @@ ROLE_PLANNER = "planner"
 ROLE_DEV = "dev"
 ROLE_REVIEWER = "reviewer"
 ROLE_ASSIGNEES = frozenset({ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER})
+_ROLE_ROUND_TITLE_RE = re.compile(r"^R\d+:\s*")
 CODEX_STATE_MAX_EVENTS = 200
 CODEX_STATE_MAX_TEXT_BYTES = 24_000
 CODEX_STATE_LOG_TAIL_BYTES = 64_000
@@ -72,6 +73,30 @@ def board_slug_for_discord_thread(thread_id: str) -> str:
 
 def _now() -> int:
     return int(time.time())
+
+
+def format_role_round_title(title: str, round_number: int) -> str:
+    """Return a role-lane ticket title with one normalized round prefix."""
+    try:
+        round_value = max(1, int(round_number))
+    except (TypeError, ValueError):
+        round_value = 1
+    clean_title = _ROLE_ROUND_TITLE_RE.sub("", str(title or "").strip()).strip()
+    return f"R{round_value}: {clean_title}"
+
+
+def active_dev_round(worker: Optional[dict[str, Any]]) -> int:
+    """Return the dev round that should receive newly-created dev tickets."""
+    try:
+        return max(1, int((worker or {}).get("review_loop_count") or 0) + 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def active_dev_round_for_board(board: Optional[str]) -> int:
+    if not board:
+        return 1
+    return active_dev_round(_read_worker_meta(board))
 
 
 def _metadata_path(board: str) -> Path:
@@ -3454,7 +3479,7 @@ def _ensure_planner_task(
         )
         return kanban_db.create_task(
             conn,
-            title="Plan Discord implementation work",
+            title=format_role_round_title("Plan Discord implementation work", 1),
             body=body,
             assignee=ROLE_PLANNER,
             created_by=created_by,
@@ -3497,8 +3522,7 @@ def _find_existing_planner_task(conn, planner_request: str) -> Optional[str]:
         """
         SELECT id, body
         FROM tasks
-        WHERE title = 'Plan Discord implementation work'
-          AND assignee = ?
+        WHERE assignee = ?
           AND status != 'archived'
         ORDER BY created_at ASC, id ASC
         """,
@@ -3679,7 +3703,7 @@ def add_subgoal(board: str, text: str) -> tuple[int, str]:
     try:
         task_id = kanban_db.create_task(
             conn,
-            title=f"User subgoal {idx}",
+            title=format_role_round_title(f"User subgoal {idx}", active_dev_round(worker)),
             body=body,
             assignee=ROLE_DEV,
             created_by="discord-subgoal",
@@ -3805,7 +3829,7 @@ def reconcile_board(board: str) -> Optional[str]:
         _update_worker_meta(board, worker)
         kanban_db.create_task(
             conn,
-            title=f"Review Discord implementation (loop {loops})",
+            title=format_role_round_title(f"Review Discord implementation (loop {loops})", loops),
             body=json.dumps(
                 {
                     "role": ROLE_REVIEWER,
