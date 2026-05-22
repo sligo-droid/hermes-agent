@@ -1966,6 +1966,13 @@ class DiscordAdapter(BasePlatformAdapter):
             if self._feature_summary_circuit_matches(handle):
                 return str(target.get("sync_key") or board)
             return None
+        if str(target.get("state") or "") in {"done", "blocked", "errored"}:
+            try:
+                from hermes_cli.discord_worker_boards import mark_thread_status_synced
+
+                mark_thread_status_synced(board, summary=True)
+            except Exception:
+                logger.debug("[%s] Failed to clear Discord terminal summary sync flag", self.name, exc_info=True)
         return str(target.get("sync_key") or board)
 
     def _heuristic_feature_request_intent(self, text: str) -> Optional[bool]:
@@ -3010,6 +3017,13 @@ class DiscordAdapter(BasePlatformAdapter):
         if message is None:
             return None
         await self._set_message_reaction_state(message, emoji)
+        if state in {"done", "blocked", "errored"}:
+            try:
+                from hermes_cli.discord_worker_boards import mark_thread_status_synced
+
+                mark_thread_status_synced(str(target.get("board") or ""), reaction=True)
+            except Exception:
+                logger.debug("[%s] Failed to clear Discord terminal reaction sync flag", self.name, exc_info=True)
         return state
 
     async def on_processing_start(self, event: MessageEvent) -> None:
