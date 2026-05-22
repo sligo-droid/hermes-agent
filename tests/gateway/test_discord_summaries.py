@@ -12,6 +12,7 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+from gateway.work_ledger import GatewayWorkLedger
 import gateway.run as gateway_run
 
 
@@ -1240,3 +1241,93 @@ async def test_runner_registers_discord_summary_post_delivery_callback():
         status="Complete",
         title=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_discord_summary_callback_completes_work_ledger_after_embed_update(tmp_path):
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._session_db = None
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    adapter = SimpleNamespace(
+        callbacks=[],
+        update_feature_summary=AsyncMock(return_value=True),
+    )
+
+    def register_post_delivery_callback(session_key, callback, generation=None):
+        adapter.callbacks.append((session_key, callback, generation))
+
+    adapter.register_post_delivery_callback = register_post_delivery_callback
+    runner.adapters = {Platform.DISCORD: adapter}
+    source = SessionSource(platform=Platform.DISCORD, chat_id="200", chat_type="thread")
+    event = MessageEvent(
+        text="Build it",
+        source=source,
+        message_id="400",
+        feature_summary={"message_id": "300"},
+    )
+    item = runner.work_ledger.accept_event(event, session_key="discord:200", freshness_seconds=60)
+    assert item is not None
+    event.work_item_id = item["id"]
+    runner.work_ledger.mark_agent_done(item["id"], final_response="Final answer")
+    runner.work_ledger.mark_response_delivered(item["id"], result_message_id="500")
+
+    runner._register_discord_summary_post_delivery(
+        event=event,
+        source=source,
+        session_key="discord:200",
+        run_generation=7,
+        session_id="session-1",
+        final_response="Final answer",
+        agent_result={"completed": True},
+    )
+    result = adapter.callbacks[0][1]()
+    if inspect.isawaitable(result):
+        result = await result
+
+    assert result is True
+    assert runner.work_ledger.get(item["id"])["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_discord_summary_callback_leaves_work_incomplete_when_embed_update_fails(tmp_path):
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._session_db = None
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    adapter = SimpleNamespace(
+        callbacks=[],
+        update_feature_summary=AsyncMock(return_value=False),
+    )
+
+    def register_post_delivery_callback(session_key, callback, generation=None):
+        adapter.callbacks.append((session_key, callback, generation))
+
+    adapter.register_post_delivery_callback = register_post_delivery_callback
+    runner.adapters = {Platform.DISCORD: adapter}
+    source = SessionSource(platform=Platform.DISCORD, chat_id="200", chat_type="thread")
+    event = MessageEvent(
+        text="Build it",
+        source=source,
+        message_id="400",
+        feature_summary={"message_id": "300"},
+    )
+    item = runner.work_ledger.accept_event(event, session_key="discord:200", freshness_seconds=60)
+    assert item is not None
+    event.work_item_id = item["id"]
+    runner.work_ledger.mark_agent_done(item["id"], final_response="Final answer")
+    runner.work_ledger.mark_response_delivered(item["id"], result_message_id="500")
+
+    runner._register_discord_summary_post_delivery(
+        event=event,
+        source=source,
+        session_key="discord:200",
+        run_generation=7,
+        session_id="session-1",
+        final_response="Final answer",
+        agent_result={"completed": True},
+    )
+    result = adapter.callbacks[0][1]()
+    if inspect.isawaitable(result):
+        result = await result
+
+    assert result is False
+    assert runner.work_ledger.get(item["id"])["status"] == "response_delivered"
