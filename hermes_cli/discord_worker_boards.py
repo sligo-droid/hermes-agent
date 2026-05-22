@@ -1633,7 +1633,7 @@ def thread_status_targets() -> list[dict[str, Any]]:
         except Exception:
             summary = {"state": board_thread_state(board)}
         state = summary.get("state") or board_thread_state(board)
-        if state == "done":
+        if state != "active":
             continue
         targets.append(
             {
