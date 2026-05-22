@@ -115,6 +115,44 @@ def _coding_worker_result_succeeded(result: object) -> bool:
     return isinstance(payload, dict) and payload.get("success") is True
 
 
+def _record_turn_tool_runtime(
+    agent: Any,
+    function_name: str,
+    duration: float,
+    result: Any,
+    is_error: bool,
+    *,
+    blocked: bool = False,
+) -> None:
+    stats = getattr(agent, "_turn_runtime_stats", None)
+    if not isinstance(stats, dict):
+        return
+    try:
+        duration_s = max(0.0, float(duration or 0.0))
+        result_len = len(result) if isinstance(result, str) else len(str(result))
+        stats["tool_calls"] = int(stats.get("tool_calls") or 0) + 1
+        stats["tool_duration_s"] = float(stats.get("tool_duration_s") or 0.0) + duration_s
+        stats["tool_chars"] = int(stats.get("tool_chars") or 0) + result_len
+        if is_error:
+            stats["tool_errors"] = int(stats.get("tool_errors") or 0) + 1
+        if blocked:
+            stats["tool_blocked"] = int(stats.get("tool_blocked") or 0) + 1
+        tools = stats.setdefault("tools", {})
+        item = tools.setdefault(
+            function_name,
+            {"count": 0, "duration_s": 0.0, "errors": 0, "blocked": 0, "chars": 0},
+        )
+        item["count"] = int(item.get("count") or 0) + 1
+        item["duration_s"] = float(item.get("duration_s") or 0.0) + duration_s
+        item["chars"] = int(item.get("chars") or 0) + result_len
+        if is_error:
+            item["errors"] = int(item.get("errors") or 0) + 1
+        if blocked:
+            item["blocked"] = int(item.get("blocked") or 0) + 1
+    except Exception:
+        logger.debug("turn tool runtime accounting failed", exc_info=True)
+
+
 def apply_tool_result_hooks(
     function_name: str,
     function_args: dict,
@@ -458,6 +496,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             else:
                 function_result = f"Error executing tool '{name}': thread did not return a result"
             tool_duration = 0.0
+            is_error = True
         else:
             function_name, function_args, function_result, tool_duration, is_error, blocked = r
 
@@ -479,7 +518,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 _err_text = _multimodal_text_summary(function_result)
                 result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
-
             # Track file-mutation outcome for the turn-end verifier.
             # `blocked` calls never actually ran — don't let a guardrail
             # block count as either a failure or a success.
@@ -503,6 +541,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if agent.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                 logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
+
+        _record_turn_tool_runtime(
+            agent,
+            name,
+            tool_duration,
+            function_result,
+            is_error,
+            blocked=blocked,
+        )
 
         # Print cute message per tool
         if agent._should_emit_quiet_tool_messages():
@@ -960,6 +1007,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
         else:
             logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
+        _record_turn_tool_runtime(
+            agent,
+            function_name,
+            tool_duration,
+            function_result,
+            _is_error_result,
+            blocked=_execution_blocked,
+        )
 
         # Track file-mutation outcome for the turn-end verifier.  See
         # the concurrent path for the rationale; both paths must feed

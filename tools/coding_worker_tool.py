@@ -5,8 +5,10 @@ The execution backend is selected by ``coding_worker.backend``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -62,6 +64,165 @@ def _resolve_cwd(cwd: Optional[str], parent_agent: Any) -> str:
     return str(path.resolve())
 
 
+_PNPM_SCAN_SKIP_DIRS = {
+    ".git",
+    ".hermes",
+    ".next",
+    ".svelte-kit",
+    ".turbo",
+    ".venv",
+    "build",
+    "dist",
+    "node_modules",
+    "venv",
+}
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _repo_root_for_path(path: Path) -> Optional[Path]:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(path),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    raw = result.stdout.strip()
+    if not raw:
+        return None
+    try:
+        return Path(raw).resolve()
+    except Exception:
+        return Path(raw)
+
+
+def _git_worktree_paths(repo_root: Path) -> list[Path]:
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    paths: list[Path] = []
+    for line in result.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        raw = line[len("worktree ") :].strip()
+        if not raw:
+            continue
+        try:
+            paths.append(Path(raw).resolve())
+        except Exception:
+            paths.append(Path(raw))
+    return paths
+
+
+def _pnpm_package_roots(workdir: Path, *, max_depth: int = 4) -> list[Path]:
+    roots: list[Path] = []
+
+    def consider(path: Path) -> None:
+        if (path / "package.json").is_file() and (path / "pnpm-lock.yaml").is_file():
+            try:
+                resolved = path.resolve()
+            except Exception:
+                resolved = path
+            if resolved not in roots:
+                roots.append(resolved)
+
+    consider(workdir)
+    for current, dirs, files in os.walk(workdir):
+        current_path = Path(current)
+        try:
+            rel_parts = current_path.relative_to(workdir).parts
+        except Exception:
+            rel_parts = ()
+        dirs[:] = [d for d in dirs if d not in _PNPM_SCAN_SKIP_DIRS]
+        if len(rel_parts) >= max_depth:
+            dirs[:] = []
+        if "package.json" in files and "pnpm-lock.yaml" in files:
+            consider(current_path)
+    return roots
+
+
+def _prepare_pnpm_dependency_links(workdir: str) -> list[str]:
+    """Reuse compatible pnpm node_modules trees across git worktrees.
+
+    Git worktrees intentionally do not copy ignored dependency directories. For
+    pnpm projects that means every fresh worktree often pays an install before
+    basic checks can run. When another worktree of the same repo already has a
+    matching lockfile and `node_modules`, a symlink is safe enough and much
+    faster. Lockfile mismatch falls back to the worker's normal install.
+    """
+    disabled_values = {"0", "false", "no", "off"}
+    if os.getenv("HERMES_CODING_WORKER_PNPM_LINKS", "1").strip().lower() in disabled_values:
+        return []
+    try:
+        root = Path(workdir).resolve()
+    except Exception:
+        root = Path(workdir)
+    repo_root = _repo_root_for_path(root)
+    if repo_root is None:
+        return []
+    worktrees = _git_worktree_paths(repo_root)
+    if not worktrees:
+        return []
+    notes: list[str] = []
+    for package_root in _pnpm_package_roots(root):
+        node_modules = package_root / "node_modules"
+        if node_modules.exists() or node_modules.is_symlink():
+            continue
+        lockfile = package_root / "pnpm-lock.yaml"
+        try:
+            rel_package = package_root.relative_to(repo_root)
+            lock_hash = _hash_file(lockfile)
+        except Exception:
+            continue
+        for worktree_root in worktrees:
+            try:
+                candidate_root = (worktree_root / rel_package).resolve()
+            except Exception:
+                candidate_root = worktree_root / rel_package
+            if candidate_root == package_root:
+                continue
+            candidate_modules = candidate_root / "node_modules"
+            candidate_lock = candidate_root / "pnpm-lock.yaml"
+            if not candidate_modules.is_dir() or not candidate_lock.is_file():
+                continue
+            try:
+                if _hash_file(candidate_lock) != lock_hash:
+                    continue
+            except Exception:
+                continue
+            try:
+                node_modules.symlink_to(candidate_modules, target_is_directory=True)
+            except Exception:
+                continue
+            note = f"linked {node_modules} -> {candidate_modules}"
+            notes.append(note)
+            break
+    return notes
+
+
 def delegate_coding_task(
     task: Optional[str] = None,
     context: Optional[str] = None,
@@ -86,6 +247,7 @@ def delegate_coding_task(
     workdir = _resolve_cwd(cwd, parent_agent)
     if not Path(workdir).exists():
         return tool_error(f"cwd does not exist: {workdir}")
+    dependency_notes = _prepare_pnpm_dependency_links(workdir)
 
     timeout = (
         float(turn_timeout_seconds)
@@ -115,6 +277,14 @@ def delegate_coding_task(
     ]
     if context and str(context).strip():
         worker_prompt_parts.extend(["", "Context from Hermes:", str(context).strip()])
+    if dependency_notes:
+        worker_prompt_parts.extend(
+            [
+                "",
+                "Hermes dependency preflight:",
+                *[f"- {note}" for note in dependency_notes],
+            ]
+        )
     worker_prompt = "\n".join(worker_prompt_parts)
 
     classification_context = f"{task_text}\n{context or ''}"

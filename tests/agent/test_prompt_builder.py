@@ -265,6 +265,9 @@ class TestBuildSkillsSystemPrompt:
         assert "python-debug" in result
         assert "Debug Python scripts" in result
         assert "available_skills" in result
+        assert "Skills (summary index)" in result
+        assert "only when the task needs that skill's detailed procedure" in result
+        assert "routine coding work" in result
 
     def test_builds_index_with_inherited_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
@@ -1244,4 +1247,3 @@ class TestOpenAIModelExecutionGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
