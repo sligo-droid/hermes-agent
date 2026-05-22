@@ -13,6 +13,7 @@ from hermes_cli.discord_worker_boards import ROLE_ASSIGNEES, ROLE_DEV, ROLE_PLAN
 
 _OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV}
 _SENSITIVE_ENV_FRAGMENTS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "ACCESS_KEY")
+_CODEX_WORKER_ENV_KEYS = ("CODEX_HOME", "HERMES_CODEX_WORKER_CREDENTIAL_ID")
 
 _ROLE_DEFAULT_REASONING = {
     "planner": "high",
@@ -137,6 +138,11 @@ def _strip_discord_credentials(env: dict[str, str]) -> None:
             env.pop(key, None)
 
 
+def _strip_inherited_codex_worker_state(env: dict[str, str]) -> None:
+    for key in _CODEX_WORKER_ENV_KEYS:
+        env.pop(key, None)
+
+
 def _configure_discord_read_broker(env: dict[str, str]) -> None:
     token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
     if not token:
@@ -151,6 +157,7 @@ def _configure_discord_read_broker(env: dict[str, str]) -> None:
 def _worker_env() -> dict[str, str]:
     env = os.environ.copy()
     _strip_discord_credentials(env)
+    _strip_inherited_codex_worker_state(env)
     _configure_discord_read_broker(env)
     return env
 
