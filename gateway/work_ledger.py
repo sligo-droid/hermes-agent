@@ -24,6 +24,7 @@ INCOMPLETE_STATUSES = frozenset(
         "summary_updated",
     }
 )
+FINISHED_DELIVERY_STATUSES = frozenset({"agent_done", "response_delivered", "summary_updated"})
 TERMINAL_STATUSES = frozenset({"completed", "failed", "blocked", "cancelled", "expired"})
 LEASE_SECONDS = 3600.0
 _DROP = object()
@@ -210,6 +211,8 @@ class GatewayWorkLedger:
         item = data["items"].get(work_id)
         if not isinstance(item, dict):
             return None
+        if item.get("status") in FINISHED_DELIVERY_STATUSES | TERMINAL_STATUSES:
+            return dict(item)
         now = self._now()
         item["status"] = "claimed"
         item["updated_at"] = now
