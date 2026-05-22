@@ -1,5 +1,7 @@
 import asyncio
 import os
+from datetime import datetime
+from threading import RLock
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -8,7 +10,7 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource, build_session_key
+from gateway.session import SessionEntry, SessionSource, build_session_key
 from gateway.work_ledger import GatewayWorkLedger
 
 
@@ -472,6 +474,83 @@ async def test_startup_replays_same_session_discord_work_in_fifo_order(tmp_path,
     assert processed_message_ids == ["replay-1", "replay-2"]
     assert runner.work_ledger.get(first_item["id"])["status"] == "completed"
     assert runner.work_ledger.get(second_item["id"])["status"] == "completed"
+    await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
+async def test_startup_skips_resume_pending_when_discord_ledger_has_same_session_work(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+    ledger_path = tmp_path / "work_ledger.json"
+    runner = _make_busy_runner(ledger_path)
+    adapter = _LedgerDrainAdapter(PlatformConfig(enabled=True, token="token"), Platform.DISCORD)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner.config = SimpleNamespace(
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+        platforms={},
+        quick_commands={},
+    )
+    runner._background_tasks = set()
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+    adapter.set_message_handler(runner._handle_message)
+
+    event = _discord_event(message_id="interrupted-1", text="finish my interrupted request")
+    session_key = build_session_key(event.source)
+    item = runner.work_ledger.accept_event(
+        event,
+        session_key=session_key,
+        freshness_seconds=60,
+    )
+    assert item is not None
+    runner.work_ledger.claim(item["id"])
+    _mark_claim_stale(runner.work_ledger, item["id"])
+
+    resume_entry = SessionEntry(
+        session_key=session_key,
+        session_id="session-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=event.source,
+        platform=Platform.DISCORD,
+        chat_type="thread",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store = MagicMock()
+    runner.session_store._lock = RLock()
+    runner.session_store._entries = {session_key: resume_entry}
+    runner.session_store._ensure_loaded_locked = MagicMock()
+
+    processed_texts = []
+
+    async def fake_handle_message_with_agent(event, source, _quick_key, _run_generation):
+        processed_texts.append(event.text)
+        work_id = getattr(event, "work_item_id", None)
+        if work_id:
+            runner.work_ledger.mark_agent_running(work_id, session_id="session-1")
+            runner.work_ledger.mark_agent_done(
+                work_id,
+                final_response="done",
+                session_id="session-1",
+                summary_status="Complete",
+            )
+            runner.work_ledger.mark_response_delivered(work_id, result_message_id="result-1")
+            runner.work_ledger.mark_summary_updated(work_id)
+            runner.work_ledger.mark_completed(work_id)
+        return ""
+
+    runner._handle_message_with_agent = fake_handle_message_with_agent
+
+    resume_scheduled = runner._schedule_resume_pending_sessions()
+    ledger_scheduled = runner._schedule_incomplete_discord_work_items()
+    if runner._background_tasks:
+        await asyncio.gather(*runner._background_tasks)
+
+    assert resume_scheduled == 0
+    assert ledger_scheduled == 1
+    assert processed_texts == ["finish my interrupted request"]
+    assert runner.work_ledger.get(item["id"])["status"] == "completed"
     await adapter.cancel_background_tasks()
 
 

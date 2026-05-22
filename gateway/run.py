@@ -3913,9 +3913,25 @@ class GatewayRunner:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return 0
 
+        discord_ledger_sessions: set[str] = set()
+        try:
+            discord_ledger_sessions = {
+                str(item.get("session_key") or "")
+                for item in self._ledger().incomplete_items()
+                if item.get("session_key")
+            }
+        except Exception as exc:
+            logger.warning("Failed to enumerate incomplete Discord work ledger: %s", exc)
+
         now = datetime.now()
         scheduled = 0
         for entry in candidates:
+            if entry.session_key in discord_ledger_sessions:
+                logger.debug(
+                    "Skipping auto-resume for %s: incomplete Discord work ledger item exists",
+                    entry.session_key,
+                )
+                continue
             marker = entry.last_resume_marked_at or entry.updated_at
             if marker is not None and (now - marker).total_seconds() > window:
                 continue
