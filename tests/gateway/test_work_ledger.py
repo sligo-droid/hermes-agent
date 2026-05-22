@@ -1,7 +1,7 @@
 import asyncio
 import os
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -29,6 +29,24 @@ def _discord_event(message_id="m1", text="do the work"):
         source=source,
         message_id=message_id,
     )
+
+
+def _make_busy_runner(ledger_path):
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(ledger_path)
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._busy_ack_ts = {}
+    runner._draining = False
+    runner._busy_input_mode = "queue"
+    runner._is_user_authorized = lambda _source: True
+    return runner
+
+
+def _mark_claim_stale(ledger, work_id):
+    data = ledger._read()
+    data["items"][work_id]["claim_pid"] = os.getpid() + 10_000_000
+    ledger._write(data)
 
 
 def test_ledger_deduplicates_discord_message_ids(tmp_path):
@@ -197,9 +215,7 @@ async def test_startup_replays_only_incomplete_discord_work(tmp_path):
     runner.work_ledger.claim(item["id"])
     # Simulate a previous gateway process.  An alive current PID would not be
     # replayed, because that would duplicate active work.
-    data = runner.work_ledger._read()
-    data["items"][item["id"]]["claim_pid"] = os.getpid() + 10_000_000
-    runner.work_ledger._write(data)
+    _mark_claim_stale(runner.work_ledger, item["id"])
 
     scheduled = runner._schedule_incomplete_discord_work_items()
     await asyncio.sleep(0)
@@ -210,6 +226,81 @@ async def test_startup_replays_only_incomplete_discord_work(tmp_path):
     assert replay.work_replay is True
     assert replay.work_item_id == item["id"]
     assert replay.text == "do the work"
+
+
+@pytest.mark.asyncio
+async def test_startup_replays_busy_followup_accepted_before_drain(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+    ledger_path = tmp_path / "work_ledger.json"
+    runner = _make_busy_runner(ledger_path)
+    adapter = SimpleNamespace(_pending_messages={}, _send_with_retry=AsyncMock())
+
+    event = _discord_event(message_id="busy-1", text="queued before drain")
+    session_key = build_session_key(event.source)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._running_agents[session_key] = MagicMock()
+
+    handled = await runner._handle_active_session_busy_message(event, session_key)
+
+    assert handled is True
+    assert adapter._pending_messages[session_key] is event
+    stored = runner.work_ledger.get(event.work_item_id)
+    assert stored is not None
+    assert stored["text"] == "queued before drain"
+    assert stored["status"] == "claimed"
+    _mark_claim_stale(runner.work_ledger, event.work_item_id)
+
+    restarted = object.__new__(GatewayRunner)
+    restarted.work_ledger = GatewayWorkLedger(ledger_path)
+    replay_adapter = SimpleNamespace(handle_message=AsyncMock())
+    restarted.adapters = {Platform.DISCORD: replay_adapter}
+    restarted._background_tasks = set()
+
+    scheduled = restarted._schedule_incomplete_discord_work_items()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    replay_adapter.handle_message.assert_awaited_once()
+    replay = replay_adapter.handle_message.await_args.args[0]
+    assert replay.work_replay is True
+    assert replay.work_item_id == event.work_item_id
+    assert replay.text == "queued before drain"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_redelivery_during_startup_replay_is_not_requeued(tmp_path, monkeypatch):
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+    ledger_path = tmp_path / "work_ledger.json"
+    ledger = GatewayWorkLedger(ledger_path)
+    event = _discord_event(message_id="busy-1", text="queued before restart")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+    ledger.claim(item["id"])
+    _mark_claim_stale(ledger, item["id"])
+
+    runner = _make_busy_runner(ledger_path)
+    adapter = SimpleNamespace(
+        _pending_messages={},
+        _send_with_retry=AsyncMock(),
+        handle_message=AsyncMock(),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._background_tasks = set()
+
+    scheduled = runner._schedule_incomplete_discord_work_items()
+    runner._running_agents[session_key] = _AGENT_PENDING_SENTINEL
+    duplicate = _discord_event(message_id="busy-1", text="queued before restart")
+    handled = await runner._handle_active_session_busy_message(duplicate, session_key)
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    assert handled is True
+    adapter.handle_message.assert_awaited_once()
+    assert session_key not in adapter._pending_messages
+    assert runner.work_ledger.get(item["id"])["status"] == "claimed"
 
 
 @pytest.mark.asyncio

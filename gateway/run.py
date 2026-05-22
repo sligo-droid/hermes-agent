@@ -3193,6 +3193,17 @@ class GatewayRunner:
             defer_completion=True,
         )
 
+    def _record_discord_busy_followup(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> Optional[dict]:
+        return self._accept_discord_work_item(
+            event,
+            session_key,
+            defer_completion=True,
+        )
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -3219,8 +3230,9 @@ class GatewayRunner:
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled():
-                self._record_discord_work_for_drain(event, session_key)
-                self._queue_or_replace_pending_event(session_key, event)
+                work_item = self._record_discord_work_for_drain(event, session_key)
+                if work_item is None or not work_item.get("_existing"):
+                    self._queue_or_replace_pending_event(session_key, event)
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
@@ -3275,6 +3287,14 @@ class GatewayRunner:
         # successful steer — the text already landed inside the run and
         # must NOT also be replayed as a next-turn user message.
         if not steered:
+            work_item = self._record_discord_busy_followup(event, session_key)
+            if work_item and work_item.get("_existing"):
+                logger.info(
+                    "Ignoring duplicate Discord busy work item %s with status=%s",
+                    work_item.get("id"),
+                    work_item.get("status"),
+                )
+                return True
             merge_pending_message_event(adapter._pending_messages, session_key, event)
 
         is_queue_mode = effective_mode == "queue"
@@ -7618,7 +7638,9 @@ class GatewayRunner:
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
                     )
-                    self._enqueue_fifo(_quick_key, queued_event, adapter)
+                    work_item = self._record_discord_busy_followup(queued_event, _quick_key)
+                    if work_item is None or not work_item.get("_existing"):
+                        self._enqueue_fifo(_quick_key, queued_event, adapter)
                 depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
                 if depth <= 1:
                     return "Queued for the next turn."
@@ -7645,7 +7667,9 @@ class GatewayRunner:
                             message_id=event.message_id,
                             channel_prompt=event.channel_prompt,
                         )
-                        adapter._pending_messages[_quick_key] = queued_event
+                        work_item = self._record_discord_busy_followup(queued_event, _quick_key)
+                        if work_item is None or not work_item.get("_existing"):
+                            adapter._pending_messages[_quick_key] = queued_event
                     return "Agent still starting — /steer queued for the next turn."
                 if running_agent and hasattr(running_agent, "steer"):
                     try:
@@ -7667,7 +7691,9 @@ class GatewayRunner:
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
                     )
-                    adapter._pending_messages[_quick_key] = queued_event
+                    work_item = self._record_discord_busy_followup(queued_event, _quick_key)
+                    if work_item is None or not work_item.get("_existing"):
+                        adapter._pending_messages[_quick_key] = queued_event
                 return "No active agent — /steer queued for the next turn."
 
             # /model must not be used while the agent is running.

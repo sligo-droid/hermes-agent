@@ -458,7 +458,20 @@ class TestBusySessionAck:
         assert sk in adapter._pending_messages
 
     @pytest.mark.asyncio
-    async def test_draining_duplicate_completed_discord_message_is_not_reclaimed(self, tmp_path):
+    @pytest.mark.parametrize(
+        "status",
+        [
+            "agent_done",
+            "response_delivered",
+            "summary_updated",
+            "completed",
+            "failed",
+            "blocked",
+            "cancelled",
+            "expired",
+        ],
+    )
+    async def test_draining_duplicate_discord_message_is_not_reclaimed_or_requeued(self, tmp_path, status):
         runner, _sentinel = _make_runner()
         runner._draining = True
         runner._busy_input_mode = "interrupt"
@@ -484,7 +497,9 @@ class TestBusySessionAck:
         sk = build_session_key(event.source)
         item = runner.work_ledger.accept_event(event, session_key=sk, freshness_seconds=60)
         assert item is not None
-        runner.work_ledger.mark_completed(item["id"], result_message_id="result-1")
+        data = runner.work_ledger._read()
+        data["items"][item["id"]]["status"] = status
+        runner.work_ledger._write(data)
         runner.adapters[event.source.platform] = adapter
         runner._queue_during_drain_enabled = lambda: True
         runner._status_action_gerund = lambda: "restarting"
@@ -492,9 +507,8 @@ class TestBusySessionAck:
         result = await runner._handle_active_session_busy_message(event, sk)
 
         assert result is True
-        assert runner.work_ledger.get(item["id"])["status"] == "completed"
-        assert runner.work_ledger.incomplete_items() == []
-        assert sk in adapter._pending_messages
+        assert runner.work_ledger.get(item["id"])["status"] == status
+        assert sk not in adapter._pending_messages
 
     @pytest.mark.asyncio
     async def test_draining_discord_cold_message_is_durably_recorded(self, tmp_path):
