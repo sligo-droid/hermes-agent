@@ -526,6 +526,52 @@ def test_docker_runner_mounts_gh_config_read_only(monkeypatch, tmp_path):
     assert "GH_CONFIG_DIR=/gh-config" in captured["cmd"]
 
 
+def test_docker_runner_forwards_discord_token_for_read_helper(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    captured = {}
+
+    class Proc:
+        pid = 9876
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, cwd, stdout, stderr, env, start_new_session):
+        captured.update({"cmd": cmd, "env": env})
+        return Proc()
+
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "discord-token")
+    monkeypatch.setattr(
+        workers,
+        "_worker_config",
+        lambda: {
+            "runner": "docker",
+            "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
+            "codex_home_root": str(tmp_path / "homes"),
+        },
+    )
+    monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
+
+    workers.spawn_codex_worker(task, str(tmp_path / "repo"), board=board.slug)
+
+    assert "DISCORD_BOT_TOKEN=discord-token" in captured["cmd"]
+
+
+def test_worker_prompt_mentions_read_only_discord_helper(monkeypatch):
+    from hermes_cli import kanban_codex_worker as worker
+
+    monkeypatch.setattr(worker.kanban_db, "build_worker_context", lambda _conn, _task_id: "{}")
+    monkeypatch.setattr(worker, "_git_summary", lambda _workspace: "clean")
+
+    prompt = worker._build_prompt(object(), "task-1", "planner")
+
+    assert "python -m hermes_cli.discord_worker_read fetch-message" in prompt
+    assert "read-only" in prompt.lower()
+
+
 def test_planner_output_links_parent_dependencies(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli import kanban_db

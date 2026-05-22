@@ -318,7 +318,7 @@ def _spawn_docker_worker(
     for key, value in env.items():
         if key.startswith(
             ("HERMES_", "CODEX_", "OPENAI_", "ANTHROPIC_", "GH_", "GITHUB_")
-        ) or key in {"PYTHONPATH", "HOME"}:
+        ) or key in {"PYTHONPATH", "HOME", "DISCORD_BOT_TOKEN"}:
             cmd.extend(["-e", f"{key}={value}"])
     cmd.extend([image, "python", "-m", "hermes_cli.kanban_codex_worker"])
 
