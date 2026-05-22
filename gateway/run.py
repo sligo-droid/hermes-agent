@@ -3187,14 +3187,11 @@ class GatewayRunner:
         event: MessageEvent,
         session_key: str,
     ) -> Optional[dict]:
-        item = self._accept_discord_work_item(
+        return self._accept_discord_work_item(
             event,
             session_key,
             defer_completion=True,
         )
-        if item and item.get("id"):
-            self._ledger().claim(str(item["id"]))
-        return item
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
