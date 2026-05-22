@@ -3180,7 +3180,7 @@ class GatewayRunner:
         status = str(item.get("status") or "")
         if status in {"completed", "blocked", "cancelled", "expired"}:
             return item
-        if not getattr(event, "work_replay", False):
+        if not getattr(event, "work_replay", False) and not item.get("_existing"):
             ledger.claim(str(item["id"]))
         return item
 
@@ -7376,6 +7376,7 @@ class GatewayRunner:
             and not getattr(event, "work_replay", False)
             and not getattr(event, "defer_work_completion", False)
         ):
+            event.defer_work_completion = True
             logger.info(
                 "Ignoring duplicate Discord work item %s with status=%s",
                 _work_item.get("id"),

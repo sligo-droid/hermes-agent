@@ -394,6 +394,50 @@ async def test_duplicate_redelivery_during_startup_replay_is_not_requeued(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_cold_duplicate_redelivery_before_startup_replay_stays_incomplete_and_replays(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    ledger = GatewayWorkLedger()
+    event = _discord_event(message_id="busy-1", text="queued before restart")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+    ledger.claim(item["id"])
+    _mark_claim_stale(ledger, item["id"])
+
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = ledger
+    runner.session_store = MagicMock()
+    runner._is_user_authorized = lambda _source: True
+    adapter = _LedgerDrainAdapter(PlatformConfig(enabled=True, token="token"), Platform.DISCORD)
+    runner.adapters = {Platform.DISCORD: adapter}
+    adapter.set_message_handler(runner._handle_message)
+
+    duplicate = _discord_event(message_id="busy-1", text="queued before restart")
+    await adapter.handle_message(duplicate)
+    if adapter._background_tasks:
+        await asyncio.gather(*adapter._background_tasks)
+
+    assert duplicate.defer_work_completion is True
+    assert ledger.get(item["id"])["status"] == "claimed"
+
+    restarted = object.__new__(GatewayRunner)
+    restarted.work_ledger = ledger
+    replay_adapter = SimpleNamespace(handle_message=AsyncMock())
+    restarted.adapters = {Platform.DISCORD: replay_adapter}
+    restarted._background_tasks = set()
+
+    scheduled = restarted._schedule_incomplete_discord_work_items()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    replay_adapter.handle_message.assert_awaited_once()
+    replay = replay_adapter.handle_message.await_args.args[0]
+    assert replay.work_replay is True
+    assert replay.work_item_id == item["id"]
+    assert replay.text == "queued before restart"
+
+
+@pytest.mark.asyncio
 async def test_startup_replays_same_session_discord_work_in_fifo_order(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
     ledger_path = tmp_path / "work_ledger.json"
