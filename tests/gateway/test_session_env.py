@@ -234,6 +234,19 @@ def test_session_key_falls_back_to_os_environ(monkeypatch):
     assert get_session_env("HERMES_SESSION_KEY") == ""
 
 
+def test_clear_session_vars_clears_session_id_contextvar(monkeypatch):
+    """HERMES_SESSION_ID should not leak across gateway turns."""
+    monkeypatch.setenv("HERMES_SESSION_ID", "env-session-id")
+    from gateway.session_context import _SESSION_ID
+
+    _SESSION_ID.set("ctx-session-id")
+    assert get_session_env("HERMES_SESSION_ID") == "ctx-session-id"
+
+    clear_session_vars([])
+
+    assert get_session_env("HERMES_SESSION_ID") == ""
+
+
 def test_set_session_env_includes_session_key():
     """_set_session_env should propagate session_key from SessionContext."""
     runner = _gateway_runner()

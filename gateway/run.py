@@ -6053,6 +6053,18 @@ class GatewayRunner:
             separators=(",", ":"),
         )
 
+    def _discord_kanban_target_cache_key(self, target: Dict[str, Any]) -> str:
+        return json.dumps(
+            {
+                "board": str(target.get("board") or ""),
+                "thread_id": str(target.get("thread_id") or ""),
+                "guild_id": str(target.get("guild_id") or ""),
+                "parent_channel_id": str(target.get("parent_channel_id") or ""),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
     def _discord_kanban_reaction_sync_due(
         self,
         cache_entry: Any,
@@ -6122,10 +6134,15 @@ class GatewayRunner:
                         for target in reaction_targets:
                             board = str(target.get("board") or "")
                             state = str(target.get("state") or "")
+                            cache_key = self._discord_kanban_target_cache_key(target)
+                            cache_entry = reaction_cache.get(cache_key)
+                            if cache_entry is None and board in reaction_cache:
+                                cache_entry = reaction_cache.pop(board)
+                                reaction_cache[cache_key] = cache_entry
                             if (
                                 not board
                                 or not self._discord_kanban_reaction_sync_due(
-                                    reaction_cache.get(board),
+                                    cache_entry,
                                     state,
                                     now,
                                 )
@@ -6141,7 +6158,7 @@ class GatewayRunner:
                                 )
                                 continue
                             if synced_state:
-                                reaction_cache[board] = {
+                                reaction_cache[cache_key] = {
                                     "state": str(synced_state),
                                     "synced_at": now,
                                 }
@@ -6160,7 +6177,12 @@ class GatewayRunner:
                                 if title:
                                     target_for_sync["title"] = title
                             sync_key = self._discord_kanban_summary_sync_key(target_for_sync)
-                            if summary_cache.get(board) == sync_key:
+                            cache_key = self._discord_kanban_target_cache_key(target_for_sync)
+                            cached_sync_key = summary_cache.get(cache_key)
+                            if cached_sync_key is None and board in summary_cache:
+                                cached_sync_key = summary_cache.pop(board)
+                                summary_cache[cache_key] = cached_sync_key
+                            if cached_sync_key == sync_key:
                                 continue
                             try:
                                 synced_key = await summary_sync(target_for_sync)
@@ -6172,7 +6194,7 @@ class GatewayRunner:
                                 )
                                 continue
                             if synced_key:
-                                summary_cache[board] = sync_key
+                                summary_cache[cache_key] = sync_key
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 logger.debug("discord kanban typing: cancelled")
