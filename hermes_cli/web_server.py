@@ -333,6 +333,22 @@ async def public_worker_session_board(session_id: str):
         raise HTTPException(status_code=500, detail="Kanban board unavailable")
 
 
+@app.get("/workers/{session_id}/summary.json", response_class=JSONResponse)
+async def worker_session_summary_json(session_id: str):
+    """Deterministic terminal summary for one Discord worker session."""
+    try:
+        from hermes_cli.discord_worker_boards import board_run_summary_for_session
+
+        return JSONResponse(board_run_summary_for_session(session_id))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Kanban board summary not found")
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Kanban board summary not found")
+    except Exception as exc:
+        _log.warning("worker board summary render failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Kanban board summary unavailable")
+
+
 @app.get("/workers/{session_id}/tickets/{task_id}", response_class=HTMLResponse)
 async def public_worker_session_ticket(session_id: str, task_id: str):
     """Public worker board with one ticket modal opened by URL."""

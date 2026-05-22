@@ -28,6 +28,7 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 DISCORD_WORKER_META_KEY = "discord_worker"
 DISCORD_WORKER_DISPATCH_DIRTY_FILENAME = "discord-worker-dispatch.dirty.json"
+BOARD_RUN_SUMMARY_FILENAME = "run-summary.json"
 PUBLIC_TOKEN_BYTES = 24
 REVIEW_LOOP_LIMIT_BLOCKED_REASON = "review loop limit reached"
 REVIEW_LOOP_CONTINUE_EXTRA_LOOPS = 5
@@ -49,6 +50,7 @@ _DISCORD_MESSAGE_ID_RE = re.compile(
     re.IGNORECASE,
 )
 PUBLIC_BOARD_COLUMNS = ("triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done")
+_DELETE_META = object()
 _POSIX_PATH_RE = re.compile(
     r"(?<![\w:/.-])/(?:home|Users|tmp|var|etc|opt|private|workspace|workspaces|mnt|srv|repo|root)"
     r"(?:/[^\s\"'<>),;{}\[\]]*)?"
@@ -74,6 +76,11 @@ def _now() -> int:
 
 def _metadata_path(board: str) -> Path:
     return kanban_db.board_metadata_path(board)
+
+
+def board_run_summary_path(board: str) -> Path:
+    """Return the deterministic terminal summary sidecar path for a board."""
+    return kanban_db.board_dir(board) / BOARD_RUN_SUMMARY_FILENAME
 
 
 def _write_metadata(board: str, metadata: dict[str, Any]) -> dict[str, Any]:
@@ -239,10 +246,53 @@ def _read_worker_meta(board: str) -> dict[str, Any]:
 def _update_worker_meta(board: str, updates: dict[str, Any]) -> dict[str, Any]:
     metadata = kanban_db.read_board_metadata(board)
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
-    worker.update(updates)
+    for key, value in updates.items():
+        if value is _DELETE_META:
+            worker.pop(key, None)
+        else:
+            worker[key] = value
     worker["updated_at"] = _now()
     metadata[DISCORD_WORKER_META_KEY] = worker
     return _write_metadata(board, metadata)
+
+
+def _clear_terminal_summary_fields(worker: dict[str, Any]) -> None:
+    for key in (
+        "board_summary",
+        "board_summary_path",
+        "board_summary_updated_at",
+        "terminal_summary_message_sent_at",
+        "terminal_summary_sync_pending",
+        "terminal_reaction_sync_pending",
+    ):
+        worker[key] = _DELETE_META
+
+
+def _clear_board_run_summary(board: str, worker: dict[str, Any]) -> None:
+    _clear_terminal_summary_fields(worker)
+    try:
+        board_run_summary_path(board).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _clear_pr_summary_fields(worker: dict[str, Any]) -> None:
+    for key in (
+        "pr_url",
+        "pr_number",
+        "pr_error",
+        "pr_status_error",
+        "pr_state",
+        "pr_merge_state",
+        "pr_mergeable",
+        "pr_is_draft",
+        "pr_review_decision",
+        "pr_checks_status",
+        "pr_checks_total",
+        "pr_checks_failed",
+        "pr_blocker",
+    ):
+        worker[key] = _DELETE_META
 
 
 def _public_base_url() -> str:
@@ -496,6 +546,7 @@ def _block_worker_board_for_code_island(board: str, worker: dict[str, Any], reas
         }
     )
     _update_worker_meta(board, worker)
+    persist_board_run_summary(board)
 
 
 def _mark_code_island_deferred(worker: dict[str, Any]) -> None:
@@ -683,6 +734,7 @@ def _public_board_snapshot_for_board(board: str) -> dict[str, Any]:
         "counts": counts,
         "running": running,
         "runtime": runtime,
+        "board_summary": read_board_run_summary(board),
         "tasks": rows,
     }
 
@@ -1473,6 +1525,18 @@ def _public_status_text(worker: dict[str, Any]) -> str:
     return status or phase or "pending"
 
 
+def _public_board_summary_html(summary: dict[str, Any]) -> str:
+    if not summary:
+        return ""
+    text = render_board_run_summary_text(summary)
+    return (
+        '<section class="criteria board-summary">'
+        '<strong>Terminal Summary</strong>'
+        f'<pre>{html.escape(text)}</pre>'
+        '</section>'
+    )
+
+
 def _public_review_text(worker: dict[str, Any]) -> str:
     count = worker.get("review_loop_count")
     limit = worker.get("review_loop_limit")
@@ -1658,6 +1722,347 @@ def _feature_summary_outcome(
     return "In progress. Kanban pipeline is preparing work."
 
 
+def _status_counts(counts: dict[str, Any]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for status in PUBLIC_BOARD_COLUMNS:
+        out[status] = int(counts.get(status) or 0)
+    for key, value in counts.items():
+        if key not in out:
+            out[str(key)] = int(value or 0)
+    out["total"] = sum(value for key, value in out.items() if key != "total")
+    return out
+
+
+def _count_values(values: list[Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        label = str(value or "unknown").strip().lower() or "unknown"
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def _clean_summary_value(value: Any, *, default: str = "unknown") -> str:
+    text = str(value or "").strip()
+    return text if text else default
+
+
+def _task_sort_timestamp(task: Any) -> int:
+    return int(
+        getattr(task, "completed_at", None)
+        or getattr(task, "started_at", None)
+        or getattr(task, "created_at", None)
+        or 0
+    )
+
+
+def _run_sort_timestamp(run: Any) -> int:
+    return int(
+        getattr(run, "ended_at", None)
+        or getattr(run, "started_at", None)
+        or 0
+    )
+
+
+def _final_reviewer_verdict(tasks: list[Any], runs_by_task: dict[str, list[Any]]) -> dict[str, str]:
+    reviewer_tasks = [
+        task for task in tasks
+        if str(getattr(task, "assignee", "") or "").strip().lower() == ROLE_REVIEWER
+    ]
+    for task in sorted(reviewer_tasks, key=_task_sort_timestamp, reverse=True):
+        for run in sorted(runs_by_task.get(getattr(task, "id", ""), []), key=_run_sort_timestamp, reverse=True):
+            metadata = getattr(run, "metadata", None) if isinstance(getattr(run, "metadata", None), dict) else {}
+            raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
+            status = str(raw.get("status") or "").strip().lower()
+            if status:
+                return {
+                    "status": status,
+                    "task_id": str(getattr(task, "id", "") or ""),
+                    "run_id": str(getattr(run, "id", "") or ""),
+                    "summary": str(getattr(run, "summary", "") or ""),
+                }
+            summary = str(getattr(run, "summary", "") or "").strip()
+            if summary:
+                return {
+                    "status": "unknown",
+                    "task_id": str(getattr(task, "id", "") or ""),
+                    "run_id": str(getattr(run, "id", "") or ""),
+                    "summary": summary,
+                }
+    return {"status": "unknown", "task_id": "", "run_id": "", "summary": ""}
+
+
+def _verification_commands(tasks: list[Any], runs_by_task: dict[str, list[Any]]) -> list[dict[str, Any]]:
+    commands: list[dict[str, Any]] = []
+    task_by_id = {str(getattr(task, "id", "") or ""): task for task in tasks}
+    for task_id, runs in runs_by_task.items():
+        task = task_by_id.get(task_id)
+        assignee = str(getattr(task, "assignee", "") or "").strip().lower() if task else ""
+        if assignee != ROLE_DEV:
+            continue
+        for run in sorted(runs, key=_run_sort_timestamp, reverse=True):
+            metadata = getattr(run, "metadata", None) if isinstance(getattr(run, "metadata", None), dict) else {}
+            tests = metadata.get("tests")
+            if not isinstance(tests, list):
+                raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
+                tests = raw.get("tests") if isinstance(raw.get("tests"), list) else []
+            for item in tests:
+                if not isinstance(item, dict):
+                    continue
+                command = str(item.get("command") or "").strip()
+                if not command:
+                    continue
+                commands.append(
+                    {
+                        "task_id": task_id,
+                        "task_title": str(getattr(task, "title", "") or "") if task else "",
+                        "run_id": getattr(run, "id", None),
+                        "command": command,
+                        "result": str(item.get("result") or "unknown").strip() or "unknown",
+                        "output": _cap_state_value(str(item.get("output") or ""), max_text=4000),
+                    }
+                )
+                if len(commands) >= 20:
+                    return commands
+    return commands
+
+
+def _latest_failure_or_blocker(worker: dict[str, Any], tasks: list[Any], runs_by_task: dict[str, list[Any]]) -> str:
+    reason = str(worker.get("blocked_reason") or "").strip()
+    if reason:
+        return reason
+    blocked = [task for task in tasks if str(getattr(task, "status", "") or "") == "blocked"]
+    for task in sorted(blocked, key=_task_sort_timestamp, reverse=True):
+        error = str(getattr(task, "last_failure_error", "") or "").strip()
+        if error:
+            return error
+        for run in sorted(runs_by_task.get(getattr(task, "id", ""), []), key=_run_sort_timestamp, reverse=True):
+            run_error = str(getattr(run, "error", "") or "").strip()
+            if run_error:
+                return run_error
+            summary = str(getattr(run, "summary", "") or "").strip()
+            if summary:
+                return summary
+    pr_blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "").strip()
+    return pr_blocker or ""
+
+
+def _summary_timestamps(worker: dict[str, Any], tasks: list[Any], runs: list[Any]) -> tuple[Optional[int], Optional[int], Optional[int]]:
+    starts = [worker.get("created_at")]
+    starts.extend(getattr(task, "created_at", None) for task in tasks)
+    starts.extend(getattr(run, "started_at", None) for run in runs)
+    started = min((int(value) for value in starts if value), default=None)
+    terminal = str(worker.get("goal_status") or "").strip().lower() in TERMINAL_GOAL_STATUSES
+    completed = int(worker.get("updated_at") or _now()) if terminal else None
+    duration = (completed - started) if started and completed and completed >= started else None
+    return started, completed, duration
+
+
+def _pr_summary(worker: dict[str, Any]) -> dict[str, Any]:
+    checks_status = str(worker.get("pr_checks_status") or "").strip() or "not checked"
+    merge_state = str(worker.get("pr_merge_state") or "").strip() or "unknown"
+    return {
+        "url": str(worker.get("pr_url") or "").strip(),
+        "number": str(worker.get("pr_number") or "").strip(),
+        "error": str(worker.get("pr_error") or "").strip(),
+        "status_error": str(worker.get("pr_status_error") or "").strip(),
+        "state": str(worker.get("pr_state") or "").strip() or "unknown",
+        "merge_state": merge_state,
+        "mergeable": worker.get("pr_mergeable") if worker.get("pr_mergeable") is not None else "unknown",
+        "is_draft": worker.get("pr_is_draft") if worker.get("pr_is_draft") is not None else "unknown",
+        "review_decision": str(worker.get("pr_review_decision") or "").strip() or "unknown",
+        "checks_status": checks_status,
+        "checks_total": int(worker.get("pr_checks_total") or 0),
+        "checks_failed": list(worker.get("pr_checks_failed") or []),
+        "blocker": str(worker.get("pr_blocker") or "").strip(),
+    }
+
+
+def build_board_run_summary(board: str) -> dict[str, Any]:
+    """Build a deterministic summary of a Discord worker board's terminal state."""
+    metadata = kanban_db.read_board_metadata(board)
+    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    if worker.get("kind") != "discord_worker_board":
+        raise KeyError("unknown Discord worker board")
+
+    conn = kanban_db.connect(board=board)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+        counts = _status_counts(kanban_db.board_stats(conn).get("by_status", {}))
+        summaries = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        runs_by_task = {t.id: kanban_db.list_runs(conn, t.id) for t in tasks}
+    finally:
+        conn.close()
+
+    runs = [run for run_list in runs_by_task.values() for run in run_list]
+    started_at, completed_at, duration_seconds = _summary_timestamps(worker, tasks, runs)
+    task_rows = [
+        {
+            "id": str(getattr(task, "id", "") or ""),
+            "title": str(getattr(task, "title", "") or ""),
+            "assignee": str(getattr(task, "assignee", "") or "unassigned"),
+            "status": str(getattr(task, "status", "") or "unknown"),
+            "last_failure_error": str(getattr(task, "last_failure_error", "") or ""),
+            "latest_summary": str(summaries.get(getattr(task, "id", "")) or ""),
+        }
+        for task in sorted(tasks, key=_task_sort_timestamp, reverse=True)[:20]
+    ]
+    blocker = _latest_failure_or_blocker(worker, tasks, runs_by_task)
+    summary = {
+        "schema_version": 1,
+        "board": board,
+        "generated_at": _now(),
+        "thread_id": str(worker.get("thread_id") or ""),
+        "chat_id": str(worker.get("chat_id") or worker.get("thread_id") or ""),
+        "title": _worker_generated_title(worker) or _fallback_feature_title(worker),
+        "root_goal": str(worker.get("root_goal") or worker.get("initial_request") or ""),
+        "goal_status": _clean_summary_value(worker.get("goal_status")),
+        "phase": _clean_summary_value(worker.get("phase")),
+        "thread_state": board_thread_state(board),
+        "blocked_reason": blocker,
+        "task_counts": counts,
+        "run_counts": {
+            "total": len(runs),
+            "by_status": _count_values([getattr(run, "status", None) for run in runs]),
+            "by_outcome": _count_values([getattr(run, "outcome", None) for run in runs]),
+        },
+        "review": {
+            "loop_count": int(worker.get("review_loop_count") or 0),
+            "loop_limit": int(worker.get("review_loop_limit") or _review_loop_limit()),
+            "final_verdict": _final_reviewer_verdict(tasks, runs_by_task),
+        },
+        "pr": _pr_summary(worker),
+        "deployment_status": str(worker.get("deployment_status") or "").strip() or "not checked",
+        "verification_commands": _verification_commands(tasks, runs_by_task),
+        "branch": str(worker.get("worker_branch") or "").strip(),
+        "public_url": str(worker.get("public_url") or "").strip(),
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "duration_seconds": duration_seconds,
+        "latest_tasks": task_rows,
+    }
+    return summary
+
+
+def persist_board_run_summary(board: str) -> dict[str, Any]:
+    """Persist and index the deterministic terminal summary for a board."""
+    summary = build_board_run_summary(board)
+    path = board_run_summary_path(board)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json_write(path, summary, indent=2)
+
+    metadata = kanban_db.read_board_metadata(board)
+    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    if worker.get("kind") == "discord_worker_board":
+        worker["board_summary"] = summary
+        worker["board_summary_path"] = str(path)
+        worker["board_summary_updated_at"] = summary["generated_at"]
+        metadata[DISCORD_WORKER_META_KEY] = worker
+        metadata.pop("db_path", None)
+        atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
+    return summary
+
+
+def read_board_run_summary(board: str) -> dict[str, Any]:
+    """Return the indexed persisted run summary, if the current run has one."""
+    worker = _read_worker_meta(board)
+    indexed_at = worker.get("board_summary_updated_at")
+    if not indexed_at:
+        return {}
+    embedded = worker.get("board_summary") if isinstance(worker.get("board_summary"), dict) else {}
+    if embedded and embedded.get("board") == board and embedded.get("generated_at") == indexed_at:
+        return dict(embedded)
+    path = Path(str(worker.get("board_summary_path") or board_run_summary_path(board)))
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return dict(embedded) if embedded else {}
+    if isinstance(loaded, dict) and loaded.get("board") == board:
+        return loaded
+    return {}
+
+
+def board_run_summary_for_session(session_id: str) -> dict[str, Any]:
+    board = board_slug_for_discord_thread(session_id)
+    if not kanban_db.board_exists(board):
+        raise KeyError("unknown board session")
+    worker = _read_worker_meta(board)
+    if worker.get("kind") != "discord_worker_board":
+        raise KeyError("unknown board session")
+    return read_board_run_summary(board) or build_board_run_summary(board)
+
+
+def _format_summary_counts(counts: dict[str, Any]) -> str:
+    bits = [
+        f"{status}:{counts.get(status) or 0}"
+        for status in PUBLIC_BOARD_COLUMNS
+        if int(counts.get(status) or 0)
+    ]
+    return " ".join(bits) or "none"
+
+
+def _format_run_outcomes(run_counts: dict[str, Any]) -> str:
+    outcomes = run_counts.get("by_outcome") if isinstance(run_counts.get("by_outcome"), dict) else {}
+    bits = [f"{key}:{value}" for key, value in sorted(outcomes.items()) if value]
+    return ", ".join(bits) or "none"
+
+
+def render_board_run_summary_text(summary: dict[str, Any]) -> str:
+    """Render deterministic terminal-board facts for Discord and diagnostics."""
+    pr = summary.get("pr") if isinstance(summary.get("pr"), dict) else {}
+    review = summary.get("review") if isinstance(summary.get("review"), dict) else {}
+    verdict = review.get("final_verdict") if isinstance(review.get("final_verdict"), dict) else {}
+    pr_ref = pr.get("url") or pr.get("error") or "not opened"
+    checks = pr.get("checks_status") or "not checked"
+    merge = pr.get("merge_state") or "unknown"
+    lines = [
+        f"Kanban goal: {summary.get('goal_status') or 'unknown'} / {summary.get('phase') or 'unknown'}",
+        f"Board: {summary.get('public_url') or summary.get('board') or 'unknown'}",
+        f"Branch: {summary.get('branch') or 'unknown'}",
+        f"PR: {pr_ref}",
+        f"PR merge: {merge}; checks: {checks}",
+        f"Deployment: {summary.get('deployment_status') or 'not checked'}",
+        f"Tasks: {_format_summary_counts(summary.get('task_counts') if isinstance(summary.get('task_counts'), dict) else {})}",
+        f"Runs: total={(summary.get('run_counts') or {}).get('total', 0) if isinstance(summary.get('run_counts'), dict) else 0}; outcomes: {_format_run_outcomes(summary.get('run_counts') if isinstance(summary.get('run_counts'), dict) else {})}",
+        f"Review: {review.get('loop_count') or 0}/{review.get('loop_limit') or 'unknown'}; final verdict: {verdict.get('status') or 'unknown'}",
+    ]
+    blocker = str(summary.get("blocked_reason") or pr.get("blocker") or "").strip()
+    if blocker:
+        lines.append(f"Blocker: {blocker}")
+    commands = summary.get("verification_commands") if isinstance(summary.get("verification_commands"), list) else []
+    if commands:
+        rendered = "; ".join(
+            f"{item.get('command')} [{item.get('result') or 'unknown'}]"
+            for item in commands[:5]
+            if isinstance(item, dict) and item.get("command")
+        )
+        if rendered:
+            lines.append(f"Verification: {rendered}")
+    started = _format_public_timestamp(summary.get("started_at")) or "unknown"
+    completed = _format_public_timestamp(summary.get("completed_at")) or "unknown"
+    duration = summary.get("duration_seconds")
+    duration_text = f"{duration}s" if duration is not None else "unknown"
+    lines.append(f"Timing: started {started}; completed {completed}; duration {duration_text}")
+    return "\n".join(lines)
+
+
+def _terminal_summary_outcome(summary: dict[str, Any]) -> str:
+    status = str(summary.get("goal_status") or summary.get("thread_state") or "unknown").strip()
+    pr = summary.get("pr") if isinstance(summary.get("pr"), dict) else {}
+    task_counts = summary.get("task_counts") if isinstance(summary.get("task_counts"), dict) else {}
+    bits = [f"{status.title()}. Tasks: {_format_summary_counts(task_counts)}."]
+    if pr.get("url"):
+        bits.append(f"PR: {pr.get('url')}.")
+    elif pr.get("error"):
+        bits.append(f"PR blocked: {pr.get('error')}.")
+    bits.append(f"Checks: {pr.get('checks_status') or 'not checked'}.")
+    deployment = summary.get("deployment_status") or "not checked"
+    bits.append(f"Deployment: {deployment}.")
+    blocker = str(summary.get("blocked_reason") or pr.get("blocker") or "").strip()
+    if blocker:
+        bits.append(f"Blocker: {blocker}.")
+    return _clean_feature_summary_text(" ".join(bits), max_chars=420)
+
+
 def feature_summary_snapshot(board: str) -> dict[str, Any]:
     """Return the current feature-summary values for a Discord worker board."""
     metadata = kanban_db.read_board_metadata(board)
@@ -1675,6 +2080,12 @@ def feature_summary_snapshot(board: str) -> dict[str, Any]:
         conn.close()
 
     state = board_thread_state(board)
+    terminal_summary = read_board_run_summary(board)
+    if state in {"done", "blocked", "errored"} and not terminal_summary:
+        try:
+            terminal_summary = persist_board_run_summary(board)
+        except Exception:
+            terminal_summary = {}
     title = _worker_generated_title(worker)
     outcome = _feature_summary_outcome(
         worker,
@@ -1684,6 +2095,8 @@ def feature_summary_snapshot(board: str) -> dict[str, Any]:
         counts=counts,
         running=running,
     )
+    if terminal_summary:
+        outcome = _terminal_summary_outcome(terminal_summary)
     snapshot = {
         "board": board,
         "thread_id": str(worker.get("thread_id") or ""),
@@ -1698,6 +2111,7 @@ def feature_summary_snapshot(board: str) -> dict[str, Any]:
         "pr_url": str(worker.get("pr_url") or "").strip(),
         "pr_number": str(worker.get("pr_number") or "").strip(),
         "public_url": str(worker.get("public_url") or "").strip(),
+        "terminal_summary_updated_at": terminal_summary.get("generated_at") if terminal_summary else None,
         "updated_at": worker.get("updated_at"),
     }
     key_payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
@@ -2111,6 +2525,7 @@ def _workers_page_css() -> str:
     .criteria strong { display: block; font-size: 14px; margin-bottom: 8px; }
     .criteria ol { margin: 0; padding-left: 20px; }
     .criteria li { color: var(--text); margin: 4px 0; }
+    .board-summary pre { color: var(--text); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 0; white-space: pre-wrap; word-break: break-word; }
     .modal { align-items: center; background: rgba(15, 23, 42, 0.54); display: none; inset: 0; justify-content: center; padding: 20px; position: fixed; z-index: 20; }
     .modal[aria-hidden="false"] { display: flex; }
     .modal-panel { background: #ffffff; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 24px 60px rgba(15, 23, 42, 0.28); max-height: min(86vh, 900px); max-width: min(920px, 96vw); min-width: min(720px, 96vw); overflow: hidden; }
@@ -2212,6 +2627,7 @@ def _render_public_board_html(
         runtime,
         return_to=board_url,
     )
+    summary_html = _public_board_summary_html(snapshot.get("board_summary") or {})
     return f"""<!doctype html>
 <html>
 <head>
@@ -2246,6 +2662,7 @@ def _render_public_board_html(
     </div>
   </header>
   <main>
+    {summary_html}
     <div class="criteria"><strong>Acceptance Criteria</strong><ol>{criteria}</ol></div>
     <div class="move-error" id="ticket-move-error" role="alert" hidden></div>
     <div class="board">{''.join(cards)}</div>
@@ -2755,6 +3172,8 @@ def start_direct_goal(
         project_context=project_context,
     )
     worker = board.worker
+    _clear_board_run_summary(board.slug, worker)
+    _clear_pr_summary_fields(worker)
     worker.update(
         {
             "root_goal": raw_goal,
@@ -2799,6 +3218,9 @@ def start_planner_request(
         include_request_id=starts_new_goal_run,
     )
     thread_context_text = str(thread_context or "").strip()
+    if starts_new_goal_run:
+        _clear_board_run_summary(board.slug, worker)
+        _clear_pr_summary_fields(worker)
     worker.update(
         {
             "root_goal": raw_request,
@@ -3130,6 +3552,9 @@ def _is_review_loop_limit_blocker(worker: dict[str, Any]) -> bool:
 def status_line(board: str) -> str:
     metadata = kanban_db.read_board_metadata(board)
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    persisted_summary = read_board_run_summary(board)
+    if persisted_summary:
+        return render_board_run_summary_text(persisted_summary)
     conn = kanban_db.connect(board=board)
     try:
         counts = kanban_db.board_stats(conn).get("by_status", {})
@@ -3162,6 +3587,7 @@ def resume_board(board: str) -> None:
 
 def start_board(board: str) -> None:
     worker = _read_worker_meta(board)
+    _clear_board_run_summary(board, worker)
     phase = worker.get("phase_before_pause") or worker.get("phase")
     if not phase or phase in {"paused", "cancelled", "intake"}:
         phase = "dev"
@@ -3188,6 +3614,7 @@ def continue_board_after_review_loop_limit(
     worker = _read_worker_meta(board)
     if not _is_review_loop_limit_blocker(worker):
         raise ValueError("board is not stopped at the review loop limit")
+    _clear_board_run_summary(board, worker)
     try:
         loops = max(0, int(worker.get("review_loop_count") or 0))
     except (TypeError, ValueError):
@@ -3232,6 +3659,7 @@ def clear_board_goal(board: str) -> None:
     worker = _read_worker_meta(board)
     worker.update({"goal_status": "cancelled", "phase": "cancelled", "cancelled": True, "paused": True})
     _update_worker_meta(board, worker)
+    persist_board_run_summary(board)
 
 
 def add_subgoal(board: str, text: str) -> tuple[int, str]:
@@ -3270,6 +3698,7 @@ def add_subgoal(board: str, text: str) -> tuple[int, str]:
     worker["phase"] = "dev"
     worker["goal_status"] = "active"
     worker["execution_mode"] = "kanban_pipeline"
+    _clear_board_run_summary(board, worker)
     _update_worker_meta(board, worker)
     return idx, body
 
@@ -3368,6 +3797,7 @@ def reconcile_board(board: str) -> Optional[str]:
                 "terminal_summary_sync_pending": True,
             })
             _update_worker_meta(board, worker)
+            persist_board_run_summary(board)
             return "blocked_review_loop_limit"
         loops += 1
         worker["review_loop_count"] = loops
