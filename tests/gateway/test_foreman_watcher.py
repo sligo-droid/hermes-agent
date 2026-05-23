@@ -106,12 +106,30 @@ def _patch_config(monkeypatch, config):
     monkeypatch.setattr(cfg, "load_config", lambda: config)
 
 
-def test_foreman_defaults_are_enabled_with_expected_discord_target():
+def test_foreman_defaults_are_disabled_with_expected_discord_target():
     foreman = DEFAULT_CONFIG["kanban"]["discord_worker"]["foreman"]
 
-    assert foreman["enabled"] is True
+    assert foreman["enabled"] is False
     assert foreman["channel_id"] == "1504252294495998043"
     assert foreman["mention"] == "<@1504235933598486580>"
+
+
+def test_foreman_watcher_missing_config_does_not_scan(monkeypatch):
+    _patch_config(monkeypatch, {"kanban": {"discord_worker": {}}})
+    _patch_lock(monkeypatch)
+    from hermes_cli import discord_worker_foreman as foreman
+
+    monkeypatch.setattr(
+        foreman,
+        "collect_foreman_issues",
+        lambda now=None: (_ for _ in ()).throw(AssertionError("must not scan")),
+    )
+
+    adapter = ForemanAdapter()
+    asyncio.run(_run_one_foreman_tick(monkeypatch, _runner(adapter)))
+
+    assert adapter.sent == []
+    assert adapter.created_goals == []
 
 
 def test_foreman_spawned_task_creates_dev_thread_and_subscription(monkeypatch, tmp_path):
