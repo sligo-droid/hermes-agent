@@ -81,6 +81,7 @@ class TurnResult:
     # of riding a CPU-spinning or auth-broken process. Mirrors openclaw
     # beta.8's "retire timed-out app-server clients" fix.
     should_retire: bool = False
+    auth_failed: bool = False
 
 
 # Markers we accept as terminal even when codex never emits turn/completed.
@@ -393,6 +394,7 @@ class CodexAppServerSession:
             hint = _classify_oauth_failure(exc.message, stderr_blob)
             if hint is not None:
                 result.error = hint
+                result.auth_failed = True
                 # Subprocess is fine on a JSON-RPC level here, but the
                 # token store is broken — retire so the next turn does a
                 # clean handshake (and the user has a chance to re-auth
@@ -410,6 +412,8 @@ class CodexAppServerSession:
             result.error = hint or self._format_error_with_stderr(
                 "turn/start timed out", exc
             )
+            if hint is not None:
+                result.auth_failed = True
             result.should_retire = True
             return result
 
@@ -437,6 +441,7 @@ class CodexAppServerSession:
                 hint = _classify_oauth_failure(stderr_blob)
                 if hint is not None:
                     result.error = hint
+                    result.auth_failed = True
                 else:
                     result.error = self._format_error_with_stderr(
                         "codex app-server subprocess exited unexpectedly",
@@ -566,6 +571,7 @@ class CodexAppServerSession:
                         hint = _classify_oauth_failure(err_msg, stderr_blob)
                         if hint is not None:
                             result.error = hint
+                            result.auth_failed = True
                             result.should_retire = True
                         else:
                             result.error = self._format_error_with_stderr(

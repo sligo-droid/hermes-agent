@@ -201,6 +201,44 @@ def prepare_codex_worker_home(
     return credential_id
 
 
+def mark_codex_worker_credential_auth_failed(
+    credential_id: str | None,
+    *,
+    message: str | None = None,
+) -> bool:
+    """Mark the worker's pool credential exhausted after a Codex auth failure."""
+    credential_id = str(credential_id or "").strip()
+    if not credential_id:
+        return False
+    try:
+        from agent.credential_pool import load_pool
+
+        pool = load_pool("openai-codex")
+    except Exception as exc:
+        logger.debug("Could not load openai-codex pool for worker auth failure: %s", exc)
+        return False
+
+    try:
+        with pool._lock:  # type: ignore[attr-defined]
+            for entry in pool._entries:  # type: ignore[attr-defined]
+                if getattr(entry, "id", None) != credential_id:
+                    continue
+                if getattr(pool, "_current_id", None) == credential_id:
+                    pool._current_id = None  # type: ignore[attr-defined]
+                pool._mark_exhausted(  # type: ignore[attr-defined]
+                    entry,
+                    401,
+                    {
+                        "reason": "worker_auth_failed",
+                        "message": message or "Codex worker authentication failed.",
+                    },
+                )
+                return True
+    except Exception as exc:
+        logger.debug("Could not mark Codex worker credential %s failed: %s", credential_id, exc)
+    return False
+
+
 def sync_codex_worker_home(
     codex_home: Path | str | None,
     credential_id: str | None,
