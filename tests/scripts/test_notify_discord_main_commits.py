@@ -94,6 +94,8 @@ def test_generic_merge_commit_uses_associated_pr_body_and_field():
     )[0]
 
     embed = payload["embeds"][0]
+    assert embed["title"] == "Show worker run profile on tickets"
+    assert embed["url"] == "https://github.com/NousResearch/hermes-agent/pull/81"
     assert embed["description"] == (
         "Expose model, sandbox, and runtime settings on worker tickets."
     )
@@ -123,6 +125,8 @@ def test_non_generic_pr_associated_commit_uses_pr_body_and_field():
     )[0]
 
     embed = payload["embeds"][0]
+    assert embed["title"] == "Improve main log notifications"
+    assert embed["url"] == "https://github.com/NousResearch/hermes-agent/pull/83"
     assert embed["description"] == "Use PR details for squash and rebase merges."
     assert {
         "name": "Pull Request",
@@ -189,8 +193,8 @@ def test_pr_merge_push_suppresses_intermediate_commits_from_same_payload():
     assert len(payloads) == 1
     assert len(payloads[0]["embeds"]) == 1
     embed = payloads[0]["embeds"][0]
-    assert embed["title"] == "0000000 pushed to main"
-    assert embed["url"].endswith("000000000000000000000000000000000000000c")
+    assert embed["title"] == "Link Discord feature summary branch field"
+    assert embed["url"] == "https://github.com/NousResearch/hermes-agent/pull/82"
     assert embed["description"] == "Summary\nUse the PR body once."
     assert "content" not in payloads[0]
 
@@ -230,7 +234,7 @@ def test_generic_merge_commit_falls_back_to_pr_title_when_body_empty():
     assert payload["embeds"][0]["description"] == "Improve Discord commit messages"
 
 
-def test_direct_commit_keeps_commit_message_when_no_pr_is_associated():
+def test_pr_lookup_mode_skips_commit_when_no_pr_is_associated():
     mod = _load_module()
     commit = _commit(6, "feat: direct commit detail")
     seen = []
@@ -239,17 +243,13 @@ def test_direct_commit_keeps_commit_message_when_no_pr_is_associated():
         seen.append(sha)
         return None
 
-    payload = mod.build_webhook_payloads(
+    payloads = mod.build_webhook_payloads(
         _event([commit]),
         pull_request_lookup=pull_request_lookup,
-    )[0]
+    )
 
     assert seen == [commit["id"]]
-    assert payload["embeds"][0]["description"] == "feat: direct commit detail"
-    assert all(
-        field["name"] != "Pull Request"
-        for field in payload["embeds"][0]["fields"]
-    )
+    assert payloads == []
 
 
 def test_deleted_branch_and_empty_commits_are_noops():
