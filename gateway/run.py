@@ -12250,6 +12250,13 @@ class GatewayRunner:
                                     "public_url": str(target.get("public_url") or board.public_url or ""),
                                 }
                             )
+                            feature_initial_request = str(feature_summary.get("initial_request") or "").strip()
+                            if feature_initial_request and not str(target.get("fallback_title") or "").strip():
+                                target["fallback_title"] = feature_initial_request
+                            if str(feature_summary.get("source_message_id") or "").strip() and feature_initial_request:
+                                title = self._fallback_discord_feature_title(feature_summary)
+                                if title:
+                                    target["title"] = title
                             if not str(target.get("title") or "").strip():
                                 title = self._discord_kanban_feature_title(target)
                                 if title:

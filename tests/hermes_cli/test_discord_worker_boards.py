@@ -541,6 +541,28 @@ def test_generated_summary_title_replaces_workers_board_title(monkeypatch, tmp_p
     assert "Build the thing" not in index_html
 
 
+def test_new_planner_goal_clears_stale_generated_summary_title(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(thread_id="5158b", goal="Build the first thing", guild_id="111")
+    dwb.set_feature_summary_title(board.slug, "First generated title")
+
+    updated = dwb.set_goal(
+        thread_id="5158b",
+        goal="Build the replacement thing",
+        guild_id="111",
+        request_id="msg-replacement",
+    )
+    snapshot = dwb.feature_summary_snapshot(updated.slug)
+    meta = kanban_db.read_board_metadata(updated.slug)["discord_worker"]
+
+    assert "summary_title" not in meta
+    assert snapshot["title"] == ""
+    assert snapshot["fallback_title"] == "Build the replacement thing"
+
+
 def test_feature_summary_snapshot_uses_kanban_branch_and_outcome(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
