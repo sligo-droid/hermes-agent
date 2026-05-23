@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import subprocess
+from fnmatch import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -59,10 +60,11 @@ def resolve_discord_project_context(
     Existing DB mappings are authoritative.  When there is no row, bootstrap
     only from a unique deterministic directory match under Hermes workspace.
     """
+    cfg = _resolve_config(config)
     target = _project_channel(channel)
     if target is None or _is_dm_like(target):
         return None
-    if _is_hard_ignored(target) or _is_infra_category(target):
+    if _is_ignored_channel(target, cfg) or _is_ignored_category(target, cfg):
         return None
 
     guild = getattr(target, "guild", None) or getattr(channel, "guild", None)
@@ -91,7 +93,7 @@ def resolve_discord_project_context(
             target,
             guild_id=guild_id,
             channel_id=channel_id,
-            config=config,
+            config=cfg,
         )
         if configured is not None:
             return configured
@@ -160,6 +162,16 @@ def _context_from_row(row: dict[str, Any]) -> DiscordProjectContext:
     )
 
 
+def _resolve_config(config: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if isinstance(config, dict):
+        return config
+    try:
+        loaded = load_config() or {}
+    except Exception:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
 def _context_from_configured_channel_cwd(
     channel: Any,
     *,
@@ -167,13 +179,7 @@ def _context_from_configured_channel_cwd(
     channel_id: str,
     config: Optional[dict[str, Any]],
 ) -> Optional[DiscordProjectContext]:
-    cfg = config
-    if cfg is None:
-        try:
-            cfg = load_config() or {}
-        except Exception:
-            cfg = {}
-    raw = cfg_get(cfg, "discord", "channel_cwds", default={})
+    raw = cfg_get(config or {}, "discord", "channel_cwds", default={})
     if not isinstance(raw, dict):
         return None
     configured = raw.get(channel_id) or raw.get(str(channel_id))
@@ -260,21 +266,50 @@ def _is_category_like(channel: Any) -> bool:
     return channel.__class__.__name__.lower() in {"categorychannel", "category"}
 
 
-def _is_hard_ignored(channel: Any) -> bool:
+def _coerce_pattern_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        items = [value]
+    return [str(item).strip().lower().lstrip("#") for item in items if str(item).strip()]
+
+
+def _matches_any_pattern(name: str, patterns: list[str]) -> bool:
+    normalized = name.strip().lower().lstrip("#")
+    if not normalized:
+        return False
+    return any(fnmatch(normalized, pattern) for pattern in patterns)
+
+
+def _is_ignored_channel(channel: Any, config: dict[str, Any]) -> bool:
+    patterns = _coerce_pattern_list(
+        cfg_get(config, "discord", "project_mapping_ignored_channel_names", default="")
+    )
+    if not patterns:
+        return False
     for candidate in (channel, getattr(channel, "parent", None)):
         if candidate is None:
             continue
-        name = (_channel_name(candidate) or "").lower().lstrip("#")
-        if name == "admin" or "human" in name:
+        name = _channel_name(candidate) or ""
+        if _matches_any_pattern(name, patterns):
             return True
     return False
 
 
-def _is_infra_category(channel: Any) -> bool:
+def _is_ignored_category(channel: Any, config: dict[str, Any]) -> bool:
+    patterns = _coerce_pattern_list(
+        cfg_get(config, "discord", "project_mapping_ignored_category_names", default="")
+    )
+    if not patterns:
+        return False
     category = getattr(channel, "category", None)
     if category is None:
         return False
-    return (_channel_name(category) or "").strip().lower().lstrip("#") == "infra"
+    return _matches_any_pattern(_channel_name(category) or "", patterns)
 
 
 def _channel_name(channel: Any) -> Optional[str]:

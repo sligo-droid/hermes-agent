@@ -212,42 +212,51 @@ def _run_codex(
         except Exception:
             pass
 
-    attempt = 0
-    while True:
-        session = CodexAppServerSession(
-            cwd=workspace,
-            codex_home=os.environ.get("CODEX_HOME"),
-            extra_args=extra_args,
-            env={
-                "HERMES_DISABLE_MCP": "1",
-                "HERMES_CODEX_WORKER_NETWORK_ACCESS": "1",
-            },
-            on_event=on_event,
-        )
-        try:
-            result = session.run_turn(prompt, turn_timeout=_role_timeout(role))
-            _attach_scheduled_runtime(result, role)
+    try:
+        attempt = 0
+        while True:
+            session = CodexAppServerSession(
+                cwd=workspace,
+                codex_home=os.environ.get("CODEX_HOME"),
+                extra_args=extra_args,
+                env={
+                    "HERMES_DISABLE_MCP": "1",
+                    "HERMES_CODEX_WORKER_NETWORK_ACCESS": "1",
+                },
+                on_event=on_event,
+            )
             try:
-                record_codex_worker_result(task_id, board=board, result=result)
+                result = session.run_turn(prompt, turn_timeout=_role_timeout(role))
+                _attach_scheduled_runtime(result, role)
+                try:
+                    record_codex_worker_result(task_id, board=board, result=result)
+                except Exception:
+                    pass
+            finally:
+                session.close()
+                try:
+                    from agent.codex_worker_auth import sync_codex_worker_home
+
+                    sync_codex_worker_home(
+                        os.environ.get("CODEX_HOME"),
+                        os.environ.get("HERMES_CODEX_WORKER_CREDENTIAL_ID"),
+                    )
+                except Exception:
+                    pass
+
+            if not _codex_result_auth_failed(result) or attempt >= _CODEX_AUTH_RETRY_LIMIT:
+                return result
+            if not _rotate_codex_worker_credential_after_auth_failure(result):
+                return result
+            attempt += 1
+    finally:
+        if os.environ.get("HERMES_CODEX_WORKER_CLEANUP_HOME") == "1":
+            try:
+                from agent.codex_worker_auth import cleanup_codex_worker_home
+
+                cleanup_codex_worker_home(os.environ.get("CODEX_HOME"))
             except Exception:
                 pass
-        finally:
-            session.close()
-            try:
-                from agent.codex_worker_auth import sync_codex_worker_home
-
-                sync_codex_worker_home(
-                    os.environ.get("CODEX_HOME"),
-                    os.environ.get("HERMES_CODEX_WORKER_CREDENTIAL_ID"),
-                )
-            except Exception:
-                pass
-
-        if not _codex_result_auth_failed(result) or attempt >= _CODEX_AUTH_RETRY_LIMIT:
-            return result
-        if not _rotate_codex_worker_credential_after_auth_failure(result):
-            return result
-        attempt += 1
 
 
 def _codex_result_auth_failed(result: Any) -> bool:
@@ -458,43 +467,23 @@ def _apply_role_output(
             return
         criteria = _string_list(payload.get("acceptance_criteria"))
         tasks = payload.get("tasks") if isinstance(payload.get("tasks"), list) else []
-        created = []
         dev_round = active_dev_round_for_board(board)
-        for idx, spec in enumerate(tasks, start=1):
-            if not isinstance(spec, dict):
-                continue
-            title = str(spec.get("title") or "").strip()
-            if not title:
-                continue
-            parent_ids = [
-                created[parent_idx]
-                for parent_idx in _parent_indices(spec, len(tasks), idx - 1)
-                if parent_idx < len(created)
-            ]
-            created.append(
-                kanban_db.create_task(
-                    conn,
-                    title=format_role_round_title(title, dev_round),
-                    body=str(spec.get("body") or ""),
-                    assignee=ROLE_DEV,
-                    parents=parent_ids,
-                    created_by=ROLE_PLANNER,
-                    workspace_kind="dir",
-                    workspace_path=workspace,
-                    tenant=board,
-                    priority=int(spec.get("priority") or (50 - idx)),
-                    max_runtime_seconds=3600,
-                )
+        specs = _planner_dev_task_specs(tasks, dev_round=dev_round, workspace=workspace, board=board)
+        created: list[str] = []
+        try:
+            created = _create_planned_dev_tasks(conn, specs, created_by=ROLE_PLANNER)
+            _merge_criteria(board, criteria)
+            kanban_db.complete_task(
+                conn,
+                task_id,
+                summary=summary or f"Planned {len(created)} task(s).",
+                metadata={"created_tasks": created, "acceptance_criteria": criteria, "raw": payload},
+                created_cards=created,
+                expected_run_id=expected_run_id,
             )
-        _merge_criteria(board, criteria)
-        kanban_db.complete_task(
-            conn,
-            task_id,
-            summary=summary or f"Planned {len(created)} task(s).",
-            metadata={"created_tasks": created, "acceptance_criteria": criteria, "raw": payload},
-            created_cards=created,
-            expected_run_id=expected_run_id,
-        )
+        except Exception:
+            _cleanup_created_tasks(conn, created)
+            raise
         return
 
     if role == ROLE_REVIEWER:
@@ -506,8 +495,10 @@ def _apply_role_output(
                 metadata={"raw": payload},
                 expected_run_id=expected_run_id,
             )
-            _ensure_pr(board, workspace)
-            _update_phase(board, "complete", goal_status="done")
+            if _ensure_pr(board, workspace):
+                _update_phase(board, "complete", goal_status="done")
+            else:
+                _update_phase(board, "blocked", goal_status="blocked")
             return
         if status == "blocked":
             kanban_db.block_task(
@@ -518,34 +509,23 @@ def _apply_role_output(
             )
             _update_phase(board, "blocked", goal_status="blocked")
             return
-        created = []
         new_tasks = payload.get("new_tasks") if isinstance(payload.get("new_tasks"), list) else []
         dev_round = active_dev_round_for_board(board)
-        for idx, spec in enumerate(new_tasks, start=1):
-            if not isinstance(spec, dict) or not str(spec.get("title") or "").strip():
-                continue
-            created.append(
-                kanban_db.create_task(
-                    conn,
-                    title=format_role_round_title(str(spec.get("title")).strip(), dev_round),
-                    body=str(spec.get("body") or ""),
-                    assignee=ROLE_DEV,
-                    created_by=ROLE_REVIEWER,
-                    workspace_kind="dir",
-                    workspace_path=workspace,
-                    tenant=board,
-                    priority=int(spec.get("priority") or (90 - idx)),
-                    max_runtime_seconds=3600,
-                )
+        specs = _reviewer_dev_task_specs(new_tasks, dev_round=dev_round, workspace=workspace, board=board)
+        created: list[str] = []
+        try:
+            created = _create_planned_dev_tasks(conn, specs, created_by=ROLE_REVIEWER)
+            kanban_db.complete_task(
+                conn,
+                task_id,
+                summary=summary or "Reviewer requested changes.",
+                metadata={"created_tasks": created, "raw": payload},
+                created_cards=created,
+                expected_run_id=expected_run_id,
             )
-        kanban_db.complete_task(
-            conn,
-            task_id,
-            summary=summary or "Reviewer requested changes.",
-            metadata={"created_tasks": created, "raw": payload},
-            created_cards=created,
-            expected_run_id=expected_run_id,
-        )
+        except Exception:
+            _cleanup_created_tasks(conn, created)
+            raise
         _update_phase(board, "dev", goal_status="active")
         return
 
@@ -572,6 +552,106 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(v).strip() for v in value if str(v).strip()]
+
+
+def _priority(value: Any, default: int) -> int:
+    return int(value if value not in (None, "") else default)
+
+
+def _planner_dev_task_specs(
+    tasks: list[Any],
+    *,
+    dev_round: int,
+    workspace: str,
+    board: Optional[str],
+) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    for raw_idx, spec in enumerate(tasks):
+        if not isinstance(spec, dict):
+            continue
+        title = str(spec.get("title") or "").strip()
+        if not title:
+            continue
+        specs.append(
+            {
+                "raw_index": raw_idx,
+                "title": format_role_round_title(title, dev_round),
+                "body": str(spec.get("body") or ""),
+                "workspace": workspace,
+                "tenant": board,
+                "priority": _priority(spec.get("priority"), 50 - (raw_idx + 1)),
+                "parent_indices": _parent_indices(spec, len(tasks), raw_idx),
+            }
+        )
+    return specs
+
+
+def _reviewer_dev_task_specs(
+    tasks: list[Any],
+    *,
+    dev_round: int,
+    workspace: str,
+    board: Optional[str],
+) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    for raw_idx, spec in enumerate(tasks):
+        if not isinstance(spec, dict):
+            continue
+        title = str(spec.get("title") or "").strip()
+        if not title:
+            continue
+        specs.append(
+            {
+                "raw_index": raw_idx,
+                "title": format_role_round_title(title, dev_round),
+                "body": str(spec.get("body") or ""),
+                "workspace": workspace,
+                "tenant": board,
+                "priority": _priority(spec.get("priority"), 90 - (raw_idx + 1)),
+                "parent_indices": [],
+            }
+        )
+    return specs
+
+
+def _create_planned_dev_tasks(
+    conn: Any,
+    specs: list[dict[str, Any]],
+    *,
+    created_by: str,
+) -> list[str]:
+    created: list[str] = []
+    created_by_raw_index: dict[int, str] = {}
+    for spec in specs:
+        parent_ids = [
+            created_by_raw_index[parent_idx]
+            for parent_idx in spec["parent_indices"]
+            if parent_idx in created_by_raw_index
+        ]
+        task_id = kanban_db.create_task(
+            conn,
+            title=spec["title"],
+            body=spec["body"],
+            assignee=ROLE_DEV,
+            parents=parent_ids,
+            created_by=created_by,
+            workspace_kind="dir",
+            workspace_path=spec["workspace"],
+            tenant=spec["tenant"],
+            priority=spec["priority"],
+            max_runtime_seconds=3600,
+        )
+        created.append(task_id)
+        created_by_raw_index[spec["raw_index"]] = task_id
+    return created
+
+
+def _cleanup_created_tasks(conn: Any, task_ids: list[str]) -> None:
+    for task_id in reversed(task_ids):
+        try:
+            kanban_db.delete_task(conn, task_id)
+        except Exception:
+            pass
 
 
 def _parent_indices(spec: dict[str, Any], task_count: int, current_idx: int) -> list[int]:
@@ -806,9 +886,9 @@ def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None
     worker["pr_blocker"] = _pr_blocker(worker)
 
 
-def _ensure_pr(board: Optional[str], workspace: str) -> None:
+def _ensure_pr(board: Optional[str], workspace: str) -> bool:
     if not board:
-        return
+        return True
     from hermes_cli.discord_worker_boards import DISCORD_WORKER_META_KEY
     from utils import atomic_json_write
 
@@ -858,7 +938,19 @@ def _ensure_pr(board: Optional[str], workspace: str) -> None:
         if existing.returncode == 0 and existing_url and existing_url != "null":
             worker["pr_url"] = existing_url
         else:
-            subprocess.run(["git", "push", "-u", "origin", branch], cwd=root, timeout=300)
+            pushed = subprocess.run(
+                ["git", "push", "-u", "origin", branch],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if pushed.returncode != 0:
+                worker["pr_error"] = (pushed.stderr or pushed.stdout or "git push failed").strip()
+                worker["pr_checks_status"] = "not checked"
+                worker["pr_merge_state"] = "unknown"
+                worker["pr_blocker"] = worker["pr_error"]
+                raise RuntimeError(worker["pr_error"])
             title_source = str(
                 worker.get("root_goal")
                 or worker.get("initial_request")
@@ -908,6 +1000,7 @@ def _ensure_pr(board: Optional[str], workspace: str) -> None:
     metadata[DISCORD_WORKER_META_KEY] = worker
     metadata.pop("db_path", None)
     atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
+    return bool(worker.get("pr_url")) and not bool(worker.get("pr_error"))
 
 
 def _merge_criteria(board: Optional[str], criteria: list[str]) -> None:

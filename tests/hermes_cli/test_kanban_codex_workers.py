@@ -825,6 +825,44 @@ def test_planner_output_links_parent_dependencies(monkeypatch, tmp_path):
         conn.close()
 
 
+def test_planner_output_cleans_created_tasks_when_completion_fails(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_PLANNER
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    payload = {
+        "status": "planned",
+        "summary": "Planned one step.",
+        "tasks": [{"title": "Build foundation", "body": "Do it.", "priority": 20}],
+    }
+
+    def fail_complete(*args, **kwargs):
+        raise RuntimeError("completion failed")
+
+    monkeypatch.setattr(kanban_db, "complete_task", fail_complete)
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        with pytest.raises(RuntimeError, match="completion failed"):
+            worker._apply_role_output(
+                conn,
+                task.id,
+                ROLE_PLANNER,
+                payload,
+                board=board.slug,
+                workspace=str(tmp_path / "repo"),
+                expected_run_id=task.current_run_id,
+            )
+        dev_tasks = [
+            item for item in kanban_db.list_tasks(conn, include_archived=False)
+            if item.assignee == "dev"
+        ]
+    finally:
+        conn.close()
+
+    assert dev_tasks == []
+
+
 def test_reviewer_output_creates_next_round_dev_ticket(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -868,6 +906,44 @@ def test_reviewer_output_creates_next_round_dev_ticket(monkeypatch, tmp_path):
         conn.close()
 
     assert [item.title for item in dev_tasks] == ["R2: Fix follow-up"]
+
+
+def test_reviewer_approval_blocks_board_when_pr_publication_fails(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+
+    board = dwb.start_direct_goal(thread_id="review-pr-failed", goal="Ship it")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        reviewer_id = kanban_db.create_task(
+            conn,
+            title="Review",
+            assignee=ROLE_REVIEWER,
+            created_by="test",
+            tenant=board.slug,
+        )
+        reviewer = kanban_db.claim_task(conn, reviewer_id)
+        assert reviewer is not None
+        monkeypatch.setattr(worker, "_ensure_pr", lambda *args, **kwargs: False)
+
+        worker._apply_role_output(
+            conn,
+            reviewer_id,
+            ROLE_REVIEWER,
+            {"status": "approved", "summary": "Looks good."},
+            board=board.slug,
+            workspace=str(tmp_path / "repo"),
+            expected_run_id=reviewer.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert meta["phase"] == "blocked"
+    assert meta["goal_status"] == "blocked"
 
 
 def test_dev_blocked_output_marks_discord_board_blocked(monkeypatch, tmp_path):
@@ -1192,7 +1268,7 @@ def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeyp
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    worker._ensure_pr(board.slug, str(workspace))
+    assert worker._ensure_pr(board.slug, str(workspace)) is True
 
     pr_list = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "list"])
     pr_create = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "create"])
@@ -1250,7 +1326,7 @@ def test_ensure_pr_records_merge_checks_and_blocker(monkeypatch, tmp_path):
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    worker._ensure_pr(board.slug, str(workspace))
+    assert worker._ensure_pr(board.slug, str(workspace)) is True
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_url"] == "https://github.com/sligo-labs/PID/pull/125"
@@ -1286,7 +1362,7 @@ def test_ensure_pr_falls_back_to_origin_remote_for_repo(monkeypatch, tmp_path):
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    worker._ensure_pr(board.slug, str(workspace))
+    assert worker._ensure_pr(board.slug, str(workspace)) is True
 
     pr_create = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "create"])
     assert pr_create[pr_create.index("--repo") + 1] == "sligo-labs/PID"
@@ -1319,11 +1395,44 @@ def test_ensure_pr_records_error_when_repo_or_head_missing(monkeypatch, tmp_path
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    worker._ensure_pr(board.slug, str(workspace))
+    assert worker._ensure_pr(board.slug, str(workspace)) is False
 
     meta = kanban_db.read_board_metadata(board.slug)[DISCORD_WORKER_META_KEY]
     assert meta["pr_error"] == "Cannot create PR: missing GitHub repository, worker branch"
     assert meta["pr_blocker"] == meta["pr_error"]
     assert meta["pr_checks_status"] == "not checked"
     assert meta["pr_merge_state"] == "unknown"
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd in calls)
+
+
+def test_ensure_pr_records_push_failure_before_create(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="push-failed",
+        goal="Cannot push",
+        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
+    )
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:2] == ["git", "push"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="permission denied")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr(board.slug, str(workspace)) is False
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert meta["pr_error"] == "permission denied"
+    assert meta["pr_blocker"] == "permission denied"
     assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd in calls)

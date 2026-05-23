@@ -22,32 +22,37 @@ from typing import Any, Optional
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from hermes_cli import kanban_db
+from hermes_cli.discord_worker_roles import (
+    BOARD_RUN_SUMMARY_FILENAME,
+    DEV_TICKET_BODY_GUIDANCE,
+    DISCORD_WORKER_DISPATCH_DIRTY_FILENAME,
+    DISCORD_WORKER_META_KEY,
+    GOAL_CONTROL_COMMANDS,
+    PUBLIC_BOARD_COLUMNS,
+    PUBLIC_TOKEN_BYTES,
+    REVIEW_LOOP_CONTINUE_EXTRA_LOOPS,
+    REVIEW_LOOP_LIMIT_BLOCKED_REASON,
+    ROLE_ASSIGNEES,
+    ROLE_DEV,
+    ROLE_PLANNER,
+    ROLE_REVIEWER,
+    TERMINAL_GOAL_STATUSES,
+    active_dev_round,
+    board_slug_for_discord_thread,
+    format_role_round_title,
+)
+from hermes_cli.discord_worker_state import (
+    CODEX_STATE_LOG_TAIL_BYTES,
+    cap_state_value as _cap_state_value,
+    codex_worker_state_path,
+    read_codex_worker_state as _read_codex_worker_state,
+    record_codex_worker_event,
+    record_codex_worker_result,
+)
 from utils import atomic_json_write
 
 
 logger = logging.getLogger(__name__)
-DISCORD_WORKER_META_KEY = "discord_worker"
-DISCORD_WORKER_DISPATCH_DIRTY_FILENAME = "discord-worker-dispatch.dirty.json"
-BOARD_RUN_SUMMARY_FILENAME = "run-summary.json"
-PUBLIC_TOKEN_BYTES = 24
-REVIEW_LOOP_LIMIT_BLOCKED_REASON = "review loop limit reached"
-REVIEW_LOOP_CONTINUE_EXTRA_LOOPS = 5
-ROLE_PLANNER = "planner"
-ROLE_DEV = "dev"
-ROLE_REVIEWER = "reviewer"
-ROLE_ASSIGNEES = frozenset({ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER})
-DEV_TICKET_BODY_GUIDANCE = (
-    "Each dev ticket body must be a detailed, self-contained implementation brief "
-    "that opens with Goal, Success means, and Stop when, followed by Scope, "
-    "Implementation notes, Likely files/subsystems, Dependencies or handoffs, "
-    "Verification, and Out of scope."
-)
-_ROLE_ROUND_TITLE_RE = re.compile(r"^R\d+:\s*")
-CODEX_STATE_MAX_EVENTS = 200
-CODEX_STATE_MAX_TEXT_BYTES = 24_000
-CODEX_STATE_LOG_TAIL_BYTES = 64_000
-GOAL_CONTROL_COMMANDS = frozenset({"status", "pause", "resume", "clear", "stop", "done"})
-TERMINAL_GOAL_STATUSES = frozenset({"done", "blocked", "cancelled"})
 _DISCORD_MESSAGE_URL_RE = re.compile(
     r"https?://(?:canary\.|ptb\.)?discord(?:app)?\.com/channels/"
     r"(?P<guild>\d+)/(?P<channel>\d+)/(?P<message>\d+)"
@@ -56,7 +61,6 @@ _DISCORD_MESSAGE_ID_RE = re.compile(
     r"\b(?:message|msg)\s+(?P<message>\d{16,24})\b",
     re.IGNORECASE,
 )
-PUBLIC_BOARD_COLUMNS = ("triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done")
 _DELETE_META = object()
 _POSIX_PATH_RE = re.compile(
     r"(?<![\w:/.-])/(?:home|Users|tmp|var|etc|opt|private|workspace|workspaces|mnt|srv|repo|root)"
@@ -69,34 +73,8 @@ class TicketMoveConflict(RuntimeError):
     """Raised when a ticket status move is valid syntax but refused."""
 
 
-def board_slug_for_discord_thread(thread_id: str) -> str:
-    """Return the canonical board slug for a Discord thread id."""
-    cleaned = re.sub(r"[^0-9a-zA-Z_-]+", "-", str(thread_id or "").strip()).strip("-_")
-    if not cleaned:
-        raise ValueError("Discord thread id is required")
-    return f"discord-{cleaned.lower()}"[:64]
-
-
 def _now() -> int:
     return int(time.time())
-
-
-def format_role_round_title(title: str, round_number: int) -> str:
-    """Return a role-lane ticket title with one normalized round prefix."""
-    try:
-        round_value = max(1, int(round_number))
-    except (TypeError, ValueError):
-        round_value = 1
-    clean_title = _ROLE_ROUND_TITLE_RE.sub("", str(title or "").strip()).strip()
-    return f"R{round_value}: {clean_title}"
-
-
-def active_dev_round(worker: Optional[dict[str, Any]]) -> int:
-    """Return the dev round that should receive newly-created dev tickets."""
-    try:
-        return max(1, int((worker or {}).get("review_loop_count") or 0) + 1)
-    except (TypeError, ValueError):
-        return 1
 
 
 def active_dev_round_for_board(board: Optional[str]) -> int:
@@ -155,117 +133,6 @@ def dispatch_dirty_marker_mtime_ns() -> int:
         return dispatch_dirty_marker_path().stat().st_mtime_ns
     except OSError:
         return 0
-
-
-def codex_worker_state_path(task_id: str, *, board: Optional[str] = None) -> Path:
-    """Return the per-ticket Codex app-server state sidecar path."""
-    log_path = kanban_db.worker_log_path(str(task_id or ""), board=board)
-    return log_path.with_name(f"{log_path.stem}.codex-state.json")
-
-
-def _read_codex_worker_state(task_id: str, *, board: Optional[str] = None) -> dict[str, Any]:
-    path = codex_worker_state_path(task_id, board=board)
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {"error": "codex state sidecar could not be read"}
-    return data if isinstance(data, dict) else {}
-
-
-def _cap_state_value(value: Any, *, max_text: int = CODEX_STATE_MAX_TEXT_BYTES) -> Any:
-    if isinstance(value, str):
-        encoded = value.encode("utf-8", errors="replace")
-        if len(encoded) <= max_text:
-            return value
-        clipped = encoded[:max_text].decode("utf-8", errors="replace")
-        return f"{clipped}\n...[truncated {len(encoded) - max_text} bytes]"
-    if isinstance(value, list):
-        return [_cap_state_value(item, max_text=max_text) for item in value[:80]]
-    if isinstance(value, dict):
-        return {
-            str(key): _cap_state_value(item, max_text=max_text)
-            for key, item in list(value.items())[:80]
-        }
-    return value
-
-
-def _write_codex_worker_state(
-    task_id: str,
-    *,
-    board: Optional[str],
-    update: dict[str, Any],
-) -> dict[str, Any]:
-    path = codex_worker_state_path(task_id, board=board)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    current = _read_codex_worker_state(task_id, board=board)
-    current.update(update)
-    current["task_id"] = str(task_id)
-    current["board"] = str(board or "")
-    current["updated_at"] = _now()
-    atomic_json_write(path, current, indent=2)
-    return current
-
-
-def record_codex_worker_event(
-    task_id: str,
-    *,
-    board: Optional[str],
-    event: dict[str, Any],
-) -> None:
-    """Append one raw Codex app-server notification to a bounded sidecar."""
-    current = _read_codex_worker_state(task_id, board=board)
-    events = current.get("events") if isinstance(current.get("events"), list) else []
-    item = ((event.get("params") or {}).get("item") or {}) if isinstance(event, dict) else {}
-    events.append(
-        {
-            "ts": _now(),
-            "method": event.get("method") if isinstance(event, dict) else "",
-            "item_type": item.get("type") if isinstance(item, dict) else "",
-            "payload": _cap_state_value(event),
-        }
-    )
-    truncated = int(current.get("truncated_events") or 0)
-    if len(events) > CODEX_STATE_MAX_EVENTS:
-        truncated += len(events) - CODEX_STATE_MAX_EVENTS
-        events = events[-CODEX_STATE_MAX_EVENTS:]
-    _write_codex_worker_state(
-        task_id,
-        board=board,
-        update={"events": events, "truncated_events": truncated},
-    )
-
-
-def record_codex_worker_result(
-    task_id: str,
-    *,
-    board: Optional[str],
-    result: Any,
-) -> None:
-    payload = {
-        "backend": getattr(result, "backend", "codex"),
-        "final_text": getattr(result, "final_text", ""),
-        "error": getattr(result, "error", None),
-        "interrupted": bool(getattr(result, "interrupted", False)),
-        "timed_out": bool(getattr(result, "timed_out", False)),
-        "should_retire": bool(getattr(result, "should_retire", False)),
-        "tool_iterations": int(getattr(result, "tool_iterations", 0) or 0),
-        "turn_id": getattr(result, "turn_id", None),
-        "thread_id": getattr(result, "thread_id", None),
-        "agents": getattr(result, "agents", []),
-        "plan_text": getattr(result, "plan_text", ""),
-        "exit_code": getattr(result, "exit_code", None),
-        "duration_seconds": getattr(result, "duration_seconds", None),
-        "run_profile": getattr(result, "run_profile", {}),
-        "service_tier": getattr(result, "service_tier", None),
-        "fast_mode": getattr(result, "fast_mode", None),
-    }
-    _write_codex_worker_state(
-        task_id,
-        board=board,
-        update={"result": _cap_state_value(payload)},
-    )
 
 
 def _read_worker_meta(board: str) -> dict[str, Any]:

@@ -191,7 +191,7 @@ class TestKillStaleDashboardPosix:
     """Kill path on Linux / macOS: SIGTERM then SIGKILL any survivors."""
 
     def test_no_stale_processes_is_a_noop(self, capsys):
-        with patch("hermes_cli.main._find_stale_dashboard_pids", return_value=[]):
+        with patch("hermes_cli.dashboard_lifecycle.find_dashboard_pids", return_value=[]):
             _kill_stale_dashboard_processes()
         assert capsys.readouterr().out == ""
 
@@ -209,7 +209,7 @@ class TestKillStaleDashboardPosix:
                 raise ProcessLookupError
             # SIGTERM itself: succeed silently.
 
-        with patch("hermes_cli.main._find_stale_dashboard_pids",
+        with patch("hermes_cli.dashboard_lifecycle.find_dashboard_pids",
                    return_value=[12345, 12346]), \
              patch("os.kill", side_effect=fake_kill), \
              patch("time.sleep"):
@@ -241,7 +241,7 @@ class TestKillStaleDashboardPosix:
                 return
             # Any other signal — also fine.
 
-        with patch("hermes_cli.main._find_stale_dashboard_pids",
+        with patch("hermes_cli.dashboard_lifecycle.find_dashboard_pids",
                    return_value=[99999]), \
              patch("os.kill", side_effect=fake_kill), \
              patch("time.sleep"), \
@@ -264,7 +264,7 @@ class TestKillStaleDashboardPosix:
         def fake_kill(pid, sig):
             raise PermissionError("Operation not permitted")
 
-        with patch("hermes_cli.main._find_stale_dashboard_pids",
+        with patch("hermes_cli.dashboard_lifecycle.find_dashboard_pids",
                    return_value=[12345]), \
              patch("os.kill", side_effect=fake_kill), \
              patch("time.sleep"):
@@ -280,7 +280,7 @@ class TestKillStaleDashboardPosix:
         def fake_kill(pid, sig):
             raise ProcessLookupError
 
-        with patch("hermes_cli.main._find_stale_dashboard_pids",
+        with patch("hermes_cli.dashboard_lifecycle.find_dashboard_pids",
                    return_value=[12345]), \
              patch("os.kill", side_effect=fake_kill), \
              patch("time.sleep"):
@@ -301,7 +301,7 @@ class TestKillStaleDashboardWindows:
             # taskkill returns 0 on success
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        with patch("hermes_cli.main._find_stale_dashboard_pids",
+        with patch("hermes_cli.dashboard_lifecycle.find_dashboard_pids",
                    return_value=[12345, 12346]), \
              patch("subprocess.run", side_effect=fake_run) as mock_run:
             _kill_stale_dashboard_processes()
@@ -326,7 +326,7 @@ class TestKillStaleDashboardWindows:
             return MagicMock(returncode=128, stdout="",
                              stderr="ERROR: Access is denied.")
 
-        with patch("hermes_cli.main._find_stale_dashboard_pids",
+        with patch("hermes_cli.dashboard_lifecycle.find_dashboard_pids",
                    return_value=[12345]), \
              patch("subprocess.run", side_effect=fake_run):
             _kill_stale_dashboard_processes()  # must not raise

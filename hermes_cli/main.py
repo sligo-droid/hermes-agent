@@ -207,7 +207,20 @@ _apply_profile_override()
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import get_hermes_home
+from hermes_cli.dashboard_lifecycle import (
+    find_dashboard_pids as _find_stale_dashboard_pids,
+    stop_dashboard_processes as _stop_dashboard_processes,
+)
 from hermes_cli.env_loader import load_hermes_dotenv
+
+
+def _kill_stale_dashboard_processes(
+    reason: str = "the running backend no longer matches the updated frontend",
+) -> bool:
+    return _stop_dashboard_processes(reason=reason)
+
+
+_warn_stale_dashboard_processes = _kill_stale_dashboard_processes
 
 load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
@@ -6478,99 +6491,6 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     return True
 
 
-def _find_stale_dashboard_pids() -> list[int]:
-    """Return PIDs of ``hermes dashboard`` processes other than ourselves.
-
-    ``hermes dashboard`` is a long-lived server process commonly started and
-    forgotten.  When ``hermes update`` replaces files on disk, the running
-    process keeps the old Python backend in memory while the JS bundle on
-    disk is updated, causing a silent frontend/backend mismatch (e.g. new
-    auth headers the old backend doesn't recognise → every API call 401s).
-
-    The dashboard has no service manager (systemd / launchd), no PID file,
-    and we can't know the original launch args — so the only sane action
-    after an update is to kill the stale process and let the user restart
-    it.  This helper is just the detection step; see
-    ``_kill_stale_dashboard_processes`` for the kill.
-
-    Returns an empty list on any scan error (missing ps/wmic, timeout, etc.).
-    """
-    patterns = [
-        "hermes dashboard",
-        "hermes_cli.main dashboard",
-        "hermes_cli/main.py dashboard",
-    ]
-    self_pid = os.getpid()
-    dashboard_pids: list[int] = []
-
-    try:
-        if sys.platform == "win32":
-            # wmic may emit text in the system code page (for example cp936
-            # on zh-CN systems), not UTF-8. In text mode, subprocess output
-            # decoding depends on Python's configuration (locale-dependent
-            # by default, or UTF-8 in UTF-8 mode). The important protection
-            # here is errors="ignore": it prevents a reader-thread
-            # UnicodeDecodeError from leaving result.stdout=None and turning
-            # the later .split() into an AttributeError (#17049).
-            result = subprocess.run(
-                ["wmic", "process", "get", "ProcessId,CommandLine", "/FORMAT:LIST"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                encoding="utf-8",
-                errors="ignore",
-            )
-            if result.returncode != 0 or result.stdout is None:
-                return []
-            current_cmd = ""
-            for line in result.stdout.split("\n"):
-                line = line.strip()
-                if line.startswith("CommandLine="):
-                    current_cmd = line[len("CommandLine=") :]
-                elif line.startswith("ProcessId="):
-                    pid_str = line[len("ProcessId=") :]
-                    if (
-                        any(p in current_cmd for p in patterns)
-                        and int(pid_str) != self_pid
-                    ):
-                        try:
-                            dashboard_pids.append(int(pid_str))
-                        except ValueError:
-                            pass
-        else:
-            # Linux / macOS: scan the process table via ps and match against
-            # the same explicit patterns list used on Windows.  Using ps
-            # (rather than `pgrep -f "hermes.*dashboard"`) keeps us consistent
-            # with `hermes_cli.gateway._scan_gateway_pids` and avoids the
-            # greedy regex matching unrelated cmdlines that merely contain
-            # both words (e.g. a chat session discussing "dashboard").
-            result = subprocess.run(
-                ["ps", "-A", "-o", "pid=,command="],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                for line in getattr(result, "stdout", "").split("\n"):
-                    stripped = line.strip()
-                    if not stripped or "grep" in stripped:
-                        continue
-                    parts = stripped.split(None, 1)
-                    if len(parts) != 2:
-                        continue
-                    try:
-                        pid = int(parts[0])
-                    except ValueError:
-                        continue
-                    command = parts[1]
-                    if any(p in command for p in patterns) and pid != self_pid:
-                        dashboard_pids.append(pid)
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return []
-
-    return dashboard_pids
-
-
 def _print_curator_first_run_notice() -> None:
     """Print a short heads-up about the skill curator after `hermes update`.
 
@@ -6696,110 +6616,6 @@ def _format_time_ago(iso_ts: str) -> str:
         return f"{secs // 86400}d ago"
     except Exception:
         return "recently"
-
-
-def _kill_stale_dashboard_processes(
-    reason: str = "the running backend no longer matches the updated frontend",
-) -> None:
-    """Kill running ``hermes dashboard`` processes.
-
-    Called at the end of ``hermes update`` (default ``reason``) and also
-    from ``hermes dashboard --stop`` (which overrides ``reason``).  The
-    dashboard has no service manager, so after a code update the running
-    process is guaranteed to be serving stale Python against a
-    freshly-updated JS bundle.  Leaving it alive produces silent
-    frontend/backend mismatches (new auth headers the old backend doesn't
-    recognise → every API call 401s).
-
-    POSIX: SIGTERM, wait up to ~3s for graceful exit, SIGKILL any survivors.
-    Windows: ``taskkill /PID <pid> /F`` since there's no clean SIGTERM
-    equivalent for background console apps.
-
-    The dashboard isn't auto-restarted because we don't know the original
-    launch args (--host, --port, --insecure, --tui, --no-open).  The user
-    restarts it manually; a hint is printed.
-    """
-    pids = _find_stale_dashboard_pids()
-    if not pids:
-        return
-
-    print()
-    print(f"⟲ Stopping {len(pids)} dashboard process(es) ({reason})")
-
-    killed: list[int] = []
-    failed: list[tuple[int, str]] = []
-
-    if sys.platform == "win32":
-        for pid in pids:
-            try:
-                result = subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/F"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                if result.returncode == 0:
-                    killed.append(pid)
-                else:
-                    failed.append((pid, (result.stderr or result.stdout or "").strip()))
-            except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
-                failed.append((pid, str(e)))
-    else:
-        import signal as _signal
-        import time as _time
-
-        # SIGTERM first — give each process a chance to shut down cleanly
-        # (uvicorn closes its socket, flushes logs, etc.).
-        for pid in pids:
-            try:
-                os.kill(pid, _signal.SIGTERM)
-            except ProcessLookupError:
-                # Already gone — count as killed.
-                killed.append(pid)
-            except (PermissionError, OSError) as e:
-                failed.append((pid, str(e)))
-
-        # Poll for exit up to ~3s total.
-        deadline = _time.monotonic() + 3.0
-        pending = [
-            p for p in pids if p not in killed and p not in {f[0] for f in failed}
-        ]
-        while pending and _time.monotonic() < deadline:
-            _time.sleep(0.1)
-            still_pending = []
-            # On Windows, os.kill(pid, 0) is NOT a no-op. Route through
-            # the cross-platform existence check.
-            from gateway.status import _pid_exists
-            for pid in pending:
-                if _pid_exists(pid):
-                    still_pending.append(pid)
-                else:
-                    killed.append(pid)
-            pending = still_pending
-
-        # SIGKILL any survivors.
-        for pid in pending:
-            try:
-                os.kill(pid, _signal.SIGKILL)
-                killed.append(pid)
-            except ProcessLookupError:
-                killed.append(pid)
-            except (PermissionError, OSError) as e:
-                failed.append((pid, str(e)))
-
-    for pid in killed:
-        print(f"    ✓ stopped PID {pid}")
-    for pid, err_msg in failed:
-        print(f"    ✗ failed to stop PID {pid}: {err_msg}")
-
-    if killed:
-        print("  Restart the dashboard when you're ready:")
-        print("    hermes dashboard --port <port>")
-
-
-# Back-compat alias: some tests and any external callers may import the old
-# warn-only name.  The new behaviour (kill stale processes) replaces it.
-_warn_stale_dashboard_processes = _kill_stale_dashboard_processes
 
 
 def _update_via_zip(args):

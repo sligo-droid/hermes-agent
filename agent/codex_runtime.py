@@ -81,7 +81,16 @@ def _close_codex_app_server_session(agent) -> None:
             )
         except Exception:
             pass
+        lease = getattr(agent, "_codex_worker_home_lease", None)
+        if lease is not None:
+            try:
+                lease.cleanup()
+            except Exception:
+                pass
     agent._codex_session = None
+    agent._codex_worker_home = None
+    agent._codex_worker_credential_id = None
+    agent._codex_worker_home_lease = None
 
 
 def _codex_kanban_worker_bootstrap() -> str:
@@ -185,23 +194,16 @@ def run_codex_app_server_turn(
         codex_home = getattr(agent, "_codex_worker_home", None)
         if codex_home is None:
             try:
-                import uuid
+                from agent.codex_worker_auth import create_codex_worker_home
 
-                from agent.codex_worker_auth import prepare_codex_worker_home
-                from hermes_constants import get_hermes_home
-
-                codex_home_path = (
-                    get_hermes_home()
-                    / "codex-worker-homes"
-                    / f"session-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-                )
-                credential_id = prepare_codex_worker_home(
-                    codex_home_path,
+                lease = create_codex_worker_home(
                     parent_agent=agent,
+                    prefix=f"session-{os.getpid()}-",
                 )
-                codex_home = str(codex_home_path)
+                codex_home = str(lease.path)
                 agent._codex_worker_home = codex_home
-                agent._codex_worker_credential_id = credential_id
+                agent._codex_worker_credential_id = lease.credential_id
+                agent._codex_worker_home_lease = lease
             except Exception:
                 codex_home = None
 
