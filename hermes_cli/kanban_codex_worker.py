@@ -245,6 +245,7 @@ def _rotate_codex_worker_credential_after_auth_failure(result: Any) -> bool:
     next_credential_id = prepare_codex_worker_home(
         codex_home,
         source_env=source_env,
+        allow_fallback=False,
     )
     if not next_credential_id or next_credential_id == failed_credential_id:
         return False

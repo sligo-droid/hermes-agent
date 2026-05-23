@@ -170,13 +170,15 @@ def prepare_codex_worker_home(
     *,
     parent_agent: Any = None,
     source_env: dict[str, str] | None = None,
+    allow_fallback: bool = True,
 ) -> Optional[str]:
     """Prepare an isolated Codex home and return inherited credential id.
 
     The active Hermes ``openai-codex`` credential wins. If no pool credential is
-    available, this preserves the previous behavior of copying the user's
-    existing Codex auth files when present. ``source_env`` lets callers choose
-    the environment used for that fallback without mutating global state.
+    available and ``allow_fallback`` is true, this preserves the previous
+    behavior of copying the user's existing Codex auth files when present.
+    ``source_env`` lets callers choose the environment used for that fallback
+    without mutating global state.
     """
     path = Path(codex_home).expanduser()
     path.mkdir(parents=True, exist_ok=True)
@@ -189,7 +191,7 @@ def prepare_codex_worker_home(
             "Codex worker inheriting openai-codex pool credential %s",
             credential_id or "<unknown>",
         )
-    else:
+    elif allow_fallback:
         _copy_codex_file(
             path,
             "auth.json",

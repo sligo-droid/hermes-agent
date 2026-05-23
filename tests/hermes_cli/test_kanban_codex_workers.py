@@ -1101,6 +1101,33 @@ def test_run_codex_retries_auth_failure_with_next_pool_credential(monkeypatch, t
     assert pool_entries["cred-1"].last_error_code == 401
 
 
+def test_rotate_codex_worker_credential_disables_fallback_auth_copy(monkeypatch, tmp_path):
+    from agent import codex_worker_auth
+    from hermes_cli import kanban_codex_worker as worker
+
+    captured = {}
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "worker-codex-home"))
+    monkeypatch.setenv("HERMES_CODEX_WORKER_CREDENTIAL_ID", "cred-1")
+    monkeypatch.setattr(
+        codex_worker_auth,
+        "mark_codex_worker_credential_auth_failed",
+        lambda credential_id, *, message=None: True,
+    )
+
+    def fake_prepare(codex_home, **kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(codex_worker_auth, "prepare_codex_worker_home", fake_prepare)
+
+    rotated = worker._rotate_codex_worker_credential_after_auth_failure(
+        SimpleNamespace(error="Codex authentication failed")
+    )
+
+    assert rotated is False
+    assert captured["allow_fallback"] is False
+
+
 def test_update_phase_refreshes_worker_updated_at(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli import kanban_db
