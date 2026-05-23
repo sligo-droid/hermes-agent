@@ -3708,7 +3708,7 @@ def reconcile_board(board: str) -> Optional[str]:
         _update_worker_meta(board, worker)
         kanban_db.create_task(
             conn,
-            title=format_role_round_title(f"Review Discord implementation (loop {loops})", loops),
+            title=format_role_round_title("Review Discord implementation", loops),
             body=json.dumps(
                 {
                     "role": ROLE_REVIEWER,

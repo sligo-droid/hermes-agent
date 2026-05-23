@@ -917,7 +917,7 @@ def test_continue_board_after_review_loop_limit_extends_and_reconciles(monkeypat
         conn.close()
     reviewer = [task for task in tasks if task.assignee == "reviewer" and task.status == "ready"]
     assert len(reviewer) == 1
-    assert reviewer[0].title.endswith("Review Discord implementation (loop 6)")
+    assert reviewer[0].title == "R6: Review Discord implementation"
 
 
 def test_public_board_index_does_not_show_dead_pid_as_running(monkeypatch, tmp_path):
@@ -1843,7 +1843,7 @@ def test_reconcile_board_creates_round_prefixed_reviewer_ticket(monkeypatch, tmp
         conn.close()
 
     assert len(reviewer_tasks) == 1
-    assert reviewer_tasks[0].title == "R1: Review Discord implementation (loop 1)"
+    assert reviewer_tasks[0].title == "R1: Review Discord implementation"
 
 
 def test_dispatch_once_allows_explicit_role_lane_assignees(monkeypatch, tmp_path):
