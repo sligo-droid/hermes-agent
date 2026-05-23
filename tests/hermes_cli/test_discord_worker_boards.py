@@ -241,6 +241,33 @@ def test_board_thread_state_reflects_kanban_tasks(monkeypatch, tmp_path):
         conn.close()
 
 
+def test_board_thread_state_completed_board_ignores_stale_worker_blocker(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(thread_id="7801", goal="Finish despite stale blocker")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        claimed = kanban_db.claim_task(conn, task.id)
+        assert claimed is not None
+        kanban_db.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "blocked",
+            "phase": "complete",
+            "blocked_reason": "stale blocker",
+        },
+    )
+
+    assert dwb.board_thread_state(board.slug) == "done"
+
+
 def test_start_direct_goal_activates_board_without_planner(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
