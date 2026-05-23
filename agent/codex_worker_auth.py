@@ -22,14 +22,13 @@ def _entry_tokens(entry: Any) -> Optional[dict[str, str]]:
     access_token = _string_attr(entry, "access_token")
     refresh_token = _string_attr(entry, "refresh_token")
     id_token = _string_attr(entry, "id_token")
-    if not access_token or not refresh_token:
+    if not access_token or not refresh_token or not id_token:
         return None
     tokens = {
         "access_token": access_token,
         "refresh_token": refresh_token,
+        "id_token": id_token,
     }
-    if id_token:
-        tokens["id_token"] = id_token
     account_id = _string_attr(entry, "account_id")
     if account_id:
         tokens["account_id"] = account_id
@@ -56,6 +55,37 @@ def _load_codex_pool():
     return None
 
 
+def _select_usable_pool_entry(pool: Any) -> Any:
+    try:
+        entry = pool.current()
+    except Exception:
+        entry = None
+    if _entry_is_usable(entry):
+        return entry
+
+    seen_ids = {getattr(entry, "id", None)} if entry is not None else set()
+    try:
+        entry = pool.select()
+    except Exception as exc:
+        logger.debug("Could not select openai-codex worker credential: %s", exc)
+        entry = None
+    if _entry_is_usable(entry):
+        return entry
+    if entry is not None:
+        seen_ids.add(getattr(entry, "id", None))
+
+    try:
+        entries = pool.entries()
+    except Exception:
+        entries = []
+    for entry in entries:
+        if getattr(entry, "id", None) in seen_ids:
+            continue
+        if _entry_is_usable(entry):
+            return entry
+    return None
+
+
 def select_codex_worker_credential(parent_agent: Any = None) -> tuple[Any, Any]:
     """Return ``(pool, entry)`` for the Codex credential a worker should use.
 
@@ -74,20 +104,8 @@ def select_codex_worker_credential(parent_agent: Any = None) -> tuple[Any, Any]:
     if pool is None:
         return None, None
 
-    entry = None
-    try:
-        entry = pool.current()
-    except Exception:
-        entry = None
-    if _entry_is_usable(entry):
-        return pool, entry
-
-    try:
-        entry = pool.select()
-    except Exception as exc:
-        logger.debug("Could not select openai-codex worker credential: %s", exc)
-        entry = None
-    if _entry_is_usable(entry):
+    entry = _select_usable_pool_entry(pool)
+    if entry is not None:
         return pool, entry
     return pool, None
 
@@ -177,6 +195,8 @@ def prepare_codex_worker_home(
     The active Hermes ``openai-codex`` credential wins. If no pool credential is
     available and ``allow_fallback`` is true, this preserves the previous
     behavior of copying the user's existing Codex auth files when present.
+    Pool credentials without ``id_token`` are treated as unavailable because
+    Codex CLI rejects those auth files before it can refresh them.
     ``source_env`` lets callers choose the environment used for that fallback
     without mutating global state.
     """
