@@ -1,5 +1,6 @@
 import json
 import os
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -234,6 +235,53 @@ async def test_discord_feature_summary_goal_set_suppresses_board_ack(tmp_path, m
 
     assert response is None
     assert meta["discord_worker"]["root_goal"] == "Ship the dashboard"
+
+
+@pytest.mark.asyncio
+async def test_discord_feature_summary_goal_set_syncs_existing_summary(tmp_path, monkeypatch):
+    kanban_home = tmp_path / "kanban-home"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://kanban.example")
+
+    adapter = _FakeAdapter()
+    adapter.sync_kanban_feature_summary = AsyncMock(return_value="sync-1")
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+
+    event = MessageEvent(
+        text="/goal Ship the dashboard",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="parent-channel",
+            chat_type="thread",
+            thread_id="1507755696501030933",
+            parent_chat_id="parent-channel",
+            guild_id="guild-1",
+            user_id="user-goal-config",
+        ),
+        message_id="msg-goal",
+        feature_summary={
+            "thread_id": "1507755696501030933",
+            "message_id": "summary-message",
+            "kanban_board": None,
+        },
+    )
+
+    response = await GatewayRunner._handle_goal_command(runner, event)
+
+    assert response is None
+    adapter.sync_kanban_feature_summary.assert_awaited_once()
+    target = adapter.sync_kanban_feature_summary.await_args.args[0]
+    assert target["board"] == "discord-1507755696501030933"
+    assert target["thread_id"] == "1507755696501030933"
+    assert target["guild_id"] == "guild-1"
+    assert target["parent_channel_id"] == "parent-channel"
+    assert target["public_url"] == "https://kanban.example/workers/1507755696501030933"
 
 
 @pytest.mark.asyncio

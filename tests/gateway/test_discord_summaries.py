@@ -752,6 +752,48 @@ async def test_sync_kanban_feature_summary_reopens_persisted_handle(adapter, mon
 
 
 @pytest.mark.asyncio
+async def test_sync_kanban_feature_summary_persists_late_board_attachment(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://hermes.sligolabs.com")
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 200 else None
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="Implement the feature from this thread",
+    )
+    assert handle is not None
+    assert handle["kanban_board"] is None
+
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(thread_id="200", goal="Ship the dashboard")
+    synced = await adapter.sync_kanban_feature_summary(
+        {
+            "board": board.slug,
+            "thread_id": "200",
+            "state": "active",
+            "public_url": "https://hermes.sligolabs.com/workers/200",
+            "sync_key": "sync-late-attach",
+        }
+    )
+
+    assert synced == "sync-late-attach"
+    state = adapter._read_project_summary_state()
+    stored = state["_feature_summaries"]["5:200"]
+    assert stored["kanban_board"] == {
+        "slug": "discord-200",
+        "public_url": "https://hermes.sligolabs.com/workers/200",
+    }
+    message = handle["_message_obj"]
+    edited_embed = message.edit.await_args.kwargs["embed"]
+    fields = {field.name: field.value for field in edited_embed.fields}
+    assert fields["Kanban Board"] == "https://hermes.sligolabs.com/workers/200"
+
+
+@pytest.mark.asyncio
 async def test_sync_kanban_feature_summary_uses_persisted_terminal_summary(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://hermes.sligolabs.com")
