@@ -948,7 +948,7 @@ def test_reviewer_output_creates_next_round_dev_ticket(monkeypatch, tmp_path):
     try:
         reviewer_id = kanban_db.create_task(
             conn,
-            title="R1: Review Discord implementation (loop 1)",
+            title="R1: Review Discord implementation",
             assignee=ROLE_REVIEWER,
             tenant=board.slug,
         )
