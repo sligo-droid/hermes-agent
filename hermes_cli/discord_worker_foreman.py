@@ -217,16 +217,7 @@ def alerts_due(
         fingerprint = _issue_fingerprint(issue)
         entry = alerts.get(fingerprint)
         if not isinstance(entry, dict):
-            entry = {
-                "first_seen_at": now,
-                "last_sent_at": None,
-                "last_attempt_at": None,
-                "last_state_key": "",
-                "send_count": 0,
-                "failure_count": 0,
-                "next_retry_at": None,
-                "last_error": "",
-            }
+            entry = _new_alert_entry(now)
             alerts[fingerprint] = entry
             changed = True
         elif not entry.get("first_seen_at"):
@@ -247,6 +238,41 @@ def alerts_due(
     if changed:
         _write_alert_state(state)
     return due
+
+
+def startup_baseline_needed() -> bool:
+    """Return True when foreman should treat the first scan as existing state."""
+    state = _read_alert_state()
+    return not bool(state.get("startup_baselined_at")) and not bool(state.get("alerts"))
+
+
+def record_startup_baseline(
+    issues: Iterable[ForemanIssue],
+    *,
+    now: Optional[int] = None,
+    config: Optional[dict[str, Any]] = None,
+) -> int:
+    """Mark currently visible startup issues as historical without sending them."""
+    now = int(time.time()) if now is None else int(now)
+    cfg = _alert_config(config)
+    state = _read_alert_state()
+    state["startup_baselined_at"] = now
+    alerts = state.setdefault("alerts", {})
+    changed = _gc_alert_state(state, now=now, retention_seconds=int(cfg["retention_seconds"]))
+    count = 0
+    for issue in issues:
+        fingerprint = _issue_fingerprint(issue)
+        if isinstance(alerts.get(fingerprint), dict):
+            continue
+        entry = _new_alert_entry(now)
+        entry["startup_suppressed_at"] = now
+        entry["startup_suppressed_state_key"] = _issue_state_key(issue)
+        alerts[fingerprint] = entry
+        count += 1
+        changed = True
+    if changed or count or state.get("startup_baselined_at") == now:
+        _write_alert_state(state)
+    return count
 
 
 def record_alert_sent(issue: ForemanIssue, *, now: Optional[int] = None) -> None:
@@ -319,6 +345,43 @@ def render_foreman_alert(issue: ForemanIssue, mention: str = "") -> str:
                 continue
             lines.append(f"- {key}: {_truncate_text(_sanitize_text(str(value)), 180)}")
     return _truncate_text("\n".join(lines), DISCORD_ALERT_LIMIT)
+
+
+def render_foreman_goal_prompt(issue: ForemanIssue) -> str:
+    """Render a sanitized /goal prompt for Kanban-owned foreman escalation."""
+    evidence = _renderable_evidence(issue.evidence)
+    lines = [
+        "/goal Foreman escalation: resolve a Discord worker issue.",
+        "",
+        "Problem:",
+        f"- Severity: {str(issue.severity or '').upper()}",
+        f"- Detector: {issue.kind}",
+        f"- Board: {issue.board}",
+        f"- Task: {issue.task_id}",
+        f"- Summary: {_truncate_text(_sanitize_text(issue.title), 240)}",
+        "",
+        "Goal:",
+        f"- {_suggest_next_action(issue)}",
+        "- Update, retry, unblock, or close the affected Kanban task as appropriate.",
+        "- Verify the board can progress without this foreman issue recurring.",
+    ]
+    session_url = evidence.get("session_url")
+    if isinstance(session_url, str) and _is_public_url(session_url):
+        lines.extend(["", f"Board URL: {session_url}"])
+    if evidence:
+        lines.extend(["", "Evidence:"])
+        for key in sorted(evidence):
+            value = evidence[key]
+            if key == "session_url" and (not isinstance(value, str) or not _is_public_url(value)):
+                continue
+            lines.append(f"- {key}: {_truncate_text(_sanitize_text(str(value)), 180)}")
+    return _truncate_text("\n".join(lines), DISCORD_ALERT_LIMIT)
+
+
+def foreman_goal_thread_title(issue: ForemanIssue) -> str:
+    """Return a compact Discord thread title for a foreman-created goal."""
+    title = f"Foreman: {issue.kind} {issue.task_id}"
+    return _truncate_text(_sanitize_text(re.sub(r"\s+", " ", title).strip()), 80)
 
 
 def collect_board_snapshots() -> list[BoardSnapshot]:
@@ -607,18 +670,22 @@ def _alert_entry(state: dict[str, Any], issue: ForemanIssue, *, now: int) -> dic
     fingerprint = _issue_fingerprint(issue)
     entry = alerts.get(fingerprint)
     if not isinstance(entry, dict):
-        entry = {
-            "first_seen_at": now,
-            "last_sent_at": None,
-            "last_attempt_at": None,
-            "last_state_key": "",
-            "send_count": 0,
-            "failure_count": 0,
-            "next_retry_at": None,
-            "last_error": "",
-        }
+        entry = _new_alert_entry(now)
         alerts[fingerprint] = entry
     return entry
+
+
+def _new_alert_entry(now: int) -> dict[str, Any]:
+    return {
+        "first_seen_at": now,
+        "last_sent_at": None,
+        "last_attempt_at": None,
+        "last_state_key": "",
+        "send_count": 0,
+        "failure_count": 0,
+        "next_retry_at": None,
+        "last_error": "",
+    }
 
 
 def _issue_fingerprint(issue: ForemanIssue) -> str:
@@ -655,6 +722,8 @@ def _is_alert_due(issue: ForemanIssue, entry: dict[str, Any], *, now: int, confi
         return False
     if int(entry.get("failure_count") or 0) > 0 and next_retry is not None and int(next_retry) <= now:
         return True
+    if entry.get("startup_suppressed_at") and not entry.get("last_sent_at"):
+        return False
     last_sent = entry.get("last_sent_at")
     if not last_sent:
         return True

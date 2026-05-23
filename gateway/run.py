@@ -6390,6 +6390,62 @@ class GatewayRunner:
             )
         return sanitize_foreman_text(value, limit=300)
 
+    async def _discord_foreman_start_goal(
+        self,
+        adapter: Any,
+        *,
+        channel_id: str,
+        issue: Any,
+        prompt: str,
+        title: str,
+    ) -> None:
+        creator = getattr(adapter, "create_foreman_goal_thread", None) if adapter else None
+        if not callable(creator):
+            raise RuntimeError("Discord adapter cannot create foreman goal threads")
+
+        handle = await creator(
+            channel_id,
+            name=title,
+            initial_request=prompt,
+            project_context=None,
+        )
+        if not isinstance(handle, dict) or not str(handle.get("thread_id") or "").strip():
+            raise RuntimeError("Discord adapter did not return a foreman goal thread")
+
+        thread_id = str(handle.get("thread_id") or "").strip()
+        thread_name = str(handle.get("thread_name") or title or thread_id).strip()
+        project_context = handle.get("project_context") if isinstance(handle.get("project_context"), dict) else {}
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id=thread_id,
+            chat_name=f"#dev / {thread_name}" if thread_name else "#dev",
+            chat_type="thread",
+            user_id="system:foreman",
+            user_name="Hermes Foreman",
+            thread_id=thread_id,
+            guild_id=str(handle.get("guild_id") or "") or None,
+            parent_chat_id=str(handle.get("parent_channel_id") or channel_id or "") or None,
+            project_name=str(project_context.get("project_name") or "") or None,
+            project_path=str(project_context.get("project_path") or "") or None,
+            project_github_url=str(project_context.get("project_github_url") or "") or None,
+            project_channel_id=str(project_context.get("project_channel_id") or "") or None,
+            project_mapping_source=str(project_context.get("project_mapping_source") or "") or None,
+            project_mapping_resolved=(
+                bool(project_context.get("project_mapping_resolved"))
+                if project_context.get("project_mapping_resolved") is not None
+                else None
+            ),
+        )
+        event = MessageEvent(
+            text=prompt,
+            message_type=MessageType.COMMAND,
+            source=source,
+            message_id=str(handle.get("message_id") or "") or None,
+            feature_summary=handle,
+            internal=True,
+        )
+        await self._handle_goal_command(event)
+
     async def _discord_worker_foreman_watcher(self) -> None:
         """Optionally scan Discord worker boards and send foreman alerts."""
         if getattr(self, "_discord_worker_foreman_watcher_active", False):
@@ -6440,6 +6496,7 @@ class GatewayRunner:
             alert_config = dict(watcher_cfg["alert_config"])
             terminal_age = int(watcher_cfg["terminal_suppression_age_seconds"])
             alert_config["terminal_suppression_age_seconds"] = terminal_age
+            startup_baseline_checked = False
             logger.info(
                 "discord foreman: enabled (interval=%.1fs channel=%s)",
                 interval,
@@ -6461,34 +6518,39 @@ class GatewayRunner:
                             logger.debug("discord foreman: helper unavailable", exc_info=True)
                         else:
                             def _collect_due_alerts() -> list[Any]:
+                                nonlocal startup_baseline_checked
                                 now = int(time.time())
                                 issues = _foreman.collect_foreman_issues(now=now)
+                                if not startup_baseline_checked:
+                                    startup_baseline_checked = True
+                                    if _foreman.startup_baseline_needed():
+                                        suppressed = _foreman.record_startup_baseline(
+                                            issues,
+                                            config=alert_config,
+                                            now=now,
+                                        )
+                                        if suppressed:
+                                            logger.info(
+                                                "discord foreman: baselined %d existing startup issue(s)",
+                                                suppressed,
+                                            )
+                                        return []
                                 return _foreman.alerts_due(issues, config=alert_config, now=now)
 
                             due = await asyncio.to_thread(_collect_due_alerts)
                             for issue in due:
-                                message = _foreman.render_foreman_alert(
-                                    issue,
-                                    mention=watcher_cfg["mention"],
-                                )
                                 try:
-                                    result = await adapter.send(
-                                        watcher_cfg["channel_id"],
-                                        message,
-                                        metadata=None,
+                                    await self._discord_foreman_start_goal(
+                                        adapter,
+                                        channel_id=watcher_cfg["channel_id"],
+                                        issue=issue,
+                                        prompt=_foreman.render_foreman_goal_prompt(issue),
+                                        title=_foreman.foreman_goal_thread_title(issue),
                                     )
-                                    success = getattr(result, "success", True)
-                                    if isinstance(result, dict):
-                                        success = bool(result.get("success", True))
-                                    if success is False:
-                                        error = getattr(result, "error", "send failed")
-                                        if isinstance(result, dict):
-                                            error = result.get("error", error)
-                                        raise RuntimeError(str(error or "send failed"))
                                 except Exception as exc:
                                     safe_error = self._discord_foreman_safe_log_text(exc)
                                     logger.warning(
-                                        "discord foreman: send failed for %s/%s: %s",
+                                        "discord foreman: goal start failed for %s/%s: %s",
                                         getattr(issue, "board", "<unknown>"),
                                         getattr(issue, "task_id", "<unknown>"),
                                         safe_error,
