@@ -78,7 +78,7 @@ def test_prepare_worker_home_writes_complete_pool_auth(tmp_path, monkeypatch):
     assert payload["tokens"]["account_id"] == "acct-pool"
 
 
-def test_prepare_worker_home_falls_back_when_pool_auth_is_incomplete(tmp_path, monkeypatch):
+def test_prepare_worker_home_accepts_pool_auth_without_id_token(tmp_path, monkeypatch):
     from agent import credential_pool
     from agent.codex_worker_auth import prepare_codex_worker_home
 
@@ -90,6 +90,30 @@ def test_prepare_worker_home_falls_back_when_pool_auth_is_incomplete(tmp_path, m
         id="pool-1",
         access_token="pool-access",
         refresh_token="pool-refresh",
+        last_status=None,
+    )
+    monkeypatch.setattr(credential_pool, "load_pool", lambda provider: FakePool(entry))
+
+    credential_id = prepare_codex_worker_home(tmp_path / "worker-codex")
+
+    payload = json.loads((tmp_path / "worker-codex" / "auth.json").read_text(encoding="utf-8"))
+    assert credential_id == "pool-1"
+    assert payload["tokens"]["access_token"] == "pool-access"
+    assert payload["tokens"]["refresh_token"] == "pool-refresh"
+    assert "id_token" not in payload["tokens"]
+
+
+def test_prepare_worker_home_falls_back_when_pool_auth_is_incomplete(tmp_path, monkeypatch):
+    from agent import credential_pool
+    from agent.codex_worker_auth import prepare_codex_worker_home
+
+    source_home = tmp_path / "source-codex"
+    _write_codex_auth(source_home, access="cli-access", refresh="cli-refresh", id_token="cli-id")
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+
+    entry = SimpleNamespace(
+        id="pool-1",
+        access_token="pool-access",
         last_status=None,
     )
     monkeypatch.setattr(credential_pool, "load_pool", lambda provider: FakePool(entry))
@@ -209,3 +233,49 @@ def test_mark_worker_credential_auth_failed_exhausts_pool_entry(tmp_path, monkey
     assert entries["cred-1"].last_error_code == 401
     assert entries["cred-1"].last_error_reason == "worker_auth_failed"
     assert pool.select().id == "cred-2"
+
+
+def test_sync_worker_home_accepts_refreshed_tokens_without_id_token(tmp_path, monkeypatch):
+    from agent.codex_worker_auth import sync_codex_worker_home
+    from agent.credential_pool import load_pool
+
+    hermes_home = tmp_path / "hermes-home"
+    _write_pool_auth(
+        hermes_home,
+        [
+            {
+                "id": "cred-1",
+                "label": "primary",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "manual:device_code",
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+                "last_status": "exhausted",
+                "last_error_code": 401,
+            },
+        ],
+    )
+    worker_home = tmp_path / "worker-codex"
+    worker_home.mkdir()
+    (worker_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "new-access",
+                    "refresh_token": "new-refresh",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    sync_codex_worker_home(worker_home, "cred-1")
+
+    entry = load_pool("openai-codex").entries()[0]
+    assert entry.access_token == "new-access"
+    assert entry.refresh_token == "new-refresh"
+    assert entry.last_status is None
+    assert entry.last_error_code is None

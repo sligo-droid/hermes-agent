@@ -22,13 +22,14 @@ def _entry_tokens(entry: Any) -> Optional[dict[str, str]]:
     access_token = _string_attr(entry, "access_token")
     refresh_token = _string_attr(entry, "refresh_token")
     id_token = _string_attr(entry, "id_token")
-    if not access_token or not refresh_token or not id_token:
+    if not access_token or not refresh_token:
         return None
     tokens = {
         "access_token": access_token,
         "refresh_token": refresh_token,
-        "id_token": id_token,
     }
+    if id_token:
+        tokens["id_token"] = id_token
     account_id = _string_attr(entry, "account_id")
     if account_id:
         tokens["account_id"] = account_id
@@ -259,7 +260,7 @@ def sync_codex_worker_home(
     access_token = str(tokens.get("access_token", "") or "").strip()
     refresh_token = str(tokens.get("refresh_token", "") or "").strip()
     id_token = str(tokens.get("id_token", "") or "").strip()
-    if not access_token or not refresh_token or not id_token:
+    if not access_token or not refresh_token:
         return
 
     try:
@@ -282,7 +283,8 @@ def sync_codex_worker_home(
                 ):
                     return
                 extra = dict(getattr(entry, "extra", {}) or {})
-                extra["id_token"] = id_token
+                if id_token:
+                    extra["id_token"] = id_token
                 account_id = str(tokens.get("account_id", "") or "").strip()
                 if account_id:
                     extra["account_id"] = account_id
