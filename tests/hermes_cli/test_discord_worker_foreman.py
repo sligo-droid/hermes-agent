@@ -419,14 +419,25 @@ def test_alert_failed_schedules_retry_without_marking_sent(monkeypatch, tmp_path
 
     issue = _alert_issue()
 
-    record_alert_failed(issue, "send failed token=abc /tmp/private.log", now=1000)
+    record_alert_failed(
+        issue,
+        "send failed Authorization: Bearer abc123 token=abc "
+        "sk-proj-abcdefghijk1234567890 ~/.hermes/config.yaml /tmp/private.log",
+        now=1000,
+    )
 
     assert alerts_due([issue], now=1200) == []
     assert alerts_due([issue], now=1300) == [issue]
     state = json.loads((root / "kanban" / "foreman-alerts.json").read_text(encoding="utf-8"))
     entry = next(iter(state["alerts"].values()))
     assert entry["last_sent_at"] is None
-    assert entry["last_error"] == "send failed [redacted] [path]"
+    assert "Authorization: Bearer abc123" not in entry["last_error"]
+    assert "token=abc" not in entry["last_error"]
+    assert "sk-proj-abcdefghijk1234567890" not in entry["last_error"]
+    assert "~/.hermes/config.yaml" not in entry["last_error"]
+    assert "/tmp/private.log" not in entry["last_error"]
+    assert entry["last_error"].count("[redacted]") == 3
+    assert entry["last_error"].count("[path]") == 2
 
 
 def test_alert_limits_do_not_mark_overflow_sent_and_daily_cap_suppresses(monkeypatch, tmp_path):
@@ -485,10 +496,10 @@ def test_render_foreman_alert_is_safe_bounded_and_informative():
     )
 
     issue = _alert_issue(
-        title="Worker failed with token=abc123 at /tmp/private.log " + "x" * 3000,
+        title="Worker failed with Authorization: Bearer abc123 at ~/.hermes/config.yaml " + "x" * 3000,
         evidence={
             "run_id": 42,
-            "run_error": "secret token=abc123 at /home/user/log.txt",
+            "run_error": "secret token=abc123 ghp_abcdefghijklmnopqrst at /home/user/log.txt",
             "session_url": "https://example.test/workers/123",
             "final_text": "do not expose",
             "events": ["do not expose"],
@@ -512,6 +523,9 @@ def test_render_foreman_alert_is_safe_bounded_and_informative():
     assert "events" not in rendered
     assert "prompt" not in rendered
     assert "token=abc123" not in rendered
+    assert "Authorization: Bearer abc123" not in rendered
+    assert "ghp_abcdefghijklmnopqrst" not in rendered
+    assert "~/.hermes/config.yaml" not in rendered
     assert "/home/user" not in rendered
     assert "/tmp/private" not in rendered
     assert len(rendered) <= DISCORD_ALERT_LIMIT

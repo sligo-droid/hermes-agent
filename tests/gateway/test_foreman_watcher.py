@@ -181,11 +181,16 @@ def test_foreman_watcher_records_send_result_failure(monkeypatch):
     monkeypatch.setattr(foreman, "record_alert_sent", lambda issue: sent.append(issue.task_id))
     monkeypatch.setattr(foreman, "record_alert_failed", lambda issue, error: failed.append((issue.task_id, error)))
 
-    adapter = ForemanAdapter(result=SimpleNamespace(success=False, error="token=abc /tmp/private.log"))
+    adapter = ForemanAdapter(
+        result=SimpleNamespace(
+            success=False,
+            error="Authorization: Bearer abc123 ghp_abcdefghijklmnopqrst ~/.hermes/config.yaml",
+        )
+    )
     asyncio.run(_run_one_foreman_tick(monkeypatch, _runner(adapter)))
 
     assert sent == []
-    assert failed == [("t1", "token=[redacted] [path]")]
+    assert failed == [("t1", "[redacted] [redacted] [path]")]
 
 
 def test_foreman_watcher_delegates_terminal_suppression_to_alerts_due(monkeypatch):

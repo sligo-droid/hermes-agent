@@ -46,8 +46,20 @@ _MISSING_READ_BROKER_MARKERS = (
     "discord worker read broker not configured",
 )
 _PATH_RE = re.compile(
-    r"(?<![\w:/.-])(?:/(?:home|Users|tmp|var|etc|opt|private|workspace|workspaces|mnt|srv|repo|root)"
+    r"(?<![\w:/.-])(?:~[\w.-]*(?:/[^\s\"'<>),;{}\[\]]*)?"
+    r"|/(?:home|Users|tmp|var|etc|opt|private|workspace|workspaces|mnt|srv|repo|root)"
     r"(?:/[^\s\"'<>),;{}\[\]]*)?|[A-Za-z]:\\[^\s\"'<>),;{}\[\]]+)"
+)
+_BEARER_TOKEN_RE = re.compile(
+    r"(?i)\bauthorization\s*:\s*bearer\s+[A-Za-z0-9._~+/=-]+"
+)
+_STANDALONE_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    r"sk-(?:proj|live|test)?-[A-Za-z0-9_-]{8,}"
+    r"|gh[pousr]_[A-Za-z0-9_]{8,}"
+    r"|xox[baprs]-[A-Za-z0-9-]{8,}"
+    r"|[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}"
+    r")(?![A-Za-z0-9_])"
 )
 _TOKEN_RE = re.compile(
     r"(?i)(?:token|secret|api[_-]?key|authorization|password)\s*[:=]\s*[^\s,;]+"
@@ -540,11 +552,17 @@ def _sanitize_value(value: Any) -> Any:
     return _sanitize_text(str(value))
 
 
-def _sanitize_text(value: str) -> str:
-    text = str(value or "")[:500]
+def sanitize_foreman_text(value: Any, *, limit: int = 500) -> str:
+    text = str(value or "")[:limit]
+    text = _BEARER_TOKEN_RE.sub("[redacted]", text)
     text = _TOKEN_RE.sub("[redacted]", text)
+    text = _STANDALONE_TOKEN_RE.sub("[redacted]", text)
     text = _PATH_RE.sub("[path]", text)
     return text
+
+
+def _sanitize_text(value: str) -> str:
+    return sanitize_foreman_text(value)
 
 
 def _alert_config(config: Optional[dict[str, Any]]) -> dict[str, Any]:

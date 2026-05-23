@@ -6177,17 +6177,21 @@ class GatewayRunner:
 
     @staticmethod
     def _discord_foreman_safe_log_text(value: Any) -> str:
-        text = str(value or "")[:300]
-        text = re.sub(
-            r"(?i)(token|secret|api[_-]?key|authorization|password)\s*[:=]\s*[^\s,;]+",
-            r"\1=[redacted]",
-            text,
-        )
-        return re.sub(
-            r"(?<![\w:/.-])(?:/(?:home|Users|tmp|var|etc|opt|private|workspace|workspaces|mnt|srv|repo|root)(?:/[^\s\"'<>),;{}\[\]]*)?|[A-Za-z]:\\[^\s\"'<>),;{}\[\]]+)",
-            "[path]",
-            text,
-        )
+        try:
+            from hermes_cli.discord_worker_foreman import sanitize_foreman_text
+        except Exception:
+            text = str(value or "")[:300]
+            text = re.sub(
+                r"(?i)(token|secret|api[_-]?key|authorization|password)\s*[:=]\s*[^\s,;]+",
+                "[redacted]",
+                text,
+            )
+            return re.sub(
+                r"(?<![\w:/.-])(?:~[\w.-]*(?:/[^\s\"'<>),;{}\[\]]*)?|/(?:home|Users|tmp|var|etc|opt|private|workspace|workspaces|mnt|srv|repo|root)(?:/[^\s\"'<>),;{}\[\]]*)?|[A-Za-z]:\\[^\s\"'<>),;{}\[\]]+)",
+                "[path]",
+                text,
+            )
+        return sanitize_foreman_text(value, limit=300)
 
     async def _discord_worker_foreman_watcher(self) -> None:
         """Optionally scan Discord worker boards and send foreman alerts."""
