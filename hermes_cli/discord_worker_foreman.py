@@ -55,7 +55,7 @@ _BEARER_TOKEN_RE = re.compile(
 )
 _STANDALONE_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:"
-    r"sk-(?:proj|live|test)?-[A-Za-z0-9_-]{8,}"
+    r"sk-(?:(?:proj|live|test)-)?[A-Za-z0-9_-]{8,}"
     r"|gh[pousr]_[A-Za-z0-9_]{8,}"
     r"|xox[baprs]-[A-Za-z0-9-]{8,}"
     r"|[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}"
@@ -184,8 +184,8 @@ class ForemanIssue:
             "board": self.board,
             "task_id": self.task_id,
             "severity": self.severity,
-            "title": self.title,
-            "evidence": dict(self.evidence),
+            "title": _sanitize_text(self.title),
+            "evidence": _sanitize_evidence(self.evidence),
         }
 
 

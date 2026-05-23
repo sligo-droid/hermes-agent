@@ -181,6 +181,7 @@ def test_collect_foreman_issues_reads_board_task_run_and_sidecar(monkeypatch, tm
     from hermes_cli.discord_worker_state import write_codex_worker_state
     from hermes_cli.discord_worker_foreman import collect_foreman_issues
 
+    plain_sk_token = "sk-abcdefghijklmnopqrstuvwxyz1234567890"
     task_id = _create_ready_task(board)
     conn = kanban_db.connect(board=board)
     try:
@@ -188,7 +189,8 @@ def test_collect_foreman_issues_reads_board_task_run_and_sidecar(monkeypatch, tm
         kanban_db._record_spawn_failure(
             conn,
             task_id,
-            "spawn failed: missing HERMES_DISCORD_WORKER_READ_TOKEN token=abc123 /home/user/secret.log",
+            "spawn failed: missing HERMES_DISCORD_WORKER_READ_TOKEN "
+            f"token=abc123 {plain_sk_token} /home/user/secret.log",
             failure_limit=1,
         )
     finally:
@@ -198,7 +200,7 @@ def test_collect_foreman_issues_reads_board_task_run_and_sidecar(monkeypatch, tm
         board=board,
         update={
             "result": {
-                "error": "read broker not configured at /tmp/private.log token=abc123",
+                "error": f"read broker not configured at /tmp/private.log token=abc123 {plain_sk_token}",
                 "final_text": "do not expose",
                 "exit_code": 2,
                 "run_profile": {"env": {"TOKEN": "abc"}},
@@ -216,6 +218,7 @@ def test_collect_foreman_issues_reads_board_task_run_and_sidecar(monkeypatch, tm
     assert "/home/user" not in evidence_text
     assert "/tmp/private" not in evidence_text
     assert "token=abc123" not in evidence_text
+    assert plain_sk_token not in evidence_text
 
 
 def test_duplicate_resolved_db_paths_are_scanned_once(monkeypatch, tmp_path):
@@ -413,6 +416,27 @@ def test_old_terminal_alerts_are_suppressed_before_first_send(monkeypatch, tmp_p
     assert due == [recent]
 
 
+def test_sanitize_foreman_text_redacts_common_secret_forms():
+    from hermes_cli.discord_worker_foreman import sanitize_foreman_text
+
+    secrets = [
+        "Authorization: Bearer abc123",
+        "token=abc123",
+        "api_key=abc123",
+        "sk-abcdefghijklmnopqrstuvwxyz1234567890",
+        "sk-proj-abcdefghijk1234567890",
+        "ghp_abcdefghijklmnopqrst",
+        "xoxb-abcdefghijklmnop",
+        "eyJhbGciOiJIUzI1NiJ9.abcdef.abcdefghijklmnopqrstuvwxyz",
+    ]
+
+    sanitized = sanitize_foreman_text(" ".join(secrets))
+
+    for secret in secrets:
+        assert secret not in sanitized
+    assert sanitized.count("[redacted]") == len(secrets)
+
+
 def test_alert_failed_schedules_retry_without_marking_sent(monkeypatch, tmp_path):
     root = _home(monkeypatch, tmp_path)
     from hermes_cli.discord_worker_foreman import alerts_due, record_alert_failed
@@ -495,11 +519,13 @@ def test_render_foreman_alert_is_safe_bounded_and_informative():
         render_foreman_alert,
     )
 
+    plain_sk_token = "sk-abcdefghijklmnopqrstuvwxyz1234567890"
     issue = _alert_issue(
-        title="Worker failed with Authorization: Bearer abc123 at ~/.hermes/config.yaml " + "x" * 3000,
+        title=f"Worker failed with Authorization: Bearer abc123 {plain_sk_token} at ~/.hermes/config.yaml "
+        + "x" * 3000,
         evidence={
             "run_id": 42,
-            "run_error": "secret token=abc123 ghp_abcdefghijklmnopqrst at /home/user/log.txt",
+            "run_error": f"secret token=abc123 ghp_abcdefghijklmnopqrst {plain_sk_token} at /home/user/log.txt",
             "session_url": "https://example.test/workers/123",
             "final_text": "do not expose",
             "events": ["do not expose"],
@@ -525,6 +551,8 @@ def test_render_foreman_alert_is_safe_bounded_and_informative():
     assert "token=abc123" not in rendered
     assert "Authorization: Bearer abc123" not in rendered
     assert "ghp_abcdefghijklmnopqrst" not in rendered
+    assert plain_sk_token not in rendered
+    assert plain_sk_token not in json.dumps(issue.to_dict())
     assert "~/.hermes/config.yaml" not in rendered
     assert "/home/user" not in rendered
     assert "/tmp/private" not in rendered
