@@ -3230,6 +3230,9 @@ def refresh_codex_oauth_pure(
     next_refresh = refresh_payload.get("refresh_token")
     if isinstance(next_refresh, str) and next_refresh.strip():
         updated["refresh_token"] = next_refresh.strip()
+    id_token = refresh_payload.get("id_token")
+    if isinstance(id_token, str) and id_token.strip():
+        updated["id_token"] = id_token.strip()
     return updated
 
 
@@ -3249,6 +3252,8 @@ def _refresh_codex_auth_tokens(
     updated_tokens = dict(tokens)
     updated_tokens["access_token"] = refreshed["access_token"]
     updated_tokens["refresh_token"] = refreshed["refresh_token"]
+    if refreshed.get("id_token"):
+        updated_tokens["id_token"] = refreshed["id_token"]
 
     _save_codex_tokens(updated_tokens)
     return updated_tokens
@@ -6756,6 +6761,7 @@ def _codex_device_code_login() -> Dict[str, Any]:
         "tokens": {
             "access_token": access_token,
             "refresh_token": refresh_token,
+            "id_token": str(tokens.get("id_token") or "").strip(),
         },
         "base_url": base_url,
         "last_refresh": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),

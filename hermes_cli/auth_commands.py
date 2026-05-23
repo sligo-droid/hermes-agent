@@ -330,6 +330,14 @@ def auth_add_command(args) -> None:
             refresh_token=creds["tokens"].get("refresh_token"),
             base_url=creds.get("base_url"),
             last_refresh=creds.get("last_refresh"),
+            extra={
+                key: value
+                for key, value in {
+                    "id_token": creds["tokens"].get("id_token"),
+                    "account_id": creds["tokens"].get("account_id"),
+                }.items()
+                if value
+            },
         )
         pool.add_entry(entry)
         print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
