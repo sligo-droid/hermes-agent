@@ -1491,8 +1491,11 @@ def board_thread_state(board: str) -> str:
     worker = _read_worker_meta(board)
     if worker.get("cancelled") or worker.get("goal_status") == "cancelled":
         return "errored"
-    if str(worker.get("blocked_reason") or "").strip() or worker.get("goal_status") == "blocked":
-        return "blocked"
+    is_terminal = worker.get("goal_status") == "done" or worker.get("phase") == "complete"
+    has_worker_blocker = (
+        bool(str(worker.get("blocked_reason") or "").strip())
+        or worker.get("goal_status") == "blocked"
+    )
 
     conn = kanban_db.connect(board=board)
     try:
@@ -1510,7 +1513,7 @@ def board_thread_state(board: str) -> str:
                 return "blocked"
             if (
                 all(task.status == "done" for task in tasks)
-                and (worker.get("goal_status") == "done" or worker.get("phase") == "complete")
+                and is_terminal
             ):
                 return "done"
             if any(task.status == "running" for task in tasks):
@@ -1519,8 +1522,10 @@ def board_thread_state(board: str) -> str:
     finally:
         conn.close()
 
-    if worker.get("goal_status") == "done" or worker.get("phase") == "complete":
+    if is_terminal:
         return "done"
+    if has_worker_blocker:
+        return "blocked"
     return "active"
 
 
