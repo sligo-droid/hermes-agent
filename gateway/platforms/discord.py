@@ -759,11 +759,18 @@ class DiscordAdapter(BasePlatformAdapter):
         channel_id = getattr(channel, "id", "")
         return f"{guild_id or 'dm'}:{channel_id}"
 
-    def _feature_summary_state_key(self, thread_channel: Any) -> str:
+    def _feature_summary_state_key(
+        self,
+        thread_channel: Any,
+        *,
+        source_message_id: Optional[str] = None,
+    ) -> str:
         guild = getattr(thread_channel, "guild", None)
         guild_id = getattr(guild, "id", None)
         thread_id = getattr(thread_channel, "id", "")
-        return f"{guild_id or 'dm'}:{thread_id}"
+        base = f"{guild_id or 'dm'}:{thread_id}"
+        source_message_id = str(source_message_id or "").strip()
+        return f"{base}:{source_message_id}" if source_message_id else base
 
     def _feature_summary_channel_identity(self, thread_channel: Any) -> Dict[str, str]:
         guild = getattr(thread_channel, "guild", None)
@@ -815,10 +822,15 @@ class DiscordAdapter(BasePlatformAdapter):
         bucket = state.get(_DISCORD_FEATURE_SUMMARY_STATE_BUCKET)
         if not isinstance(bucket, dict):
             bucket = {}
-        key = self._feature_summary_state_key(thread_channel)
+        source_message_id = str(handle.get("source_message_id") or "").strip()
+        key = self._feature_summary_state_key(
+            thread_channel,
+            source_message_id=source_message_id or None,
+        )
         bucket[key] = {
             "thread_id": thread_id,
             "message_id": message_id,
+            "source_message_id": source_message_id or None,
             "summary_channel_id": str(handle.get("summary_channel_id") or ""),
             "guild_id": str(handle.get("guild_id") or identity.get("guild_id") or ""),
             "parent_channel_id": str(
@@ -1021,20 +1033,40 @@ class DiscordAdapter(BasePlatformAdapter):
     def _load_feature_summary_handle_by_thread_id(
         self,
         thread_id: str,
+        *,
+        message_id: Optional[str] = None,
+        source_message_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         needle = str(thread_id or "").strip()
         if not needle:
             return None
+        message_needle = str(message_id or "").strip()
+        source_needle = str(source_message_id or "").strip()
         state = self._read_project_summary_state()
         bucket = state.get(_DISCORD_FEATURE_SUMMARY_STATE_BUCKET)
         if not isinstance(bucket, dict):
             return None
+        matches = []
         for stored in bucket.values():
             if not isinstance(stored, dict):
                 continue
             if str(stored.get("thread_id") or "") == needle:
-                return dict(stored)
-        return None
+                if message_needle and str(stored.get("message_id") or "") != message_needle:
+                    continue
+                if source_needle and str(stored.get("source_message_id") or "") != source_needle:
+                    continue
+                matches.append(stored)
+        if not matches:
+            return None
+
+        def _updated_at(item: Dict[str, Any]) -> float:
+            try:
+                return float(item.get("updated_at") or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        latest = max(matches, key=_updated_at)
+        return dict(latest)
 
     def _persist_feature_summary_handle_by_scope(self, handle: Dict[str, Any]) -> None:
         scope = self._feature_summary_handle_scope(handle)
@@ -1054,6 +1086,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 for field in (
                     "guild_id",
                     "parent_channel_id",
+                    "source_message_id",
                     "summary_channel_id",
                     "project_context",
                     "kanban_board",
@@ -1793,6 +1826,8 @@ class DiscordAdapter(BasePlatformAdapter):
         initial_request: str = "",
         project_context: Optional[Dict[str, Any]] = None,
         transcript_quote: Optional[str] = None,
+        source_message_id: Optional[str] = None,
+        reply_to_message: Any = None,
     ) -> Optional[Dict[str, Any]]:
         if thread_channel is None or not hasattr(thread_channel, "send"):
             return None
@@ -1827,7 +1862,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 metadata=self._collect_discord_project_metadata(project_context),
                 kanban_url=(board_handle or {}).get("public_url"),
             )
-            msg = await thread_channel.send(embed=embed)
+            send_kwargs = {"embed": embed}
+            if reply_to_message is not None:
+                reference = reply_to_message
+                to_reference = getattr(reply_to_message, "to_reference", None)
+                if callable(to_reference):
+                    try:
+                        reference = to_reference(fail_if_not_exists=False)
+                    except TypeError:
+                        reference = to_reference()
+                send_kwargs["reference"] = reference
+            msg = await thread_channel.send(**send_kwargs)
         except Exception as exc:
             logger.warning("[%s] Failed to send Discord feature summary: %s", self.name, exc)
             return None
@@ -1840,6 +1885,7 @@ class DiscordAdapter(BasePlatformAdapter):
         handle = {
             "thread_id": str(getattr(thread_channel, "id", "") or ""),
             "message_id": str(getattr(msg, "id", "") or ""),
+            "source_message_id": str(source_message_id or "") or None,
             "guild_id": str(getattr(getattr(thread_channel, "guild", None), "id", "") or ""),
             "parent_channel_id": str(getattr(parent_channel, "id", "") or ""),
             "initial_request": initial_request,
@@ -1980,7 +2026,11 @@ class DiscordAdapter(BasePlatformAdapter):
         board = str(target.get("board") or "").strip()
         if not thread_id or not board:
             return None
-        handle = self._load_feature_summary_handle_by_thread_id(thread_id)
+        handle = self._load_feature_summary_handle_by_thread_id(
+            thread_id,
+            message_id=str(target.get("message_id") or "") or None,
+            source_message_id=str(target.get("source_message_id") or "") or None,
+        )
         if not handle:
             return None
         if not self._feature_summary_target_matches_handle(handle, target):
@@ -7323,6 +7373,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 initial_request=normalized_content,
                 project_context=project_context,
                 transcript_quote=voice_feature_transcript if message_is_voice else None,
+            )
+            self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
+        elif is_thread and slash_command_starts_threaded_work:
+            _stage_started = time.perf_counter()
+            feature_summary_handle = await self.initialize_feature_summary(
+                message.channel,
+                parent_channel=self._thread_parent_channel(message.channel),
+                initial_request=normalized_content,
+                project_context=project_context,
+                source_message_id=str(message.id),
+                reply_to_message=message,
             )
             self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
         elif is_thread:
