@@ -3066,16 +3066,21 @@ class DiscordAdapter(BasePlatformAdapter):
             return
         await self._mark_feature_summary_running(event)
         messages = await self._processing_reaction_messages(event)
-        has_kanban_board = self._feature_kanban_board_slug(getattr(event, "feature_summary", None)) is not None
+        feature_summary = getattr(event, "feature_summary", None)
+        has_feature_summary = feature_summary is not None
+        has_kanban_board = self._feature_kanban_board_slug(feature_summary) is not None
         for message in messages:
             if not hasattr(message, "add_reaction"):
                 continue
             if has_kanban_board:
                 await self._set_message_reaction_state(message, "👀")
                 continue
-            await self._remove_reaction(message, "✅")
-            await self._remove_reaction(message, "❌")
-            await self._add_reaction(message, "👀")
+            if has_feature_summary:
+                await self._remove_reaction(message, "✅")
+                await self._remove_reaction(message, "❌")
+                await self._add_reaction(message, "👀")
+                continue
+            await self._set_message_reaction_state(message, "⏳")
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction."""
@@ -3083,12 +3088,21 @@ class DiscordAdapter(BasePlatformAdapter):
             return
         kanban_state = self._feature_kanban_reaction_state(getattr(event, "feature_summary", None))
         kanban_emoji = self._feature_kanban_reaction_emoji(kanban_state)
+        has_feature_summary = getattr(event, "feature_summary", None) is not None
         messages = await self._processing_reaction_messages(event)
         for message in messages:
             if not hasattr(message, "add_reaction"):
                 continue
             if kanban_emoji:
                 await self._set_message_reaction_state(message, kanban_emoji)
+                continue
+            if not has_feature_summary:
+                if outcome == ProcessingOutcome.SUCCESS:
+                    await self._set_message_reaction_state(message, "✅")
+                elif outcome == ProcessingOutcome.FAILURE:
+                    await self._set_message_reaction_state(message, "❌")
+                else:
+                    await self._set_message_reaction_state(message, None)
                 continue
             await self._remove_reaction(message, "👀")
             if outcome == ProcessingOutcome.SUCCESS:
