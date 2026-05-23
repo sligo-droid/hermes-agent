@@ -342,6 +342,65 @@ def test_archived_board_alerts_do_not_repeat_after_success(monkeypatch, tmp_path
     assert alerts_due([escalated], now=1200, config={"cooldown_seconds": 1}) == []
 
 
+def test_terminal_thread_state_alerts_do_not_repeat_after_success(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
+
+    for index, thread_state in enumerate(("blocked", "errored", "done", "archived"), start=1):
+        issue = _alert_issue(
+            kind="stale_running",
+            task_id=f"t{index}",
+            severity="warning",
+            evidence={
+                "task_status": "running",
+                "thread_state": thread_state,
+                "heartbeat_age_seconds": 9999,
+            },
+        )
+        record_alert_sent(issue, now=1000)
+
+        changed = _alert_issue(
+            kind="stale_running",
+            task_id=f"t{index}",
+            severity="warning",
+            evidence={**issue.evidence, "heartbeat_age_seconds": 10_000},
+        )
+        escalated = _alert_issue(
+            kind="stale_running",
+            task_id=f"t{index}",
+            severity="error",
+            evidence=issue.evidence,
+        )
+
+        assert alerts_due([issue], now=4600, config={"cooldown_seconds": 1}) == []
+        assert alerts_due([changed], now=1200, config={"cooldown_seconds": 1}) == []
+        assert alerts_due([escalated], now=1200, config={"cooldown_seconds": 1}) == []
+
+
+def test_active_and_running_thread_state_alerts_still_repeat(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
+
+    for index, thread_state in enumerate(("active", "running"), start=1):
+        issue = _alert_issue(
+            task_id=f"t{index}",
+            severity="warning",
+            evidence={**_alert_issue().evidence, "task_status": "running", "thread_state": thread_state},
+        )
+        record_alert_sent(issue, now=1000)
+
+        changed = _alert_issue(
+            task_id=f"t{index}",
+            severity="warning",
+            evidence={**issue.evidence, "run_error": "different"},
+        )
+        escalated = _alert_issue(task_id=f"t{index}", severity="error", evidence=issue.evidence)
+
+        assert alerts_due([changed], now=1200, config={"cooldown_seconds": 3600}) == [changed]
+        assert alerts_due([escalated], now=1200, config={"cooldown_seconds": 3600}) == [escalated]
+        assert alerts_due([issue], now=4600, config={"cooldown_seconds": 1}) == [issue]
+
+
 def test_old_terminal_alerts_are_suppressed_before_first_send(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli.discord_worker_foreman import alerts_due

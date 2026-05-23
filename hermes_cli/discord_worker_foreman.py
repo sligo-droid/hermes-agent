@@ -90,6 +90,7 @@ _ALLOWED_RENDER_EVIDENCE_KEYS = frozenset(
     }
 )
 _SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2, "critical": 3}
+_TERMINAL_THREAD_STATES = frozenset({"blocked", "errored", "done", "archived", "cancelled"})
 
 
 @dataclass(frozen=True)
@@ -657,7 +658,7 @@ def _is_terminal_or_archived_issue(issue: ForemanIssue) -> bool:
     if task_status and task_status != "running":
         return True
     thread_state = str(evidence.get("thread_state") or "").casefold()
-    return thread_state in {"done", "archived", "cancelled"}
+    return thread_state in _TERMINAL_THREAD_STATES
 
 
 def _terminal_issue_recent(issue: ForemanIssue, *, now: int, max_age_seconds: int) -> bool:
