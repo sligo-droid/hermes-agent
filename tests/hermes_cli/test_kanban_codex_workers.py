@@ -203,6 +203,67 @@ def test_codex_role_worker_inherits_available_pool_credential(monkeypatch, tmp_p
     assert payload["tokens"]["refresh_token"] == "refresh-2"
 
 
+def test_codex_worker_refreshes_pool_credential_missing_id_token(monkeypatch, tmp_path):
+    from agent import credential_pool
+    from agent.codex_worker_auth import prepare_codex_worker_home
+
+    hermes_home = tmp_path / "hermes-home"
+    _write_pool_auth(
+        hermes_home,
+        [
+            {
+                "id": "cred-1",
+                "label": "primary",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "manual:device_code",
+                "access_token": "access-old",
+                "refresh_token": "refresh-old",
+            },
+        ],
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    calls = []
+
+    def fake_refresh(access_token, refresh_token):
+        calls.append((access_token, refresh_token))
+        return {
+            "access_token": "access-new",
+            "refresh_token": "refresh-new",
+            "id_token": "id-new",
+            "last_refresh": "now",
+        }
+
+    monkeypatch.setattr(credential_pool.auth_mod, "refresh_codex_oauth_pure", fake_refresh)
+
+    codex_home = tmp_path / "worker-codex-home"
+    credential_id = prepare_codex_worker_home(codex_home, allow_fallback=False)
+
+    payload = json.loads((codex_home / "auth.json").read_text(encoding="utf-8"))
+    entry = credential_pool.load_pool("openai-codex").entries()[0]
+    assert credential_id == "cred-1"
+    assert calls == [("access-old", "refresh-old")]
+    assert payload["tokens"]["access_token"] == "access-new"
+    assert payload["tokens"]["refresh_token"] == "refresh-new"
+    assert payload["tokens"]["id_token"] == "id-new"
+    assert entry.id_token == "id-new"
+
+
+def test_cleanup_codex_worker_home_allows_child_of_explicit_root(monkeypatch, tmp_path):
+    from agent.codex_worker_auth import cleanup_codex_worker_home
+
+    root = tmp_path / "codex-worker-homes"
+    child = root / "task-1"
+    child.mkdir(parents=True)
+    (child / "auth.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("HERMES_CODEX_WORKER_CLEANUP_ROOT", str(root))
+
+    cleanup_codex_worker_home(child)
+
+    assert root.exists()
+    assert not child.exists()
+
+
 def test_codex_role_worker_does_not_copy_inherited_worker_codex_home(monkeypatch, tmp_path):
     from agent import credential_pool
     from hermes_cli import kanban_codex_workers as workers
