@@ -67,6 +67,7 @@ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _DISCORD_KANBAN_REACTION_RESYNC_SECS = 30.0
 _DISCORD_FOREMAN_DEFAULT_CHANNEL_ID = "1504252294495998043"
 _DISCORD_FOREMAN_DEFAULT_MENTION = "<@1504235933598486580>"
+_DISCORD_FOREMAN_THREAD_STATE_KEY = "foreman_thread"
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _TRUTHY_ENV_VALUES = {"true", "1", "yes", "on"}
 _CODEX_APP_SERVER_ACTIVITY_PREFIX = "Codex app-server event:"
@@ -6016,6 +6017,8 @@ class GatewayRunner:
                             res.promoted,
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                         )
+                if any_spawned:
+                    await self._discord_foreman_announce_spawned_tasks(results)
                 # Health telemetry (aggregate across boards)
                 ready_pending = await asyncio.to_thread(_ready_nonempty)
                 if ready_pending and not any_spawned:
@@ -6140,7 +6143,7 @@ class GatewayRunner:
             raw.get("daily_cap_per_board", 20),
         )
         return {
-            "enabled": is_truthy_value(raw.get("enabled"), default=False),
+            "enabled": is_truthy_value(raw.get("enabled"), default=True),
             "channel_id": _DISCORD_FOREMAN_DEFAULT_CHANNEL_ID,
             "mention": _DISCORD_FOREMAN_DEFAULT_MENTION,
             "scan_interval_seconds": self._discord_foreman_clamped_int(
@@ -6174,6 +6177,176 @@ class GatewayRunner:
                 ),
             },
         }
+
+    def _discord_foreman_task_thread_info(
+        self,
+        board: str,
+        task_id: str,
+        workspace_path: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        from urllib.parse import quote as _quote
+
+        from hermes_cli import discord_worker_boards as _dwb
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
+        from hermes_cli.discord_worker_state import read_codex_worker_state
+
+        if not _dwb.is_discord_worker_board(board):
+            return None
+
+        state = read_codex_worker_state(task_id, board=board)
+        existing = state.get(_DISCORD_FOREMAN_THREAD_STATE_KEY)
+        if isinstance(existing, dict) and str(existing.get("thread_id") or "").strip():
+            return {"existing_thread": dict(existing)}
+
+        conn = _kb.connect(board=board)
+        try:
+            task = _kb.get_task(conn, task_id)
+        finally:
+            conn.close()
+        if task is None:
+            return None
+
+        metadata = _kb.read_board_metadata(board)
+        worker = metadata.get(DISCORD_WORKER_META_KEY)
+        worker = dict(worker) if isinstance(worker, dict) else {}
+        project_context = worker.get("project_context")
+        if not isinstance(project_context, dict):
+            project_context = {}
+        board_url = str(worker.get("public_url") or "").strip()
+        if not board_url:
+            board_url = _dwb.public_session_board_url(str(worker.get("thread_id") or ""))
+        ticket_url = f"{board_url.rstrip('/')}/tickets/{_quote(str(task_id), safe='')}" if board_url else ""
+        body = str(task.body or "").strip()
+        request_parts = [str(task.title or task_id).strip()]
+        if body:
+            request_parts.append(body)
+        if workspace_path:
+            request_parts.append(f"Workspace: {workspace_path}")
+
+        return {
+            "task_id": task_id,
+            "board": board,
+            "title": str(task.title or task_id).strip() or task_id,
+            "assignee": str(task.assignee or "").strip(),
+            "initial_request": "\n\n".join(part for part in request_parts if part),
+            "project_context": project_context,
+            "kanban_url": ticket_url or board_url,
+        }
+
+    def _discord_foreman_record_task_thread(
+        self,
+        *,
+        board: str,
+        task_id: str,
+        channel_id: str,
+        thread_handle: Dict[str, Any],
+    ) -> None:
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli.discord_worker_state import write_codex_worker_state
+
+        thread_id = str(thread_handle.get("thread_id") or "").strip()
+        if not thread_id:
+            return
+
+        conn = _kb.connect(board=board)
+        try:
+            _kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform="discord",
+                chat_id=str(channel_id),
+                thread_id=thread_id,
+                user_id="system:foreman",
+                notifier_profile=self._active_profile_name(),
+            )
+        finally:
+            conn.close()
+
+        write_codex_worker_state(
+            task_id,
+            board=board,
+            update={
+                _DISCORD_FOREMAN_THREAD_STATE_KEY: {
+                    "thread_id": thread_id,
+                    "parent_channel_id": str(channel_id),
+                    "message_id": str(thread_handle.get("message_id") or ""),
+                    "thread_name": str(thread_handle.get("thread_name") or ""),
+                    "created_at": int(thread_handle.get("created_at") or time.time()),
+                }
+            },
+        )
+
+    async def _discord_foreman_announce_spawned_tasks(self, results: Any) -> None:
+        if not results:
+            return
+        try:
+            from hermes_cli.config import load_config as _load_config
+
+            watcher_cfg = self._discord_foreman_watcher_config(_load_config())
+        except Exception as exc:
+            logger.debug("discord foreman: task-thread config unavailable: %s", exc)
+            return
+        if not watcher_cfg.get("enabled") or not watcher_cfg.get("channel_id"):
+            return
+
+        adapter = self.adapters.get(Platform.DISCORD)
+        creator = getattr(adapter, "create_worker_task_thread", None) if adapter else None
+        if not callable(creator):
+            return
+
+        channel_id = str(watcher_cfg["channel_id"])
+        for board, res in results:
+            spawned = getattr(res, "spawned", None) if res is not None else None
+            if not spawned:
+                continue
+            for task_id, assignee, workspace_path in spawned:
+                try:
+                    info = await asyncio.to_thread(
+                        self._discord_foreman_task_thread_info,
+                        str(board),
+                        str(task_id),
+                        str(workspace_path or ""),
+                    )
+                    if not info:
+                        continue
+                    existing_thread = info.get("existing_thread")
+                    if isinstance(existing_thread, dict) and str(existing_thread.get("thread_id") or "").strip():
+                        await asyncio.to_thread(
+                            self._discord_foreman_record_task_thread,
+                            board=str(board),
+                            task_id=str(task_id),
+                            channel_id=channel_id,
+                            thread_handle=existing_thread,
+                        )
+                        continue
+                    title = str(info.get("title") or task_id).strip()
+                    lane = str(info.get("assignee") or assignee or "").strip()
+                    thread_name = f"{lane}: {title}" if lane else title
+                    handle = await creator(
+                        channel_id,
+                        name=thread_name,
+                        title=title,
+                        initial_request=str(info.get("initial_request") or title),
+                        project_context=info.get("project_context"),
+                        kanban_url=str(info.get("kanban_url") or ""),
+                    )
+                    if not isinstance(handle, dict) or not str(handle.get("thread_id") or "").strip():
+                        continue
+                    await asyncio.to_thread(
+                        self._discord_foreman_record_task_thread,
+                        board=str(board),
+                        task_id=str(task_id),
+                        channel_id=channel_id,
+                        thread_handle=handle,
+                    )
+                except Exception:
+                    logger.debug(
+                        "discord foreman: task-thread create failed for %s/%s",
+                        board,
+                        task_id,
+                        exc_info=True,
+                    )
 
     @staticmethod
     def _discord_foreman_safe_log_text(value: Any) -> str:

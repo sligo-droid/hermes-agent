@@ -624,6 +624,36 @@ async def test_feature_summary_update_edits_initial_message(adapter, monkeypatch
     assert "Feature Branch URL" not in fields
 
 
+@pytest.mark.asyncio
+async def test_worker_task_thread_seeds_feature_summary(adapter):
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=201, parent=parent)
+    parent.create_thread = AsyncMock(return_value=thread)
+    adapter._client.get_channel = lambda channel_id: parent if int(channel_id) == 100 else None
+
+    handle = await adapter.create_worker_task_thread(
+        "100",
+        name="dev: Build dashboard filters",
+        title="Build dashboard filters",
+        initial_request="Build dashboard filters\n\nAdd filter controls.",
+        project_context={"project_name": "Hermes"},
+        kanban_url="https://hermes.example.test/workers/123/tickets/t1",
+    )
+
+    assert handle == {
+        "thread_id": "201",
+        "thread_name": "feature-thread",
+        "message_id": "300",
+    }
+    parent.create_thread.assert_awaited_once()
+    sent_embed = thread.sent[0][0]["embed"]
+    fields = {field.name: field.value for field in sent_embed.fields}
+    assert sent_embed.title == "Build dashboard filters"
+    assert fields["Status"] == "⏳ Running"
+    assert fields["Concise Outcome"].startswith("Build dashboard filters")
+    assert fields["Kanban Board"] == "https://hermes.example.test/workers/123/tickets/t1"
+
+
 def test_feature_summary_kanban_status_labels(adapter):
     adapter._feature_kanban_reaction_state = MagicMock(return_value="active")
     active_embed = adapter._build_feature_summary_embed(

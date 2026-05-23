@@ -1622,7 +1622,7 @@ DEFAULT_CONFIG = {
             "max_workers_per_board": 2,
             "review_loop_limit": 5,
             "foreman": {
-                "enabled": False,
+                "enabled": True,
                 "channel_id": "1504252294495998043",
                 "mention": "<@1504235933598486580>",
                 "scan_interval_seconds": 300,
