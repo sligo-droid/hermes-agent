@@ -358,6 +358,7 @@ def detect_worker_errored(snapshot: BoardSnapshot) -> list[ForemanIssue]:
                 "run_status": latest.status,
                 "run_outcome": latest.outcome,
                 "run_error": latest.error,
+                "run_ended_at": latest.ended_at,
             }
         elif _sidecar_failed(sidecar):
             evidence = {
