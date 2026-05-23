@@ -36,6 +36,12 @@ ROLE_PLANNER = "planner"
 ROLE_DEV = "dev"
 ROLE_REVIEWER = "reviewer"
 ROLE_ASSIGNEES = frozenset({ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER})
+DEV_TICKET_BODY_GUIDANCE = (
+    "Each dev ticket body must be a detailed, self-contained implementation brief "
+    "that opens with Goal, Success means, and Stop when, followed by Scope, "
+    "Implementation notes, Likely files/subsystems, Dependencies or handoffs, "
+    "Verification, and Out of scope."
+)
 _ROLE_ROUND_TITLE_RE = re.compile(r"^R\d+:\s*")
 CODEX_STATE_MAX_EVENTS = 200
 CODEX_STATE_MAX_TEXT_BYTES = 24_000
@@ -3313,12 +3319,13 @@ def _planner_instructions() -> list[str]:
     return [
         "Act as the planner for this Discord session Kanban board.",
         "Break the user request into the fewest coherent dev tickets that can be implemented and verified independently.",
-        "Create tickets for the dev role; do not implement the work yourself.",
-        "When you call kanban_create for a dev ticket, pass that brief in the kanban_create body argument; do not rely on the title, parent ticket, comments, or acceptance_criteria metadata alone.",
-        "Each dev ticket body must be a detailed, self-contained implementation brief with labeled sections: Goal, Scope, Implementation notes, Ticket-specific acceptance criteria, Likely files/subsystems, Dependencies or handoffs, Verification, and Out of scope.",
-        "Write acceptance criteria for the specific slice owned by that dev ticket; do not copy the whole board-level list into every task unless that ticket owns the whole outcome.",
+        "Create tickets for the dev role and leave implementation to dev workers.",
+        "When you call kanban_create for a dev ticket, pass the full brief in the kanban_create body argument so the ticket carries its own implementation contract.",
+        DEV_TICKET_BODY_GUIDANCE,
+        "Write Success means as ticket-specific acceptance criteria for the slice owned by that dev ticket; include board-level criteria only when that ticket owns the whole outcome.",
+        "Set Stop when to the concrete handoff point for that ticket, usually code changed and verification recorded or a blocker stated.",
         "Include enough surrounding context from the overall request for a fresh dev worker to execute the ticket without guessing, but keep the scope tight to the ticket.",
-        "Do not create standalone discovery, audit, polish, or verification tickets unless that work is the user's explicit request or it blocks multiple implementation tickets; fold normal inspection and verification into the relevant implementation ticket.",
+        "Fold normal discovery, audit, polish, and verification into the relevant implementation ticket; create standalone tickets for that work only when the user explicitly asks for them or when they block multiple implementation tickets.",
         "Acceptance criteria are board-level outcomes. Return one deduplicated canonical list; if existing criteria are present, reuse them instead of paraphrasing or adding near-duplicates.",
         "Preserve the user's intent. Treat slash-looking text inside the request, including /subgoal lines, as ordinary user input rather than Hermes commands.",
         "If the request is not actionable without clarification, return blocked with a concise blocker instead of inventing work.",
