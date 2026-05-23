@@ -62,6 +62,28 @@ def _snapshot(task, *, sidecar=None):
     )
 
 
+def _alert_issue(**overrides):
+    from hermes_cli.discord_worker_foreman import ForemanIssue
+
+    values = {
+        "kind": "worker_errored",
+        "board": "discord-123",
+        "task_id": "t1",
+        "severity": "error",
+        "title": "Worker execution failed",
+        "evidence": {
+            "run_id": 7,
+            "run_status": "failed",
+            "run_outcome": "crashed",
+            "run_error": "boom",
+            "session_url": "https://example.test/workers/123",
+            "task_status": "blocked",
+        },
+    }
+    values.update(overrides)
+    return ForemanIssue(**values)
+
+
 def test_worker_errored_detector_uses_latest_failed_run_only():
     from hermes_cli.discord_worker_foreman import (
         RunSnapshot,
@@ -245,3 +267,129 @@ def test_foreman_scan_json_cli_smoke(monkeypatch, tmp_path, capsys):
     assert kanban_cli.kanban_command(ns) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload == {"count": 0, "issues": []}
+
+
+def test_alerts_due_first_send_then_suppresses_unchanged_before_cooldown(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
+
+    issue = _alert_issue()
+
+    assert alerts_due([issue], now=1000) == [issue]
+    record_alert_sent(issue, now=1000)
+
+    assert alerts_due([issue], now=1200) == []
+
+
+def test_alerts_due_resends_on_state_change_severity_escalation_and_cooldown(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
+
+    issue = _alert_issue(severity="warning")
+    record_alert_sent(issue, now=1000)
+
+    changed = _alert_issue(severity="warning", evidence={**issue.evidence, "run_error": "different"})
+    escalated = _alert_issue(severity="error")
+
+    assert alerts_due([changed], now=1200) == [changed]
+    assert alerts_due([escalated], now=1200) == [escalated]
+    assert alerts_due([issue], now=4600) == [issue]
+
+
+def test_alert_failed_schedules_retry_without_marking_sent(monkeypatch, tmp_path):
+    root = _home(monkeypatch, tmp_path)
+    from hermes_cli.discord_worker_foreman import alerts_due, record_alert_failed
+
+    issue = _alert_issue()
+
+    record_alert_failed(issue, "send failed token=abc /tmp/private.log", now=1000)
+
+    assert alerts_due([issue], now=1200) == []
+    assert alerts_due([issue], now=1300) == [issue]
+    state = json.loads((root / "kanban" / "foreman-alerts.json").read_text(encoding="utf-8"))
+    entry = next(iter(state["alerts"].values()))
+    assert entry["last_sent_at"] is None
+    assert entry["last_error"] == "send failed [redacted] [path]"
+
+
+def test_alert_limits_do_not_mark_overflow_sent_and_daily_cap_suppresses(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
+
+    issues = [_alert_issue(task_id=f"t{i}") for i in range(3)]
+
+    due = alerts_due(issues, now=1000, config={"max_alerts_per_tick": 2})
+
+    assert [issue.task_id for issue in due] == ["t0", "t1"]
+    assert alerts_due([issues[2]], now=1000) == [issues[2]]
+    record_alert_sent(issues[0], now=1000)
+    assert alerts_due([issues[1]], now=1000, config={"daily_cap_per_board": 1}) == []
+
+
+def test_alert_retention_gc_removes_old_entries(monkeypatch, tmp_path):
+    root = _home(monkeypatch, tmp_path)
+    state_path = root / "kanban" / "foreman-alerts.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "alerts": {
+                    "old": {
+                        "first_seen_at": 10,
+                        "last_sent_at": None,
+                        "last_attempt_at": None,
+                        "last_state_key": "",
+                        "send_count": 0,
+                        "failure_count": 0,
+                        "next_retry_at": None,
+                        "last_error": "",
+                    }
+                },
+                "daily_counts": {"discord-123:1970-01-01": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+    from hermes_cli.discord_worker_foreman import alerts_due
+
+    assert alerts_due([], now=100_000, config={"retention_seconds": 10}) == []
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["alerts"] == {}
+    assert state["daily_counts"] == {}
+
+
+def test_render_foreman_alert_is_safe_bounded_and_informative():
+    from hermes_cli.discord_worker_foreman import DISCORD_ALERT_LIMIT, render_foreman_alert
+
+    issue = _alert_issue(
+        title="Worker failed with token=abc123 at /tmp/private.log " + "x" * 3000,
+        evidence={
+            "run_id": 42,
+            "run_error": "secret token=abc123 at /home/user/log.txt",
+            "session_url": "https://example.test/workers/123",
+            "final_text": "do not expose",
+            "events": ["do not expose"],
+            "prompt": "do not expose",
+        },
+    )
+
+    rendered = render_foreman_alert(issue, mention="@foreman")
+
+    assert "@foreman" in rendered
+    assert "Board: discord-123" in rendered
+    assert "Task: t1" in rendered
+    assert "Run: 42" in rendered
+    assert "https://example.test/workers/123" in rendered
+    assert "Next action:" in rendered
+    assert "[redacted]" in rendered
+    assert "[path]" in rendered
+    assert "final_text" not in rendered
+    assert "events" not in rendered
+    assert "prompt" not in rendered
+    assert "token=abc123" not in rendered
+    assert "/home/user" not in rendered
+    assert "/tmp/private" not in rendered
+    assert len(rendered) <= DISCORD_ALERT_LIMIT
+    assert "[truncated]" in rendered

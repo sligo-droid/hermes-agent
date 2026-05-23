@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -17,10 +20,22 @@ from hermes_cli.discord_worker_boards import (
 )
 from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
 from hermes_cli.discord_worker_state import read_codex_worker_state
+from utils import atomic_json_write
 
 
 STALE_RUNNING_SECONDS = kanban_db._STALE_HEARTBEAT_GAP_SECONDS
 ERROR_OUTCOMES = frozenset({"spawn_failed", "crashed", "timed_out", "gave_up"})
+ALERT_DETECTOR_VERSION = 1
+ALERT_STATE_VERSION = 1
+DISCORD_ALERT_LIMIT = 2000
+_ALERT_DEFAULTS = {
+    "cooldown_seconds": 3600,
+    "retry_backoff_seconds": 300,
+    "max_retry_backoff_seconds": 3600,
+    "max_alerts_per_tick": 10,
+    "daily_cap_per_board": 20,
+    "retention_seconds": 30 * 24 * 3600,
+}
 _MISSING_READ_BROKER_MARKERS = (
     "HERMES_DISCORD_WORKER_READ_URL",
     "HERMES_DISCORD_WORKER_READ_TOKEN",
@@ -51,6 +66,27 @@ _DISALLOWED_EVIDENCE_KEYS = frozenset(
         "workspace_path",
     }
 )
+_ALLOWED_RENDER_EVIDENCE_KEYS = frozenset(
+    {
+        "error_excerpt",
+        "heartbeat_age_seconds",
+        "last_heartbeat_at",
+        "run_error",
+        "run_id",
+        "run_outcome",
+        "run_status",
+        "session_url",
+        "sidecar_error",
+        "sidecar_exit_code",
+        "sidecar_timed_out",
+        "stale_after_seconds",
+        "task_assignee",
+        "task_status",
+        "thread_id",
+        "thread_state",
+    }
+)
+_SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2, "critical": 3}
 
 
 @dataclass(frozen=True)
@@ -145,6 +181,121 @@ def collect_foreman_issues(now: Optional[int] = None) -> list[ForemanIssue]:
         issues.extend(detect_stale_running(snapshot, now=now))
         issues.extend(detect_missing_read_broker(snapshot))
     return sorted(issues, key=lambda issue: (issue.board, issue.task_id, issue.kind))
+
+
+def alerts_due(
+    issues: Iterable[ForemanIssue],
+    *,
+    now: Optional[int] = None,
+    config: Optional[dict[str, Any]] = None,
+) -> list[ForemanIssue]:
+    """Return issues that should be attempted without marking them sent."""
+    now = int(time.time()) if now is None else int(now)
+    cfg = _alert_config(config)
+    state = _read_alert_state()
+    alerts = state.setdefault("alerts", {})
+    changed = _gc_alert_state(state, now=now, retention_seconds=int(cfg["retention_seconds"]))
+    due: list[ForemanIssue] = []
+    for issue in issues:
+        fingerprint = _issue_fingerprint(issue)
+        entry = alerts.get(fingerprint)
+        if not isinstance(entry, dict):
+            entry = {
+                "first_seen_at": now,
+                "last_sent_at": None,
+                "last_attempt_at": None,
+                "last_state_key": "",
+                "send_count": 0,
+                "failure_count": 0,
+                "next_retry_at": None,
+                "last_error": "",
+            }
+            alerts[fingerprint] = entry
+            changed = True
+        elif not entry.get("first_seen_at"):
+            entry["first_seen_at"] = now
+            changed = True
+        if len(due) >= int(cfg["max_alerts_per_tick"]):
+            continue
+        if _board_daily_count(state, issue.board, now) >= int(cfg["daily_cap_per_board"]):
+            continue
+        if _is_alert_due(issue, entry, now=now, config=cfg):
+            due.append(issue)
+    if changed:
+        _write_alert_state(state)
+    return due
+
+
+def record_alert_sent(issue: ForemanIssue, *, now: Optional[int] = None) -> None:
+    """Record a successful send for an issue."""
+    now = int(time.time()) if now is None else int(now)
+    state = _read_alert_state()
+    entry = _alert_entry(state, issue, now=now)
+    entry["last_sent_at"] = now
+    entry["last_attempt_at"] = now
+    entry["last_state_key"] = _issue_state_key(issue)
+    entry["last_sent_severity"] = issue.severity
+    entry["send_count"] = int(entry.get("send_count") or 0) + 1
+    entry["failure_count"] = 0
+    entry["next_retry_at"] = None
+    entry["last_error"] = ""
+    daily_counts = state.setdefault("daily_counts", {})
+    key = _daily_key(issue.board, now)
+    daily_counts[key] = int(daily_counts.get(key) or 0) + 1
+    _write_alert_state(state)
+
+
+def record_alert_failed(issue: ForemanIssue, error: str, *, now: Optional[int] = None) -> None:
+    """Record a failed send attempt without marking the issue as sent."""
+    now = int(time.time()) if now is None else int(now)
+    state = _read_alert_state()
+    entry = _alert_entry(state, issue, now=now)
+    failure_count = int(entry.get("failure_count") or 0) + 1
+    backoff = min(
+        int(_ALERT_DEFAULTS["max_retry_backoff_seconds"]),
+        int(_ALERT_DEFAULTS["retry_backoff_seconds"]) * (2 ** max(0, failure_count - 1)),
+    )
+    entry["last_attempt_at"] = now
+    entry["failure_count"] = failure_count
+    entry["next_retry_at"] = now + backoff
+    entry["last_error"] = _truncate_text(_sanitize_text(error), 200)
+    _write_alert_state(state)
+
+
+def render_foreman_alert(issue: ForemanIssue, mention: str = "") -> str:
+    """Render a bounded Discord-safe foreman alert."""
+    safe_mention = _truncate_text(_sanitize_text(mention).strip(), 80)
+    evidence = _renderable_evidence(issue.evidence)
+    lines = []
+    if safe_mention:
+        lines.append(safe_mention)
+    lines.extend(
+        [
+            f"Foreman alert: {issue.severity.upper()} {issue.kind}",
+            f"Board: {issue.board}",
+            f"Task: {issue.task_id}",
+        ]
+    )
+    run_id = evidence.get("run_id")
+    if run_id not in (None, ""):
+        lines.append(f"Run: {run_id}")
+    session_url = evidence.get("session_url")
+    if isinstance(session_url, str) and _is_public_url(session_url):
+        lines.append(f"URL: {session_url}")
+    lines.extend(
+        [
+            f"Reason: {_truncate_text(_sanitize_text(issue.title), 240)}",
+            f"Next action: {_suggest_next_action(issue)}",
+        ]
+    )
+    if evidence:
+        lines.append("Evidence:")
+        for key in sorted(evidence):
+            value = evidence[key]
+            if key == "session_url" and (not isinstance(value, str) or not _is_public_url(value)):
+                continue
+            lines.append(f"- {key}: {_truncate_text(_sanitize_text(str(value)), 180)}")
+    return _truncate_text("\n".join(lines), DISCORD_ALERT_LIMIT)
 
 
 def collect_board_snapshots() -> list[BoardSnapshot]:
@@ -380,3 +531,170 @@ def _sanitize_text(value: str) -> str:
     text = _TOKEN_RE.sub("[redacted]", text)
     text = _PATH_RE.sub("[path]", text)
     return text
+
+
+def _alert_config(config: Optional[dict[str, Any]]) -> dict[str, Any]:
+    cfg = dict(_ALERT_DEFAULTS)
+    if config:
+        for key in cfg:
+            if key in config and config[key] is not None:
+                cfg[key] = int(config[key])
+    return cfg
+
+
+def _alert_state_path() -> Path:
+    return kanban_db.kanban_home() / "kanban" / "foreman-alerts.json"
+
+
+def _read_alert_state() -> dict[str, Any]:
+    path = _alert_state_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = {}
+    if not isinstance(raw, dict) or raw.get("version") != ALERT_STATE_VERSION:
+        return {"version": ALERT_STATE_VERSION, "alerts": {}, "daily_counts": {}}
+    alerts = raw.get("alerts")
+    if not isinstance(alerts, dict):
+        raw["alerts"] = {}
+    daily_counts = raw.get("daily_counts")
+    if not isinstance(daily_counts, dict):
+        raw["daily_counts"] = {}
+    return raw
+
+
+def _write_alert_state(state: dict[str, Any]) -> None:
+    state["version"] = ALERT_STATE_VERSION
+    state.setdefault("alerts", {})
+    state.setdefault("daily_counts", {})
+    atomic_json_write(_alert_state_path(), state, indent=2, sort_keys=True)
+
+
+def _alert_entry(state: dict[str, Any], issue: ForemanIssue, *, now: int) -> dict[str, Any]:
+    alerts = state.setdefault("alerts", {})
+    fingerprint = _issue_fingerprint(issue)
+    entry = alerts.get(fingerprint)
+    if not isinstance(entry, dict):
+        entry = {
+            "first_seen_at": now,
+            "last_sent_at": None,
+            "last_attempt_at": None,
+            "last_state_key": "",
+            "send_count": 0,
+            "failure_count": 0,
+            "next_retry_at": None,
+            "last_error": "",
+        }
+        alerts[fingerprint] = entry
+    return entry
+
+
+def _issue_fingerprint(issue: ForemanIssue) -> str:
+    payload = {
+        "detector_version": ALERT_DETECTOR_VERSION,
+        "kind": issue.kind,
+        "board": issue.board,
+        "task_id": issue.task_id,
+    }
+    return _stable_digest(payload)
+
+
+def _issue_state_key(issue: ForemanIssue) -> str:
+    payload = {
+        "detector_version": ALERT_DETECTOR_VERSION,
+        "kind": issue.kind,
+        "board": issue.board,
+        "task_id": issue.task_id,
+        "severity": issue.severity,
+        "title": issue.title,
+        "evidence": _sanitize_evidence(issue.evidence),
+    }
+    return _stable_digest(payload)
+
+
+def _stable_digest(payload: dict[str, Any]) -> str:
+    data = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def _is_alert_due(issue: ForemanIssue, entry: dict[str, Any], *, now: int, config: dict[str, Any]) -> bool:
+    next_retry = entry.get("next_retry_at")
+    if next_retry is not None and int(next_retry) > now:
+        return False
+    if int(entry.get("failure_count") or 0) > 0 and next_retry is not None and int(next_retry) <= now:
+        return True
+    last_sent = entry.get("last_sent_at")
+    if not last_sent:
+        return True
+    state_key = _issue_state_key(issue)
+    if state_key != str(entry.get("last_state_key") or ""):
+        return True
+    if _severity_rank(issue.severity) > _severity_rank(str(entry.get("last_sent_severity") or "")):
+        return True
+    return now - int(last_sent) >= int(config["cooldown_seconds"])
+
+
+def _severity_rank(severity: str) -> int:
+    return _SEVERITY_RANK.get(str(severity or "").casefold(), 0)
+
+
+def _daily_key(board: str, now: int) -> str:
+    day = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d")
+    return f"{board}:{day}"
+
+
+def _board_daily_count(state: dict[str, Any], board: str, now: int) -> int:
+    return int(state.setdefault("daily_counts", {}).get(_daily_key(board, now)) or 0)
+
+
+def _gc_alert_state(state: dict[str, Any], *, now: int, retention_seconds: int) -> bool:
+    changed = False
+    cutoff = now - retention_seconds
+    alerts = state.setdefault("alerts", {})
+    for fingerprint, entry in list(alerts.items()):
+        if not isinstance(entry, dict):
+            alerts.pop(fingerprint, None)
+            changed = True
+            continue
+        seen = int(entry.get("first_seen_at") or 0)
+        sent = int(entry.get("last_sent_at") or 0)
+        attempted = int(entry.get("last_attempt_at") or 0)
+        if max(seen, sent, attempted) < cutoff:
+            alerts.pop(fingerprint, None)
+            changed = True
+    today_prefix = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d")
+    daily_counts = state.setdefault("daily_counts", {})
+    for key in list(daily_counts):
+        if not str(key).endswith(f":{today_prefix}"):
+            daily_counts.pop(key, None)
+            changed = True
+    return changed
+
+
+def _renderable_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+    clean = _sanitize_evidence(evidence)
+    return {key: value for key, value in clean.items() if key in _ALLOWED_RENDER_EVIDENCE_KEYS}
+
+
+def _is_public_url(value: str) -> bool:
+    return value.startswith("https://") and not any(host in value for host in ("localhost", "127.0.0.1", "[::1]"))
+
+
+def _suggest_next_action(issue: ForemanIssue) -> str:
+    if issue.kind == "missing_read_broker":
+        return "Configure the Discord worker read broker credentials, then retry the task."
+    if issue.kind == "stale_running":
+        return "Inspect the worker heartbeat and reclaim or restart the task if it is stuck."
+    if issue.kind == "worker_errored":
+        return "Inspect the failed worker run and unblock or retry with the recorded error fixed."
+    return "Inspect the Kanban task and resolve the reported worker issue."
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    value = str(text or "")
+    if len(value) <= limit:
+        return value
+    marker = "... [truncated]"
+    if limit <= len(marker):
+        return marker[:limit]
+    return value[: limit - len(marker)] + marker
