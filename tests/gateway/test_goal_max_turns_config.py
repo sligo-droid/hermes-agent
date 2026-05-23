@@ -242,6 +242,15 @@ async def test_discord_feature_summary_goal_set_syncs_existing_summary(tmp_path,
     kanban_home = tmp_path / "kanban-home"
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
     monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://kanban.example")
+    from hermes_cli import discord_worker_boards as dwb
+
+    stale = dwb.set_goal(
+        thread_id="1507755696501030933",
+        goal="The previous thread goal",
+        guild_id="guild-1",
+        parent_channel_id="parent-channel",
+    )
+    dwb.set_feature_summary_title(stale.slug, "Stale generated title")
 
     adapter = _FakeAdapter()
     adapter.sync_kanban_feature_summary = AsyncMock(return_value="sync-1")
@@ -268,6 +277,8 @@ async def test_discord_feature_summary_goal_set_syncs_existing_summary(tmp_path,
         feature_summary={
             "thread_id": "1507755696501030933",
             "message_id": "summary-message",
+            "source_message_id": "msg-goal",
+            "initial_request": "/goal Ship the dashboard",
             "kanban_board": None,
         },
     )
@@ -282,6 +293,8 @@ async def test_discord_feature_summary_goal_set_syncs_existing_summary(tmp_path,
     assert target["guild_id"] == "guild-1"
     assert target["parent_channel_id"] == "parent-channel"
     assert target["message_id"] == "summary-message"
+    assert target["source_message_id"] == "msg-goal"
+    assert target["title"] == "Ship the dashboard"
     assert target["public_url"] == "https://kanban.example/workers/1507755696501030933"
 
 

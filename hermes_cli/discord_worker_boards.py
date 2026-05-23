@@ -193,6 +193,10 @@ def _clear_pr_summary_fields(worker: dict[str, Any]) -> None:
         worker[key] = _DELETE_META
 
 
+def _clear_generated_summary_title(worker: dict[str, Any]) -> None:
+    worker["summary_title"] = _DELETE_META
+
+
 def _public_base_url() -> str:
     value = str(os.getenv("HERMES_PUBLIC_KANBAN_BASE_URL") or "").strip()
     if value:
@@ -3075,6 +3079,9 @@ def start_direct_goal(
         project_context=project_context,
     )
     worker = board.worker
+    previous_goal = str(worker.get("root_goal") or worker.get("initial_request") or "")
+    if _planner_request_fingerprint(previous_goal) != _planner_request_fingerprint(raw_goal):
+        _clear_generated_summary_title(worker)
     _clear_board_run_summary(board.slug, worker)
     _clear_pr_summary_fields(worker)
     worker.update(
@@ -3115,12 +3122,21 @@ def start_planner_request(
     worker = board.worker
     previous_goal_status = str(worker.get("goal_status") or "").strip().lower()
     starts_new_goal_run = previous_goal_status in TERMINAL_GOAL_STATUSES
+    previous_goal = str(
+        worker.get("latest_planner_request")
+        or worker.get("root_goal")
+        or worker.get("initial_request")
+        or ""
+    )
+    request_changed = _planner_request_fingerprint(previous_goal) != _planner_request_fingerprint(raw_request)
     planner_key = _planner_request_key(
         raw_request,
         request_id=request_id,
         include_request_id=starts_new_goal_run,
     )
     thread_context_text = str(thread_context or "").strip()
+    if request_changed:
+        _clear_generated_summary_title(worker)
     if starts_new_goal_run:
         _clear_board_run_summary(board.slug, worker)
         _clear_pr_summary_fields(worker)
