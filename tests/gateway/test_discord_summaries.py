@@ -113,7 +113,7 @@ class FakeThread:
         self._messages = {}
 
     async def send(self, **kwargs):
-        msg = SimpleNamespace(id=300, edit=AsyncMock())
+        msg = SimpleNamespace(id=300 + len(self.sent), edit=AsyncMock())
         self.sent.append((kwargs, msg))
         self._messages[msg.id] = msg
         return msg
@@ -183,9 +183,9 @@ def adapter(monkeypatch):
     return instance
 
 
-def _make_message(adapter, *, channel, content):
+def _make_message(adapter, *, channel, content, message_id=123):
     return SimpleNamespace(
-        id=123,
+        id=message_id,
         content=content,
         mentions=[adapter._client.user],
         attachments=[],
@@ -296,6 +296,56 @@ async def test_tagged_thread_followup_reuses_persisted_feature_summary(adapter, 
     assert event.feature_summary["thread_id"] == "200"
     assert event.feature_summary["message_id"] == "300"
     assert event.feature_summary["_thread_obj"] is thread
+
+
+@pytest.mark.asyncio
+async def test_thread_goal_message_creates_per_message_feature_summary(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://kanban.example")
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+    top_handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="Build a deploy dashboard",
+    )
+    assert top_handle is not None
+    adapter.handle_message.reset_mock()
+
+    first = _make_message(adapter, channel=thread, content="<@999> /goal Ship the dashboard", message_id=501)
+    await adapter._handle_message(first)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert len(thread.sent) == 2
+    assert thread.sent[1][0]["reference"] is first
+    assert event.text == "/goal Ship the dashboard"
+    assert event.feature_summary["thread_id"] == "200"
+    assert event.feature_summary["message_id"] == "301"
+    assert event.feature_summary["source_message_id"] == "501"
+    assert event.feature_summary["kanban_board"]["slug"] == "discord-200"
+
+    adapter.handle_message.reset_mock()
+    second = _make_message(adapter, channel=thread, content="<@999> /goal Ship another goal", message_id=502)
+    await adapter._handle_message(second)
+
+    event = adapter.handle_message.await_args.args[0]
+    assert len(thread.sent) == 3
+    assert thread.sent[2][0]["reference"] is second
+    assert event.feature_summary["message_id"] == "302"
+    assert event.feature_summary["source_message_id"] == "502"
+
+    state = adapter._read_project_summary_state()
+    bucket = state["_feature_summaries"]
+    assert bucket["5:200"]["message_id"] == "300"
+    assert bucket["5:200:501"]["message_id"] == "301"
+    assert bucket["5:200:502"]["message_id"] == "302"
+    first_handle = adapter._load_feature_summary_handle_by_thread_id("200", message_id="301")
+    assert first_handle["source_message_id"] == "501"
+    latest = adapter._load_feature_summary_handle_by_thread_id("200")
+    assert latest["message_id"] == "302"
+    assert latest["source_message_id"] == "502"
 
 
 @pytest.mark.asyncio

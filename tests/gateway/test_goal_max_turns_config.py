@@ -281,6 +281,7 @@ async def test_discord_feature_summary_goal_set_syncs_existing_summary(tmp_path,
     assert target["thread_id"] == "1507755696501030933"
     assert target["guild_id"] == "guild-1"
     assert target["parent_channel_id"] == "parent-channel"
+    assert target["message_id"] == "summary-message"
     assert target["public_url"] == "https://kanban.example/workers/1507755696501030933"
 
 

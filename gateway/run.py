@@ -12227,6 +12227,8 @@ class GatewayRunner:
                         adapter = self.adapters.get(source.platform) if source else None
                         summary_sync = getattr(adapter, "sync_kanban_feature_summary", None) if adapter else None
                         if callable(summary_sync):
+                            feature_summary = getattr(event, "feature_summary", None)
+                            feature_summary = feature_summary if isinstance(feature_summary, dict) else {}
                             try:
                                 target = _dwb.feature_summary_snapshot(board.slug)
                             except Exception:
@@ -12242,6 +12244,8 @@ class GatewayRunner:
                                     ),
                                     "guild_id": str(getattr(source, "guild_id", "") or ""),
                                     "parent_channel_id": str(getattr(source, "parent_chat_id", "") or ""),
+                                    "message_id": str(feature_summary.get("message_id") or ""),
+                                    "source_message_id": str(feature_summary.get("source_message_id") or ""),
                                     "state": str(target.get("state") or "active"),
                                     "public_url": str(target.get("public_url") or board.public_url or ""),
                                 }
