@@ -14,6 +14,18 @@ from hermes_cli.discord_worker_boards import ROLE_ASSIGNEES, ROLE_DEV, ROLE_PLAN
 _OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV}
 _SENSITIVE_ENV_FRAGMENTS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "ACCESS_KEY")
 _CODEX_WORKER_ENV_KEYS = ("CODEX_HOME", "HERMES_CODEX_WORKER_CREDENTIAL_ID")
+_WORKER_CONTAINER_ENV_PREFIXES = (
+    "HERMES_",
+    "CODEX_",
+    "OPENAI_",
+    "ANTHROPIC_",
+    "GH_",
+    "GITHUB_",
+    "VITE_",
+    "PUBLIC_",
+    "NEXT_PUBLIC_",
+)
+_WORKER_CONTAINER_ENV_KEYS = {"PYTHONPATH", "HOME"}
 
 _ROLE_DEFAULT_REASONING = {
     "planner": "high",
@@ -172,6 +184,13 @@ def _codex_home_source_env() -> dict[str, str]:
 def _is_sensitive_env_key(key: str) -> bool:
     upper = key.upper()
     return any(fragment in upper for fragment in _SENSITIVE_ENV_FRAGMENTS)
+
+
+def _forward_env_to_worker_container(key: str) -> bool:
+    return (
+        key.startswith(_WORKER_CONTAINER_ENV_PREFIXES)
+        or key in _WORKER_CONTAINER_ENV_KEYS
+    )
 
 
 def _redacted_command(cmd: list[str], env: dict[str, str]) -> str:
@@ -376,9 +395,7 @@ def _spawn_docker_worker(
         env["GH_CONFIG_DIR"] = "/gh-config"
         cmd.extend(["-v", f"{Path(host_gh_config_dir).resolve()}:/gh-config:ro"])
     for key in env:
-        if key.startswith(
-            ("HERMES_", "CODEX_", "OPENAI_", "ANTHROPIC_", "GH_", "GITHUB_")
-        ) or key in {"PYTHONPATH", "HOME"}:
+        if _forward_env_to_worker_container(key):
             cmd.extend(["-e", key])
     cmd.extend([image, "python", "-m", "hermes_cli.kanban_codex_worker"])
 
