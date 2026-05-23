@@ -11964,6 +11964,38 @@ class GatewayRunner:
                     finished_ts=time.time(),
                 )
                 if getattr(event, "feature_summary", None):
+                    try:
+                        adapter = self.adapters.get(source.platform) if source else None
+                        summary_sync = getattr(adapter, "sync_kanban_feature_summary", None) if adapter else None
+                        if callable(summary_sync):
+                            try:
+                                target = _dwb.feature_summary_snapshot(board.slug)
+                            except Exception:
+                                logger.debug("Discord Kanban goal summary snapshot failed", exc_info=True)
+                                target = {}
+                            target.update(
+                                {
+                                    "board": board.slug,
+                                    "thread_id": str(
+                                        getattr(source, "thread_id", "")
+                                        or getattr(source, "chat_id", "")
+                                        or ""
+                                    ),
+                                    "guild_id": str(getattr(source, "guild_id", "") or ""),
+                                    "parent_channel_id": str(getattr(source, "parent_chat_id", "") or ""),
+                                    "state": str(target.get("state") or "active"),
+                                    "public_url": str(target.get("public_url") or board.public_url or ""),
+                                }
+                            )
+                            if not str(target.get("title") or "").strip():
+                                title = self._discord_kanban_feature_title(target)
+                                if title:
+                                    target["title"] = title
+                            if not str(target.get("sync_key") or "").strip():
+                                target["sync_key"] = self._discord_kanban_summary_sync_key(target)
+                            await summary_sync(target)
+                    except Exception:
+                        logger.debug("Discord Kanban goal feature-summary sync failed", exc_info=True)
                     return None
                 return f"Kanban goal set. Board: {board.public_url or board.slug}"
         except Exception as exc:

@@ -1035,6 +1035,28 @@ class DiscordAdapter(BasePlatformAdapter):
                 return dict(stored)
         return None
 
+    def _persist_feature_summary_handle_by_scope(self, handle: Dict[str, Any]) -> None:
+        scope = self._feature_summary_handle_scope(handle)
+        if not scope:
+            return
+        state = self._read_project_summary_state()
+        bucket = state.get(_DISCORD_FEATURE_SUMMARY_STATE_BUCKET)
+        if not isinstance(bucket, dict):
+            return
+        for stored in bucket.values():
+            if not isinstance(stored, dict):
+                continue
+            if (
+                str(stored.get("thread_id") or "") == scope["thread_id"]
+                and str(stored.get("message_id") or "") == scope["message_id"]
+            ):
+                for field in ("guild_id", "parent_channel_id", "project_context", "kanban_board"):
+                    if field in handle:
+                        stored[field] = handle.get(field) or None
+                stored["updated_at"] = time.time()
+                self._write_project_summary_state(state)
+                return
+
     def _summary_workdir(self) -> str:
         raw = (os.getenv("TERMINAL_CWD") or os.getcwd() or "").strip()
         if raw and os.path.isdir(raw):
@@ -1965,6 +1987,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if target.get("public_url"):
             board_handle["public_url"] = target.get("public_url")
         handle["kanban_board"] = board_handle
+        self._persist_feature_summary_handle_by_scope(handle)
         if self._feature_summary_circuit_matches(handle):
             return str(target.get("sync_key") or board)
         ok = await self.update_feature_summary(
