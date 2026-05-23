@@ -649,6 +649,51 @@ def test_docker_runner_mounts_gh_config_read_only(monkeypatch, tmp_path):
     assert "GH_CONFIG_DIR=/gh-config" not in captured["cmd"]
 
 
+def test_docker_runner_forwards_public_frontend_env_only(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    captured = {}
+
+    class Proc:
+        pid = 9876
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, cwd, stdout, stderr, env, start_new_session):
+        captured.update({"cmd": cmd, "env": env})
+        return Proc()
+
+    monkeypatch.setenv("VITE_SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("VITE_SUPABASE_ANON_KEY", "public-anon-key")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "private-service-role")
+    monkeypatch.setenv("DATABASE_URL", "postgres://private-db")
+    monkeypatch.setattr(
+        workers,
+        "_worker_config",
+        lambda: {
+            "runner": "docker",
+            "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
+            "codex_home_root": str(tmp_path / "homes"),
+        },
+    )
+    monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
+
+    workers.spawn_codex_worker(task, str(tmp_path / "repo"), board=board.slug)
+
+    assert "-e" in captured["cmd"]
+    assert "VITE_SUPABASE_URL" in captured["cmd"]
+    assert "VITE_SUPABASE_ANON_KEY" in captured["cmd"]
+    assert "VITE_SUPABASE_URL=https://example.supabase.co" not in captured["cmd"]
+    assert "VITE_SUPABASE_ANON_KEY=public-anon-key" not in captured["cmd"]
+    assert "SUPABASE_SERVICE_ROLE_KEY" not in captured["cmd"]
+    assert "DATABASE_URL" not in captured["cmd"]
+    assert "private-service-role" not in captured["cmd"]
+    assert "postgres://private-db" not in captured["cmd"]
+
+
 def test_docker_runner_uses_read_broker_without_discord_credentials(monkeypatch, tmp_path):
     from hermes_cli import discord_worker_read
     from hermes_cli import kanban_codex_workers as workers
