@@ -6167,7 +6167,7 @@ class GatewayRunner:
             raw.get("daily_cap_per_board", 20),
         )
         return {
-            "enabled": is_truthy_value(raw.get("enabled"), default=True),
+            "enabled": is_truthy_value(raw.get("enabled"), default=False),
             "channel_id": _DISCORD_FOREMAN_DEFAULT_CHANNEL_ID,
             "mention": _DISCORD_FOREMAN_DEFAULT_MENTION,
             "scan_interval_seconds": self._discord_foreman_clamped_int(
