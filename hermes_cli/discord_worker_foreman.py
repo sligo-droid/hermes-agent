@@ -639,13 +639,13 @@ def _is_alert_due(issue: ForemanIssue, entry: dict[str, Any], *, now: int, confi
     last_sent = entry.get("last_sent_at")
     if not last_sent:
         return True
+    if _is_terminal_or_archived_issue(issue):
+        return False
     state_key = _issue_state_key(issue)
     if state_key != str(entry.get("last_state_key") or ""):
         return True
     if _severity_rank(issue.severity) > _severity_rank(str(entry.get("last_sent_severity") or "")):
         return True
-    if _is_terminal_or_archived_issue(issue):
-        return False
     return now - int(last_sent) >= int(config["cooldown_seconds"])
 
 

@@ -310,7 +310,7 @@ def test_alerts_due_resends_on_state_change_severity_escalation_and_cooldown(mon
     assert alerts_due([issue], now=4600) == [issue]
 
 
-def test_terminal_alerts_do_not_repeat_after_cooldown_but_state_changes_do(monkeypatch, tmp_path):
+def test_terminal_alerts_do_not_repeat_after_success(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
 
@@ -322,11 +322,11 @@ def test_terminal_alerts_do_not_repeat_after_cooldown_but_state_changes_do(monke
 
     config = {"cooldown_seconds": 1, "terminal_suppression_age_seconds": 30 * 24 * 3600}
     assert alerts_due([issue], now=4600, config=config) == []
-    assert alerts_due([changed], now=1200, config=config) == [changed]
-    assert alerts_due([escalated], now=1200, config=config) == [escalated]
+    assert alerts_due([changed], now=1200, config=config) == []
+    assert alerts_due([escalated], now=1200, config=config) == []
 
 
-def test_archived_board_alerts_do_not_repeat_after_cooldown(monkeypatch, tmp_path):
+def test_archived_board_alerts_do_not_repeat_after_success(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
 
@@ -334,7 +334,12 @@ def test_archived_board_alerts_do_not_repeat_after_cooldown(monkeypatch, tmp_pat
     issue = _alert_issue(evidence=evidence)
     record_alert_sent(issue, now=1000)
 
+    changed = _alert_issue(evidence={**evidence, "run_error": "different"})
+    escalated = _alert_issue(severity="critical", evidence=evidence)
+
     assert alerts_due([issue], now=4600, config={"cooldown_seconds": 1}) == []
+    assert alerts_due([changed], now=1200, config={"cooldown_seconds": 1}) == []
+    assert alerts_due([escalated], now=1200, config={"cooldown_seconds": 1}) == []
 
 
 def test_old_terminal_alerts_are_suppressed_before_first_send(monkeypatch, tmp_path):
