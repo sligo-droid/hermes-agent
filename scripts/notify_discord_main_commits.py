@@ -120,6 +120,17 @@ def _pull_request_field_value(pull_request: dict[str, Any]) -> str:
     return _truncate(label, DISCORD_FIELD_VALUE_LIMIT)
 
 
+def _pull_request_title(pull_request: dict[str, Any]) -> str:
+    title = str(pull_request.get("title") or "").strip()
+    if title:
+        return _truncate(title, DISCORD_EMBED_TITLE_LIMIT)
+
+    number = pull_request.get("number")
+    if number:
+        return f"Pull request #{number} merged."
+    return "Pull request merged."
+
+
 def _commit_url(event: dict[str, Any], commit: dict[str, Any]) -> str:
     url = str(commit.get("url") or "").strip()
     if url.startswith("http://") or url.startswith("https://"):
@@ -151,8 +162,12 @@ def _commit_embed(
     if pull_request:
         description = _pull_request_description(pull_request)
 
+    title = _truncate(f"{short_sha} pushed to {branch}", DISCORD_EMBED_TITLE_LIMIT)
+    if pull_request:
+        title = _pull_request_title(pull_request)
+
     embed: dict[str, Any] = {
-        "title": _truncate(f"{short_sha} pushed to {branch}", DISCORD_EMBED_TITLE_LIMIT),
+        "title": title,
         "description": description,
         "color": 0x2F81F7,
         "fields": [
@@ -183,6 +198,10 @@ def _commit_embed(
         )
 
     url = _commit_url(event, commit)
+    if pull_request:
+        pr_url = str(pull_request.get("html_url") or "").strip()
+        if pr_url:
+            url = pr_url
     if url:
         embed["url"] = url
     timestamp = str(commit.get("timestamp") or "").strip()
@@ -210,10 +229,13 @@ def build_webhook_payloads(
         if not isinstance(commit, dict):
             continue
         sha = str(commit.get("id") or "").strip()
-        message = str(commit.get("message") or "")
         pull_request = None
-        if pull_request_lookup and sha:
+        if pull_request_lookup is not None:
+            if not sha:
+                continue
             pull_request = pull_request_lookup(sha)
+            if pull_request is None:
+                continue
         embeds.append(_commit_embed(event, commit, pull_request))
     payloads: list[dict[str, Any]] = []
     for index in range(0, len(embeds), MAX_EMBEDS_PER_MESSAGE):
