@@ -28,6 +28,8 @@ ERROR_OUTCOMES = frozenset({"spawn_failed", "crashed", "timed_out", "gave_up"})
 ALERT_DETECTOR_VERSION = 1
 ALERT_STATE_VERSION = 1
 DISCORD_ALERT_LIMIT = 2000
+FOREMAN_DISCORD_CHANNEL_ID = "1504252294495998043"
+FOREMAN_DISCORD_MENTION = "<@1504235933598486580>"
 _ALERT_DEFAULTS = {
     "cooldown_seconds": 3600,
     "retry_backoff_seconds": 300,
@@ -264,11 +266,11 @@ def record_alert_failed(issue: ForemanIssue, error: str, *, now: Optional[int] =
 
 def render_foreman_alert(issue: ForemanIssue, mention: str = "") -> str:
     """Render a bounded Discord-safe foreman alert."""
-    safe_mention = _truncate_text(_sanitize_text(mention).strip(), 80)
+    # The foreman alert target is fixed; config/callers must not override it.
+    safe_mention = FOREMAN_DISCORD_MENTION
     evidence = _renderable_evidence(issue.evidence)
     lines = []
-    if safe_mention:
-        lines.append(safe_mention)
+    lines.append(safe_mention)
     lines.extend(
         [
             f"Foreman alert: {issue.severity.upper()} {issue.kind}",

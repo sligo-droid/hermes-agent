@@ -6141,12 +6141,8 @@ class GatewayRunner:
         )
         return {
             "enabled": is_truthy_value(raw.get("enabled"), default=False),
-            "channel_id": str(
-                raw.get("channel_id") or _DISCORD_FOREMAN_DEFAULT_CHANNEL_ID
-            ).strip(),
-            "mention": str(
-                raw.get("mention") if raw.get("mention") is not None else _DISCORD_FOREMAN_DEFAULT_MENTION
-            ).strip(),
+            "channel_id": _DISCORD_FOREMAN_DEFAULT_CHANNEL_ID,
+            "mention": _DISCORD_FOREMAN_DEFAULT_MENTION,
             "scan_interval_seconds": self._discord_foreman_clamped_int(
                 raw.get("scan_interval_seconds"), 300, 10, 3600,
             ),

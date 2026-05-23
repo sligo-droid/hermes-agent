@@ -361,7 +361,11 @@ def test_alert_retention_gc_removes_old_entries(monkeypatch, tmp_path):
 
 
 def test_render_foreman_alert_is_safe_bounded_and_informative():
-    from hermes_cli.discord_worker_foreman import DISCORD_ALERT_LIMIT, render_foreman_alert
+    from hermes_cli.discord_worker_foreman import (
+        DISCORD_ALERT_LIMIT,
+        FOREMAN_DISCORD_MENTION,
+        render_foreman_alert,
+    )
 
     issue = _alert_issue(
         title="Worker failed with token=abc123 at /tmp/private.log " + "x" * 3000,
@@ -377,7 +381,9 @@ def test_render_foreman_alert_is_safe_bounded_and_informative():
 
     rendered = render_foreman_alert(issue, mention="@foreman")
 
-    assert "@foreman" in rendered
+    assert FOREMAN_DISCORD_MENTION in rendered
+    assert rendered.count(FOREMAN_DISCORD_MENTION) == 1
+    assert "@foreman" not in rendered
     assert "Board: discord-123" in rendered
     assert "Task: t1" in rendered
     assert "Run: 42" in rendered
@@ -393,3 +399,12 @@ def test_render_foreman_alert_is_safe_bounded_and_informative():
     assert "/tmp/private" not in rendered
     assert len(rendered) <= DISCORD_ALERT_LIMIT
     assert "[truncated]" in rendered
+
+
+def test_render_foreman_alert_uses_fixed_mention_once_in_normal_alert():
+    from hermes_cli.discord_worker_foreman import FOREMAN_DISCORD_MENTION, render_foreman_alert
+
+    rendered = render_foreman_alert(_alert_issue(), mention="@foreman")
+
+    assert rendered.count(FOREMAN_DISCORD_MENTION) == 1
+    assert "@foreman" not in rendered

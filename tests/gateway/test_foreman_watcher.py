@@ -126,7 +126,7 @@ def test_foreman_watcher_requires_discord_adapter_and_connection(monkeypatch):
     assert disconnected.sent == []
 
 
-def test_foreman_watcher_sends_only_due_alert_to_configured_channel(monkeypatch):
+def test_foreman_watcher_sends_due_alert_to_fixed_channel_and_mention(monkeypatch):
     _patch_config(monkeypatch, _enabled_config())
     _patch_lock(monkeypatch)
     from hermes_cli import discord_worker_foreman as foreman
@@ -155,7 +155,11 @@ def test_foreman_watcher_sends_only_due_alert_to_configured_channel(monkeypatch)
     assert due_calls[0][1]["max_alerts_per_tick"] == 50
     assert due_calls[0][1]["daily_cap_per_board"] == 200
     assert adapter.sent == [
-        {"chat_id": "foreman-channel", "content": "@foreman t1", "metadata": None}
+        {
+            "chat_id": "1504252294495998043",
+            "content": "<@1504235933598486580> t1",
+            "metadata": None,
+        }
     ]
     assert sent == ["t1"]
     assert failed == []
