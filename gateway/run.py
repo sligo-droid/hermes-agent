@@ -65,6 +65,8 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _DISCORD_KANBAN_REACTION_RESYNC_SECS = 30.0
+_DISCORD_FOREMAN_DEFAULT_CHANNEL_ID = "1504252294495998043"
+_DISCORD_FOREMAN_DEFAULT_MENTION = "<@1504235933598486580>"
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _TRUTHY_ENV_VALUES = {"true", "1", "yes", "on"}
 _CODEX_APP_SERVER_ACTIVITY_PREFIX = "Codex app-server event:"
@@ -4564,6 +4566,10 @@ class GatewayRunner:
         # ownership so external dispatchers still surface activity.
         asyncio.create_task(self._discord_kanban_typing_watcher())
 
+        # Optional Discord worker foreman alerts. Disabled by default and
+        # gated inside the watcher so non-Discord gateways do no work.
+        asyncio.create_task(self._discord_worker_foreman_watcher())
+
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
             logger.info(
@@ -6107,6 +6113,211 @@ class GatewayRunner:
         except (TypeError, ValueError):
             synced_at = 0.0
         return now - synced_at >= _DISCORD_KANBAN_REACTION_RESYNC_SECS
+
+    @staticmethod
+    def _discord_foreman_clamped_int(
+        value: Any,
+        default: int,
+        minimum: int,
+        maximum: int,
+        *,
+        allow_zero: bool = False,
+    ) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        if allow_zero and parsed <= 0:
+            return 0
+        return min(max(parsed, minimum), maximum)
+
+    def _discord_foreman_watcher_config(self, config: dict) -> dict[str, Any]:
+        raw = cfg_get(config, "kanban", "discord_worker", "foreman", default={})
+        if not isinstance(raw, dict):
+            raw = {}
+        max_alerts_per_board = raw.get(
+            "max_alerts_per_board_per_day",
+            raw.get("daily_cap_per_board", 20),
+        )
+        return {
+            "enabled": is_truthy_value(raw.get("enabled"), default=False),
+            "channel_id": _DISCORD_FOREMAN_DEFAULT_CHANNEL_ID,
+            "mention": _DISCORD_FOREMAN_DEFAULT_MENTION,
+            "scan_interval_seconds": self._discord_foreman_clamped_int(
+                raw.get("scan_interval_seconds"), 300, 10, 3600,
+            ),
+            "terminal_suppression_age_seconds": self._discord_foreman_clamped_int(
+                raw.get("terminal_suppression_age_seconds"),
+                7 * 24 * 3600,
+                3600,
+                30 * 24 * 3600,
+                allow_zero=True,
+            ),
+            "alert_config": {
+                "cooldown_seconds": self._discord_foreman_clamped_int(
+                    raw.get("cooldown_seconds"), 3600, 60, 7 * 24 * 3600,
+                ),
+                "retry_backoff_seconds": self._discord_foreman_clamped_int(
+                    raw.get("retry_backoff_seconds"), 300, 30, 3600,
+                ),
+                "max_retry_backoff_seconds": self._discord_foreman_clamped_int(
+                    raw.get("max_retry_backoff_seconds"), 3600, 60, 24 * 3600,
+                ),
+                "retention_seconds": self._discord_foreman_clamped_int(
+                    raw.get("retention_seconds"), 30 * 24 * 3600, 3600, 90 * 24 * 3600,
+                ),
+                "max_alerts_per_tick": self._discord_foreman_clamped_int(
+                    raw.get("max_alerts_per_tick"), 10, 1, 50,
+                ),
+                "daily_cap_per_board": self._discord_foreman_clamped_int(
+                    max_alerts_per_board, 20, 1, 200,
+                ),
+            },
+        }
+
+    @staticmethod
+    def _discord_foreman_safe_log_text(value: Any) -> str:
+        try:
+            from hermes_cli.discord_worker_foreman import sanitize_foreman_text
+        except Exception:
+            text = str(value or "")[:300]
+            text = re.sub(
+                r"(?i)(token|secret|api[_-]?key|authorization|password)\s*[:=]\s*[^\s,;]+",
+                "[redacted]",
+                text,
+            )
+            return re.sub(
+                r"(?<![\w:/.-])(?:~[\w.-]*(?:/[^\s\"'<>),;{}\[\]]*)?|/(?:home|Users|tmp|var|etc|opt|private|workspace|workspaces|mnt|srv|repo|root)(?:/[^\s\"'<>),;{}\[\]]*)?|[A-Za-z]:\\[^\s\"'<>),;{}\[\]]+)",
+                "[path]",
+                text,
+            )
+        return sanitize_foreman_text(value, limit=300)
+
+    async def _discord_worker_foreman_watcher(self) -> None:
+        """Optionally scan Discord worker boards and send foreman alerts."""
+        if getattr(self, "_discord_worker_foreman_watcher_active", False):
+            logger.debug("discord foreman: watcher already active for this gateway")
+            return
+
+        try:
+            from hermes_cli.config import load_config as _load_config
+        except Exception:
+            logger.warning("discord foreman: config loader unavailable; disabled")
+            return
+
+        try:
+            watcher_cfg = self._discord_foreman_watcher_config(_load_config())
+        except Exception as exc:
+            logger.warning("discord foreman: cannot load config (%s); disabled", exc)
+            return
+        if not watcher_cfg["enabled"]:
+            logger.info(
+                "discord foreman: disabled via config kanban.discord_worker.foreman.enabled=false"
+            )
+            return
+        if not watcher_cfg["channel_id"]:
+            logger.warning("discord foreman: enabled without a channel_id; disabled")
+            return
+
+        profile = self._active_profile_name()
+        lock_identity = f"{profile}:{_hermes_home}"
+        lock_acquired = False
+        try:
+            from gateway.status import acquire_scoped_lock, release_scoped_lock
+
+            lock_acquired, existing = acquire_scoped_lock(
+                "discord-worker-foreman",
+                lock_identity,
+                metadata={"profile": profile, "hermes_home": str(_hermes_home)},
+            )
+            if not lock_acquired:
+                logger.info(
+                    "discord foreman: another watcher owns profile %s (pid=%s); disabled here",
+                    profile,
+                    (existing or {}).get("pid"),
+                )
+                return
+
+            self._discord_worker_foreman_watcher_active = True
+            interval = float(watcher_cfg["scan_interval_seconds"])
+            alert_config = dict(watcher_cfg["alert_config"])
+            terminal_age = int(watcher_cfg["terminal_suppression_age_seconds"])
+            alert_config["terminal_suppression_age_seconds"] = terminal_age
+            logger.info(
+                "discord foreman: enabled (interval=%.1fs channel=%s)",
+                interval,
+                watcher_cfg["channel_id"],
+            )
+
+            await asyncio.sleep(5)
+            while self._running:
+                try:
+                    adapter = self.adapters.get(Platform.DISCORD)
+                    if adapter is None:
+                        logger.debug("discord foreman: Discord adapter not connected; skipping tick")
+                    elif getattr(adapter, "is_connected", True) is False:
+                        logger.debug("discord foreman: Discord adapter disconnected; skipping tick")
+                    else:
+                        try:
+                            from hermes_cli import discord_worker_foreman as _foreman
+                        except Exception:
+                            logger.debug("discord foreman: helper unavailable", exc_info=True)
+                        else:
+                            def _collect_due_alerts() -> list[Any]:
+                                now = int(time.time())
+                                issues = _foreman.collect_foreman_issues(now=now)
+                                return _foreman.alerts_due(issues, config=alert_config, now=now)
+
+                            due = await asyncio.to_thread(_collect_due_alerts)
+                            for issue in due:
+                                message = _foreman.render_foreman_alert(
+                                    issue,
+                                    mention=watcher_cfg["mention"],
+                                )
+                                try:
+                                    result = await adapter.send(
+                                        watcher_cfg["channel_id"],
+                                        message,
+                                        metadata=None,
+                                    )
+                                    success = getattr(result, "success", True)
+                                    if isinstance(result, dict):
+                                        success = bool(result.get("success", True))
+                                    if success is False:
+                                        error = getattr(result, "error", "send failed")
+                                        if isinstance(result, dict):
+                                            error = result.get("error", error)
+                                        raise RuntimeError(str(error or "send failed"))
+                                except Exception as exc:
+                                    safe_error = self._discord_foreman_safe_log_text(exc)
+                                    logger.warning(
+                                        "discord foreman: send failed for %s/%s: %s",
+                                        getattr(issue, "board", "<unknown>"),
+                                        getattr(issue, "task_id", "<unknown>"),
+                                        safe_error,
+                                    )
+                                    await asyncio.to_thread(
+                                        _foreman.record_alert_failed,
+                                        issue,
+                                        safe_error,
+                                    )
+                                else:
+                                    await asyncio.to_thread(_foreman.record_alert_sent, issue)
+                except asyncio.CancelledError:
+                    logger.debug("discord foreman: cancelled")
+                    raise
+                except Exception:
+                    logger.exception("discord foreman: unexpected watcher error")
+
+                if self._running:
+                    await asyncio.sleep(interval)
+        finally:
+            self._discord_worker_foreman_watcher_active = False
+            if lock_acquired:
+                try:
+                    release_scoped_lock("discord-worker-foreman", lock_identity)
+                except Exception:
+                    logger.debug("discord foreman: failed to release watcher lock", exc_info=True)
 
     async def _discord_kanban_typing_watcher(self, interval: float = 8.0) -> None:
         """Keep Discord thread typing visible while thread workers are running."""

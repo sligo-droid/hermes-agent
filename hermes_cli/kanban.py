@@ -477,6 +477,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit JSON (structured) instead of the default human table",
     )
 
+    # --- foreman (Discord worker board scanner) ---
+    p_foreman = sub.add_parser(
+        "foreman",
+        help="Read-only Discord worker board foreman utilities",
+    )
+    foreman_sub = p_foreman.add_subparsers(dest="foreman_action")
+    p_foreman_scan = foreman_sub.add_parser(
+        "scan",
+        help="Scan Discord worker boards for foreman issues",
+    )
+    p_foreman_scan.add_argument("--json", action="store_true", help="Emit JSON output")
+
     # --- link / unlink ---
     p_link = sub.add_parser("link", help="Add a parent->child dependency")
     p_link.add_argument("parent_id")
@@ -890,6 +902,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "reassign": _cmd_reassign,
         "diagnostics": _cmd_diagnostics,
         "diag":     _cmd_diagnostics,
+        "foreman":  _cmd_foreman,
         "link":     _cmd_link,
         "unlink":   _cmd_unlink,
         "claim":    _cmd_claim,
@@ -1752,6 +1765,31 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 if a.suggested:
                     print(f"       → {a.label}")
         print()
+    return 0
+
+
+def _cmd_foreman(args: argparse.Namespace) -> int:
+    sub = getattr(args, "foreman_action", None) or "scan"
+    if sub != "scan":
+        print(f"kanban foreman: unknown action {sub!r}", file=sys.stderr)
+        return 2
+
+    from hermes_cli.discord_worker_foreman import collect_foreman_issues
+
+    issues = collect_foreman_issues()
+    payload = {
+        "count": len(issues),
+        "issues": [issue.to_dict() for issue in issues],
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+    if not issues:
+        print("No Discord worker foreman issues found.")
+        return 0
+    print(f"{len(issues)} Discord worker foreman issue(s):")
+    for issue in issues:
+        print(f"  {issue.board} {issue.task_id} [{issue.severity}] {issue.kind}: {issue.title}")
     return 0
 
 
