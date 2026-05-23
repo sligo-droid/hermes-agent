@@ -130,6 +130,32 @@ def test_prepare_worker_home_falls_back_when_pool_auth_is_incomplete(tmp_path, m
     assert payload["tokens"]["id_token"] == "cli-id"
 
 
+def test_prepare_worker_home_can_disable_fallback_auth_copy(tmp_path, monkeypatch):
+    from agent import credential_pool
+    from agent.codex_worker_auth import prepare_codex_worker_home
+
+    source_home = tmp_path / "source-codex"
+    _write_codex_auth(source_home, access="cli-access", refresh="cli-refresh", id_token="cli-id")
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+
+    entry = SimpleNamespace(
+        id="pool-1",
+        access_token="pool-access",
+        last_status=None,
+    )
+    monkeypatch.setattr(credential_pool, "load_pool", lambda provider: FakePool(entry))
+
+    worker_home = tmp_path / "worker-codex"
+    _write_codex_auth(worker_home, access="failed-access", refresh="failed-refresh", id_token="")
+
+    credential_id = prepare_codex_worker_home(worker_home, allow_fallback=False)
+
+    payload = json.loads((worker_home / "auth.json").read_text(encoding="utf-8"))
+    assert credential_id is None
+    assert payload["tokens"]["access_token"] == "failed-access"
+    assert payload["tokens"]["refresh_token"] == "failed-refresh"
+
+
 def test_prepare_worker_home_skips_auth_failed_pool_credentials(tmp_path, monkeypatch):
     from agent.codex_worker_auth import prepare_codex_worker_home
 
