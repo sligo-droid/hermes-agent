@@ -286,11 +286,13 @@ def test_set_goal_preserves_nested_subgoal_text_for_planner(monkeypatch, tmp_pat
     assert payload["planner_instructions"]
     instructions = "\n".join(payload["planner_instructions"])
     assert "fewest coherent dev tickets" in instructions
-    assert "Do not create standalone discovery, audit, polish, or verification tickets" in instructions
-    assert "pass that brief in the kanban_create body argument" in instructions
+    assert "Fold normal discovery, audit, polish, and verification" in instructions
+    assert "pass the full brief in the kanban_create body argument" in instructions
     assert "detailed, self-contained implementation brief" in instructions
-    assert "Ticket-specific acceptance criteria" in instructions
-    assert "do not copy the whole board-level list into every task" in instructions
+    assert "opens with Goal, Success means, and Stop when" in instructions
+    assert "ticket-specific acceptance criteria" in instructions
+    assert "include board-level criteria only when that ticket owns the whole outcome" in instructions
+    assert "Set Stop when to the concrete handoff point" in instructions
     assert "one deduplicated canonical list" in instructions
 
 

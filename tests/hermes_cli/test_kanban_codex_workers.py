@@ -922,11 +922,31 @@ def test_planner_schema_uses_parents_not_depends_on():
     assert '"parents"' in schema
     assert "depends_on" not in schema
     assert "fewest coherent dev tickets" in schema
-    assert "Do not create standalone discovery, audit, polish, or verification tickets" in schema
+    assert "Fold normal discovery, audit, polish, and verification" in schema
     assert "detailed, self-contained implementation brief" in schema
-    assert "Ticket-specific acceptance criteria" in schema
-    assert "do not copy the whole board-level list into every task" in schema
+    assert "opens with Goal, Success means, and Stop when" in schema
+    assert "ticket-specific acceptance criteria" in schema
+    assert "include board-level criteria only when that ticket owns the whole outcome" in schema
+    assert "Set Stop when to the concrete handoff point" in schema
     assert "deduplicated canonical board-level list" in schema
+
+
+def test_worker_role_frames_are_outcome_first():
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_DEV, ROLE_REVIEWER
+
+    dev_frame = worker._role_outcome_frame(ROLE_DEV)
+    reviewer_frame = worker._role_outcome_frame(ROLE_REVIEWER)
+    reviewer_schema = worker._schema_instructions(ROLE_REVIEWER)
+
+    assert "Goal: Complete the assigned Kanban ticket" in dev_frame
+    assert "Success means:" in dev_frame
+    assert "Stop when: Return the JSON completion" in dev_frame
+    assert "Goal: Decide whether the board work satisfies" in reviewer_frame
+    assert "Success means:" in reviewer_frame
+    assert "Stop when: Return the JSON review verdict." in reviewer_frame
+    assert "new_tasks body must be a self-contained follow-up brief" in reviewer_schema
+    assert "opens with Goal, Success means, and Stop when" in reviewer_schema
 
 
 def test_worker_prompt_mentions_discord_read_helper(monkeypatch, tmp_path):
@@ -942,6 +962,10 @@ def test_worker_prompt_mentions_discord_read_helper(monkeypatch, tmp_path):
         conn.close()
 
     assert "Do not call Hermes tools" in prompt
+    assert "Outcome frame:" in prompt
+    assert "Goal: Convert the Kanban context into the smallest coherent implementation plan" in prompt
+    assert "Success means:" in prompt
+    assert "Stop when: Return the JSON plan or a concise blocker." in prompt
     assert "python -m hermes_cli.discord_worker_read fetch-message" in prompt
     assert "python -m hermes_cli.discord_worker_read fetch-messages" in prompt
     assert "Do not attempt Discord mutation or admin actions" in prompt

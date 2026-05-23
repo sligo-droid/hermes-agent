@@ -13,6 +13,7 @@ from typing import Any, Optional
 from agent.transports.codex_app_server_session import CodexAppServerSession
 from hermes_cli import kanban_db
 from hermes_cli.discord_worker_boards import (
+    DEV_TICKET_BODY_GUIDANCE,
     ROLE_DEV,
     ROLE_PLANNER,
     ROLE_REVIEWER,
@@ -79,6 +80,7 @@ def main() -> int:
 
 def _build_prompt(conn: Any, task_id: str, role: str) -> str:
     context = kanban_db.build_worker_context(conn, task_id)
+    outcome = _role_outcome_frame(role)
     schema = _schema_instructions(role)
     git = _git_summary(os.environ.get("HERMES_KANBAN_WORKSPACE", "") or os.getcwd())
     discord_read = (
@@ -92,11 +94,45 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
     return (
         f"You are the Discord Kanban {role} worker.\n"
         "Do not call Hermes tools. Work only from the repository, shell, files, and the read-only Discord helper available in this worker environment.\n"
-        "Return exactly one JSON object matching the schema below; do not wrap it in Markdown.\n\n"
+        "Return exactly one raw JSON object matching the schema below, with no Markdown fence or surrounding prose.\n\n"
+        f"{outcome}\n\n"
         f"{discord_read}"
         f"{schema}\n\n"
         f"Git context:\n{git}\n\n"
         f"Kanban context:\n{context}"
+    )
+
+
+def _role_outcome_frame(role: str) -> str:
+    if role == ROLE_PLANNER:
+        return (
+            "Outcome frame:\n"
+            "Goal: Convert the Kanban context into the smallest coherent implementation plan for dev workers.\n"
+            "Success means:\n"
+            "- The JSON status is planned or blocked.\n"
+            "- The board-level acceptance_criteria list is deduplicated and canonical.\n"
+            "- Each dev ticket body opens with Goal, Success means, and Stop when, then gives the worker scope, files, dependencies, verification, and out-of-scope boundaries.\n"
+            "Stop when: Return the JSON plan or a concise blocker."
+        )
+    if role == ROLE_REVIEWER:
+        return (
+            "Outcome frame:\n"
+            "Goal: Decide whether the board work satisfies the user goal and acceptance criteria.\n"
+            "Success means:\n"
+            "- The JSON status is approved, changes_requested, or blocked.\n"
+            "- Findings name concrete issues, or findings is empty when the work is approved.\n"
+            "- New dev tasks are outcome-first follow-up briefs when changes are required.\n"
+            "- criteria_assessment maps each criterion to evidence or a gap.\n"
+            "Stop when: Return the JSON review verdict."
+        )
+    return (
+        "Outcome frame:\n"
+        "Goal: Complete the assigned Kanban ticket or produce a checkpoint/blocker with evidence.\n"
+        "Success means:\n"
+        "- The smallest correct change within ticket scope is implemented.\n"
+        "- Focused verification is run when available and recorded in tests.\n"
+        "- changed_files, tests, pr_ready, and blocker reflect the actual repository state.\n"
+        "Stop when: Return the JSON completion, checkpoint, or blocker object."
     )
 
 
@@ -107,9 +143,10 @@ def _schema_instructions(role: str) -> str:
             '"tasks":[{"title":"...","body":"...","priority":0,"parents":[]}],"blocker":null} '
             'In each task, "parents" is a list of earlier task indices this task depends on. '
             "Break the job into the fewest coherent dev tickets that can be implemented and verified independently. "
-            "Do not create standalone discovery, audit, polish, or verification tickets unless that work is the user's explicit request or it blocks multiple implementation tickets; fold normal inspection and verification into the relevant implementation ticket. "
-            "Each dev task body must be a detailed, self-contained implementation brief with these labeled sections: Goal, Scope, Implementation notes, Ticket-specific acceptance criteria, Likely files/subsystems, Dependencies or handoffs, Verification, and Out of scope. "
-            "Write acceptance criteria for the specific slice owned by that dev ticket; do not copy the whole board-level list into every task unless that ticket owns the whole outcome. "
+            "Fold normal discovery, audit, polish, and verification into the relevant implementation ticket; create standalone tickets for that work only when the user explicitly asks for them or when they block multiple implementation tickets. "
+            f"{DEV_TICKET_BODY_GUIDANCE} "
+            "Write Success means as ticket-specific acceptance criteria for the slice owned by that dev ticket; include board-level criteria only when that ticket owns the whole outcome. "
+            "Set Stop when to the concrete handoff point for that ticket, usually code changed and verification recorded or a blocker stated. "
             "Include enough surrounding context from the overall request for a fresh dev worker to execute the ticket without guessing, but keep the scope tight to the ticket. "
             "The top-level acceptance_criteria must be one deduplicated canonical board-level list; if criteria already exist in the Kanban context, reuse them instead of paraphrasing or adding near-duplicates. "
             "Treat slash-looking text in the request as user prose unless the Kanban context explicitly says otherwise."
@@ -117,7 +154,8 @@ def _schema_instructions(role: str) -> str:
     if role == ROLE_REVIEWER:
         return (
             'Schema: {"status":"approved|changes_requested|blocked","summary":"...","findings":["..."],'
-            '"new_tasks":[{"title":"...","body":"...","priority":0}],"criteria_assessment":{}, "blocker":null}'
+            '"new_tasks":[{"title":"...","body":"...","priority":0}],"criteria_assessment":{}, "blocker":null} '
+            "When requesting changes, each new_tasks body must be a self-contained follow-up brief that opens with Goal, Success means, and Stop when."
         )
     return (
         'Schema: {"status":"completed|blocked|checkpoint","summary":"...","changed_files":["..."],'
