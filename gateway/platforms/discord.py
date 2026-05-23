@@ -6396,6 +6396,102 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return None
 
+    async def create_worker_task_thread(
+        self,
+        parent_chat_id: str,
+        *,
+        name: str,
+        title: str = "",
+        initial_request: str = "",
+        project_context: Optional[Dict[str, Any]] = None,
+        kanban_url: str = "",
+        auto_archive_duration: int = 1440,
+    ) -> Optional[Dict[str, str]]:
+        """Create a #dev worker-task thread and seed it with a feature summary."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return None
+
+        try:
+            parent_id = int(parent_chat_id)
+        except (TypeError, ValueError):
+            return None
+
+        try:
+            parent = self._client.get_channel(parent_id)
+            if parent is None:
+                parent = await self._client.fetch_channel(parent_id)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Worker task thread: cannot resolve parent %s: %s",
+                self.name, parent_chat_id, exc,
+            )
+            return None
+
+        if isinstance(parent, getattr(discord, "DMChannel", ())):
+            return None
+
+        thread_name = re.sub(r"\s+", " ", str(name or title or "Hermes worker task")).strip()
+        thread_name = thread_name[:80] if len(thread_name) <= 80 else thread_name[:77].rstrip() + "..."
+        if not thread_name:
+            thread_name = "Hermes worker task"
+        reason = "Hermes foreman worker task"
+
+        thread = None
+        try:
+            create = getattr(parent, "create_thread", None)
+            if create is not None:
+                thread = await create(
+                    name=thread_name,
+                    auto_archive_duration=auto_archive_duration,
+                    reason=reason,
+                )
+        except Exception as direct_error:
+            logger.debug(
+                "[%s] Worker task thread: direct create failed (%s); trying seed-message fallback",
+                self.name, direct_error,
+            )
+
+        if thread is None:
+            try:
+                send = getattr(parent, "send", None)
+                if send is None:
+                    return None
+                seed_msg = await send(f"Hermes worker task: **{thread_name}**")
+                thread = await seed_msg.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=auto_archive_duration,
+                    reason=reason,
+                )
+            except Exception as fallback_error:
+                logger.warning(
+                    "[%s] Worker task thread: create failed for parent %s: %s",
+                    self.name, parent_chat_id, fallback_error,
+                )
+                return None
+
+        handle = {
+            "thread_id": str(getattr(thread, "id", "") or ""),
+            "thread_name": str(getattr(thread, "name", None) or thread_name),
+            "message_id": "",
+        }
+        try:
+            metadata = self._collect_discord_project_metadata(
+                project_context if isinstance(project_context, dict) else None
+            )
+            embed = self._build_feature_summary_embed(
+                initial_request=initial_request,
+                status="Running",
+                outcome=initial_request or title or thread_name,
+                title=title or thread_name,
+                metadata=metadata,
+                kanban_url=kanban_url,
+            )
+            msg = await thread.send(embed=embed)
+            handle["message_id"] = str(getattr(msg, "id", "") or "")
+        except Exception as exc:
+            logger.warning("[%s] Worker task feature summary send failed: %s", self.name, exc)
+        return handle
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",

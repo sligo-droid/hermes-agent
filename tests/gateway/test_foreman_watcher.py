@@ -12,12 +12,21 @@ class ForemanAdapter:
         self.result = result
         self.error = error
         self.sent = []
+        self.created_threads = []
 
     async def send(self, chat_id, content, metadata=None):
         self.sent.append({"chat_id": chat_id, "content": content, "metadata": metadata})
         if self.error:
             raise self.error
         return self.result
+
+    async def create_worker_task_thread(self, parent_chat_id, **kwargs):
+        self.created_threads.append({"parent_chat_id": parent_chat_id, **kwargs})
+        return {
+            "thread_id": f"thread-{len(self.created_threads)}",
+            "thread_name": kwargs.get("name") or "worker task",
+            "message_id": f"message-{len(self.created_threads)}",
+        }
 
 
 def _runner(adapter=None):
@@ -82,12 +91,82 @@ def _patch_config(monkeypatch, config):
     monkeypatch.setattr(cfg, "load_config", lambda: config)
 
 
-def test_foreman_defaults_are_disabled_with_expected_discord_target():
+def test_foreman_defaults_are_enabled_with_expected_discord_target():
     foreman = DEFAULT_CONFIG["kanban"]["discord_worker"]["foreman"]
 
-    assert foreman["enabled"] is False
+    assert foreman["enabled"] is True
     assert foreman["channel_id"] == "1504252294495998043"
     assert foreman["mention"] == "<@1504235933598486580>"
+
+
+def test_foreman_spawned_task_creates_dev_thread_and_subscription(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://hermes.example.test")
+    _patch_config(monkeypatch, _enabled_config())
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_state import read_codex_worker_state
+
+    board = dwb.ensure_discord_thread_board(
+        thread_id="123",
+        chat_id="parent-123",
+        guild_id="guild-1",
+        parent_channel_id="dev-parent",
+        initial_request="/goal Ship the dashboard",
+        project_context={"project_name": "Hermes", "project_path": "/repo/hermes"},
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Build dashboard filters",
+            body="Add filter controls and verify them.",
+            assignee=dwb.ROLE_DEV,
+            tenant=board.slug,
+            initial_status="running",
+            board=board.slug,
+        )
+    finally:
+        conn.close()
+
+    adapter = ForemanAdapter()
+    runner = _runner(adapter)
+    result = SimpleNamespace(spawned=[(task_id, dwb.ROLE_DEV, "/tmp/hermes-worktree")])
+
+    asyncio.run(runner._discord_foreman_announce_spawned_tasks([(board.slug, result)]))
+    asyncio.run(runner._discord_foreman_announce_spawned_tasks([(board.slug, result)]))
+
+    assert len(adapter.created_threads) == 1
+    created = adapter.created_threads[0]
+    assert created["parent_chat_id"] == "1504252294495998043"
+    assert created["name"] == "dev: Build dashboard filters"
+    assert created["title"] == "Build dashboard filters"
+    assert "Add filter controls" in created["initial_request"]
+    assert created["project_context"] == {"project_name": "Hermes", "project_path": "/repo/hermes"}
+    assert created["kanban_url"] == f"https://hermes.example.test/workers/123/tickets/{task_id}"
+
+    state = read_codex_worker_state(task_id, board=board.slug)
+    assert state["foreman_thread"]["thread_id"] == "thread-1"
+    assert state["foreman_thread"]["message_id"] == "message-1"
+
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        subs = kanban_db.list_notify_subs(conn, task_id)
+    finally:
+        conn.close()
+    assert subs == [
+        {
+            "task_id": task_id,
+            "platform": "discord",
+            "chat_id": "1504252294495998043",
+            "thread_id": "thread-1",
+            "user_id": "system:foreman",
+            "notifier_profile": "default",
+            "created_at": subs[0]["created_at"],
+            "last_event_id": 0,
+        }
+    ]
 
 
 def test_foreman_watcher_disabled_config_does_not_scan(monkeypatch):
