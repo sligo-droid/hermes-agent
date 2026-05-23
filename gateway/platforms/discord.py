@@ -1132,7 +1132,9 @@ class DiscordAdapter(BasePlatformAdapter):
         return None
 
     def _obsidian_vault_path(self) -> _Path:
-        return _Path(os.getenv("OBSIDIAN_VAULT_PATH") or "/home/droid/.hermes/obsidian-vault")
+        from hermes_constants import get_hermes_home
+
+        return _Path(os.getenv("OBSIDIAN_VAULT_PATH") or get_hermes_home() / "obsidian-vault")
 
     def _normalize_project_note_key(self, value: Optional[str]) -> str:
         text = str(value or "").strip().lower().lstrip("#")

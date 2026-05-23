@@ -6,11 +6,36 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+class CodexWorkerHomeLease:
+    """Temporary Codex home containing short-lived worker credentials."""
+
+    def __init__(self, tmp_dir: tempfile.TemporaryDirectory[str], credential_id: Optional[str]):
+        self._tmp_dir = tmp_dir
+        self.path = Path(tmp_dir.name)
+        self.credential_id = credential_id
+
+    def cleanup(self) -> None:
+        self._tmp_dir.cleanup()
+
+    def __enter__(self) -> "CodexWorkerHomeLease":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.cleanup()
+
+
+def _codex_worker_home_root() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return (get_hermes_home() / "tmp" / "codex-worker-homes").resolve()
 
 
 def _string_attr(entry: Any, name: str) -> str:
@@ -205,6 +230,7 @@ def prepare_codex_worker_home(
 
     pool, entry = select_codex_worker_credential(parent_agent)
     credential_id = None
+    copied_fallback_auth = False
     if entry is not None and _write_codex_auth(path, entry):
         credential_id = str(getattr(entry, "id", "") or "").strip() or None
         logger.info(
@@ -218,10 +244,65 @@ def prepare_codex_worker_home(
             source_env=source_env,
             overwrite=not _codex_auth_has_id_token(path),
         )
+        copied_fallback_auth = True
 
-    _copy_codex_file(path, "credentials.json", source_env=source_env)
+    if copied_fallback_auth:
+        _copy_codex_file(path, "credentials.json", source_env=source_env)
     _write_minimal_config(path)
     return credential_id
+
+
+def create_codex_worker_home(
+    *,
+    parent_agent: Any = None,
+    source_env: dict[str, str] | None = None,
+    allow_fallback: bool = True,
+    prefix: str = "codex-worker-",
+) -> CodexWorkerHomeLease:
+    """Create a temporary Codex home lease populated with worker auth."""
+    root = _codex_worker_home_root()
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.chmod(0o700)
+    except OSError:
+        pass
+    tmp_dir = tempfile.TemporaryDirectory(prefix=prefix, dir=str(root))
+    try:
+        credential_id = prepare_codex_worker_home(
+            Path(tmp_dir.name),
+            parent_agent=parent_agent,
+            source_env=source_env,
+            allow_fallback=allow_fallback,
+        )
+    except Exception:
+        tmp_dir.cleanup()
+        raise
+    return CodexWorkerHomeLease(tmp_dir, credential_id)
+
+
+def cleanup_codex_worker_home(codex_home: Path | str | None) -> None:
+    """Best-effort removal for detached worker homes after token sync."""
+    if not codex_home:
+        return
+    cleanup_root = os.environ.get("HERMES_CODEX_WORKER_CLEANUP_ROOT", "").strip()
+    root = Path(cleanup_root).expanduser().resolve() if cleanup_root else _codex_worker_home_root()
+    path = Path(codex_home).expanduser().resolve()
+    allowed = path == root if cleanup_root else path != root and root in path.parents
+    if not allowed:
+        logger.warning("Refusing to clean non-worker Codex home: %s", path)
+        return
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        try:
+            for child in path.iterdir():
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+            path.rmdir()
+        except OSError:
+            pass
 
 
 def mark_codex_worker_credential_auth_failed(

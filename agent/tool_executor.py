@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import random
+import re
 import threading
 import time
 from typing import Any, Optional
@@ -78,6 +79,16 @@ _CODING_WORKER_BLOCKED_MUTATION_TOOLS = frozenset({
     "execute_code",
 })
 
+_TERMINAL_MUTATION_PATTERNS = re.compile(
+    r"""(?:^|\s|&&|\|\||;|`|\()(?:(?:apply_patch|touch|mkdir|ln|chmod|chown)\s|
+        tee\s|
+        git\s+(?:add|am|apply|branch\s+-D|cherry-pick|commit|merge|mv|pull|push|rebase|restore|revert|rm|stash|switch)\b|
+        (?:npm|pnpm|yarn|bun|pip|uv|poetry)\s+(?:install|add|remove|update|upgrade|lock|sync)\b|
+        (?:python\d*|node|ruby|perl)\s+(?:-|-[ce])(?:\s|$)
+    )""",
+    re.VERBOSE,
+)
+
 
 def _ra():
     """Lazy reference to ``run_agent`` so patches like ``run_agent._set_interrupt`` work."""
@@ -85,11 +96,23 @@ def _ra():
     return run_agent
 
 
-def _coding_worker_mutation_block(agent, function_name: str) -> Optional[str]:
+def _terminal_command_may_mutate(function_args: dict[str, Any]) -> bool:
+    command = str(function_args.get("command") or "")
+    if not command.strip():
+        return False
+    if _is_destructive_command(command):
+        return True
+    return bool(_TERMINAL_MUTATION_PATTERNS.search(command))
+
+
+def _coding_worker_mutation_block(agent, function_name: str, function_args: Optional[dict[str, Any]] = None) -> Optional[str]:
     """Return a guardrail message when Hermes-codebase work skipped the worker."""
     if function_name == "delegate_coding_task":
         return None
-    if function_name not in _CODING_WORKER_BLOCKED_MUTATION_TOOLS:
+    function_args = function_args or {}
+    mutation_tool = function_name in _CODING_WORKER_BLOCKED_MUTATION_TOOLS
+    terminal_mutation = function_name == "terminal" and _terminal_command_may_mutate(function_args)
+    if not mutation_tool and not terminal_mutation:
         return None
     if str(getattr(agent, "api_mode", "") or "").strip().lower() == "codex_app_server":
         return None
@@ -262,7 +285,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
         block_result = None
         blocked_by_guardrail = False
-        block_message = _coding_worker_mutation_block(agent, function_name)
+        block_message = _coding_worker_mutation_block(agent, function_name, function_args)
         if block_message is None:
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
@@ -653,7 +676,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         # Check plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
-        _block_msg = _coding_worker_mutation_block(agent, function_name)
+        _block_msg = _coding_worker_mutation_block(agent, function_name, function_args)
         if _block_msg is None:
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message

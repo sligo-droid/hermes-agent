@@ -603,7 +603,7 @@ class TestSenderPrefixWithBackfill:
 
         assert result.startswith("[Gateway note: The user uploaded .txt document(s) 'notes.txt'.")
         assert "synthesize durable non-secret learnings" in result
-        assert "/home/droid/.hermes/obsidian-vault" in result
+        assert "/obsidian-vault" in result
         assert result.endswith("[Alice] please inspect\n\nfile line")
         assert "The file is also saved at" not in result
 

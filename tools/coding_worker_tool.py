@@ -365,22 +365,20 @@ def delegate_coding_task(
         approval_callback = None
 
     codex_home = None
+    codex_home_lease = None
     inherited_credential_id = None
     try:
-        from agent.codex_worker_auth import prepare_codex_worker_home
-        from hermes_constants import get_hermes_home
+        from agent.codex_worker_auth import create_codex_worker_home
 
-        codex_home = (
-            get_hermes_home()
-            / "codex-worker-homes"
-            / f"delegate-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        )
-        inherited_credential_id = prepare_codex_worker_home(
-            codex_home,
+        codex_home_lease = create_codex_worker_home(
             parent_agent=parent_agent,
+            prefix=f"delegate-{os.getpid()}-{uuid.uuid4().hex[:8]}-",
         )
+        codex_home = codex_home_lease.path
+        inherited_credential_id = codex_home_lease.credential_id
     except Exception:
         codex_home = None
+        codex_home_lease = None
         inherited_credential_id = None
 
     def _touch_codex_activity(note: dict) -> None:
@@ -474,6 +472,8 @@ def delegate_coding_task(
                 sync_codex_worker_home(codex_home, inherited_credential_id)
             except Exception:
                 pass
+        if codex_home_lease is not None:
+            codex_home_lease.cleanup()
 
     duration = round(time.monotonic() - started, 2)
     success = bool(turn.final_text) and not turn.error and not turn.interrupted

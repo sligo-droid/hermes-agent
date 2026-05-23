@@ -8539,7 +8539,9 @@ class GatewayRunner:
                     _names.append(parts[2] if len(parts) >= 3 else basename)
             _names = [re.sub(r'[^\w.\- ]', '_', name) for name in _names]
             _doc_label = ", ".join(f"'{name}'" for name in _names) or ".txt upload"
-            _vault_path = os.getenv("OBSIDIAN_VAULT_PATH") or "/home/droid/.hermes/obsidian-vault"
+            _vault_path = os.getenv("OBSIDIAN_VAULT_PATH") or str(
+                get_hermes_home() / "obsidian-vault"
+            )
             _obsidian_note = (
                 f"[Gateway note: The user uploaded .txt document(s) {_doc_label}. "
                 f"Before answering, synthesize durable non-secret learnings from the uploaded text "

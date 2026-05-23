@@ -18,6 +18,11 @@ class FakeSession:
         self.kwargs = kwargs
         self.closed = False
         self.run_calls = []
+        self.auth_payload = None
+        if kwargs.get("codex_home"):
+            auth_path = Path(kwargs["codex_home"]) / "auth.json"
+            if auth_path.exists():
+                self.auth_payload = json.loads(auth_path.read_text(encoding="utf-8"))
         FakeSession.instances.append(self)
 
     def __enter__(self):
@@ -351,9 +356,11 @@ def test_runs_with_available_codex_pool_credential(monkeypatch, tmp_path):
     assert result["success"] is True
     codex_home = FakeSession.instances[0].kwargs["codex_home"]
     assert codex_home
-    payload = json.loads((Path(codex_home) / "auth.json").read_text())
+    payload = FakeSession.instances[0].auth_payload
+    assert payload is not None
     assert payload["tokens"]["access_token"] == "access-2"
     assert payload["tokens"]["refresh_token"] == "refresh-2"
+    assert not Path(codex_home).exists()
 
 
 def test_codex_worker_home_prefers_parent_current_credential(tmp_path):

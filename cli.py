@@ -1328,7 +1328,6 @@ _ACCENT_ANSI_DEFAULT = "\033[1;38;2;255;215;0m"  # True-color #FFD700 bold — f
 _BOLD = "\033[1m"
 _RST = "\033[0m"
 _STREAM_PAD = "    "  # 4-space indent for streamed response text (matches Panel padding)
-_OPENCODE_WORKER_INTEGRATION_ENABLED = False
 
 
 def _hex_to_ansi(hex_color: str, *, bold: bool = False) -> str:
@@ -3071,9 +3070,6 @@ class HermesCLI:
         self._image_counter = 0
         self.preloaded_skills: list[str] = []
         self._startup_skills_line_shown = False
-        self._opencode_mode = False
-        self._opencode_env_cache: Optional[dict] = None
-        self._opencode_env_cache_at = 0.0
 
         # Voice mode state (also reinitialized inside run() for interactive TUI).
         self._voice_lock = threading.Lock()
@@ -6227,7 +6223,6 @@ class HermesCLI:
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
-        self._opencode_mode = False
 
         if self.agent:
             self.agent.session_id = self.session_id
@@ -6514,7 +6509,6 @@ class HermesCLI:
         self.session_id = target_id
         self._resumed = True
         self._pending_title = None
-        self._opencode_mode = False
 
         # Load conversation history (strip transcript-only metadata entries)
         restored = self._load_resumed_conversation(target_id)
@@ -8277,8 +8271,6 @@ class HermesCLI:
             self._handle_reasoning_command(cmd_original)
         elif canonical == "fast":
             self._handle_fast_command(cmd_original)
-        elif canonical == "opencode":
-            self._handle_opencode_command(cmd_original)
         elif canonical == "compress":
             self._manual_compress(cmd_original)
         elif canonical == "usage":
@@ -9378,362 +9370,6 @@ class HermesCLI:
                 f"  ⚡ YOLO mode {_Colors.BOLD}{_Colors.GREEN}ON{_Colors.RESET}"
                 " — all commands auto-approved. Use with caution."
             )
-
-    def _inspect_opencode_environment(self, *, refresh: bool = False) -> dict:
-        """Return OpenCode CLI readiness for worker-mode guidance."""
-        now = time.monotonic()
-        cached = getattr(self, "_opencode_env_cache", None)
-        cached_at = getattr(self, "_opencode_env_cache_at", 0.0)
-        if not refresh and cached and now - cached_at < 30.0:
-            return dict(cached)
-
-        path = shutil.which("opencode")
-        status = {
-            "available": False,
-            "binary_path": path or "",
-            "version": "",
-            "credentials_configured": False,
-            "credentials_summary": "",
-            "error": "",
-            # Back-compat aliases for older tests/helpers.
-            "ready": False,
-            "path": path or "",
-            "providers_ok": False,
-        }
-        if not path:
-            status["error"] = "OpenCode CLI not found in PATH."
-            self._opencode_env_cache = dict(status)
-            self._opencode_env_cache_at = now
-            return status
-
-        def _run(args: list[str], timeout: float) -> tuple[int, str]:
-            import subprocess
-
-            try:
-                proc = subprocess.run(
-                    args,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    check=False,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-            except subprocess.TimeoutExpired:
-                return 124, f"timed out after {timeout:g}s"
-            except Exception as exc:
-                return 127, str(exc)
-            out = "\n".join(
-                part.strip() for part in (proc.stdout, proc.stderr) if part and part.strip()
-            ).strip()
-            return proc.returncode, out
-
-        version_rc, version_out = _run([path, "--version"], 10)
-        if version_rc != 0:
-            status["error"] = f"OpenCode version check failed: {version_out or version_rc}"
-            self._opencode_env_cache = dict(status)
-            self._opencode_env_cache_at = now
-            return status
-        status["version"] = version_out.splitlines()[0] if version_out else "unknown"
-        status["available"] = True
-
-        providers_rc, providers_out = _run([path, "providers", "list"], 15)
-        if providers_rc != 0:
-            status["error"] = f"OpenCode credentials check failed: {providers_out or providers_rc}"
-            self._opencode_env_cache = dict(status)
-            self._opencode_env_cache_at = now
-            return status
-
-        plain_providers = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", providers_out).strip()
-        credentials_configured = bool(plain_providers) and not re.search(
-            r"\b(?:0|no) credentials\b",
-            plain_providers,
-            flags=re.IGNORECASE,
-        )
-        if credentials_configured:
-            summary_match = re.search(
-                r"(\d+\s+credentials?)",
-                plain_providers,
-                flags=re.IGNORECASE,
-            )
-            if summary_match:
-                status["credentials_summary"] = summary_match.group(1)
-            else:
-                lines = [line.strip() for line in plain_providers.splitlines() if line.strip()]
-                status["credentials_summary"] = lines[-1] if lines else "configured"
-            status["credentials_configured"] = True
-            status["providers_ok"] = True
-            status["ready"] = True
-        else:
-            status["error"] = "OpenCode is installed but has no configured credentials."
-
-        self._opencode_env_cache = dict(status)
-        self._opencode_env_cache_at = now
-        return status
-
-    @staticmethod
-    def _looks_like_coding_request(message: str) -> bool:
-        """Conservative heuristic for when OpenCode worker guidance is useful."""
-        if not isinstance(message, str):
-            return False
-        text = message.strip()
-        if not text:
-            return False
-        if text.startswith("[IMPORTANT: Background process "):
-            return False
-
-        lower = text.lower()
-        if any(phrase in lower for phrase in ("use opencode", "with opencode", "opencode run")):
-            return True
-
-        if re.search(
-            r"(^|[\s`'\"(])[\w./-]+\.(py|js|ts|tsx|jsx|rs|go|java|c|cc|cpp|h|hpp|rb|php|swift|kt|scala|sh|yaml|yml|json|toml)(?=$|[\s`'\"),:])",
-            lower,
-        ):
-            return True
-
-        coding_tokens = (
-            "implement",
-            "implementation",
-            "refactor",
-            "bug",
-            "fix",
-            "debug",
-            "test",
-            "tests",
-            "code review",
-            "review this diff",
-            "review this pr",
-            "review this code",
-            "lint",
-            "typecheck",
-            "regression",
-            "patch",
-            "diff",
-            "commit",
-            "pull request",
-            "coding",
-        )
-        for token in coding_tokens:
-            if " " in token:
-                if token in lower:
-                    return True
-            elif re.search(rf"\b{re.escape(token)}\b", lower):
-                return True
-        return False
-
-    @staticmethod
-    def _choose_opencode_variant(prompt: str) -> tuple[str, str]:
-        """Choose an OpenCode worker reasoning variant from the task text."""
-        lower = str(prompt or "").lower()
-
-        def _near_worker_variant(value: str) -> bool:
-            worker = r"(?:opencode|open code|worker)"
-            knob = r"(?:variant|reasoning|effort)"
-            value_re = re.escape(value)
-            return bool(
-                re.search(rf"\b{worker}\b.{{0,60}}\b{knob}\b.{{0,40}}\b{value_re}\b", lower)
-                or re.search(rf"\b{worker}\b.{{0,60}}\b{value_re}\b.{{0,40}}\b{knob}\b", lower)
-                or re.search(rf"\b{value_re}\b.{{0,40}}\b{knob}\b.{{0,60}}\b{worker}\b", lower)
-                or re.search(rf"\b{knob}\b.{{0,40}}\b{value_re}\b.{{0,60}}\b{worker}\b", lower)
-            )
-
-        for explicit in ("minimal", "high", "max"):
-            if _near_worker_variant(explicit):
-                return explicit, f"user explicitly requested OpenCode worker {explicit} effort"
-
-        def _contains_any(signals: tuple[str, ...]) -> str:
-            for signal in signals:
-                if " " in signal:
-                    if signal in lower:
-                        return signal
-                elif re.search(rf"\b{re.escape(signal)}\b", lower):
-                    return signal
-            return ""
-
-        max_hit = _contains_any((
-            "security", "auth", "permission", "sandbox", "secret", "credential",
-            "payment", "wallet", "signing", "race", "deadlock", "concurrency",
-            "data loss", "migration", "schema migration", "breaking change",
-            "architecture", "design review", "audit", "incident", "production",
-            "unsafe", "dangerous", "rewrite", "upgrade", "rebase", "merge conflict",
-            "flaky", "intermittent", "root cause",
-        ))
-        if max_hit:
-            return "max", f"high-risk signal detected: {max_hit}"
-
-        minimal_hit = _contains_any((
-            "typo", "comment", "format", "formatting", "lint only", "rename",
-            "small docs", "documentation", "readme", "changelog", "one-line",
-            "one line", "trivial", "mechanical", "obvious",
-        ))
-        if minimal_hit:
-            return "minimal", f"mechanical low-risk signal detected: {minimal_hit}"
-
-        high_hit = _contains_any((
-            "debug", "bug", "failing test", "failing tests", "regression",
-            "refactor", "code review", "review this diff", "review this pr",
-            "implement", "feature", "integration", "api", "database",
-            "state machine", "async", "thread", "cache", "performance", "memory leak",
-        ))
-        if high_hit:
-            return "high", f"substantive coding signal detected: {high_hit}"
-
-        return "default", "no strong worker-specific signal"
-
-    @staticmethod
-    def _opencode_fast_gpt_model_id(model_id: str) -> tuple[str, bool]:
-        """Map GPT-family model ids to OpenCode fast worker ids."""
-        raw = str(model_id or "").strip()
-        if not raw:
-            return "", False
-        provider = ""
-        bare = raw
-        if "/" in raw:
-            provider, bare = raw.rsplit("/", 1)
-        lower = bare.lower()
-        if not lower.startswith("gpt-"):
-            return raw, False
-        if lower.endswith("-fast"):
-            return raw, False
-        fast = f"{bare}-fast"
-        if provider:
-            return f"{provider}/{fast}", True
-        return fast, True
-
-    def _opencode_model_argument(self) -> tuple[str, str]:
-        """Return a best-effort OpenCode --model argument for this session."""
-        model = str(getattr(self, "model", "") or "").strip()
-        if not model:
-            return "", "Hermes has not resolved a concrete model for this session"
-
-        if "/" in model:
-            normalized, changed = self._opencode_fast_gpt_model_id(model)
-            if changed:
-                return normalized, "provider-qualified GPT-family model normalized to OpenCode FAST mode"
-            return normalized, "Hermes model is already provider-qualified for OpenCode"
-
-        provider = str(
-            getattr(self, "provider", "") or getattr(self, "requested_provider", "") or ""
-        ).strip().lower()
-        provider_map = {
-            "openai-codex": "openai",
-            "openai": "openai",
-            "anthropic": "anthropic",
-            "gemini": "google",
-            "google-gemini-cli": "google",
-            "google": "google",
-            "xai": "xai",
-            "x-ai": "xai",
-            "zai": "zai",
-            "z-ai": "zai",
-            "minimax": "minimax",
-            "mistral": "mistral",
-            "groq": "groq",
-        }
-        mapped_provider = provider_map.get(provider)
-        if mapped_provider:
-            candidate = f"{mapped_provider}/{model}"
-            reason = f"Hermes provider '{provider}' maps to OpenCode provider '{mapped_provider}'"
-        else:
-            candidate = model
-            reason = "Hermes provider is unknown to OpenCode mapping; using the Hermes model id directly"
-
-        normalized, changed = self._opencode_fast_gpt_model_id(candidate)
-        if changed:
-            reason = f"{reason}; GPT-family worker model normalized to FAST mode"
-        return normalized, reason
-
-    def _build_opencode_prefix(self, message: str) -> str:
-        """Build an API-local OpenCode worker instruction prefix when appropriate."""
-        if not _OPENCODE_WORKER_INTEGRATION_ENABLED:
-            return ""
-        if not getattr(self, "_opencode_mode", False):
-            return ""
-        if not isinstance(message, str) or not self._looks_like_coding_request(message):
-            return ""
-
-        variant, variant_reason = self._choose_opencode_variant(message)
-        model_arg, model_reason = self._opencode_model_argument()
-        skills = ", ".join(getattr(self, "preloaded_skills", []) or [])
-
-        lines = [
-            "[OpenCode worker mode is enabled for this session.",
-            "For coding implementation, refactor, debugging, test, and code-review tasks, prefer the local OpenCode CLI via terminal/process for the coding-heavy step.",
-            "For substantive coding work, prefer an interactive OpenCode background PTY so Hermes can steer, inspect intermediate output, and iterate.",
-            "Use `opencode run` only for trivial smoke checks or when the user explicitly asks for a one-shot worker run.",
-            "Hermes remains the orchestrator: prepare the worker brief, verify changed files/tests, and summarize outcomes.",
-            "If OpenCode fails or is a worse fit, fall back to normal Hermes execution and report the blocker.",
-        ]
-        if model_arg:
-            lines.append(
-                f"Model guidance: use the same worker model family as Hermes, `{model_arg}` ({model_reason}). "
-                f"Interactive command shape: `opencode --model {model_arg}`. "
-                f"Explicit one-shot path: `opencode run --model {model_arg} <brief>`. "
-                "GPT-family OpenCode workers must be FAST mode. "
-                "Do not use OpenCode's configured default model unless the exact worker model is unavailable and that blocker is reported."
-            )
-        else:
-            lines.append(
-                f"Model guidance: {model_reason}. Do not silently use OpenCode's configured default model; report the blocker first."
-            )
-        if variant == "default":
-            lines.append(
-                f"Variant guidance: use OpenCode's configured default variant and adjust after inspection ({variant_reason})."
-            )
-        else:
-            lines.append(
-                f"Variant guidance: prefer `{variant}` ({variant_reason}); use `--variant {variant}` if the chosen OpenCode invocation supports a variant flag, otherwise apply it in the first worker brief or adjust interactively."
-            )
-        if skills:
-            lines.append(
-                f"Active Hermes skills: {skills}. Distill only relevant skill guidance into the OpenCode worker brief rather than dumping unnecessary text."
-            )
-        lines.append("]\n\n")
-        return "\n".join(lines)
-
-    def _handle_opencode_command(self, cmd: str) -> None:
-        """Handle /opencode — toggle coding-worker guidance for this CLI session."""
-        parts = cmd.strip().split(maxsplit=1)
-        arg = parts[1].strip().lower() if len(parts) > 1 else "status"
-        if arg not in {"on", "off", "status"}:
-            _cprint(f"  {_DIM}Usage: /opencode [on|off|status]{_RST}")
-            return
-
-        if not _OPENCODE_WORKER_INTEGRATION_ENABLED:
-            self._opencode_mode = False
-            _cprint(f"  {_ACCENT}OpenCode worker mode: disabled{_RST}")
-            _cprint(f"  {_DIM}OpenCode worker integration is temporarily disabled in Hermes.{_RST}")
-            return
-
-        if arg == "off":
-            self._opencode_mode = False
-            _cprint(f"  {_ACCENT}OpenCode worker mode: off (session only){_RST}")
-            return
-
-        status = self._inspect_opencode_environment(refresh=True)
-        if arg == "on":
-            if status.get("available") and status.get("credentials_configured"):
-                self._opencode_mode = True
-            else:
-                self._opencode_mode = False
-
-        ready = bool(status.get("available") and status.get("credentials_configured"))
-        mode = "ON" if getattr(self, "_opencode_mode", False) else "OFF"
-        readiness = "ready" if ready else "blocked"
-        _cprint(f"  {_ACCENT}OpenCode worker mode: {mode} (session only){_RST}")
-        _cprint(f"  {_ACCENT}Readiness: {readiness}{_RST}")
-        if status.get("binary_path"):
-            _cprint(f"  {_DIM}Path: {status['binary_path']}{_RST}")
-        if status.get("version"):
-            _cprint(f"  {_DIM}Version: {status['version']}{_RST}")
-        if status.get("credentials_summary"):
-            _cprint(f"  {_DIM}Credentials: {status['credentials_summary']}{_RST}")
-        if status.get("error"):
-            _cprint(f"  {_DIM}Blocker: {status['error']}{_RST}")
-        if arg == "on" and ready:
-            _cprint(f"  {_DIM}Hermes stays orchestrator; OpenCode is only worker guidance for this session.{_RST}")
-        _cprint(f"  {_DIM}Usage: /opencode [on|off|status]{_RST}")
 
     def _handle_reasoning_command(self, cmd: str):
         """Handle /reasoning — manage effort level and display toggle.
@@ -11687,10 +11323,7 @@ class HermesCLI:
                     "[Voice input — respond concisely and conversationally, "
                     "2-3 sentences max. No code blocks or markdown.] "
                 )
-            _opencode_prefix = self._build_opencode_prefix(message) if isinstance(message, str) else ""
-            _local_message_prefixes = [
-                prefix for prefix in (_voice_prefix, _opencode_prefix) if prefix
-            ]
+            _local_message_prefixes = [prefix for prefix in (_voice_prefix,) if prefix]
             _persist_clean_user_message = (
                 message if _local_message_prefixes and isinstance(message, str) else None
             )

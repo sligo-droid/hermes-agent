@@ -157,7 +157,7 @@ def test_hermes_context_detects_prompt_references_and_cwd(monkeypatch, tmp_path)
     monkeypatch.setattr(cws, "_git_common_dir", lambda cwd: None)
 
     assert cws.message_references_hermes_repo("update the Hermes repo CLI command")
-    assert cws.message_references_hermes_repo("fix /home/droid/hermes run_agent.py")
+    assert cws.message_references_hermes_repo(f"fix {hermes_root} run_agent.py")
     assert cws.message_references_hermes_repo("add tests in ~/hermes")
     assert cws.cwd_is_hermes_repo(str(hermes_root / "agent"))
 

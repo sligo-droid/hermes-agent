@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 @dataclass
 class CodingWorkerStatus:
@@ -361,8 +363,11 @@ def _inside_path(path: Path, root: Path) -> bool:
 
 
 def _known_hermes_roots() -> tuple[Path, ...]:
-    home = Path.home()
-    return (Path("/home/droid/hermes"), home / "hermes")
+    roots = [_REPO_ROOT]
+    home_checkout = Path.home() / "hermes"
+    if home_checkout != _REPO_ROOT:
+        roots.append(home_checkout)
+    return tuple(roots)
 
 
 def _git_common_dir(cwd: Path) -> Optional[Path]:
@@ -395,8 +400,11 @@ def message_references_hermes_repo(message: str) -> bool:
     if not isinstance(message, str):
         return False
     lower = message.lower()
-    if "/home/droid/hermes" in lower or "~/hermes" in lower:
+    if "~/hermes" in lower:
         return True
+    for root in _known_hermes_roots():
+        if str(root).lower() in lower:
+            return True
     return bool(re.search(r"\bhermes\s+(?:repo|codebase)\b", lower))
 
 

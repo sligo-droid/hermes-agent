@@ -55,6 +55,7 @@ def test_prepare_worker_home_writes_complete_pool_auth(tmp_path, monkeypatch):
 
     source_home = tmp_path / "source-codex"
     _write_codex_auth(source_home, access="cli-access", refresh="cli-refresh", id_token="cli-id")
+    (source_home / "credentials.json").write_text('{"secret":"do-not-copy"}', encoding="utf-8")
     monkeypatch.setenv("CODEX_HOME", str(source_home))
 
     entry = SimpleNamespace(
@@ -76,6 +77,55 @@ def test_prepare_worker_home_writes_complete_pool_auth(tmp_path, monkeypatch):
     assert payload["tokens"]["refresh_token"] == "pool-refresh"
     assert payload["tokens"]["id_token"] == "pool-id"
     assert payload["tokens"]["account_id"] == "acct-pool"
+    assert not (tmp_path / "worker-codex" / "credentials.json").exists()
+
+
+def test_create_worker_home_lease_cleans_up_auth_material(tmp_path, monkeypatch):
+    from agent import credential_pool
+    from agent.codex_worker_auth import create_codex_worker_home
+
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    entry = SimpleNamespace(
+        id="pool-1",
+        access_token="pool-access",
+        refresh_token="pool-refresh",
+        id_token="pool-id",
+        last_status=None,
+    )
+    monkeypatch.setattr(credential_pool, "load_pool", lambda provider: FakePool(entry))
+
+    lease = create_codex_worker_home(prefix="test-")
+    auth_path = lease.path / "auth.json"
+
+    assert auth_path.exists()
+    assert str(lease.path).startswith(str(hermes_home / "tmp" / "codex-worker-homes"))
+    lease.cleanup()
+    assert not lease.path.exists()
+
+
+def test_cleanup_worker_home_only_removes_allowed_temp_homes(tmp_path, monkeypatch):
+    from agent.codex_worker_auth import cleanup_codex_worker_home
+
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    managed = hermes_home / "tmp" / "codex-worker-homes" / "worker-1"
+    managed.mkdir(parents=True)
+    (managed / "auth.json").write_text("{}", encoding="utf-8")
+    real_home = tmp_path / "real-codex-home"
+    real_home.mkdir()
+    (real_home / "auth.json").write_text("{}", encoding="utf-8")
+
+    cleanup_codex_worker_home(managed)
+    cleanup_codex_worker_home(real_home)
+
+    assert not managed.exists()
+    assert real_home.exists()
+    assert (real_home / "auth.json").exists()
+
+    monkeypatch.setenv("HERMES_CODEX_WORKER_CLEANUP_ROOT", str(real_home))
+    cleanup_codex_worker_home(real_home)
+    assert not real_home.exists()
 
 
 def test_prepare_worker_home_skips_pool_auth_without_id_token(tmp_path, monkeypatch):

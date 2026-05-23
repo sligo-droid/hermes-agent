@@ -134,7 +134,7 @@ def test_configured_channel_cwd_applies_to_threads(tmp_path):
     db.close()
 
 
-def test_admin_human_and_infra_are_not_project_mapped(tmp_path):
+def test_configured_channel_and_category_names_are_not_project_mapped(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -144,11 +144,13 @@ def test_admin_human_and_infra_are_not_project_mapped(tmp_path):
         FakeChannel(channel_id="admin", name="admin", guild=guild),
         session_db=db,
         workspace_root=workspace,
+        config={"discord": {"project_mapping_ignored_channel_names": "admin"}},
     ) is None
     assert resolve_discord_project_context(
         FakeChannel(channel_id="human", name="pid-human", guild=guild),
         session_db=db,
         workspace_root=workspace,
+        config={"discord": {"project_mapping_ignored_channel_names": "*human*"}},
     ) is None
     assert resolve_discord_project_context(
         FakeChannel(
@@ -159,6 +161,7 @@ def test_admin_human_and_infra_are_not_project_mapped(tmp_path):
         ),
         session_db=db,
         workspace_root=workspace,
+        config={"discord": {"project_mapping_ignored_category_names": "infra"}},
     ) is None
     db.close()
 

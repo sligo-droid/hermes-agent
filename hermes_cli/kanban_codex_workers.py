@@ -13,7 +13,12 @@ from hermes_cli.discord_worker_boards import ROLE_ASSIGNEES, ROLE_DEV, ROLE_PLAN
 
 _OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV}
 _SENSITIVE_ENV_FRAGMENTS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "ACCESS_KEY")
-_CODEX_WORKER_ENV_KEYS = ("CODEX_HOME", "HERMES_CODEX_WORKER_CREDENTIAL_ID")
+_CODEX_WORKER_ENV_KEYS = (
+    "CODEX_HOME",
+    "HERMES_CODEX_WORKER_CREDENTIAL_ID",
+    "HERMES_CODEX_WORKER_CLEANUP_HOME",
+    "HERMES_CODEX_WORKER_CLEANUP_ROOT",
+)
 _WORKER_CONTAINER_ENV_PREFIXES = (
     "HERMES_",
     "CODEX_",
@@ -306,6 +311,8 @@ def _spawn_host_worker(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if codex_home is not None:
         env["CODEX_HOME"] = str(codex_home)
+        env["HERMES_CODEX_WORKER_CLEANUP_HOME"] = "1"
+        env["HERMES_CODEX_WORKER_CLEANUP_ROOT"] = str(codex_home.parent)
     if inherited_credential_id:
         env["HERMES_CODEX_WORKER_CREDENTIAL_ID"] = inherited_credential_id
     gh_config_dir = _github_cli_config_dir(env)
@@ -358,6 +365,8 @@ def _spawn_docker_worker(
             "HERMES_CODEX_WORKER_SERVICE_TIER": settings["service_tier"],
             "HERMES_CODING_WORKER_BACKEND": backend,
             "CODEX_HOME": "/codex-home",
+            "HERMES_CODEX_WORKER_CLEANUP_HOME": "1",
+            "HERMES_CODEX_WORKER_CLEANUP_ROOT": "/codex-home",
             "PYTHONPATH": "/hermes",
         }
     )
@@ -411,9 +420,11 @@ def _spawn_docker_worker(
 
 
 def _codex_home(task: Any, cfg: dict[str, Any]) -> Path:
+    from hermes_constants import get_hermes_home
+
     root = Path(
         cfg.get("codex_home_root")
-        or (Path.home() / ".hermes" / "codex-worker-homes")
+        or (get_hermes_home() / "tmp" / "codex-worker-homes")
     )
     path = root / str(getattr(task, "id", "task"))
     path.mkdir(parents=True, exist_ok=True)

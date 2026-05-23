@@ -1414,6 +1414,8 @@ DEFAULT_CONFIG = {
         "feature_request_channels": "", # Channel IDs where @mention asks skip LLM feature triage
         "project_channel_cwd": "",     # Cwd for mapped project channels; project_path still injects mapped repo context
         "channel_cwds": {},            # Per-channel cwd overrides keyed by Discord channel ID
+        "project_mapping_ignored_channel_names": "",  # Comma-separated channel name/glob patterns ignored by project auto-mapping
+        "project_mapping_ignored_category_names": "", # Comma-separated category name/glob patterns ignored by project auto-mapping
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
         "thread_require_mention": False,  # If True, require @mention in threads too (multi-bot threads)
         "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)

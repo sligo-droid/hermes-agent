@@ -102,6 +102,7 @@ def _write_codex_pool_with_exhausted_primary(hermes_home: Path) -> None:
                             "source": "manual:device_code",
                             "access_token": "access-2",
                             "refresh_token": "refresh-2",
+                            "id_token": "id-2",
                         },
                     ]
                 },
@@ -160,6 +161,7 @@ class TestRunConversationCodexPath:
         assert agent._codex_worker_credential_id == "cred-2"
         assert payload["tokens"]["access_token"] == "access-2"
         assert payload["tokens"]["refresh_token"] == "refresh-2"
+        assert payload["tokens"]["id_token"] == "id-2"
 
     def test_activity_summary_tracks_codex_runtime(self, monkeypatch):
         """Gateway long-running notices use get_activity_summary().
