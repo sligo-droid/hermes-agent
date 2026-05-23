@@ -823,11 +823,15 @@ class CredentialPool:
                     entry.access_token,
                     entry.refresh_token,
                 )
+                extra_updates = dict(entry.extra)
+                if refreshed.get("id_token"):
+                    extra_updates["id_token"] = refreshed["id_token"]
                 updated = replace(
                     entry,
                     access_token=refreshed["access_token"],
                     refresh_token=refreshed["refresh_token"],
                     last_refresh=refreshed.get("last_refresh"),
+                    extra=extra_updates,
                 )
             elif self.provider == "xai-oauth":
                 # Adopt fresher tokens from auth.json before spending the

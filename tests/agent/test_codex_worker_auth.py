@@ -128,7 +128,7 @@ def test_cleanup_worker_home_only_removes_allowed_temp_homes(tmp_path, monkeypat
     assert not real_home.exists()
 
 
-def test_prepare_worker_home_accepts_pool_auth_without_id_token(tmp_path, monkeypatch):
+def test_prepare_worker_home_skips_pool_auth_without_id_token(tmp_path, monkeypatch):
     from agent import credential_pool
     from agent.codex_worker_auth import prepare_codex_worker_home
 
@@ -147,10 +147,56 @@ def test_prepare_worker_home_accepts_pool_auth_without_id_token(tmp_path, monkey
     credential_id = prepare_codex_worker_home(tmp_path / "worker-codex")
 
     payload = json.loads((tmp_path / "worker-codex" / "auth.json").read_text(encoding="utf-8"))
-    assert credential_id == "pool-1"
-    assert payload["tokens"]["access_token"] == "pool-access"
-    assert payload["tokens"]["refresh_token"] == "pool-refresh"
-    assert "id_token" not in payload["tokens"]
+    assert credential_id is None
+    assert payload["tokens"]["access_token"] == "cli-access"
+    assert payload["tokens"]["refresh_token"] == "cli-refresh"
+    assert payload["tokens"]["id_token"] == "cli-id"
+
+
+def test_prepare_worker_home_skips_to_pool_auth_with_id_token(tmp_path, monkeypatch):
+    from agent import credential_pool
+    from agent.codex_worker_auth import prepare_codex_worker_home
+
+    class MultiPool:
+        def __init__(self, entries):
+            self._entries = entries
+
+        def has_credentials(self):
+            return True
+
+        def current(self):
+            return self._entries[0]
+
+        def select(self):
+            return self._entries[0]
+
+        def entries(self):
+            return self._entries
+
+    entries = [
+        SimpleNamespace(
+            id="pool-1",
+            access_token="pool-access-1",
+            refresh_token="pool-refresh-1",
+            last_status=None,
+        ),
+        SimpleNamespace(
+            id="pool-2",
+            access_token="pool-access-2",
+            refresh_token="pool-refresh-2",
+            id_token="pool-id-2",
+            last_status=None,
+        ),
+    ]
+    monkeypatch.setattr(credential_pool, "load_pool", lambda provider: MultiPool(entries))
+
+    credential_id = prepare_codex_worker_home(tmp_path / "worker-codex")
+
+    payload = json.loads((tmp_path / "worker-codex" / "auth.json").read_text(encoding="utf-8"))
+    assert credential_id == "pool-2"
+    assert payload["tokens"]["access_token"] == "pool-access-2"
+    assert payload["tokens"]["refresh_token"] == "pool-refresh-2"
+    assert payload["tokens"]["id_token"] == "pool-id-2"
 
 
 def test_prepare_worker_home_falls_back_when_pool_auth_is_incomplete(tmp_path, monkeypatch):

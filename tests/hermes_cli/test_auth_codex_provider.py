@@ -13,7 +13,9 @@ from hermes_cli.auth import (
     AuthError,
     DEFAULT_CODEX_BASE_URL,
     PROVIDER_REGISTRY,
+    _codex_device_code_login,
     _read_codex_tokens,
+    _refresh_codex_auth_tokens,
     _save_codex_tokens,
     _import_codex_cli_tokens,
     _login_openai_codex,
@@ -221,6 +223,22 @@ class _StubHTTPClient:
         return self._response
 
 
+class _SequenceHTTPClient:
+    def __init__(self, responses):
+        self._responses = responses
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def post(self, *args, **kwargs):
+        if not self._responses:
+            raise AssertionError("unexpected HTTP POST")
+        return self._responses.pop(0)
+
+
 def _patch_httpx(monkeypatch, response):
     def _factory(*args, **kwargs):
         return _StubHTTPClient(response)
@@ -313,6 +331,80 @@ def test_refresh_falls_back_to_generic_message_on_unparseable_body(monkeypatch):
     # invalid/expired — force relogin even without a parseable error body.
     assert err.relogin_required is True
     assert "status 401" in str(err)
+
+
+def test_refresh_codex_oauth_pure_returns_id_token(monkeypatch):
+    response = _StubHTTPResponse(
+        200,
+        {
+            "access_token": "access-new",
+            "refresh_token": "refresh-new",
+            "id_token": "id-new",
+        },
+    )
+    _patch_httpx(monkeypatch, response)
+
+    refreshed = refresh_codex_oauth_pure("access-old", "refresh-old")
+
+    assert refreshed["access_token"] == "access-new"
+    assert refreshed["refresh_token"] == "refresh-new"
+    assert refreshed["id_token"] == "id-new"
+
+
+def test_refresh_codex_auth_tokens_persists_id_token(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(hermes_home, access_token="access-old", refresh_token="refresh-old")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(
+        "hermes_cli.auth.refresh_codex_oauth_pure",
+        lambda access, refresh, timeout_seconds=20.0: {
+            "access_token": "access-new",
+            "refresh_token": "refresh-new",
+            "id_token": "id-new",
+        },
+    )
+
+    updated = _refresh_codex_auth_tokens(
+        {"access_token": "access-old", "refresh_token": "refresh-old"},
+        timeout_seconds=20.0,
+    )
+    stored = _read_codex_tokens()["tokens"]
+
+    assert updated["id_token"] == "id-new"
+    assert stored["id_token"] == "id-new"
+
+
+def test_codex_device_code_login_returns_id_token(monkeypatch):
+    responses = [
+        _StubHTTPResponse(
+            200,
+            {"user_code": "USER-CODE", "device_auth_id": "device-id", "interval": 3},
+        ),
+        _StubHTTPResponse(
+            200,
+            {"authorization_code": "auth-code", "code_verifier": "verifier"},
+        ),
+        _StubHTTPResponse(
+            200,
+            {
+                "access_token": "access-new",
+                "refresh_token": "refresh-new",
+                "id_token": "id-new",
+            },
+        ),
+    ]
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.httpx.Client",
+        lambda *args, **kwargs: _SequenceHTTPClient(responses),
+    )
+    monkeypatch.setattr("hermes_cli.auth.time.sleep", lambda seconds: None)
+
+    creds = _codex_device_code_login()
+
+    assert creds["tokens"]["access_token"] == "access-new"
+    assert creds["tokens"]["refresh_token"] == "refresh-new"
+    assert creds["tokens"]["id_token"] == "id-new"
 
 
 def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypatch):
