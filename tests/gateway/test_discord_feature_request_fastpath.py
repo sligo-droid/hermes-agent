@@ -81,6 +81,11 @@ def _patch_agent_runtime(monkeypatch):
     _install_fake_agent(monkeypatch)
     monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_load_reasoning_config",
+        staticmethod(lambda: {"enabled": True, "effort": "high"}),
+    )
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
     monkeypatch.setattr(
         gateway_run,
@@ -142,6 +147,7 @@ async def test_discord_feature_request_fast_path_adds_guidance_and_zero_tool_del
     init = _CapturingAgent.last_init
     assert init is not None
     assert init["tool_delay"] == 0.0
+    assert init["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
     assert init.get("skip_memory", False) is False
     assert "Discord feature-request thread guidance" in init["ephemeral_system_prompt"]
     assert init["ephemeral_system_prompt"].endswith("Global prompt")
@@ -166,7 +172,48 @@ async def test_discord_goal_feature_summary_does_not_use_fast_path(monkeypatch):
     init = _CapturingAgent.last_init
     assert init is not None
     assert "tool_delay" not in init
+    assert init["reasoning_config"] == {"enabled": True, "effort": "high"}
     assert "Discord feature-request thread guidance" not in str(init.get("ephemeral_system_prompt") or "")
+
+
+@pytest.mark.asyncio
+async def test_discord_feature_request_reasoning_override_is_configurable(monkeypatch):
+    _install_fake_agent(monkeypatch)
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"discord": {"feature_request_reasoning_effort": "low"}},
+    )
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_load_reasoning_config",
+        staticmethod(lambda: {"enabled": True, "effort": "high"}),
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+    runner = _make_runner()
+    _CapturingAgent.last_init = None
+
+    await _run_discord_agent(
+        runner,
+        {"initial_request": "Build it", "message_id": "300", "kanban_board": None},
+    )
+
+    assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "low"}
 
 
 @pytest.mark.asyncio

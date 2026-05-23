@@ -1412,6 +1412,35 @@ def test_runner_persists_discord_kanban_fallback_title(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_discord_feature_summary_title_uses_request_not_stale_session_title():
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._session_db = SimpleNamespace(get_session_title=lambda _session_id: "Unrelated stale title")
+    adapter = SimpleNamespace(update_feature_summary=AsyncMock())
+    runner.adapters = {Platform.DISCORD: adapter}
+    source = SessionSource(platform=Platform.DISCORD, chat_id="200", chat_type="thread")
+    feature_summary = {
+        "message_id": "300",
+        "initial_request": "investigate and fix thread 1507755696501030933",
+        "kanban_board": None,
+    }
+
+    assert await runner._update_discord_summaries(
+        source=source,
+        feature_summary=feature_summary,
+        final_response="Fixed.",
+        status="Complete",
+        session_id="session-1",
+    )
+
+    adapter.update_feature_summary.assert_awaited_once_with(
+        feature_summary,
+        final_response="Fixed.",
+        status="Complete",
+        title="investigate and fix thread 1507755696501030933",
+    )
+
+
+@pytest.mark.asyncio
 async def test_runner_registers_discord_summary_post_delivery_callback():
     runner = object.__new__(gateway_run.GatewayRunner)
     runner._session_db = None

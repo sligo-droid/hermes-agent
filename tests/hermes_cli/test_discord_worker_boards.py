@@ -1484,7 +1484,7 @@ def test_worker_ticket_terminal_endpoint_returns_auth_scoped_feed(monkeypatch, t
         kanban_db._append_worker_log_line(log_path, f"[codex worker] retained full log line {i}")
     kanban_db._append_worker_log_line(
         log_path,
-        "[kanban dispatcher] scheduled Codex role worker: role=planner reasoning=high mode=fast",
+        "[kanban dispatcher] scheduled Codex role worker: role=planner reasoning=xhigh mode=fast",
     )
     kanban_db._append_worker_log_line(
         log_path,
@@ -1560,7 +1560,7 @@ def test_worker_ticket_terminal_endpoint_returns_auth_scoped_feed(monkeypatch, t
     assert data["current_run"]["id"] == claimed.current_run_id
     assert data["lines"][0] == f"$ ticket {task.id}"
     assert "[codex worker] retained full log line 0" in "\n".join(data["lines"])
-    assert "scheduled Codex role worker: role=planner reasoning=high mode=fast" in "\n".join(data["lines"])
+    assert "scheduled Codex role worker: role=planner reasoning=xhigh mode=fast" in "\n".join(data["lines"])
     assert "completed: Read /home/droid/private/config.yaml" in "\n".join(data["lines"])
     assert data["lines"].index("# worker terminal") < data["lines"].index("# codex app worker log")
     assert "commandExecution status=completed cwd=/home/droid/private exit=0 duration=123ms output hidden" in "\n".join(data["lines"])
@@ -1670,7 +1670,7 @@ def test_worker_run_profile_renders_without_fastapi():
             "label": "1-pass simple build",
             "pass_count": 1,
             "plan_used": False,
-            "passes": [{"name": "build", "agent": "build", "reasoning": "high"}],
+            "passes": [{"name": "build", "agent": "build", "reasoning": "xhigh"}],
         },
         "service_tier": "normal",
         "fast_mode": False,
@@ -1692,9 +1692,9 @@ def test_worker_run_profile_renders_without_fastapi():
         codex_state={"result": result},
     )
 
-    assert line == "1-pass simple build; build reasoning=high; fast mode=off"
+    assert line == "1-pass simple build; build reasoning=x-high; fast mode=off"
     assert state["summary"] == line
-    assert "worker_run: 1-pass simple build; build reasoning=high; fast mode=off" in feed
+    assert "worker_run: 1-pass simple build; build reasoning=x-high; fast mode=off" in feed
 
 
 def test_worker_ticket_terminal_page_explains_sparse_feed(monkeypatch, tmp_path):
