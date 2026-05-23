@@ -24,6 +24,7 @@ from hermes_cli.discord_worker_boards import (
 )
 
 _OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV}
+_CODEX_AUTH_RETRY_LIMIT = 2
 
 
 def main() -> int:
@@ -173,35 +174,82 @@ def _run_codex(
         except Exception:
             pass
 
-    session = CodexAppServerSession(
-        cwd=workspace,
-        codex_home=os.environ.get("CODEX_HOME"),
-        extra_args=extra_args,
-        env={
-            "HERMES_DISABLE_MCP": "1",
-            "HERMES_CODEX_WORKER_NETWORK_ACCESS": "1",
-        },
-        on_event=on_event,
-    )
-    try:
-        result = session.run_turn(prompt, turn_timeout=_role_timeout(role))
-        _attach_scheduled_runtime(result, role)
+    attempt = 0
+    while True:
+        session = CodexAppServerSession(
+            cwd=workspace,
+            codex_home=os.environ.get("CODEX_HOME"),
+            extra_args=extra_args,
+            env={
+                "HERMES_DISABLE_MCP": "1",
+                "HERMES_CODEX_WORKER_NETWORK_ACCESS": "1",
+            },
+            on_event=on_event,
+        )
         try:
-            record_codex_worker_result(task_id, board=board, result=result)
-        except Exception:
-            pass
-        return result
-    finally:
-        session.close()
-        try:
-            from agent.codex_worker_auth import sync_codex_worker_home
+            result = session.run_turn(prompt, turn_timeout=_role_timeout(role))
+            _attach_scheduled_runtime(result, role)
+            try:
+                record_codex_worker_result(task_id, board=board, result=result)
+            except Exception:
+                pass
+        finally:
+            session.close()
+            try:
+                from agent.codex_worker_auth import sync_codex_worker_home
 
-            sync_codex_worker_home(
-                os.environ.get("CODEX_HOME"),
-                os.environ.get("HERMES_CODEX_WORKER_CREDENTIAL_ID"),
-            )
-        except Exception:
-            pass
+                sync_codex_worker_home(
+                    os.environ.get("CODEX_HOME"),
+                    os.environ.get("HERMES_CODEX_WORKER_CREDENTIAL_ID"),
+                )
+            except Exception:
+                pass
+
+        if not _codex_result_auth_failed(result) or attempt >= _CODEX_AUTH_RETRY_LIMIT:
+            return result
+        if not _rotate_codex_worker_credential_after_auth_failure(result):
+            return result
+        attempt += 1
+
+
+def _codex_result_auth_failed(result: Any) -> bool:
+    if bool(getattr(result, "auth_failed", False)):
+        return True
+    error = str(getattr(result, "error", "") or "").lower()
+    return "codex authentication failed" in error
+
+
+def _rotate_codex_worker_credential_after_auth_failure(result: Any) -> bool:
+    failed_credential_id = os.environ.get("HERMES_CODEX_WORKER_CREDENTIAL_ID", "").strip()
+    codex_home = os.environ.get("CODEX_HOME", "").strip()
+    if not failed_credential_id or not codex_home:
+        return False
+
+    try:
+        from agent.codex_worker_auth import (
+            mark_codex_worker_credential_auth_failed,
+            prepare_codex_worker_home,
+        )
+    except Exception:
+        return False
+
+    if not mark_codex_worker_credential_auth_failed(
+        failed_credential_id,
+        message=str(getattr(result, "error", "") or "Codex worker auth failure."),
+    ):
+        return False
+
+    source_env = os.environ.copy()
+    source_env.pop("CODEX_HOME", None)
+    source_env.pop("HERMES_CODEX_WORKER_CREDENTIAL_ID", None)
+    next_credential_id = prepare_codex_worker_home(
+        codex_home,
+        source_env=source_env,
+    )
+    if not next_credential_id or next_credential_id == failed_credential_id:
+        return False
+    os.environ["HERMES_CODEX_WORKER_CREDENTIAL_ID"] = next_credential_id
+    return True
 
 
 def _run_opencode(

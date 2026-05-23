@@ -1,4 +1,5 @@
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,6 +30,19 @@ def _write_codex_auth(path: Path, *, access: str, refresh: str, id_token: str) -
                     "id_token": id_token,
                     "account_id": "acct-" + access,
                 },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_pool_auth(hermes_home: Path, entries: list[dict]) -> None:
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credential_pool": {"openai-codex": entries},
             }
         ),
         encoding="utf-8",
@@ -90,3 +104,108 @@ def test_prepare_worker_home_falls_back_when_pool_auth_is_incomplete(tmp_path, m
     assert payload["tokens"]["access_token"] == "cli-access"
     assert payload["tokens"]["refresh_token"] == "cli-refresh"
     assert payload["tokens"]["id_token"] == "cli-id"
+
+
+def test_prepare_worker_home_skips_auth_failed_pool_credentials(tmp_path, monkeypatch):
+    from agent.codex_worker_auth import prepare_codex_worker_home
+
+    now = time.time()
+    _write_pool_auth(
+        tmp_path / "hermes-home",
+        [
+            {
+                "id": "cred-1",
+                "label": "primary",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "manual:device_code",
+                "access_token": "access-1",
+                "refresh_token": "refresh-1",
+                "id_token": "id-1",
+                "last_status": "exhausted",
+                "last_status_at": now,
+                "last_error_code": 401,
+                "last_error_reason": "token_invalidated",
+                "last_error_reset_at": now + 3600,
+            },
+            {
+                "id": "cred-2",
+                "label": "secondary",
+                "auth_type": "oauth",
+                "priority": 1,
+                "source": "manual:device_code",
+                "access_token": "access-2",
+                "refresh_token": "refresh-2",
+                "id_token": "id-2",
+                "last_status": "exhausted",
+                "last_status_at": now,
+                "last_error_code": 401,
+                "last_error_reason": "token_revoked",
+                "last_error_reset_at": now + 3600,
+            },
+            {
+                "id": "cred-3",
+                "label": "working",
+                "auth_type": "oauth",
+                "priority": 2,
+                "source": "manual:device_code",
+                "access_token": "access-3",
+                "refresh_token": "refresh-3",
+                "id_token": "id-3",
+            },
+        ],
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+
+    credential_id = prepare_codex_worker_home(tmp_path / "worker-codex")
+
+    payload = json.loads((tmp_path / "worker-codex" / "auth.json").read_text(encoding="utf-8"))
+    assert credential_id == "cred-3"
+    assert payload["tokens"]["access_token"] == "access-3"
+    assert payload["tokens"]["refresh_token"] == "refresh-3"
+
+
+def test_mark_worker_credential_auth_failed_exhausts_pool_entry(tmp_path, monkeypatch):
+    from agent.codex_worker_auth import mark_codex_worker_credential_auth_failed
+    from agent.credential_pool import STATUS_EXHAUSTED, load_pool
+
+    hermes_home = tmp_path / "hermes-home"
+    _write_pool_auth(
+        hermes_home,
+        [
+            {
+                "id": "cred-1",
+                "label": "primary",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "manual:device_code",
+                "access_token": "access-1",
+                "refresh_token": "refresh-1",
+                "id_token": "id-1",
+            },
+            {
+                "id": "cred-2",
+                "label": "working",
+                "auth_type": "oauth",
+                "priority": 1,
+                "source": "manual:device_code",
+                "access_token": "access-2",
+                "refresh_token": "refresh-2",
+                "id_token": "id-2",
+            },
+        ],
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    marked = mark_codex_worker_credential_auth_failed(
+        "cred-1",
+        message="Your access token could not be refreshed because your refresh token was revoked.",
+    )
+
+    pool = load_pool("openai-codex")
+    entries = {entry.id: entry for entry in pool.entries()}
+    assert marked is True
+    assert entries["cred-1"].last_status == STATUS_EXHAUSTED
+    assert entries["cred-1"].last_error_code == 401
+    assert entries["cred-1"].last_error_reason == "worker_auth_failed"
+    assert pool.select().id == "cred-2"

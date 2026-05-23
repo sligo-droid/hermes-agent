@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,6 +47,19 @@ def _write_codex_auth(path: Path, *, access: str, refresh: str, id_token: str) -
                     "refresh_token": refresh,
                     "id_token": id_token,
                 },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_pool_auth(hermes_home: Path, entries: list[dict]) -> None:
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credential_pool": {"openai-codex": entries},
             }
         ),
         encoding="utf-8",
@@ -990,6 +1004,101 @@ def test_run_codex_records_app_server_state(monkeypatch, tmp_path):
     assert state["events"][0]["item_type"] == "commandExecution"
     assert "/home/droid/secret" not in rendered
     assert "[REDACTED_PATH]" in rendered
+
+
+def test_run_codex_retries_auth_failure_with_next_pool_credential(monkeypatch, tmp_path):
+    from agent.credential_pool import STATUS_EXHAUSTED, load_pool
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_PLANNER
+
+    hermes_home = tmp_path / "hermes-home"
+    _write_pool_auth(
+        hermes_home,
+        [
+            {
+                "id": "cred-1",
+                "label": "primary",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "manual:device_code",
+                "access_token": "access-1",
+                "refresh_token": "refresh-1",
+                "id_token": "id-1",
+            },
+            {
+                "id": "cred-2",
+                "label": "secondary",
+                "auth_type": "oauth",
+                "priority": 1,
+                "source": "manual:device_code",
+                "access_token": "access-2",
+                "refresh_token": "refresh-2",
+                "id_token": "id-2",
+            },
+        ],
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    codex_home = tmp_path / "worker-codex-home"
+    _write_codex_auth(codex_home, access="access-1", refresh="refresh-1", id_token="id-1")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("HERMES_CODEX_WORKER_CREDENTIAL_ID", "cred-1")
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    session_access_tokens = []
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            payload = json.loads((Path(kwargs["codex_home"]) / "auth.json").read_text(encoding="utf-8"))
+            session_access_tokens.append(payload["tokens"]["access_token"])
+
+        def run_turn(self, prompt, turn_timeout):
+            if len(session_access_tokens) == 1:
+                return SimpleNamespace(
+                    final_text="",
+                    error="Codex authentication failed: refresh token was revoked.",
+                    auth_failed=True,
+                    interrupted=False,
+                    timed_out=False,
+                    should_retire=True,
+                    tool_iterations=0,
+                    turn_id=None,
+                    thread_id=None,
+                )
+            return SimpleNamespace(
+                final_text='{"status":"planned","summary":"ok","tasks":[]}',
+                error=None,
+                auth_failed=False,
+                interrupted=False,
+                timed_out=False,
+                should_retire=False,
+                tool_iterations=1,
+                turn_id="turn-2",
+                thread_id="thread-2",
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(worker, "CodexAppServerSession", FakeSession)
+    monkeypatch.setattr(worker, "record_codex_worker_result", lambda *args, **kwargs: None)
+
+    result = worker._run_codex(
+        "prompt",
+        str(workspace),
+        ROLE_PLANNER,
+        task_id=task.id,
+        board=board.slug,
+    )
+
+    pool_entries = {entry.id: entry for entry in load_pool("openai-codex").entries()}
+    payload = json.loads((codex_home / "auth.json").read_text(encoding="utf-8"))
+    assert result.turn_id == "turn-2"
+    assert session_access_tokens == ["access-1", "access-2"]
+    assert os.environ["HERMES_CODEX_WORKER_CREDENTIAL_ID"] == "cred-2"
+    assert payload["tokens"]["access_token"] == "access-2"
+    assert pool_entries["cred-1"].last_status == STATUS_EXHAUSTED
+    assert pool_entries["cred-1"].last_error_code == 401
 
 
 def test_update_phase_refreshes_worker_updated_at(monkeypatch, tmp_path):
