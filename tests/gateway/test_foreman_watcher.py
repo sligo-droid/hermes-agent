@@ -13,6 +13,7 @@ class ForemanAdapter:
         self.error = error
         self.sent = []
         self.created_threads = []
+        self.created_goals = []
 
     async def send(self, chat_id, content, metadata=None):
         self.sent.append({"chat_id": chat_id, "content": content, "metadata": metadata})
@@ -26,6 +27,20 @@ class ForemanAdapter:
             "thread_id": f"thread-{len(self.created_threads)}",
             "thread_name": kwargs.get("name") or "worker task",
             "message_id": f"message-{len(self.created_threads)}",
+        }
+
+    async def create_foreman_goal_thread(self, parent_chat_id, **kwargs):
+        self.created_goals.append({"parent_chat_id": parent_chat_id, **kwargs})
+        if self.error:
+            raise self.error
+        return {
+            "thread_id": f"goal-thread-{len(self.created_goals)}",
+            "thread_name": kwargs.get("name") or "foreman goal",
+            "message_id": f"goal-message-{len(self.created_goals)}",
+            "guild_id": "guild-1",
+            "parent_channel_id": str(parent_chat_id),
+            "initial_request": kwargs.get("initial_request") or "",
+            "project_context": {"project_name": "Hermes", "project_path": "/repo/hermes"},
         }
 
 
@@ -205,7 +220,7 @@ def test_foreman_watcher_requires_discord_adapter_and_connection(monkeypatch):
     assert disconnected.sent == []
 
 
-def test_foreman_watcher_sends_due_alert_to_fixed_channel_and_mention(monkeypatch):
+def test_foreman_watcher_starts_due_issue_as_internal_goal(monkeypatch):
     _patch_config(monkeypatch, _enabled_config())
     _patch_lock(monkeypatch)
     from hermes_cli import discord_worker_foreman as foreman
@@ -217,30 +232,50 @@ def test_foreman_watcher_sends_due_alert_to_fixed_channel_and_mention(monkeypatc
     failed = []
 
     monkeypatch.setattr(foreman, "collect_foreman_issues", lambda now=None: [first, skipped])
+    monkeypatch.setattr(foreman, "startup_baseline_needed", lambda: False)
 
     def fake_alerts_due(issues, *, config=None, now=None):
         due_calls.append((issues, config, now))
         return [first]
 
     monkeypatch.setattr(foreman, "alerts_due", fake_alerts_due)
-    monkeypatch.setattr(foreman, "render_foreman_alert", lambda issue, mention="": f"{mention} {issue.task_id}")
+    monkeypatch.setattr(foreman, "render_foreman_goal_prompt", lambda issue: f"/goal Fix {issue.task_id}")
+    monkeypatch.setattr(foreman, "foreman_goal_thread_title", lambda issue: f"Foreman {issue.task_id}")
     monkeypatch.setattr(foreman, "record_alert_sent", lambda issue: sent.append(issue.task_id))
     monkeypatch.setattr(foreman, "record_alert_failed", lambda issue, error: failed.append((issue.task_id, error)))
 
     adapter = ForemanAdapter()
-    asyncio.run(_run_one_foreman_tick(monkeypatch, _runner(adapter)))
+    runner = _runner(adapter)
+    goal_events = []
+
+    async def fake_handle_goal(event):
+        goal_events.append(event)
+        return None
+
+    monkeypatch.setattr(runner, "_handle_goal_command", fake_handle_goal)
+    asyncio.run(_run_one_foreman_tick(monkeypatch, runner))
 
     assert [issue.task_id for issue in due_calls[0][0]] == ["t1", "t2"]
     assert due_calls[0][1]["max_alerts_per_tick"] == 50
     assert due_calls[0][1]["daily_cap_per_board"] == 200
     assert due_calls[0][1]["terminal_suppression_age_seconds"] == 0
-    assert adapter.sent == [
+    assert adapter.sent == []
+    assert adapter.created_goals == [
         {
-            "chat_id": "1504252294495998043",
-            "content": "<@1504235933598486580> t1",
-            "metadata": None,
+            "parent_chat_id": "1504252294495998043",
+            "name": "Foreman t1",
+            "initial_request": "/goal Fix t1",
+            "project_context": None,
         }
     ]
+    assert len(goal_events) == 1
+    event = goal_events[0]
+    assert event.text == "/goal Fix t1"
+    assert event.internal is True
+    assert event.source.thread_id == "goal-thread-1"
+    assert event.source.parent_chat_id == "1504252294495998043"
+    assert event.source.user_id == "system:foreman"
+    assert event.feature_summary["message_id"] == "goal-message-1"
     assert sent == ["t1"]
     assert failed == []
 
@@ -255,16 +290,15 @@ def test_foreman_watcher_records_send_result_failure(monkeypatch):
     failed = []
 
     monkeypatch.setattr(foreman, "collect_foreman_issues", lambda now=None: [issue])
+    monkeypatch.setattr(foreman, "startup_baseline_needed", lambda: False)
     monkeypatch.setattr(foreman, "alerts_due", lambda issues, *, config=None, now=None: list(issues))
-    monkeypatch.setattr(foreman, "render_foreman_alert", lambda issue, mention="": "alert")
+    monkeypatch.setattr(foreman, "render_foreman_goal_prompt", lambda issue: "/goal Fix worker")
+    monkeypatch.setattr(foreman, "foreman_goal_thread_title", lambda issue: "Foreman worker")
     monkeypatch.setattr(foreman, "record_alert_sent", lambda issue: sent.append(issue.task_id))
     monkeypatch.setattr(foreman, "record_alert_failed", lambda issue, error: failed.append((issue.task_id, error)))
 
     adapter = ForemanAdapter(
-        result=SimpleNamespace(
-            success=False,
-            error="Authorization: Bearer abc123 ghp_abcdefghijklmnopqrst ~/.hermes/config.yaml",
-        )
+        error=RuntimeError("Authorization: Bearer abc123 ghp_abcdefghijklmnopqrst ~/.hermes/config.yaml")
     )
     asyncio.run(_run_one_foreman_tick(monkeypatch, _runner(adapter)))
 
@@ -284,6 +318,7 @@ def test_foreman_watcher_delegates_terminal_suppression_to_alerts_due(monkeypatc
     due_configs = []
 
     monkeypatch.setattr(foreman, "collect_foreman_issues", lambda now=None: [old, recent])
+    monkeypatch.setattr(foreman, "startup_baseline_needed", lambda: False)
     monkeypatch.setattr(
         foreman,
         "alerts_due",
@@ -294,6 +329,35 @@ def test_foreman_watcher_delegates_terminal_suppression_to_alerts_due(monkeypatc
 
     assert [issue.task_id for issue in due_inputs] == ["old", "recent"]
     assert due_configs[0]["terminal_suppression_age_seconds"] == 3600
+
+
+def test_foreman_watcher_baselines_existing_startup_issues(monkeypatch):
+    _patch_config(monkeypatch, _enabled_config())
+    _patch_lock(monkeypatch)
+    from hermes_cli import discord_worker_foreman as foreman
+
+    issue = _issue("historical")
+    baselined = []
+
+    monkeypatch.setattr(foreman, "collect_foreman_issues", lambda now=None: [issue])
+    monkeypatch.setattr(foreman, "startup_baseline_needed", lambda: True)
+    monkeypatch.setattr(
+        foreman,
+        "record_startup_baseline",
+        lambda issues, *, config=None, now=None: baselined.extend(issues) or len(issues),
+    )
+    monkeypatch.setattr(
+        foreman,
+        "alerts_due",
+        lambda issues, *, config=None, now=None: (_ for _ in ()).throw(AssertionError("must not alert")),
+    )
+
+    adapter = ForemanAdapter()
+    asyncio.run(_run_one_foreman_tick(monkeypatch, _runner(adapter)))
+
+    assert [item.task_id for item in baselined] == ["historical"]
+    assert adapter.sent == []
+    assert adapter.created_goals == []
 
 
 def test_foreman_watcher_active_guard_prevents_duplicate_runner_loop(monkeypatch):

@@ -819,6 +819,7 @@ class DiscordAdapter(BasePlatformAdapter):
         bucket[key] = {
             "thread_id": thread_id,
             "message_id": message_id,
+            "summary_channel_id": str(handle.get("summary_channel_id") or ""),
             "guild_id": str(handle.get("guild_id") or identity.get("guild_id") or ""),
             "parent_channel_id": str(
                 handle.get("parent_channel_id") or identity.get("parent_channel_id") or ""
@@ -1050,7 +1051,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 str(stored.get("thread_id") or "") == scope["thread_id"]
                 and str(stored.get("message_id") or "") == scope["message_id"]
             ):
-                for field in ("guild_id", "parent_channel_id", "project_context", "kanban_board"):
+                for field in (
+                    "guild_id",
+                    "parent_channel_id",
+                    "summary_channel_id",
+                    "project_context",
+                    "kanban_board",
+                ):
                     if field in handle:
                         stored[field] = handle.get(field) or None
                 stored["updated_at"] = time.time()
@@ -1874,9 +1881,12 @@ class DiscordAdapter(BasePlatformAdapter):
         else:
             status = self._feature_kanban_summary_status(handle) or status
         try:
+            summary_channel_id = str(handle.get("summary_channel_id") or handle.get("thread_id") or "")
+            thread_id = str(handle.get("thread_id") or "")
+            fallback_channel = handle.get("_thread_obj") if summary_channel_id == thread_id else None
             thread = await self._resolve_summary_channel(
-                str(handle.get("thread_id") or ""),
-                fallback=handle.get("_thread_obj"),
+                summary_channel_id,
+                fallback=fallback_channel,
                 raise_errors=kanban_sync,
             )
         except Exception as exc:
@@ -6490,6 +6500,90 @@ class DiscordAdapter(BasePlatformAdapter):
             handle["message_id"] = str(getattr(msg, "id", "") or "")
         except Exception as exc:
             logger.warning("[%s] Worker task feature summary send failed: %s", self.name, exc)
+        return handle
+
+    async def create_foreman_goal_thread(
+        self,
+        parent_chat_id: str,
+        *,
+        name: str,
+        initial_request: str,
+        project_context: Optional[Dict[str, Any]] = None,
+        auto_archive_duration: int = 1440,
+    ) -> Optional[Dict[str, Any]]:
+        """Create a #dev goal thread anchored by a feature-summary embed."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return None
+
+        try:
+            parent_id = int(parent_chat_id)
+        except (TypeError, ValueError):
+            return None
+
+        try:
+            parent = self._client.get_channel(parent_id)
+            if parent is None:
+                parent = await self._client.fetch_channel(parent_id)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Foreman goal thread: cannot resolve parent %s: %s",
+                self.name,
+                parent_chat_id,
+                exc,
+            )
+            return None
+
+        if isinstance(parent, getattr(discord, "DMChannel", ())):
+            return None
+
+        thread_name = re.sub(r"\s+", " ", str(name or "Foreman goal")).strip()
+        thread_name = thread_name[:80] if len(thread_name) <= 80 else thread_name[:77].rstrip() + "..."
+        if not thread_name:
+            thread_name = "Foreman goal"
+
+        resolved_context = project_context if isinstance(project_context, dict) else None
+        if resolved_context is None:
+            resolved_context = self._resolve_project_context_for_channel(parent)
+        metadata = self._collect_discord_project_metadata(resolved_context)
+        embed = self._build_feature_summary_embed(
+            initial_request=initial_request,
+            status="In progress",
+            outcome=initial_request,
+            title=thread_name,
+            metadata=metadata,
+        )
+
+        try:
+            starter = await parent.send(embed=embed)
+            thread = await starter.create_thread(
+                name=thread_name,
+                auto_archive_duration=auto_archive_duration,
+                reason="Hermes foreman internal goal",
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Foreman goal thread: create failed for parent %s: %s",
+                self.name,
+                parent_chat_id,
+                exc,
+            )
+            return None
+
+        handle = {
+            "thread_id": str(getattr(thread, "id", "") or ""),
+            "thread_name": str(getattr(thread, "name", None) or thread_name),
+            "message_id": str(getattr(starter, "id", "") or ""),
+            "summary_channel_id": str(getattr(parent, "id", "") or parent_chat_id),
+            "guild_id": str(getattr(getattr(parent, "guild", None), "id", "") or ""),
+            "parent_channel_id": str(getattr(parent, "id", "") or parent_chat_id),
+            "initial_request": initial_request,
+            "project_context": resolved_context,
+            "kanban_board": None,
+        }
+        try:
+            self._persist_feature_summary_handle(thread, handle)
+        except Exception:
+            logger.debug("[%s] Failed to persist foreman feature summary handle", self.name, exc_info=True)
         return handle
 
     async def send_exec_approval(

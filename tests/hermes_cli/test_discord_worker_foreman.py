@@ -416,6 +416,22 @@ def test_old_terminal_alerts_are_suppressed_before_first_send(monkeypatch, tmp_p
     assert due == [recent]
 
 
+def test_startup_baseline_suppresses_existing_issue_without_hiding_new_issue(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli.discord_worker_foreman import alerts_due, record_startup_baseline, startup_baseline_needed
+
+    historical = _alert_issue(task_id="historical")
+    new_issue = _alert_issue(task_id="new")
+
+    assert startup_baseline_needed() is True
+    assert record_startup_baseline([historical], now=1000) == 1
+    assert startup_baseline_needed() is False
+
+    due = alerts_due([historical, new_issue], now=4600, config={"cooldown_seconds": 1})
+
+    assert due == [new_issue]
+
+
 def test_sanitize_foreman_text_redacts_common_secret_forms():
     from hermes_cli.discord_worker_foreman import sanitize_foreman_text
 
@@ -558,6 +574,39 @@ def test_render_foreman_alert_is_safe_bounded_and_informative():
     assert "/tmp/private" not in rendered
     assert len(rendered) <= DISCORD_ALERT_LIMIT
     assert "[truncated]" in rendered
+
+
+def test_render_foreman_goal_prompt_is_goal_command_safe_and_informative():
+    from hermes_cli.discord_worker_foreman import render_foreman_goal_prompt
+
+    plain_sk_token = "sk-abcdefghijklmnopqrstuvwxyz1234567890"
+    issue = _alert_issue(
+        title=f"Worker failed with Authorization: Bearer abc123 {plain_sk_token} at ~/.hermes/config.yaml",
+        evidence={
+            "run_id": 42,
+            "run_error": f"secret token=abc123 ghp_abcdefghijklmnopqrst {plain_sk_token} at /home/user/log.txt",
+            "session_url": "https://example.test/workers/123",
+            "prompt": "do not expose",
+        },
+    )
+
+    rendered = render_foreman_goal_prompt(issue)
+
+    assert rendered.startswith("/goal Foreman escalation")
+    assert "Problem:" in rendered
+    assert "Goal:" in rendered
+    assert "Evidence:" in rendered
+    assert "Board: discord-123" in rendered
+    assert "Task: t1" in rendered
+    assert "https://example.test/workers/123" in rendered
+    assert "Update, retry, unblock, or close" in rendered
+    assert "prompt" not in rendered
+    assert "Authorization: Bearer abc123" not in rendered
+    assert "token=abc123" not in rendered
+    assert "ghp_abcdefghijklmnopqrst" not in rendered
+    assert plain_sk_token not in rendered
+    assert "~/.hermes/config.yaml" not in rendered
+    assert "/home/user" not in rendered
 
 
 def test_render_foreman_alert_uses_fixed_mention_once_in_normal_alert():
