@@ -33,9 +33,9 @@ _WORKER_CONTAINER_ENV_PREFIXES = (
 _WORKER_CONTAINER_ENV_KEYS = {"PYTHONPATH", "HOME"}
 
 _ROLE_DEFAULT_REASONING = {
-    "planner": "high",
+    "planner": "xhigh",
     "dev": "medium",
-    "reviewer": "high",
+    "reviewer": "xhigh",
 }
 
 

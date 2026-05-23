@@ -51,10 +51,10 @@ def test_simple_task_runs_build_only(monkeypatch, tmp_path):
         "label": "1-pass simple build",
         "pass_count": 1,
         "plan_used": False,
-        "passes": [{"name": "build", "agent": "build", "reasoning": "high"}],
+        "passes": [{"name": "build", "agent": "build", "reasoning": "xhigh"}],
     }
     assert _option(calls[0], "--agent") == "build"
-    assert _option(calls[0], "--variant") == "high"
+    assert _option(calls[0], "--variant") == "xhigh"
     assert calls[0][2] == "Read the attached Hermes worker brief and follow it exactly."
     assert calls[0].index("--file") == len(calls[0]) - 2
 

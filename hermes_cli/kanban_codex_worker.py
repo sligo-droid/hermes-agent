@@ -380,7 +380,7 @@ def _worker_reasoning_effort(role: str) -> str:
     if effort in {"minimal", "low", "medium", "high", "xhigh"}:
         return effort
     if role in {ROLE_PLANNER, ROLE_REVIEWER}:
-        return "high"
+        return "xhigh"
     return "medium"
 
 
@@ -724,12 +724,6 @@ def _github_repo_from_url(url: str) -> Optional[str]:
 
 
 def _resolve_github_repo(worker: dict[str, Any], root: Path) -> Optional[str]:
-    context = worker.get("project_context") if isinstance(worker.get("project_context"), dict) else {}
-    for source in (context, worker):
-        for key in ("github_url", "project_github_url", "repo_url", "repository_url"):
-            repo = _github_repo_from_url(str(source.get(key) or ""))
-            if repo:
-                return repo
     try:
         remote = subprocess.run(
             ["git", "remote", "get-url", "origin"],
@@ -739,10 +733,19 @@ def _resolve_github_repo(worker: dict[str, Any], root: Path) -> Optional[str]:
             timeout=10,
         )
     except Exception:
-        return None
-    if remote.returncode != 0:
-        return None
-    return _github_repo_from_url(remote.stdout)
+        remote = None
+    if remote is not None and remote.returncode == 0:
+        repo = _github_repo_from_url(remote.stdout)
+        if repo:
+            return repo
+
+    context = worker.get("project_context") if isinstance(worker.get("project_context"), dict) else {}
+    for source in (context, worker):
+        for key in ("github_url", "project_github_url", "repo_url", "repository_url"):
+            repo = _github_repo_from_url(str(source.get(key) or ""))
+            if repo:
+                return repo
+    return None
 
 
 def _pr_number_from_url(url: str) -> str:

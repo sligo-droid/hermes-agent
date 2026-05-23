@@ -118,7 +118,7 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     assert captured["cmd"][1:] == ["-m", "hermes_cli.kanban_codex_worker"]
     assert captured["cwd"] == str(workspace.resolve())
     assert captured["env"]["HERMES_CODEX_WORKER_ROLE"] == "planner"
-    assert captured["env"]["HERMES_CODEX_WORKER_REASONING"] == "high"
+    assert captured["env"]["HERMES_CODEX_WORKER_REASONING"] == "xhigh"
     assert captured["env"]["HERMES_CODEX_WORKER_SERVICE_TIER"] == "normal"
     assert captured["env"]["HERMES_KANBAN_BOARD"] == board.slug
     assert captured["env"]["HERMES_DISCORD_WORKER_READ_URL"] == "http://127.0.0.1:9"
@@ -425,6 +425,17 @@ def test_role_extra_args_use_scheduled_runtime_env(monkeypatch):
         "-c", 'model_reasoning_effort="low"',
         "-c", 'service_tier="fast"',
     ]
+
+
+def test_role_extra_args_default_reasoning_by_role(monkeypatch):
+    from hermes_cli import kanban_codex_worker as worker
+
+    monkeypatch.delenv("HERMES_CODEX_WORKER_REASONING", raising=False)
+    monkeypatch.delenv("HERMES_CODEX_WORKER_SERVICE_TIER", raising=False)
+
+    assert worker._role_extra_args("planner")[1] == 'model_reasoning_effort="xhigh"'
+    assert worker._role_extra_args("reviewer")[1] == 'model_reasoning_effort="xhigh"'
+    assert worker._role_extra_args("dev")[1] == 'model_reasoning_effort="medium"'
 
 
 def test_scheduled_runtime_metadata_attaches_to_worker_result(monkeypatch):
@@ -1429,6 +1440,40 @@ def test_ensure_pr_falls_back_to_origin_remote_for_repo(monkeypatch, tmp_path):
     assert pr_create[pr_create.index("--repo") + 1] == "sligo-labs/PID"
     assert pr_create[pr_create.index("--base") + 1] == "main"
     assert pr_create[pr_create.index("--head") + 1] == "discord/remote-pr"
+
+
+def test_ensure_pr_prefers_checkout_remote_over_stale_project_context(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+
+    board = dwb.start_direct_goal(
+        thread_id="stale-context-pr",
+        goal="Ship remote override",
+        project_context={"project_github_url": "https://github.com/sligo-droid/PID"},
+    )
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "remote", "get-url", "origin"]:
+            return SimpleNamespace(returncode=0, stdout="git@github.com:sligo-labs/PID.git\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/124\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr(board.slug, str(workspace)) is True
+
+    pr_list = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "list"])
+    pr_create = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "create"])
+    assert pr_list[pr_list.index("--repo") + 1] == "sligo-labs/PID"
+    assert pr_create[pr_create.index("--repo") + 1] == "sligo-labs/PID"
 
 
 def test_ensure_pr_records_error_when_repo_or_head_missing(monkeypatch, tmp_path):

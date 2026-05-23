@@ -111,6 +111,22 @@ def _is_standard_discord_feature_request(
     return not bool(feature_summary.get("kanban_board"))
 
 
+def _discord_feature_request_reasoning_config(config: Optional[dict]) -> dict | None:
+    """Reasoning override for ordinary Discord feature-request threads."""
+    from hermes_constants import parse_reasoning_effort
+
+    raw = cfg_get(config or {}, "discord", "feature_request_reasoning_effort", default="xhigh")
+    effort = str(raw or "xhigh").strip() or "xhigh"
+    parsed = parse_reasoning_effort(effort)
+    if parsed is not None:
+        return parsed
+    logger.warning(
+        "Unknown discord.feature_request_reasoning_effort '%s', using xhigh",
+        effort,
+    )
+    return parse_reasoning_effort("xhigh")
+
+
 def _gateway_flow_telemetry_fields(
     *,
     route_type: str,
@@ -6069,6 +6085,14 @@ class GatewayRunner:
                 logger.debug("Discord Kanban feature-title persistence failed", exc_info=True)
         return title
 
+    def _fallback_discord_feature_title(self, feature_summary: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not isinstance(feature_summary, dict):
+            return None
+        initial_request = str(feature_summary.get("initial_request") or "").strip()
+        if not initial_request:
+            return None
+        return self._fallback_discord_kanban_feature_title({"fallback_title": initial_request})
+
     def _discord_kanban_summary_sync_key(self, target: Dict[str, Any]) -> str:
         return json.dumps(
             {
@@ -9724,7 +9748,7 @@ class GatewayRunner:
             if work_item_id and source.platform == Platform.DISCORD:
                 try:
                     title = None
-                    if session_entry.session_id and self._session_db:
+                    if session_entry.session_id and self._session_db and not getattr(event, "feature_summary", None):
                         try:
                             title = self._session_db.get_session_title(session_entry.session_id)
                         except Exception:
@@ -12302,11 +12326,17 @@ class GatewayRunner:
         if not adapter:
             return False
         session_db = getattr(self, "_session_db", None)
-        if not title and session_id and session_db:
+        if not title and session_id and session_db and not feature_summary:
             try:
                 title = session_db.get_session_title(session_id)
             except Exception:
                 title = None
+        has_feature_kanban = isinstance(feature_summary, dict) and isinstance(
+            feature_summary.get("kanban_board"),
+            dict,
+        )
+        if feature_summary and not title and not has_feature_kanban:
+            title = self._fallback_discord_feature_title(feature_summary)
         if feature_summary and hasattr(adapter, "update_feature_summary"):
             try:
                 concise_response = await asyncio.to_thread(
@@ -17809,6 +17839,8 @@ class GatewayRunner:
                 source=source,
                 session_key=session_key,
             )
+            if standard_discord_feature_request:
+                reasoning_config = _discord_feature_request_reasoning_config(user_config)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             # Set up stream consumer for token streaming or interim commentary.
@@ -18633,10 +18665,13 @@ class GatewayRunner:
                                     logger.debug("Gateway title callback failed", exc_info=True)
 
                         maybe_auto_title_kwargs["title_callback"] = _run_title_callbacks
+                    title_seed_message = message
+                    if source.platform == Platform.DISCORD and isinstance(feature_summary, dict):
+                        title_seed_message = str(feature_summary.get("initial_request") or "").strip() or message
                     maybe_auto_title(
                         self._session_db,
                         effective_session_id,
-                        message,
+                        title_seed_message,
                         final_response,
                         all_msgs,
                         **maybe_auto_title_kwargs,

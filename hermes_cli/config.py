@@ -1293,7 +1293,7 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "backend": "codex",  # codex | opencode
         "turn_timeout_seconds": 1800,
-        "simple_build_reasoning_level": "high",
+        "simple_build_reasoning_level": "xhigh",
         "complex_plan_reasoning_level": "xhigh",
         "complex_build_reasoning_level": "medium",
         "opencode": {
@@ -1412,6 +1412,7 @@ DEFAULT_CONFIG = {
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "feature_request_channels": "", # Channel IDs where @mention asks skip LLM feature triage
+        "feature_request_reasoning_effort": "xhigh", # Reasoning effort for non-Kanban Discord feature requests
         "project_channel_cwd": "",     # Cwd for mapped project channels; project_path still injects mapped repo context
         "channel_cwds": {},            # Per-channel cwd overrides keyed by Discord channel ID
         "project_mapping_ignored_channel_names": "",  # Comma-separated channel name/glob patterns ignored by project auto-mapping
@@ -1635,9 +1636,9 @@ DEFAULT_CONFIG = {
                 "terminal_suppression_age_seconds": 7 * 24 * 3600,
             },
             "roles": {
-                "planner": {"reasoning": "high", "service_tier": "normal", "max_runtime_seconds": 1800},
+                "planner": {"reasoning": "xhigh", "service_tier": "normal", "max_runtime_seconds": 1800},
                 "dev": {"reasoning": "medium", "service_tier": "normal", "max_runtime_seconds": 3600},
-                "reviewer": {"reasoning": "high", "service_tier": "normal", "max_runtime_seconds": 1800},
+                "reviewer": {"reasoning": "xhigh", "service_tier": "normal", "max_runtime_seconds": 1800},
             },
         },
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
