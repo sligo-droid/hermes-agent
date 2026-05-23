@@ -6189,29 +6189,6 @@ class GatewayRunner:
             text,
         )
 
-    @staticmethod
-    def _discord_foreman_terminal_issue_recent(
-        issue: Any,
-        *,
-        now: int,
-        max_age_seconds: int,
-    ) -> bool:
-        if max_age_seconds <= 0:
-            return True
-        evidence = getattr(issue, "evidence", None)
-        if not isinstance(evidence, dict):
-            return True
-        task_status = str(evidence.get("task_status") or "").lower()
-        if task_status == "running":
-            return True
-        ended_at = evidence.get("run_ended_at")
-        if ended_at in (None, ""):
-            return True
-        try:
-            return now - int(ended_at) <= max_age_seconds
-        except (TypeError, ValueError):
-            return True
-
     async def _discord_worker_foreman_watcher(self) -> None:
         """Optionally scan Discord worker boards and send foreman alerts."""
         if getattr(self, "_discord_worker_foreman_watcher_active", False):
@@ -6261,6 +6238,7 @@ class GatewayRunner:
             interval = float(watcher_cfg["scan_interval_seconds"])
             alert_config = dict(watcher_cfg["alert_config"])
             terminal_age = int(watcher_cfg["terminal_suppression_age_seconds"])
+            alert_config["terminal_suppression_age_seconds"] = terminal_age
             logger.info(
                 "discord foreman: enabled (interval=%.1fs channel=%s)",
                 interval,
@@ -6283,15 +6261,7 @@ class GatewayRunner:
                         else:
                             def _collect_due_alerts() -> list[Any]:
                                 now = int(time.time())
-                                issues = [
-                                    issue
-                                    for issue in _foreman.collect_foreman_issues(now=now)
-                                    if self._discord_foreman_terminal_issue_recent(
-                                        issue,
-                                        now=now,
-                                        max_age_seconds=terminal_age,
-                                    )
-                                ]
+                                issues = _foreman.collect_foreman_issues(now=now)
                                 return _foreman.alerts_due(issues, config=alert_config, now=now)
 
                             due = await asyncio.to_thread(_collect_due_alerts)

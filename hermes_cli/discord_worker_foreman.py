@@ -37,6 +37,7 @@ _ALERT_DEFAULTS = {
     "max_alerts_per_tick": 10,
     "daily_cap_per_board": 20,
     "retention_seconds": 30 * 24 * 3600,
+    "terminal_suppression_age_seconds": 7 * 24 * 3600,
 }
 _MISSING_READ_BROKER_MARKERS = (
     "HERMES_DISCORD_WORKER_READ_URL",
@@ -152,6 +153,7 @@ class BoardSnapshot:
     thread_state: str
     run_summary: dict[str, Any]
     tasks: tuple[TaskSnapshot, ...]
+    archived: bool = False
 
 
 @dataclass(frozen=True)
@@ -220,6 +222,12 @@ def alerts_due(
         if len(due) >= int(cfg["max_alerts_per_tick"]):
             continue
         if _board_daily_count(state, issue.board, now) >= int(cfg["daily_cap_per_board"]):
+            continue
+        if not _terminal_issue_recent(
+            issue,
+            now=now,
+            max_age_seconds=int(cfg["terminal_suppression_age_seconds"]),
+        ):
             continue
         if _is_alert_due(issue, entry, now=now, config=cfg):
             due.append(issue)
@@ -303,7 +311,7 @@ def render_foreman_alert(issue: ForemanIssue, mention: str = "") -> str:
 def collect_board_snapshots() -> list[BoardSnapshot]:
     snapshots: list[BoardSnapshot] = []
     seen_db_paths: set[Path] = set()
-    for meta in kanban_db.list_boards(include_archived=False):
+    for meta in kanban_db.list_boards(include_archived=True):
         board = str(meta.get("slug") or kanban_db.DEFAULT_BOARD)
         worker = meta.get(DISCORD_WORKER_META_KEY)
         if not isinstance(worker, dict) or worker.get("kind") != "discord_worker_board":
@@ -312,11 +320,11 @@ def collect_board_snapshots() -> list[BoardSnapshot]:
         if db_path in seen_db_paths:
             continue
         seen_db_paths.add(db_path)
-        snapshots.append(_build_board_snapshot(board, worker))
+        snapshots.append(_build_board_snapshot(board, worker, archived=bool(meta.get("archived"))))
     return snapshots
 
 
-def _build_board_snapshot(board: str, worker: dict[str, Any]) -> BoardSnapshot:
+def _build_board_snapshot(board: str, worker: dict[str, Any], *, archived: bool = False) -> BoardSnapshot:
     conn = kanban_db.connect(board=board)
     try:
         tasks = kanban_db.list_tasks(conn, include_archived=False)
@@ -345,6 +353,7 @@ def _build_board_snapshot(board: str, worker: dict[str, Any]) -> BoardSnapshot:
         thread_state=board_thread_state(board),
         run_summary=dict(summary) if isinstance(summary, dict) else {},
         tasks=task_snapshots,
+        archived=archived,
     )
 
 
@@ -440,6 +449,7 @@ def _issue(
         "thread_state": snapshot.thread_state,
         "task_status": task.status,
         "task_assignee": task.assignee,
+        "board_archived": snapshot.archived,
     }
     base.update(evidence)
     if snapshot.thread_id:
@@ -634,7 +644,33 @@ def _is_alert_due(issue: ForemanIssue, entry: dict[str, Any], *, now: int, confi
         return True
     if _severity_rank(issue.severity) > _severity_rank(str(entry.get("last_sent_severity") or "")):
         return True
+    if _is_terminal_or_archived_issue(issue):
+        return False
     return now - int(last_sent) >= int(config["cooldown_seconds"])
+
+
+def _is_terminal_or_archived_issue(issue: ForemanIssue) -> bool:
+    evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
+    if bool(evidence.get("board_archived")):
+        return True
+    task_status = str(evidence.get("task_status") or "").casefold()
+    if task_status and task_status != "running":
+        return True
+    thread_state = str(evidence.get("thread_state") or "").casefold()
+    return thread_state in {"done", "archived", "cancelled"}
+
+
+def _terminal_issue_recent(issue: ForemanIssue, *, now: int, max_age_seconds: int) -> bool:
+    if max_age_seconds <= 0 or not _is_terminal_or_archived_issue(issue):
+        return True
+    evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
+    ended_at = evidence.get("run_ended_at")
+    if ended_at in (None, ""):
+        return True
+    try:
+        return now - int(ended_at) <= max_age_seconds
+    except (TypeError, ValueError):
+        return True
 
 
 def _severity_rank(severity: str) -> int:

@@ -235,7 +235,7 @@ def test_duplicate_resolved_db_paths_are_scanned_once(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(foreman.kanban_db, "kanban_db_path", lambda board=None: same_path)
 
-    def fake_snapshot(board, worker):
+    def fake_snapshot(board, worker, *, archived=False):
         seen.append(board)
         return foreman.BoardSnapshot(
             board=board,
@@ -253,6 +253,19 @@ def test_duplicate_resolved_db_paths_are_scanned_once(monkeypatch, tmp_path):
 
     assert [snapshot.board for snapshot in snapshots] == ["discord-1"]
     assert seen == ["discord-1"]
+
+
+def test_collect_board_snapshots_includes_archived_discord_worker_boards(monkeypatch, tmp_path):
+    board = _discord_board(monkeypatch, tmp_path)
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_foreman import collect_board_snapshots
+
+    kanban_db.write_board_metadata(board, archived=True)
+
+    snapshots = collect_board_snapshots()
+
+    assert [snapshot.board for snapshot in snapshots] == [board]
+    assert snapshots[0].archived is True
 
 
 def test_foreman_scan_json_cli_smoke(monkeypatch, tmp_path, capsys):
@@ -285,15 +298,55 @@ def test_alerts_due_resends_on_state_change_severity_escalation_and_cooldown(mon
     _home(monkeypatch, tmp_path)
     from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
 
+    evidence = {**_alert_issue().evidence, "task_status": "running"}
+    issue = _alert_issue(severity="warning", evidence=evidence)
+    record_alert_sent(issue, now=1000)
+
+    changed = _alert_issue(severity="warning", evidence={**issue.evidence, "run_error": "different"})
+    escalated = _alert_issue(severity="error", evidence=evidence)
+
+    assert alerts_due([changed], now=1200) == [changed]
+    assert alerts_due([escalated], now=1200) == [escalated]
+    assert alerts_due([issue], now=4600) == [issue]
+
+
+def test_terminal_alerts_do_not_repeat_after_cooldown_but_state_changes_do(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
+
     issue = _alert_issue(severity="warning")
     record_alert_sent(issue, now=1000)
 
     changed = _alert_issue(severity="warning", evidence={**issue.evidence, "run_error": "different"})
     escalated = _alert_issue(severity="error")
 
-    assert alerts_due([changed], now=1200) == [changed]
-    assert alerts_due([escalated], now=1200) == [escalated]
-    assert alerts_due([issue], now=4600) == [issue]
+    config = {"cooldown_seconds": 1, "terminal_suppression_age_seconds": 30 * 24 * 3600}
+    assert alerts_due([issue], now=4600, config=config) == []
+    assert alerts_due([changed], now=1200, config=config) == [changed]
+    assert alerts_due([escalated], now=1200, config=config) == [escalated]
+
+
+def test_archived_board_alerts_do_not_repeat_after_cooldown(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
+
+    evidence = {**_alert_issue().evidence, "board_archived": True, "task_status": "running"}
+    issue = _alert_issue(evidence=evidence)
+    record_alert_sent(issue, now=1000)
+
+    assert alerts_due([issue], now=4600, config={"cooldown_seconds": 1}) == []
+
+
+def test_old_terminal_alerts_are_suppressed_before_first_send(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli.discord_worker_foreman import alerts_due
+
+    old = _alert_issue(evidence={**_alert_issue().evidence, "run_ended_at": 1})
+    recent = _alert_issue(task_id="recent", evidence={**_alert_issue().evidence, "run_ended_at": 9_000})
+
+    due = alerts_due([old, recent], now=10_000, config={"terminal_suppression_age_seconds": 3600})
+
+    assert due == [recent]
 
 
 def test_alert_failed_schedules_retry_without_marking_sent(monkeypatch, tmp_path):

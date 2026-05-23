@@ -154,6 +154,7 @@ def test_foreman_watcher_sends_due_alert_to_fixed_channel_and_mention(monkeypatc
     assert [issue.task_id for issue in due_calls[0][0]] == ["t1", "t2"]
     assert due_calls[0][1]["max_alerts_per_tick"] == 50
     assert due_calls[0][1]["daily_cap_per_board"] == 200
+    assert due_calls[0][1]["terminal_suppression_age_seconds"] == 0
     assert adapter.sent == [
         {
             "chat_id": "1504252294495998043",
@@ -187,7 +188,7 @@ def test_foreman_watcher_records_send_result_failure(monkeypatch):
     assert failed == [("t1", "token=[redacted] [path]")]
 
 
-def test_foreman_watcher_suppresses_old_terminal_issues(monkeypatch):
+def test_foreman_watcher_delegates_terminal_suppression_to_alerts_due(monkeypatch):
     _patch_config(monkeypatch, _enabled_config(terminal_suppression_age_seconds=3600))
     _patch_lock(monkeypatch)
     monkeypatch.setattr("gateway.run.time.time", lambda: 10_000)
@@ -196,13 +197,19 @@ def test_foreman_watcher_suppresses_old_terminal_issues(monkeypatch):
     old = _issue("old", run_ended_at=1)
     recent = _issue("recent", run_ended_at=9_000)
     due_inputs = []
+    due_configs = []
 
     monkeypatch.setattr(foreman, "collect_foreman_issues", lambda now=None: [old, recent])
-    monkeypatch.setattr(foreman, "alerts_due", lambda issues, *, config=None, now=None: due_inputs.extend(issues) or [])
+    monkeypatch.setattr(
+        foreman,
+        "alerts_due",
+        lambda issues, *, config=None, now=None: due_configs.append(config) or due_inputs.extend(issues) or [],
+    )
 
     asyncio.run(_run_one_foreman_tick(monkeypatch, _runner(ForemanAdapter())))
 
-    assert [issue.task_id for issue in due_inputs] == ["recent"]
+    assert [issue.task_id for issue in due_inputs] == ["old", "recent"]
+    assert due_configs[0]["terminal_suppression_age_seconds"] == 3600
 
 
 def test_foreman_watcher_active_guard_prevents_duplicate_runner_loop(monkeypatch):
