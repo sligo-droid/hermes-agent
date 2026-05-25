@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -24,6 +25,10 @@ GENERIC_MERGE_PREFIXES = (
     "merge branch",
 )
 PR_MERGE_PREFIX = "merge pull request"
+PR_NUMBER_PATTERNS = (
+    re.compile(r"\(#(?P<number>\d+)\)"),
+    re.compile(r"\bmerge pull request #(?P<number>\d+)\b", re.IGNORECASE),
+)
 TEST_SECTION_NAMES = {
     "test",
     "tests",
@@ -69,6 +74,14 @@ def _is_generic_merge_message(message: str) -> bool:
 
 def _is_pull_request_merge_message(message: str) -> bool:
     return message.strip().lower().startswith(PR_MERGE_PREFIX)
+
+
+def _pull_request_number_from_commit_message(message: str) -> int | None:
+    for pattern in PR_NUMBER_PATTERNS:
+        match = pattern.search(message or "")
+        if match:
+            return int(match.group("number"))
+    return None
 
 
 def _section_name(line: str) -> str:
@@ -214,6 +227,7 @@ def build_webhook_payloads(
     event: dict[str, Any],
     *,
     pull_request_lookup: Callable[[str], dict[str, Any] | None] | None = None,
+    pull_request_number_lookup: Callable[[int], dict[str, Any] | None] | None = None,
 ) -> list[dict[str, Any]]:
     """Return Discord webhook payloads for a GitHub push event."""
     if event.get("deleted"):
@@ -234,6 +248,12 @@ def build_webhook_payloads(
             if not sha:
                 continue
             pull_request = pull_request_lookup(sha)
+            if pull_request is None and pull_request_number_lookup is not None:
+                pr_number = _pull_request_number_from_commit_message(
+                    str(commit.get("message") or "")
+                )
+                if pr_number is not None:
+                    pull_request = pull_request_number_lookup(pr_number)
             if pull_request is None:
                 continue
         embeds.append(_commit_embed(event, commit, pull_request))
@@ -317,6 +337,53 @@ def fetch_pull_request_for_commit(
     return None
 
 
+def fetch_pull_request_by_number(
+    repository: str,
+    number: int,
+    token: str,
+    api_url: str = "https://api.github.com",
+) -> dict[str, Any] | None:
+    """Return a PR by number, or None on lookup failure."""
+    repository = repository.strip()
+    token = token.strip()
+    if not repository or number <= 0 or not token:
+        return None
+
+    quoted_repo = quote(repository, safe="/")
+    url = f"{api_url.rstrip('/')}/repos/{quoted_repo}/pulls/{number}"
+    req = request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "hermes-main-commit-logs",
+        },
+        method="GET",
+    )
+    try:
+        with request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        print(
+            f"Warning: PR lookup for #{number} failed with "
+            f"HTTP {exc.code}: {body}",
+            file=sys.stderr,
+        )
+        return None
+    except Exception as exc:
+        print(
+            f"Warning: PR lookup for #{number} failed: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+    if isinstance(data, dict):
+        return data
+    return None
+
+
 def post_payload(webhook_url: str, payload: dict[str, Any]) -> None:
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     req = request.Request(
@@ -371,6 +438,7 @@ def main() -> int:
     github_token = os.getenv("GITHUB_TOKEN", "").strip()
     github_api_url = os.getenv("GITHUB_API_URL", "https://api.github.com").strip()
     pull_request_lookup = None
+    pull_request_number_lookup = None
     if repository and github_token:
         pull_request_lookup = lambda sha: fetch_pull_request_for_commit(
             repository,
@@ -378,10 +446,17 @@ def main() -> int:
             github_token,
             github_api_url,
         )
+        pull_request_number_lookup = lambda number: fetch_pull_request_by_number(
+            repository,
+            number,
+            github_token,
+            github_api_url,
+        )
 
     payloads = build_webhook_payloads(
         event,
         pull_request_lookup=pull_request_lookup,
+        pull_request_number_lookup=pull_request_number_lookup,
     )
     if not payloads:
         print("No main-branch commit notifications to send.")

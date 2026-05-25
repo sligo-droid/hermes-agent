@@ -138,6 +138,55 @@ def test_non_generic_pr_associated_commit_uses_pr_body_and_field():
     } in embed["fields"]
 
 
+def test_squash_merge_message_falls_back_to_pr_number_lookup():
+    mod = _load_module()
+    commit = _commit(30, "fix: improve Discord logs (#130)")
+    pull_request = {
+        "number": 130,
+        "title": "Improve Discord logs",
+        "body": "Post merged PRs even when commit association has not indexed yet.",
+        "html_url": "https://github.com/NousResearch/hermes-agent/pull/130",
+    }
+    seen_sha = []
+    seen_number = []
+
+    payload = mod.build_webhook_payloads(
+        _event([commit]),
+        pull_request_lookup=lambda sha: seen_sha.append(sha) or None,
+        pull_request_number_lookup=lambda number: seen_number.append(number) or pull_request,
+    )[0]
+
+    assert seen_sha == [commit["id"]]
+    assert seen_number == [130]
+    embed = payload["embeds"][0]
+    assert embed["title"] == "Improve Discord logs"
+    assert embed["url"] == "https://github.com/NousResearch/hermes-agent/pull/130"
+    assert embed["description"] == (
+        "Post merged PRs even when commit association has not indexed yet."
+    )
+
+
+def test_merge_pull_request_message_falls_back_to_pr_number_lookup():
+    mod = _load_module()
+    commit = _commit(31, "Merge pull request #131 from sligo-droid/fix/logs")
+    pull_request = {
+        "number": 131,
+        "title": "Catch merged PR logs",
+        "body": "",
+        "html_url": "https://github.com/NousResearch/hermes-agent/pull/131",
+    }
+    seen_number = []
+
+    payload = mod.build_webhook_payloads(
+        _event([commit]),
+        pull_request_lookup=lambda _sha: None,
+        pull_request_number_lookup=lambda number: seen_number.append(number) or pull_request,
+    )[0]
+
+    assert seen_number == [131]
+    assert payload["embeds"][0]["title"] == "Catch merged PR logs"
+
+
 def test_pr_description_strips_tests_section():
     mod = _load_module()
     commit = _commit(7, "Merge pull request #82 from sligo-droid/example")
