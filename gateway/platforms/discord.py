@@ -1858,7 +1858,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         board_handle: Optional[Dict[str, Any]] = None
         request_id = str(source_message_id or "").strip()
-        if self._slash_command_starts_threaded_work(initial_request) or request_id:
+        if self._slash_command_starts_threaded_work(initial_request):
             try:
                 from hermes_cli.discord_worker_boards import ensure_discord_thread_board
 
@@ -7661,16 +7661,6 @@ class DiscordAdapter(BasePlatformAdapter):
         event_text = normalized_content
         if pending_text_injection:
             event_text = f"{event_text}\n\n{pending_text_injection}" if event_text else pending_text_injection
-        feature_kanban_board_slug = self._feature_kanban_board_slug(feature_summary_handle)
-        feature_request_uses_kanban = bool(
-            feature_kanban_board_slug
-            and not slash_command_starts_threaded_work
-            and direct_question_prompt is False
-        )
-        if feature_request_uses_kanban and event_text.strip():
-            event_text = f"/goal {event_text}".strip()
-            msg_type = MessageType.COMMAND
-
         # ── History backfill ─────────────────────────────────────────
         # When require_mention is active, the bot only processes messages
         # that @mention it.  Messages in the channel between bot turns are
@@ -7724,7 +7714,7 @@ class DiscordAdapter(BasePlatformAdapter):
             event_text = "(The user sent a message with no text content)"
 
         _goal_thread_context = None
-        if is_thread and (slash_command_starts_threaded_work or feature_request_uses_kanban):
+        if is_thread and slash_command_starts_threaded_work:
             context_channel = effective_channel if auto_threaded_channel is not None else message.channel
             _goal_thread_context = await self._fetch_goal_thread_context(context_channel, before=message)
 

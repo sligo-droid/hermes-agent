@@ -231,9 +231,9 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
     event = adapter.handle_message.await_args.args[0]
     assert event.project_summary["channel_id"] == "100"
     assert event.feature_summary["thread_id"] == "200"
-    assert event.feature_summary["kanban_board"]["slug"] == "discord-200-m-123"
-    assert event.text == "/goal Build a deploy dashboard"
-    assert event.message_type == MessageType.COMMAND
+    assert event.feature_summary["kanban_board"] is None
+    assert event.text == "Build a deploy dashboard"
+    assert event.message_type == MessageType.TEXT
 
 
 @pytest.mark.asyncio
@@ -351,7 +351,7 @@ async def test_thread_goal_message_creates_per_message_feature_summary(adapter, 
 
 
 @pytest.mark.asyncio
-async def test_thread_feature_message_creates_request_scoped_kanban_board(adapter, monkeypatch, tmp_path):
+async def test_thread_feature_message_does_not_create_request_scoped_kanban_board(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://kanban.example")
@@ -363,15 +363,12 @@ async def test_thread_feature_message_creates_request_scoped_kanban_board(adapte
 
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
-    assert event.text == "/goal Add CSV export"
-    assert event.message_type == MessageType.COMMAND
+    assert event.text == "Add CSV export"
+    assert event.message_type == MessageType.TEXT
     assert event.feature_summary["thread_id"] == "200"
     assert event.feature_summary["message_id"] == "300"
     assert event.feature_summary["source_message_id"] == "503"
-    assert event.feature_summary["kanban_board"] == {
-        "slug": "discord-200-m-503",
-        "public_url": "https://kanban.example/workers/discord-200-m-503",
-    }
+    assert event.feature_summary["kanban_board"] is None
     assert thread.sent[0][0]["reference"] is message
 
 
