@@ -3229,6 +3229,40 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.debug("[%s] Failed to clear Discord terminal reaction sync flag", self.name, exc_info=True)
         return state
 
+    async def send_kanban_completion_notice(self, target: Dict[str, Any]) -> Optional[str]:
+        """Post a one-shot text notice when a Discord Kanban goal finishes."""
+        if str(target.get("state") or "").strip() != "done":
+            return None
+        if not target.get("terminal_completion_message_pending"):
+            return None
+        board = str(target.get("board") or "").strip()
+        thread_id = str(target.get("thread_id") or "").strip()
+        chat_id = str(target.get("chat_id") or thread_id).strip()
+        if not board or not thread_id:
+            return None
+
+        result = await self.send(
+            chat_id or thread_id,
+            "Goal completed",
+            metadata={"thread_id": thread_id},
+        )
+        if not getattr(result, "success", False):
+            logger.debug(
+                "[%s] Failed to send Discord Kanban completion notice for board %s: %s",
+                self.name,
+                board,
+                getattr(result, "error", None),
+            )
+            return None
+        try:
+            from hermes_cli.discord_worker_boards import mark_thread_status_synced
+
+            mark_thread_status_synced(board, completion_message=True)
+        except Exception:
+            logger.debug("[%s] Failed to clear Discord terminal completion notice flag", self.name, exc_info=True)
+            return None
+        return board
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Mark a Discord turn as in-progress.
 

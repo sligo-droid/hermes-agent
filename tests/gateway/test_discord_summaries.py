@@ -990,6 +990,43 @@ async def test_sync_kanban_feature_summary_uses_persisted_terminal_summary(adapt
 
 
 @pytest.mark.asyncio
+async def test_send_kanban_completion_notice_posts_goal_completed_and_clears_flag(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 200 else None
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="200", goal="Ship the dashboard")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_completion_message_pending": True,
+        },
+    )
+
+    target = {
+        "board": board.slug,
+        "thread_id": "200",
+        "chat_id": "200",
+        "state": "done",
+        "terminal_completion_message_pending": True,
+    }
+    sent = await adapter.send_kanban_completion_notice(target)
+
+    assert sent == board.slug
+    assert thread.sent[-1][0]["content"] == "Goal completed"
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "terminal_completion_message_pending" not in worker
+    assert isinstance(worker["terminal_completion_message_sent_at"], int)
+
+
+@pytest.mark.asyncio
 async def test_sync_kanban_feature_summary_refuses_mismatched_board(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     parent = FakeTextChannel(channel_id=100)
