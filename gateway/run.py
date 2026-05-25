@@ -6536,6 +6536,14 @@ class GatewayRunner:
                                         watcher_cfg["blocked_board_min_age_seconds"]
                                     ),
                                 )
+                                issues.extend(
+                                    _foreman.collect_human_intervention_issues(
+                                        now=now,
+                                        blocked_board_min_age_seconds=int(
+                                            watcher_cfg["blocked_board_min_age_seconds"]
+                                        ),
+                                    )
+                                )
                                 if not startup_baseline_checked:
                                     startup_baseline_checked = True
                                     if _foreman.startup_baseline_needed():
@@ -6555,17 +6563,31 @@ class GatewayRunner:
                             due = await asyncio.to_thread(_collect_due_alerts)
                             for issue in due:
                                 try:
-                                    await self._discord_foreman_start_goal(
-                                        adapter,
-                                        channel_id=watcher_cfg["channel_id"],
-                                        issue=issue,
-                                        prompt=_foreman.render_foreman_goal_prompt(issue),
-                                        title=_foreman.foreman_goal_thread_title(issue),
-                                    )
+                                    if getattr(issue, "kind", "") == "human_intervention_required":
+                                        sender = getattr(adapter, "send", None)
+                                        if not callable(sender):
+                                            raise RuntimeError("Discord adapter cannot send foreman human alerts")
+                                        result = await sender(
+                                            watcher_cfg["channel_id"],
+                                            _foreman.render_foreman_alert(issue),
+                                            metadata={"foreman_alert_kind": getattr(issue, "kind", "")},
+                                        )
+                                        if getattr(result, "success", True) is False:
+                                            raise RuntimeError(
+                                                getattr(result, "error", "foreman human alert send failed")
+                                            )
+                                    else:
+                                        await self._discord_foreman_start_goal(
+                                            adapter,
+                                            channel_id=watcher_cfg["channel_id"],
+                                            issue=issue,
+                                            prompt=_foreman.render_foreman_goal_prompt(issue),
+                                            title=_foreman.foreman_goal_thread_title(issue),
+                                        )
                                 except Exception as exc:
                                     safe_error = self._discord_foreman_safe_log_text(exc)
                                     logger.warning(
-                                        "discord foreman: goal start failed for %s/%s: %s",
+                                        "discord foreman: alert handling failed for %s/%s: %s",
                                         getattr(issue, "board", "<unknown>"),
                                         getattr(issue, "task_id", "<unknown>"),
                                         safe_error,
