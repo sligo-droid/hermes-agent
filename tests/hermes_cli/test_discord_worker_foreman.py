@@ -175,6 +175,168 @@ def test_missing_read_broker_detector_matches_allowlisted_errors():
     assert "HERMES_DISCORD_WORKER_READ_URL" in issues[0].evidence["error_excerpt"]
 
 
+def test_collect_foreman_issues_detects_board_level_blocker_after_min_age(monkeypatch, tmp_path):
+    board = _discord_board(monkeypatch, tmp_path)
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_foreman import collect_foreman_issues
+
+    meta = kanban_db.read_board_metadata(board)
+    worker = dict(meta["discord_worker"])
+    worker.update(
+        {
+            "goal_status": "blocked",
+            "phase": "blocked",
+            "blocked_reason": "Need a private Windmill host before deployment can continue.",
+            "updated_at": 100,
+        }
+    )
+    meta.pop("db_path", None)
+    meta["discord_worker"] = worker
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Stand up private Windmill execution plane",
+            assignee="dev",
+            initial_status="blocked",
+            board=board,
+        )
+    finally:
+        conn.close()
+
+    issues = collect_foreman_issues(now=701, blocked_board_min_age_seconds=600)
+
+    assert [(issue.kind, issue.board, issue.task_id) for issue in issues] == [
+        ("board_stalled", board, task_id)
+    ]
+    evidence = issues[0].evidence
+    assert evidence["board_goal_status"] == "blocked"
+    assert evidence["blocked_reason"] == "Need a private Windmill host before deployment can continue."
+    assert evidence["blocked_count"] == 1
+    assert evidence["running_count"] == 0
+    assert evidence["stalled_after_seconds"] == 600
+
+
+def test_stalled_blocked_board_detector_waits_min_age_and_skips_running():
+    from hermes_cli.discord_worker_foreman import (
+        BoardSnapshot,
+        RunSnapshot,
+        TaskSnapshot,
+        detect_stalled_blocked_board,
+    )
+
+    task = TaskSnapshot(
+        id="t1",
+        title="Wait for external host",
+        assignee="dev",
+        status="ready",
+        created_at=1,
+        started_at=100,
+        last_heartbeat_at=None,
+        latest_run=RunSnapshot(
+            id=7,
+            status="blocked",
+            outcome="blocked",
+            started_at=100,
+            ended_at=200,
+            last_heartbeat_at=None,
+            error="",
+        ),
+    )
+    snapshot = BoardSnapshot(
+        board="discord-123",
+        thread_id="123",
+        chat_id="123",
+        session_url="https://example.test/workers/123",
+        thread_state="blocked",
+        run_summary={},
+        tasks=(task,),
+        created_at=1,
+        updated_at=200,
+        goal_status="blocked",
+        phase="blocked",
+        blocked_reason="Need external host",
+    )
+
+    assert detect_stalled_blocked_board(snapshot, now=799, min_age_seconds=600) == []
+    assert [issue.kind for issue in detect_stalled_blocked_board(snapshot, now=800, min_age_seconds=600)] == [
+        "board_stalled"
+    ]
+
+    running = TaskSnapshot(
+        id="running",
+        title="Worker still active",
+        assignee="dev",
+        status="running",
+        created_at=1,
+        started_at=100,
+        last_heartbeat_at=750,
+    )
+    running_snapshot = BoardSnapshot(
+        board="discord-123",
+        thread_id="123",
+        chat_id="123",
+        session_url="https://example.test/workers/123",
+        thread_state="blocked",
+        run_summary={},
+        tasks=(running,),
+        created_at=1,
+        updated_at=100,
+        goal_status="blocked",
+        phase="blocked",
+        blocked_reason="Need external host",
+    )
+
+    assert detect_stalled_blocked_board(running_snapshot, now=800, min_age_seconds=600) == []
+
+
+def test_board_stalled_alerts_are_per_board_and_do_not_repeat_terminal_state(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
+
+    base_evidence = {
+        "thread_state": "blocked",
+        "task_status": "ready",
+        "board_goal_status": "blocked",
+        "board_phase": "blocked",
+        "blocked_reason": "Need external host",
+        "stalled_since": 100,
+        "stalled_after_seconds": 600,
+        "stalled_age_seconds": 601,
+    }
+    first = _alert_issue(
+        kind="board_stalled",
+        board="discord-1",
+        task_id="t1",
+        severity="warning",
+        title="Discord worker board is blocked with no running workers",
+        evidence=base_evidence,
+    )
+    second = _alert_issue(
+        kind="board_stalled",
+        board="discord-2",
+        task_id="t2",
+        severity="warning",
+        title="Discord worker board is blocked with no running workers",
+        evidence=base_evidence,
+    )
+
+    assert alerts_due([first, second], now=1000) == [first, second]
+    record_alert_sent(first, now=1000)
+
+    older = _alert_issue(
+        kind="board_stalled",
+        board="discord-1",
+        task_id="t1",
+        severity="warning",
+        title="Discord worker board is blocked with no running workers",
+        evidence={**base_evidence, "stalled_age_seconds": 1200},
+    )
+    assert alerts_due([older], now=2000, config={"cooldown_seconds": 1}) == []
+
+
 def test_collect_foreman_issues_reads_board_task_run_and_sidecar(monkeypatch, tmp_path):
     board = _discord_board(monkeypatch, tmp_path)
     from hermes_cli import kanban_db

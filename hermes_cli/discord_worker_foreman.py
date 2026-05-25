@@ -30,6 +30,10 @@ ALERT_STATE_VERSION = 1
 DISCORD_ALERT_LIMIT = 2000
 FOREMAN_DISCORD_CHANNEL_ID = "1504252294495998043"
 FOREMAN_DISCORD_MENTION = "<@1504235933598486580>"
+BLOCKED_BOARD_MIN_AGE_SECONDS = 10 * 60
+_ACTIVE_BOARD_TASK_STATUSES = frozenset(
+    {"triage", "todo", "scheduled", "ready", "running", "blocked", "review"}
+)
 _ALERT_DEFAULTS = {
     "cooldown_seconds": 3600,
     "retry_backoff_seconds": 300,
@@ -87,19 +91,32 @@ _ALLOWED_RENDER_EVIDENCE_KEYS = frozenset(
         "error_excerpt",
         "heartbeat_age_seconds",
         "last_heartbeat_at",
+        "active_task_count",
+        "blocked_count",
+        "blocked_reason",
+        "board_goal_status",
+        "board_phase",
+        "ready_count",
         "run_error",
         "run_id",
         "run_outcome",
         "run_status",
+        "review_count",
         "session_url",
         "sidecar_error",
         "sidecar_exit_code",
         "sidecar_timed_out",
+        "scheduled_count",
+        "stalled_after_seconds",
+        "stalled_age_seconds",
+        "stalled_since",
         "stale_after_seconds",
         "task_assignee",
         "task_status",
         "thread_id",
         "thread_state",
+        "todo_count",
+        "running_count",
     }
 )
 _SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2, "critical": 3}
@@ -138,6 +155,7 @@ class TaskSnapshot:
     created_at: Optional[int]
     started_at: Optional[int]
     last_heartbeat_at: Optional[int]
+    completed_at: Optional[int] = None
     last_failure_error: str = ""
     latest_run: Optional[RunSnapshot] = None
     sidecar: dict[str, Any] = field(default_factory=dict)
@@ -152,6 +170,7 @@ class TaskSnapshot:
             created_at=getattr(task, "created_at", None),
             started_at=getattr(task, "started_at", None),
             last_heartbeat_at=getattr(task, "last_heartbeat_at", None),
+            completed_at=getattr(task, "completed_at", None),
             last_failure_error=str(getattr(task, "last_failure_error", "") or ""),
             latest_run=RunSnapshot.from_run(latest_run) if latest_run else None,
             sidecar=dict(sidecar) if isinstance(sidecar, dict) else {},
@@ -168,6 +187,10 @@ class BoardSnapshot:
     run_summary: dict[str, Any]
     tasks: tuple[TaskSnapshot, ...]
     created_at: Optional[int] = None
+    updated_at: Optional[int] = None
+    goal_status: str = ""
+    phase: str = ""
+    blocked_reason: str = ""
     archived: bool = False
 
 
@@ -191,14 +214,23 @@ class ForemanIssue:
         }
 
 
-def collect_foreman_issues(now: Optional[int] = None) -> list[ForemanIssue]:
+def collect_foreman_issues(
+    now: Optional[int] = None,
+    *,
+    blocked_board_min_age_seconds: int = BLOCKED_BOARD_MIN_AGE_SECONDS,
+) -> list[ForemanIssue]:
     """Return deterministic read-only foreman issues for Discord worker boards."""
     now = int(time.time()) if now is None else int(now)
+    min_age = _coerce_nonnegative_int(
+        blocked_board_min_age_seconds,
+        BLOCKED_BOARD_MIN_AGE_SECONDS,
+    )
     issues: list[ForemanIssue] = []
     for snapshot in collect_board_snapshots():
         issues.extend(detect_worker_errored(snapshot))
         issues.extend(detect_stale_running(snapshot, now=now))
         issues.extend(detect_missing_read_broker(snapshot))
+        issues.extend(detect_stalled_blocked_board(snapshot, now=now, min_age_seconds=min_age))
     return sorted(issues, key=lambda issue: (issue.board, issue.task_id, issue.kind))
 
 
@@ -483,6 +515,10 @@ def _build_board_snapshot(
         run_summary=dict(summary) if isinstance(summary, dict) else {},
         tasks=task_snapshots,
         created_at=created_at,
+        updated_at=_coerce_optional_int(worker.get("updated_at")),
+        goal_status=str(worker.get("goal_status") or ""),
+        phase=str(worker.get("phase") or ""),
+        blocked_reason=str(worker.get("blocked_reason") or ""),
         archived=archived,
     )
 
@@ -567,6 +603,74 @@ def detect_missing_read_broker(snapshot: BoardSnapshot) -> list[ForemanIssue]:
     return issues
 
 
+def detect_stalled_blocked_board(
+    snapshot: BoardSnapshot,
+    *,
+    now: int,
+    min_age_seconds: int = BLOCKED_BOARD_MIN_AGE_SECONDS,
+) -> list[ForemanIssue]:
+    """Detect board-level blockers that leave a worker board unable to progress."""
+    if snapshot.archived or _board_is_terminal(snapshot):
+        return []
+
+    counts = _board_task_counts(snapshot)
+    running_count = int(counts.get("running") or 0)
+    if running_count > 0 or any(task.status == "running" for task in snapshot.tasks):
+        return []
+
+    active_count = sum(int(counts.get(status) or 0) for status in _ACTIVE_BOARD_TASK_STATUSES)
+    if active_count <= 0 and _canonical_problem_text(snapshot.goal_status) != "blocked":
+        return []
+
+    reason = _board_blocked_reason(snapshot)
+    goal_status = _canonical_problem_text(snapshot.goal_status)
+    phase = _canonical_problem_text(snapshot.phase)
+    blocked_count = int(counts.get("blocked") or 0)
+    if goal_status != "blocked" and phase != "blocked" and not reason and blocked_count <= 0:
+        return []
+
+    blocker = _board_blocker_task(snapshot)
+    if blocker is not None and _task_has_worker_error_issue(blocker):
+        return []
+
+    stalled_since = _board_stalled_since(snapshot, blocker)
+    stalled_age = None if stalled_since is None else max(0, now - int(stalled_since))
+    if stalled_age is not None and stalled_age < max(0, int(min_age_seconds)):
+        return []
+    if stalled_since is None and min_age_seconds > 0:
+        return []
+
+    task = blocker or _synthetic_board_task(snapshot)
+    evidence = {
+        "board_goal_status": snapshot.goal_status,
+        "board_phase": snapshot.phase,
+        "blocked_reason": reason,
+        "active_task_count": active_count,
+        "ready_count": counts.get("ready", 0),
+        "todo_count": counts.get("todo", 0),
+        "scheduled_count": counts.get("scheduled", 0),
+        "blocked_count": counts.get("blocked", 0),
+        "review_count": counts.get("review", 0),
+        "running_count": running_count,
+        "stalled_since": stalled_since,
+        "stalled_age_seconds": stalled_age,
+        "stalled_after_seconds": max(0, int(min_age_seconds)),
+    }
+    if stalled_since is not None:
+        # Reuse the existing terminal-age suppression path for old board-level blockers.
+        evidence["run_ended_at"] = stalled_since
+    return [
+        _issue(
+            "board_stalled",
+            snapshot,
+            task,
+            "warning",
+            "Discord worker board is blocked with no running workers",
+            evidence,
+        )
+    ]
+
+
 def _issue(
     kind: str,
     snapshot: BoardSnapshot,
@@ -624,6 +728,121 @@ def _sidecar_failed(result: dict[str, Any]) -> bool:
         return int(exit_code) != 0
     except (TypeError, ValueError):
         return True
+
+
+def _task_has_worker_error_issue(task: TaskSnapshot) -> bool:
+    latest = task.latest_run
+    if latest and latest.outcome in ERROR_OUTCOMES:
+        return True
+    return _sidecar_failed(_sidecar_result(task))
+
+
+def _board_is_terminal(snapshot: BoardSnapshot) -> bool:
+    goal_status = _canonical_problem_text(snapshot.goal_status)
+    phase = _canonical_problem_text(snapshot.phase)
+    thread_state = _canonical_problem_text(snapshot.thread_state)
+    return (
+        goal_status in {"done", "cancelled"}
+        or phase in {"complete", "cancelled"}
+        or thread_state in {"done", "archived", "cancelled"}
+    )
+
+
+def _board_task_counts(snapshot: BoardSnapshot) -> dict[str, int]:
+    counts = {status: 0 for status in _ACTIVE_BOARD_TASK_STATUSES}
+    for task in snapshot.tasks:
+        status = str(task.status or "")
+        counts[status] = int(counts.get(status) or 0) + 1
+    if snapshot.tasks:
+        return counts
+    summary_counts = (
+        snapshot.run_summary.get("task_counts")
+        if isinstance(snapshot.run_summary, dict)
+        else None
+    )
+    if isinstance(summary_counts, dict):
+        for key, value in summary_counts.items():
+            try:
+                counts[str(key)] = int(value or 0)
+            except (TypeError, ValueError):
+                counts[str(key)] = 0
+    return counts
+
+
+def _board_blocked_reason(snapshot: BoardSnapshot) -> str:
+    reason = str(snapshot.blocked_reason or "").strip()
+    if not reason and isinstance(snapshot.run_summary, dict):
+        reason = str(snapshot.run_summary.get("blocked_reason") or "").strip()
+    if reason:
+        return reason
+    task = _board_blocker_task(snapshot)
+    if task is None:
+        return ""
+    if task.last_failure_error:
+        return task.last_failure_error
+    if task.latest_run:
+        return str(task.latest_run.error or "") or str(task.latest_run.outcome or "")
+    return task.title
+
+
+def _board_blocker_task(snapshot: BoardSnapshot) -> Optional[TaskSnapshot]:
+    blocked = [task for task in snapshot.tasks if task.status == "blocked"]
+    if blocked:
+        return max(blocked, key=_task_blocker_timestamp)
+    blocked_runs = [
+        task
+        for task in snapshot.tasks
+        if task.latest_run and task.latest_run.outcome == "blocked"
+    ]
+    if blocked_runs:
+        return max(blocked_runs, key=_task_blocker_timestamp)
+    active = [task for task in snapshot.tasks if task.status in _ACTIVE_BOARD_TASK_STATUSES]
+    if active:
+        return max(active, key=_task_blocker_timestamp)
+    return None
+
+
+def _task_blocker_timestamp(task: TaskSnapshot) -> int:
+    latest = task.latest_run
+    values = [
+        latest.ended_at if latest else None,
+        latest.started_at if latest else None,
+        task.completed_at,
+        task.started_at,
+        task.created_at,
+    ]
+    return max((_coerce_optional_int(value) or 0 for value in values), default=0)
+
+
+def _board_stalled_since(snapshot: BoardSnapshot, blocker: Optional[TaskSnapshot]) -> Optional[int]:
+    if blocker and blocker.latest_run and blocker.latest_run.outcome == "blocked":
+        ended = _coerce_optional_int(blocker.latest_run.ended_at)
+        if ended is not None:
+            return ended
+    for value in (
+        snapshot.updated_at,
+        snapshot.run_summary.get("completed_at") if isinstance(snapshot.run_summary, dict) else None,
+        snapshot.run_summary.get("generated_at") if isinstance(snapshot.run_summary, dict) else None,
+        blocker.started_at if blocker else None,
+        blocker.created_at if blocker else None,
+        snapshot.created_at,
+    ):
+        parsed = _coerce_optional_int(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _synthetic_board_task(snapshot: BoardSnapshot) -> TaskSnapshot:
+    return TaskSnapshot(
+        id="__board__",
+        title=snapshot.blocked_reason or "Board-level blocker",
+        assignee="",
+        status="blocked",
+        created_at=snapshot.created_at,
+        started_at=snapshot.updated_at or snapshot.created_at,
+        last_heartbeat_at=None,
+    )
 
 
 def _task_error_texts(task: TaskSnapshot) -> Iterable[str]:
@@ -772,6 +991,14 @@ def _coerce_optional_int(value: Any) -> Optional[int]:
         return None
 
 
+def _coerce_nonnegative_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = int(default)
+    return max(0, parsed)
+
+
 def _board_created_at_allowed(issue: ForemanIssue, *, min_created_at: int) -> bool:
     if min_created_at <= 0:
         return True
@@ -822,6 +1049,11 @@ def _issue_group_payload(issue: ForemanIssue) -> dict[str, Any]:
     elif issue.kind == "stale_running":
         payload["task_assignee"] = _canonical_problem_text(evidence.get("task_assignee") or "")
         payload["stale_after_seconds"] = evidence.get("stale_after_seconds")
+    elif issue.kind == "board_stalled":
+        payload["board"] = issue.board
+        payload["board_goal_status"] = _canonical_problem_text(evidence.get("board_goal_status") or "")
+        payload["board_phase"] = _canonical_problem_text(evidence.get("board_phase") or "")
+        payload["blocked_reason"] = _canonical_problem_text(evidence.get("blocked_reason") or "")
     return payload
 
 
@@ -982,6 +1214,8 @@ def _suggest_next_action(issue: ForemanIssue) -> str:
         return "Inspect the worker heartbeat and reclaim or restart the task if it is stuck."
     if issue.kind == "worker_errored":
         return "Inspect the failed worker run and unblock or retry with the recorded error fixed."
+    if issue.kind == "board_stalled":
+        return "Inspect the board-level blocker, provide missing inputs, then unblock or retry the affected task."
     return "Inspect the Kanban task and resolve the reported worker issue."
 
 

@@ -112,6 +112,7 @@ def test_foreman_defaults_are_disabled_with_expected_discord_target():
     assert foreman["enabled"] is False
     assert foreman["channel_id"] == "1504252294495998043"
     assert foreman["mention"] == "<@1504235933598486580>"
+    assert foreman["blocked_board_min_age_seconds"] == 600
 
 
 def test_foreman_watcher_missing_config_does_not_scan(monkeypatch):
@@ -122,7 +123,7 @@ def test_foreman_watcher_missing_config_does_not_scan(monkeypatch):
     monkeypatch.setattr(
         foreman,
         "collect_foreman_issues",
-        lambda now=None: (_ for _ in ()).throw(AssertionError("must not scan")),
+        lambda now=None, **kwargs: (_ for _ in ()).throw(AssertionError("must not scan")),
     )
 
     adapter = ForemanAdapter()
@@ -210,7 +211,7 @@ def test_foreman_watcher_disabled_config_does_not_scan(monkeypatch):
     monkeypatch.setattr(
         foreman,
         "collect_foreman_issues",
-        lambda now=None: (_ for _ in ()).throw(AssertionError("must not scan")),
+        lambda now=None, **kwargs: (_ for _ in ()).throw(AssertionError("must not scan")),
     )
 
     adapter = ForemanAdapter()
@@ -227,7 +228,7 @@ def test_foreman_watcher_requires_discord_adapter_and_connection(monkeypatch):
     monkeypatch.setattr(
         foreman,
         "collect_foreman_issues",
-        lambda now=None: (_ for _ in ()).throw(AssertionError("must not scan")),
+        lambda now=None, **kwargs: (_ for _ in ()).throw(AssertionError("must not scan")),
     )
 
     asyncio.run(_run_one_foreman_tick(monkeypatch, _runner()))
@@ -249,7 +250,7 @@ def test_foreman_watcher_starts_due_issue_as_internal_goal(monkeypatch):
     sent = []
     failed = []
 
-    monkeypatch.setattr(foreman, "collect_foreman_issues", lambda now=None: [first, skipped])
+    monkeypatch.setattr(foreman, "collect_foreman_issues", lambda now=None, **kwargs: [first, skipped])
     monkeypatch.setattr(foreman, "startup_baseline_needed", lambda: False)
 
     def fake_alerts_due(issues, *, config=None, now=None):
@@ -307,7 +308,7 @@ def test_foreman_watcher_records_send_result_failure(monkeypatch):
     sent = []
     failed = []
 
-    monkeypatch.setattr(foreman, "collect_foreman_issues", lambda now=None: [issue])
+    monkeypatch.setattr(foreman, "collect_foreman_issues", lambda now=None, **kwargs: [issue])
     monkeypatch.setattr(foreman, "startup_baseline_needed", lambda: False)
     monkeypatch.setattr(foreman, "alerts_due", lambda issues, *, config=None, now=None: list(issues))
     monkeypatch.setattr(foreman, "render_foreman_goal_prompt", lambda issue: "/goal Fix worker")
@@ -335,7 +336,7 @@ def test_foreman_watcher_delegates_terminal_suppression_to_alerts_due(monkeypatc
     due_inputs = []
     due_configs = []
 
-    monkeypatch.setattr(foreman, "collect_foreman_issues", lambda now=None: [old, recent])
+    monkeypatch.setattr(foreman, "collect_foreman_issues", lambda now=None, **kwargs: [old, recent])
     monkeypatch.setattr(foreman, "startup_baseline_needed", lambda: False)
     monkeypatch.setattr(
         foreman,
@@ -357,7 +358,7 @@ def test_foreman_watcher_baselines_existing_startup_issues(monkeypatch):
     issue = _issue("historical")
     baselined = []
 
-    monkeypatch.setattr(foreman, "collect_foreman_issues", lambda now=None: [issue])
+    monkeypatch.setattr(foreman, "collect_foreman_issues", lambda now=None, **kwargs: [issue])
     monkeypatch.setattr(foreman, "startup_baseline_needed", lambda: True)
     monkeypatch.setattr(
         foreman,
@@ -385,7 +386,7 @@ def test_foreman_watcher_active_guard_prevents_duplicate_runner_loop(monkeypatch
     monkeypatch.setattr(
         foreman,
         "collect_foreman_issues",
-        lambda now=None: (_ for _ in ()).throw(AssertionError("must not scan")),
+        lambda now=None, **kwargs: (_ for _ in ()).throw(AssertionError("must not scan")),
     )
     runner = _runner(ForemanAdapter())
     runner._discord_worker_foreman_watcher_active = True
