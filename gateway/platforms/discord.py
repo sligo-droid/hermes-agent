@@ -1939,6 +1939,40 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("[%s] Failed to persist Discord feature summary handle", self.name, exc_info=True)
         return handle
 
+    async def initialize_goal_feature_summary_for_source(
+        self,
+        source: Any,
+        *,
+        initial_request: str,
+        project_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Create the standard /goal feature-summary embed for a gateway source."""
+        thread_id = str(
+            getattr(source, "thread_id", "")
+            or getattr(source, "chat_id", "")
+            or ""
+        ).strip()
+        if not thread_id:
+            return None
+
+        thread = await self._resolve_channel_by_id(thread_id)
+        if thread is None:
+            return None
+
+        parent = None
+        parent_id = str(getattr(source, "parent_chat_id", "") or "").strip()
+        if parent_id:
+            parent = await self._resolve_channel_by_id(parent_id)
+        if parent is None:
+            parent = self._thread_parent_channel(thread)
+
+        return await self.initialize_feature_summary(
+            thread,
+            parent_channel=parent,
+            initial_request=initial_request,
+            project_context=project_context,
+        )
+
     async def update_feature_summary(
         self,
         handle: Optional[Dict[str, Any]],

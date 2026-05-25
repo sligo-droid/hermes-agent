@@ -72,6 +72,7 @@ _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-
 _TRUTHY_ENV_VALUES = {"true", "1", "yes", "on"}
 _CODEX_APP_SERVER_ACTIVITY_PREFIX = "Codex app-server event:"
 _MEETING_GOAL_SKILL_NAMES = {"meeting", "discord-meeting-intake"}
+_MEETING_AUTO_GOAL_TEXT = "Follow up on the todos from this meeting."
 _DISCORD_FEATURE_REQUEST_FAST_PATH_PROMPT = (
     "Discord feature-request thread guidance: move directly from request to "
     "implementation and verification. For straightforward code/deploy asks, "
@@ -12051,6 +12052,50 @@ class GatewayRunner:
         if not todos:
             return ""
 
+        async def _defer_discord_goal_embed_after_delivery(project_context: dict[str, Any]) -> bool:
+            adapter = getattr(self, "adapters", {}).get(Platform.DISCORD)
+            initializer = getattr(adapter, "initialize_goal_feature_summary_for_source", None)
+            if not adapter or not callable(initializer):
+                logger.debug("meeting auto-goal: Discord feature summary initializer unavailable")
+                return False
+
+            source = event.source
+            initial_request = f"/goal {_MEETING_AUTO_GOAL_TEXT}"
+
+            async def _deliver() -> bool:
+                try:
+                    handle = await initializer(
+                        source,
+                        initial_request=initial_request,
+                        project_context=project_context,
+                    )
+                    return bool(handle)
+                except Exception as exc:
+                    logger.warning("meeting auto-goal: feature summary embed send failed: %s", exc, exc_info=True)
+                    return False
+
+            try:
+                session_key = self._session_key_for_source(source)
+            except Exception:
+                session_key = None
+
+            if session_key and hasattr(adapter, "register_post_delivery_callback"):
+                try:
+                    generation = None
+                    active = getattr(adapter, "_active_sessions", {}).get(session_key)
+                    if active is not None:
+                        generation = getattr(active, "_hermes_run_generation", None)
+                    adapter.register_post_delivery_callback(
+                        session_key,
+                        _deliver,
+                        generation=generation,
+                    )
+                    return True
+                except Exception as exc:
+                    logger.debug("meeting auto-goal: post-delivery embed registration failed: %s", exc)
+
+            return await _deliver()
+
         source = getattr(event, "source", None)
         platform = getattr(source, "platform", None)
         platform_value = platform.value if hasattr(platform, "value") else str(platform or "")
@@ -12064,7 +12109,7 @@ class GatewayRunner:
                     dispatch_start_ts = time.time()
                     board = _dwb.start_direct_goal(
                         thread_id=thread_id,
-                        goal="Follow up on the todos from this meeting.",
+                        goal=_MEETING_AUTO_GOAL_TEXT,
                         chat_id=str(getattr(source, "chat_id", "") or ""),
                         guild_id=str(getattr(source, "guild_id", "") or ""),
                         parent_channel_id=str(getattr(source, "parent_chat_id", "") or ""),
@@ -12101,9 +12146,8 @@ class GatewayRunner:
                             event.skip_post_turn_goal_once = True
                         except Exception:
                             pass
-                        ticket_word = "ticket" if added == 1 else "tickets"
-                        board_ref = board.public_url or board.slug
-                        return f"Kanban goal started with {added} subgoal {ticket_word}. Board: {board_ref}"
+                        await _defer_discord_goal_embed_after_delivery(dict(board.worker.get("project_context") or {}))
+                        return ""
                     return ""
                 except Exception as exc:
                     logger.debug(
@@ -12120,7 +12164,7 @@ class GatewayRunner:
 
         created_goal = not mgr.has_goal()
         if created_goal:
-            state = mgr.set("Follow up on the todos from this meeting.")
+            state = mgr.set(_MEETING_AUTO_GOAL_TEXT)
         else:
             state = mgr.state
 

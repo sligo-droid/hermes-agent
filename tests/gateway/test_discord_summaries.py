@@ -275,6 +275,38 @@ async def test_goal_feature_summary_keeps_worker_board_handle(adapter):
 
 
 @pytest.mark.asyncio
+async def test_goal_feature_summary_for_source_uses_standard_goal_embed(adapter, monkeypatch):
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://kanban.example")
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+
+    async def resolve_channel(channel_id):
+        return {"100": parent, "200": thread}.get(str(channel_id))
+
+    adapter._resolve_channel_by_id = AsyncMock(side_effect=resolve_channel)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="200",
+        chat_type="thread",
+        thread_id="200",
+        parent_chat_id="100",
+        user_id="user-1",
+    )
+
+    handle = await adapter.initialize_goal_feature_summary_for_source(
+        source,
+        initial_request="/goal Follow up on the todos from this meeting.",
+        project_context={"project_name": "Hermes Project"},
+    )
+
+    assert handle is not None
+    assert handle["thread_id"] == "200"
+    assert handle["kanban_board"]["slug"] == "discord-200"
+    fields = {field.name: field.value for field in thread.sent[0][0]["embed"].fields}
+    assert "Kanban Board" in fields
+
+
+@pytest.mark.asyncio
 async def test_tagged_thread_followup_reuses_persisted_feature_summary(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
