@@ -377,18 +377,17 @@ async def test_feature_thread_reactions_target_triggering_user_message(adapter):
     adapter.update_feature_summary.assert_awaited_once_with(event.feature_summary, status="Running")
     summary_message.add_reaction.assert_not_awaited()
     summary_message.remove_reaction.assert_not_awaited()
-    assert [call.args for call in raw_message.remove_reaction.await_args_list] == [
-        ("✅", adapter._client.user),
-        ("❌", adapter._client.user),
-    ]
-    raw_message.add_reaction.assert_awaited_once_with("👀")
+    assert [call.args for call in raw_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="⏳",
+    )
+    raw_message.add_reaction.assert_awaited_once_with("⏳")
 
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
     assert [call.args for call in raw_message.remove_reaction.await_args_list] == [
-        ("✅", adapter._client.user),
-        ("❌", adapter._client.user),
-        ("👀", adapter._client.user),
+        *_status_remove_calls(adapter, except_emoji="⏳"),
+        *_status_remove_calls(adapter, except_emoji="✅"),
     ]
     assert raw_message.add_reaction.await_args_list[1].args == ("✅",)
 
@@ -419,12 +418,11 @@ async def test_top_level_feature_summary_reactions_target_triggering_user_messag
     summary_message.add_reaction.assert_not_awaited()
     summary_message.remove_reaction.assert_not_awaited()
     assert [call.args for call in raw_message.remove_reaction.await_args_list] == [
-        ("✅", adapter._client.user),
-        ("❌", adapter._client.user),
-        ("👀", adapter._client.user),
+        *_status_remove_calls(adapter, except_emoji="⏳"),
+        *_status_remove_calls(adapter, except_emoji="✅"),
     ]
     assert [call.args for call in raw_message.add_reaction.await_args_list] == [
-        ("👀",),
+        ("⏳",),
         ("✅",),
     ]
 

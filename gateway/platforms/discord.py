@@ -3159,9 +3159,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._set_message_reaction_state(message, "👀")
                 continue
             if has_feature_summary:
-                await self._remove_reaction(message, "✅")
-                await self._remove_reaction(message, "❌")
-                await self._add_reaction(message, "👀")
+                await self._set_message_reaction_state(message, "⏳")
                 continue
             await self._set_message_reaction_state(message, "⏳")
 
@@ -3187,11 +3185,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 else:
                     await self._set_message_reaction_state(message, None)
                 continue
-            await self._remove_reaction(message, "👀")
             if outcome == ProcessingOutcome.SUCCESS:
-                await self._add_reaction(message, "✅")
+                await self._set_message_reaction_state(message, "✅")
             elif outcome == ProcessingOutcome.FAILURE:
-                await self._add_reaction(message, "❌")
+                await self._set_message_reaction_state(message, "❌")
+            else:
+                await self._set_message_reaction_state(message, None)
 
     async def send(
         self,
