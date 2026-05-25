@@ -120,7 +120,6 @@ def test_worker_errored_detector_uses_latest_failed_run_only():
 def test_stale_running_detector_flags_missing_and_old_heartbeat():
     from hermes_cli.discord_worker_foreman import TaskSnapshot, detect_stale_running
 
-
     missing = TaskSnapshot(
         id="missing",
         title="Missing heartbeat",
@@ -148,10 +147,106 @@ def test_stale_running_detector_flags_missing_and_old_heartbeat():
         started_at=10,
         last_heartbeat_at=4500,
     )
+    young_missing = TaskSnapshot(
+        id="young-missing",
+        title="Young missing heartbeat",
+        assignee="dev",
+        status="running",
+        created_at=4500,
+        started_at=4900,
+        last_heartbeat_at=None,
+    )
 
-    issues = detect_stale_running(_snapshot((missing, old, fresh)), now=5000)
+    issues = detect_stale_running(
+        _snapshot((missing, old, fresh, young_missing)),
+        now=5000,
+    )
 
     assert [issue.task_id for issue in issues] == ["missing", "old"]
+
+
+def test_coalesce_foreman_issues_suppresses_active_same_source_board(monkeypatch):
+    from hermes_cli import discord_worker_foreman as foreman
+    from hermes_cli.discord_worker_foreman import (
+        BoardSnapshot,
+        ForemanIssue,
+        TaskSnapshot,
+    )
+
+    source = ForemanIssue(
+        kind="stale_running",
+        board="discord-source",
+        task_id="source-task",
+        severity="warning",
+        title="Running worker has no recent heartbeat",
+        evidence={"task_status": "running"},
+    )
+    human = ForemanIssue(
+        kind="human_intervention_required",
+        board="discord-source",
+        task_id="source-task",
+        severity="critical",
+        title="Foreman attempt requires human manual intervention",
+        evidence={"task_status": "blocked"},
+    )
+    active_task = TaskSnapshot(
+        id="foreman-task",
+        title="Resolve source issue",
+        assignee="dev",
+        status="running",
+        created_at=1,
+        started_at=2,
+        last_heartbeat_at=3,
+    )
+    active_foreman = BoardSnapshot(
+        board="discord-foreman",
+        thread_id="foreman-thread",
+        chat_id="foreman-thread",
+        session_url="https://example.test/workers/discord-foreman",
+        thread_state="running",
+        run_summary={},
+        tasks=(active_task,),
+        goal_status="active",
+        phase="dev",
+        request_text=foreman.render_foreman_goal_prompt(source),
+    )
+
+    monkeypatch.setattr(
+        foreman,
+        "collect_board_snapshots",
+        lambda *, foreman_generated_only=False: (
+            [active_foreman] if foreman_generated_only else []
+        ),
+    )
+
+    assert foreman.coalesce_foreman_issues([source]) == []
+    assert foreman.coalesce_foreman_issues([human]) == [human]
+
+
+def test_coalesce_foreman_issues_keeps_one_autonomous_issue_per_source(monkeypatch):
+    from hermes_cli import discord_worker_foreman as foreman
+    from hermes_cli.discord_worker_foreman import ForemanIssue
+
+    warning = ForemanIssue(
+        kind="stale_running",
+        board="discord-source",
+        task_id="stale-task",
+        severity="warning",
+        title="Running worker has no recent heartbeat",
+        evidence={"task_status": "running"},
+    )
+    error = ForemanIssue(
+        kind="worker_errored",
+        board="discord-source",
+        task_id="failed-task",
+        severity="error",
+        title="Worker execution failed",
+        evidence={"task_status": "blocked"},
+    )
+
+    monkeypatch.setattr(foreman, "collect_board_snapshots", lambda **kwargs: [])
+
+    assert foreman.coalesce_foreman_issues([warning, error]) == [error]
 
 
 def test_missing_read_broker_detector_matches_allowlisted_errors():

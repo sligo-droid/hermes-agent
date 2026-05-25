@@ -6558,7 +6558,8 @@ class GatewayRunner:
                                                 suppressed,
                                             )
                                         return []
-                                return _foreman.alerts_due(issues, config=alert_config, now=now)
+                                due = _foreman.alerts_due(issues, config=alert_config, now=now)
+                                return _foreman.coalesce_foreman_issues(due)
 
                             due = await asyncio.to_thread(_collect_due_alerts)
                             for issue in due:

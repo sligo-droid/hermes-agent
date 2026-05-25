@@ -246,6 +246,38 @@ def collect_foreman_issues(
     return sorted(issues, key=lambda issue: (issue.board, issue.task_id, issue.kind))
 
 
+def coalesce_foreman_issues(issues: Iterable[ForemanIssue]) -> list[ForemanIssue]:
+    """Suppress redundant autonomous foreman work for a source board.
+
+    Foreman should make at most one autonomous recovery attempt for a source
+    board at a time. Human-intervention alerts remain exempt because they are
+    the terminal escalation path after an autonomous attempt discovers a
+    human-only blocker.
+    """
+    active_sources = _active_foreman_source_boards()
+    seen_sources = set(active_sources)
+    coalesced: list[ForemanIssue] = []
+    for issue in sorted(
+        issues,
+        key=lambda item: (
+            -_severity_rank(getattr(item, "severity", "")),
+            str(getattr(item, "board", "") or ""),
+            str(getattr(item, "task_id", "") or ""),
+            str(getattr(item, "kind", "") or ""),
+        ),
+    ):
+        if getattr(issue, "kind", "") == "human_intervention_required":
+            coalesced.append(issue)
+            continue
+        source_board = _issue_source_board(issue)
+        if source_board and source_board in seen_sources:
+            continue
+        coalesced.append(issue)
+        if source_board:
+            seen_sources.add(source_board)
+    return coalesced
+
+
 def collect_human_intervention_issues(
     now: Optional[int] = None,
     *,
@@ -698,6 +730,8 @@ def detect_stale_running(snapshot: BoardSnapshot, *, now: int) -> list[ForemanIs
         heartbeat_age = None if heartbeat is None else max(0, now - int(heartbeat))
         if heartbeat_age is not None and heartbeat_age <= STALE_RUNNING_SECONDS:
             continue
+        if heartbeat is None and not _running_task_old_enough(task, now=now):
+            continue
         issues.append(
             _issue(
                 "stale_running",
@@ -868,6 +902,49 @@ def _task_has_worker_error_issue(task: TaskSnapshot) -> bool:
     if latest and latest.outcome in ERROR_OUTCOMES:
         return True
     return _sidecar_failed(_sidecar_result(task))
+
+
+def _running_task_old_enough(task: TaskSnapshot, *, now: int) -> bool:
+    started = _running_task_started_at(task)
+    if started is None:
+        return False
+    return max(0, int(now) - int(started)) > STALE_RUNNING_SECONDS
+
+
+def _running_task_started_at(task: TaskSnapshot) -> Optional[int]:
+    latest = task.latest_run
+    for value in (
+        latest.started_at if latest else None,
+        task.started_at,
+        task.created_at,
+    ):
+        parsed = _coerce_optional_int(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _active_foreman_source_boards() -> set[str]:
+    sources: set[str] = set()
+    for snapshot in collect_board_snapshots(foreman_generated_only=True):
+        if not _is_active_foreman_board(snapshot):
+            continue
+        source = _foreman_source_from_request(snapshot.request_text).get("source_board")
+        if source:
+            sources.add(source)
+    return sources
+
+
+def _is_active_foreman_board(snapshot: BoardSnapshot) -> bool:
+    if snapshot.archived or _board_is_terminal(snapshot):
+        return False
+    counts = _board_task_counts(snapshot)
+    return any(int(counts.get(status) or 0) > 0 for status in _ACTIVE_BOARD_TASK_STATUSES)
+
+
+def _issue_source_board(issue: ForemanIssue) -> str:
+    evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
+    return str(evidence.get("source_board") or issue.board or "").strip()
 
 
 def _board_is_terminal(snapshot: BoardSnapshot) -> bool:

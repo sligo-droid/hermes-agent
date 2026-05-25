@@ -1476,6 +1476,45 @@ def test_ensure_pr_prefers_checkout_remote_over_stale_project_context(monkeypatc
     assert pr_create[pr_create.index("--repo") + 1] == "sligo-labs/PID"
 
 
+def test_ensure_pr_skips_foreman_no_change_branch(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="foreman-no-change",
+        goal="Foreman escalation: resolve a Discord worker issue.",
+        project_context={
+            "project_github_url": "https://github.com/sligo-labs/PID.git"
+        },
+    )
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "remote", "get-url", "origin"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="no remote")
+        if cmd[:3] == ["git", "rev-list", "--count"]:
+            return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr(board.slug, str(workspace)) is True
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert meta["pr_skipped_no_changes"] is True
+    assert meta["pr_state"] == "not_needed"
+    assert meta["pr_checks_status"] == "passed"
+    assert meta["pr_blocker"] == ""
+    assert not any(cmd[:3] == ["gh", "pr", "list"] for cmd in calls)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd in calls)
+
+
 def test_ensure_pr_records_error_when_repo_or_head_missing(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
