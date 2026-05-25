@@ -271,8 +271,8 @@ def test_recompute_ready_cascades_through_chain(kanban_home):
         assert kb.get_task(conn, c).status == "ready"
 
 
-def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
-    """blocked tasks with all parents done should be promoted to ready."""
+def test_recompute_ready_does_not_promote_blocked_with_done_parents(kanban_home):
+    """Blocked tasks need an explicit unblock even after parents finish."""
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="a")
         child = kb.create_task(
@@ -290,13 +290,13 @@ def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
         )
         conn.commit()
         assert kb.get_task(conn, child).status == "blocked"
-        # recompute_ready should promote blocked → ready and reset failures
+        # recompute_ready should not erase an explicit worker blocker.
         promoted = kb.recompute_ready(conn)
-        assert promoted == 1
+        assert promoted == 0
         task = kb.get_task(conn, child)
-        assert task.status == "ready"
-        assert task.consecutive_failures == 0
-        assert task.last_failure_error is None
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 5
+        assert task.last_failure_error == "persistent error"
 
 
 def test_recompute_ready_does_not_promote_root_blocked_task(kanban_home):

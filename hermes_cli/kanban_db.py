@@ -2048,7 +2048,7 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status FROM tasks WHERE status IN ('todo', 'blocked')"
+            "SELECT id, status FROM tasks WHERE status = 'todo'"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -2059,23 +2059,11 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if not parents and cur_status == "blocked":
-                continue
             if all(p["status"] in ("done", "archived") for p in parents):
-                # Blocked tasks also get their failure counters reset —
-                # this is effectively an auto-unblock.
-                if cur_status == "blocked":
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready', "
-                        "consecutive_failures = 0, last_failure_error = NULL "
-                        "WHERE id = ? AND status = 'blocked'",
-                        (task_id,),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                        (task_id,),
-                    )
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
+                    (task_id,),
+                )
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
     return promoted
