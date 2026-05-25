@@ -31,6 +31,11 @@ class _FakeAllowedMentions:
         )
 
 
+class _FakeObject:
+    def __init__(self, *, id):
+        self.id = id
+
+
 def _ensure_discord_mock():
     """Install (or augment) a mock ``discord`` module.
 
@@ -42,6 +47,7 @@ def _ensure_discord_mock():
     """
     if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
         sys.modules["discord"].AllowedMentions = _FakeAllowedMentions
+        sys.modules["discord"].Object = _FakeObject
         return
 
     if sys.modules.get("discord") is None:
@@ -77,11 +83,12 @@ def _ensure_discord_mock():
     # by another test's _ensure_discord_mock, force the AllowedMentions
     # stand-in onto it — _build_allowed_mentions() reads this attribute.
     sys.modules["discord"].AllowedMentions = _FakeAllowedMentions
+    sys.modules["discord"].Object = _FakeObject
 
 
 _ensure_discord_mock()
 
-from gateway.platforms.discord import _build_allowed_mentions  # noqa: E402
+from gateway.platforms.discord import _allowed_mentions_for_metadata, _build_allowed_mentions  # noqa: E402
 
 
 # The four DISCORD_ALLOW_MENTION_* env vars that _build_allowed_mentions reads.
@@ -153,3 +160,12 @@ def test_all_four_knobs_together(monkeypatch):
     assert am.roles is True
     assert am.users is False
     assert am.replied_user is False
+
+
+def test_metadata_can_allow_specific_role_mentions_without_everyone():
+    am = _allowed_mentions_for_metadata({"allowed_role_mentions": ["1503914570077442058", "bad"]})
+
+    assert am.everyone is False
+    assert [role.id for role in am.roles] == [1503914570077442058]
+    assert am.users is True
+    assert am.replied_user is True

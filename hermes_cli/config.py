@@ -1633,7 +1633,7 @@ DEFAULT_CONFIG = {
             "foreman": {
                 "enabled": False,
                 "channel_id": "1504252294495998043",
-                "mention": "<@1504235933598486580>",
+                "mention": "<@&1503914570077442058>",
                 "scan_interval_seconds": 300,
                 "blocked_board_min_age_seconds": 600,
                 "cooldown_seconds": 3600,

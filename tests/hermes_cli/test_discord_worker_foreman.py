@@ -891,9 +891,8 @@ def test_render_foreman_alert_is_safe_bounded_and_informative():
 
     rendered = render_foreman_alert(issue, mention="@foreman")
 
-    assert FOREMAN_DISCORD_MENTION in rendered
-    assert rendered.count(FOREMAN_DISCORD_MENTION) == 1
-    assert "@foreman" not in rendered
+    assert "@foreman" in rendered
+    assert FOREMAN_DISCORD_MENTION not in rendered
     assert "Board: discord-123" in rendered
     assert "Task: t1" in rendered
     assert "Run: 42" in rendered
@@ -917,7 +916,7 @@ def test_render_foreman_alert_is_safe_bounded_and_informative():
 
 
 def test_render_human_intervention_alert_includes_explicit_steps():
-    from hermes_cli.discord_worker_foreman import FOREMAN_DISCORD_MENTION, ForemanIssue, render_foreman_alert
+    from hermes_cli.discord_worker_foreman import ForemanIssue, render_foreman_alert
 
     issue = ForemanIssue(
         kind="human_intervention_required",
@@ -928,6 +927,9 @@ def test_render_human_intervention_alert_includes_explicit_steps():
         evidence={
             "task_status": "blocked",
             "foreman_board": "discord-foreman",
+            "source_board": "discord-source",
+            "source_task_id": "source-task",
+            "session_url": "https://example.test/workers/discord-foreman",
             "manual_intervention_reason": "Create a vendor API key.",
             "manual_intervention_type": "api_key",
             "manual_intervention_steps": [
@@ -939,13 +941,20 @@ def test_render_human_intervention_alert_includes_explicit_steps():
         },
     )
 
-    rendered = render_foreman_alert(issue)
+    rendered = render_foreman_alert(issue, mention="<@&admin>")
 
-    assert FOREMAN_DISCORD_MENTION in rendered
-    assert "Human instructions:" in rendered
+    assert rendered.startswith("<@&admin>\n**Foreman needs human input**")
+    assert "Source board: `discord-source`" in rendered
+    assert "Source task: `source-task`" in rendered
+    assert "Foreman attempt: `discord-foreman`" in rendered
+    assert "Foreman board: https://example.test/workers/discord-foreman" in rendered
+    assert "**Why this needs a human**" in rendered
+    assert "**Do this next**" in rendered
     assert "1. Open the vendor developer console." in rendered
     assert "2. Create a project-scoped API key with read-only access." in rendered
     assert "3. Store it as PID_VENDOR_API_KEY, not in chat." in rendered
+    assert "When complete, ask Hermes to retry `source-task`." in rendered
+    assert "Evidence:" not in rendered
     assert "manual_intervention_steps" not in rendered
 
 
@@ -985,7 +994,32 @@ def test_render_foreman_goal_prompt_is_goal_command_safe_and_informative():
 def test_render_foreman_alert_uses_fixed_mention_once_in_normal_alert():
     from hermes_cli.discord_worker_foreman import FOREMAN_DISCORD_MENTION, render_foreman_alert
 
-    rendered = render_foreman_alert(_alert_issue(), mention="@foreman")
+    rendered = render_foreman_alert(_alert_issue())
 
     assert rendered.count(FOREMAN_DISCORD_MENTION) == 1
-    assert "@foreman" not in rendered
+
+
+def test_render_foreman_alert_uses_supplied_mention_once_in_normal_alert():
+    from hermes_cli.discord_worker_foreman import FOREMAN_DISCORD_MENTION, render_foreman_alert
+
+    rendered = render_foreman_alert(_alert_issue(), mention="@foreman")
+
+    assert rendered.count("@foreman") == 1
+    assert FOREMAN_DISCORD_MENTION not in rendered
+
+
+def test_request_scoped_foreman_snapshot_uses_board_slug_url(monkeypatch, tmp_path):
+    board = _discord_board(monkeypatch, tmp_path, slug="discord-4243-m-msg-1")
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_foreman import collect_board_snapshots
+
+    meta = kanban_db.read_board_metadata(board)
+    worker = dict(meta["discord_worker"])
+    worker["thread_id"] = "4243"
+    meta.pop("db_path", None)
+    meta["discord_worker"] = worker
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+
+    snapshots = {snapshot.board: snapshot for snapshot in collect_board_snapshots()}
+
+    assert snapshots[board].session_url == "https://example.test/workers/discord-4243-m-msg-1"

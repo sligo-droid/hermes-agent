@@ -229,6 +229,33 @@ def _build_allowed_mentions():
     )
 
 
+def _allowed_mentions_for_metadata(metadata: Optional[Dict[str, Any]] = None):
+    if not DISCORD_AVAILABLE or not isinstance(metadata, dict):
+        return None
+    raw_roles = metadata.get("allowed_role_mentions")
+    if isinstance(raw_roles, str):
+        candidates = [raw_roles]
+    elif isinstance(raw_roles, (list, tuple, set)):
+        candidates = list(raw_roles)
+    else:
+        candidates = []
+    role_ids = []
+    for value in candidates:
+        text = str(value or "").strip()
+        if text.isdigit():
+            role_ids.append(int(text))
+    if not role_ids:
+        return None
+    object_factory = getattr(discord, "Object", None)
+    roles = [object_factory(id=role_id) for role_id in role_ids] if callable(object_factory) else role_ids
+    return discord.AllowedMentions(
+        everyone=False,
+        roles=roles,
+        users=True,
+        replied_user=True,
+    )
+
+
 class VoiceReceiver:
     """Captures and decodes voice audio from a Discord voice channel.
 
@@ -3288,11 +3315,15 @@ class DiscordAdapter(BasePlatformAdapter):
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
+                allowed_mentions = _allowed_mentions_for_metadata(metadata)
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    send_kwargs = {
+                        "content": chunk,
+                        "reference": chunk_reference,
+                    }
+                    if allowed_mentions is not None:
+                        send_kwargs["allowed_mentions"] = allowed_mentions
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -3311,10 +3342,13 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        retry_kwargs = {
+                            "content": chunk,
+                            "reference": None,
+                        }
+                        if allowed_mentions is not None:
+                            retry_kwargs["allowed_mentions"] = allowed_mentions
+                        msg = await channel.send(**retry_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
