@@ -34,6 +34,34 @@ class FakeGoalManager:
         return "continue meeting follow-up"
 
 
+class FakeDiscordAdapter:
+    def __init__(self):
+        self._active_sessions = {}
+        self.callback = None
+        self.callback_session_key = None
+        self.initialized = []
+
+    def register_post_delivery_callback(self, session_key, callback, *, generation=None):
+        self.callback_session_key = session_key
+        self.callback = callback
+
+    async def initialize_goal_feature_summary_for_source(
+        self,
+        source,
+        *,
+        initial_request,
+        project_context=None,
+    ):
+        self.initialized.append(
+            {
+                "source": source,
+                "initial_request": initial_request,
+                "project_context": project_context,
+            }
+        )
+        return {"message_id": "summary-1"}
+
+
 def _meeting_event(*, platform: Platform = Platform.DISCORD) -> MessageEvent:
     return MessageEvent(
         text="/meeting",
@@ -90,13 +118,19 @@ def test_extract_meeting_todos_recovers_printed_subgoal_commands():
 @pytest.mark.asyncio
 async def test_meeting_auto_goal_creates_discord_kanban_goal_and_subgoal_tickets(monkeypatch):
     runner = GatewayRunner.__new__(GatewayRunner)
+    adapter = FakeDiscordAdapter()
+    runner.adapters = {Platform.DISCORD: adapter}
     calls = {"start_direct_goal": None, "subgoals": []}
 
     from hermes_cli import discord_worker_boards as _dwb
 
     def fake_start_direct_goal(**kwargs):
         calls["start_direct_goal"] = kwargs
-        return SimpleNamespace(slug="discord-thread-1", public_url="https://kanban.example/thread-1")
+        return SimpleNamespace(
+            slug="discord-thread-1",
+            public_url="https://kanban.example/thread-1",
+            worker={"project_context": kwargs["project_context"]},
+        )
 
     def fake_add_subgoal(board, text):
         calls["subgoals"].append((board, text))
@@ -109,6 +143,7 @@ async def test_meeting_auto_goal_creates_discord_kanban_goal_and_subgoal_tickets
     )
     monkeypatch.setattr(_dwb, "start_direct_goal", fake_start_direct_goal)
     monkeypatch.setattr(_dwb, "add_subgoal", fake_add_subgoal)
+    monkeypatch.setattr(runner, "_session_key_for_source", lambda source: "session-key")
 
     status = await runner._apply_meeting_auto_goal_from_response(
         _meeting_event(),
@@ -138,7 +173,16 @@ Next todos
         ("discord-thread-1", "Draft the client summary."),
         ("discord-thread-1", "Create the follow-up issue list."),
     ]
-    assert status == "Kanban goal started with 2 subgoal tickets. Board: https://kanban.example/thread-1"
+    assert status == ""
+    assert adapter.callback_session_key == "session-key"
+    assert adapter.initialized == []
+
+    assert adapter.callback is not None
+    assert await adapter.callback() is True
+    assert len(adapter.initialized) == 1
+    assert adapter.initialized[0]["source"].thread_id == "thread-1"
+    assert adapter.initialized[0]["initial_request"] == "/goal Follow up on the todos from this meeting."
+    assert adapter.initialized[0]["project_context"] == calls["start_direct_goal"]["project_context"]
 
 
 @pytest.mark.asyncio
