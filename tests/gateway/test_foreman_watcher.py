@@ -93,6 +93,17 @@ def _issue(task_id="t1", **evidence):
     )
 
 
+def _human_issue(task_id="t1", **evidence):
+    return SimpleNamespace(
+        kind="human_intervention_required",
+        board="discord-1",
+        task_id=task_id,
+        severity="critical",
+        title="Foreman attempt requires human manual intervention",
+        evidence={"task_status": "blocked", **evidence},
+    )
+
+
 def _patch_lock(monkeypatch):
     import gateway.status as status
 
@@ -104,6 +115,12 @@ def _patch_config(monkeypatch, config):
     import hermes_cli.config as cfg
 
     monkeypatch.setattr(cfg, "load_config", lambda: config)
+
+
+def _patch_no_human_escalations(monkeypatch):
+    from hermes_cli import discord_worker_foreman as foreman
+
+    monkeypatch.setattr(foreman, "collect_human_intervention_issues", lambda **kwargs: [])
 
 
 def test_foreman_defaults_are_disabled_with_expected_discord_target():
@@ -242,6 +259,7 @@ def test_foreman_watcher_requires_discord_adapter_and_connection(monkeypatch):
 def test_foreman_watcher_starts_due_issue_as_internal_goal(monkeypatch):
     _patch_config(monkeypatch, _enabled_config())
     _patch_lock(monkeypatch)
+    _patch_no_human_escalations(monkeypatch)
     from hermes_cli import discord_worker_foreman as foreman
 
     first = _issue("t1")
@@ -299,9 +317,56 @@ def test_foreman_watcher_starts_due_issue_as_internal_goal(monkeypatch):
     assert failed == []
 
 
+def test_foreman_watcher_direct_alerts_human_intervention_issue(monkeypatch):
+    _patch_config(monkeypatch, _enabled_config())
+    _patch_lock(monkeypatch)
+    from hermes_cli import discord_worker_foreman as foreman
+
+    issue = _human_issue(
+        "source-task",
+        source_board="discord-source",
+        foreman_board="discord-foreman",
+        manual_intervention_reason="Human must create the API key.",
+    )
+    sent = []
+    failed = []
+
+    monkeypatch.setattr(foreman, "collect_foreman_issues", lambda now=None, **kwargs: [])
+    monkeypatch.setattr(foreman, "collect_human_intervention_issues", lambda now=None, **kwargs: [issue])
+    monkeypatch.setattr(foreman, "startup_baseline_needed", lambda: False)
+    monkeypatch.setattr(foreman, "alerts_due", lambda issues, *, config=None, now=None: list(issues))
+    monkeypatch.setattr(foreman, "render_foreman_alert", lambda issue: f"human alert: {issue.task_id}")
+    monkeypatch.setattr(foreman, "record_alert_sent", lambda issue: sent.append(issue.task_id))
+    monkeypatch.setattr(foreman, "record_alert_failed", lambda issue, error: failed.append((issue.task_id, error)))
+
+    adapter = ForemanAdapter()
+    runner = _runner(adapter)
+    goal_events = []
+
+    async def fake_handle_goal(event):
+        goal_events.append(event)
+        return None
+
+    monkeypatch.setattr(runner, "_handle_goal_command", fake_handle_goal)
+    asyncio.run(_run_one_foreman_tick(monkeypatch, runner))
+
+    assert adapter.sent == [
+        {
+            "chat_id": "1504252294495998043",
+            "content": "human alert: source-task",
+            "metadata": {"foreman_alert_kind": "human_intervention_required"},
+        }
+    ]
+    assert adapter.created_goals == []
+    assert goal_events == []
+    assert sent == ["source-task"]
+    assert failed == []
+
+
 def test_foreman_watcher_records_send_result_failure(monkeypatch):
     _patch_config(monkeypatch, _enabled_config())
     _patch_lock(monkeypatch)
+    _patch_no_human_escalations(monkeypatch)
     from hermes_cli import discord_worker_foreman as foreman
 
     issue = _issue("t1")
@@ -328,6 +393,7 @@ def test_foreman_watcher_records_send_result_failure(monkeypatch):
 def test_foreman_watcher_delegates_terminal_suppression_to_alerts_due(monkeypatch):
     _patch_config(monkeypatch, _enabled_config(terminal_suppression_age_seconds=3600))
     _patch_lock(monkeypatch)
+    _patch_no_human_escalations(monkeypatch)
     monkeypatch.setattr("gateway.run.time.time", lambda: 10_000)
     from hermes_cli import discord_worker_foreman as foreman
 
@@ -353,6 +419,7 @@ def test_foreman_watcher_delegates_terminal_suppression_to_alerts_due(monkeypatc
 def test_foreman_watcher_baselines_existing_startup_issues(monkeypatch):
     _patch_config(monkeypatch, _enabled_config())
     _patch_lock(monkeypatch)
+    _patch_no_human_escalations(monkeypatch)
     from hermes_cli import discord_worker_foreman as foreman
 
     issue = _issue("historical")
