@@ -29,7 +29,7 @@ ALERT_DETECTOR_VERSION = 1
 ALERT_STATE_VERSION = 1
 DISCORD_ALERT_LIMIT = 2000
 FOREMAN_DISCORD_CHANNEL_ID = "1504252294495998043"
-FOREMAN_DISCORD_MENTION = "<@1504235933598486580>"
+FOREMAN_DISCORD_MENTION = "<@&1503914570077442058>"
 BLOCKED_BOARD_MIN_AGE_SECONDS = 10 * 60
 MANUAL_ESCALATION_TASK = "foreman_manual_escalation"
 _ACTIVE_BOARD_TASK_STATUSES = frozenset(
@@ -444,9 +444,11 @@ def record_alert_failed(issue: ForemanIssue, error: str, *, now: Optional[int] =
 
 def render_foreman_alert(issue: ForemanIssue, mention: str = "") -> str:
     """Render a bounded Discord-safe foreman alert."""
-    # The foreman alert target is fixed; config/callers must not override it.
-    safe_mention = FOREMAN_DISCORD_MENTION
+    safe_mention = _safe_foreman_mention(mention)
     evidence = _renderable_evidence(issue.evidence)
+    if issue.kind == "human_intervention_required":
+        return _render_human_intervention_alert(issue, evidence, safe_mention)
+
     lines = []
     lines.append(safe_mention)
     lines.extend(
@@ -482,6 +484,58 @@ def render_foreman_alert(issue: ForemanIssue, mention: str = "") -> str:
             if key == "session_url" and (not isinstance(value, str) or not _is_public_url(value)):
                 continue
             lines.append(f"- {key}: {_truncate_text(_sanitize_text(str(value)), 180)}")
+    return _truncate_text("\n".join(lines), DISCORD_ALERT_LIMIT)
+
+
+def _render_human_intervention_alert(
+    issue: ForemanIssue,
+    evidence: dict[str, Any],
+    mention: str,
+) -> str:
+    source_board = str(evidence.get("source_board") or issue.board or "").strip()
+    source_task = str(evidence.get("source_task_id") or issue.task_id or "").strip()
+    foreman_board = str(evidence.get("foreman_board") or "").strip()
+    reason = str(
+        evidence.get("manual_intervention_reason")
+        or issue.title
+        or "Manual intervention is required."
+    )
+    session_url = evidence.get("session_url")
+    steps = _manual_instruction_steps(evidence)
+    if not steps:
+        steps = [
+            "Review the reason above and add the missing credential, access grant, or configuration in the approved secret/config location.",
+            "Reply that the manual setup is complete, then ask Hermes to retry the blocked source task.",
+        ]
+
+    lines = [
+        mention,
+        "**Foreman needs human input**",
+        "",
+        f"Source board: `{_truncate_text(_sanitize_text(source_board), 120)}`",
+        f"Source task: `{_truncate_text(_sanitize_text(source_task), 80)}`",
+    ]
+    if foreman_board:
+        lines.append(f"Foreman attempt: `{_truncate_text(_sanitize_text(foreman_board), 120)}`")
+    if isinstance(session_url, str) and _is_public_url(session_url):
+        lines.append(f"Foreman board: {session_url}")
+    lines.extend(
+        [
+            "",
+            "**Why this needs a human**",
+            _truncate_text(_sanitize_text(reason), 420),
+            "",
+            "**Do this next**",
+        ]
+    )
+    for index, step in enumerate(steps[:8], start=1):
+        lines.append(f"{index}. {_truncate_text(_sanitize_text(step), 260)}")
+    lines.extend(
+        [
+            "",
+            f"When complete, ask Hermes to retry `{_truncate_text(_sanitize_text(source_task), 80)}`.",
+        ]
+    )
     return _truncate_text("\n".join(lines), DISCORD_ALERT_LIMIT)
 
 
@@ -582,7 +636,7 @@ def _build_board_snapshot(
         board=board,
         thread_id=str(worker.get("thread_id") or ""),
         chat_id=str(worker.get("chat_id") or worker.get("thread_id") or ""),
-        session_url=public_session_board_url(str(worker.get("thread_id") or "")),
+        session_url=_public_worker_url_for_board(board, worker),
         thread_state=board_thread_state(board),
         run_summary=dict(summary) if isinstance(summary, dict) else {},
         tasks=task_snapshots,
@@ -974,6 +1028,7 @@ def _manual_assessment_key(issue: ForemanIssue) -> str:
         "foreman_issue_kind": issue.kind,
         "foreman_board": issue.board,
         "foreman_task_id": issue.task_id,
+        "manual_assessment_prompt_version": 2,
         "source_board": evidence.get("source_board") or "",
         "source_task_id": evidence.get("source_task_id") or "",
         "source_issue_kind": evidence.get("source_issue_kind") or "",
@@ -1020,11 +1075,15 @@ def _llm_assess_manual_intervention(issue: ForemanIssue) -> dict[str, Any]:
                 "or supply information outside an AI agent's authority. Return only compact JSON "
                 "with keys: requires_manual_intervention (boolean), reason (string), "
                 "intervention_type (string), confidence (low|medium|high), "
-                "instructions (array of short step-by-step strings for the human). "
-                "When credentials are needed, make the instructions as explicit as possible: "
-                "which service/account area to open, what credential/access to create or request, "
-                "where it should be installed in Hermes or the project, and what to ask the agent to retry. "
-                "Do not invent secret values."
+                "instructions (array of literal line-by-line actions for the human). "
+                "Do not simply copy every blocker phrase into the checklist. Infer the minimum human-only "
+                "actions needed and omit speculative prerequisites or implementation choices that are not "
+                "directly required. Each instruction must start with a concrete verb like Open, Create, Add, "
+                "Grant, Paste, Save, or Reply. Avoid vague steps such as 'provide access' or 'provision resources' "
+                "unless you name the exact account, console, secret, config file, or person the human should use. "
+                "When credentials are needed, say which service/account area to open, what credential/access to "
+                "create or request, where it should be installed in Hermes or the project, and what to ask the "
+                "agent to retry. Do not invent secret values."
             ),
         },
         {
@@ -1037,7 +1096,7 @@ def _llm_assess_manual_intervention(issue: ForemanIssue) -> dict[str, Any]:
                         "true only when a human must provide manual configuration, credentials, "
                         "account/admin access, external infrastructure access, or other non-agent action. "
                         "false when another autonomous code/debugging attempt is likely appropriate. "
-                        "If true, include explicit human instructions to the degree possible from the evidence."
+                        "If true, include literal human instructions to the degree possible from the evidence."
                     ),
                 },
                 ensure_ascii=False,
@@ -1113,6 +1172,24 @@ def _manual_instruction_steps(evidence: dict[str, Any]) -> list[str]:
     return _normalize_instruction_steps(
         {"instructions": evidence.get("manual_intervention_steps")}
     )
+
+
+def _safe_foreman_mention(mention: str = "") -> str:
+    raw = str(mention or FOREMAN_DISCORD_MENTION or "").strip()
+    if "\n" in raw:
+        raw = raw.splitlines()[0].strip()
+    safe = _truncate_text(_sanitize_text(raw), 100).strip()
+    return safe or FOREMAN_DISCORD_MENTION
+
+
+def _public_worker_url_for_board(board: str, worker: dict[str, Any]) -> str:
+    public_url = str(worker.get("public_url") or "").strip()
+    if public_url:
+        return public_url
+    thread_id = str(worker.get("thread_id") or "").strip()
+    legacy_board = f"discord-{thread_id}" if thread_id else ""
+    route_id = thread_id if legacy_board and str(board or "") == legacy_board else str(board or thread_id)
+    return public_session_board_url(route_id)
 
 
 def _manual_intervention_issue(issue: ForemanIssue, assessment: dict[str, Any]) -> ForemanIssue:

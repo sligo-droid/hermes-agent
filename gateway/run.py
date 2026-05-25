@@ -66,7 +66,7 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _DISCORD_KANBAN_REACTION_RESYNC_SECS = 30.0
 _DISCORD_FOREMAN_DEFAULT_CHANNEL_ID = "1504252294495998043"
-_DISCORD_FOREMAN_DEFAULT_MENTION = "<@1504235933598486580>"
+_DISCORD_FOREMAN_DEFAULT_MENTION = "<@&1503914570077442058>"
 _DISCORD_FOREMAN_THREAD_STATE_KEY = "foreman_thread"
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _TRUTHY_ENV_VALUES = {"true", "1", "yes", "on"}
@@ -6569,8 +6569,14 @@ class GatewayRunner:
                                             raise RuntimeError("Discord adapter cannot send foreman human alerts")
                                         result = await sender(
                                             watcher_cfg["channel_id"],
-                                            _foreman.render_foreman_alert(issue),
-                                            metadata={"foreman_alert_kind": getattr(issue, "kind", "")},
+                                            _foreman.render_foreman_alert(
+                                                issue,
+                                                mention=watcher_cfg["mention"],
+                                            ),
+                                            metadata={
+                                                "foreman_alert_kind": getattr(issue, "kind", ""),
+                                                "allowed_role_mentions": ["1503914570077442058"],
+                                            },
                                         )
                                         if getattr(result, "success", True) is False:
                                             raise RuntimeError(

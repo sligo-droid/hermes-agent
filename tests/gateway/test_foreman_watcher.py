@@ -128,7 +128,7 @@ def test_foreman_defaults_are_disabled_with_expected_discord_target():
 
     assert foreman["enabled"] is False
     assert foreman["channel_id"] == "1504252294495998043"
-    assert foreman["mention"] == "<@1504235933598486580>"
+    assert foreman["mention"] == "<@&1503914570077442058>"
     assert foreman["blocked_board_min_age_seconds"] == 600
 
 
@@ -335,7 +335,12 @@ def test_foreman_watcher_direct_alerts_human_intervention_issue(monkeypatch):
     monkeypatch.setattr(foreman, "collect_human_intervention_issues", lambda now=None, **kwargs: [issue])
     monkeypatch.setattr(foreman, "startup_baseline_needed", lambda: False)
     monkeypatch.setattr(foreman, "alerts_due", lambda issues, *, config=None, now=None: list(issues))
-    monkeypatch.setattr(foreman, "render_foreman_alert", lambda issue: f"human alert: {issue.task_id}")
+    rendered_mentions = []
+    monkeypatch.setattr(
+        foreman,
+        "render_foreman_alert",
+        lambda issue, mention="": rendered_mentions.append(mention) or f"human alert: {issue.task_id}",
+    )
     monkeypatch.setattr(foreman, "record_alert_sent", lambda issue: sent.append(issue.task_id))
     monkeypatch.setattr(foreman, "record_alert_failed", lambda issue, error: failed.append((issue.task_id, error)))
 
@@ -354,11 +359,15 @@ def test_foreman_watcher_direct_alerts_human_intervention_issue(monkeypatch):
         {
             "chat_id": "1504252294495998043",
             "content": "human alert: source-task",
-            "metadata": {"foreman_alert_kind": "human_intervention_required"},
+            "metadata": {
+                "foreman_alert_kind": "human_intervention_required",
+                "allowed_role_mentions": ["1503914570077442058"],
+            },
         }
     ]
     assert adapter.created_goals == []
     assert goal_events == []
+    assert rendered_mentions == ["<@&1503914570077442058>"]
     assert sent == ["source-task"]
     assert failed == []
 
