@@ -6173,6 +6173,13 @@ class GatewayRunner:
             "scan_interval_seconds": self._discord_foreman_clamped_int(
                 raw.get("scan_interval_seconds"), 300, 10, 3600,
             ),
+            "blocked_board_min_age_seconds": self._discord_foreman_clamped_int(
+                raw.get("blocked_board_min_age_seconds"),
+                600,
+                60,
+                7 * 24 * 3600,
+                allow_zero=True,
+            ),
             "terminal_suppression_age_seconds": self._discord_foreman_clamped_int(
                 raw.get("terminal_suppression_age_seconds"),
                 7 * 24 * 3600,
@@ -6523,7 +6530,12 @@ class GatewayRunner:
                             def _collect_due_alerts() -> list[Any]:
                                 nonlocal startup_baseline_checked
                                 now = int(time.time())
-                                issues = _foreman.collect_foreman_issues(now=now)
+                                issues = _foreman.collect_foreman_issues(
+                                    now=now,
+                                    blocked_board_min_age_seconds=int(
+                                        watcher_cfg["blocked_board_min_age_seconds"]
+                                    ),
+                                )
                                 if not startup_baseline_checked:
                                     startup_baseline_checked = True
                                     if _foreman.startup_baseline_needed():
