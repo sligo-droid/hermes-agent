@@ -28,12 +28,25 @@ PUBLIC_BOARD_COLUMNS = ("triage", "todo", "scheduled", "ready", "running", "bloc
 _ROLE_ROUND_TITLE_RE = re.compile(r"^R\d+:\s*")
 
 
+def _discord_slug_part(value: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z_-]+", "-", str(value or "").strip()).strip("-_")
+
+
 def board_slug_for_discord_thread(thread_id: str) -> str:
-    """Return the canonical board slug for a Discord thread id."""
-    cleaned = re.sub(r"[^0-9a-zA-Z_-]+", "-", str(thread_id or "").strip()).strip("-_")
+    """Return the canonical legacy board slug for a Discord thread id."""
+    cleaned = _discord_slug_part(thread_id)
     if not cleaned:
         raise ValueError("Discord thread id is required")
     return f"discord-{cleaned.lower()}"[:64]
+
+
+def board_slug_for_discord_request(thread_id: str, request_id: Optional[str] = None) -> str:
+    """Return the board slug for one Discord work request within a thread."""
+    base = board_slug_for_discord_thread(thread_id)
+    request = _discord_slug_part(str(request_id or ""))
+    if not request:
+        return base
+    return f"{base}-m-{request.lower()}"[:64]
 
 
 def format_role_round_title(title: str, round_number: int) -> str:

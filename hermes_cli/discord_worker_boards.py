@@ -38,6 +38,7 @@ from hermes_cli.discord_worker_roles import (
     ROLE_REVIEWER,
     TERMINAL_GOAL_STATUSES,
     active_dev_round,
+    board_slug_for_discord_request,
     board_slug_for_discord_thread,
     format_role_round_title,
 )
@@ -239,6 +240,33 @@ def public_session_board_url(session_id: str) -> str:
     return f"{base}/{session}" if base and session else ""
 
 
+def _public_session_id_for_board(board: str, worker: dict[str, Any]) -> str:
+    thread_id = str(worker.get("thread_id") or "").strip()
+    if not thread_id:
+        return str(board or "")
+    try:
+        legacy = board_slug_for_discord_thread(thread_id)
+    except ValueError:
+        legacy = ""
+    return thread_id if legacy and board == legacy else str(board or thread_id)
+
+
+def resolve_public_session_board(session_id: str) -> str:
+    raw = str(session_id or "").strip()
+    if not raw:
+        raise KeyError("unknown board session")
+    candidates = [raw]
+    if not raw.startswith("discord-"):
+        candidates.append(board_slug_for_discord_thread(raw))
+    for board in candidates:
+        if not kanban_db.board_exists(board):
+            continue
+        worker = _read_worker_meta(board)
+        if worker.get("kind") == "discord_worker_board":
+            return board
+    raise KeyError("unknown board session")
+
+
 def public_board_url(token: str) -> str:
     """Return the token URL when an absolute public base is configured."""
     path = f"/public/kanban/{token}"
@@ -286,10 +314,16 @@ def ensure_discord_thread_board(
     parent_channel_id: Optional[str] = None,
     initial_request: str = "",
     project_context: Optional[dict[str, Any]] = None,
+    request_id: Optional[str] = None,
+    board_slug: Optional[str] = None,
+    source_message_id: Optional[str] = None,
+    summary_message_id: Optional[str] = None,
 ) -> DiscordBoard:
-    """Create or update the board backing a Discord thread."""
+    """Create or update the board backing a Discord thread/request."""
     started = time.time()
-    slug = board_slug_for_discord_thread(thread_id)
+    request_id = str(source_message_id or request_id or "").strip()
+    slug = str(board_slug or "").strip() or board_slug_for_discord_request(thread_id, request_id)
+    route_id = slug if slug != board_slug_for_discord_thread(thread_id) else str(thread_id)
     worker = _read_worker_meta(slug)
     existing_context = worker.get("project_context")
     merged_project_context = dict(existing_context) if isinstance(existing_context, dict) else {}
@@ -303,10 +337,11 @@ def ensure_discord_thread_board(
     if project_path:
         merged_project_context["project_path"] = project_path
     token = worker.get("share_token") or secrets.token_urlsafe(PUBLIC_TOKEN_BYTES)
-    branch = f"discord/{thread_id}"
+    request_suffix = slug.removeprefix("discord-")
+    branch = f"discord/{request_suffix or thread_id}"
     metadata = kanban_db.create_board(
         slug,
-        name=f"Discord {thread_id}",
+        name=f"Discord {thread_id}" if route_id == str(thread_id) else f"Discord {thread_id} / {request_id}",
         description=(initial_request or "")[:500],
         icon="",
         color="#22c55e",
@@ -315,11 +350,14 @@ def ensure_discord_thread_board(
     project_path_changed = bool(project_path and project_path != existing_project_path)
     worktree_path = previous_worktree_path
     if not worktree_path or (project_path_changed and not worker.get("code_island_ready")):
-        worktree_path = _default_worktree_path(project_path, str(thread_id))
+        worktree_path = _default_worktree_path(project_path, request_suffix or str(thread_id))
     worker.update(
         {
             "kind": "discord_worker_board",
             "thread_id": str(thread_id),
+            "request_id": request_id or worker.get("request_id") or "",
+            "source_message_id": str(source_message_id or worker.get("source_message_id") or request_id or ""),
+            "summary_message_id": str(summary_message_id or worker.get("summary_message_id") or ""),
             "chat_id": str(chat_id or ""),
             "guild_id": str(guild_id or ""),
             "parent_channel_id": str(parent_channel_id or ""),
@@ -336,7 +374,7 @@ def ensure_discord_thread_board(
             "review_loop_count": int(worker.get("review_loop_count") or 0),
             "review_loop_limit": int(worker.get("review_loop_limit") or _review_loop_limit()),
             "share_token": token,
-            "public_url": public_session_board_url(str(thread_id)),
+            "public_url": public_session_board_url(route_id),
             "created_at": worker.get("created_at") or _now(),
         }
     )
@@ -358,6 +396,23 @@ def ensure_discord_thread_board(
         elapsed_ms,
     )
     return DiscordBoard(slug=slug, metadata=metadata)
+
+
+def set_feature_summary_handle(
+    board: str,
+    *,
+    message_id: Optional[str] = None,
+    source_message_id: Optional[str] = None,
+) -> None:
+    """Attach the Discord summary/source message ids to a worker board."""
+    updates: dict[str, Any] = {}
+    if message_id:
+        updates["summary_message_id"] = str(message_id)
+    if source_message_id:
+        updates["source_message_id"] = str(source_message_id)
+        updates["request_id"] = str(source_message_id)
+    if updates:
+        _update_worker_meta(board, updates)
 
 
 def _sync_role_task_workspaces(board: str, *, old_path: str, new_path: str) -> None:
@@ -586,12 +641,7 @@ def public_board_snapshot(token: str) -> dict[str, Any]:
 
 
 def public_board_snapshot_for_session(session_id: str) -> dict[str, Any]:
-    board = board_slug_for_discord_thread(session_id)
-    if not kanban_db.board_exists(board):
-        raise KeyError("unknown board session")
-    worker = _read_worker_meta(board)
-    if worker.get("kind") != "discord_worker_board":
-        raise KeyError("unknown board session")
+    board = resolve_public_session_board(session_id)
     return _public_board_snapshot_for_board(board)
 
 
@@ -631,7 +681,8 @@ def _public_board_snapshot_for_board(board: str) -> dict[str, Any]:
         "board": board,
         "name": _worker_board_name(worker, metadata, board),
         "description": metadata.get("description") or "",
-        "session_id": str(worker.get("thread_id") or ""),
+        "session_id": _public_session_id_for_board(board, worker),
+        "thread_id": str(worker.get("thread_id") or ""),
         "worker": _public_worker_meta(worker),
         "counts": counts,
         "running": running,
@@ -642,22 +693,14 @@ def _public_board_snapshot_for_board(board: str) -> dict[str, Any]:
 
 
 def ticket_state_for_session(session_id: str, task_id: str) -> dict[str, Any]:
-    board = board_slug_for_discord_thread(session_id)
-    if not kanban_db.board_exists(board):
-        raise KeyError("unknown board session")
+    board = resolve_public_session_board(session_id)
     worker = _read_worker_meta(board)
-    if worker.get("kind") != "discord_worker_board":
-        raise KeyError("unknown board session")
     return _ticket_state_for_board(board, task_id, worker=worker)
 
 
 def ticket_terminal_feed_for_session(session_id: str, task_id: str) -> dict[str, Any]:
-    board = board_slug_for_discord_thread(session_id)
-    if not kanban_db.board_exists(board):
-        raise KeyError("unknown board session")
+    board = resolve_public_session_board(session_id)
     worker = _read_worker_meta(board)
-    if worker.get("kind") != "discord_worker_board":
-        raise KeyError("unknown board session")
     return _ticket_terminal_feed_for_board(board, task_id, worker=worker)
 
 
@@ -723,12 +766,8 @@ def render_public_session_ticket_terminal_html(session_id: str, task_id: str) ->
 
 def move_ticket_for_session(session_id: str, task_id: str, status: str) -> dict[str, Any]:
     """Move one public worker-board ticket to another visible status column."""
-    board = board_slug_for_discord_thread(session_id)
-    if not kanban_db.board_exists(board):
-        raise KeyError("unknown board session")
+    board = resolve_public_session_board(session_id)
     worker = _read_worker_meta(board)
-    if worker.get("kind") != "discord_worker_board":
-        raise KeyError("unknown board session")
 
     task_id = str(task_id or "").strip()
     new_status = str(status or "").strip().lower()
@@ -1889,12 +1928,7 @@ def read_board_run_summary(board: str) -> dict[str, Any]:
 
 
 def board_run_summary_for_session(session_id: str) -> dict[str, Any]:
-    board = board_slug_for_discord_thread(session_id)
-    if not kanban_db.board_exists(board):
-        raise KeyError("unknown board session")
-    worker = _read_worker_meta(board)
-    if worker.get("kind") != "discord_worker_board":
-        raise KeyError("unknown board session")
+    board = resolve_public_session_board(session_id)
     return read_board_run_summary(board) or build_board_run_summary(board)
 
 
@@ -2008,6 +2042,8 @@ def feature_summary_snapshot(board: str) -> dict[str, Any]:
         "board": board,
         "thread_id": str(worker.get("thread_id") or ""),
         "chat_id": str(worker.get("chat_id") or worker.get("thread_id") or ""),
+        "message_id": str(worker.get("summary_message_id") or "").strip(),
+        "source_message_id": str(worker.get("source_message_id") or "").strip(),
         "guild_id": str(worker.get("guild_id") or "").strip(),
         "parent_channel_id": str(worker.get("parent_channel_id") or "").strip(),
         "state": state,
@@ -2053,6 +2089,8 @@ def thread_status_targets() -> list[dict[str, Any]]:
                 "board": board,
                 "thread_id": thread_id,
                 "chat_id": str(worker.get("chat_id") or thread_id),
+                "message_id": summary.get("message_id") or str(worker.get("summary_message_id") or ""),
+                "source_message_id": summary.get("source_message_id") or str(worker.get("source_message_id") or ""),
                 "guild_id": summary.get("guild_id") or str(worker.get("guild_id") or ""),
                 "parent_channel_id": summary.get("parent_channel_id") or str(worker.get("parent_channel_id") or ""),
                 "state": state,
@@ -2523,11 +2561,12 @@ def _render_public_board_html(
         if (c.get("active", True) if isinstance(c, dict) else True)
     )
     discord_thread_url = str(worker.get("discord_thread_url") or "").strip()
+    thread_display = str(worker.get("thread_id") or session_id)
     session_text = (
         f'<a href="{esc(discord_thread_url)}" target="_blank" rel="noopener noreferrer">'
-        f"<code>{esc(session_id)}</code></a>"
+        f"<code>{esc(thread_display)}</code></a>"
         if discord_thread_url
-        else f"<code>{esc(session_id)}</code>"
+        else f"<code>{esc(thread_display)}</code>"
     )
     runtime_action = _runtime_action_form_html(
         session_id,
@@ -2903,7 +2942,7 @@ def public_board_index_snapshot() -> dict[str, Any]:
             )
         finally:
             conn.close()
-        session_id = str(worker.get("thread_id") or "")
+        session_id = _public_session_id_for_board(slug, worker)
         boards.append(
             {
                 "board": slug,
@@ -2943,11 +2982,12 @@ def render_public_board_index_html() -> str:
         title = esc(_worker_index_title(worker, board.get("name")))
         link = f'<a class="board-title" href="{esc(href)}">{title}</a>' if href else title
         discord_thread_url = str(worker.get("discord_thread_url") or "").strip()
+        thread_display = str(worker.get("thread_id") or session_id)
         session_text = (
             f'<a href="{esc(discord_thread_url)}" target="_blank" rel="noopener noreferrer">'
-            f"<code>{esc(session_id)}</code></a>"
+            f"<code>{esc(thread_display)}</code></a>"
             if discord_thread_url
-            else f"<code>{esc(session_id)}</code>"
+            else f"<code>{esc(thread_display)}</code>"
         )
         status = _public_status_text(worker)
         execution_mode = str(worker.get("execution_mode") or "").strip()
@@ -3045,6 +3085,7 @@ def set_goal(
     project_context: Optional[dict[str, Any]] = None,
     request_id: Optional[str] = None,
     thread_context: Optional[str] = None,
+    board_slug: Optional[str] = None,
 ) -> DiscordBoard:
     return start_planner_request(
         thread_id=thread_id,
@@ -3055,6 +3096,7 @@ def set_goal(
         project_context=project_context,
         request_id=request_id,
         thread_context=thread_context,
+        board_slug=board_slug,
         created_by="discord-goal",
     )
 
@@ -3067,6 +3109,8 @@ def start_direct_goal(
     guild_id: Optional[str] = None,
     parent_channel_id: Optional[str] = None,
     project_context: Optional[dict[str, Any]] = None,
+    request_id: Optional[str] = None,
+    board_slug: Optional[str] = None,
 ) -> DiscordBoard:
     """Activate a Discord worker board whose work items already exist."""
     raw_goal = str(goal or "").strip()
@@ -3077,6 +3121,8 @@ def start_direct_goal(
         parent_channel_id=parent_channel_id,
         initial_request=raw_goal,
         project_context=project_context,
+        request_id=request_id,
+        board_slug=board_slug,
     )
     worker = board.worker
     previous_goal = str(worker.get("root_goal") or worker.get("initial_request") or "")
@@ -3109,6 +3155,7 @@ def start_planner_request(
     request_id: Optional[str] = None,
     thread_context: Optional[str] = None,
     created_by: str = "discord-feature-request",
+    board_slug: Optional[str] = None,
 ) -> DiscordBoard:
     raw_request = _canonical_planner_request_text(request)
     board = ensure_discord_thread_board(
@@ -3118,6 +3165,9 @@ def start_planner_request(
         parent_channel_id=parent_channel_id,
         initial_request=raw_request,
         project_context=project_context,
+        request_id=request_id,
+        board_slug=board_slug,
+        source_message_id=request_id,
     )
     worker = board.worker
     previous_goal_status = str(worker.get("goal_status") or "").strip().lower()
@@ -3829,7 +3879,27 @@ def board_for_gateway_event(event: Any, *, create: bool = False) -> Optional[Dis
     thread_id = str(source_thread_id or getattr(source, "chat_id", "") or "")
     if not thread_id:
         return None
-    slug = board_slug_for_discord_thread(thread_id)
+    feature_summary = getattr(event, "feature_summary", None)
+    feature_board = None
+    if isinstance(feature_summary, dict):
+        board_handle = feature_summary.get("kanban_board")
+        if isinstance(board_handle, dict):
+            feature_board = str(board_handle.get("slug") or "").strip() or None
+    command_name = ""
+    get_command = getattr(event, "get_command", None)
+    if callable(get_command):
+        try:
+            command_name = str(get_command() or "").lstrip("/").lower()
+        except Exception:
+            command_name = ""
+    request_id = str(
+        (feature_summary or {}).get("source_message_id") if isinstance(feature_summary, dict) else ""
+    ).strip()
+    if not request_id and create and command_name == "goal":
+        request_id = str(getattr(event, "message_id", "") or "").strip()
+    slug = feature_board or (
+        board_slug_for_discord_request(thread_id, request_id) if create else board_slug_for_discord_thread(thread_id)
+    )
     if not create and not kanban_db.board_exists(slug):
         return None
     if create:
@@ -3849,5 +3919,8 @@ def board_for_gateway_event(event: Any, *, create: bool = False) -> Optional[Dis
             parent_channel_id=str(getattr(source, "parent_chat_id", "") or ""),
             initial_request=str(getattr(event, "text", "") or ""),
             project_context=project_context,
+            request_id=request_id,
+            board_slug=slug,
+            source_message_id=request_id,
         )
     return DiscordBoard(slug=slug, metadata=kanban_db.read_board_metadata(slug))
