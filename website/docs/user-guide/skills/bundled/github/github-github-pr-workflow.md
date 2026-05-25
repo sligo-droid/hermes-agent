@@ -16,7 +16,7 @@ GitHub PR lifecycle: branch, commit, open, CI, merge.
 |---|---|
 | Source | Bundled (installed by default) |
 | Path | `skills/github/github-pr-workflow` |
-| Version | `1.1.2` |
+| Version | `1.1.3` |
 | Author | Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos, windows |
@@ -144,18 +144,31 @@ git push -u origin HEAD
 
 **With gh:**
 
-```bash
-gh pr create \
-  --title "feat: add JWT-based user authentication" \
-  --body "## Summary
+Write the PR body to a temporary Markdown file with real line breaks, then pass
+that file to `gh`. Do not pass JSON-escaped Markdown such as
+`--body "## Summary\n- ..."`; GitHub will render the literal `\n` text.
+
+Example `pr-body.md`:
+
+```markdown
+## Summary
 - Adds login and register API endpoints
 - JWT token generation and validation
 
 ## Test Plan
 - [ ] Unit tests pass
 
-Closes #42"
+Closes #42
 ```
+
+```bash
+gh pr create \
+  --title "feat: add JWT-based user authentication" \
+  --body-file pr-body.md
+```
+
+Before merge, verify `gh pr view --json body --jq .body` prints actual multiple
+lines, not `\n` escape sequences.
 
 Options: `--draft`, `--reviewer user1,user2`, `--label "enhancement"`, `--base develop`
 
