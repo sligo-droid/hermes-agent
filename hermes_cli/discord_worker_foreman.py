@@ -31,6 +31,7 @@ DISCORD_ALERT_LIMIT = 2000
 FOREMAN_DISCORD_CHANNEL_ID = "1504252294495998043"
 FOREMAN_DISCORD_MENTION = "<@1504235933598486580>"
 BLOCKED_BOARD_MIN_AGE_SECONDS = 10 * 60
+MANUAL_ESCALATION_TASK = "foreman_manual_escalation"
 _ACTIVE_BOARD_TASK_STATUSES = frozenset(
     {"triage", "todo", "scheduled", "ready", "running", "blocked", "review"}
 )
@@ -91,11 +92,18 @@ _ALLOWED_RENDER_EVIDENCE_KEYS = frozenset(
         "error_excerpt",
         "heartbeat_age_seconds",
         "last_heartbeat_at",
+        "llm_assessed_at",
+        "llm_confidence",
         "active_task_count",
         "blocked_count",
         "blocked_reason",
         "board_goal_status",
         "board_phase",
+        "foreman_board",
+        "foreman_task_id",
+        "manual_intervention_reason",
+        "manual_intervention_steps",
+        "manual_intervention_type",
         "ready_count",
         "run_error",
         "run_id",
@@ -117,6 +125,9 @@ _ALLOWED_RENDER_EVIDENCE_KEYS = frozenset(
         "thread_state",
         "todo_count",
         "running_count",
+        "source_board",
+        "source_issue_kind",
+        "source_task_id",
     }
 )
 _SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2, "critical": 3}
@@ -191,6 +202,7 @@ class BoardSnapshot:
     goal_status: str = ""
     phase: str = ""
     blocked_reason: str = ""
+    request_text: str = ""
     archived: bool = False
 
 
@@ -231,6 +243,55 @@ def collect_foreman_issues(
         issues.extend(detect_stale_running(snapshot, now=now))
         issues.extend(detect_missing_read_broker(snapshot))
         issues.extend(detect_stalled_blocked_board(snapshot, now=now, min_age_seconds=min_age))
+    return sorted(issues, key=lambda issue: (issue.board, issue.task_id, issue.kind))
+
+
+def collect_human_intervention_issues(
+    now: Optional[int] = None,
+    *,
+    blocked_board_min_age_seconds: int = BLOCKED_BOARD_MIN_AGE_SECONDS,
+    assessment_fn: Optional[Any] = None,
+) -> list[ForemanIssue]:
+    """Return human-escalation issues for blocked foreman-generated boards.
+
+    The manual-configuration decision is intentionally made by an auxiliary
+    LLM once per unique foreman-board blockage, then persisted in foreman
+    state so the watcher does not keep spending inference on the same block.
+    """
+    now = int(time.time()) if now is None else int(now)
+    min_age = _coerce_nonnegative_int(
+        blocked_board_min_age_seconds,
+        BLOCKED_BOARD_MIN_AGE_SECONDS,
+    )
+    state = _read_alert_state()
+    assessments = state.setdefault("manual_assessments", {})
+    changed = _gc_alert_state(
+        state,
+        now=now,
+        retention_seconds=int(_ALERT_DEFAULTS["retention_seconds"]),
+    )
+    issues: list[ForemanIssue] = []
+    seen_keys: set[str] = set()
+    for snapshot in collect_board_snapshots(foreman_generated_only=True):
+        candidates: list[ForemanIssue] = []
+        candidates.extend(detect_worker_errored(snapshot))
+        candidates.extend(detect_missing_read_broker(snapshot))
+        candidates.extend(detect_stalled_blocked_board(snapshot, now=now, min_age_seconds=min_age))
+        candidates = [_with_foreman_source(issue, snapshot) for issue in candidates]
+        for issue in candidates:
+            key = _manual_assessment_key(issue)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            entry = assessments.get(key)
+            if not isinstance(entry, dict):
+                entry = _assess_manual_intervention(issue, now=now, assessment_fn=assessment_fn)
+                assessments[key] = entry
+                changed = True
+            if bool(entry.get("requires_manual_intervention")):
+                issues.append(_manual_intervention_issue(issue, entry))
+    if changed:
+        _write_alert_state(state)
     return sorted(issues, key=lambda issue: (issue.board, issue.task_id, issue.kind))
 
 
@@ -407,10 +468,17 @@ def render_foreman_alert(issue: ForemanIssue, mention: str = "") -> str:
             f"Next action: {_suggest_next_action(issue)}",
         ]
     )
+    steps = _manual_instruction_steps(evidence)
+    if steps:
+        lines.append("Human instructions:")
+        for index, step in enumerate(steps[:8], start=1):
+            lines.append(f"{index}. {_truncate_text(_sanitize_text(step), 220)}")
     if evidence:
         lines.append("Evidence:")
         for key in sorted(evidence):
             value = evidence[key]
+            if key == "manual_intervention_steps":
+                continue
             if key == "session_url" and (not isinstance(value, str) or not _is_public_url(value)):
                 continue
             lines.append(f"- {key}: {_truncate_text(_sanitize_text(str(value)), 180)}")
@@ -434,6 +502,9 @@ def render_foreman_goal_prompt(issue: ForemanIssue) -> str:
         f"- {_suggest_next_action(issue)}",
         "- Update, retry, unblock, or close the affected Kanban task as appropriate.",
         "- Verify the board can progress without this foreman issue recurring.",
+        "- Make one autonomous attempt to resolve the blocker.",
+        "- If progress requires human-only configuration, credentials, account/admin access, "
+        "or external infrastructure access, block with a concise manual-intervention reason instead of cycling.",
     ]
     session_url = evidence.get("session_url")
     if isinstance(session_url, str) and _is_public_url(session_url):
@@ -454,7 +525,7 @@ def foreman_goal_thread_title(issue: ForemanIssue) -> str:
     return _truncate_text(_sanitize_text(re.sub(r"\s+", " ", title).strip()), 80)
 
 
-def collect_board_snapshots() -> list[BoardSnapshot]:
+def collect_board_snapshots(*, foreman_generated_only: bool = False) -> list[BoardSnapshot]:
     snapshots: list[BoardSnapshot] = []
     seen_db_paths: set[Path] = set()
     for meta in kanban_db.list_boards(include_archived=True):
@@ -462,7 +533,8 @@ def collect_board_snapshots() -> list[BoardSnapshot]:
         worker = meta.get(DISCORD_WORKER_META_KEY)
         if not isinstance(worker, dict) or worker.get("kind") != "discord_worker_board":
             continue
-        if _is_foreman_generated_board(worker):
+        is_foreman_generated = _is_foreman_generated_board(worker)
+        if foreman_generated_only != is_foreman_generated:
             continue
         db_path = _resolved_db_path(board)
         if db_path in seen_db_paths:
@@ -519,6 +591,12 @@ def _build_board_snapshot(
         goal_status=str(worker.get("goal_status") or ""),
         phase=str(worker.get("phase") or ""),
         blocked_reason=str(worker.get("blocked_reason") or ""),
+        request_text=str(
+            worker.get("root_goal")
+            or worker.get("initial_request")
+            or summary.get("root_goal")
+            or ""
+        ),
         archived=archived,
     )
 
@@ -656,6 +734,7 @@ def detect_stalled_blocked_board(
         "stalled_age_seconds": stalled_age,
         "stalled_after_seconds": max(0, int(min_age_seconds)),
     }
+    evidence.update(_foreman_source_from_request(snapshot.request_text))
     if stalled_since is not None:
         # Reuse the existing terminal-age suppression path for old board-level blockers.
         evidence["run_ended_at"] = stalled_since
@@ -845,6 +924,222 @@ def _synthetic_board_task(snapshot: BoardSnapshot) -> TaskSnapshot:
     )
 
 
+def _foreman_source_from_request(text: str) -> dict[str, str]:
+    source: dict[str, str] = {}
+    mapping = {
+        "board": "source_board",
+        "task": "source_task_id",
+        "detector": "source_issue_kind",
+    }
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip().lstrip("- ").strip()
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        target = mapping.get(key.strip().casefold())
+        if target and value.strip():
+            source[target] = _truncate_text(_sanitize_text(value.strip()), 120)
+    return source
+
+
+def _with_foreman_source(issue: ForemanIssue, snapshot: BoardSnapshot) -> ForemanIssue:
+    source = _foreman_source_from_request(snapshot.request_text)
+    if not source:
+        return issue
+    evidence = dict(issue.evidence) if isinstance(issue.evidence, dict) else {}
+    for key, value in source.items():
+        evidence.setdefault(key, value)
+    return ForemanIssue(
+        kind=issue.kind,
+        board=issue.board,
+        task_id=issue.task_id,
+        severity=issue.severity,
+        title=issue.title,
+        evidence=_sanitize_evidence(evidence),
+    )
+
+
+def _manual_assessment_key(issue: ForemanIssue) -> str:
+    evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
+    problem = (
+        evidence.get("run_error")
+        or evidence.get("sidecar_error")
+        or evidence.get("error_excerpt")
+        or evidence.get("blocked_reason")
+        or issue.title
+    )
+    payload = {
+        "detector_version": ALERT_DETECTOR_VERSION,
+        "kind": "manual_intervention_assessment",
+        "foreman_issue_kind": issue.kind,
+        "foreman_board": issue.board,
+        "foreman_task_id": issue.task_id,
+        "source_board": evidence.get("source_board") or "",
+        "source_task_id": evidence.get("source_task_id") or "",
+        "source_issue_kind": evidence.get("source_issue_kind") or "",
+        "problem": _canonical_problem_text(problem),
+    }
+    return _stable_digest(payload)
+
+
+def _assess_manual_intervention(
+    issue: ForemanIssue,
+    *,
+    now: int,
+    assessment_fn: Optional[Any] = None,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "assessed_at": now,
+        "requires_manual_intervention": False,
+        "reason": "",
+        "intervention_type": "",
+        "confidence": "",
+        "error": "",
+    }
+    try:
+        raw = assessment_fn(issue) if assessment_fn is not None else _llm_assess_manual_intervention(issue)
+        parsed = _normalize_manual_assessment(raw)
+    except Exception as exc:
+        entry["error"] = _truncate_text(_sanitize_text(str(exc)), 200)
+        return entry
+    entry.update(parsed)
+    return entry
+
+
+def _llm_assess_manual_intervention(issue: ForemanIssue) -> dict[str, Any]:
+    from agent.auxiliary_client import call_llm
+
+    evidence = _renderable_evidence(issue.evidence)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You classify blocked Hermes foreman attempts. The foreman has already made one "
+                "automated attempt to resolve a worker-board blockage. Decide whether this new "
+                "blockage now requires a human to perform manual configuration, provide access, "
+                "or supply information outside an AI agent's authority. Return only compact JSON "
+                "with keys: requires_manual_intervention (boolean), reason (string), "
+                "intervention_type (string), confidence (low|medium|high), "
+                "instructions (array of short step-by-step strings for the human). "
+                "When credentials are needed, make the instructions as explicit as possible: "
+                "which service/account area to open, what credential/access to create or request, "
+                "where it should be installed in Hermes or the project, and what to ask the agent to retry. "
+                "Do not invent secret values."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "foreman_issue": issue.to_dict(),
+                    "renderable_evidence": evidence,
+                    "decision_standard": (
+                        "true only when a human must provide manual configuration, credentials, "
+                        "account/admin access, external infrastructure access, or other non-agent action. "
+                        "false when another autonomous code/debugging attempt is likely appropriate. "
+                        "If true, include explicit human instructions to the degree possible from the evidence."
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        },
+    ]
+    response = call_llm(
+        task=MANUAL_ESCALATION_TASK,
+        messages=messages,
+        max_tokens=800,
+        temperature=0,
+        timeout=30,
+    )
+    content = str(response.choices[0].message.content or "")
+    return _parse_manual_assessment_json(content)
+
+
+def _parse_manual_assessment_json(content: str) -> dict[str, Any]:
+    text = str(content or "").strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            raise
+        data = json.loads(match.group(0))
+    if not isinstance(data, dict):
+        raise ValueError("manual intervention assessment did not return a JSON object")
+    return data
+
+
+def _normalize_manual_assessment(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, bool):
+        return {"requires_manual_intervention": raw}
+    if not isinstance(raw, dict):
+        raw = _parse_manual_assessment_json(str(raw or ""))
+    return {
+        "requires_manual_intervention": bool(raw.get("requires_manual_intervention")),
+        "reason": _truncate_text(_sanitize_text(str(raw.get("reason") or "")), 300),
+        "intervention_type": _truncate_text(_sanitize_text(str(raw.get("intervention_type") or "")), 80),
+        "instructions": _normalize_instruction_steps(raw),
+        "confidence": _truncate_text(_sanitize_text(str(raw.get("confidence") or "")), 20),
+        "error": "",
+    }
+
+
+def _normalize_instruction_steps(raw: dict[str, Any]) -> list[str]:
+    value = (
+        raw.get("instructions")
+        or raw.get("manual_intervention_steps")
+        or raw.get("steps")
+        or []
+    )
+    if isinstance(value, str):
+        candidates = [line.strip() for line in value.splitlines()]
+    elif isinstance(value, (list, tuple)):
+        candidates = [str(item or "").strip() for item in value]
+    else:
+        candidates = []
+    steps: list[str] = []
+    for item in candidates:
+        step = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", item).strip()
+        if not step:
+            continue
+        steps.append(_truncate_text(_sanitize_text(step), 220))
+        if len(steps) >= 8:
+            break
+    return steps
+
+
+def _manual_instruction_steps(evidence: dict[str, Any]) -> list[str]:
+    return _normalize_instruction_steps(
+        {"instructions": evidence.get("manual_intervention_steps")}
+    )
+
+
+def _manual_intervention_issue(issue: ForemanIssue, assessment: dict[str, Any]) -> ForemanIssue:
+    evidence = dict(issue.evidence) if isinstance(issue.evidence, dict) else {}
+    evidence.update(
+        {
+            "foreman_board": issue.board,
+            "foreman_task_id": issue.task_id,
+            "manual_intervention_reason": assessment.get("reason") or "Manual intervention required.",
+            "manual_intervention_steps": assessment.get("instructions") or [],
+            "manual_intervention_type": assessment.get("intervention_type") or "manual_intervention",
+            "llm_confidence": assessment.get("confidence") or "",
+            "llm_assessed_at": assessment.get("assessed_at"),
+        }
+    )
+    source_board = str(evidence.get("source_board") or issue.board)
+    source_task = str(evidence.get("source_task_id") or issue.task_id)
+    return ForemanIssue(
+        kind="human_intervention_required",
+        board=source_board,
+        task_id=source_task,
+        severity="critical",
+        title="Foreman attempt requires human manual intervention",
+        evidence=_sanitize_evidence(evidence),
+    )
+
+
 def _task_error_texts(task: TaskSnapshot) -> Iterable[str]:
     if task.last_failure_error:
         yield task.last_failure_error
@@ -923,13 +1218,22 @@ def _read_alert_state() -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         raw = {}
     if not isinstance(raw, dict) or raw.get("version") != ALERT_STATE_VERSION:
-        return {"version": ALERT_STATE_VERSION, "alerts": {}, "daily_counts": {}}
+        return {
+            "version": ALERT_STATE_VERSION,
+            "alerts": {},
+            "issue_groups": {},
+            "manual_assessments": {},
+            "daily_counts": {},
+        }
     alerts = raw.get("alerts")
     if not isinstance(alerts, dict):
         raw["alerts"] = {}
     groups = raw.get("issue_groups")
     if not isinstance(groups, dict):
         raw["issue_groups"] = {}
+    assessments = raw.get("manual_assessments")
+    if not isinstance(assessments, dict):
+        raw["manual_assessments"] = {}
     daily_counts = raw.get("daily_counts")
     if not isinstance(daily_counts, dict):
         raw["daily_counts"] = {}
@@ -940,6 +1244,7 @@ def _write_alert_state(state: dict[str, Any]) -> None:
     state["version"] = ALERT_STATE_VERSION
     state.setdefault("alerts", {})
     state.setdefault("issue_groups", {})
+    state.setdefault("manual_assessments", {})
     state.setdefault("daily_counts", {})
     atomic_json_write(_alert_state_path(), state, indent=2, sort_keys=True)
 
@@ -1054,6 +1359,14 @@ def _issue_group_payload(issue: ForemanIssue) -> dict[str, Any]:
         payload["board_goal_status"] = _canonical_problem_text(evidence.get("board_goal_status") or "")
         payload["board_phase"] = _canonical_problem_text(evidence.get("board_phase") or "")
         payload["blocked_reason"] = _canonical_problem_text(evidence.get("blocked_reason") or "")
+    elif issue.kind == "human_intervention_required":
+        payload["board"] = issue.board
+        payload["source_board"] = _canonical_problem_text(evidence.get("source_board") or "")
+        payload["source_task_id"] = _canonical_problem_text(evidence.get("source_task_id") or "")
+        payload["foreman_board"] = _canonical_problem_text(evidence.get("foreman_board") or "")
+        payload["manual_intervention_type"] = _canonical_problem_text(
+            evidence.get("manual_intervention_type") or ""
+        )
     return payload
 
 
@@ -1189,6 +1502,16 @@ def _gc_alert_state(state: dict[str, Any], *, now: int, retention_seconds: int) 
         if max(seen, sent, attempted) < cutoff:
             groups.pop(fingerprint, None)
             changed = True
+    assessments = state.setdefault("manual_assessments", {})
+    for fingerprint, entry in list(assessments.items()):
+        if not isinstance(entry, dict):
+            assessments.pop(fingerprint, None)
+            changed = True
+            continue
+        assessed = int(entry.get("assessed_at") or 0)
+        if assessed < cutoff:
+            assessments.pop(fingerprint, None)
+            changed = True
     today_prefix = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d")
     daily_counts = state.setdefault("daily_counts", {})
     for key in list(daily_counts):
@@ -1216,6 +1539,8 @@ def _suggest_next_action(issue: ForemanIssue) -> str:
         return "Inspect the failed worker run and unblock or retry with the recorded error fixed."
     if issue.kind == "board_stalled":
         return "Inspect the board-level blocker, provide missing inputs, then unblock or retry the affected task."
+    if issue.kind == "human_intervention_required":
+        return "A human must provide the requested manual intervention, then unblock or retry the source task."
     return "Inspect the Kanban task and resolve the reported worker issue."
 
 

@@ -337,6 +337,141 @@ def test_board_stalled_alerts_are_per_board_and_do_not_repeat_terminal_state(mon
     assert alerts_due([older], now=2000, config={"cooldown_seconds": 1}) == []
 
 
+def test_human_intervention_scan_assesses_foreman_board_once(monkeypatch, tmp_path):
+    board = _discord_board(monkeypatch, tmp_path)
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_foreman import collect_human_intervention_issues, render_foreman_goal_prompt
+
+    source = _alert_issue(
+        kind="board_stalled",
+        board="discord-source",
+        task_id="source-task",
+        severity="warning",
+        title="Discord worker board is blocked with no running workers",
+        evidence={
+            "thread_state": "blocked",
+            "task_status": "blocked",
+            "blocked_reason": "Need external API credentials.",
+        },
+    )
+    meta = kanban_db.read_board_metadata(board)
+    worker = dict(meta["discord_worker"])
+    worker.update(
+        {
+            "initial_request": render_foreman_goal_prompt(source),
+            "root_goal": render_foreman_goal_prompt(source),
+            "goal_status": "blocked",
+            "phase": "blocked",
+            "blocked_reason": "Cannot continue without a human-created API key.",
+            "updated_at": 100,
+        }
+    )
+    meta.pop("db_path", None)
+    meta["discord_worker"] = worker
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    conn = kanban_db.connect(board=board)
+    try:
+        kanban_db.create_task(
+            conn,
+            title="Resolve foreman escalation",
+            assignee="dev",
+            initial_status="blocked",
+            board=board,
+        )
+    finally:
+        conn.close()
+
+    calls = []
+
+    def assess(issue):
+        calls.append(issue.task_id)
+        return {
+            "requires_manual_intervention": True,
+            "reason": "A human must create the API key in the vendor console.",
+            "intervention_type": "api_key",
+            "instructions": [
+                "Open the vendor developer console for the PID project.",
+                "Create a read-only API key for the data ingestion job.",
+                "Add the key to the Hermes/PID secret store as PID_VENDOR_API_KEY.",
+                "Ask Hermes to retry the blocked source task.",
+            ],
+            "confidence": "high",
+        }
+
+    first = collect_human_intervention_issues(
+        now=701,
+        blocked_board_min_age_seconds=600,
+        assessment_fn=assess,
+    )
+    second = collect_human_intervention_issues(
+        now=800,
+        blocked_board_min_age_seconds=600,
+        assessment_fn=assess,
+    )
+
+    assert calls == [first[0].evidence["foreman_task_id"]]
+    assert [(issue.kind, issue.board, issue.task_id) for issue in first] == [
+        ("human_intervention_required", "discord-source", "source-task")
+    ]
+    assert [(issue.kind, issue.board, issue.task_id) for issue in second] == [
+        ("human_intervention_required", "discord-source", "source-task")
+    ]
+    assert first[0].evidence["foreman_board"] == board
+    assert first[0].evidence["manual_intervention_reason"] == "A human must create the API key in the vendor console."
+    assert first[0].evidence["manual_intervention_type"] == "api_key"
+    assert first[0].evidence["manual_intervention_steps"] == [
+        "Open the vendor developer console for the PID project.",
+        "Create a read-only API key for the data ingestion job.",
+        "Add the key to the Hermes/PID secret store as PID_VENDOR_API_KEY.",
+        "Ask Hermes to retry the blocked source task.",
+    ]
+    assert first[0].evidence["llm_confidence"] == "high"
+
+
+def test_human_intervention_scan_records_negative_assessment_once(monkeypatch, tmp_path):
+    board = _discord_board(monkeypatch, tmp_path)
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_foreman import collect_human_intervention_issues, render_foreman_goal_prompt
+
+    source = _alert_issue(kind="board_stalled", board="discord-source", task_id="source-task")
+    meta = kanban_db.read_board_metadata(board)
+    worker = dict(meta["discord_worker"])
+    worker.update(
+        {
+            "initial_request": render_foreman_goal_prompt(source),
+            "root_goal": render_foreman_goal_prompt(source),
+            "goal_status": "blocked",
+            "phase": "blocked",
+            "blocked_reason": "Autonomous retry might still fix this.",
+            "updated_at": 100,
+        }
+    )
+    meta.pop("db_path", None)
+    meta["discord_worker"] = worker
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    conn = kanban_db.connect(board=board)
+    try:
+        kanban_db.create_task(
+            conn,
+            title="Resolve foreman escalation",
+            assignee="dev",
+            initial_status="blocked",
+            board=board,
+        )
+    finally:
+        conn.close()
+
+    calls = []
+
+    def assess(issue):
+        calls.append(issue.task_id)
+        return {"requires_manual_intervention": False, "reason": "Retry autonomously."}
+
+    assert collect_human_intervention_issues(now=701, blocked_board_min_age_seconds=600, assessment_fn=assess) == []
+    assert collect_human_intervention_issues(now=800, blocked_board_min_age_seconds=600, assessment_fn=assess) == []
+    assert len(calls) == 1
+
+
 def test_collect_foreman_issues_reads_board_task_run_and_sidecar(monkeypatch, tmp_path):
     board = _discord_board(monkeypatch, tmp_path)
     from hermes_cli import kanban_db
@@ -779,6 +914,39 @@ def test_render_foreman_alert_is_safe_bounded_and_informative():
     assert "/tmp/private" not in rendered
     assert len(rendered) <= DISCORD_ALERT_LIMIT
     assert "[truncated]" in rendered
+
+
+def test_render_human_intervention_alert_includes_explicit_steps():
+    from hermes_cli.discord_worker_foreman import FOREMAN_DISCORD_MENTION, ForemanIssue, render_foreman_alert
+
+    issue = ForemanIssue(
+        kind="human_intervention_required",
+        board="discord-source",
+        task_id="source-task",
+        severity="critical",
+        title="Foreman attempt requires human manual intervention",
+        evidence={
+            "task_status": "blocked",
+            "foreman_board": "discord-foreman",
+            "manual_intervention_reason": "Create a vendor API key.",
+            "manual_intervention_type": "api_key",
+            "manual_intervention_steps": [
+                "Open the vendor developer console.",
+                "Create a project-scoped API key with read-only access.",
+                "Store it as PID_VENDOR_API_KEY, not in chat.",
+                "Tell Hermes to retry source-task.",
+            ],
+        },
+    )
+
+    rendered = render_foreman_alert(issue)
+
+    assert FOREMAN_DISCORD_MENTION in rendered
+    assert "Human instructions:" in rendered
+    assert "1. Open the vendor developer console." in rendered
+    assert "2. Create a project-scoped API key with read-only access." in rendered
+    assert "3. Store it as PID_VENDOR_API_KEY, not in chat." in rendered
+    assert "manual_intervention_steps" not in rendered
 
 
 def test_render_foreman_goal_prompt_is_goal_command_safe_and_informative():
