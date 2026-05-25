@@ -1,0 +1,23 @@
+name: PR Body Format
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-body:
+    name: pr body
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout trusted base code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Check PR body Markdown
+        run: python scripts/check_pr_body_format.py --event-path "$GITHUB_EVENT_PATH"
