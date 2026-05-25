@@ -766,8 +766,39 @@ def _reset_pr_status_fields(worker: dict[str, Any]) -> None:
         "pr_checks_total",
         "pr_checks_failed",
         "pr_blocker",
+        "pr_skipped_no_changes",
     ):
         worker.pop(key, None)
+
+
+def _is_foreman_generated_worker(worker: dict[str, Any]) -> bool:
+    request = str(
+        worker.get("root_goal") or worker.get("initial_request") or ""
+    ).lstrip()
+    return request.startswith("Foreman escalation:") or request.startswith(
+        "/goal Foreman escalation:"
+    )
+
+
+def _branch_has_commits(root: Path, *, base: str, branch: str) -> Optional[bool]:
+    if not base or not branch:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "rev-list", "--count", f"{base}..{branch}"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return int((result.stdout or "").strip() or "0") > 0
+    except ValueError:
+        return None
 
 
 def _check_rollup_summary(items: Any) -> tuple[str, int, list[str]]:
@@ -914,84 +945,99 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
             worker["pr_merge_state"] = "unknown"
             worker["pr_blocker"] = worker["pr_error"]
             raise RuntimeError(worker["pr_error"])
-        existing = subprocess.run(
-            [
-                "gh",
-                "pr",
-                "list",
-                "--repo",
-                repo,
-                "--head",
-                branch,
-                "--base",
-                base,
-                "--state",
-                "open",
-                "--json",
-                "url",
-                "--jq",
-                ".[0].url",
-            ],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        existing_url = (existing.stdout or "").strip()
-        if existing.returncode == 0 and existing_url and existing_url != "null":
-            worker["pr_url"] = existing_url
+        has_commits = _branch_has_commits(root, base=base, branch=branch)
+        if _is_foreman_generated_worker(worker) and has_commits is False:
+            worker["pr_skipped_no_changes"] = True
+            worker["pr_state"] = "not_needed"
+            worker["pr_checks_status"] = "passed"
+            worker["pr_checks_total"] = 0
+            worker["pr_checks_failed"] = []
+            worker["pr_merge_state"] = "clean"
+            worker["pr_mergeable"] = True
+            worker["pr_blocker"] = ""
         else:
-            pushed = subprocess.run(
-                ["git", "push", "-u", "origin", branch],
-                cwd=root,
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-            if pushed.returncode != 0:
-                worker["pr_error"] = (pushed.stderr or pushed.stdout or "git push failed").strip()
-                worker["pr_checks_status"] = "not checked"
-                worker["pr_merge_state"] = "unknown"
-                worker["pr_blocker"] = worker["pr_error"]
-                raise RuntimeError(worker["pr_error"])
-            title_source = str(
-                worker.get("root_goal")
-                or worker.get("initial_request")
-                or "implementation"
-            )
-            title = f"Discord worker: {title_source[:80]}"
-            body = (
-                f"Board: {worker.get('public_url') or board}\n\n"
-                f"Goal:\n{worker.get('root_goal') or worker.get('initial_request') or ''}"
-            )
-            created = subprocess.run(
+            existing = subprocess.run(
                 [
                     "gh",
                     "pr",
-                    "create",
+                    "list",
                     "--repo",
                     repo,
-                    "--base",
-                    base,
                     "--head",
                     branch,
-                    "--title",
-                    title,
-                    "--body",
-                    body,
+                    "--base",
+                    base,
+                    "--state",
+                    "open",
+                    "--json",
+                    "url",
+                    "--jq",
+                    ".[0].url",
                 ],
                 cwd=root,
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=20,
             )
-            if created.returncode == 0 and (created.stdout or "").strip():
-                worker["pr_url"] = created.stdout.strip()
+            existing_url = (existing.stdout or "").strip()
+            if existing.returncode == 0 and existing_url and existing_url != "null":
+                worker["pr_url"] = existing_url
             else:
-                worker["pr_error"] = (created.stderr or created.stdout or "gh pr create failed").strip()
+                pushed = subprocess.run(
+                    ["git", "push", "-u", "origin", branch],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+                if pushed.returncode != 0:
+                    worker["pr_error"] = (
+                        pushed.stderr or pushed.stdout or "git push failed"
+                    ).strip()
+                    worker["pr_checks_status"] = "not checked"
+                    worker["pr_merge_state"] = "unknown"
+                    worker["pr_blocker"] = worker["pr_error"]
+                    raise RuntimeError(worker["pr_error"])
+                title_source = str(
+                    worker.get("root_goal")
+                    or worker.get("initial_request")
+                    or "implementation"
+                )
+                title = f"Discord worker: {title_source[:80]}"
+                body = (
+                    f"Board: {worker.get('public_url') or board}\n\n"
+                    f"Goal:\n{worker.get('root_goal') or worker.get('initial_request') or ''}"
+                )
+                created = subprocess.run(
+                    [
+                        "gh",
+                        "pr",
+                        "create",
+                        "--repo",
+                        repo,
+                        "--base",
+                        base,
+                        "--head",
+                        branch,
+                        "--title",
+                        title,
+                        "--body",
+                        body,
+                    ],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if created.returncode == 0 and (created.stdout or "").strip():
+                    worker["pr_url"] = created.stdout.strip()
+                else:
+                    worker["pr_error"] = (
+                        created.stderr or created.stdout or "gh pr create failed"
+                    ).strip()
         if worker.get("pr_url"):
             _refresh_pr_status(worker, root=root, repo=repo)
-        else:
+        elif not worker.get("pr_skipped_no_changes"):
             worker.setdefault("pr_checks_status", "not checked")
             worker.setdefault("pr_merge_state", "unknown")
             worker["pr_blocker"] = _pr_blocker(worker)
@@ -1003,7 +1049,10 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
     metadata[DISCORD_WORKER_META_KEY] = worker
     metadata.pop("db_path", None)
     atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
-    return bool(worker.get("pr_url")) and not bool(worker.get("pr_error"))
+    has_pr_or_skip = bool(worker.get("pr_url")) or bool(
+        worker.get("pr_skipped_no_changes")
+    )
+    return has_pr_or_skip and not bool(worker.get("pr_error"))
 
 
 def _merge_criteria(board: Optional[str], criteria: list[str]) -> None:
