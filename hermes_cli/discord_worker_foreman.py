@@ -36,6 +36,7 @@ _ALERT_DEFAULTS = {
     "max_retry_backoff_seconds": 3600,
     "max_alerts_per_tick": 10,
     "daily_cap_per_board": 20,
+    "min_board_created_at": 0,
     "retention_seconds": 30 * 24 * 3600,
     "terminal_suppression_age_seconds": 7 * 24 * 3600,
 }
@@ -166,6 +167,7 @@ class BoardSnapshot:
     thread_state: str
     run_summary: dict[str, Any]
     tasks: tuple[TaskSnapshot, ...]
+    created_at: Optional[int] = None
     archived: bool = False
 
 
@@ -211,9 +213,13 @@ def alerts_due(
     cfg = _alert_config(config)
     state = _read_alert_state()
     alerts = state.setdefault("alerts", {})
+    groups = state.setdefault("issue_groups", {})
     changed = _gc_alert_state(state, now=now, retention_seconds=int(cfg["retention_seconds"]))
     due: list[ForemanIssue] = []
+    due_groups: set[str] = set()
     for issue in issues:
+        if not _board_created_at_allowed(issue, min_created_at=int(cfg["min_board_created_at"])):
+            continue
         fingerprint = _issue_fingerprint(issue)
         entry = alerts.get(fingerprint)
         if not isinstance(entry, dict):
@@ -223,6 +229,17 @@ def alerts_due(
         elif not entry.get("first_seen_at"):
             entry["first_seen_at"] = now
             changed = True
+        group_key = _issue_group_key(issue)
+        group_entry = groups.get(group_key)
+        if not isinstance(group_entry, dict):
+            group_entry = _new_alert_entry(now)
+            groups[group_key] = group_entry
+            changed = True
+        elif not group_entry.get("first_seen_at"):
+            group_entry["first_seen_at"] = now
+            changed = True
+        if group_key in due_groups:
+            continue
         if len(due) >= int(cfg["max_alerts_per_tick"]):
             continue
         if _board_daily_count(state, issue.board, now) >= int(cfg["daily_cap_per_board"]):
@@ -233,8 +250,13 @@ def alerts_due(
             max_age_seconds=int(cfg["terminal_suppression_age_seconds"]),
         ):
             continue
-        if _is_alert_due(issue, entry, now=now, config=cfg):
+        if _is_alert_due(issue, entry, now=now, config=cfg) and _is_group_alert_due(
+            issue,
+            group_entry,
+            now=now,
+        ):
             due.append(issue)
+            due_groups.add(group_key)
     if changed:
         _write_alert_state(state)
     return due
@@ -261,6 +283,8 @@ def record_startup_baseline(
     changed = _gc_alert_state(state, now=now, retention_seconds=int(cfg["retention_seconds"]))
     count = 0
     for issue in issues:
+        if not _board_created_at_allowed(issue, min_created_at=int(cfg["min_board_created_at"])):
+            continue
         fingerprint = _issue_fingerprint(issue)
         if isinstance(alerts.get(fingerprint), dict):
             continue
@@ -291,6 +315,15 @@ def record_alert_sent(issue: ForemanIssue, *, now: Optional[int] = None) -> None
     daily_counts = state.setdefault("daily_counts", {})
     key = _daily_key(issue.board, now)
     daily_counts[key] = int(daily_counts.get(key) or 0) + 1
+    group_entry = _group_entry(state, issue, now=now)
+    group_entry["last_sent_at"] = now
+    group_entry["last_attempt_at"] = now
+    group_entry["last_state_key"] = _issue_group_state_key(issue)
+    group_entry["last_sent_severity"] = issue.severity
+    group_entry["send_count"] = int(group_entry.get("send_count") or 0) + 1
+    group_entry["failure_count"] = 0
+    group_entry["next_retry_at"] = None
+    group_entry["last_error"] = ""
     _write_alert_state(state)
 
 
@@ -308,6 +341,11 @@ def record_alert_failed(issue: ForemanIssue, error: str, *, now: Optional[int] =
     entry["failure_count"] = failure_count
     entry["next_retry_at"] = now + backoff
     entry["last_error"] = _truncate_text(_sanitize_text(error), 200)
+    group_entry = _group_entry(state, issue, now=now)
+    group_entry["last_attempt_at"] = now
+    group_entry["failure_count"] = failure_count
+    group_entry["next_retry_at"] = now + backoff
+    group_entry["last_error"] = entry["last_error"]
     _write_alert_state(state)
 
 
@@ -392,15 +430,30 @@ def collect_board_snapshots() -> list[BoardSnapshot]:
         worker = meta.get(DISCORD_WORKER_META_KEY)
         if not isinstance(worker, dict) or worker.get("kind") != "discord_worker_board":
             continue
+        if _is_foreman_generated_board(worker):
+            continue
         db_path = _resolved_db_path(board)
         if db_path in seen_db_paths:
             continue
         seen_db_paths.add(db_path)
-        snapshots.append(_build_board_snapshot(board, worker, archived=bool(meta.get("archived"))))
+        snapshots.append(
+            _build_board_snapshot(
+                board,
+                worker,
+                archived=bool(meta.get("archived")),
+                created_at=_coerce_optional_int(meta.get("created_at")),
+            )
+        )
     return snapshots
 
 
-def _build_board_snapshot(board: str, worker: dict[str, Any], *, archived: bool = False) -> BoardSnapshot:
+def _build_board_snapshot(
+    board: str,
+    worker: dict[str, Any],
+    *,
+    archived: bool = False,
+    created_at: Optional[int] = None,
+) -> BoardSnapshot:
     conn = kanban_db.connect(board=board)
     try:
         tasks = kanban_db.list_tasks(conn, include_archived=False)
@@ -429,6 +482,7 @@ def _build_board_snapshot(board: str, worker: dict[str, Any], *, archived: bool 
         thread_state=board_thread_state(board),
         run_summary=dict(summary) if isinstance(summary, dict) else {},
         tasks=task_snapshots,
+        created_at=created_at,
         archived=archived,
     )
 
@@ -527,6 +581,8 @@ def _issue(
         "task_assignee": task.assignee,
         "board_archived": snapshot.archived,
     }
+    if snapshot.created_at is not None:
+        base["board_created_at"] = snapshot.created_at
     base.update(evidence)
     if snapshot.thread_id:
         base["thread_id"] = snapshot.thread_id
@@ -652,6 +708,9 @@ def _read_alert_state() -> dict[str, Any]:
     alerts = raw.get("alerts")
     if not isinstance(alerts, dict):
         raw["alerts"] = {}
+    groups = raw.get("issue_groups")
+    if not isinstance(groups, dict):
+        raw["issue_groups"] = {}
     daily_counts = raw.get("daily_counts")
     if not isinstance(daily_counts, dict):
         raw["daily_counts"] = {}
@@ -661,6 +720,7 @@ def _read_alert_state() -> dict[str, Any]:
 def _write_alert_state(state: dict[str, Any]) -> None:
     state["version"] = ALERT_STATE_VERSION
     state.setdefault("alerts", {})
+    state.setdefault("issue_groups", {})
     state.setdefault("daily_counts", {})
     atomic_json_write(_alert_state_path(), state, indent=2, sort_keys=True)
 
@@ -672,6 +732,16 @@ def _alert_entry(state: dict[str, Any], issue: ForemanIssue, *, now: int) -> dic
     if not isinstance(entry, dict):
         entry = _new_alert_entry(now)
         alerts[fingerprint] = entry
+    return entry
+
+
+def _group_entry(state: dict[str, Any], issue: ForemanIssue, *, now: int) -> dict[str, Any]:
+    groups = state.setdefault("issue_groups", {})
+    group_key = _issue_group_key(issue)
+    entry = groups.get(group_key)
+    if not isinstance(entry, dict):
+        entry = _new_alert_entry(now)
+        groups[group_key] = entry
     return entry
 
 
@@ -688,6 +758,30 @@ def _new_alert_entry(now: int) -> dict[str, Any]:
     }
 
 
+def _is_foreman_generated_board(worker: dict[str, Any]) -> bool:
+    request = str(worker.get("initial_request") or "").lstrip()
+    return request.startswith("Foreman escalation:") or request.startswith("/goal Foreman escalation:")
+
+
+def _coerce_optional_int(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _board_created_at_allowed(issue: ForemanIssue, *, min_created_at: int) -> bool:
+    if min_created_at <= 0:
+        return True
+    evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
+    board_created_at = _coerce_optional_int(evidence.get("board_created_at"))
+    if board_created_at is None:
+        return False
+    return board_created_at >= min_created_at
+
+
 def _issue_fingerprint(issue: ForemanIssue) -> str:
     payload = {
         "detector_version": ALERT_DETECTOR_VERSION,
@@ -696,6 +790,47 @@ def _issue_fingerprint(issue: ForemanIssue) -> str:
         "task_id": issue.task_id,
     }
     return _stable_digest(payload)
+
+
+def _issue_group_key(issue: ForemanIssue) -> str:
+    return _stable_digest(_issue_group_payload(issue))
+
+
+def _issue_group_state_key(issue: ForemanIssue) -> str:
+    payload = {
+        **_issue_group_payload(issue),
+        "severity": issue.severity,
+    }
+    return _stable_digest(payload)
+
+
+def _issue_group_payload(issue: ForemanIssue) -> dict[str, Any]:
+    evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
+    problem = (
+        evidence.get("run_error")
+        or evidence.get("sidecar_error")
+        or evidence.get("error_excerpt")
+        or issue.title
+    )
+    payload: dict[str, Any] = {
+        "detector_version": ALERT_DETECTOR_VERSION,
+        "kind": issue.kind,
+        "problem": _canonical_problem_text(problem),
+    }
+    if issue.kind == "worker_errored":
+        payload["run_outcome"] = _canonical_problem_text(evidence.get("run_outcome") or "")
+    elif issue.kind == "stale_running":
+        payload["task_assignee"] = _canonical_problem_text(evidence.get("task_assignee") or "")
+        payload["stale_after_seconds"] = evidence.get("stale_after_seconds")
+    return payload
+
+
+def _canonical_problem_text(value: Any) -> str:
+    text = _sanitize_text(str(value or "")).casefold()
+    text = re.sub(r"\bpid\s+\d+\b", "pid <pid>", text)
+    text = re.sub(r"\b\d{4,}\b", "<num>", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return _truncate_text(text, 300)
 
 
 def _issue_state_key(issue: ForemanIssue) -> str:
@@ -735,6 +870,27 @@ def _is_alert_due(issue: ForemanIssue, entry: dict[str, Any], *, now: int, confi
     if _severity_rank(issue.severity) > _severity_rank(str(entry.get("last_sent_severity") or "")):
         return True
     return now - int(last_sent) >= int(config["cooldown_seconds"])
+
+
+def _is_group_alert_due(issue: ForemanIssue, entry: dict[str, Any], *, now: int) -> bool:
+    next_retry = entry.get("next_retry_at")
+    if next_retry is not None and int(next_retry) > now:
+        return False
+    if int(entry.get("failure_count") or 0) > 0 and next_retry is not None and int(next_retry) <= now:
+        return True
+    if entry.get("startup_suppressed_at") and not entry.get("last_sent_at"):
+        return False
+    last_sent = entry.get("last_sent_at")
+    if not last_sent:
+        return True
+    if _is_terminal_or_archived_issue(issue):
+        return False
+    state_key = _issue_group_state_key(issue)
+    if state_key != str(entry.get("last_state_key") or ""):
+        return True
+    if _severity_rank(issue.severity) > _severity_rank(str(entry.get("last_sent_severity") or "")):
+        return True
+    return False
 
 
 def _is_terminal_or_archived_issue(issue: ForemanIssue) -> bool:
@@ -788,6 +944,18 @@ def _gc_alert_state(state: dict[str, Any], *, now: int, retention_seconds: int) 
         attempted = int(entry.get("last_attempt_at") or 0)
         if max(seen, sent, attempted) < cutoff:
             alerts.pop(fingerprint, None)
+            changed = True
+    groups = state.setdefault("issue_groups", {})
+    for fingerprint, entry in list(groups.items()):
+        if not isinstance(entry, dict):
+            groups.pop(fingerprint, None)
+            changed = True
+            continue
+        seen = int(entry.get("first_seen_at") or 0)
+        sent = int(entry.get("last_sent_at") or 0)
+        attempted = int(entry.get("last_attempt_at") or 0)
+        if max(seen, sent, attempted) < cutoff:
+            groups.pop(fingerprint, None)
             changed = True
     today_prefix = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d")
     daily_counts = state.setdefault("daily_counts", {})

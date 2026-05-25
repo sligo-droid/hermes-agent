@@ -238,7 +238,7 @@ def test_duplicate_resolved_db_paths_are_scanned_once(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(foreman.kanban_db, "kanban_db_path", lambda board=None: same_path)
 
-    def fake_snapshot(board, worker, *, archived=False):
+    def fake_snapshot(board, worker, *, archived=False, created_at=None):
         seen.append(board)
         return foreman.BoardSnapshot(
             board=board,
@@ -256,6 +256,26 @@ def test_duplicate_resolved_db_paths_are_scanned_once(monkeypatch, tmp_path):
 
     assert [snapshot.board for snapshot in snapshots] == ["discord-1"]
     assert seen == ["discord-1"]
+
+
+def test_collect_board_snapshots_skips_foreman_generated_boards(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_foreman as foreman
+
+    meta = {
+        "discord_worker": {
+            "kind": "discord_worker_board",
+            "thread_id": "1",
+            "initial_request": "Foreman escalation: resolve a Discord worker issue.",
+        },
+    }
+    monkeypatch.setattr(foreman.kanban_db, "list_boards", lambda include_archived=False: [dict(meta, slug="discord-1")])
+
+    called = []
+    monkeypatch.setattr(foreman, "_build_board_snapshot", lambda *args, **kwargs: called.append(args) or None)
+
+    assert foreman.collect_board_snapshots() == []
+    assert called == []
 
 
 def test_collect_board_snapshots_includes_archived_discord_worker_boards(monkeypatch, tmp_path):
@@ -297,6 +317,29 @@ def test_alerts_due_first_send_then_suppresses_unchanged_before_cooldown(monkeyp
     assert alerts_due([issue], now=1200) == []
 
 
+def test_alerts_due_dedupes_same_problem_across_boards(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
+
+    first = _alert_issue(board="discord-1", task_id="t1", evidence={**_alert_issue().evidence, "run_error": "pid 1234 not alive"})
+    second = _alert_issue(board="discord-2", task_id="t2", evidence={**_alert_issue().evidence, "run_error": "pid 5678 not alive"})
+
+    assert alerts_due([first, second], now=1000) == [first]
+    record_alert_sent(first, now=1000)
+
+    assert alerts_due([second], now=5000, config={"cooldown_seconds": 1}) == []
+
+
+def test_alerts_due_skips_boards_before_min_created_at(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli.discord_worker_foreman import alerts_due
+
+    old = _alert_issue(task_id="old", evidence={**_alert_issue().evidence, "board_created_at": 900})
+    new = _alert_issue(task_id="new", evidence={**_alert_issue().evidence, "board_created_at": 1100})
+
+    assert alerts_due([old, new], now=1200, config={"min_board_created_at": 1000}) == [new]
+
+
 def test_alerts_due_resends_on_state_change_severity_escalation_and_cooldown(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
@@ -310,7 +353,7 @@ def test_alerts_due_resends_on_state_change_severity_escalation_and_cooldown(mon
 
     assert alerts_due([changed], now=1200) == [changed]
     assert alerts_due([escalated], now=1200) == [escalated]
-    assert alerts_due([issue], now=4600) == [issue]
+    assert alerts_due([issue], now=4600) == []
 
 
 def test_terminal_alerts_do_not_repeat_after_success(monkeypatch, tmp_path):
@@ -380,7 +423,7 @@ def test_terminal_thread_state_alerts_do_not_repeat_after_success(monkeypatch, t
         assert alerts_due([escalated], now=1200, config={"cooldown_seconds": 1}) == []
 
 
-def test_active_and_running_thread_state_alerts_still_repeat(monkeypatch, tmp_path):
+def test_active_and_running_thread_state_alerts_resend_only_on_change(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
 
@@ -401,7 +444,7 @@ def test_active_and_running_thread_state_alerts_still_repeat(monkeypatch, tmp_pa
 
         assert alerts_due([changed], now=1200, config={"cooldown_seconds": 3600}) == [changed]
         assert alerts_due([escalated], now=1200, config={"cooldown_seconds": 3600}) == [escalated]
-        assert alerts_due([issue], now=4600, config={"cooldown_seconds": 1}) == [issue]
+        assert alerts_due([issue], now=4600, config={"cooldown_seconds": 1}) == []
 
 
 def test_old_terminal_alerts_are_suppressed_before_first_send(monkeypatch, tmp_path):
@@ -488,7 +531,7 @@ def test_alert_limits_do_not_mark_overflow_sent_and_daily_cap_suppresses(monkeyp
 
     due = alerts_due(issues, now=1000, config={"max_alerts_per_tick": 2})
 
-    assert [issue.task_id for issue in due] == ["t0", "t1"]
+    assert [issue.task_id for issue in due] == ["t0"]
     assert alerts_due([issues[2]], now=1000) == [issues[2]]
     record_alert_sent(issues[0], now=1000)
     assert alerts_due([issues[1]], now=1000, config={"daily_cap_per_board": 1}) == []

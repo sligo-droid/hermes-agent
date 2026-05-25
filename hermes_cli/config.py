@@ -1633,6 +1633,7 @@ DEFAULT_CONFIG = {
                 "retention_seconds": 30 * 24 * 3600,
                 "max_alerts_per_tick": 10,
                 "max_alerts_per_board_per_day": 20,
+                "min_board_created_at": 0,
                 "terminal_suppression_age_seconds": 7 * 24 * 3600,
             },
             "roles": {
