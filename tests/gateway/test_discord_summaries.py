@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
 from gateway.work_ledger import GatewayWorkLedger
 import gateway.run as gateway_run
@@ -231,8 +231,9 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
     event = adapter.handle_message.await_args.args[0]
     assert event.project_summary["channel_id"] == "100"
     assert event.feature_summary["thread_id"] == "200"
-    assert event.feature_summary["kanban_board"] is None
-    assert event.text == "Build a deploy dashboard"
+    assert event.feature_summary["kanban_board"]["slug"] == "discord-200-m-123"
+    assert event.text == "/goal Build a deploy dashboard"
+    assert event.message_type == MessageType.COMMAND
 
 
 @pytest.mark.asyncio
@@ -324,7 +325,7 @@ async def test_thread_goal_message_creates_per_message_feature_summary(adapter, 
     assert event.feature_summary["thread_id"] == "200"
     assert event.feature_summary["message_id"] == "301"
     assert event.feature_summary["source_message_id"] == "501"
-    assert event.feature_summary["kanban_board"]["slug"] == "discord-200"
+    assert event.feature_summary["kanban_board"]["slug"] == "discord-200-m-501"
 
     adapter.handle_message.reset_mock()
     second = _make_message(adapter, channel=thread, content="<@999> /goal Ship another goal", message_id=502)
@@ -335,6 +336,7 @@ async def test_thread_goal_message_creates_per_message_feature_summary(adapter, 
     assert thread.sent[2][0]["reference"] is second
     assert event.feature_summary["message_id"] == "302"
     assert event.feature_summary["source_message_id"] == "502"
+    assert event.feature_summary["kanban_board"]["slug"] == "discord-200-m-502"
 
     state = adapter._read_project_summary_state()
     bucket = state["_feature_summaries"]
@@ -346,6 +348,31 @@ async def test_thread_goal_message_creates_per_message_feature_summary(adapter, 
     latest = adapter._load_feature_summary_handle_by_thread_id("200")
     assert latest["message_id"] == "302"
     assert latest["source_message_id"] == "502"
+
+
+@pytest.mark.asyncio
+async def test_thread_feature_message_creates_request_scoped_kanban_board(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://kanban.example")
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+
+    message = _make_message(adapter, channel=thread, content="<@999> Add CSV export", message_id=503)
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "/goal Add CSV export"
+    assert event.message_type == MessageType.COMMAND
+    assert event.feature_summary["thread_id"] == "200"
+    assert event.feature_summary["message_id"] == "300"
+    assert event.feature_summary["source_message_id"] == "503"
+    assert event.feature_summary["kanban_board"] == {
+        "slug": "discord-200-m-503",
+        "public_url": "https://kanban.example/workers/discord-200-m-503",
+    }
+    assert thread.sent[0][0]["reference"] is message
 
 
 @pytest.mark.asyncio

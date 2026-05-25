@@ -219,8 +219,10 @@ async def test_discord_feature_summary_goal_set_suppresses_board_ack(tmp_path, m
         feature_summary={
             "thread_id": "1506523962190860318",
             "message_id": "summary-message",
+            "source_message_id": "msg-goal",
             "kanban_board": {
-                "public_url": "https://kanban.example/workers/1506523962190860318",
+                "slug": "discord-1506523962190860318-m-msg-goal",
+                "public_url": "https://kanban.example/workers/discord-1506523962190860318-m-msg-goal",
             },
         },
     )
@@ -230,7 +232,7 @@ async def test_discord_feature_summary_goal_set_suppresses_board_ack(tmp_path, m
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_db
 
-    board = dwb.board_slug_for_discord_thread("1506523962190860318")
+    board = dwb.board_slug_for_discord_request("1506523962190860318", "msg-goal")
     meta = kanban_db.read_board_metadata(board)
 
     assert response is None
@@ -288,14 +290,14 @@ async def test_discord_feature_summary_goal_set_syncs_existing_summary(tmp_path,
     assert response is None
     adapter.sync_kanban_feature_summary.assert_awaited_once()
     target = adapter.sync_kanban_feature_summary.await_args.args[0]
-    assert target["board"] == "discord-1507755696501030933"
+    assert target["board"] == "discord-1507755696501030933-m-msg-goal"
     assert target["thread_id"] == "1507755696501030933"
     assert target["guild_id"] == "guild-1"
     assert target["parent_channel_id"] == "parent-channel"
     assert target["message_id"] == "summary-message"
     assert target["source_message_id"] == "msg-goal"
     assert target["title"] == "Ship the dashboard"
-    assert target["public_url"] == "https://kanban.example/workers/1507755696501030933"
+    assert target["public_url"] == "https://kanban.example/workers/discord-1507755696501030933-m-msg-goal"
 
 
 @pytest.mark.asyncio
@@ -318,7 +320,7 @@ async def test_discord_goal_set_passes_thread_context_to_planner(tmp_path, monke
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_db
 
-    board = dwb.board_slug_for_discord_thread("thread-context")
+    board = dwb.board_slug_for_discord_request("thread-context", "msg-thread-context")
     conn = kanban_db.connect(board=board)
     try:
         tasks = kanban_db.list_tasks(conn, include_archived=False)
@@ -356,12 +358,12 @@ async def test_discord_goal_set_signals_dirty_dispatch(tmp_path, monkeypatch):
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_db
 
-    board = dwb.board_slug_for_discord_thread("thread-set")
+    board = dwb.board_slug_for_discord_request("thread-set", "msg-thread-set")
     meta = kanban_db.read_board_metadata(board)
 
     assert response is not None
     assert response.startswith("Kanban goal set. Board: ")
-    assert response.endswith("/workers/thread-set")
+    assert response.endswith("/workers/discord-thread-set-m-msg-thread-set")
     assert meta["discord_worker"]["root_goal"] == "Ship the dashboard"
     assert signals == [True]
 

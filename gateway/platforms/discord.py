@@ -878,12 +878,12 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
         if str(handle.get("thread_id") or "").strip() != thread_id:
             return False
-        expected_board = self._expected_feature_summary_board_slug(thread_id)
-        if expected_board and board != expected_board:
-            return False
         handle_board = self._raw_feature_kanban_board_slug(handle)
         if handle_board and handle_board != board:
             return False
+        for field in ("message_id", "source_message_id"):
+            if self._feature_summary_field_conflicts(handle, target, field):
+                return False
         for field in ("guild_id", "parent_channel_id"):
             if self._feature_summary_field_conflicts(handle, target, field):
                 return False
@@ -899,6 +899,8 @@ class DiscordAdapter(BasePlatformAdapter):
         target = {
             "board": snapshot.get("board"),
             "thread_id": snapshot.get("thread_id"),
+            "message_id": snapshot.get("message_id"),
+            "source_message_id": snapshot.get("source_message_id"),
             "guild_id": snapshot.get("guild_id"),
             "parent_channel_id": snapshot.get("parent_channel_id"),
         }
@@ -1036,12 +1038,14 @@ class DiscordAdapter(BasePlatformAdapter):
         *,
         message_id: Optional[str] = None,
         source_message_id: Optional[str] = None,
+        board: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         needle = str(thread_id or "").strip()
         if not needle:
             return None
         message_needle = str(message_id or "").strip()
         source_needle = str(source_message_id or "").strip()
+        board_needle = str(board or "").strip()
         state = self._read_project_summary_state()
         bucket = state.get(_DISCORD_FEATURE_SUMMARY_STATE_BUCKET)
         if not isinstance(bucket, dict):
@@ -1055,6 +1059,10 @@ class DiscordAdapter(BasePlatformAdapter):
                     continue
                 if source_needle and str(stored.get("source_message_id") or "") != source_needle:
                     continue
+                if board_needle:
+                    stored_board = self._raw_feature_kanban_board_slug(stored)
+                    if stored_board and stored_board != board_needle:
+                        continue
                 matches.append(stored)
         if not matches:
             return None
@@ -1690,16 +1698,6 @@ class DiscordAdapter(BasePlatformAdapter):
         slug = self._raw_feature_kanban_board_slug(handle)
         if not slug:
             return None
-        thread_id = str((handle or {}).get("thread_id") or "").strip() if isinstance(handle, dict) else ""
-        expected = self._expected_feature_summary_board_slug(thread_id)
-        if expected and slug != expected:
-            logger.warning(
-                "[%s] Ignoring Discord feature summary Kanban board mismatch: %s != %s",
-                self.name,
-                slug,
-                expected,
-            )
-            return None
         return slug
 
     def _feature_kanban_reaction_state(self, handle: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -1832,7 +1830,8 @@ class DiscordAdapter(BasePlatformAdapter):
         if thread_channel is None or not hasattr(thread_channel, "send"):
             return None
         board_handle: Optional[Dict[str, Any]] = None
-        if self._slash_command_starts_threaded_work(initial_request):
+        request_id = str(source_message_id or "").strip()
+        if self._slash_command_starts_threaded_work(initial_request) or request_id:
             try:
                 from hermes_cli.discord_worker_boards import ensure_discord_thread_board
 
@@ -1848,6 +1847,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     parent_channel_id=str(getattr(parent_channel, "id", "") or ""),
                     initial_request=initial_request,
                     project_context=project_context,
+                    request_id=request_id or None,
+                    source_message_id=request_id or None,
                 )
                 board_handle = {
                     "slug": board.slug,
@@ -1896,6 +1897,17 @@ class DiscordAdapter(BasePlatformAdapter):
         }
         try:
             self._persist_feature_summary_handle(thread_channel, handle)
+            if board_handle and board_handle.get("slug"):
+                try:
+                    from hermes_cli.discord_worker_boards import set_feature_summary_handle
+
+                    set_feature_summary_handle(
+                        str(board_handle["slug"]),
+                        message_id=str(getattr(msg, "id", "") or ""),
+                        source_message_id=str(source_message_id or "") or None,
+                    )
+                except Exception:
+                    logger.debug("[%s] Failed to attach feature summary ids to board", self.name, exc_info=True)
         except Exception:
             logger.debug("[%s] Failed to persist Discord feature summary handle", self.name, exc_info=True)
         return handle
@@ -2030,6 +2042,7 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_id,
             message_id=str(target.get("message_id") or "") or None,
             source_message_id=str(target.get("source_message_id") or "") or None,
+            board=board,
         )
         if not handle:
             return None
@@ -3111,6 +3124,24 @@ class DiscordAdapter(BasePlatformAdapter):
                 return True
         return False
 
+    async def _kanban_reaction_target_message(self, thread: Any, target: Dict[str, Any]) -> Optional[Any]:
+        message_ids = [
+            str(target.get("source_message_id") or "").strip(),
+            str(target.get("message_id") or "").strip(),
+        ]
+        for message_id in [item for item in message_ids if item]:
+            for channel in (thread, getattr(thread, "parent", None)):
+                fetch = getattr(channel, "fetch_message", None)
+                if not callable(fetch):
+                    continue
+                try:
+                    message = await fetch(int(message_id))
+                except Exception:
+                    continue
+                if message is not None and hasattr(message, "add_reaction"):
+                    return message
+        return await self._thread_origin_message(thread)
+
     async def sync_kanban_thread_reaction(self, target: Dict[str, Any]) -> Optional[str]:
         """Synchronize a Discord worker thread's origin-message reaction."""
         state = str(target.get("state") or "").strip() or None
@@ -3124,7 +3155,7 @@ class DiscordAdapter(BasePlatformAdapter):
         thread = await self._resolve_summary_channel(str(target.get("thread_id") or ""))
         if thread is None:
             return None
-        message = await self._thread_origin_message(thread)
+        message = await self._kanban_reaction_target_message(thread, target)
         if message is None:
             return None
         await self._set_message_reaction_state(message, emoji)
@@ -5699,6 +5730,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 parent_channel=parent_channel,
                 initial_request=command_text,
                 project_context=project_context,
+                source_message_id=str(getattr(interaction, "id", "") or "") or None,
             )
         board_url = ""
         if isinstance(feature_summary_handle, dict):
@@ -7372,9 +7404,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 initial_request=normalized_content,
                 project_context=project_context,
                 transcript_quote=voice_feature_transcript if message_is_voice else None,
+                source_message_id=str(message.id),
             )
             self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
-        elif is_thread and slash_command_starts_threaded_work:
+        elif is_thread and (slash_command_starts_threaded_work or feature_request_intent is True):
             _stage_started = time.perf_counter()
             feature_summary_handle = await self.initialize_feature_summary(
                 message.channel,
@@ -7594,6 +7627,15 @@ class DiscordAdapter(BasePlatformAdapter):
         event_text = normalized_content
         if pending_text_injection:
             event_text = f"{event_text}\n\n{pending_text_injection}" if event_text else pending_text_injection
+        feature_kanban_board_slug = self._feature_kanban_board_slug(feature_summary_handle)
+        feature_request_uses_kanban = bool(
+            feature_kanban_board_slug
+            and not slash_command_starts_threaded_work
+            and direct_question_prompt is False
+        )
+        if feature_request_uses_kanban and event_text.strip():
+            event_text = f"/goal {event_text}".strip()
+            msg_type = MessageType.COMMAND
 
         # ── History backfill ─────────────────────────────────────────
         # When require_mention is active, the bot only processes messages
@@ -7648,8 +7690,9 @@ class DiscordAdapter(BasePlatformAdapter):
             event_text = "(The user sent a message with no text content)"
 
         _goal_thread_context = None
-        if is_thread and slash_command_starts_threaded_work:
-            _goal_thread_context = await self._fetch_goal_thread_context(message.channel, before=message)
+        if is_thread and (slash_command_starts_threaded_work or feature_request_uses_kanban):
+            context_channel = effective_channel if auto_threaded_channel is not None else message.channel
+            _goal_thread_context = await self._fetch_goal_thread_context(context_channel, before=message)
 
         _chan = message.channel
         _parent_id = str(getattr(_chan, "parent_id", "") or "")

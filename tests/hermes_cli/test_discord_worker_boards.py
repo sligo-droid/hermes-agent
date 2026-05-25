@@ -346,7 +346,7 @@ def test_set_goal_persists_thread_context_for_planner(monkeypatch, tmp_path):
     assert payload["discord_thread_context"] == context
 
 
-def test_completed_goal_thread_same_request_gets_new_planner_context(monkeypatch, tmp_path):
+def test_completed_goal_thread_new_request_gets_new_board(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_db
@@ -363,25 +363,27 @@ def test_completed_goal_thread_same_request_gets_new_planner_context(monkeypatch
     dwb._update_worker_meta(board.slug, {"goal_status": "done", "phase": "complete"})
 
     context = "[Goal thread context]\n[Alice] second run should use this"
-    dwb.set_goal(
+    second = dwb.set_goal(
         thread_id="7792",
         goal="Ship the dashboard",
         request_id="second",
         thread_context=context,
     )
-    conn = kanban_db.connect(board=board.slug)
+    conn = kanban_db.connect(board=second.slug)
     try:
         tasks = kanban_db.list_tasks(conn, include_archived=False)
     finally:
         conn.close()
 
-    assert len(tasks) == 2
-    payloads = [json.loads(task.body or "{}") for task in tasks]
-    assert payloads[-1]["request"] == "Ship the dashboard"
-    assert payloads[-1]["discord_thread_context"] == context
+    assert board.slug == "discord-7792-m-first"
+    assert second.slug == "discord-7792-m-second"
+    assert len(tasks) == 1
+    payload = json.loads(tasks[0].body or "{}")
+    assert payload["request"] == "Ship the dashboard"
+    assert payload["discord_thread_context"] == context
 
 
-def test_feature_request_starts_distinct_planner_tickets(monkeypatch, tmp_path):
+def test_feature_request_starts_distinct_request_boards(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_db
@@ -391,12 +393,12 @@ def test_feature_request_starts_distinct_planner_tickets(monkeypatch, tmp_path):
         request="Build the drilldown page",
         request_id="msg-a",
     )
-    dwb.start_planner_request(
+    second = dwb.start_planner_request(
         thread_id="780",
         request="Also add CSV export",
         request_id="msg-b",
     )
-    dwb.start_planner_request(
+    repeated = dwb.start_planner_request(
         thread_id="780",
         request="Also add CSV export",
         request_id="msg-b",
@@ -408,11 +410,17 @@ def test_feature_request_starts_distinct_planner_tickets(monkeypatch, tmp_path):
     finally:
         conn.close()
 
-    assert [task.assignee for task in tasks] == ["planner", "planner"]
-    assert [json.loads(task.body or "{}")["request"] for task in tasks] == [
-        "Build the drilldown page",
-        "Also add CSV export",
-    ]
+    conn2 = kanban_db.connect(board=second.slug)
+    try:
+        second_tasks = kanban_db.list_tasks(conn2, include_archived=False)
+    finally:
+        conn2.close()
+
+    assert board.slug == "discord-780-m-msg-a"
+    assert second.slug == "discord-780-m-msg-b"
+    assert repeated.slug == second.slug
+    assert [json.loads(task.body or "{}")["request"] for task in tasks] == ["Build the drilldown page"]
+    assert [json.loads(task.body or "{}")["request"] for task in second_tasks] == ["Also add CSV export"]
 
 
 def test_goal_reuses_existing_feature_summary_planner(monkeypatch, tmp_path):
@@ -429,6 +437,7 @@ def test_goal_reuses_existing_feature_summary_planner(monkeypatch, tmp_path):
         thread_id="780",
         goal="Build the drilldown page",
         request_id="goal-message",
+        board_slug=board.slug,
     )
 
     conn = kanban_db.connect(board=board.slug)
@@ -490,6 +499,21 @@ def test_public_session_snapshot_resolves_discord_thread_id(monkeypatch, tmp_pat
 
     assert snapshot["board"] == board.slug
     assert snapshot["worker"]["thread_id"] == "4242"
+
+
+def test_public_session_snapshot_resolves_request_board_slug(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(thread_id="4243", goal="Ship it", request_id="msg-1")
+
+    snapshot = dwb.public_board_snapshot_for_session(board.slug)
+
+    assert board.slug == "discord-4243-m-msg-1"
+    assert snapshot["board"] == board.slug
+    assert snapshot["session_id"] == board.slug
+    assert snapshot["worker"]["thread_id"] == "4243"
+    assert snapshot["worker"]["public_url"] == "https://example.test/workers/discord-4243-m-msg-1"
 
 
 def test_public_session_url_accepts_workers_base(monkeypatch, tmp_path):

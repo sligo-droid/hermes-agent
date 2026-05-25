@@ -384,14 +384,11 @@ async def start_worker_session_board(session_id: str, return_to: Optional[str] =
     """Start or resume a Discord worker session board."""
     try:
         from hermes_cli.discord_worker_boards import (
-            board_slug_for_discord_thread,
+            resolve_public_session_board,
             start_board,
         )
-        from hermes_cli import kanban_db
 
-        board = board_slug_for_discord_thread(session_id)
-        if not kanban_db.board_exists(board):
-            raise KeyError("unknown board session")
+        board = resolve_public_session_board(session_id)
         start_board(board)
         return RedirectResponse(
             url=_worker_action_redirect_url(session_id, return_to),
@@ -411,14 +408,11 @@ async def pause_worker_session_board(session_id: str, return_to: Optional[str] =
     """Pause a Discord worker session board."""
     try:
         from hermes_cli.discord_worker_boards import (
-            board_slug_for_discord_thread,
+            resolve_public_session_board,
             pause_board,
         )
-        from hermes_cli import kanban_db
 
-        board = board_slug_for_discord_thread(session_id)
-        if not kanban_db.board_exists(board):
-            raise KeyError("unknown board session")
+        board = resolve_public_session_board(session_id)
         pause_board(board, reason="workers-page")
         return RedirectResponse(
             url=_worker_action_redirect_url(session_id, return_to),
@@ -438,14 +432,11 @@ async def continue_worker_session_board(session_id: str, return_to: Optional[str
     """Continue a Discord worker session board stopped at its review loop limit."""
     try:
         from hermes_cli.discord_worker_boards import (
-            board_slug_for_discord_thread,
+            resolve_public_session_board,
             continue_board_after_review_loop_limit,
         )
-        from hermes_cli import kanban_db
 
-        board = board_slug_for_discord_thread(session_id)
-        if not kanban_db.board_exists(board):
-            raise KeyError("unknown board session")
+        board = resolve_public_session_board(session_id)
         continue_board_after_review_loop_limit(board)
         return RedirectResponse(
             url=_worker_action_redirect_url(session_id, return_to),
