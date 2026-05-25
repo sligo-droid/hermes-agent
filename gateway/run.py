@@ -6199,6 +6199,9 @@ class GatewayRunner:
                 "daily_cap_per_board": self._discord_foreman_clamped_int(
                     max_alerts_per_board, 20, 1, 200,
                 ),
+                "min_board_created_at": self._discord_foreman_clamped_int(
+                    raw.get("min_board_created_at"), 0, 0, 4102444800, allow_zero=True,
+                ),
             },
         }
 
