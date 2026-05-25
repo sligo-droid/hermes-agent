@@ -160,6 +160,8 @@ def _clear_terminal_summary_fields(worker: dict[str, Any]) -> None:
         "board_summary",
         "board_summary_path",
         "board_summary_updated_at",
+        "terminal_completion_message_pending",
+        "terminal_completion_message_sent_at",
         "terminal_summary_message_sent_at",
         "terminal_summary_sync_pending",
         "terminal_reaction_sync_pending",
@@ -2078,9 +2080,11 @@ def thread_status_targets() -> list[dict[str, Any]]:
         except Exception:
             summary = {"state": board_thread_state(board)}
         state = summary.get("state") or board_thread_state(board)
+        terminal_completion_message_pending = bool(worker.get("terminal_completion_message_pending"))
         terminal_sync_pending = bool(
             worker.get("terminal_reaction_sync_pending")
             or worker.get("terminal_summary_sync_pending")
+            or terminal_completion_message_pending
         )
         if state not in {"active", "running"} and not (state in {"done", "blocked", "errored"} and terminal_sync_pending):
             continue
@@ -2104,6 +2108,7 @@ def thread_status_targets() -> list[dict[str, Any]]:
                 "sync_key": summary.get("sync_key") or "",
                 "terminal_reaction_sync_pending": bool(worker.get("terminal_reaction_sync_pending")),
                 "terminal_summary_sync_pending": bool(worker.get("terminal_summary_sync_pending")),
+                "terminal_completion_message_pending": terminal_completion_message_pending,
             }
         )
     return targets
@@ -2114,9 +2119,10 @@ def mark_thread_status_synced(
     *,
     reaction: bool = False,
     summary: bool = False,
+    completion_message: bool = False,
 ) -> None:
     """Clear one-shot terminal Discord thread sync flags for a board."""
-    if not board or not (reaction or summary):
+    if not board or not (reaction or summary or completion_message):
         return
     metadata = kanban_db.read_board_metadata(board)
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
@@ -2126,6 +2132,9 @@ def mark_thread_status_synced(
     if reaction and worker.pop("terminal_reaction_sync_pending", None) is not None:
         changed = True
     if summary and worker.pop("terminal_summary_sync_pending", None) is not None:
+        changed = True
+    if completion_message and worker.pop("terminal_completion_message_pending", None) is not None:
+        worker["terminal_completion_message_sent_at"] = _now()
         changed = True
     if not changed:
         return

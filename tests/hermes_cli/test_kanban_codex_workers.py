@@ -1313,6 +1313,7 @@ def test_update_phase_refreshes_worker_updated_at(monkeypatch, tmp_path):
     assert meta["phase"] == "complete"
     assert meta["goal_status"] == "done"
     assert meta["updated_at"] == 12345
+    assert meta["terminal_completion_message_pending"] is True
 
 
 def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeypatch, tmp_path):
