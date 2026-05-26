@@ -163,7 +163,7 @@ def test_foreman_watcher_missing_config_does_not_scan(monkeypatch):
     assert adapter.created_goals == []
 
 
-def test_foreman_spawned_task_posts_source_thread_embed_and_subscription(monkeypatch, tmp_path):
+def test_foreman_spawned_task_records_subscription_without_ticket_embed(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://hermes.example.test")
     _patch_config(monkeypatch, _enabled_config())
@@ -201,23 +201,11 @@ def test_foreman_spawned_task_posts_source_thread_embed_and_subscription(monkeyp
     asyncio.run(runner._discord_foreman_announce_spawned_tasks([(board.slug, result)]))
     asyncio.run(runner._discord_foreman_announce_spawned_tasks([(board.slug, result)]))
 
-    assert len(adapter.created_threads) == 1
-    created = adapter.created_threads[0]
-    assert created["thread_chat_id"] == "123"
-    assert created["title"] == "Build dashboard filters"
-    assert "Add filter controls" in created["initial_request"]
-    assert created["project_context"] == {"project_name": "Hermes", "project_path": "/repo/hermes"}
-    assert created["kanban_url"] == f"https://hermes.example.test/workers/123/tickets/{task_id}"
-    assert created["source_board"] == board.slug
-    assert created["source_task_id"] == task_id
-    assert created["source_task_url"] == f"https://hermes.example.test/workers/123/tickets/{task_id}"
-    assert created["source_kanban_url"] == "https://hermes.example.test/workers/123"
-    assert created["source_discord_thread_url"] == "https://discord.com/channels/guild-1/123"
-    assert created["hide_source_links"] is True
+    assert adapter.created_threads == []
 
     state = read_codex_worker_state(task_id, board=board.slug)
     assert state["foreman_thread"]["thread_id"] == "123"
-    assert state["foreman_thread"]["message_id"] == "message-1"
+    assert state["foreman_thread"]["message_id"] == ""
 
     conn = kanban_db.connect(board=board.slug)
     try:

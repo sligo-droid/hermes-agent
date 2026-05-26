@@ -764,9 +764,7 @@ async def test_goal_slash_acks_thread_before_background_dispatch(adapter):
     adapter._resolve_channel_by_id = AsyncMock(return_value=thread)
     project_context = {"project_path": "/home/droid/hermes", "source": "configured_channel_cwd"}
     adapter._resolve_project_context_for_channel = MagicMock(return_value=project_context)
-    adapter.initialize_feature_summary = AsyncMock(
-        return_value={"kanban_board": {"public_url": "https://example.test/workers/555"}}
-    )
+    adapter.initialize_feature_summary = AsyncMock()
     adapter._dispatch_thread_session = AsyncMock()
     scheduled = []
 
@@ -782,20 +780,16 @@ async def test_goal_slash_acks_thread_before_background_dispatch(adapter):
     interaction.edit_original_response.assert_awaited_once()
     content = interaction.edit_original_response.await_args.kwargs["content"]
     assert "<#555>" in content
-    assert "https://example.test/workers/555" in content
+    assert "https://example.test/workers/555" not in content
     assert scheduled and scheduled[0][1] == "/goal 555"
-    adapter._resolve_project_context_for_channel.assert_called_once_with(parent)
-    adapter.initialize_feature_summary.assert_awaited_once()
-    feature_args, feature_kwargs = adapter.initialize_feature_summary.await_args
-    assert feature_args == (thread,)
-    assert feature_kwargs["parent_channel"] is parent
-    assert feature_kwargs["project_context"] == project_context
-    assert feature_kwargs["initial_request"] == "/goal Ship faster"
+    adapter._resolve_project_context_for_channel.assert_not_called()
+    adapter.initialize_feature_summary.assert_not_awaited()
+    assert adapter._dispatch_thread_session.call_args.kwargs["feature_summary"] is None
     adapter._dispatch_thread_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_goal_slash_from_thread_uses_thread_parent_for_project_context(adapter):
+async def test_goal_slash_from_thread_does_not_create_feature_summary(adapter):
     thread = _FakeThreadChannel(channel_id=555, name="Ship faster", parent_id=123)
     interaction = SimpleNamespace(
         channel=thread,
@@ -810,7 +804,7 @@ async def test_goal_slash_from_thread_uses_thread_parent_for_project_context(ada
     adapter._resolve_channel_by_id = AsyncMock()
     project_context = {"project_path": "/home/droid/hermes", "source": "configured_channel_cwd"}
     adapter._resolve_project_context_for_channel = MagicMock(return_value=project_context)
-    adapter.initialize_feature_summary = AsyncMock(return_value={})
+    adapter.initialize_feature_summary = AsyncMock()
     adapter._fetch_goal_thread_context = AsyncMock(return_value="[Goal thread context]\n[Alice] prior detail")
     adapter._dispatch_thread_session = AsyncMock()
     scheduled = []
@@ -825,14 +819,10 @@ async def test_goal_slash_from_thread_uses_thread_parent_for_project_context(ada
 
     adapter._create_thread.assert_not_awaited()
     adapter._resolve_channel_by_id.assert_not_awaited()
-    adapter._resolve_project_context_for_channel.assert_called_once_with(thread.parent)
-    adapter.initialize_feature_summary.assert_awaited_once()
-    feature_args, feature_kwargs = adapter.initialize_feature_summary.await_args
-    assert feature_args == (thread,)
-    assert feature_kwargs["parent_channel"] is thread.parent
-    assert feature_kwargs["project_context"] == project_context
-    assert feature_kwargs["initial_request"] == "/goal Ship faster"
+    adapter._resolve_project_context_for_channel.assert_not_called()
+    adapter.initialize_feature_summary.assert_not_awaited()
     adapter._fetch_goal_thread_context.assert_awaited_once_with(thread)
+    assert adapter._dispatch_thread_session.call_args.kwargs["feature_summary"] is None
     assert adapter._dispatch_thread_session.call_args.kwargs["goal_thread_context"] == (
         "[Goal thread context]\n[Alice] prior detail"
     )
@@ -858,6 +848,7 @@ async def test_text_goal_in_existing_thread_captures_planner_context(adapter, mo
     adapter._fetch_goal_thread_context.assert_awaited_once()
     assert len(captured_events) == 1
     assert captured_events[0].goal_thread_context == "[Goal thread context]\n[Alice] prior detail"
+    assert captured_events[0].feature_summary is None
 
 
 def _fake_message(channel, *, content="Hello", author_id=42, display_name="Jezza"):

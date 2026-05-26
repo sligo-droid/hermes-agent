@@ -174,15 +174,9 @@ Next todos
         ("discord-thread-1", "Create the follow-up issue list."),
     ]
     assert status == ""
-    assert adapter.callback_session_key == "session-key"
+    assert adapter.callback_session_key is None
     assert adapter.initialized == []
-
-    assert adapter.callback is not None
-    assert await adapter.callback() is True
-    assert len(adapter.initialized) == 1
-    assert adapter.initialized[0]["source"].thread_id == "thread-1"
-    assert adapter.initialized[0]["initial_request"] == "/goal Follow up on the todos from this meeting."
-    assert adapter.initialized[0]["project_context"] == calls["start_direct_goal"]["project_context"]
+    assert adapter.callback is None
 
 
 @pytest.mark.asyncio
