@@ -149,6 +149,8 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     assert captured["env"]["HERMES_KANBAN_BOARD"] == board.slug
     assert captured["env"]["HERMES_DISCORD_WORKER_READ_URL"] == "http://127.0.0.1:9"
     assert captured["env"]["HERMES_DISCORD_WORKER_READ_TOKEN"] == "broker-secret"
+    assert captured["env"]["HERMES_DISCORD_WORKER_CONTROL_URL"] == "http://127.0.0.1:9"
+    assert captured["env"]["HERMES_DISCORD_WORKER_CONTROL_TOKEN"] == "broker-secret"
     assert "DISCORD_BOT_TOKEN" not in captured["env"]
     assert "DISCORD_ADMIN_ACTIONS" not in captured["env"]
     assert captured["env"]["CODEX_HOME"].endswith("/homes/" + task.id)
@@ -854,8 +856,12 @@ def test_docker_runner_uses_read_broker_without_discord_credentials(monkeypatch,
     assert captured["env"].get("HERMES_CODEX_WORKER_CREDENTIAL_ID") != "parent-cred"
     assert captured["env"]["HERMES_DISCORD_WORKER_READ_URL"] == "http://127.0.0.1:9"
     assert captured["env"]["HERMES_DISCORD_WORKER_READ_TOKEN"] == "broker-secret"
+    assert captured["env"]["HERMES_DISCORD_WORKER_CONTROL_URL"] == "http://127.0.0.1:9"
+    assert captured["env"]["HERMES_DISCORD_WORKER_CONTROL_TOKEN"] == "broker-secret"
     assert "HERMES_DISCORD_WORKER_READ_URL" in captured["cmd"]
     assert "HERMES_DISCORD_WORKER_READ_TOKEN" in captured["cmd"]
+    assert "HERMES_DISCORD_WORKER_CONTROL_URL" in captured["cmd"]
+    assert "HERMES_DISCORD_WORKER_CONTROL_TOKEN" in captured["cmd"]
     assert "broker-secret" not in captured["cmd"]
     assert "discord-token" not in captured["cmd"]
     assert "parent-cred" not in captured["cmd"]
@@ -868,7 +874,7 @@ def test_docker_runner_uses_read_broker_without_discord_credentials(monkeypatch,
     assert "parent-cred" not in log
 
 
-def test_worker_prompt_mentions_read_only_discord_helper(monkeypatch):
+def test_worker_prompt_mentions_discord_control_helper(monkeypatch):
     from hermes_cli import kanban_codex_worker as worker
 
     monkeypatch.setattr(worker.kanban_db, "build_worker_context", lambda _conn, _task_id: "{}")
@@ -877,7 +883,10 @@ def test_worker_prompt_mentions_read_only_discord_helper(monkeypatch):
     prompt = worker._build_prompt(object(), "task-1", "planner")
 
     assert "python -m hermes_cli.discord_worker_read fetch-message" in prompt
-    assert "read-only" in prompt.lower()
+    assert "python -m hermes_cli.discord_worker_read discord-request" in prompt
+    assert "python -m hermes_cli.discord_worker_read update-board" in prompt
+    assert "python -m hermes_cli.discord_worker_read sync-summary" in prompt
+    assert "read-only" not in prompt.lower()
 
 
 def test_planner_output_links_parent_dependencies(monkeypatch, tmp_path):
@@ -1136,14 +1145,15 @@ def test_worker_prompt_mentions_discord_read_helper(monkeypatch, tmp_path):
     finally:
         conn.close()
 
-    assert "Do not call Hermes tools" in prompt
+    assert "mutate Hermes/Discord state when that is the correct outcome" in prompt
     assert "Outcome frame:" in prompt
     assert "Goal: Convert the Kanban context into the smallest coherent implementation plan" in prompt
     assert "Success means:" in prompt
     assert "Stop when: Return the JSON plan or a concise blocker." in prompt
     assert "python -m hermes_cli.discord_worker_read fetch-message" in prompt
     assert "python -m hermes_cli.discord_worker_read fetch-messages" in prompt
-    assert "Do not attempt Discord mutation or admin actions" in prompt
+    assert "python -m hermes_cli.discord_worker_read update-board" in prompt
+    assert "Do not attempt Discord mutation or admin actions" not in prompt
 
 
 def test_run_codex_records_app_server_state(monkeypatch, tmp_path):
