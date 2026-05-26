@@ -1437,15 +1437,16 @@ def get_model_context_length(
     """Get the context length for a model.
 
     Resolution order:
-    0. Explicit config override (model.context_length or custom_providers per-model)
-    1. Persistent cache (previously discovered via probing).  Nous URLs
+    0. Codex OAuth context cap (authoritative; config can only lower it)
+    1. Explicit config override (model.context_length or custom_providers per-model)
+    2. Persistent cache (previously discovered via probing).  Nous URLs
        bypass the cache here so step 5b can always reconcile against
        the authoritative portal /v1/models response.
-    1b. AWS Bedrock static table (must precede custom-endpoint probe)
-    2. Active endpoint metadata (/models for explicit custom endpoints)
-    3. Local server query (for local endpoints)
-    4. Anthropic /v1/models API (API-key users only, not OAuth)
-    5. Provider-aware lookups (before generic OpenRouter cache):
+    3. AWS Bedrock static table (must precede custom-endpoint probe)
+    4. Active endpoint metadata (/models for explicit custom endpoints)
+    5. Local server query (for local endpoints)
+    6. Anthropic /v1/models API (API-key users only, not OAuth)
+    7. Provider-aware lookups (before generic OpenRouter cache):
        a. Copilot live /models API
        b. Nous: live /v1/models probe first (authoritative), then OR
           cache fallback with suffix/version normalisation.  Only
@@ -1454,11 +1455,49 @@ def get_model_context_length(
        d. GMI /models endpoint
        e. Ollama native /api/show probe (any base_url, provider-agnostic)
        f. models.dev registry lookup (with :cloud/-cloud suffix fallback)
-    6. OpenRouter live API metadata (Kimi-family 32k guard)
-    7. Hardcoded defaults (broad family patterns, longest-key-first)
-    8. Local server query (last resort)
-    9. Default fallback (256K)"""
-    # 0. Explicit config override — user knows best
+    8. OpenRouter live API metadata (Kimi-family 32k guard)
+    9. Hardcoded defaults (broad family patterns, longest-key-first)
+    10. Local server query (last resort)
+    11. Default fallback (256K)"""
+    effective_provider = provider
+    if not effective_provider or effective_provider in {"openrouter", "custom"}:
+        if base_url:
+            inferred = _infer_provider_from_url(base_url)
+            if inferred:
+                effective_provider = inferred
+
+    is_codex_oauth = effective_provider in {"openai-codex", "codex"} or (
+        bool(base_url)
+        and base_url_host_matches(base_url, "chatgpt.com")
+        and "/backend-api/codex" in base_url
+    )
+    if is_codex_oauth:
+        # Codex OAuth enforces its own context cap. A higher config override
+        # makes Hermes compress too late and can wedge sessions; a lower one
+        # is still useful when users want earlier compaction.
+        codex_model = _strip_provider_prefix(model)
+        if base_url:
+            cached = get_cached_context_length(codex_model, base_url)
+            if cached is not None and cached < 400_000:
+                if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
+                    return min(config_context_length, cached)
+                return cached
+            if cached is not None:
+                logger.info(
+                    "Dropping stale Codex cache entry %s@%s -> %s (pre-fix value); "
+                    "re-resolving via live /models probe",
+                    codex_model, base_url, f"{cached:,}",
+                )
+                _invalidate_cached_context_length(codex_model, base_url)
+        codex_ctx = _resolve_codex_oauth_context_length(codex_model, access_token=api_key or "")
+        if codex_ctx:
+            if base_url:
+                save_context_length(codex_model, base_url, codex_ctx)
+            if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
+                return min(config_context_length, codex_ctx)
+            return codex_ctx
+
+    # 1. Explicit config override — user knows best for non-OAuth providers.
     if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
         return config_context_length
 
@@ -1603,13 +1642,6 @@ def get_model_context_length(
     # since the same model can have different context limits per provider
     # (e.g. claude-opus-4.6 is 1M on Anthropic but 128K on GitHub Copilot).
     # If provider is generic (openrouter/custom/empty), try to infer from URL.
-    effective_provider = provider
-    if not effective_provider or effective_provider in {"openrouter", "custom"}:
-        if base_url:
-            inferred = _infer_provider_from_url(base_url)
-            if inferred:
-                effective_provider = inferred
-
     # 5a. Copilot live /models API — max_prompt_tokens from the user's account.
     # This catches account-specific models (e.g. claude-opus-4.6-1m) that
     # don't exist in models.dev. For models that ARE in models.dev, this

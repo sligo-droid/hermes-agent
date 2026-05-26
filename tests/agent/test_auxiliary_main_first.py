@@ -162,8 +162,8 @@ class TestResolveAutoMainFirst:
         assert mock_resolve.call_args.args[0] == "anthropic"
         assert mock_resolve.call_args.args[1] == "runtime-model"
 
-    def test_compression_on_codex_main_uses_mini_model_first(self):
-        """Codex main compression uses a dedicated mini model."""
+    def test_compression_on_codex_main_uses_codex_model_first(self):
+        """Codex main compression uses a dedicated faster Codex model."""
         mock_client = MagicMock()
         with patch(
             "agent.auxiliary_client._read_main_provider",
@@ -176,16 +176,16 @@ class TestResolveAutoMainFirst:
             side_effect=AssertionError("fallback chain should not run first"),
         ), patch(
             "agent.auxiliary_client.resolve_provider_client",
-            return_value=(mock_client, "gpt-5.4-mini"),
+            return_value=(mock_client, "gpt-5.3-codex"),
         ) as mock_resolve:
             from agent.auxiliary_client import _resolve_auto
 
             client, model = _resolve_auto(task="compression")
 
         assert client is mock_client
-        assert model == "gpt-5.4-mini"
+        assert model == "gpt-5.3-codex"
         assert mock_resolve.call_args.args[0] == "openai-codex"
-        assert mock_resolve.call_args.args[1] == "gpt-5.4-mini"
+        assert mock_resolve.call_args.args[1] == "gpt-5.3-codex"
 
     def test_non_compression_codex_auto_still_uses_main(self):
         """Only compression gets the Codex fast-backend exception."""
@@ -231,7 +231,7 @@ class TestResolveAutoMainFirst:
         assert client is chain_client
         assert model == "google/gemini-3-flash-preview"
         assert mock_resolve.call_args.args[0] == "openai-codex"
-        assert mock_resolve.call_args.args[1] == "gpt-5.4-mini"
+        assert mock_resolve.call_args.args[1] == "gpt-5.3-codex"
 
 
 # ── Vision — resolve_vision_provider_client ─────────────────────────────────

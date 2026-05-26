@@ -360,6 +360,40 @@ class TestCodexOAuthContextLength:
         assert ctx_55 == 300_000
         assert ctx_54 == 400_000
 
+    def test_codex_context_cap_overrides_higher_config(self):
+        """A stale high model.context_length must not delay Codex compression
+        past the OAuth backend's real context cap.
+        """
+        from agent.model_metadata import get_model_context_length
+
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.save_context_length"):
+            ctx = get_model_context_length(
+                model="gpt-5.5",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="",
+                config_context_length=600_000,
+                provider="openai-codex",
+            )
+
+        assert ctx == 272_000
+
+    def test_codex_allows_lower_config_context(self):
+        """Lower explicit context_length values still force earlier compaction."""
+        from agent.model_metadata import get_model_context_length
+
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.save_context_length"):
+            ctx = get_model_context_length(
+                model="gpt-5.5",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="",
+                config_context_length=128_000,
+                provider="openai-codex",
+            )
+
+        assert ctx == 128_000
+
     def test_probe_failure_falls_back_to_hardcoded(self):
         """If the probe fails (non-200 / network error), we still return
         the hardcoded 272k rather than leaking through to models.dev 1.05M."""
