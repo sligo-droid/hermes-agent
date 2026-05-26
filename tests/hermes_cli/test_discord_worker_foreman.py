@@ -729,6 +729,128 @@ def test_alerts_due_dedupes_same_problem_across_boards(monkeypatch, tmp_path):
     assert alerts_due([second], now=5000, config={"cooldown_seconds": 1}) == []
 
 
+def test_human_intervention_alert_has_own_daily_bucket(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
+
+    source_warning = _alert_issue(
+        kind="board_stalled",
+        board="discord-source",
+        task_id="__board__",
+        severity="warning",
+        title="Discord worker board is blocked with no running workers",
+        evidence={
+            "thread_state": "blocked",
+            "task_status": "blocked",
+            "blocked_reason": "merge state: DIRTY",
+            "stalled_since": 100,
+            "stalled_after_seconds": 300,
+            "stalled_age_seconds": 600,
+        },
+    )
+    human = _alert_issue(
+        kind="human_intervention_required",
+        board="discord-source",
+        task_id="__board__",
+        severity="critical",
+        title="Foreman attempt requires human manual intervention",
+        evidence={
+            "source_board": "discord-source",
+            "source_task_id": "__board__",
+            "foreman_board": "foreman-abc",
+            "manual_intervention_type": "foreman_blocked",
+            "thread_state": "blocked",
+            "task_status": "blocked",
+            "run_ended_at": 500,
+        },
+    )
+
+    config = {"daily_cap_per_board": 1, "terminal_suppression_age_seconds": 10_000}
+    record_alert_sent(source_warning, now=1000)
+
+    assert alerts_due([human], now=1100, config=config) == [human]
+    record_alert_sent(human, now=1100)
+    another_human = _alert_issue(
+        kind="human_intervention_required",
+        board="discord-source",
+        task_id="other-source-task",
+        severity="critical",
+        title="Foreman attempt requires human manual intervention",
+        evidence={
+            **human.evidence,
+            "source_task_id": "other-source-task",
+            "foreman_board": "foreman-def",
+        },
+    )
+    assert alerts_due([another_human], now=1200, config=config) == []
+
+
+def test_human_intervention_alerts_are_prioritized_when_tick_cap_is_reached(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli.discord_worker_foreman import alerts_due
+
+    warning = _alert_issue(
+        kind="board_stalled",
+        board="discord-source-old",
+        task_id="__board__",
+        severity="warning",
+        title="Discord worker board is blocked with no running workers",
+        evidence={
+            "board_created_at": 100,
+            "thread_state": "blocked",
+            "task_status": "blocked",
+            "blocked_reason": "Needs attention",
+            "stalled_since": 200,
+            "stalled_after_seconds": 300,
+            "stalled_age_seconds": 900,
+        },
+    )
+    older_human = _alert_issue(
+        kind="human_intervention_required",
+        board="discord-old-human",
+        task_id="__board__",
+        severity="critical",
+        title="Foreman attempt requires human manual intervention",
+        evidence={
+            "board_created_at": 300,
+            "source_board": "discord-old-human",
+            "source_task_id": "__board__",
+            "foreman_board": "foreman-old",
+            "manual_intervention_type": "foreman_blocked",
+            "thread_state": "blocked",
+            "task_status": "blocked",
+            "stalled_since": 400,
+            "run_ended_at": 400,
+        },
+    )
+    newer_human = _alert_issue(
+        kind="human_intervention_required",
+        board="discord-new-human",
+        task_id="__board__",
+        severity="critical",
+        title="Foreman attempt requires human manual intervention",
+        evidence={
+            "board_created_at": 500,
+            "source_board": "discord-new-human",
+            "source_task_id": "__board__",
+            "foreman_board": "foreman-new",
+            "manual_intervention_type": "foreman_blocked",
+            "thread_state": "blocked",
+            "task_status": "blocked",
+            "stalled_since": 600,
+            "run_ended_at": 600,
+        },
+    )
+
+    due = alerts_due(
+        [warning, older_human, newer_human],
+        now=1000,
+        config={"max_alerts_per_tick": 1, "terminal_suppression_age_seconds": 10_000},
+    )
+
+    assert due == [newer_human]
+
+
 def test_alerts_due_skips_boards_before_min_created_at(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli.discord_worker_foreman import alerts_due

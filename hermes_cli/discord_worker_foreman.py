@@ -364,7 +364,7 @@ def alerts_due(
     changed = _gc_alert_state(state, now=now, retention_seconds=int(cfg["retention_seconds"]))
     due: list[ForemanIssue] = []
     due_groups: set[str] = set()
-    for issue in issues:
+    for _, issue in sorted(enumerate(issues), key=lambda item: _alert_issue_sort_key(item[0], item[1])):
         if not _board_created_at_allowed(issue, min_created_at=int(cfg["min_board_created_at"])):
             continue
         fingerprint = _issue_fingerprint(issue)
@@ -389,7 +389,7 @@ def alerts_due(
             continue
         if len(due) >= int(cfg["max_alerts_per_tick"]):
             continue
-        if _board_daily_count(state, issue.board, now) >= int(cfg["daily_cap_per_board"]):
+        if _issue_daily_count(state, issue, now) >= int(cfg["daily_cap_per_board"]):
             continue
         if not _terminal_issue_recent(
             issue,
@@ -460,7 +460,7 @@ def record_alert_sent(issue: ForemanIssue, *, now: Optional[int] = None) -> None
     entry["next_retry_at"] = None
     entry["last_error"] = ""
     daily_counts = state.setdefault("daily_counts", {})
-    key = _daily_key(issue.board, now)
+    key = _issue_daily_key(issue, now)
     daily_counts[key] = int(daily_counts.get(key) or 0) + 1
     group_entry = _group_entry(state, issue, now=now)
     group_entry["last_sent_at"] = now
@@ -1541,6 +1541,20 @@ def _board_created_at_allowed(issue: ForemanIssue, *, min_created_at: int) -> bo
     return board_created_at >= min_created_at
 
 
+def _alert_issue_sort_key(index: int, issue: ForemanIssue) -> tuple[int, int, int, int, int]:
+    evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
+    board_created_at = _coerce_optional_int(evidence.get("board_created_at")) or 0
+    stalled_since = _coerce_optional_int(evidence.get("stalled_since")) or 0
+    is_human_intervention = issue.kind == "human_intervention_required"
+    return (
+        0 if is_human_intervention else 1,
+        -_severity_rank(issue.severity),
+        -board_created_at,
+        -stalled_since,
+        index,
+    )
+
+
 def _issue_fingerprint(issue: ForemanIssue) -> str:
     payload = {
         "detector_version": ALERT_DETECTOR_VERSION,
@@ -1693,13 +1707,29 @@ def _severity_rank(severity: str) -> int:
     return _SEVERITY_RANK.get(str(severity or "").casefold(), 0)
 
 
-def _daily_key(board: str, now: int) -> str:
+def _daily_key(scope: str, now: int) -> str:
     day = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d")
-    return f"{board}:{day}"
+    return f"{scope}:{day}"
 
 
-def _board_daily_count(state: dict[str, Any], board: str, now: int) -> int:
-    return int(state.setdefault("daily_counts", {}).get(_daily_key(board, now)) or 0)
+def _issue_daily_scope(issue: ForemanIssue) -> str:
+    """Return the daily-cap bucket for an alert issue.
+
+    Human-intervention alerts are the terminal escalation path for a Foreman
+    attempt. Keep them in their own per-board bucket so an earlier autonomous
+    warning for the source board cannot consume the day's only notification slot.
+    """
+    if issue.kind == "human_intervention_required":
+        return f"{issue.board}:human_intervention_required"
+    return issue.board
+
+
+def _issue_daily_key(issue: ForemanIssue, now: int) -> str:
+    return _daily_key(_issue_daily_scope(issue), now)
+
+
+def _issue_daily_count(state: dict[str, Any], issue: ForemanIssue, now: int) -> int:
+    return int(state.setdefault("daily_counts", {}).get(_issue_daily_key(issue, now)) or 0)
 
 
 def _gc_alert_state(state: dict[str, Any], *, now: int, retention_seconds: int) -> bool:
