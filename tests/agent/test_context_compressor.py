@@ -765,6 +765,31 @@ class TestSummaryFailureTrackingForGatewayWarning:
         assert "[USER]: msg 3" in summary or "[ASSISTANT]: msg 4" in summary
         assert "removed to free context space but could not be summarized" not in summary
 
+    def test_summary_failure_uses_tighter_live_tail(self):
+        """Timeout fallback should reduce enough context to avoid immediate re-compaction."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=2)
+
+        msgs = [{"role": "system", "content": "sys"}]
+        for i in range(30):
+            msgs.append({
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"message {i} " + ("x" * 4000),
+            })
+        normal_tail_only = msgs[11]["content"]
+
+        with patch("agent.context_compressor.call_llm", side_effect=Exception("timeout")):
+            result = c.compress(msgs)
+
+        assert c._last_summary_fallback_used is True
+        assert len(result) <= 16
+        assert all(m.get("content") != normal_tail_only for m in result)
+        assert any(
+            isinstance(m.get("content"), str) and m["content"].startswith(SUMMARY_PREFIX)
+            for m in result
+        )
+        assert result[-1]["content"] == msgs[-1]["content"]
+
     def test_compress_clears_fallback_flag_on_subsequent_success(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]

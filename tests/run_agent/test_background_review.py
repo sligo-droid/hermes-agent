@@ -241,3 +241,46 @@ def test_background_review_fork_skips_external_memory_plugins(monkeypatch):
         "the fork leaks harness prompts into the user's real memory "
         "namespace via on_turn_start / prefetch_all / sync_all."
     )
+
+
+def test_background_review_does_not_persist_harness_prompt(monkeypatch):
+    """The fork may inspect review messages, but must not write them to the parent session."""
+    persisted_messages: list = []
+    captured_review_messages: list = []
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            self._session_messages = []
+
+        def _persist_session(self, messages, conversation_history=None):
+            persisted_messages.append((messages, conversation_history))
+
+        def run_conversation(self, **kwargs):
+            messages = [
+                *kwargs["conversation_history"],
+                {"role": "user", "content": kwargs["user_message"]},
+            ]
+            self._persist_session(messages, kwargs["conversation_history"])
+            captured_review_messages.extend(self._session_messages)
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    assert persisted_messages == []
+    assert captured_review_messages
+    assert captured_review_messages[-1]["role"] == "user"
+    assert "review memory" in captured_review_messages[-1]["content"]

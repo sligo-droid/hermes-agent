@@ -619,6 +619,41 @@ class TestToolResultPreflightCompression:
         mock_compress.assert_called_once()
         assert result["completed"] is True
 
+    def test_post_tool_compression_counts_new_tool_results(self, agent):
+        """Do not rely only on the previous API prompt-token count after tool output."""
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 100_000
+        agent.context_compressor.threshold_tokens = 40_000
+
+        tc = SimpleNamespace(
+            id="tc1", type="function",
+            function=SimpleNamespace(name="web_search", arguments='{"query":"test"}'),
+        )
+        tool_resp = _mock_response(
+            content=None, finish_reason="stop", tool_calls=[tc],
+            usage={"prompt_tokens": 20_000, "completion_tokens": 100, "total_tokens": 20_100},
+        )
+        ok_resp = _mock_response(content="Done", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [tool_resp, ok_resp]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="x" * 120_000),
+            patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=55_000) as mock_estimate,
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": "hello"}], "compressed prompt",
+            )
+            result = agent.run_conversation("hello")
+
+        mock_estimate.assert_called()
+        mock_compress.assert_called_once()
+        assert mock_compress.call_args.kwargs["approx_tokens"] == 55_000
+        assert result["completed"] is True
+
     def test_anthropic_prompt_too_long_safety_net(self, agent):
         """Anthropic 'prompt is too long' error triggers compression as safety net."""
         err_400 = Exception(

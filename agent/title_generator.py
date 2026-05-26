@@ -26,6 +26,16 @@ _TITLE_PROMPT = (
 )
 
 
+def _title_user_seed(user_message: str) -> str:
+    """Return the user-authored part of a gateway prompt for title generation."""
+    if not user_message:
+        return ""
+    marker = "[New message]"
+    if marker in user_message:
+        return user_message.rsplit(marker, 1)[1].strip()
+    return user_message.strip()
+
+
 def generate_title(
     user_message: str,
     assistant_response: str,
@@ -44,8 +54,11 @@ def generate_title(
     ``AIAgent._emit_auxiliary_failure`` so the user sees a warning instead
     of silently accumulating untitled sessions.
     """
-    # Truncate long messages to keep the request small
-    user_snippet = user_message[:500] if user_message else ""
+    # Truncate long messages to keep the request small. Gateway prompts may
+    # include recent-channel backfill before the actual trigger; titles should
+    # describe the trigger, not stale surrounding context.
+    user_seed = _title_user_seed(user_message)
+    user_snippet = user_seed[:500] if user_seed else ""
     assistant_snippet = assistant_response[:500] if assistant_response else ""
 
     messages = [

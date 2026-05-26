@@ -57,7 +57,9 @@ _MIN_SUMMARY_TOKENS = 2000
 _SUMMARY_RATIO = 0.20
 # Absolute ceiling for summary tokens (even on very large context windows)
 _SUMMARY_TOKENS_CEILING = 12_000
-_LOCAL_FALLBACK_MAX_CHARS = 12_000
+_LOCAL_FALLBACK_MAX_CHARS = 8_000
+_LOCAL_FALLBACK_TAIL_RATIO = 0.50
+_LOCAL_FALLBACK_MIN_TAIL_TOKENS = 3_000
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
@@ -1665,6 +1667,33 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                     n_skipped,
                 )
             return messages
+
+        if not summary:
+            # When the LLM summarizer is unavailable, keep the live tail tighter
+            # than a normal summarized compaction. The local fallback preserves a
+            # bounded extract of the older window, and keeping a large tail is how
+            # timeout-driven compactions can immediately remain near threshold.
+            fallback_tail_budget = max(
+                _LOCAL_FALLBACK_MIN_TAIL_TOKENS,
+                int(self.tail_token_budget * _LOCAL_FALLBACK_TAIL_RATIO),
+            )
+            fallback_compress_end = self._find_tail_cut_by_tokens(
+                messages,
+                compress_start,
+                token_budget=fallback_tail_budget,
+            )
+            if fallback_compress_end > compress_end:
+                compress_end = fallback_compress_end
+                turns_to_summarize = messages[compress_start:compress_end]
+                summary_idx, summary_body = self._find_latest_context_summary(
+                    messages,
+                    summary_search_start,
+                    compress_end,
+                )
+                if summary_idx is not None:
+                    if summary_body and not self._previous_summary:
+                        self._previous_summary = summary_body
+                    turns_to_summarize = messages[max(compress_start, summary_idx + 1):compress_end]
 
         # Phase 4: Assemble compressed message list
         compressed = []
