@@ -353,6 +353,7 @@ def _run_opencode(
             workspace,
             timeout=_role_timeout(role),
             context_for_classification=context,
+            force_plan=False,
             title=f"kanban {task_id}",
             on_event=on_event,
         )
