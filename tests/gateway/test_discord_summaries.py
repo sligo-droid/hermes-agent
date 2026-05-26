@@ -113,7 +113,13 @@ class FakeThread:
         self._messages = {}
 
     async def send(self, **kwargs):
-        msg = SimpleNamespace(id=300 + len(self.sent), edit=AsyncMock())
+        msg = SimpleNamespace(
+            id=300 + len(self.sent),
+            edit=AsyncMock(),
+            add_reaction=AsyncMock(),
+            remove_reaction=AsyncMock(),
+            reactions=[],
+        )
         self.sent.append((kwargs, msg))
         self._messages[msg.id] = msg
         return msg
@@ -769,15 +775,51 @@ async def test_worker_task_thread_seeds_feature_summary(adapter):
 
 
 @pytest.mark.asyncio
-async def test_foreman_goal_thread_embed_names_source_board_and_thread(adapter):
+async def test_worker_task_embed_posts_to_existing_thread_and_hides_source_links(adapter):
     parent = FakeTextChannel(channel_id=100)
     thread = FakeThread(channel_id=202, parent=parent)
-    starter = SimpleNamespace(id=301, create_thread=AsyncMock(return_value=thread))
-    parent.send = AsyncMock(return_value=starter)
-    adapter._client.get_channel = lambda channel_id: parent if int(channel_id) == 100 else None
+
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 202 else None
+
+    handle = await adapter.send_worker_task_embed(
+        "202",
+        title="Build dashboard filters",
+        initial_request="Build dashboard filters\n\nAdd filter controls.",
+        project_context={"project_name": "Hermes"},
+        kanban_url="https://hermes.example.test/workers/123/tickets/t1",
+        source_board="discord-123",
+        source_task_id="t1",
+        source_task_url="https://hermes.example.test/workers/123/tickets/t1",
+        source_kanban_url="https://hermes.example.test/workers/123",
+        source_discord_thread_url="https://discord.com/channels/5/123",
+    )
+
+    assert handle == {
+        "thread_id": "202",
+        "thread_name": "feature-thread",
+        "message_id": "300",
+    }
+    sent_embed = thread.sent[0][0]["embed"]
+    sent_message = thread.sent[0][1]
+    fields = {field.name: field.value for field in sent_embed.fields}
+    assert sent_embed.title == "Build dashboard filters"
+    assert fields["Status"] == "⏳ Running"
+    assert fields["Concise Outcome"].startswith("Build dashboard filters")
+    assert "Affected Board" not in fields
+    assert "Affected Task" not in fields
+    assert "Discord Thread" not in fields
+    assert "Foreman Kanban" not in fields
+    sent_message.add_reaction.assert_awaited_once_with("⏳")
+
+
+@pytest.mark.asyncio
+async def test_foreman_goal_embed_posts_to_source_thread_and_hides_source_links(adapter):
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=202, parent=parent)
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 202 else None
 
     handle = await adapter.create_foreman_goal_thread(
-        "100",
+        "202",
         name="Foreman: fix discord-123/t1",
         initial_request="/goal Foreman escalation: resolve t1",
         source_board="discord-123",
@@ -791,15 +833,18 @@ async def test_foreman_goal_thread_embed_names_source_board_and_thread(adapter):
     assert handle["title"] == "Foreman: fix discord-123/t1"
     assert handle["source_board"] == "discord-123"
     assert handle["source_task_url"] == "https://hermes.example.test/workers/123/tickets/t1"
-    parent.send.assert_awaited_once()
-    starter.create_thread.assert_awaited_once()
-    sent_embed = parent.send.await_args.kwargs["embed"]
+    assert handle["hide_source_links"] is True
+    assert handle["thread_id"] == "202"
+    assert handle["summary_channel_id"] == "202"
+    sent_embed = thread.sent[0][0]["embed"]
+    sent_message = thread.sent[0][1]
     fields = {field.name: field.value for field in sent_embed.fields}
     assert sent_embed.title == "Foreman: fix discord-123/t1"
-    assert fields["Affected Board"] == "[discord-123](https://hermes.example.test/workers/123)"
-    assert fields["Affected Task"] == "[t1](https://hermes.example.test/workers/123/tickets/t1)"
-    assert fields["Discord Thread"] == "[Open source thread](https://discord.com/channels/5/123)"
+    assert "Affected Board" not in fields
+    assert "Affected Task" not in fields
+    assert "Discord Thread" not in fields
     assert "Foreman Kanban" not in fields
+    sent_message.add_reaction.assert_awaited_once_with("👀")
 
 
 def test_feature_summary_kanban_status_labels(adapter):
@@ -834,6 +879,13 @@ def test_feature_summary_kanban_status_labels(adapter):
     )
     blocked_fields = {field.name: field.value for field in blocked_embed.fields}
     assert blocked_fields["Status"] == "❓ Blocked"
+
+    foreman_embed = adapter._build_feature_summary_embed(
+        initial_request="",
+        status="Foreman",
+    )
+    foreman_fields = {field.name: field.value for field in foreman_embed.fields}
+    assert foreman_fields["Status"] == "🔨 Foreman"
 
 
 @pytest.mark.asyncio

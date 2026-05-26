@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -6569,6 +6570,11 @@ class GatewayRunner:
             "assignee": str(task.assignee or "").strip(),
             "initial_request": "\n\n".join(part for part in request_parts if part),
             "project_context": project_context,
+            "thread_id": str(worker.get("thread_id") or "").strip(),
+            "chat_id": str(worker.get("chat_id") or worker.get("thread_id") or "").strip(),
+            "guild_id": str(worker.get("guild_id") or "").strip(),
+            "parent_channel_id": str(worker.get("parent_channel_id") or "").strip(),
+            "source_message_id": str(worker.get("source_message_id") or worker.get("request_id") or "").strip(),
             "kanban_url": ticket_url or board_url,
             "board_url": board_url,
             "ticket_url": ticket_url,
@@ -6616,6 +6622,88 @@ class GatewayRunner:
             "source_kanban_url": source_kanban_url,
             "source_discord_thread_url": source_discord_thread_url,
         }
+
+    def _discord_foreman_issue_source_context(self, issue: Any) -> Dict[str, Any]:
+        evidence = getattr(issue, "evidence", None)
+        evidence = evidence if isinstance(evidence, dict) else {}
+        source_board = str(evidence.get("source_board") or getattr(issue, "board", "") or "").strip()
+        source_task_id = str(evidence.get("source_task_id") or getattr(issue, "task_id", "") or "").strip()
+        context: Dict[str, Any] = {
+            "source_board": source_board,
+            "source_task_id": source_task_id,
+            "thread_id": str(evidence.get("thread_id") or "").strip(),
+            "chat_id": str(evidence.get("chat_id") or "").strip(),
+            "guild_id": str(evidence.get("guild_id") or "").strip(),
+            "parent_channel_id": str(evidence.get("parent_channel_id") or "").strip(),
+            "source_message_id": str(evidence.get("source_message_id") or "").strip(),
+            "project_context": None,
+            "public_url": "",
+        }
+        if source_board:
+            try:
+                from hermes_cli import kanban_db as _kb
+                from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
+
+                metadata = _kb.read_board_metadata(source_board)
+                worker = metadata.get(DISCORD_WORKER_META_KEY)
+                worker = dict(worker) if isinstance(worker, dict) else {}
+                context["thread_id"] = str(worker.get("thread_id") or context["thread_id"] or "").strip()
+                context["chat_id"] = str(worker.get("chat_id") or context["chat_id"] or context["thread_id"] or "").strip()
+                context["guild_id"] = str(worker.get("guild_id") or context["guild_id"] or "").strip()
+                context["parent_channel_id"] = str(
+                    worker.get("parent_channel_id") or context["parent_channel_id"] or ""
+                ).strip()
+                context["source_message_id"] = str(
+                    worker.get("source_message_id")
+                    or worker.get("request_id")
+                    or context["source_message_id"]
+                    or ""
+                ).strip()
+                project_context = worker.get("project_context")
+                if isinstance(project_context, dict):
+                    context["project_context"] = dict(project_context)
+                context["public_url"] = str(worker.get("public_url") or "").strip()
+            except Exception:
+                logger.debug("discord foreman: source context unavailable for %s", source_board, exc_info=True)
+        if not context["chat_id"] and context["thread_id"]:
+            context["chat_id"] = context["thread_id"]
+        return context
+
+    @staticmethod
+    def _discord_foreman_goal_board_slug(issue: Any) -> str:
+        evidence = getattr(issue, "evidence", None)
+        evidence = evidence if isinstance(evidence, dict) else {}
+        payload = {
+            "kind": str(getattr(issue, "kind", "") or ""),
+            "board": str(evidence.get("source_board") or getattr(issue, "board", "") or ""),
+            "task_id": str(evidence.get("source_task_id") or getattr(issue, "task_id", "") or ""),
+            "title": str(getattr(issue, "title", "") or ""),
+        }
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return "foreman-" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+    async def _discord_foreman_sync_source_reaction(
+        self,
+        adapter: Any,
+        source_context: Dict[str, Any],
+    ) -> None:
+        reaction_sync = getattr(adapter, "sync_kanban_thread_reaction", None) if adapter else None
+        if not callable(reaction_sync):
+            return
+        thread_id = str(source_context.get("thread_id") or "").strip()
+        if not thread_id:
+            return
+        await reaction_sync(
+            {
+                "board": str(source_context.get("source_board") or ""),
+                "thread_id": thread_id,
+                "chat_id": str(source_context.get("chat_id") or thread_id),
+                "message_id": "",
+                "source_message_id": str(source_context.get("source_message_id") or ""),
+                "state": "active",
+                "reaction_state": "foreman",
+            }
+        )
 
     def _discord_foreman_record_task_thread(
         self,
@@ -6670,15 +6758,14 @@ class GatewayRunner:
         except Exception as exc:
             logger.debug("discord foreman: task-thread config unavailable: %s", exc)
             return
-        if not watcher_cfg.get("enabled") or not watcher_cfg.get("channel_id"):
+        if not watcher_cfg.get("enabled"):
             return
 
         adapter = self.adapters.get(Platform.DISCORD)
-        creator = getattr(adapter, "create_worker_task_thread", None) if adapter else None
-        if not callable(creator):
+        sender = getattr(adapter, "send_worker_task_embed", None) if adapter else None
+        if not callable(sender):
             return
 
-        channel_id = str(watcher_cfg["channel_id"])
         for board, res in results:
             spawned = getattr(res, "spawned", None) if res is not None else None
             if not spawned:
@@ -6699,16 +6786,20 @@ class GatewayRunner:
                             self._discord_foreman_record_task_thread,
                             board=str(board),
                             task_id=str(task_id),
-                            channel_id=channel_id,
+                            channel_id=str(
+                                existing_thread.get("parent_channel_id")
+                                or existing_thread.get("thread_id")
+                                or ""
+                            ),
                             thread_handle=existing_thread,
                         )
                         continue
+                    thread_id = str(info.get("thread_id") or "").strip()
+                    if not thread_id:
+                        continue
                     title = str(info.get("title") or task_id).strip()
-                    lane = str(info.get("assignee") or assignee or "").strip()
-                    thread_name = f"{lane}: {title}" if lane else title
-                    handle = await creator(
-                        channel_id,
-                        name=thread_name,
+                    handle = await sender(
+                        thread_id,
                         title=title,
                         initial_request=str(info.get("initial_request") or title),
                         project_context=info.get("project_context"),
@@ -6718,6 +6809,7 @@ class GatewayRunner:
                         source_task_url=str(info.get("ticket_url") or ""),
                         source_kanban_url=str(info.get("board_url") or ""),
                         source_discord_thread_url=str(info.get("discord_thread_url") or ""),
+                        hide_source_links=True,
                     )
                     if not isinstance(handle, dict) or not str(handle.get("thread_id") or "").strip():
                         continue
@@ -6725,7 +6817,7 @@ class GatewayRunner:
                         self._discord_foreman_record_task_thread,
                         board=str(board),
                         task_id=str(task_id),
-                        channel_id=channel_id,
+                        channel_id=str(info.get("chat_id") or thread_id),
                         thread_handle=handle,
                     )
                 except Exception:
@@ -6767,16 +6859,33 @@ class GatewayRunner:
         if not callable(creator):
             raise RuntimeError("Discord adapter cannot create foreman goal threads")
 
+        source_context = self._discord_foreman_issue_source_context(issue)
+        source_thread_id = str(source_context.get("thread_id") or "").strip()
+        if not source_thread_id:
+            raise RuntimeError("Discord foreman issue has no source thread")
+
+        try:
+            from hermes_cli import discord_worker_boards as _dwb
+
+            foreman_board_slug = self._discord_foreman_goal_board_slug(issue)
+            foreman_board_url = _dwb.public_session_board_url(foreman_board_slug)
+        except Exception:
+            foreman_board_slug = self._discord_foreman_goal_board_slug(issue)
+            foreman_board_url = ""
+
         embed_context = self._discord_foreman_issue_embed_context(issue)
         handle = await creator(
-            channel_id,
+            source_thread_id,
             name=title,
             initial_request=prompt,
-            project_context=None,
+            project_context=source_context.get("project_context"),
+            kanban_board={"slug": foreman_board_slug, "public_url": foreman_board_url},
+            hide_source_links=True,
             **embed_context,
         )
         if not isinstance(handle, dict) or not str(handle.get("thread_id") or "").strip():
-            raise RuntimeError("Discord adapter did not return a foreman goal thread")
+            raise RuntimeError("Discord adapter did not return a foreman goal embed")
+        await self._discord_foreman_sync_source_reaction(adapter, source_context)
 
         thread_id = str(handle.get("thread_id") or "").strip()
         thread_name = str(handle.get("thread_name") or title or thread_id).strip()
@@ -6784,13 +6893,18 @@ class GatewayRunner:
         source = SessionSource(
             platform=Platform.DISCORD,
             chat_id=thread_id,
-            chat_name=f"#dev / {thread_name}" if thread_name else "#dev",
+            chat_name=thread_name or "Discord foreman",
             chat_type="thread",
             user_id="system:foreman",
             user_name="Hermes Foreman",
             thread_id=thread_id,
-            guild_id=str(handle.get("guild_id") or "") or None,
-            parent_chat_id=str(handle.get("parent_channel_id") or channel_id or "") or None,
+            guild_id=str(handle.get("guild_id") or source_context.get("guild_id") or "") or None,
+            parent_chat_id=str(
+                handle.get("parent_channel_id")
+                or source_context.get("parent_channel_id")
+                or channel_id
+                or ""
+            ) or None,
             project_name=str(project_context.get("project_name") or "") or None,
             project_path=str(project_context.get("project_path") or "") or None,
             project_github_url=str(project_context.get("project_github_url") or "") or None,
@@ -6834,10 +6948,6 @@ class GatewayRunner:
                 "discord foreman: disabled via config kanban.discord_worker.foreman.enabled=false"
             )
             return
-        if not watcher_cfg["channel_id"]:
-            logger.warning("discord foreman: enabled without a channel_id; disabled")
-            return
-
         profile = self._active_profile_name()
         lock_identity = f"{profile}:{_hermes_home}"
         lock_acquired = False
@@ -6864,9 +6974,8 @@ class GatewayRunner:
             alert_config["terminal_suppression_age_seconds"] = terminal_age
             startup_baseline_checked = False
             logger.info(
-                "discord foreman: enabled (interval=%.1fs channel=%s)",
+                "discord foreman: enabled (interval=%.1fs)",
                 interval,
-                watcher_cfg["channel_id"],
             )
 
             await asyncio.sleep(5)
@@ -6924,8 +7033,12 @@ class GatewayRunner:
                                         sender = getattr(adapter, "send", None)
                                         if not callable(sender):
                                             raise RuntimeError("Discord adapter cannot send foreman human alerts")
+                                        source_context = self._discord_foreman_issue_source_context(issue)
+                                        source_thread_id = str(source_context.get("thread_id") or "").strip()
+                                        if not source_thread_id:
+                                            raise RuntimeError("Discord foreman human alert has no source thread")
                                         result = await sender(
-                                            watcher_cfg["channel_id"],
+                                            source_thread_id,
                                             _foreman.render_foreman_alert(
                                                 issue,
                                                 mention=watcher_cfg["mention"],
@@ -6935,6 +7048,7 @@ class GatewayRunner:
                                                 "allowed_role_mentions": ["1503914570077442058"],
                                             },
                                         )
+                                        await self._discord_foreman_sync_source_reaction(adapter, source_context)
                                         if getattr(result, "success", True) is False:
                                             raise RuntimeError(
                                                 getattr(result, "error", "foreman human alert send failed")
@@ -7033,7 +7147,7 @@ class GatewayRunner:
                         now = time.monotonic()
                         for target in reaction_targets:
                             board = str(target.get("board") or "")
-                            state = str(target.get("state") or "")
+                            state = str(target.get("reaction_state") or target.get("state") or "")
                             cache_key = self._discord_kanban_target_cache_key(target)
                             cache_entry = reaction_cache.get(cache_key)
                             if cache_entry is None and board in reaction_cache:
@@ -12737,6 +12851,8 @@ class GatewayRunner:
                             ):
                                 if feature_summary.get(key):
                                     target[key] = str(feature_summary.get(key) or "")
+                            if feature_summary.get("hide_source_links") is not None:
+                                target["hide_source_links"] = bool(feature_summary.get("hide_source_links"))
                             preferred_title = str(feature_summary.get("title") or "").strip()
                             if preferred_title:
                                 target["title"] = preferred_title

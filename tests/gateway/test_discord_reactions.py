@@ -44,7 +44,7 @@ from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
 
 
-STATUS_REACTION_EMOJIS = ("✅", "❌", "👀", "❓", "⏳")
+STATUS_REACTION_EMOJIS = ("✅", "❌", "👀", "❓", "⏳", "🔨")
 
 
 def _status_remove_calls(adapter, *, except_emoji=None):
@@ -435,6 +435,7 @@ async def test_top_level_feature_summary_reactions_target_triggering_user_messag
         ("done", "✅"),
         ("blocked", "❓"),
         ("errored", "❌"),
+        ("foreman", "🔨"),
     ],
 )
 async def test_feature_summary_reactions_follow_kanban_state(adapter, state, emoji):
@@ -462,9 +463,34 @@ async def test_feature_summary_reactions_follow_kanban_state(adapter, state, emo
     assert (emoji, adapter._client.user) not in completion_removes
     assert completion_removes == [
         (existing, adapter._client.user)
-        for existing in ("✅", "❌", "👀", "❓", "⏳")
+        for existing in STATUS_REACTION_EMOJIS
         if existing != emoji
     ]
+
+
+@pytest.mark.asyncio
+async def test_kanban_thread_reaction_prefers_explicit_reaction_state(adapter):
+    message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="👀", me=True)],
+    )
+    thread = SimpleNamespace(id=123)
+    adapter._resolve_summary_channel = AsyncMock(return_value=thread)
+    adapter._kanban_reaction_target_message = AsyncMock(return_value=message)
+
+    synced = await adapter.sync_kanban_thread_reaction(
+        {
+            "board": "discord-123",
+            "thread_id": "123",
+            "state": "done",
+            "reaction_state": "foreman",
+        }
+    )
+
+    assert synced == "foreman"
+    message.remove_reaction.assert_awaited_once_with("👀", adapter._client.user)
+    message.add_reaction.assert_awaited_once_with("🔨")
 
 
 @pytest.mark.asyncio

@@ -1612,6 +1612,44 @@ def board_thread_state(board: str) -> str:
     return "active"
 
 
+def _is_foreman_generated_worker(worker: dict[str, Any]) -> bool:
+    request = str(
+        worker.get("initial_request")
+        or worker.get("root_goal")
+        or worker.get("latest_planner_request")
+        or ""
+    ).lstrip()
+    return request.startswith("Foreman escalation:") or request.startswith("/goal Foreman escalation:")
+
+
+def _foreman_source_board_from_request(text: str) -> str:
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip().lstrip("- ").strip()
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        if key.strip().casefold() == "board":
+            return value.strip()[:120]
+    return ""
+
+
+def _active_foreman_source_boards() -> set[str]:
+    sources: set[str] = set()
+    for board_meta in kanban_db.list_boards(include_archived=False):
+        board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
+        worker = _read_worker_meta(board)
+        if worker.get("kind") != "discord_worker_board" or not _is_foreman_generated_worker(worker):
+            continue
+        if worker.get("cancelled") or str(worker.get("goal_status") or "").strip().lower() in TERMINAL_GOAL_STATUSES:
+            continue
+        source = _foreman_source_board_from_request(
+            str(worker.get("initial_request") or worker.get("root_goal") or "")
+        )
+        if source:
+            sources.add(source)
+    return sources
+
+
 def _latest_task_summaries(tasks: list[Any], summaries: dict[str, str]) -> list[str]:
     ordered = sorted(
         tasks,
@@ -2105,6 +2143,7 @@ def feature_summary_snapshot(board: str) -> dict[str, Any]:
 def thread_status_targets() -> list[dict[str, Any]]:
     """Return Discord thread targets with their current board state."""
     targets: list[dict[str, Any]] = []
+    active_foreman_sources = _active_foreman_source_boards()
     for board_meta in kanban_db.list_boards(include_archived=False):
         board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
         worker = _read_worker_meta(board)
@@ -2124,31 +2163,38 @@ def thread_status_targets() -> list[dict[str, Any]]:
             or worker.get("terminal_summary_sync_pending")
             or terminal_completion_message_pending
         )
-        if state not in {"active", "running"} and not (state in {"done", "blocked", "errored"} and terminal_sync_pending):
+        if (
+            state not in {"active", "running"}
+            and not (state in {"done", "blocked", "errored"} and terminal_sync_pending)
+            and board not in active_foreman_sources
+        ):
             continue
-        targets.append(
-            {
-                "board": board,
-                "thread_id": thread_id,
-                "chat_id": str(worker.get("chat_id") or thread_id),
-                "message_id": summary.get("message_id") or str(worker.get("summary_message_id") or ""),
-                "source_message_id": summary.get("source_message_id") or str(worker.get("source_message_id") or ""),
-                "guild_id": summary.get("guild_id") or str(worker.get("guild_id") or ""),
-                "parent_channel_id": summary.get("parent_channel_id") or str(worker.get("parent_channel_id") or ""),
-                "state": state,
-                "title": summary.get("title") or "",
-                "fallback_title": summary.get("fallback_title") or "",
-                "outcome": summary.get("outcome") or "",
-                "branch": summary.get("branch") or "",
-                "pr_url": summary.get("pr_url") or "",
-                "pr_number": summary.get("pr_number") or "",
-                "public_url": summary.get("public_url") or "",
-                "sync_key": summary.get("sync_key") or "",
-                "terminal_reaction_sync_pending": bool(worker.get("terminal_reaction_sync_pending")),
-                "terminal_summary_sync_pending": bool(worker.get("terminal_summary_sync_pending")),
-                "terminal_completion_message_pending": terminal_completion_message_pending,
-            }
-        )
+        target = {
+            "board": board,
+            "thread_id": thread_id,
+            "chat_id": str(worker.get("chat_id") or thread_id),
+            "message_id": summary.get("message_id") or str(worker.get("summary_message_id") or ""),
+            "source_message_id": summary.get("source_message_id") or str(worker.get("source_message_id") or ""),
+            "guild_id": summary.get("guild_id") or str(worker.get("guild_id") or ""),
+            "parent_channel_id": summary.get("parent_channel_id") or str(worker.get("parent_channel_id") or ""),
+            "state": state,
+            "title": summary.get("title") or "",
+            "fallback_title": summary.get("fallback_title") or "",
+            "outcome": summary.get("outcome") or "",
+            "branch": summary.get("branch") or "",
+            "pr_url": summary.get("pr_url") or "",
+            "pr_number": summary.get("pr_number") or "",
+            "public_url": summary.get("public_url") or "",
+            "sync_key": summary.get("sync_key") or "",
+            "terminal_reaction_sync_pending": bool(worker.get("terminal_reaction_sync_pending")),
+            "terminal_summary_sync_pending": bool(worker.get("terminal_summary_sync_pending")),
+            "terminal_completion_message_pending": terminal_completion_message_pending,
+        }
+        if board in active_foreman_sources:
+            target["reaction_state"] = "foreman"
+        if _is_foreman_generated_worker(worker):
+            target["hide_source_links"] = True
+        targets.append(target)
     return targets
 
 
