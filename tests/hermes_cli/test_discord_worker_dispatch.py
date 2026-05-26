@@ -84,3 +84,43 @@ def test_discord_worker_dispatch_respects_global_live_cap(monkeypatch, tmp_path)
 
     assert len(spawned) == 1
     assert sum(len(result.spawned) for _board, result in results if result is not None) == 1
+
+
+def test_discord_worker_dispatch_defaults_allow_eight_global_workers(monkeypatch, tmp_path):
+    from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
+
+    boards = [_prepare_board(monkeypatch, tmp_path, thread_id=f"default-{idx}") for idx in range(5)]
+    spawned = []
+
+    def spawn_fn(task, _workspace, board=None):
+        spawned.append((board, task.id))
+        return 3000 + len(spawned)
+
+    results = dispatch_discord_worker_boards(
+        [board.slug for board in boards],
+        spawn_fn=spawn_fn,
+    )
+
+    assert len(spawned) == 3
+    assert sum(len(result.spawned) for _board, result in results if result is not None) == 3
+
+
+def test_discord_worker_dispatch_invalid_caps_fall_back_to_defaults(monkeypatch, tmp_path):
+    from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
+
+    boards = [_prepare_board(monkeypatch, tmp_path, thread_id=f"fallback-{idx}") for idx in range(5)]
+    spawned = []
+
+    def spawn_fn(task, _workspace, board=None):
+        spawned.append((board, task.id))
+        return 4000 + len(spawned)
+
+    results = dispatch_discord_worker_boards(
+        [board.slug for board in boards],
+        max_global_workers=0,
+        max_workers_per_board=0,
+        spawn_fn=spawn_fn,
+    )
+
+    assert len(spawned) == 3
+    assert sum(len(result.spawned) for _board, result in results if result is not None) == 3

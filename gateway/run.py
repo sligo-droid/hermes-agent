@@ -5945,7 +5945,7 @@ class GatewayRunner:
 
         discord_max_global_workers = _positive_int_config(
             discord_worker_cfg.get("max_global_workers"),
-            4,
+            8,
         )
         discord_max_workers_per_board = _positive_int_config(
             discord_worker_cfg.get("max_workers_per_board"),

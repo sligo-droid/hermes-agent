@@ -772,6 +772,14 @@ class TestDiscordChannelPromptsConfig:
         assert raw["discord"]["channel_prompts"] == {}
 
 
+class TestDiscordWorkerConcurrencyConfig:
+    def test_default_worker_concurrency_caps(self):
+        worker = DEFAULT_CONFIG["kanban"]["discord_worker"]
+
+        assert worker["max_global_workers"] == 8
+        assert worker["max_workers_per_board"] == 2
+
+
 class TestUserMessagePreviewConfig:
     def test_default_config_preview_line_counts(self):
         preview = DEFAULT_CONFIG["display"]["user_message_preview"]

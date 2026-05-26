@@ -59,7 +59,7 @@ def _dispatch_board(
 def dispatch_discord_worker_boards(
     boards: list[str],
     *,
-    max_global_workers: int = 4,
+    max_global_workers: int = 8,
     max_workers_per_board: int = 2,
     failure_limit: int = kanban_db.DEFAULT_FAILURE_LIMIT,
     spawn_fn: Optional[Callable] = None,
@@ -71,7 +71,7 @@ def dispatch_discord_worker_boards(
     reviewer ordering is still enforced by task dependencies, while the global
     pool prevents one busy board from monopolizing the dispatcher loop.
     """
-    max_global_workers = _coerce_positive_int(max_global_workers, 4)
+    max_global_workers = _coerce_positive_int(max_global_workers, 8)
     max_workers_per_board = _coerce_positive_int(max_workers_per_board, 2)
     if spawn_fn is None:
         from hermes_cli.kanban_codex_workers import spawn_or_default

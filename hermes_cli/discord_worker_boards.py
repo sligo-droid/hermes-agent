@@ -2388,13 +2388,13 @@ def _queue_reason(
 
     worker_cfg = _worker_config()
     try:
-        max_per_board = int(worker_cfg.get("max_workers_per_board") or 1)
+        max_per_board = int(worker_cfg.get("max_workers_per_board") or 2)
     except (TypeError, ValueError):
-        max_per_board = 1
+        max_per_board = 2
     try:
-        max_global = int(worker_cfg.get("max_global_workers") or 4)
+        max_global = int(worker_cfg.get("max_global_workers") or 8)
     except (TypeError, ValueError):
-        max_global = 4
+        max_global = 8
     if max_per_board > 0 and running_count >= max_per_board:
         return "board worker limit reached"
     if max_global > 0:

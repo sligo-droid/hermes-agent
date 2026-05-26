@@ -1719,7 +1719,7 @@ DEFAULT_CONFIG = {
             # Allow limited per-board parallelism so independent dev-lane
             # tickets from one /goal can move together. Planner/reviewer
             # ordering is still enforced by ticket dependencies.
-            "max_global_workers": 4,
+            "max_global_workers": 8,
             "max_workers_per_board": 2,
             "review_loop_limit": 5,
             "foreman": {
