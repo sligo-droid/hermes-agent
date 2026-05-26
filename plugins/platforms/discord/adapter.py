@@ -7858,7 +7858,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 is_feature_request_channel
                 and not self._discord_history_backfill_feature_channels()
             )
-            if _needed_mention and _backfill_enabled and not _skip_feature_channel_backfill:
+            _skip_auto_threaded_direct_question_backfill = (
+                auto_threaded_channel is not None
+                and auto_threaded_direct_question
+            )
+            if (
+                _needed_mention
+                and _backfill_enabled
+                and not _skip_feature_channel_backfill
+                and not _skip_auto_threaded_direct_question_backfill
+            ):
                 _stage_started = time.perf_counter()
                 _backfill_text = await self._fetch_channel_context(
                     message.channel, before=message,
