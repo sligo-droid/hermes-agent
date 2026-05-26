@@ -63,6 +63,8 @@ Good fits:
 - **You're iterating on an agent** and want recipients to pick up new versions with one command.
 - **You're building an agent as a product** — opinionated defaults, curated skills, tuned prompts — that other people should use as a starting point.
 
+Hermes also ships installable coding-team examples for planner, implementer, reviewer, and tester roles. See [Coding Team Profile Distributions](../guides/coding-team-profile-distributions.md).
+
 Not a fit:
 
 - **You just want to back up a profile on your own machine.** Use [`hermes profile export` / `import`](../reference/profile-commands.md#hermes-profile-export) — that's what those are for.

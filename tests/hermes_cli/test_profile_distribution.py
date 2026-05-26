@@ -582,3 +582,25 @@ class TestErrorSurfaces:
         with pytest.raises((ValueError, DistributionError)):
             plan_install(str(staged), tmp_path / "work")
 
+
+# ===========================================================================
+# Example coding-team distributions
+# ===========================================================================
+
+
+class TestCodingTeamDistributionExamples:
+
+    @pytest.mark.parametrize("role", ["planner", "implementer", "reviewer", "tester"])
+    def test_example_distribution_installs(self, profile_env, role):
+        repo_root = Path(__file__).resolve().parents[2]
+        source = repo_root / "profile-distributions" / "coding-team" / role
+
+        plan = install_distribution(str(source), name=f"example-{role}")
+
+        assert plan.target_dir.is_dir()
+        assert (plan.target_dir / "SOUL.md").is_file()
+        assert (plan.target_dir / "config.yaml").is_file()
+        assert (plan.target_dir / "skills" / f"coding-team-{role}" / "SKILL.md").is_file()
+        manifest = read_manifest(plan.target_dir)
+        assert manifest.name == f"example-{role}"
+        assert manifest.source == str(source.resolve())

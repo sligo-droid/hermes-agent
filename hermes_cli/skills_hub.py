@@ -161,6 +161,80 @@ def _scan_result_to_dict(result) -> dict:
     }
 
 
+def _find_local_skill_dirs(root: Path, include_nested: bool = False) -> list[Path]:
+    """Return skill directories under ``root``, excluding caches and deps."""
+    if root.is_file():
+        return []
+    root_skill = root / "SKILL.md"
+    if root_skill.is_file() and not include_nested and not is_excluded_skill_path(root_skill):
+        return [root]
+    return sorted(
+        {p.parent for p in root.rglob("SKILL.md") if not is_excluded_skill_path(p)},
+        key=lambda p: str(p.relative_to(root)),
+    )
+
+
+def _skill_pack_result_to_dict(
+    root: Path,
+    results: list[tuple[Path, object]],
+    source: str,
+) -> dict:
+    verdict_counts = {"safe": 0, "caution": 0, "dangerous": 0}
+    total_findings = 0
+    items = []
+    for path, result in results:
+        verdict_counts[result.verdict] = verdict_counts.get(result.verdict, 0) + 1
+        total_findings += len(result.findings)
+        item = _scan_result_to_dict(result)
+        item["path"] = str(path.relative_to(root))
+        items.append(item)
+    return {
+        "type": "skill_pack",
+        "root": str(root),
+        "source": source,
+        "summary": {
+            "total": len(results),
+            "safe": verdict_counts.get("safe", 0),
+            "caution": verdict_counts.get("caution", 0),
+            "dangerous": verdict_counts.get("dangerous", 0),
+            "findings": total_findings,
+        },
+        "results": items,
+    }
+
+
+def _format_skill_pack_report(
+    root: Path,
+    results: list[tuple[Path, object]],
+    source: str,
+) -> tuple[Table, str]:
+    payload = _skill_pack_result_to_dict(root, results, source)
+    summary = payload["summary"]
+    table = Table(title=f"Skill Pack Audit - {root}")
+    table.add_column("Path", style="cyan")
+    table.add_column("Skill", style="bold")
+    table.add_column("Verdict")
+    table.add_column("Findings", justify="right")
+    for path, result in results:
+        verdict_style = {
+            "safe": "green",
+            "caution": "yellow",
+            "dangerous": "red",
+        }.get(result.verdict, "dim")
+        table.add_row(
+            str(path.relative_to(root)),
+            result.skill_name,
+            f"[{verdict_style}]{result.verdict.upper()}[/]",
+            str(len(result.findings)),
+        )
+    line = (
+        f"{summary['total']} skill(s): {summary['safe']} safe, "
+        f"{summary['caution']} caution, {summary['dangerous']} dangerous; "
+        f"{summary['findings']} finding(s) total"
+    )
+    return table, line
+
+
 def _derive_category_from_install_path(install_path: str) -> str:
     path = Path(install_path)
     parent = str(path.parent)
@@ -706,6 +780,7 @@ def do_vet(
     target: str,
     source: str = "",
     json_output: bool = False,
+    recursive: bool = False,
     console: Optional[Console] = None,
 ):
     """Scan a local or remote skill without installing it."""
@@ -717,6 +792,29 @@ def do_vet(
 
     if target_path.exists():
         scan_source = source or "community"
+        skill_dirs = _find_local_skill_dirs(target_path, include_nested=recursive)
+        has_root_skill = (target_path / "SKILL.md").is_file()
+        if target_path.is_dir() and (
+            recursive or len(skill_dirs) > 1 or (skill_dirs and not has_root_skill)
+        ):
+            if not skill_dirs:
+                c.print(f"[bold red]Error:[/] No SKILL.md files found under {target_path}.\n")
+                return None
+            results = [(path, scan_skill(path, source=scan_source)) for path in skill_dirs]
+            if json_output:
+                payload = _skill_pack_result_to_dict(target_path, results, scan_source)
+                c.print(json.dumps(payload, indent=2, sort_keys=True))
+            else:
+                table, summary = _format_skill_pack_report(target_path, results, scan_source)
+                c.print(table)
+                c.print(f"[bold]Summary:[/] {summary}")
+                c.print("[dim]No files were installed and no config was changed.[/]\n")
+            return results
+
+        if target_path.is_dir() and not has_root_skill:
+            c.print(f"[bold red]Error:[/] No SKILL.md files found under {target_path}.\n")
+            return None
+
         result = scan_skill(target_path, source=scan_source)
         if json_output:
             c.print(json.dumps(_scan_result_to_dict(result), indent=2, sort_keys=True))
@@ -1414,6 +1512,7 @@ def skills_command(args) -> None:
             args.target,
             source=getattr(args, "source", "") or "",
             json_output=getattr(args, "json", False),
+            recursive=getattr(args, "recursive", False),
         )
     elif action == "list":
         do_list(
@@ -1472,6 +1571,7 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
         /skills install https://example.com/path/SKILL.md
         /skills inspect openai/skills/skill-creator
         /skills vet ./candidate-skill
+        /skills vet ./candidate-pack --recursive
         /skills list
         /skills list --source hub
         /skills check
@@ -1576,13 +1676,19 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
 
     elif action == "vet":
         if not args:
-            c.print("[bold red]Usage:[/] /skills vet <path-or-identifier-or-url> [--source <source>] [--json]\n")
+            c.print("[bold red]Usage:[/] /skills vet <path-or-identifier-or-url> [--source <source>] [--json] [--recursive]\n")
             return
         source = ""
         for i, a in enumerate(args):
             if a == "--source" and i + 1 < len(args):
                 source = args[i + 1]
-        do_vet(args[0], source=source, json_output="--json" in args, console=c)
+        do_vet(
+            args[0],
+            source=source,
+            json_output="--json" in args,
+            recursive="--recursive" in args or "-r" in args,
+            console=c,
+        )
 
     elif action == "list":
         source_filter = "all"
@@ -1679,7 +1785,7 @@ def _print_skills_help(console: Console) -> None:
         "  [cyan]search[/] <query>              Search registries for skills\n"
         "  [cyan]install[/] <identifier>        Install a skill (with security scan)\n"
         "  [cyan]inspect[/] <identifier>        Preview a skill without installing\n"
-        "  [cyan]vet[/] <path-or-identifier>    Scan a skill without installing\n"
+        "  [cyan]vet[/] <path-or-identifier>    Scan a skill or local pack without installing\n"
         "  [cyan]list[/] [--source hub|builtin|local] [--enabled-only]\n"
         "       List installed skills; --enabled-only filters to the active profile's live set\n"
         "  [cyan]check[/] [name]                Check hub skills for upstream updates\n"
