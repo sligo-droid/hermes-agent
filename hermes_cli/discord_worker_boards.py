@@ -242,6 +242,14 @@ def public_session_board_url(session_id: str) -> str:
     return f"{base}/{session}" if base and session else ""
 
 
+def _starter_message_thread_id_from_slug(session_id: str) -> str:
+    raw = str(session_id or "").strip()
+    if not raw.startswith("discord-") or "-m-" not in raw:
+        return ""
+    thread_part, request_part = raw[len("discord-") :].rsplit("-m-", 1)
+    return thread_part if thread_part and thread_part == request_part else ""
+
+
 def _public_session_id_for_board(board: str, worker: dict[str, Any]) -> str:
     thread_id = str(worker.get("thread_id") or "").strip()
     if not thread_id:
@@ -250,7 +258,16 @@ def _public_session_id_for_board(board: str, worker: dict[str, Any]) -> str:
         legacy = board_slug_for_discord_thread(thread_id)
     except ValueError:
         legacy = ""
-    return thread_id if legacy and board == legacy else str(board or thread_id)
+    request_id = str(
+        worker.get("request_id") or worker.get("source_message_id") or ""
+    ).strip()
+    starter = ""
+    if request_id and request_id == thread_id:
+        try:
+            starter = board_slug_for_discord_request(thread_id, request_id)
+        except ValueError:
+            starter = ""
+    return thread_id if board in {legacy, starter} else str(board or thread_id)
 
 
 def resolve_public_session_board(session_id: str) -> str:
@@ -258,8 +275,12 @@ def resolve_public_session_board(session_id: str) -> str:
     if not raw:
         raise KeyError("unknown board session")
     candidates = [raw]
-    if not raw.startswith("discord-"):
+    starter_thread_id = _starter_message_thread_id_from_slug(raw)
+    if starter_thread_id:
+        candidates.append(board_slug_for_discord_thread(starter_thread_id))
+    elif not raw.startswith("discord-"):
         candidates.append(board_slug_for_discord_thread(raw))
+        candidates.append(board_slug_for_discord_request(raw, raw))
     for board in candidates:
         if not kanban_db.board_exists(board):
             continue
@@ -323,9 +344,21 @@ def ensure_discord_thread_board(
 ) -> DiscordBoard:
     """Create or update the board backing a Discord thread/request."""
     started = time.time()
+    thread_id = str(thread_id or "").strip()
     request_id = str(source_message_id or request_id or "").strip()
-    slug = str(board_slug or "").strip() or board_slug_for_discord_request(thread_id, request_id)
-    route_id = slug if slug != board_slug_for_discord_thread(thread_id) else str(thread_id)
+    legacy_slug = board_slug_for_discord_thread(thread_id)
+    starter_slug = ""
+    is_starter_message = bool(request_id and request_id == thread_id)
+    if is_starter_message:
+        starter_slug = board_slug_for_discord_request(thread_id, request_id)
+    default_slug = board_slug_for_discord_request(
+        thread_id,
+        "" if is_starter_message else request_id,
+    )
+    slug = str(board_slug or "").strip()
+    if not slug:
+        slug = starter_slug if starter_slug and kanban_db.board_exists(starter_slug) else default_slug
+    route_id = str(thread_id) if slug in {legacy_slug, starter_slug} else slug
     worker = _read_worker_meta(slug)
     existing_context = worker.get("project_context")
     merged_project_context = dict(existing_context) if isinstance(existing_context, dict) else {}
@@ -679,13 +712,18 @@ def _public_board_snapshot_for_board(board: str) -> dict[str, Any]:
             )
     finally:
         conn.close()
+    session_id = _public_session_id_for_board(board, worker)
+    public_worker = _public_worker_meta(worker)
+    public_url = public_session_board_url(session_id)
+    if public_url:
+        public_worker["public_url"] = public_url
     return {
         "board": board,
         "name": _worker_board_name(worker, metadata, board),
         "description": metadata.get("description") or "",
-        "session_id": _public_session_id_for_board(board, worker),
+        "session_id": session_id,
         "thread_id": str(worker.get("thread_id") or ""),
-        "worker": _public_worker_meta(worker),
+        "worker": public_worker,
         "counts": counts,
         "running": running,
         "runtime": runtime,
@@ -3906,9 +3944,21 @@ def board_for_gateway_event(event: Any, *, create: bool = False) -> Optional[Dis
     ).strip()
     if not request_id and create and command_name == "goal":
         request_id = str(getattr(event, "message_id", "") or "").strip()
-    slug = feature_board or (
-        board_slug_for_discord_request(thread_id, request_id) if create else board_slug_for_discord_thread(thread_id)
-    )
+    if feature_board:
+        slug = feature_board
+    elif create:
+        is_starter_message = bool(request_id and request_id == thread_id)
+        starter_slug = board_slug_for_discord_request(thread_id, request_id) if is_starter_message else ""
+        slug = (
+            starter_slug
+            if starter_slug and kanban_db.board_exists(starter_slug)
+            else board_slug_for_discord_request(
+                thread_id,
+                "" if is_starter_message else request_id,
+            )
+        )
+    else:
+        slug = board_slug_for_discord_thread(thread_id)
     if not create and not kanban_db.board_exists(slug):
         return None
     if create:

@@ -12230,6 +12230,30 @@ Examples:
     )
     skills_inspect.add_argument("identifier", help="Skill identifier")
 
+    skills_vet = skills_subparsers.add_parser(
+        "vet", help="Scan a local or remote skill without installing"
+    )
+    skills_vet.add_argument(
+        "target",
+        help="Local skill path, skill identifier, or direct HTTP(S) URL to a SKILL.md file",
+    )
+    skills_vet.add_argument(
+        "--source",
+        default="",
+        help="Source label for trust policy when scanning local paths (default: community)",
+    )
+    skills_vet.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable scan results",
+    )
+    skills_vet.add_argument(
+        "--recursive",
+        "-r",
+        action="store_true",
+        help="Scan every nested SKILL.md under a local directory",
+    )
+
     skills_list = skills_subparsers.add_parser("list", help="List installed skills")
     skills_list.add_argument(
         "--source", default="all", choices=["all", "hub", "builtin", "local"]

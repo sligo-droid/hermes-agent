@@ -1,0 +1,11 @@
+name: coding-tester
+version: 0.1.0
+description: "Testing profile for verification and regression checks."
+hermes_requires: ">=0.1.0"
+author: "Hermes Agent"
+license: "MIT"
+distribution_owned:
+  - SOUL.md
+  - config.yaml
+  - skills
+  - distribution.yaml
