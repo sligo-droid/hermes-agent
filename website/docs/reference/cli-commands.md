@@ -791,6 +791,7 @@ Subcommands:
 | `search` | Search skill registries. |
 | `install` | Install a skill. |
 | `inspect` | Preview a skill without installing it. |
+| `vet` | Scan a local or remote skill, or local skill pack, without installing it. |
 | `list` | List installed skills. |
 | `check` | Check installed hub skills for upstream updates. |
 | `update` | Reinstall hub skills with upstream changes when available. |
@@ -811,6 +812,8 @@ hermes skills search react --source skills-sh
 hermes skills search https://mintlify.com/docs --source well-known
 hermes skills inspect official/security/1password
 hermes skills inspect skills-sh/vercel-labs/json-render/json-render-react
+hermes skills vet ./candidate-skill
+hermes skills vet ./candidate-pack --recursive --json
 hermes skills install official/migration/openclaw-migration
 hermes skills install skills-sh/anthropics/skills/pdf --force
 hermes skills install https://sharethis.chat/SKILL.md                     # Direct URL (single-file SKILL.md)

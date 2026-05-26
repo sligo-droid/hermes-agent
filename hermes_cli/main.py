@@ -11994,6 +11994,12 @@ Examples:
         action="store_true",
         help="Emit machine-readable scan results",
     )
+    skills_vet.add_argument(
+        "--recursive",
+        "-r",
+        action="store_true",
+        help="Scan every nested SKILL.md under a local directory",
+    )
 
     skills_list = skills_subparsers.add_parser("list", help="List installed skills")
     skills_list.add_argument(

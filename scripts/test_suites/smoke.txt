@@ -8,6 +8,10 @@ tests/test_model_tools.py
 tests/test_toolsets.py
 tests/tools/test_registry.py
 tests/tools/test_file_tools.py
+tests/hermes_cli/test_skills_hub.py::test_do_vet_scans_local_skill_pack_json_without_initializing_hub
+tests/hermes_cli/test_skills_hub.py::test_do_vet_recursive_scans_nested_skills_under_single_skill_root
+tests/hermes_cli/test_profile_distribution.py::TestCodingTeamDistributionExamples::test_example_distribution_installs
+tests/agent/test_shell_hooks.py::TestCallbackSubprocess::test_block_translation_end_to_end
 
 # Core session and agent sanity checks.
 tests/test_lazy_session_regressions.py
