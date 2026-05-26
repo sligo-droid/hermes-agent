@@ -31,6 +31,18 @@ def _discord_board(monkeypatch, tmp_path: Path, slug: str = "discord-123") -> st
     return slug
 
 
+def _update_worker_meta(board: str, **updates):
+    from hermes_cli import kanban_db
+
+    meta = kanban_db.read_board_metadata(board)
+    worker = dict(meta["discord_worker"])
+    worker.update(updates)
+    meta.pop("db_path", None)
+    meta["discord_worker"] = worker
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    return worker
+
+
 def _create_ready_task(board: str, *, title: str = "Worker task") -> str:
     from hermes_cli import kanban_db
 
@@ -44,6 +56,50 @@ def _create_ready_task(board: str, *, title: str = "Worker task") -> str:
             initial_status="running",
             board=board,
         )
+    finally:
+        conn.close()
+
+
+def _create_done_task(board: str, *, title: str = "Completed task") -> str:
+    from hermes_cli import kanban_db
+
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title=title,
+            assignee="dev",
+            workspace_kind="scratch",
+            initial_status="running",
+            board=board,
+        )
+        assert kanban_db.complete_task(conn, task_id, result="done", summary="done")
+        return task_id
+    finally:
+        conn.close()
+
+
+def _create_blocked_foreman_task(board: str, *, assignee: str = "reviewer", runtime_failure: bool = True) -> str:
+    from hermes_cli import kanban_db
+
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Review source recovery",
+            assignee=assignee,
+            initial_status="running" if runtime_failure else "blocked",
+            board=board,
+        )
+        if runtime_failure:
+            assert kanban_db.claim_task(conn, task_id)
+            kanban_db._record_spawn_failure(
+                conn,
+                task_id,
+                "reviewer worker crashed before finalizing source board closure",
+                failure_limit=1,
+            )
+        return task_id
     finally:
         conn.close()
 
@@ -565,6 +621,189 @@ def test_human_intervention_scan_records_negative_assessment_once(monkeypatch, t
     assert collect_human_intervention_issues(now=701, blocked_board_min_age_seconds=600, assessment_fn=assess) == []
     assert collect_human_intervention_issues(now=800, blocked_board_min_age_seconds=600, assessment_fn=assess) == []
     assert len(calls) == 1
+
+
+def _auto_close_fixture(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    suffix="auto",
+    source_pr=None,
+    foreman_assignee="reviewer",
+    runtime_failure=True,
+):
+    from hermes_cli.discord_worker_foreman import render_foreman_goal_prompt
+
+    source_board = _discord_board(monkeypatch, tmp_path, f"discord-source-{suffix}")
+    source_task = _create_done_task(source_board, title="Original source task")
+    pr = {
+        "pr_url": "https://github.example.test/acme/repo/pull/123",
+        "pr_number": "123",
+        "pr_state": "MERGED",
+        "pr_checks_status": "passed",
+        "pr_merge_commit": "abc123def456",
+    }
+    if source_pr:
+        pr.update(source_pr)
+    _update_worker_meta(
+        source_board,
+        goal_status="blocked",
+        phase="blocked",
+        blocked_reason="Stale blocked metadata after all source tasks completed.",
+        **pr,
+    )
+
+    source_issue = _alert_issue(
+        kind="board_stalled",
+        board=source_board,
+        task_id=source_task,
+        severity="warning",
+        title="Source board metadata was stale after merge",
+        evidence={"thread_state": "blocked", "task_status": "blocked"},
+    )
+    foreman_board = _discord_board(monkeypatch, tmp_path, f"foreman-{suffix}")
+    prompt = render_foreman_goal_prompt(source_issue)
+    _update_worker_meta(
+        foreman_board,
+        initial_request=prompt,
+        root_goal=prompt,
+        goal_status="blocked",
+        phase="blocked",
+        blocked_reason="Reviewer worker crashed while closing the recovery board.",
+    )
+    foreman_task = _create_blocked_foreman_task(
+        foreman_board,
+        assignee=foreman_assignee,
+        runtime_failure=runtime_failure,
+    )
+    return source_board, source_task, foreman_board, foreman_task
+
+
+def test_auto_close_completed_foreman_board_reconciles_stale_source_and_foreman(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import board_thread_state
+    from hermes_cli.discord_worker_foreman import (
+        auto_close_completed_foreman_boards,
+        collect_human_intervention_issues,
+    )
+
+    source_board, source_task, foreman_board, foreman_task = _auto_close_fixture(monkeypatch, tmp_path)
+
+    closures = auto_close_completed_foreman_boards(now=10_000)
+
+    assert closures == [
+        {
+            "foreman_board": foreman_board,
+            "foreman_task_id": foreman_task,
+            "source_board": source_board,
+            "source_task_id": source_task,
+            "source_issue_kind": "board_stalled",
+            "pr_state": "MERGED",
+            "pr_checks_status": "passed",
+            "pr_merge_commit": "abc123def456",
+        }
+    ]
+    source_worker = kanban_db.read_board_metadata(source_board)["discord_worker"]
+    foreman_worker = kanban_db.read_board_metadata(foreman_board)["discord_worker"]
+    assert source_worker["goal_status"] == "done"
+    assert source_worker["phase"] == "complete"
+    assert source_worker["blocked_reason"] == ""
+    assert source_worker["terminal_summary_sync_pending"] is True
+    assert source_worker["terminal_reaction_sync_pending"] is True
+    assert foreman_worker["goal_status"] == "done"
+    assert foreman_worker["phase"] == "complete"
+    assert foreman_worker["blocked_reason"] == ""
+    assert foreman_worker["terminal_summary_sync_pending"] is True
+    assert foreman_worker["terminal_reaction_sync_pending"] is True
+    conn = kanban_db.connect(board=foreman_board)
+    try:
+        tasks = {task.id: task for task in kanban_db.list_tasks(conn)}
+        latest = kanban_db.latest_run(conn, foreman_task)
+    finally:
+        conn.close()
+    assert tasks[foreman_task].status == "done"
+    assert latest is not None
+    assert latest.metadata["auto_closed"] is True
+    assert latest.metadata["source_board"] == source_board
+    assert board_thread_state(source_board) == "done"
+    assert board_thread_state(foreman_board) == "done"
+    assert collect_human_intervention_issues(now=10_001, blocked_board_min_age_seconds=0) == []
+    assert auto_close_completed_foreman_boards(now=10_002) == []
+
+
+def test_auto_close_completed_foreman_board_skips_active_source_or_blocked_pr(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_foreman import auto_close_completed_foreman_boards
+
+    source_board, _, foreman_board, foreman_task = _auto_close_fixture(monkeypatch, tmp_path)
+    conn = kanban_db.connect(board=source_board)
+    try:
+        kanban_db.create_task(
+            conn,
+            title="Still active source task",
+            assignee="dev",
+            initial_status="running",
+            board=source_board,
+        )
+    finally:
+        conn.close()
+
+    assert auto_close_completed_foreman_boards(now=10_000) == []
+    assert kanban_db.read_board_metadata(source_board)["discord_worker"]["goal_status"] == "blocked"
+    conn = kanban_db.connect(board=foreman_board)
+    try:
+        assert {task.id: task.status for task in kanban_db.list_tasks(conn)}[foreman_task] == "blocked"
+    finally:
+        conn.close()
+
+    source_board, _, foreman_board, foreman_task = _auto_close_fixture(
+        monkeypatch,
+        tmp_path,
+        suffix="blocked-pr",
+        source_pr={"pr_state": "OPEN", "pr_checks_status": "failure", "pr_merge_commit": ""},
+    )
+
+    assert auto_close_completed_foreman_boards(now=10_001) == []
+    assert kanban_db.read_board_metadata(source_board)["discord_worker"]["goal_status"] == "blocked"
+    conn = kanban_db.connect(board=foreman_board)
+    try:
+        assert {task.id: task.status for task in kanban_db.list_tasks(conn)}[foreman_task] == "blocked"
+    finally:
+        conn.close()
+
+
+def test_auto_close_completed_foreman_board_skips_non_reviewer_or_non_runtime_blocker(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_foreman import auto_close_completed_foreman_boards
+
+    source_board, _, foreman_board, foreman_task = _auto_close_fixture(
+        monkeypatch,
+        tmp_path,
+        foreman_assignee="dev",
+    )
+
+    assert auto_close_completed_foreman_boards(now=10_000) == []
+    assert kanban_db.read_board_metadata(source_board)["discord_worker"]["goal_status"] == "blocked"
+    conn = kanban_db.connect(board=foreman_board)
+    try:
+        assert {task.id: task.status for task in kanban_db.list_tasks(conn)}[foreman_task] == "blocked"
+    finally:
+        conn.close()
+
+    source_board, _, foreman_board, foreman_task = _auto_close_fixture(
+        monkeypatch,
+        tmp_path,
+        suffix="non-runtime",
+        runtime_failure=False,
+    )
+
+    assert auto_close_completed_foreman_boards(now=10_001) == []
+    assert kanban_db.read_board_metadata(source_board)["discord_worker"]["goal_status"] == "blocked"
+    conn = kanban_db.connect(board=foreman_board)
+    try:
+        assert {task.id: task.status for task in kanban_db.list_tasks(conn)}[foreman_task] == "blocked"
+    finally:
+        conn.close()
 
 
 def test_collect_foreman_issues_reads_board_task_run_and_sidecar(monkeypatch, tmp_path):

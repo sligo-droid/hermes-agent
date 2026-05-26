@@ -7060,6 +7060,7 @@ class GatewayRunner:
                             def _collect_due_alerts() -> list[Any]:
                                 nonlocal startup_baseline_checked
                                 now = int(time.time())
+                                _foreman.auto_close_completed_foreman_boards(now=now)
                                 issues = _foreman.collect_foreman_issues(
                                     now=now,
                                     blocked_board_min_age_seconds=int(
