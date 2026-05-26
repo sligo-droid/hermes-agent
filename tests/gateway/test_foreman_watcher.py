@@ -163,7 +163,7 @@ def test_foreman_watcher_missing_config_does_not_scan(monkeypatch):
     assert adapter.created_goals == []
 
 
-def test_foreman_spawned_task_records_subscription_without_ticket_embed(monkeypatch, tmp_path):
+def test_foreman_spawned_task_records_thread_state_without_transition_subscription(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://hermes.example.test")
     _patch_config(monkeypatch, _enabled_config())
@@ -212,18 +212,7 @@ def test_foreman_spawned_task_records_subscription_without_ticket_embed(monkeypa
         subs = kanban_db.list_notify_subs(conn, task_id)
     finally:
         conn.close()
-    assert subs == [
-        {
-            "task_id": task_id,
-            "platform": "discord",
-            "chat_id": "parent-123",
-            "thread_id": "123",
-            "user_id": "system:foreman",
-            "notifier_profile": "default",
-            "created_at": subs[0]["created_at"],
-            "last_event_id": 0,
-        }
-    ]
+    assert subs == []
 
 
 def test_foreman_watcher_disabled_config_does_not_scan(monkeypatch):

@@ -53,19 +53,6 @@ class DiscordStatusSyncAdapter(FeatureSummarySyncAdapter, ReactionSyncAdapter):
     pass
 
 
-class CompletionNoticeAdapter(DiscordStatusSyncAdapter):
-    def __init__(self):
-        super().__init__()
-        self.completion_notices = []
-
-    async def send_kanban_completion_notice(self, target):
-        self.completion_notices.append(dict(target))
-        from hermes_cli import discord_worker_boards as dwb
-
-        dwb.mark_thread_status_synced(target.get("board"), completion_message=True)
-        return target.get("board")
-
-
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
 
@@ -424,13 +411,13 @@ def test_discord_terminal_status_target_syncs_only_when_pending(tmp_path, monkey
     assert dwb.thread_status_targets() == []
 
 
-def test_discord_completion_notice_keeps_terminal_target_until_sent(tmp_path, monkeypatch):
+def test_discord_stale_completion_notice_flag_keeps_terminal_target_until_cleared(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb
 
     board = dwb.set_goal(
         thread_id="99018",
-        goal="Send a completion notice",
+        goal="Clear a stale completion notice flag",
         chat_id="parent-99018",
     )
     conn = kb.connect(board=board.slug)
@@ -463,16 +450,16 @@ def test_discord_completion_notice_keeps_terminal_target_until_sent(tmp_path, mo
     assert dwb.thread_status_targets() == []
     worker = kb.read_board_metadata(board.slug)["discord_worker"]
     assert "terminal_completion_message_pending" not in worker
-    assert isinstance(worker["terminal_completion_message_sent_at"], int)
+    assert "terminal_completion_message_sent_at" not in worker
 
 
-def test_discord_kanban_typing_watcher_sends_goal_completed_notice(tmp_path, monkeypatch):
+def test_discord_kanban_typing_watcher_clears_stale_completion_notice_flag(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb
 
     board = dwb.set_goal(
         thread_id="99019",
-        goal="Announce completed goal",
+        goal="Suppress completed goal notice",
         chat_id="parent-99019",
     )
     conn = kb.connect(board=board.slug)
@@ -494,14 +481,11 @@ def test_discord_kanban_typing_watcher_sends_goal_completed_notice(tmp_path, mon
         },
     )
 
-    adapter = CompletionNoticeAdapter()
+    adapter = DiscordStatusSyncAdapter()
     runner = _make_discord_runner(adapter)
 
     asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
 
-    assert len(adapter.completion_notices) == 1
-    assert adapter.completion_notices[0]["board"] == board.slug
-    assert adapter.completion_notices[0]["state"] == "done"
     worker = kb.read_board_metadata(board.slug)["discord_worker"]
     assert "terminal_completion_message_pending" not in worker
 
