@@ -286,7 +286,9 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = _API_KEY_PROVIDER_AUX_MODELS_FALL
 # mini keeps quality acceptable while avoiding the timeout/cost profile of
 # frontier chat models.
 _CODEX_COMPRESSION_MODEL = "gpt-5.4-mini"
-_CODEX_COMPRESSION_REASONING = {"effort": "low"}
+# Disable reasoning by default because even low reasoning can spend the whole
+# compression timeout before emitting a summary.
+_CODEX_COMPRESSION_REASONING = {"enabled": False}
 
 # Vision-specific model overrides for direct providers.
 # When the user's main provider has a dedicated vision/multimodal model that
@@ -4636,7 +4638,7 @@ def _default_compression_reasoning_if_codex(
     client: Any,
     extra_body: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Use low Codex reasoning for compression unless the user configured it."""
+    """Disable Codex reasoning for compression unless the user configured it."""
     if task != "compression":
         return extra_body
     if not _is_codex_auxiliary_client(client):
