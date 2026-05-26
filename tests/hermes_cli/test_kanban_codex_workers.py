@@ -499,6 +499,7 @@ def test_dev_role_uses_opencode_backend(monkeypatch, tmp_path):
     assert result.backend == "opencode"
     assert calls
     assert calls[0][1] == str(tmp_path)
+    assert calls[0][2]["force_plan"] is False
 
 
 def test_planner_role_uses_opencode_plan_agent(monkeypatch, tmp_path):

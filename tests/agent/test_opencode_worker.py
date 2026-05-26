@@ -246,6 +246,43 @@ def test_auth_error_is_classified(monkeypatch, tmp_path):
     assert result.thread_id == "ses-auth"
 
 
+def test_context_overflow_is_not_classified_as_auth(monkeypatch, tmp_path):
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+
+    def fake_run(cmd, **_kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "type": "error",
+                    "sessionID": "ses-context",
+                    "error": {
+                        "name": "ContextOverflowError",
+                        "data": {"message": "Input exceeds context window of this model"},
+                    },
+                }
+            )
+            + "\n",
+            stderr="OpenCode authentication failed from a previous summary\n" + ("x" * 10000),
+        )
+
+    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+
+    result = ow.run_opencode_task(
+        "fix parser.py",
+        str(tmp_path),
+        timeout=60,
+        config=_cfg(),
+    )
+
+    assert result.error is not None
+    assert "context window exceeded" in result.error.lower()
+    assert "opencode auth login" not in result.error
+    assert "... [truncated]" in result.error
+    assert len(result.error) < 4500
+    assert result.thread_id == "ses-context"
+
+
 def test_timeout_becomes_worker_error(monkeypatch, tmp_path):
     monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
 
@@ -280,7 +317,8 @@ def test_missing_binary_becomes_worker_error(monkeypatch, tmp_path):
     assert "not found" in result.error.lower()
 
 
-def test_backend_ignores_removed_codex_worker_config_key():
+def test_backend_ignores_removed_codex_worker_config_key(monkeypatch):
+    monkeypatch.delenv("HERMES_CODING_WORKER_BACKEND", raising=False)
     cfg = {"codex_worker": {"backend": "opencode"}}
 
     assert ow.load_coding_worker_backend(cfg) == "codex"

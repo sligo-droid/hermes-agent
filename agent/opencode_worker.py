@@ -684,6 +684,21 @@ def _event_text(value: Any) -> str:
 def _classify_opencode_error(*parts: str) -> str:
     text = "\n".join(part for part in parts if part).strip()
     lower = text.lower()
+    details = _shorten_opencode_error_details(text)
+    if any(
+        needle in lower
+        for needle in (
+            "contextoverflowerror",
+            "context_length_exceeded",
+            "input exceeds context window",
+            "exceeds the context window",
+            "context window of this model",
+        )
+    ):
+        return (
+            "OpenCode context window exceeded. Reduce the worker prompt or "
+            f"retry with a larger-context model. Details: {details}"
+        )
     if any(
         needle in lower
         for needle in (
@@ -702,6 +717,15 @@ def _classify_opencode_error(*parts: str) -> str:
     ):
         return (
             "OpenCode authentication failed. Run `opencode auth login` "
-            f"or configure a valid OpenCode provider, then retry. Details: {text}"
+            f"or configure a valid OpenCode provider, then retry. Details: {details}"
         )
     return text or "OpenCode worker failed."
+
+
+def _shorten_opencode_error_details(text: str, limit: int = 4000) -> str:
+    if len(text) <= limit:
+        return text
+    marker = "\n... [truncated]"
+    if limit <= len(marker):
+        return marker[:limit]
+    return text[: limit - len(marker)] + marker
