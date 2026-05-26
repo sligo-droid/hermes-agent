@@ -281,7 +281,7 @@ async def test_goal_feature_summary_keeps_worker_board_handle(adapter):
 
 
 @pytest.mark.asyncio
-async def test_goal_feature_summary_for_source_uses_standard_goal_embed(adapter, monkeypatch):
+async def test_goal_feature_summary_for_source_does_not_post_regular_goal_embed(adapter, monkeypatch):
     monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://kanban.example")
     parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
     thread = FakeThread(channel_id=200, parent=parent)
@@ -305,11 +305,8 @@ async def test_goal_feature_summary_for_source_uses_standard_goal_embed(adapter,
         project_context={"project_name": "Hermes Project"},
     )
 
-    assert handle is not None
-    assert handle["thread_id"] == "200"
-    assert handle["kanban_board"]["slug"] == "discord-200"
-    fields = {field.name: field.value for field in thread.sent[0][0]["embed"].fields}
-    assert "Kanban Board" in fields
+    assert handle is None
+    assert thread.sent == []
 
 
 @pytest.mark.asyncio
@@ -338,7 +335,7 @@ async def test_tagged_thread_followup_reuses_persisted_feature_summary(adapter, 
 
 
 @pytest.mark.asyncio
-async def test_thread_goal_message_creates_per_message_feature_summary(adapter, monkeypatch, tmp_path):
+async def test_thread_goal_message_does_not_create_per_message_feature_summary(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://kanban.example")
@@ -357,35 +354,27 @@ async def test_thread_goal_message_creates_per_message_feature_summary(adapter, 
 
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
-    assert len(thread.sent) == 2
-    assert thread.sent[1][0]["reference"] is first
+    assert len(thread.sent) == 1
     assert event.text == "/goal Ship the dashboard"
-    assert event.feature_summary["thread_id"] == "200"
-    assert event.feature_summary["message_id"] == "301"
-    assert event.feature_summary["source_message_id"] == "501"
-    assert event.feature_summary["kanban_board"]["slug"] == "discord-200-m-501"
+    assert event.feature_summary is None
 
     adapter.handle_message.reset_mock()
     second = _make_message(adapter, channel=thread, content="<@999> /goal Ship another goal", message_id=502)
     await adapter._handle_message(second)
 
     event = adapter.handle_message.await_args.args[0]
-    assert len(thread.sent) == 3
-    assert thread.sent[2][0]["reference"] is second
-    assert event.feature_summary["message_id"] == "302"
-    assert event.feature_summary["source_message_id"] == "502"
-    assert event.feature_summary["kanban_board"]["slug"] == "discord-200-m-502"
+    assert len(thread.sent) == 1
+    assert event.text == "/goal Ship another goal"
+    assert event.feature_summary is None
 
     state = adapter._read_project_summary_state()
     bucket = state["_feature_summaries"]
     assert bucket["5:200"]["message_id"] == "300"
-    assert bucket["5:200:501"]["message_id"] == "301"
-    assert bucket["5:200:502"]["message_id"] == "302"
-    first_handle = adapter._load_feature_summary_handle_by_thread_id("200", message_id="301")
-    assert first_handle["source_message_id"] == "501"
+    assert "5:200:501" not in bucket
+    assert "5:200:502" not in bucket
     latest = adapter._load_feature_summary_handle_by_thread_id("200")
-    assert latest["message_id"] == "302"
-    assert latest["source_message_id"] == "502"
+    assert latest["message_id"] == "300"
+    assert latest["source_message_id"] is None
 
 
 @pytest.mark.asyncio
@@ -737,7 +726,7 @@ async def test_feature_summary_update_edits_initial_message(adapter, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_worker_task_thread_seeds_feature_summary(adapter):
+async def test_worker_task_thread_does_not_seed_feature_summary(adapter):
     parent = FakeTextChannel(channel_id=100)
     thread = FakeThread(channel_id=201, parent=parent)
     parent.create_thread = AsyncMock(return_value=thread)
@@ -760,22 +749,14 @@ async def test_worker_task_thread_seeds_feature_summary(adapter):
     assert handle == {
         "thread_id": "201",
         "thread_name": "feature-thread",
-        "message_id": "300",
+        "message_id": "",
     }
     parent.create_thread.assert_awaited_once()
-    sent_embed = thread.sent[0][0]["embed"]
-    fields = {field.name: field.value for field in sent_embed.fields}
-    assert sent_embed.title == "Build dashboard filters"
-    assert fields["Status"] == "⏳ Running"
-    assert fields["Concise Outcome"].startswith("Build dashboard filters")
-    assert fields["Affected Board"] == "[discord-123](https://hermes.example.test/workers/123)"
-    assert fields["Affected Task"] == "[t1](https://hermes.example.test/workers/123/tickets/t1)"
-    assert fields["Discord Thread"] == "[Open source thread](https://discord.com/channels/5/123)"
-    assert "Kanban Board" not in fields
+    assert thread.sent == []
 
 
 @pytest.mark.asyncio
-async def test_worker_task_embed_posts_to_existing_thread_and_hides_source_links(adapter):
+async def test_worker_task_embed_does_not_post_to_existing_thread(adapter):
     parent = FakeTextChannel(channel_id=100)
     thread = FakeThread(channel_id=202, parent=parent)
 
@@ -797,19 +778,9 @@ async def test_worker_task_embed_posts_to_existing_thread_and_hides_source_links
     assert handle == {
         "thread_id": "202",
         "thread_name": "feature-thread",
-        "message_id": "300",
+        "message_id": "",
     }
-    sent_embed = thread.sent[0][0]["embed"]
-    sent_message = thread.sent[0][1]
-    fields = {field.name: field.value for field in sent_embed.fields}
-    assert sent_embed.title == "Build dashboard filters"
-    assert fields["Status"] == "⏳ Running"
-    assert fields["Concise Outcome"].startswith("Build dashboard filters")
-    assert "Affected Board" not in fields
-    assert "Affected Task" not in fields
-    assert "Discord Thread" not in fields
-    assert "Foreman Kanban" not in fields
-    sent_message.add_reaction.assert_awaited_once_with("⏳")
+    assert thread.sent == []
 
 
 @pytest.mark.asyncio
