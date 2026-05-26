@@ -83,7 +83,7 @@ export interface ConfigVoiceConfig {
 }
 
 export interface ConfigFullResponse {
-  config?: { display?: ConfigDisplayConfig; voice?: ConfigVoiceConfig }
+  config?: { display?: ConfigDisplayConfig; voice?: ConfigVoiceConfig; paste_collapse_threshold?: number }
 }
 
 export interface ConfigMtimeResponse {

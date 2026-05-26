@@ -1351,6 +1351,13 @@ class SessionStore:
                     reasoning_details=safe_message.get("reasoning_details") if safe_message.get("role") == "assistant" else None,
                     codex_reasoning_items=safe_message.get("codex_reasoning_items") if safe_message.get("role") == "assistant" else None,
                     codex_message_items=safe_message.get("codex_message_items") if safe_message.get("role") == "assistant" else None,
+                    # Platform-side message id (yuanbao msg_id, telegram update_id, …).
+                    # Accept either explicit ``platform_message_id`` or the legacy
+                    # ``message_id`` key the JSONL transcript used.
+                    platform_message_id=(
+                        safe_message.get("platform_message_id") or safe_message.get("message_id")
+                    ),
+                    observed=bool(safe_message.get("observed")),
                 )
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)

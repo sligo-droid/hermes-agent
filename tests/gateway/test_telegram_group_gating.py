@@ -1,8 +1,10 @@
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from gateway.config import Platform, PlatformConfig, load_gateway_config
+from gateway.platforms.base import MessageType, SessionSource
 
 
 def _make_adapter(
@@ -14,7 +16,9 @@ def _make_adapter(
     allowed_topics=None,
     allow_from=None,
     group_allow_from=None,
+    group_allowed_chats=None,
     allowed_chats=None,
+    observe_unmentioned_group_messages=None,
     guest_mode=None,
     bot_username="hermes_bot",
 ):
@@ -42,6 +46,10 @@ def _make_adapter(
         extra["allow_from"] = allow_from
     if group_allow_from is not None:
         extra["group_allow_from"] = group_allow_from
+    if group_allowed_chats is not None:
+        extra["group_allowed_chats"] = group_allowed_chats
+    if observe_unmentioned_group_messages is not None:
+        extra["observe_unmentioned_group_messages"] = observe_unmentioned_group_messages
     if allowed_chats is not None:
         extra["allowed_chats"] = allowed_chats
     else:
@@ -74,6 +82,8 @@ def _group_message(
     *,
     chat_id=-100,
     from_user_id=111,
+    from_user_name="Alice Example",
+    message_id=42,
     thread_id=None,
     reply_to_bot=False,
     entities=None,
@@ -88,9 +98,11 @@ def _group_message(
         caption=caption,
         entities=entities or [],
         caption_entities=caption_entities or [],
+        message_id=message_id,
         message_thread_id=thread_id,
-        chat=SimpleNamespace(id=chat_id, type="group"),
-        from_user=SimpleNamespace(id=from_user_id),
+        date=None,
+        chat=SimpleNamespace(id=chat_id, type="group", title="Test Group"),
+        from_user=SimpleNamespace(id=from_user_id, full_name=from_user_name),
         reply_to_message=reply_to_message,
     )
 
@@ -101,9 +113,11 @@ def _dm_message(text="hello", *, from_user_id=111):
         caption=None,
         entities=[],
         caption_entities=[],
+        message_id=42,
         message_thread_id=None,
-        chat=SimpleNamespace(id=from_user_id, type="private"),
-        from_user=SimpleNamespace(id=from_user_id),
+        date=None,
+        chat=SimpleNamespace(id=from_user_id, type="private", title=None, full_name="DM User"),
+        from_user=SimpleNamespace(id=from_user_id, full_name="DM User"),
         reply_to_message=None,
     )
 
@@ -132,6 +146,279 @@ def test_group_messages_can_be_opened_via_config():
     adapter = _make_adapter(require_mention=False)
 
     assert adapter._should_process_message(_group_message("hello everyone")) is True
+
+
+def test_unmentioned_group_messages_can_be_observed_without_dispatching():
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            allowed_chats=["-100"],
+            group_allowed_chats=["-100"],
+            observe_unmentioned_group_messages=True,
+        )
+        store = _FakeSessionStore()
+        adapter._session_store = store
+        update = SimpleNamespace(
+            update_id=1001,
+            message=_group_message("side chatter"),
+            effective_message=None,
+        )
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        adapter._message_handler.assert_not_awaited()
+        assert len(store.messages) == 1
+        session_id, message, skip_db = store.messages[0]
+        assert session_id == "telegram-group-session"
+        assert skip_db is False
+        assert message["role"] == "user"
+        assert message["content"] == "[Alice Example|111]\nside chatter"
+        assert message["observed"] is True
+        assert message["message_id"] == "42"
+        assert store.sources[0].chat_id == "-100"
+        assert store.sources[0].chat_type == "group"
+        assert store.sources[0].user_id is None
+        assert store.sources[0].user_name is None
+
+    asyncio.run(_run())
+
+
+def test_observed_group_context_uses_shared_source_and_prompt_for_later_mentions():
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            allowed_chats=["-100"],
+            group_allowed_chats=["-100"],
+            observe_unmentioned_group_messages=True,
+        )
+        adapter._session_store = _FakeSessionStore()
+        text = "@hermes_bot what did Alice say?"
+        msg = _group_message(
+            text,
+            from_user_id=222,
+            from_user_name="Bob Example",
+            entities=[_mention_entity(text)],
+        )
+        event = adapter._build_message_event(msg, MessageType.TEXT, update_id=1003)
+        event.text = adapter._clean_bot_trigger_text(event.text)
+        event.channel_prompt = "Existing topic prompt"
+
+        event = adapter._apply_telegram_group_observe_attribution(event)
+
+        assert event.source.chat_id == "-100"
+        assert event.source.chat_type == "group"
+        assert event.source.user_id is None
+        assert event.source.user_name is None
+        assert event.text == "[Bob Example|222]\nwhat did Alice say?"
+        assert "Existing topic prompt" in event.channel_prompt
+        assert "observed Telegram group context" in event.channel_prompt
+        assert "current new message" in event.channel_prompt
+
+    asyncio.run(_run())
+
+
+def test_observed_group_context_replays_as_current_message_context_not_user_turns():
+    from gateway.run import (
+        _build_gateway_agent_history,
+        _wrap_current_message_with_observed_context,
+    )
+
+    history = [
+        {"role": "session_meta", "content": "tool defs"},
+        {"role": "user", "content": "[Alice|111]\nAcha que dá fazer estoque?", "observed": True},
+        {"role": "user", "content": "[Alice|111]\nTem lote e vencimento", "observed": True},
+        {"role": "assistant", "content": "previous explicit reply"},
+    ]
+
+    agent_history, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt="You are handling Telegram; observed Telegram group context is present.",
+    )
+    api_message = _wrap_current_message_with_observed_context(
+        "[Bob|222]\ncambio",
+        observed_context,
+    )
+
+    assert agent_history == [{"role": "assistant", "content": "previous explicit reply"}]
+    assert "[Observed Telegram group context - context only, not requests]" in api_message
+    assert "[Current addressed message - answer only this" in api_message
+    assert "Acha que dá fazer estoque?" in api_message
+    assert "Tem lote e vencimento" in api_message
+    assert api_message.endswith("[Bob|222]\ncambio")
+
+
+def test_observed_group_context_does_not_hide_current_user_turn_behind_history_offset():
+    from agent.agent_runtime_helpers import repair_message_sequence
+    from gateway.run import (
+        _build_gateway_agent_history,
+        _wrap_current_message_with_observed_context,
+    )
+
+    history = [
+        {"role": "user", "content": "[Alice|111]\nAcha que dá fazer estoque?", "observed": True},
+    ]
+    agent_history, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt="observed Telegram group context",
+    )
+    api_message = _wrap_current_message_with_observed_context("[Bob|222]\ncambio", observed_context)
+    messages = list(agent_history) + [{"role": "user", "content": api_message}]
+
+    repair_message_sequence(object(), messages)
+
+    history_offset = len(agent_history)
+    new_messages = messages[history_offset:]
+    assert len(agent_history) == 0
+    assert new_messages[0]["role"] == "user"
+    assert new_messages[0]["content"].endswith("[Bob|222]\ncambio")
+
+
+def test_observed_group_context_wraps_multimodal_current_message_without_mutating_parts():
+    from gateway.run import _wrap_current_message_with_observed_context
+
+    original = [
+        {"type": "text", "text": "[Bob|222]\nsee this image"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+    ]
+
+    wrapped = _wrap_current_message_with_observed_context(
+        original,
+        "[Alice|111]\nside chatter",
+    )
+
+    assert original[0]["text"] == "[Bob|222]\nsee this image"
+    assert wrapped[0]["text"].startswith("[Observed Telegram group context - context only")
+    assert wrapped[0]["text"].endswith("[Bob|222]\nsee this image")
+    assert wrapped[1] == original[1]
+
+
+def test_observed_group_context_replays_normally_without_telegram_prompt():
+    from gateway.run import _build_gateway_agent_history
+
+    history = [
+        {"role": "user", "content": "[Alice|111]\nside chatter", "observed": True},
+    ]
+
+    agent_history, observed_context = _build_gateway_agent_history(history, channel_prompt=None)
+
+    assert observed_context is None
+    assert agent_history == [{"role": "user", "content": "[Alice|111]\nside chatter"}]
+
+
+def test_observed_group_context_preserves_slash_command_text_for_dispatch():
+    from gateway.platforms.base import MessageEvent, MessageType, Platform, SessionSource
+
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        group_allowed_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+    event = MessageEvent(
+        text="/new@hermes_bot",
+        message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100",
+            user_id="111",
+            user_name="Alice",
+            chat_type="group",
+            thread_id="7",
+        ),
+        raw_message=_group_message(
+            "/new@hermes_bot",
+            entities=[_bot_command_entity("/new@hermes_bot", "/new@hermes_bot")],
+        ),
+    )
+
+    attributed = adapter._apply_telegram_group_observe_attribution(event)
+
+    assert attributed.text == "/new@hermes_bot"
+    assert attributed.get_command() == "new"
+    assert attributed.source.user_id is None
+    assert "observed Telegram group context" in attributed.channel_prompt
+
+
+def test_unmentioned_group_observe_requires_chat_allowlist_for_shared_context():
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            allowed_chats=["-100"],
+            observe_unmentioned_group_messages=True,
+        )
+        store = _FakeSessionStore()
+        adapter._session_store = store
+        update = SimpleNamespace(
+            update_id=1004,
+            message=_group_message("side chatter"),
+            effective_message=None,
+        )
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        adapter._message_handler.assert_not_awaited()
+        assert store.messages == []
+
+    asyncio.run(_run())
+
+
+def test_shared_group_observe_source_is_authorized_by_group_allowed_chats(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-100",
+        chat_type="group",
+        user_id=None,
+        user_name=None,
+    )
+
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_CHATS", "-100")
+    monkeypatch.delenv("TELEGRAM_ALLOWED_CHATS", raising=False)
+
+    assert runner._is_user_authorized(source) is True
+
+
+def test_unmentioned_group_observe_respects_chat_allowlist():
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=True,
+            allowed_chats=["-200"],
+            group_allowed_chats=["-200"],
+            observe_unmentioned_group_messages=True,
+        )
+        store = _FakeSessionStore()
+        adapter._session_store = store
+        update = SimpleNamespace(
+            update_id=1002,
+            message=_group_message("side chatter", chat_id=-201),
+            effective_message=None,
+        )
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        adapter._message_handler.assert_not_awaited()
+        assert store.messages == []
+
+    asyncio.run(_run())
+
+
+class _FakeSessionEntry:
+    session_id = "telegram-group-session"
+
+
+class _FakeSessionStore:
+    def __init__(self):
+        self.sources = []
+        self.messages = []
+
+    def get_or_create_session(self, source):
+        self.sources.append(source)
+        return _FakeSessionEntry()
+
+    def append_to_transcript(self, session_id, message, skip_db=False):
+        self.messages.append((session_id, message, skip_db))
 
 
 def test_group_messages_can_require_direct_trigger_via_config():

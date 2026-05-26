@@ -70,8 +70,8 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-import gateway.platforms.discord as discord_platform  # noqa: E402
-from gateway.platforms.discord import DiscordAdapter  # noqa: E402
+import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
+from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
 class FakeEmbed:
@@ -1474,7 +1474,7 @@ async def test_native_voice_feature_request_triages_from_transcript(adapter, mon
     )
 
     with patch(
-        "gateway.platforms.discord.cache_audio_from_bytes",
+        "plugins.platforms.discord.adapter.cache_audio_from_bytes",
         return_value="/tmp/voice_from_read.ogg",
     ) as mock_cache, patch(
         "tools.transcription_tools.transcribe_audio",

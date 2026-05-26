@@ -51,6 +51,7 @@ class ResponsesApiTransport(ProviderTransport):
             session_id: str | None — used for prompt_cache_key + xAI conv header
             max_tokens: int | None — max_output_tokens
             ephemeral_max_output_tokens: int | None — one-shot continuation budget
+            timeout: float | None — per-request timeout forwarded to the SDK
             request_overrides: dict | None — extra kwargs merged in
             provider: str | None — provider name for backend-specific logic
             base_url: str | None — endpoint URL
@@ -146,6 +147,20 @@ class ResponsesApiTransport(ProviderTransport):
         request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
+
+        # Forward per-request timeout to the SDK so OpenAI/Anthropic clients
+        # honor it.  Without this, ``providers.<id>.request_timeout_seconds``
+        # is silently dropped on the main agent Codex path while the
+        # chat_completions path and auxiliary Codex adapter both forward it.
+        timeout = kwargs.get("timeout", params.get("timeout"))
+        if (
+            isinstance(timeout, (int, float))
+            and not isinstance(timeout, bool)
+            and 0 < float(timeout) < float("inf")
+        ):
+            kwargs["timeout"] = float(timeout)
+        else:
+            kwargs.pop("timeout", None)
 
         if is_codex_backend:
             prompt_cache_key = kwargs.get("prompt_cache_key")

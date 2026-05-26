@@ -1544,7 +1544,7 @@ export default class Ink {
       return ''
     }
 
-    const text = getSelectedText(this.selection, this.frontFrame.screen)
+    const text = this.getTextSelectionText()
 
     if (text) {
       try {
@@ -1571,6 +1571,10 @@ export default class Ink {
     }
 
     return ''
+  }
+
+  getTextSelectionText(): string {
+    return hasSelection(this.selection) ? getSelectedText(this.selection, this.frontFrame.screen) : ''
   }
 
   /**
@@ -2391,7 +2395,9 @@ export default class Ink {
         dispatchKeyboardEvent={this.dispatchKeyboardEvent}
         exitOnCtrlC={this.options.exitOnCtrlC}
         getHyperlinkAt={this.getHyperlinkAt}
+        getSelectedText={this.getTextSelectionText}
         onClickAt={this.dispatchClick}
+        onCopySelectionNoClear={this.copySelectionNoClear}
         onCursorAdvance={this.noteExternalCursorAdvance}
         onCursorDeclaration={this.setCursorDeclaration}
         onExit={this.unmount}

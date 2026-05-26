@@ -40,9 +40,8 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from gateway.platforms.discord import DiscordAdapter  # noqa: E402
-import gateway.platforms.discord as discord_platform  # noqa: E402
-from gateway.platforms.discord import discord as discord_module  # noqa: E402
+from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
 
 
 STATUS_REACTION_EMOJIS = ("✅", "❌", "👀", "❓", "⏳")
@@ -785,7 +784,7 @@ async def test_ship_reaction_routes_thread_session(adapter, monkeypatch):
     class FakeThread:
         pass
 
-    monkeypatch.setattr(discord_module, "Thread", FakeThread)
+    monkeypatch.setattr(discord_platform.discord, "Thread", FakeThread)
     guild = SimpleNamespace(id=10, name="Test Guild")
     parent = SimpleNamespace(id=55, name="features", guild=guild, type=0, topic="parent topic")
     thread = FakeThread()

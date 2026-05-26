@@ -308,14 +308,14 @@ export function ChatSidebar({
   return (
     <aside
       className={cn(
-        "flex h-full w-full min-w-0 shrink-0 flex-col gap-3 overflow-y-auto overflow-x-hidden pr-1 normal-case lg:w-80",
+        "flex h-full w-full min-w-0 shrink-0 flex-col gap-3 overflow-y-auto overflow-x-hidden pr-1 lg:w-80",
         className,
       )}
     >
       <Card className="flex items-center justify-between gap-2 px-3 py-2">
         <div className="min-w-0">
-          <div className="text-xs uppercase tracking-wider text-muted-foreground">
-            visible TUI model
+          <div className="text-display text-xs tracking-wider text-text-tertiary">
+            model
           </div>
 
           <Button
@@ -325,7 +325,7 @@ export function ChatSidebar({
             onClick={() => setModelOpen(true)}
             suffix={
               canPickModel ? (
-                <ChevronDown className="opacity-60" />
+                <ChevronDown className="text-text-secondary" />
               ) : undefined
             }
             className="self-start min-w-0 px-0 py-0 normal-case tracking-normal text-sm font-medium hover:underline disabled:no-underline"
@@ -361,13 +361,13 @@ export function ChatSidebar({
       )}
 
       <Card className="flex min-h-0 flex-none flex-col px-2 py-2">
-        <div className="px-1 pb-2 text-xs uppercase tracking-wider text-muted-foreground">
+        <div className="text-display px-1 pb-2 text-xs tracking-wider text-text-tertiary">
           tools
         </div>
 
         <div className="flex min-h-0 flex-col gap-1.5">
           {tools.length === 0 ? (
-            <div className="px-2 py-4 text-center text-xs text-muted-foreground">
+            <div className="px-2 py-4 text-center text-xs text-text-secondary">
               no tool calls yet
             </div>
           ) : (

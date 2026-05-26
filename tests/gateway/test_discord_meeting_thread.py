@@ -6,7 +6,7 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.base import MessageType
-from gateway.platforms.discord import DiscordAdapter
+from plugins.platforms.discord.adapter import DiscordAdapter
 
 
 @pytest.fixture

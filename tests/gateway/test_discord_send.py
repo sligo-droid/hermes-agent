@@ -42,8 +42,8 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from gateway.platforms.discord import DiscordAdapter  # noqa: E402
-import gateway.platforms.discord as discord_adapter_module  # noqa: E402
+from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+import plugins.platforms.discord.adapter as discord_adapter_module  # noqa: E402
 
 
 @pytest.mark.asyncio
