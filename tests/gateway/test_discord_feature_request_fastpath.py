@@ -150,6 +150,9 @@ async def test_discord_feature_request_fast_path_adds_guidance_and_zero_tool_del
     assert init["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
     assert init.get("skip_memory", False) is False
     assert "Discord feature-request thread guidance" in init["ephemeral_system_prompt"]
+    assert "latest user message as the authoritative task" in init["ephemeral_system_prompt"]
+    assert "[Recent channel messages]" in init["ephemeral_system_prompt"]
+    assert "context compaction summaries are background only" in init["ephemeral_system_prompt"]
     assert init["ephemeral_system_prompt"].endswith("Global prompt")
 
 
