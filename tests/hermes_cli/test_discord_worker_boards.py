@@ -516,6 +516,40 @@ def test_public_session_snapshot_resolves_request_board_slug(monkeypatch, tmp_pa
     assert snapshot["worker"]["public_url"] == "https://example.test/workers/discord-4243-m-msg-1"
 
 
+def test_starter_message_request_uses_thread_board_url(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(thread_id="4244", goal="Ship it", request_id="4244")
+    snapshot = dwb.public_board_snapshot_for_session("discord-4244-m-4244")
+
+    assert board.slug == "discord-4244"
+    assert board.public_url == "https://example.test/workers/4244"
+    assert snapshot["board"] == board.slug
+    assert snapshot["session_id"] == "4244"
+    assert snapshot["worker"]["public_url"] == "https://example.test/workers/4244"
+
+
+def test_existing_starter_message_board_gets_canonical_thread_url(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.ensure_discord_thread_board(
+        thread_id="4245",
+        initial_request="Ship it",
+        request_id="4245",
+        board_slug="discord-4245-m-4245",
+        source_message_id="4245",
+    )
+    snapshot = dwb.public_board_snapshot_for_session("4245")
+
+    assert board.slug == "discord-4245-m-4245"
+    assert board.public_url == "https://example.test/workers/4245"
+    assert snapshot["board"] == board.slug
+    assert snapshot["session_id"] == "4245"
+    assert snapshot["worker"]["public_url"] == "https://example.test/workers/4245"
+
+
 def test_public_session_url_accepts_workers_base(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://example.test/workers")
@@ -1182,6 +1216,7 @@ def test_public_kanban_web_routes(monkeypatch, tmp_path):
     from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
 
     board = dwb.set_goal(thread_id="6161", goal="Build the thing")
+    starter_board = dwb.set_goal(thread_id="6168", goal="Build starter thing", request_id="6168")
     token = board.worker["share_token"]
     client = TestClient(app)
     client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
@@ -1191,6 +1226,7 @@ def test_public_kanban_web_routes(monkeypatch, tmp_path):
     root_session_redirect = client.get("/6161", follow_redirects=False)
     kanban_session_redirect = client.get("/kanban/6161", follow_redirects=False)
     session = client.get("/workers/6161")
+    starter_legacy_slug = client.get("/workers/discord-6168-m-6168")
     legacy_token = client.get(f"/kanban/public/kanban/{token}")
     token_resp = client.get(f"/workers/public/kanban/{token}")
     missing = client.get("/workers/does-not-exist")
@@ -1204,6 +1240,9 @@ def test_public_kanban_web_routes(monkeypatch, tmp_path):
     assert kanban_session_redirect.headers["location"] == "/workers/6161"
     assert session.status_code == 200
     assert "Discord 6161" in session.text
+    assert starter_board.slug == "discord-6168"
+    assert starter_legacy_slug.status_code == 200
+    assert "Discord 6168" in starter_legacy_slug.text
     assert legacy_token.status_code == 200
     assert "Discord 6161" in legacy_token.text
     assert token_resp.status_code == 200
