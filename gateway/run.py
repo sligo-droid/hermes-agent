@@ -6554,6 +6554,7 @@ class GatewayRunner:
         if not board_url:
             board_url = _dwb.public_session_board_url(str(worker.get("thread_id") or ""))
         ticket_url = f"{board_url.rstrip('/')}/tickets/{_quote(str(task_id), safe='')}" if board_url else ""
+        discord_thread_url = self._discord_foreman_board_thread_url(worker)
         body = str(task.body or "").strip()
         request_parts = [str(task.title or task_id).strip()]
         if body:
@@ -6569,6 +6570,51 @@ class GatewayRunner:
             "initial_request": "\n\n".join(part for part in request_parts if part),
             "project_context": project_context,
             "kanban_url": ticket_url or board_url,
+            "board_url": board_url,
+            "ticket_url": ticket_url,
+            "discord_thread_url": discord_thread_url,
+        }
+
+    @staticmethod
+    def _discord_foreman_board_thread_url(worker: Dict[str, Any]) -> str:
+        from urllib.parse import quote as _quote
+
+        guild_id = str(worker.get("guild_id") or "").strip()
+        thread_id = str(worker.get("thread_id") or "").strip()
+        if not guild_id or not thread_id:
+            return ""
+        return f"https://discord.com/channels/{_quote(guild_id, safe='')}/{_quote(thread_id, safe='')}"
+
+    def _discord_foreman_issue_embed_context(self, issue: Any) -> Dict[str, str]:
+        from urllib.parse import quote as _quote
+
+        evidence = getattr(issue, "evidence", None)
+        evidence = evidence if isinstance(evidence, dict) else {}
+        source_board = str(evidence.get("source_board") or getattr(issue, "board", "") or "").strip()
+        source_task_id = str(evidence.get("source_task_id") or getattr(issue, "task_id", "") or "").strip()
+        source_kanban_url = str(evidence.get("source_kanban_url") or evidence.get("session_url") or "").strip()
+        source_discord_thread_url = str(evidence.get("source_discord_thread_url") or "").strip()
+        if source_board:
+            try:
+                from hermes_cli import kanban_db as _kb
+                from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
+
+                metadata = _kb.read_board_metadata(source_board)
+                worker = metadata.get(DISCORD_WORKER_META_KEY)
+                worker = dict(worker) if isinstance(worker, dict) else {}
+                source_discord_thread_url = source_discord_thread_url or self._discord_foreman_board_thread_url(worker)
+                source_kanban_url = source_kanban_url or str(worker.get("public_url") or "").strip()
+            except Exception:
+                logger.debug("discord foreman: source board metadata unavailable for %s", source_board, exc_info=True)
+        source_task_url = ""
+        if source_kanban_url and source_task_id and source_task_id != "__board__":
+            source_task_url = f"{source_kanban_url.rstrip('/')}/tickets/{_quote(source_task_id, safe='')}"
+        return {
+            "source_board": source_board,
+            "source_task_id": source_task_id,
+            "source_task_url": source_task_url,
+            "source_kanban_url": source_kanban_url,
+            "source_discord_thread_url": source_discord_thread_url,
         }
 
     def _discord_foreman_record_task_thread(
@@ -6667,6 +6713,11 @@ class GatewayRunner:
                         initial_request=str(info.get("initial_request") or title),
                         project_context=info.get("project_context"),
                         kanban_url=str(info.get("kanban_url") or ""),
+                        source_board=str(info.get("board") or ""),
+                        source_task_id=str(info.get("task_id") or ""),
+                        source_task_url=str(info.get("ticket_url") or ""),
+                        source_kanban_url=str(info.get("board_url") or ""),
+                        source_discord_thread_url=str(info.get("discord_thread_url") or ""),
                     )
                     if not isinstance(handle, dict) or not str(handle.get("thread_id") or "").strip():
                         continue
@@ -6716,11 +6767,13 @@ class GatewayRunner:
         if not callable(creator):
             raise RuntimeError("Discord adapter cannot create foreman goal threads")
 
+        embed_context = self._discord_foreman_issue_embed_context(issue)
         handle = await creator(
             channel_id,
             name=title,
             initial_request=prompt,
             project_context=None,
+            **embed_context,
         )
         if not isinstance(handle, dict) or not str(handle.get("thread_id") or "").strip():
             raise RuntimeError("Discord adapter did not return a foreman goal thread")
@@ -12675,10 +12728,22 @@ class GatewayRunner:
                                     "public_url": str(target.get("public_url") or board.public_url or ""),
                                 }
                             )
+                            for key in (
+                                "source_board",
+                                "source_task_id",
+                                "source_task_url",
+                                "source_kanban_url",
+                                "source_discord_thread_url",
+                            ):
+                                if feature_summary.get(key):
+                                    target[key] = str(feature_summary.get(key) or "")
+                            preferred_title = str(feature_summary.get("title") or "").strip()
+                            if preferred_title:
+                                target["title"] = preferred_title
                             feature_initial_request = str(feature_summary.get("initial_request") or "").strip()
                             if feature_initial_request and not str(target.get("fallback_title") or "").strip():
                                 target["fallback_title"] = feature_initial_request
-                            if str(feature_summary.get("source_message_id") or "").strip() and feature_initial_request:
+                            if not preferred_title and str(feature_summary.get("source_message_id") or "").strip() and feature_initial_request:
                                 title = self._fallback_discord_feature_title(feature_summary)
                                 if title:
                                     target["title"] = title
