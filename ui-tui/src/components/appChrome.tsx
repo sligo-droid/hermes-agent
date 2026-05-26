@@ -196,6 +196,23 @@ export function statusRuleLayout(cols: number, cwdLabel: string) {
   return { cwdLabel: visibleCwd, leftWidth: Math.max(1, cols - rightWidth) }
 }
 
+export function statusRuleWidths(cols: number, cwdLabel: string) {
+  const width = Math.max(1, Math.floor(cols || 1))
+  const desiredSeparatorWidth = width >= 24 ? 3 : 1
+  const minLeftWidth = width >= 24 ? 8 : 1
+  const maxRightWidth = Math.max(0, width - desiredSeparatorWidth - minLeftWidth)
+
+  if (!cwdLabel || maxRightWidth <= 0) {
+    return { leftWidth: width, rightWidth: 0, separatorWidth: 0 }
+  }
+
+  const rightWidth = Math.max(0, Math.min(stringWidth(cwdLabel), maxRightWidth))
+  const separatorWidth = rightWidth > 0 ? desiredSeparatorWidth : 0
+  const leftWidth = Math.max(1, width - separatorWidth - rightWidth)
+
+  return { leftWidth, rightWidth, separatorWidth }
+}
+
 function SpawnHud({ t }: { t: Theme }) {
   // Tight HUD that only appears when the session is actually fanning out.
   // Colour escalates to warn/error as depth or concurrency approaches the cap.
@@ -343,11 +360,11 @@ export function StatusRule({
       : ''
 
   const bar = usage.context_max ? ctxBar(pct) : ''
-  const layout = statusRuleLayout(cols, cwdLabel)
+  const { leftWidth, rightWidth, separatorWidth } = statusRuleWidths(cols, cwdLabel)
 
   return (
     <Box height={1}>
-      <Box flexShrink={1} width={layout.leftWidth}>
+      <Box flexShrink={1} width={leftWidth}>
         <Text color={t.color.border} wrap="truncate-end">
           {'─ '}
           {busy ? (
@@ -395,10 +412,14 @@ export function StatusRule({
         </Text>
       </Box>
 
-      {layout.cwdLabel ? (
+      {rightWidth > 0 ? (
         <>
-          <Text color={t.color.border}> ─ </Text>
-          <Text color={t.color.label}>{layout.cwdLabel}</Text>
+          <Text color={t.color.border}>{separatorWidth >= 3 ? ' ─ ' : ' '}</Text>
+          <Box flexShrink={0} width={rightWidth}>
+            <Text color={t.color.label} wrap="truncate-end">
+              {cwdLabel}
+            </Text>
+          </Box>
         </>
       ) : null}
     </Box>

@@ -6,6 +6,7 @@ import type { GatewayClient } from "@/lib/gatewayClient";
 import { Check, Search, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { cn, themedBody } from "@/lib/utils";
 
 /**
  * Two-stage model picker modal.
@@ -211,7 +212,7 @@ export function ModelPickerDialog(props: Props) {
       aria-modal="true"
       aria-labelledby="model-picker-title"
     >
-      <div className="relative w-full max-w-3xl max-h-[80vh] border border-border bg-card shadow-2xl flex flex-col">
+      <div className={cn(themedBody, "relative w-full max-w-3xl max-h-[80vh] border border-border bg-card shadow-2xl flex flex-col")}>
         <Button
           ghost
           size="icon"
@@ -225,7 +226,7 @@ export function ModelPickerDialog(props: Props) {
         <header className="p-5 pb-3 border-b border-border">
           <h2
             id="model-picker-title"
-            className="font-display text-base tracking-wider uppercase"
+            className="font-mondwest text-display text-base tracking-wider"
           >
             {title}
           </h2>
@@ -372,7 +373,7 @@ function ProviderColumn({
                 <span className="font-medium truncate">{p.name}</span>
                 {p.is_current && <CurrentTag />}
               </div>
-              <div className="text-[0.65rem] text-muted-foreground/80 font-mono truncate">
+              <div className="text-xs text-text-secondary font-mono truncate">
                 {p.slug} · {p.total_models ?? p.models?.length ?? 0} models
               </div>
             </div>
@@ -459,7 +460,7 @@ function ModelColumn({
 
 function CurrentTag() {
   return (
-    <span className="text-[0.6rem] uppercase tracking-wider text-primary/80 shrink-0">
+    <span className="text-display text-xs tracking-wider text-primary shrink-0">
       current
     </span>
   );

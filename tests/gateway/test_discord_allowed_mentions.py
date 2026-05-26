@@ -88,7 +88,7 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from gateway.platforms.discord import _allowed_mentions_for_metadata, _build_allowed_mentions  # noqa: E402
+from plugins.platforms.discord.adapter import _allowed_mentions_for_metadata, _build_allowed_mentions  # noqa: E402
 
 
 # The four DISCORD_ALLOW_MENTION_* env vars that _build_allowed_mentions reads.
