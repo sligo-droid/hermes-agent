@@ -18,7 +18,7 @@ from hermes_cli.discord_worker_boards import (
     public_session_board_url,
     read_board_run_summary,
 )
-from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
+from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY, ROLE_REVIEWER
 from hermes_cli.discord_worker_state import read_codex_worker_state
 from utils import atomic_json_write
 
@@ -349,6 +349,86 @@ def collect_human_intervention_issues(
     if changed:
         _write_alert_state(state)
     return sorted(issues, key=lambda issue: (issue.board, issue.task_id, issue.kind))
+
+
+def auto_close_completed_foreman_boards(now: Optional[int] = None) -> list[dict[str, Any]]:
+    """Deterministically close stale Foreman boards whose source is complete."""
+    now = int(time.time()) if now is None else int(now)
+    closures: list[dict[str, Any]] = []
+    for snapshot in collect_board_snapshots(foreman_generated_only=True):
+        if snapshot.archived or _board_is_terminal(snapshot):
+            continue
+        blocker = _board_blocker_task(snapshot)
+        if blocker is None or blocker.status != "blocked":
+            continue
+        if str(blocker.assignee or "").strip() != ROLE_REVIEWER:
+            continue
+        if not _task_has_worker_error_issue(blocker):
+            continue
+
+        source = _foreman_source_from_request(snapshot.request_text)
+        source_board = str(source.get("source_board") or "").strip()
+        if not source_board:
+            continue
+        source_worker = _discord_worker_meta_for_source_board(source_board)
+        if source_worker is None:
+            continue
+        source_complete, pr_evidence = _source_board_auto_closure_ready(source_board, source_worker)
+        if not source_complete:
+            continue
+
+        outcome = (
+            "Deterministic Foreman reconciliation: source board is complete; "
+            "closing stale Foreman reviewer runtime blocker."
+        )
+        _mark_board_complete_for_auto_closure(
+            source_board,
+            concise_outcome="Deterministic Foreman reconciliation marked the completed source board done.",
+        )
+
+        metadata = {
+            "completed_directly": True,
+            "auto_closed": True,
+            "auto_closed_at": now,
+            "source_board": source_board,
+            "source_task_id": source.get("source_task_id") or "",
+            "source_issue_kind": source.get("source_issue_kind") or "",
+            "foreman_board": snapshot.board,
+            "foreman_task_id": blocker.id,
+            "original_blocker": _auto_closure_blocker_metadata(blocker),
+            "pr": pr_evidence,
+        }
+        conn = kanban_db.connect(board=snapshot.board)
+        try:
+            completed = kanban_db.complete_task(
+                conn,
+                blocker.id,
+                result=outcome,
+                summary=outcome,
+                metadata=metadata,
+            )
+        finally:
+            conn.close()
+        if not completed:
+            continue
+
+        _mark_board_complete_for_auto_closure(
+            snapshot.board,
+            concise_outcome="Deterministic Foreman reconciliation closed the stale recovery board.",
+        )
+        closures.append(
+            {
+                "foreman_board": snapshot.board,
+                "foreman_task_id": blocker.id,
+                "source_board": source_board,
+                "source_task_id": source.get("source_task_id") or "",
+                "source_issue_kind": source.get("source_issue_kind") or "",
+                "pr_state": pr_evidence.get("state") or "",
+                "pr_checks_status": pr_evidence.get("checks_status") or "",
+                "pr_merge_commit": pr_evidence.get("merge_commit") or "",
+            }
+        )
+    return closures
 
 
 def alerts_due(
@@ -1061,6 +1141,182 @@ def _board_blocker_task(snapshot: BoardSnapshot) -> Optional[TaskSnapshot]:
     if active:
         return max(active, key=_task_blocker_timestamp)
     return None
+
+
+def _discord_worker_meta_for_source_board(board: str) -> Optional[dict[str, Any]]:
+    try:
+        metadata = kanban_db.read_board_metadata(board)
+    except Exception:
+        return None
+    worker = metadata.get(DISCORD_WORKER_META_KEY)
+    if not isinstance(worker, dict) or worker.get("kind") != "discord_worker_board":
+        return None
+    if _is_foreman_generated_board(worker):
+        return None
+    return dict(worker)
+
+
+def _source_board_auto_closure_ready(
+    board: str,
+    worker: dict[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    conn = kanban_db.connect(board=board)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+    if not tasks or any(str(task.status or "") != "done" for task in tasks):
+        return False, {}
+
+    refreshed_worker = _refresh_source_pr_status_for_auto_closure(board, dict(worker))
+    pr_evidence = _auto_closure_pr_evidence(refreshed_worker)
+    if pr_evidence.get("has_pr_evidence") and not pr_evidence.get("safe"):
+        return False, pr_evidence
+    if not _source_worktree_clean_for_auto_closure(refreshed_worker):
+        pr_evidence["safe"] = False
+        pr_evidence["blocker"] = pr_evidence.get("blocker") or "source worktree has uncommitted changes"
+        return False, pr_evidence
+    return True, pr_evidence
+
+
+def _refresh_source_pr_status_for_auto_closure(board: str, worker: dict[str, Any]) -> dict[str, Any]:
+    """Best-effort live PR refresh for a source board before auto-closing."""
+    pr_ref = str(worker.get("pr_url") or worker.get("pr_number") or "").strip()
+    if not pr_ref:
+        return worker
+    root_text = str(worker.get("worktree_path") or worker.get("project_path") or "").strip()
+    if not root_text:
+        return worker
+    root = Path(root_text).expanduser()
+    if not root.is_dir():
+        return worker
+    try:
+        from hermes_cli.kanban_codex_worker import _refresh_pr_status, _resolve_github_repo
+
+        repo = _resolve_github_repo(worker, root)
+        if not repo:
+            return worker
+        _refresh_pr_status(worker, root=root, repo=repo)
+        metadata = kanban_db.read_board_metadata(board)
+        current = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+        current.update(worker)
+        metadata[DISCORD_WORKER_META_KEY] = current
+        metadata.pop("db_path", None)
+        atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
+    except Exception as exc:
+        worker["pr_status_error"] = _truncate_text(_sanitize_text(str(exc)), 240)
+        worker["pr_blocker"] = worker["pr_status_error"]
+    return worker
+
+
+def _source_worktree_clean_for_auto_closure(worker: dict[str, Any]) -> bool:
+    root_text = str(worker.get("worktree_path") or "").strip()
+    if not root_text:
+        return True
+    root = Path(root_text).expanduser()
+    if not root.is_dir():
+        return True
+    import subprocess
+
+    try:
+        status = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return False
+    if status.returncode != 0:
+        return False
+    return not (status.stdout or "").strip()
+
+
+def _auto_closure_pr_evidence(worker: dict[str, Any]) -> dict[str, Any]:
+    state = str(worker.get("pr_state") or "").strip().upper()
+    checks_status = str(worker.get("pr_checks_status") or "").strip().lower()
+    merge_commit = str(
+        worker.get("pr_merge_commit_sha")
+        or worker.get("pr_merge_commit")
+        or ""
+    ).strip()
+    blocker = str(
+        worker.get("pr_blocker")
+        or worker.get("pr_status_error")
+        or worker.get("pr_error")
+        or ""
+    ).strip()
+    evidence = {
+        "url": str(worker.get("pr_url") or "").strip(),
+        "number": str(worker.get("pr_number") or "").strip(),
+        "state": state,
+        "checks_status": checks_status,
+        "merge_commit": merge_commit,
+        "blocker": blocker,
+        "has_pr_evidence": False,
+        "safe": True,
+    }
+    pr_keys = (
+        "pr_url",
+        "pr_number",
+        "pr_state",
+        "pr_checks_status",
+        "pr_merge_commit",
+        "pr_merge_commit_sha",
+        "pr_blocker",
+        "pr_status_error",
+        "pr_error",
+        "pr_skipped_no_changes",
+    )
+    evidence["has_pr_evidence"] = any(str(worker.get(key) or "").strip() for key in pr_keys)
+    if not evidence["has_pr_evidence"]:
+        return evidence
+    checks_ok = checks_status in {"passed", "success"}
+    skipped_no_changes = bool(worker.get("pr_skipped_no_changes")) or state in {"NOT_NEEDED", "NO_CHANGES"}
+    evidence["safe"] = (
+        (
+            (state == "MERGED" and bool(merge_commit))
+            or skipped_no_changes
+        )
+        and checks_ok
+        and not blocker
+    )
+    return evidence
+
+
+def _auto_closure_blocker_metadata(task: TaskSnapshot) -> dict[str, Any]:
+    latest = task.latest_run
+    sidecar = _sidecar_result(task)
+    return {
+        "task_id": task.id,
+        "assignee": task.assignee,
+        "status": task.status,
+        "last_failure_error": task.last_failure_error,
+        "run_id": latest.id if latest else None,
+        "run_status": latest.status if latest else "",
+        "run_outcome": latest.outcome if latest else "",
+        "run_error": latest.error if latest else "",
+        "sidecar_error": sidecar.get("error"),
+        "sidecar_timed_out": sidecar.get("timed_out"),
+        "sidecar_exit_code": sidecar.get("exit_code"),
+    }
+
+
+def _mark_board_complete_for_auto_closure(board: str, *, concise_outcome: str) -> None:
+    from hermes_cli.discord_worker_read import update_board
+
+    update_board(
+        board,
+        goal_status="done",
+        phase="complete",
+        clear_blocked_reason=True,
+        concise_outcome=concise_outcome,
+        sync_summary=True,
+        sync_reaction=True,
+        persist_summary=True,
+        dispatch_reason="foreman-auto-close-completed-board",
+    )
 
 
 def _task_blocker_timestamp(task: TaskSnapshot) -> int:

@@ -127,6 +127,42 @@ def test_ensure_code_island_blocks_active_board_on_checkout_error(monkeypatch, t
     assert "not a git repository" in worker["blocked_reason"]
 
 
+def test_prepare_existing_code_island_quarantines_plans_before_recreate(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    worktree = tmp_path / "repo-discord-123"
+    plans = worktree / ".hermes" / "plans"
+    plans.mkdir(parents=True)
+    (plans / "plan.md").write_text("old plan", encoding="utf-8")
+    worker = {"worktree_path": str(worktree)}
+    removed = []
+
+    monkeypatch.setattr(dwb, "_is_git_worktree", lambda path: True)
+    monkeypatch.setattr(dwb, "_current_worktree_branch", lambda path: "feat/old")
+    monkeypatch.setattr(dwb, "_meaningful_worktree_status", lambda path: [])
+    monkeypatch.setattr(dwb, "_worktree_head_merged_into", lambda path, base: True)
+    monkeypatch.setattr(
+        dwb,
+        "_remove_clean_merged_worktree",
+        lambda repo_root, path: removed.append(path) or None,
+    )
+
+    handled = dwb._prepare_existing_code_island_worktree(
+        worker,
+        repo_root=str(tmp_path / "repo"),
+        branch="discord/123",
+        base_branch="main",
+    )
+
+    assert handled is False
+    assert removed == [str(worktree)]
+    assert not plans.exists()
+    quarantine = Path(worker["generated_plan_quarantine_path"])
+    assert (quarantine / "plan.md").read_text(encoding="utf-8") == "old plan"
+    assert worker["stale_worktree_previous_branch"] == "feat/old"
+
+
 def test_set_goal_creates_planner_task_for_role_lane(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

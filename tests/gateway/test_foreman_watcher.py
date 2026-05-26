@@ -133,6 +133,7 @@ def _patch_config(monkeypatch, config):
 def _patch_no_human_escalations(monkeypatch):
     from hermes_cli import discord_worker_foreman as foreman
 
+    monkeypatch.setattr(foreman, "auto_close_completed_foreman_boards", lambda **kwargs: [])
     monkeypatch.setattr(foreman, "collect_human_intervention_issues", lambda **kwargs: [])
 
 
@@ -349,6 +350,7 @@ def test_foreman_watcher_direct_alerts_human_intervention_issue(monkeypatch):
     sent = []
     failed = []
 
+    monkeypatch.setattr(foreman, "auto_close_completed_foreman_boards", lambda **kwargs: [])
     monkeypatch.setattr(foreman, "collect_foreman_issues", lambda now=None, **kwargs: [])
     monkeypatch.setattr(foreman, "collect_human_intervention_issues", lambda now=None, **kwargs: [issue])
     monkeypatch.setattr(foreman, "startup_baseline_needed", lambda: False)
@@ -462,6 +464,37 @@ def test_foreman_watcher_suppresses_matching_goal_when_human_alert_is_due(monkey
     assert goal_events == []
     assert sent == ["human_intervention_required"]
     assert failed == []
+
+
+def test_foreman_watcher_auto_closes_before_collecting_issues(monkeypatch):
+    _patch_config(monkeypatch, _enabled_config())
+    _patch_lock(monkeypatch)
+    from hermes_cli import discord_worker_foreman as foreman
+
+    calls = []
+
+    def auto_close(now=None):
+        calls.append(("auto", now))
+        return [{"foreman_board": "foreman-1"}]
+
+    def collect_foreman(now=None, **kwargs):
+        calls.append(("foreman", now))
+        return []
+
+    def collect_human(now=None, **kwargs):
+        calls.append(("human", now))
+        return []
+
+    monkeypatch.setattr(foreman, "auto_close_completed_foreman_boards", auto_close)
+    monkeypatch.setattr(foreman, "collect_foreman_issues", collect_foreman)
+    monkeypatch.setattr(foreman, "collect_human_intervention_issues", collect_human)
+    monkeypatch.setattr(foreman, "startup_baseline_needed", lambda: False)
+    monkeypatch.setattr(foreman, "alerts_due", lambda issues, *, config=None, now=None: [])
+
+    asyncio.run(_run_one_foreman_tick(monkeypatch, _runner(ForemanAdapter())))
+
+    assert [name for name, _ in calls] == ["auto", "foreman", "human"]
+    assert len({now for _, now in calls}) == 1
 
 
 def test_foreman_watcher_records_send_result_failure(monkeypatch):

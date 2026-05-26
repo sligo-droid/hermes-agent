@@ -84,6 +84,19 @@ class FakeEmbed:
     def add_field(self, *, name, value, inline=False):
         self.fields.append(SimpleNamespace(name=name, value=value, inline=inline))
 
+    def to_dict(self):
+        payload = {
+            "title": self.title,
+            "description": self.description,
+            "fields": [
+                {"name": field.name, "value": field.value, "inline": field.inline}
+                for field in self.fields
+            ],
+        }
+        if self.color is not None:
+            payload["color"] = self.color
+        return payload
+
 
 class FakeDMChannel:
     pass
@@ -733,6 +746,68 @@ async def test_feature_summary_update_edits_initial_message(adapter, monkeypatch
     assert fields["Concise Outcome"].startswith("Done.")
     assert fields["Branch"] == "[feature/summary](https://github.com/acme/hermes-project/tree/feature/summary)"
     assert "Feature Branch URL" not in fields
+
+
+@pytest.mark.asyncio
+async def test_feature_summary_update_skips_unchanged_embed(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="Ship project links",
+    )
+
+    assert await adapter.update_feature_summary(
+        handle,
+        final_response="Done.",
+        status="Complete",
+        title="Project Links",
+    )
+    assert await adapter.update_feature_summary(
+        handle,
+        final_response="Done.",
+        status="Complete",
+        title="Project Links",
+    )
+
+    message = handle["_message_obj"]
+    message.edit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_feature_summary_update_backs_off_after_rate_limit(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="Ship project links",
+    )
+    message = handle["_message_obj"]
+
+    class RateLimitError(Exception):
+        retry_after = 10
+
+    message.edit.side_effect = RateLimitError("rate limited")
+    monkeypatch.setattr(adapter, "_is_discord_rate_limit", lambda exc: isinstance(exc, RateLimitError))
+
+    assert await adapter.update_feature_summary(
+        handle,
+        final_response="Done.",
+        status="Complete",
+        title="Project Links",
+    ) is False
+    assert await adapter.update_feature_summary(
+        handle,
+        final_response="Done again.",
+        status="Complete",
+        title="Project Links",
+    ) is False
+
+    message.edit.assert_awaited_once()
 
 
 @pytest.mark.asyncio
