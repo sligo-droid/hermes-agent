@@ -980,6 +980,71 @@ async def test_discord_per_user_channel_backfills_too(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_auto_threaded_direct_question_skips_parent_channel_backfill(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    adapter.config.extra["history_backfill"] = True
+    adapter._classify_discord_feature_request = AsyncMock(return_value=False)
+    adapter._fetch_channel_context = AsyncMock(
+        return_value="[Recent channel messages]\n[Alice] old task"
+    )
+
+    parent = FakeTextChannel(channel_id=321)
+    thread = FakeThread(channel_id=456, parent=parent)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+    bot_user = adapter._client.user
+    message = make_message(
+        channel=parent,
+        content=f"<@{bot_user.id}> What changed?",
+        mentions=[bot_user],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once()
+    adapter._fetch_channel_context.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "456"
+    assert event.source.chat_type == "thread"
+    assert event.text == "What changed?"
+    assert event.channel_context is None
+    assert "classified as a direct question/request" in event.channel_prompt
+
+
+@pytest.mark.asyncio
+async def test_mentioned_existing_thread_still_backfills_thread_history(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    adapter.config.extra["history_backfill"] = True
+    adapter._classify_discord_feature_request = AsyncMock(return_value=False)
+    adapter._fetch_channel_context = AsyncMock(
+        return_value="[Recent channel messages]\n[Alice] thread note"
+    )
+
+    thread = FakeThread(channel_id=456, name="follow-up")
+    bot_user = adapter._client.user
+    message = make_message(
+        channel=thread,
+        content=f"<@{bot_user.id}> proceed with the OpenFEC scope",
+        mentions=[bot_user],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._fetch_channel_context.assert_awaited_once()
+    assert adapter._fetch_channel_context.await_args.args[0] is thread
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "456"
+    assert event.source.chat_type == "thread"
+    assert event.text == "proceed with the OpenFEC scope"
+    assert event.channel_context == "[Recent channel messages]\n[Alice] thread note"
+
+
+@pytest.mark.asyncio
 async def test_discord_dm_does_not_backfill(adapter, monkeypatch):
     """DMs skip backfill — every DM triggers the bot, so there's no mention gap."""
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
