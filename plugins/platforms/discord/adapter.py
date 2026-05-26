@@ -34,6 +34,7 @@ _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
+_DISCORD_FEATURE_SUMMARY_EDIT_BACKOFF_SECONDS = 30.0
 _DISCORD_AUDIO_EXTENSIONS = frozenset({
     ".aac", ".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga",
     ".oga", ".ogg", ".opus", ".wav", ".webm",
@@ -702,6 +703,8 @@ class DiscordAdapter(BasePlatformAdapter):
         # history backfill to skip the full scan on hot paths.  Falls back to
         # scanning channel.history() on cache miss (cold start / restart).
         self._last_self_message_id: Dict[str, str] = {}
+        self._feature_summary_edit_payloads: Dict[str, Dict[str, Any]] = {}
+        self._feature_summary_edit_backoff_until: Dict[str, float] = {}
 
     def _new_discord_intake_timing(self, message: Any) -> Dict[str, Any]:
         return {
@@ -1876,6 +1879,52 @@ class DiscordAdapter(BasePlatformAdapter):
                 pass
         return embed
 
+    @staticmethod
+    def _feature_summary_embed_payload(embed: Any) -> Optional[Dict[str, Any]]:
+        if embed is None:
+            return None
+        to_dict = getattr(embed, "to_dict", None)
+        if callable(to_dict):
+            try:
+                payload = to_dict()
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                return payload
+        fields = []
+        for field in getattr(embed, "fields", []) or []:
+            fields.append({
+                "name": str(getattr(field, "name", "") or ""),
+                "value": str(getattr(field, "value", "") or ""),
+                "inline": bool(getattr(field, "inline", False)),
+            })
+        color = getattr(embed, "color", None)
+        return {
+            "title": str(getattr(embed, "title", "") or ""),
+            "description": str(getattr(embed, "description", "") or ""),
+            "color": str(color) if color is not None else None,
+            "fields": fields,
+        }
+
+    def _feature_summary_edit_cache_key(self, handle: Dict[str, Any], msg: Any) -> str:
+        return ":".join(
+            str(part or "").strip()
+            for part in (
+                handle.get("summary_channel_id") or handle.get("thread_id"),
+                handle.get("message_id") or getattr(msg, "id", ""),
+            )
+        )
+
+    def _current_feature_summary_embed_payload(self, msg: Any) -> Optional[Dict[str, Any]]:
+        embeds = getattr(msg, "embeds", None)
+        if not embeds:
+            return None
+        try:
+            current = embeds[0]
+        except Exception:
+            return None
+        return self._feature_summary_embed_payload(current)
+
     def _format_feature_summary_transcript_quote(
         self,
         transcript: Optional[str],
@@ -2108,9 +2157,48 @@ class DiscordAdapter(BasePlatformAdapter):
                 source_discord_thread_url=str(handle.get("source_discord_thread_url") or "") or None,
                 hide_source_links=bool(handle.get("hide_source_links")),
             )
+            edit_key = self._feature_summary_edit_cache_key(handle, msg)
+            payload = self._feature_summary_embed_payload(embed)
+            backoff_until = self._feature_summary_edit_backoff_until.get(edit_key, 0.0)
+            now = time.monotonic()
+            if backoff_until > now:
+                logger.debug(
+                    "[%s] Skipping Discord feature summary edit for %s during rate-limit backoff (%.1fs remaining)",
+                    self.name,
+                    edit_key,
+                    backoff_until - now,
+                )
+                return False
+            cached_payload = self._feature_summary_edit_payloads.get(edit_key)
+            current_payload = self._current_feature_summary_embed_payload(msg)
+            if payload is not None and (cached_payload == payload or current_payload == payload):
+                self._feature_summary_edit_payloads[edit_key] = payload
+                return True
             await msg.edit(embed=embed)
+            if payload is not None:
+                self._feature_summary_edit_payloads[edit_key] = payload
+            try:
+                setattr(msg, "embeds", [embed])
+            except Exception:
+                pass
             return True
         except Exception as exc:
+            if self._is_discord_rate_limit(exc):
+                retry_after = self._extract_discord_retry_after(exc)
+                if retry_after is None:
+                    retry_after = _DISCORD_FEATURE_SUMMARY_EDIT_BACKOFF_SECONDS
+                retry_after = max(1.0, float(retry_after))
+                try:
+                    edit_key = self._feature_summary_edit_cache_key(handle, msg)
+                    self._feature_summary_edit_backoff_until[edit_key] = time.monotonic() + retry_after
+                except Exception:
+                    pass
+                logger.warning(
+                    "[%s] Discord rate-limited feature summary edit; backing off %.0fs",
+                    self.name,
+                    retry_after,
+                )
+                return False
             if kanban_sync and self._is_permanent_feature_summary_error(exc):
                 self._mark_feature_summary_kanban_sync_circuit(handle, "message_edit_failed")
                 logger.info("[%s] Disabled Discord Kanban feature-summary sync for inaccessible message", self.name)

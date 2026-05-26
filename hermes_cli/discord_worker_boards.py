@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -188,6 +189,8 @@ def _clear_pr_summary_fields(worker: dict[str, Any]) -> None:
         "pr_mergeable",
         "pr_is_draft",
         "pr_review_decision",
+        "pr_merged_at",
+        "pr_merge_commit",
         "pr_checks_status",
         "pr_checks_total",
         "pr_checks_failed",
@@ -502,6 +505,166 @@ def _is_git_worktree(path: str) -> bool:
     return result.returncode == 0 and (result.stdout or "").strip().lower() == "true"
 
 
+def _git_text(cwd: str, args: list[str], *, timeout: int = 10) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return (result.stdout or "").strip()
+
+
+def _current_worktree_branch(worktree_path: str) -> str:
+    return _git_text(worktree_path, ["branch", "--show-current"]) or ""
+
+
+def _quarantine_generated_plan_artifacts(worktree_path: str, worker: dict[str, Any]) -> None:
+    plans_dir = Path(worktree_path) / ".hermes" / "plans"
+    if not plans_dir.exists():
+        return
+    try:
+        if plans_dir.is_dir() and not any(plans_dir.iterdir()):
+            plans_dir.rmdir()
+            return
+    except OSError:
+        return
+    try:
+        from hermes_constants import get_hermes_home
+
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "-", Path(worktree_path).name).strip("-") or "worktree"
+        dest = get_hermes_home() / "gateway" / "discord-plan-quarantine" / safe_name / str(_now())
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(plans_dir), str(dest))
+        worker["generated_plan_quarantine_path"] = str(dest)
+        worker["generated_plan_quarantined_at"] = _now()
+        try:
+            (Path(worktree_path) / ".hermes").rmdir()
+        except OSError:
+            pass
+    except Exception as exc:
+        worker["generated_plan_quarantine_error"] = str(exc)
+
+
+def _is_generated_plan_status_line(line: str) -> bool:
+    path = line[3:].strip() if len(line) > 3 else line.strip()
+    return path == ".hermes/plans" or path.startswith(".hermes/plans/")
+
+
+def _meaningful_worktree_status(worktree_path: str) -> list[str]:
+    status = _git_text(
+        worktree_path,
+        ["status", "--porcelain", "--untracked-files=all"],
+    )
+    if not status:
+        return []
+    return [line for line in status.splitlines() if not _is_generated_plan_status_line(line)]
+
+
+def _worktree_head_merged_into(worktree_path: str, base_branch: str) -> bool:
+    refs = [base_branch]
+    if base_branch and "/" not in base_branch:
+        refs.append(f"origin/{base_branch}")
+    for ref in [r for r in refs if r]:
+        try:
+            verify = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet", ref],
+                cwd=worktree_path,
+                timeout=10,
+            )
+            if verify.returncode != 0:
+                continue
+            merged = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", "HEAD", ref],
+                cwd=worktree_path,
+                timeout=20,
+            )
+        except Exception:
+            continue
+        if merged.returncode == 0:
+            return True
+    return False
+
+
+def _remove_clean_merged_worktree(repo_root: str, worktree_path: str) -> Optional[str]:
+    cwd = repo_root if repo_root and os.path.isdir(repo_root) else worktree_path
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "remove", worktree_path],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except Exception as exc:
+        return str(exc)
+    if result.returncode == 0:
+        return None
+    return (result.stderr or result.stdout or "git worktree remove failed").strip()
+
+
+def _prepare_existing_code_island_worktree(
+    worker: dict[str, Any],
+    *,
+    repo_root: str,
+    branch: str,
+    base_branch: str,
+) -> bool:
+    """Return True when the existing worktree path has been fully handled."""
+    worktree_path = str(worker.get("worktree_path") or "").strip()
+    if not os.path.isdir(worktree_path):
+        return False
+    if not _is_git_worktree(worktree_path):
+        worker["code_island_ready"] = False
+        worker["code_island_pending"] = False
+        worker["code_island_error"] = f"worktree path is not a git repository: {worktree_path}"
+        return True
+
+    _quarantine_generated_plan_artifacts(worktree_path, worker)
+    current_branch = _current_worktree_branch(worktree_path)
+    if branch and current_branch and current_branch != branch:
+        status = _meaningful_worktree_status(worktree_path)
+        if status:
+            worker["code_island_ready"] = False
+            worker["code_island_pending"] = False
+            worker["code_island_error"] = (
+                f"worker checkout is on {current_branch!r}, expected {branch!r}, "
+                f"and has local changes: {'; '.join(status[:5])}"
+            )
+            return True
+        if _worktree_head_merged_into(worktree_path, base_branch):
+            removed_error = _remove_clean_merged_worktree(repo_root, worktree_path)
+            if removed_error is None:
+                worker["stale_worktree_removed_at"] = _now()
+                worker["stale_worktree_previous_branch"] = current_branch
+                worker["code_island_ready"] = False
+                worker["code_island_pending"] = True
+                worker.pop("code_island_error", None)
+                return False
+            worker["code_island_ready"] = False
+            worker["code_island_pending"] = False
+            worker["code_island_error"] = f"could not remove stale worker checkout: {removed_error}"
+            return True
+        worker["code_island_ready"] = False
+        worker["code_island_pending"] = False
+        worker["code_island_error"] = (
+            f"worker checkout is on {current_branch!r}, expected {branch!r}; "
+            f"not removing because HEAD is not merged into {base_branch!r}"
+        )
+        return True
+
+    worker["code_island_ready"] = True
+    worker["code_island_pending"] = False
+    worker.pop("code_island_error", None)
+    return True
+
+
 def _code_island_blocker(worker: dict[str, Any]) -> str:
     project_path = str(worker.get("project_path") or "").strip()
     worktree_path = str(worker.get("worktree_path") or "").strip()
@@ -569,18 +732,7 @@ def _ensure_code_island(worker: dict[str, Any]) -> None:
     if not project_path or not worktree_path or not branch or not os.path.isdir(project_path):
         worker["code_island_pending"] = False
         return
-    if os.path.isdir(worktree_path):
-        if _is_git_worktree(worktree_path):
-            worker["code_island_ready"] = True
-            worker["code_island_pending"] = False
-            worker.pop("code_island_error", None)
-        else:
-            worker["code_island_ready"] = False
-            worker["code_island_pending"] = False
-            worker["code_island_error"] = f"worktree path is not a git repository: {worktree_path}"
-        return
-    worker["code_island_ready"] = False
-    worker["code_island_pending"] = True
+
     try:
         root = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -589,10 +741,31 @@ def _ensure_code_island(worker: dict[str, Any]) -> None:
             text=True,
             timeout=10,
         )
-        if root.returncode != 0:
-            worker["code_island_error"] = (root.stderr or root.stdout or "not a git repository").strip()
+    except Exception as exc:
+        worker["code_island_ready"] = False
+        worker["code_island_pending"] = True
+        worker["code_island_error"] = str(exc)
+        return
+    if root.returncode != 0:
+        worker["code_island_error"] = (root.stderr or root.stdout or "not a git repository").strip()
+        return
+    repo_root = root.stdout.strip() or project_path
+
+    if os.path.isdir(worktree_path):
+        handled = _prepare_existing_code_island_worktree(
+            worker,
+            repo_root=repo_root,
+            branch=branch,
+            base_branch=base_branch,
+        )
+        if handled:
             return
-        repo_root = root.stdout.strip() or project_path
+
+    if os.path.isdir(worktree_path):
+        return
+    worker["code_island_ready"] = False
+    worker["code_island_pending"] = True
+    try:
         Path(worktree_path).parent.mkdir(parents=True, exist_ok=True)
         branch_exists = subprocess.run(
             ["git", "rev-parse", "--verify", "--quiet", branch],
@@ -1890,6 +2063,8 @@ def _pr_summary(worker: dict[str, Any]) -> dict[str, Any]:
         "error": str(worker.get("pr_error") or "").strip(),
         "status_error": str(worker.get("pr_status_error") or "").strip(),
         "state": str(worker.get("pr_state") or "").strip() or "unknown",
+        "merged_at": str(worker.get("pr_merged_at") or "").strip(),
+        "merge_commit": str(worker.get("pr_merge_commit") or "").strip(),
         "merge_state": merge_state,
         "mergeable": worker.get("pr_mergeable") if worker.get("pr_mergeable") is not None else "unknown",
         "is_draft": worker.get("pr_is_draft") if worker.get("pr_is_draft") is not None else "unknown",
@@ -1957,6 +2132,13 @@ def build_board_run_summary(board: str) -> dict[str, Any]:
         "pr": _pr_summary(worker),
         "deployment_status": str(worker.get("deployment_status") or "").strip() or "not checked",
         "verification_commands": _verification_commands(tasks, runs_by_task),
+        "final_response": {
+            "text": str(worker.get("final_discord_response") or ""),
+            "recorded_at": worker.get("final_discord_response_at"),
+            "session_id": str(worker.get("final_discord_session_id") or ""),
+            "work_item_id": str(worker.get("final_discord_work_item_id") or ""),
+            "message_id": str(worker.get("final_discord_message_id") or ""),
+        },
         "branch": str(worker.get("worker_branch") or "").strip(),
         "public_url": str(worker.get("public_url") or "").strip(),
         "started_at": started_at,
@@ -1984,6 +2166,39 @@ def persist_board_run_summary(board: str) -> dict[str, Any]:
         metadata.pop("db_path", None)
         atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
     return summary
+
+
+def record_final_discord_response(
+    board: str,
+    *,
+    final_response: str,
+    session_id: Optional[str] = None,
+    work_item_id: Optional[str] = None,
+    result_message_id: Optional[str] = None,
+) -> None:
+    """Persist final Discord-response provenance on a worker board."""
+    if not board:
+        return
+    metadata = kanban_db.read_board_metadata(board)
+    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    if worker.get("kind") != "discord_worker_board":
+        return
+    worker["final_discord_response"] = _cap_state_value(str(final_response or ""), max_text=12000)
+    worker["final_discord_response_at"] = _now()
+    if session_id:
+        worker["final_discord_session_id"] = str(session_id)
+    if work_item_id:
+        worker["final_discord_work_item_id"] = str(work_item_id)
+    if result_message_id:
+        worker["final_discord_message_id"] = str(result_message_id)
+    worker["terminal_summary_sync_pending"] = True
+    metadata[DISCORD_WORKER_META_KEY] = worker
+    metadata.pop("db_path", None)
+    atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
+    try:
+        persist_board_run_summary(board)
+    except Exception:
+        logger.debug("Failed to refresh Discord board run summary for %s", board, exc_info=True)
 
 
 def read_board_run_summary(board: str) -> dict[str, Any]:
@@ -2033,6 +2248,7 @@ def render_board_run_summary_text(summary: dict[str, Any]) -> str:
     pr_ref = pr.get("url") or pr.get("error") or "not opened"
     checks = pr.get("checks_status") or "not checked"
     merge = pr.get("merge_state") or "unknown"
+    merge_commit = pr.get("merge_commit") or ""
     lines = [
         f"Kanban goal: {summary.get('goal_status') or 'unknown'} / {summary.get('phase') or 'unknown'}",
         f"Board: {summary.get('public_url') or summary.get('board') or 'unknown'}",
@@ -2047,6 +2263,8 @@ def render_board_run_summary_text(summary: dict[str, Any]) -> str:
     blocker = str(summary.get("blocked_reason") or pr.get("blocker") or "").strip()
     if blocker:
         lines.append(f"Blocker: {blocker}")
+    if merge_commit:
+        lines.append(f"Merge commit: {merge_commit}")
     commands = summary.get("verification_commands") if isinstance(summary.get("verification_commands"), list) else []
     if commands:
         rendered = "; ".join(

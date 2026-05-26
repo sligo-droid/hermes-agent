@@ -127,6 +127,35 @@ def test_ledger_keeps_finished_delivery_phases_incomplete_until_completed(tmp_pa
     assert ledger.incomplete_items() == []
 
 
+def test_ledger_records_discord_board_final_response_provenance(tmp_path, monkeypatch):
+    import gateway.work_ledger as work_ledger
+
+    calls = []
+    monkeypatch.setattr(
+        work_ledger,
+        "_record_discord_board_final_response",
+        lambda item, result_message_id=None: calls.append(
+            (item.get("final_response"), result_message_id)
+        ),
+    )
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="m1")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(item["id"], final_response="normal final answer")
+    ledger.mark_response_delivered(item["id"], result_message_id="result-1")
+
+    assert calls == [
+        ("normal final answer", None),
+        ("normal final answer", "result-1"),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_startup_replays_only_incomplete_discord_work(tmp_path):
     runner = object.__new__(GatewayRunner)

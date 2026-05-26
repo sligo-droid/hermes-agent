@@ -967,10 +967,7 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     assert event.internal is True
     assert event.message_type == MessageType.TEXT
     assert event.source == source
-    # Text is empty — the existing _is_resume_pending branch in
-    # _handle_message_with_agent owns the system-note injection so we don't
-    # double it up.
-    assert event.text == ""
+    assert "Continue the turn" in event.text
 
 
 @pytest.mark.asyncio

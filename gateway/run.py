@@ -4227,11 +4227,15 @@ class GatewayRunner:
                 )
                 continue
 
-            # Empty-text internal event — the _is_resume_pending branch in
-            # _handle_message_with_agent prepends the proper reason-aware
-            # system note before the turn runs.
+            # Internal auto-resume event.  The _is_resume_pending branch in
+            # _handle_message_with_agent prepends the reason-aware system note;
+            # this text makes the recovered turn explicitly continue instead of
+            # treating the empty restart event as a fresh prompt.
             event = MessageEvent(
-                text="",
+                text=(
+                    "Continue the turn that was interrupted by the gateway restart. "
+                    "Use the existing transcript/tool results and report what was completed."
+                ),
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
@@ -4576,10 +4580,10 @@ class GatewayRunner:
         except Exception as e:
             logger.warning("Process checkpoint recovery: %s", e)
 
-        # Suspend sessions that were active when the gateway last exited.
-        # This prevents stuck sessions from being blindly resumed on restart,
-        # which can create an unrecoverable loop (#7536).  Suspended sessions
-        # auto-reset on the next incoming message, giving the user a clean start.
+        # Mark sessions that were active when the gateway last exited as
+        # resume-pending.  Stuck-loop detection below still suspends sessions
+        # after repeated restart failures, but the first recovery attempt now
+        # preserves the transcript and auto-continues the interrupted turn.
         #
         # SKIP suspension after a clean (graceful) shutdown — the previous
         # process already drained active agents, so sessions aren't stuck.
@@ -4587,7 +4591,7 @@ class GatewayRunner:
         # `hermes gateway restart`, or `/restart`.
         _clean_marker = _hermes_home / ".clean_shutdown"
         if _clean_marker.exists():
-            logger.info("Previous gateway exited cleanly — skipping session suspension")
+            logger.info("Previous gateway exited cleanly — skipping restart recovery")
             try:
                 _clean_marker.unlink()
             except Exception:
@@ -4598,7 +4602,7 @@ class GatewayRunner:
                 if suspended:
                     logger.info("Marked %d in-flight session(s) as resumable from previous run", suspended)
             except Exception as e:
-                logger.warning("Session suspension on startup failed: %s", e)
+                logger.warning("Session restart-recovery marking failed: %s", e)
 
         # Stuck-loop detection (#7536): if a session has been active across
         # 3+ consecutive restarts, it's probably stuck in a loop (the same
@@ -6224,6 +6228,94 @@ class GatewayRunner:
                             pass
             return False
 
+        def _dispatcher_blocker_detail() -> str:
+            """Summarize why ready work did not produce worker spawns."""
+            try:
+                boards = _kb.list_boards(include_archived=False)
+            except Exception:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            try:
+                from hermes_cli.profiles import profile_exists
+            except Exception:
+                profile_exists = None  # type: ignore[assignment]
+            try:
+                from hermes_cli import discord_worker_boards as _dwb
+                from hermes_cli.discord_worker_dispatch import running_role_count
+            except Exception:
+                _dwb = None  # type: ignore[assignment]
+                running_role_count = None  # type: ignore[assignment]
+            details: list[str] = []
+            for b in boards:
+                slug = str(b.get("slug") or _kb.DEFAULT_BOARD)
+                conn = None
+                try:
+                    conn = _kb.connect(board=slug)
+                    rows = conn.execute(
+                        "SELECT id, status, assignee, last_failure_error "
+                        "FROM tasks WHERE status IN ('ready', 'review') "
+                        "AND claim_lock IS NULL ORDER BY priority DESC, created_at ASC LIMIT 20"
+                    ).fetchall()
+                    if not rows:
+                        continue
+                    is_discord = bool(_dwb and _dwb.is_discord_worker_board(slug))
+                    extra = set(_dwb.ROLE_ASSIGNEES) if is_discord and _dwb else set()
+                    unassigned = 0
+                    nonspawnable: set[str] = set()
+                    guarded: dict[str, int] = {}
+                    spawnable: set[str] = set()
+                    for row in rows:
+                        assignee = str(row["assignee"] or "").strip()
+                        if not assignee:
+                            unassigned += 1
+                            continue
+                        assignee_key = assignee.lower()
+                        if (
+                            profile_exists is not None
+                            and assignee_key not in extra
+                            and not profile_exists(assignee)
+                        ):
+                            nonspawnable.add(assignee)
+                            continue
+                        reason = _kb.check_respawn_guard(conn, row["id"])
+                        if reason:
+                            guarded[reason] = guarded.get(reason, 0) + 1
+                            continue
+                        spawnable.add(assignee)
+                    parts = []
+                    if spawnable:
+                        parts.append("spawnable=" + ",".join(sorted(spawnable)[:4]))
+                    if unassigned:
+                        parts.append(f"unassigned={unassigned}")
+                    if nonspawnable:
+                        parts.append("nonprofile=" + ",".join(sorted(nonspawnable)[:4]))
+                    if guarded:
+                        parts.append(
+                            "guarded="
+                            + ",".join(f"{key}:{value}" for key, value in sorted(guarded.items()))
+                        )
+                    if is_discord and running_role_count is not None:
+                        try:
+                            board_running = int(running_role_count(slug) or 0)
+                        except Exception:
+                            board_running = 0
+                        if board_running >= discord_max_workers_per_board:
+                            parts.append(
+                                f"board_worker_cap={board_running}/{discord_max_workers_per_board}"
+                            )
+                    if parts:
+                        details.append(f"{slug}: " + "; ".join(parts))
+                except Exception:
+                    continue
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                if len(details) >= 3:
+                    break
+            return " | ".join(details)
+
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
         # ``kanban.auto_decompose`` (default True). Capped by
@@ -6351,12 +6443,14 @@ class GatewayRunner:
                 if bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())
                     if now - last_warn_at >= 300:
+                        detail = await asyncio.to_thread(_dispatcher_blocker_detail)
                         logger.warning(
                             "kanban dispatcher stuck: ready queue non-empty for "
                             "%d consecutive ticks but 0 workers spawned. Check "
                             "profile health (venv, PATH, credentials) and "
-                            "`hermes kanban list --status ready`.",
+                            "`hermes kanban list --status ready`. %s",
                             bad_ticks,
+                            f"Observed: {detail}" if detail else "No blocker detail available.",
                         )
                         last_warn_at = now
             except asyncio.CancelledError:
@@ -7448,16 +7542,23 @@ class GatewayRunner:
                 _resume_reason = (
                     "restart_timeout" if self._restart_requested else "shutdown_timeout"
                 )
+                _marked_resume = 0
                 for _sk, _agent in list(self._running_agents.items()):
                     if _agent is _AGENT_PENDING_SENTINEL:
                         continue
                     try:
-                        self.session_store.mark_resume_pending(_sk, _resume_reason)
+                        if self.session_store.mark_resume_pending(_sk, _resume_reason):
+                            _marked_resume += 1
                     except Exception as _e:
                         logger.debug(
                             "mark_resume_pending failed for %s: %s",
                             _sk, _e,
                         )
+                logger.info(
+                    "Marked %d interrupted session(s) resume-pending before gateway %s",
+                    _marked_resume,
+                    "restart" if self._restart_requested else "shutdown",
+                )
                 self._interrupt_running_agents(
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
@@ -7609,8 +7710,8 @@ class GatewayRunner:
             else:
                 logger.info(
                     "Skipping .clean_shutdown marker — drain timed out with "
-                    "interrupted agents; next startup will suspend recently "
-                    "active sessions."
+                    "interrupted agents; next startup will auto-resume recent "
+                    "resume-pending sessions."
                 )
 
             # Track sessions that were active at shutdown for stuck-loop
