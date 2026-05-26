@@ -71,6 +71,55 @@ def _durable_metadata(value: Any) -> Any:
     return None if safe is _DROP else safe
 
 
+def _discord_board_slug_for_item(item: dict[str, Any]) -> str:
+    feature_summary = item.get("feature_summary")
+    if isinstance(feature_summary, dict):
+        board = feature_summary.get("kanban_board")
+        if isinstance(board, dict):
+            slug = str(board.get("slug") or "").strip()
+            if slug:
+                return slug
+    try:
+        from hermes_cli.discord_worker_roles import board_slug_for_discord_thread
+        from hermes_cli import kanban_db
+
+        source = item.get("source") if isinstance(item.get("source"), dict) else {}
+        thread_id = str(source.get("thread_id") or source.get("chat_id") or "").strip()
+        if not thread_id:
+            return ""
+        slug = board_slug_for_discord_thread(thread_id)
+        return slug if kanban_db.board_exists(slug) else ""
+    except Exception:
+        return ""
+
+
+def _record_discord_board_final_response(
+    item: dict[str, Any],
+    *,
+    result_message_id: str | None = None,
+) -> None:
+    if item.get("platform") != "discord":
+        return
+    final_response = str(item.get("final_response") or "")
+    if not final_response and not result_message_id:
+        return
+    slug = _discord_board_slug_for_item(item)
+    if not slug:
+        return
+    try:
+        from hermes_cli.discord_worker_boards import record_final_discord_response
+
+        record_final_discord_response(
+            slug,
+            final_response=final_response,
+            session_id=str(item.get("session_id") or "") or None,
+            work_item_id=str(item.get("id") or "") or None,
+            result_message_id=result_message_id,
+        )
+    except Exception:
+        pass
+
+
 def _item_id(
     *,
     platform: Any,
@@ -262,6 +311,7 @@ class GatewayWorkLedger:
             item["feature_summary"] = _durable_metadata(feature_summary)
         if project_summary is not None:
             item["project_summary"] = _durable_metadata(project_summary)
+        _record_discord_board_final_response(item)
         self._write(data)
         return True
 
@@ -274,6 +324,10 @@ class GatewayWorkLedger:
         item["updated_at"] = self._now()
         if result_message_id:
             item["result_message_id"] = str(result_message_id)
+        _record_discord_board_final_response(
+            item,
+            result_message_id=str(result_message_id) if result_message_id else None,
+        )
         self._write(data)
         return True
 
