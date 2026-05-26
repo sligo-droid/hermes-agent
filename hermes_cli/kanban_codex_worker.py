@@ -763,6 +763,8 @@ def _reset_pr_status_fields(worker: dict[str, Any]) -> None:
         "pr_mergeable",
         "pr_is_draft",
         "pr_review_decision",
+        "pr_merged_at",
+        "pr_merge_commit",
         "pr_checks_status",
         "pr_checks_total",
         "pr_checks_failed",
@@ -834,6 +836,31 @@ def _check_rollup_summary(items: Any) -> tuple[str, int, list[str]]:
     return "passed", total, []
 
 
+def _pr_merge_wait_seconds() -> float:
+    raw = os.environ.get("HERMES_KANBAN_PR_MERGE_WAIT_SECONDS", "300")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _pr_merge_poll_seconds() -> float:
+    raw = os.environ.get("HERMES_KANBAN_PR_MERGE_POLL_SECONDS", "10")
+    try:
+        return max(0.5, float(raw))
+    except (TypeError, ValueError):
+        return 10.0
+
+
+def _pr_ref(worker: dict[str, Any]) -> str:
+    return str(worker.get("pr_url") or worker.get("pr_number") or "").strip()
+
+
+def _pr_is_merged(worker: dict[str, Any]) -> bool:
+    state = str(worker.get("pr_state") or "").strip().upper()
+    return state == "MERGED" or bool(worker.get("pr_merged_at"))
+
+
 def _pr_blocker(worker: dict[str, Any]) -> str:
     if worker.get("pr_error"):
         return str(worker.get("pr_error") or "")
@@ -841,6 +868,11 @@ def _pr_blocker(worker: dict[str, Any]) -> str:
         return str(worker.get("pr_status_error") or "")
     if not worker.get("pr_url"):
         return "PR not opened"
+    state = str(worker.get("pr_state") or "").strip().upper()
+    if state == "MERGED":
+        return ""
+    if state and state not in {"OPEN", "UNKNOWN"}:
+        return f"PR state: {state}"
     if worker.get("pr_is_draft") is True:
         return "PR is draft"
     review_decision = str(worker.get("pr_review_decision") or "").strip().upper()
@@ -852,6 +884,8 @@ def _pr_blocker(worker: dict[str, Any]) -> str:
         return f"checks failed: {failed}" if failed else "checks failed"
     if checks_status == "pending":
         return "checks pending"
+    if checks_status == "not checked":
+        return "checks not checked"
     merge_state = str(worker.get("pr_merge_state") or "unknown").strip().upper()
     if merge_state and merge_state not in {"CLEAN", "HAS_HOOKS", "UNKNOWN"}:
         return f"merge state: {merge_state}"
@@ -859,7 +893,7 @@ def _pr_blocker(worker: dict[str, Any]) -> str:
 
 
 def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None:
-    pr_ref = str(worker.get("pr_url") or worker.get("pr_number") or "").strip()
+    pr_ref = _pr_ref(worker)
     if not pr_ref:
         worker.setdefault("pr_checks_status", "not checked")
         worker.setdefault("pr_merge_state", "unknown")
@@ -878,7 +912,7 @@ def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None
             "--repo",
             repo,
             "--json",
-            "number,url,state,mergeStateStatus,mergeable,isDraft,reviewDecision,statusCheckRollup",
+            "number,url,state,mergedAt,mergeCommit,mergeStateStatus,mergeable,isDraft,reviewDecision,statusCheckRollup",
         ],
         cwd=root,
         capture_output=True,
@@ -910,6 +944,9 @@ def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None
     if data.get("number") is not None:
         worker["pr_number"] = str(data.get("number"))
     worker["pr_state"] = str(data.get("state") or "unknown")
+    worker["pr_merged_at"] = str(data.get("mergedAt") or "")
+    merge_commit = data.get("mergeCommit") if isinstance(data.get("mergeCommit"), dict) else {}
+    worker["pr_merge_commit"] = str(merge_commit.get("oid") or "")
     worker["pr_merge_state"] = str(data.get("mergeStateStatus") or "unknown")
     worker["pr_mergeable"] = data.get("mergeable") if data.get("mergeable") is not None else "unknown"
     worker["pr_is_draft"] = bool(data.get("isDraft"))
@@ -919,6 +956,54 @@ def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None
     worker["pr_checks_total"] = checks_total
     worker["pr_checks_failed"] = failed
     worker["pr_blocker"] = _pr_blocker(worker)
+
+
+def _ensure_pr_merged(worker: dict[str, Any], *, root: Path, repo: str) -> bool:
+    pr_ref = _pr_ref(worker)
+    if not pr_ref:
+        worker.setdefault("pr_checks_status", "not checked")
+        worker.setdefault("pr_merge_state", "unknown")
+        worker["pr_blocker"] = _pr_blocker(worker)
+        return False
+
+    deadline = time.monotonic() + _pr_merge_wait_seconds()
+    poll_seconds = _pr_merge_poll_seconds()
+    while True:
+        _refresh_pr_status(worker, root=root, repo=repo)
+        if _pr_is_merged(worker):
+            worker["pr_blocker"] = ""
+            return True
+
+        blocker = _pr_blocker(worker)
+        if not blocker:
+            merged = subprocess.run(
+                ["gh", "pr", "merge", pr_ref, "--repo", repo, "--merge", "--delete-branch"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if merged.returncode != 0:
+                worker["pr_status_error"] = (
+                    merged.stderr or merged.stdout or "gh pr merge failed"
+                ).strip()
+                worker["pr_blocker"] = _pr_blocker(worker)
+                return False
+            _refresh_pr_status(worker, root=root, repo=repo)
+            if _pr_is_merged(worker):
+                worker["pr_blocker"] = ""
+                return True
+            worker["pr_blocker"] = _pr_blocker(worker) or "PR did not report merged after merge"
+            return False
+
+        if blocker not in {"checks pending", "checks not checked"}:
+            worker["pr_blocker"] = blocker
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            worker["pr_blocker"] = blocker
+            return False
+        time.sleep(min(poll_seconds, remaining))
 
 
 def _ensure_pr(board: Optional[str], workspace: str) -> bool:
@@ -957,31 +1042,35 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
             worker["pr_mergeable"] = True
             worker["pr_blocker"] = ""
         else:
-            existing = subprocess.run(
-                [
-                    "gh",
-                    "pr",
-                    "list",
-                    "--repo",
-                    repo,
-                    "--head",
-                    branch,
-                    "--base",
-                    base,
-                    "--state",
-                    "open",
-                    "--json",
-                    "url",
-                    "--jq",
-                    ".[0].url",
-                ],
-                cwd=root,
-                capture_output=True,
-                text=True,
-                timeout=20,
-            )
-            existing_url = (existing.stdout or "").strip()
-            if existing.returncode == 0 and existing_url and existing_url != "null":
+            existing_url = ""
+            if worker.get("pr_url"):
+                existing_url = str(worker.get("pr_url") or "").strip()
+            if not existing_url:
+                existing = subprocess.run(
+                    [
+                        "gh",
+                        "pr",
+                        "list",
+                        "--repo",
+                        repo,
+                        "--head",
+                        branch,
+                        "--base",
+                        base,
+                        "--state",
+                        "open",
+                        "--json",
+                        "url",
+                        "--jq",
+                        ".[0].url",
+                    ],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                existing_url = (existing.stdout or "").strip()
+            if existing_url and existing_url != "null":
                 worker["pr_url"] = existing_url
             else:
                 pushed = subprocess.run(
@@ -1037,7 +1126,7 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
                         created.stderr or created.stdout or "gh pr create failed"
                     ).strip()
         if worker.get("pr_url"):
-            _refresh_pr_status(worker, root=root, repo=repo)
+            _ensure_pr_merged(worker, root=root, repo=repo)
         elif not worker.get("pr_skipped_no_changes"):
             worker.setdefault("pr_checks_status", "not checked")
             worker.setdefault("pr_merge_state", "unknown")
@@ -1053,7 +1142,9 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
     has_pr_or_skip = bool(worker.get("pr_url")) or bool(
         worker.get("pr_skipped_no_changes")
     )
-    return has_pr_or_skip and not bool(worker.get("pr_error"))
+    if worker.get("pr_skipped_no_changes"):
+        return not bool(worker.get("pr_error"))
+    return has_pr_or_skip and _pr_is_merged(worker) and not bool(worker.get("pr_error"))
 
 
 def _merge_criteria(board: Optional[str], criteria: list[str]) -> None:

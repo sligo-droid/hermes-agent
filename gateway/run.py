@@ -76,7 +76,10 @@ _CODEX_APP_SERVER_ACTIVITY_PREFIX = "Codex app-server event:"
 _MEETING_GOAL_SKILL_NAMES = {"meeting", "discord-meeting-intake"}
 _MEETING_AUTO_GOAL_TEXT = "Follow up on the todos from this meeting."
 _DISCORD_FEATURE_REQUEST_FAST_PATH_PROMPT = (
-    "Discord feature-request thread guidance: move directly from request to "
+    "Discord feature-request thread guidance: treat the latest user message as "
+    "the authoritative task. Earlier transcript, [Recent channel messages], and "
+    "context compaction summaries are background only unless the latest message "
+    "explicitly revives them. Move directly from that latest request to "
     "implementation and verification. For straightforward code/deploy asks, "
     "avoid lengthy planning/status narration, make the smallest correct change, "
     "run focused checks, and report the result concisely with PR/deploy evidence "
