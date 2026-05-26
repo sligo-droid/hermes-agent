@@ -432,7 +432,7 @@ def test_board_stalled_alerts_are_per_board_and_do_not_repeat_terminal_state(mon
     assert alerts_due([older], now=2000, config={"cooldown_seconds": 1}) == []
 
 
-def test_human_intervention_scan_assesses_foreman_board_once(monkeypatch, tmp_path):
+def test_human_intervention_scan_alerts_blocked_foreman_board_without_assessment(monkeypatch, tmp_path):
     board = _discord_board(monkeypatch, tmp_path)
     from hermes_cli import kanban_db
     from hermes_cli.discord_worker_foreman import collect_human_intervention_issues, render_foreman_goal_prompt
@@ -504,7 +504,7 @@ def test_human_intervention_scan_assesses_foreman_board_once(monkeypatch, tmp_pa
         assessment_fn=assess,
     )
 
-    assert calls == [first[0].evidence["foreman_task_id"]]
+    assert calls == []
     assert [(issue.kind, issue.board, issue.task_id) for issue in first] == [
         ("human_intervention_required", "discord-source", "source-task")
     ]
@@ -512,13 +512,13 @@ def test_human_intervention_scan_assesses_foreman_board_once(monkeypatch, tmp_pa
         ("human_intervention_required", "discord-source", "source-task")
     ]
     assert first[0].evidence["foreman_board"] == board
-    assert first[0].evidence["manual_intervention_reason"] == "A human must create the API key in the vendor console."
-    assert first[0].evidence["manual_intervention_type"] == "api_key"
+    assert "has remained blocked" in first[0].evidence["manual_intervention_reason"]
+    assert "Cannot continue without a human-created API key." in first[0].evidence["manual_intervention_reason"]
+    assert first[0].evidence["manual_intervention_type"] == "foreman_blocked"
     assert first[0].evidence["manual_intervention_steps"] == [
-        "Open the vendor developer console for the PID project.",
-        "Create a read-only API key for the data ingestion job.",
-        "Add the key to the Hermes/PID secret store as PID_VENDOR_API_KEY.",
-        "Ask Hermes to retry the blocked source task.",
+        "Open the Foreman board linked in this alert and inspect the blocked task.",
+        "Decide whether to retry or reassign the Foreman worker, add missing human context, or cancel the attempt.",
+        "Reply in Discord with the next action Hermes should take, then ask Hermes to retry the blocked source task if appropriate.",
     ]
     assert first[0].evidence["llm_confidence"] == "high"
 
@@ -535,9 +535,9 @@ def test_human_intervention_scan_records_negative_assessment_once(monkeypatch, t
         {
             "initial_request": render_foreman_goal_prompt(source),
             "root_goal": render_foreman_goal_prompt(source),
-            "goal_status": "blocked",
-            "phase": "blocked",
-            "blocked_reason": "Autonomous retry might still fix this.",
+            "goal_status": "active",
+            "phase": "running",
+            "blocked_reason": "",
             "updated_at": 100,
         }
     )
@@ -546,12 +546,19 @@ def test_human_intervention_scan_records_negative_assessment_once(monkeypatch, t
     kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
     conn = kanban_db.connect(board=board)
     try:
-        kanban_db.create_task(
+        task_id = kanban_db.create_task(
             conn,
             title="Resolve foreman escalation",
             assignee="dev",
-            initial_status="blocked",
+            initial_status="running",
             board=board,
+        )
+        assert kanban_db.claim_task(conn, task_id)
+        kanban_db._record_spawn_failure(
+            conn,
+            task_id,
+            "Autonomous retry might still fix this.",
+            failure_limit=999,
         )
     finally:
         conn.close()

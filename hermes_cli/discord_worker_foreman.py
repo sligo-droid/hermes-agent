@@ -286,9 +286,11 @@ def collect_human_intervention_issues(
 ) -> list[ForemanIssue]:
     """Return human-escalation issues for blocked foreman-generated boards.
 
-    The manual-configuration decision is intentionally made by an auxiliary
-    LLM once per unique foreman-board blockage, then persisted in foreman
-    state so the watcher does not keep spending inference on the same block.
+    A foreman board that is itself stalled after the configured age is already
+    the terminal escalation path: the autonomous foreman attempt has blocked, so
+    alert a human deterministically instead of letting a manual-configuration
+    classifier suppress the alert. Non-stalled foreman failures still use the
+    auxiliary classifier once per unique blockage and persist the result.
     """
     now = int(time.time()) if now is None else int(now)
     min_age = _coerce_nonnegative_int(
@@ -305,10 +307,30 @@ def collect_human_intervention_issues(
     issues: list[ForemanIssue] = []
     seen_keys: set[str] = set()
     for snapshot in collect_board_snapshots(foreman_generated_only=True):
+        stalled = []
+        if _foreman_board_explicitly_blocked(snapshot):
+            stalled = [
+                _with_foreman_source(issue, snapshot)
+                for issue in detect_stalled_blocked_board(
+                    snapshot,
+                    now=now,
+                    min_age_seconds=min_age,
+                    include_worker_error_blockers=True,
+                )
+            ]
+        if stalled:
+            issues.extend(
+                _manual_intervention_issue(
+                    issue,
+                    _foreman_blocked_attention_assessment(issue, now=now),
+                )
+                for issue in stalled
+            )
+            continue
+
         candidates: list[ForemanIssue] = []
         candidates.extend(detect_worker_errored(snapshot))
         candidates.extend(detect_missing_read_broker(snapshot))
-        candidates.extend(detect_stalled_blocked_board(snapshot, now=now, min_age_seconds=min_age))
         candidates = [_with_foreman_source(issue, snapshot) for issue in candidates]
         for issue in candidates:
             key = _manual_assessment_key(issue)
@@ -782,6 +804,7 @@ def detect_stalled_blocked_board(
     *,
     now: int,
     min_age_seconds: int = BLOCKED_BOARD_MIN_AGE_SECONDS,
+    include_worker_error_blockers: bool = False,
 ) -> list[ForemanIssue]:
     """Detect board-level blockers that leave a worker board unable to progress."""
     if snapshot.archived or _board_is_terminal(snapshot):
@@ -804,7 +827,7 @@ def detect_stalled_blocked_board(
         return []
 
     blocker = _board_blocker_task(snapshot)
-    if blocker is not None and _task_has_worker_error_issue(blocker):
+    if blocker is not None and not include_worker_error_blockers and _task_has_worker_error_issue(blocker):
         return []
 
     stalled_since = _board_stalled_since(snapshot, blocker)
@@ -964,6 +987,14 @@ def _board_is_terminal(snapshot: BoardSnapshot) -> bool:
         or phase in {"complete", "cancelled"}
         or thread_state in {"done", "archived", "cancelled"}
     )
+
+
+def _foreman_board_explicitly_blocked(snapshot: BoardSnapshot) -> bool:
+    """Return True when the foreman worker board itself advertises a blocked state."""
+    goal_status = _canonical_problem_text(snapshot.goal_status)
+    phase = _canonical_problem_text(snapshot.phase)
+    thread_state = _canonical_problem_text(snapshot.thread_state)
+    return goal_status == "blocked" or phase == "blocked" or thread_state == "blocked"
 
 
 def _board_task_counts(snapshot: BoardSnapshot) -> dict[str, int]:
@@ -1257,6 +1288,40 @@ def _manual_instruction_steps(evidence: dict[str, Any]) -> list[str]:
     return _normalize_instruction_steps(
         {"instructions": evidence.get("manual_intervention_steps")}
     )
+
+
+def _foreman_blocked_attention_assessment(issue: ForemanIssue, *, now: int) -> dict[str, Any]:
+    evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
+    problem = (
+        evidence.get("blocked_reason")
+        or evidence.get("sidecar_error")
+        or evidence.get("run_error")
+        or evidence.get("error_excerpt")
+        or issue.title
+        or "The foreman board is blocked."
+    )
+    age = evidence.get("stalled_age_seconds")
+    threshold = evidence.get("stalled_after_seconds")
+    if age not in (None, "") and threshold not in (None, ""):
+        reason = (
+            f"Foreman board {issue.board} has remained blocked for {age} seconds "
+            f"after the {threshold}-second alert threshold. Latest blocker: {problem}"
+        )
+    else:
+        reason = f"Foreman board {issue.board} is blocked. Latest blocker: {problem}"
+    return {
+        "assessed_at": now,
+        "requires_manual_intervention": True,
+        "reason": _truncate_text(_sanitize_text(reason), 300),
+        "intervention_type": "foreman_blocked",
+        "instructions": [
+            "Open the Foreman board linked in this alert and inspect the blocked task.",
+            "Decide whether to retry or reassign the Foreman worker, add missing human context, or cancel the attempt.",
+            "Reply in Discord with the next action Hermes should take, then ask Hermes to retry the blocked source task if appropriate.",
+        ],
+        "confidence": "high",
+        "error": "",
+    }
 
 
 def _safe_foreman_mention(mention: str = "") -> str:
