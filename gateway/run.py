@@ -12538,6 +12538,50 @@ class GatewayRunner:
         if not todos:
             return ""
 
+        async def _defer_discord_goal_embed_after_delivery(project_context: dict[str, Any]) -> bool:
+            adapter = getattr(self, "adapters", {}).get(Platform.DISCORD)
+            initializer = getattr(adapter, "initialize_goal_feature_summary_for_source", None)
+            if not adapter or not callable(initializer):
+                logger.debug("meeting auto-goal: Discord feature summary initializer unavailable")
+                return False
+
+            source = event.source
+            initial_request = f"/goal {_MEETING_AUTO_GOAL_TEXT}"
+
+            async def _deliver() -> bool:
+                try:
+                    handle = await initializer(
+                        source,
+                        initial_request=initial_request,
+                        project_context=project_context,
+                    )
+                    return bool(handle)
+                except Exception as exc:
+                    logger.warning("meeting auto-goal: feature summary embed send failed: %s", exc, exc_info=True)
+                    return False
+
+            try:
+                session_key = self._session_key_for_source(source)
+            except Exception:
+                session_key = None
+
+            if session_key and hasattr(adapter, "register_post_delivery_callback"):
+                try:
+                    generation = None
+                    active = getattr(adapter, "_active_sessions", {}).get(session_key)
+                    if active is not None:
+                        generation = getattr(active, "_hermes_run_generation", None)
+                    adapter.register_post_delivery_callback(
+                        session_key,
+                        _deliver,
+                        generation=generation,
+                    )
+                    return True
+                except Exception as exc:
+                    logger.debug("meeting auto-goal: post-delivery embed registration failed: %s", exc)
+
+            return await _deliver()
+
         source = getattr(event, "source", None)
         platform = getattr(source, "platform", None)
         platform_value = platform.value if hasattr(platform, "value") else str(platform or "")
@@ -12588,6 +12632,7 @@ class GatewayRunner:
                             event.skip_post_turn_goal_once = True
                         except Exception:
                             pass
+                        await _defer_discord_goal_embed_after_delivery(dict(board.worker.get("project_context") or {}))
                         return ""
                     return ""
                 except Exception as exc:
