@@ -1,0 +1,11 @@
+name: coding-planner
+version: 0.1.0
+description: "Planning profile for decomposing coding work."
+hermes_requires: ">=0.1.0"
+author: "Hermes Agent"
+license: "MIT"
+distribution_owned:
+  - SOUL.md
+  - config.yaml
+  - skills
+  - distribution.yaml
