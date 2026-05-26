@@ -249,10 +249,10 @@ def collect_foreman_issues(
 def coalesce_foreman_issues(issues: Iterable[ForemanIssue]) -> list[ForemanIssue]:
     """Suppress redundant autonomous foreman work for a source board.
 
-    Foreman should make at most one autonomous recovery attempt for a source
-    board at a time. Human-intervention alerts remain exempt because they are
-    the terminal escalation path after an autonomous attempt discovers a
-    human-only blocker.
+    Foreman should make at most one recovery path visible for a source board at
+    a time. Human-intervention alerts are terminal escalations, so when one is
+    present it consumes the source-board slot and suppresses the matching
+    autonomous foreman retry prompt for that tick.
     """
     active_sources = _active_foreman_source_boards()
     seen_sources = set(active_sources)
@@ -266,10 +266,12 @@ def coalesce_foreman_issues(issues: Iterable[ForemanIssue]) -> list[ForemanIssue
             str(getattr(item, "kind", "") or ""),
         ),
     ):
+        source_board = _issue_source_board(issue)
         if getattr(issue, "kind", "") == "human_intervention_required":
             coalesced.append(issue)
+            if source_board:
+                seen_sources.add(source_board)
             continue
-        source_board = _issue_source_board(issue)
         if source_board and source_board in seen_sources:
             continue
         coalesced.append(issue)
@@ -364,7 +366,13 @@ def alerts_due(
     changed = _gc_alert_state(state, now=now, retention_seconds=int(cfg["retention_seconds"]))
     due: list[ForemanIssue] = []
     due_groups: set[str] = set()
+    due_human_input_keys: set[str] = set()
     for _, issue in sorted(enumerate(issues), key=lambda item: _alert_issue_sort_key(item[0], item[1])):
+        human_input_key = _human_input_condition_key(issue)
+        if issue.kind != "human_intervention_required" and (
+            human_input_key in due_human_input_keys or _human_input_already_sent(state, issue)
+        ):
+            continue
         if not _board_created_at_allowed(issue, min_created_at=int(cfg["min_board_created_at"])):
             continue
         fingerprint = _issue_fingerprint(issue)
@@ -404,6 +412,8 @@ def alerts_due(
         ):
             due.append(issue)
             due_groups.add(group_key)
+            if issue.kind == "human_intervention_required":
+                due_human_input_keys.add(human_input_key)
     if changed:
         _write_alert_state(state)
     return due
@@ -471,6 +481,8 @@ def record_alert_sent(issue: ForemanIssue, *, now: Optional[int] = None) -> None
     group_entry["failure_count"] = 0
     group_entry["next_retry_at"] = None
     group_entry["last_error"] = ""
+    if issue.kind == "human_intervention_required":
+        _record_human_input_sent(state, issue, now=now)
     _write_alert_state(state)
 
 
@@ -1449,6 +1461,7 @@ def _read_alert_state() -> dict[str, Any]:
             "version": ALERT_STATE_VERSION,
             "alerts": {},
             "issue_groups": {},
+            "human_input_alerts": {},
             "manual_assessments": {},
             "daily_counts": {},
         }
@@ -1458,6 +1471,9 @@ def _read_alert_state() -> dict[str, Any]:
     groups = raw.get("issue_groups")
     if not isinstance(groups, dict):
         raw["issue_groups"] = {}
+    human_input_alerts = raw.get("human_input_alerts")
+    if not isinstance(human_input_alerts, dict):
+        raw["human_input_alerts"] = {}
     assessments = raw.get("manual_assessments")
     if not isinstance(assessments, dict):
         raw["manual_assessments"] = {}
@@ -1471,6 +1487,7 @@ def _write_alert_state(state: dict[str, Any]) -> None:
     state["version"] = ALERT_STATE_VERSION
     state.setdefault("alerts", {})
     state.setdefault("issue_groups", {})
+    state.setdefault("human_input_alerts", {})
     state.setdefault("manual_assessments", {})
     state.setdefault("daily_counts", {})
     atomic_json_write(_alert_state_path(), state, indent=2, sort_keys=True)
@@ -1575,6 +1592,39 @@ def _issue_group_state_key(issue: ForemanIssue) -> str:
         "severity": issue.severity,
     }
     return _stable_digest(payload)
+
+
+def _human_input_condition_key(issue: ForemanIssue) -> str:
+    evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
+    source_issue_kind = str(evidence.get("source_issue_kind") or "").strip()
+    payload = {
+        "detector_version": ALERT_DETECTOR_VERSION,
+        "source_board": _issue_source_board(issue),
+        "source_task_id": str(evidence.get("source_task_id") or issue.task_id or "").strip(),
+        "source_issue_kind": source_issue_kind or str(issue.kind or "").strip(),
+    }
+    return _stable_digest(payload)
+
+
+def _human_input_already_sent(state: dict[str, Any], issue: ForemanIssue) -> bool:
+    alerts = state.setdefault("human_input_alerts", {})
+    entry = alerts.get(_human_input_condition_key(issue))
+    return isinstance(entry, dict) and bool(entry.get("last_sent_at"))
+
+
+def _record_human_input_sent(state: dict[str, Any], issue: ForemanIssue, *, now: int) -> None:
+    alerts = state.setdefault("human_input_alerts", {})
+    key = _human_input_condition_key(issue)
+    entry = alerts.get(key)
+    if not isinstance(entry, dict):
+        entry = _new_alert_entry(now)
+        alerts[key] = entry
+    entry["last_sent_at"] = now
+    entry["last_attempt_at"] = now
+    entry["send_count"] = int(entry.get("send_count") or 0) + 1
+    entry["failure_count"] = 0
+    entry["next_retry_at"] = None
+    entry["last_error"] = ""
 
 
 def _issue_group_payload(issue: ForemanIssue) -> dict[str, Any]:
@@ -1758,6 +1808,18 @@ def _gc_alert_state(state: dict[str, Any], *, now: int, retention_seconds: int) 
         attempted = int(entry.get("last_attempt_at") or 0)
         if max(seen, sent, attempted) < cutoff:
             groups.pop(fingerprint, None)
+            changed = True
+    human_input_alerts = state.setdefault("human_input_alerts", {})
+    for fingerprint, entry in list(human_input_alerts.items()):
+        if not isinstance(entry, dict):
+            human_input_alerts.pop(fingerprint, None)
+            changed = True
+            continue
+        seen = int(entry.get("first_seen_at") or 0)
+        sent = int(entry.get("last_sent_at") or 0)
+        attempted = int(entry.get("last_attempt_at") or 0)
+        if max(seen, sent, attempted) < cutoff:
+            human_input_alerts.pop(fingerprint, None)
             changed = True
     assessments = state.setdefault("manual_assessments", {})
     for fingerprint, entry in list(assessments.items()):

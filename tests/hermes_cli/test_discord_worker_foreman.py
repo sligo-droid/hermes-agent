@@ -221,6 +221,7 @@ def test_coalesce_foreman_issues_suppresses_active_same_source_board(monkeypatch
 
     assert foreman.coalesce_foreman_issues([source]) == []
     assert foreman.coalesce_foreman_issues([human]) == [human]
+    assert foreman.coalesce_foreman_issues([source, human]) == [human]
 
 
 def test_coalesce_foreman_issues_keeps_one_autonomous_issue_per_source(monkeypatch):
@@ -729,7 +730,7 @@ def test_alerts_due_dedupes_same_problem_across_boards(monkeypatch, tmp_path):
     assert alerts_due([second], now=5000, config={"cooldown_seconds": 1}) == []
 
 
-def test_human_intervention_alert_has_own_daily_bucket(monkeypatch, tmp_path):
+def test_human_intervention_alert_suppresses_matching_source_warning(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
 
@@ -757,6 +758,7 @@ def test_human_intervention_alert_has_own_daily_bucket(monkeypatch, tmp_path):
         evidence={
             "source_board": "discord-source",
             "source_task_id": "__board__",
+            "source_issue_kind": "board_stalled",
             "foreman_board": "foreman-abc",
             "manual_intervention_type": "foreman_blocked",
             "thread_state": "blocked",
@@ -766,10 +768,33 @@ def test_human_intervention_alert_has_own_daily_bucket(monkeypatch, tmp_path):
     )
 
     config = {"daily_cap_per_board": 1, "terminal_suppression_age_seconds": 10_000}
+    assert alerts_due([source_warning, human], now=900, config=config) == [human]
     record_alert_sent(source_warning, now=1000)
 
     assert alerts_due([human], now=1100, config=config) == [human]
     record_alert_sent(human, now=1100)
+    matching_warning = _alert_issue(
+        kind="board_stalled",
+        board="discord-source",
+        task_id="__board__",
+        severity="warning",
+        title="Discord worker board is blocked with no running workers",
+        evidence={**source_warning.evidence, "stalled_age_seconds": 900},
+    )
+    other_task_warning = _alert_issue(
+        kind="worker_errored",
+        board="discord-source",
+        task_id="other-source-task",
+        severity="error",
+        title="Worker execution failed",
+        evidence={"task_status": "blocked", "run_error": "different failure"},
+    )
+
+    assert alerts_due([matching_warning], now=1200, config={**config, "daily_cap_per_board": 10}) == []
+    assert alerts_due([other_task_warning], now=1200, config={**config, "daily_cap_per_board": 10}) == [
+        other_task_warning
+    ]
+
     another_human = _alert_issue(
         kind="human_intervention_required",
         board="discord-source",
