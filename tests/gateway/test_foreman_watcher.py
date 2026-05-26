@@ -14,6 +14,7 @@ class ForemanAdapter:
         self.sent = []
         self.created_threads = []
         self.created_goals = []
+        self.synced_reactions = []
 
     async def send(self, chat_id, content, metadata=None):
         self.sent.append({"chat_id": chat_id, "content": content, "metadata": metadata})
@@ -29,19 +30,31 @@ class ForemanAdapter:
             "message_id": f"message-{len(self.created_threads)}",
         }
 
+    async def send_worker_task_embed(self, thread_chat_id, **kwargs):
+        self.created_threads.append({"thread_chat_id": thread_chat_id, **kwargs})
+        return {
+            "thread_id": str(thread_chat_id),
+            "thread_name": kwargs.get("title") or "worker task",
+            "message_id": f"message-{len(self.created_threads)}",
+        }
+
     async def create_foreman_goal_thread(self, parent_chat_id, **kwargs):
         self.created_goals.append({"parent_chat_id": parent_chat_id, **kwargs})
         if self.error:
             raise self.error
         return {
-            "thread_id": f"goal-thread-{len(self.created_goals)}",
+            "thread_id": str(parent_chat_id),
             "thread_name": kwargs.get("name") or "foreman goal",
             "message_id": f"goal-message-{len(self.created_goals)}",
             "guild_id": "guild-1",
-            "parent_channel_id": str(parent_chat_id),
+            "parent_channel_id": "source-parent",
             "initial_request": kwargs.get("initial_request") or "",
             "project_context": {"project_name": "Hermes", "project_path": "/repo/hermes"},
         }
+
+    async def sync_kanban_thread_reaction(self, target):
+        self.synced_reactions.append(dict(target))
+        return target.get("reaction_state") or target.get("state")
 
 
 def _runner(adapter=None):
@@ -150,7 +163,7 @@ def test_foreman_watcher_missing_config_does_not_scan(monkeypatch):
     assert adapter.created_goals == []
 
 
-def test_foreman_spawned_task_creates_dev_thread_and_subscription(monkeypatch, tmp_path):
+def test_foreman_spawned_task_posts_source_thread_embed_and_subscription(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://hermes.example.test")
     _patch_config(monkeypatch, _enabled_config())
@@ -190,8 +203,7 @@ def test_foreman_spawned_task_creates_dev_thread_and_subscription(monkeypatch, t
 
     assert len(adapter.created_threads) == 1
     created = adapter.created_threads[0]
-    assert created["parent_chat_id"] == "1504252294495998043"
-    assert created["name"] == "dev: Build dashboard filters"
+    assert created["thread_chat_id"] == "123"
     assert created["title"] == "Build dashboard filters"
     assert "Add filter controls" in created["initial_request"]
     assert created["project_context"] == {"project_name": "Hermes", "project_path": "/repo/hermes"}
@@ -201,9 +213,10 @@ def test_foreman_spawned_task_creates_dev_thread_and_subscription(monkeypatch, t
     assert created["source_task_url"] == f"https://hermes.example.test/workers/123/tickets/{task_id}"
     assert created["source_kanban_url"] == "https://hermes.example.test/workers/123"
     assert created["source_discord_thread_url"] == "https://discord.com/channels/guild-1/123"
+    assert created["hide_source_links"] is True
 
     state = read_codex_worker_state(task_id, board=board.slug)
-    assert state["foreman_thread"]["thread_id"] == "thread-1"
+    assert state["foreman_thread"]["thread_id"] == "123"
     assert state["foreman_thread"]["message_id"] == "message-1"
 
     conn = kanban_db.connect(board=board.slug)
@@ -215,8 +228,8 @@ def test_foreman_spawned_task_creates_dev_thread_and_subscription(monkeypatch, t
         {
             "task_id": task_id,
             "platform": "discord",
-            "chat_id": "1504252294495998043",
-            "thread_id": "thread-1",
+            "chat_id": "parent-123",
+            "thread_id": "123",
             "user_id": "system:foreman",
             "notifier_profile": "default",
             "created_at": subs[0]["created_at"],
@@ -267,8 +280,13 @@ def test_foreman_watcher_starts_due_issue_as_internal_goal(monkeypatch):
     _patch_no_human_escalations(monkeypatch)
     from hermes_cli import discord_worker_foreman as foreman
 
-    first = _issue("t1")
-    skipped = _issue("t2")
+    first = _issue(
+        "t1",
+        thread_id="source-thread-1",
+        chat_id="source-thread-1",
+        parent_channel_id="source-parent",
+    )
+    skipped = _issue("t2", thread_id="source-thread-2", chat_id="source-thread-2")
     due_calls = []
     sent = []
     failed = []
@@ -302,27 +320,38 @@ def test_foreman_watcher_starts_due_issue_as_internal_goal(monkeypatch):
     assert due_calls[0][1]["daily_cap_per_board"] == 200
     assert due_calls[0][1]["terminal_suppression_age_seconds"] == 0
     assert adapter.sent == []
-    assert adapter.created_goals == [
-        {
-            "parent_chat_id": "1504252294495998043",
-            "name": "Foreman t1",
-            "initial_request": "/goal Fix t1",
-            "project_context": None,
-            "source_board": "discord-1",
-            "source_task_id": "t1",
-            "source_task_url": "",
-            "source_kanban_url": "",
-            "source_discord_thread_url": "",
-        }
-    ]
+    assert len(adapter.created_goals) == 1
+    created_goal = adapter.created_goals[0]
+    assert created_goal["parent_chat_id"] == "source-thread-1"
+    assert created_goal["name"] == "Foreman t1"
+    assert created_goal["initial_request"] == "/goal Fix t1"
+    assert created_goal["project_context"] is None
+    assert created_goal["kanban_board"]["slug"].startswith("foreman-")
+    assert created_goal["hide_source_links"] is True
+    assert created_goal["source_board"] == "discord-1"
+    assert created_goal["source_task_id"] == "t1"
+    assert created_goal["source_task_url"] == ""
+    assert created_goal["source_kanban_url"] == ""
+    assert created_goal["source_discord_thread_url"] == ""
     assert len(goal_events) == 1
     event = goal_events[0]
     assert event.text == "/goal Fix t1"
     assert event.internal is True
-    assert event.source.thread_id == "goal-thread-1"
-    assert event.source.parent_chat_id == "1504252294495998043"
+    assert event.source.thread_id == "source-thread-1"
+    assert event.source.parent_chat_id == "source-parent"
     assert event.source.user_id == "system:foreman"
     assert event.feature_summary["message_id"] == "goal-message-1"
+    assert adapter.synced_reactions == [
+        {
+            "board": "discord-1",
+            "thread_id": "source-thread-1",
+            "chat_id": "source-thread-1",
+            "message_id": "",
+            "source_message_id": "",
+            "state": "active",
+            "reaction_state": "foreman",
+        }
+    ]
     assert sent == ["t1"]
     assert failed == []
 
@@ -335,6 +364,8 @@ def test_foreman_watcher_direct_alerts_human_intervention_issue(monkeypatch):
     issue = _human_issue(
         "source-task",
         source_board="discord-source",
+        thread_id="source-thread",
+        chat_id="source-thread",
         foreman_board="discord-foreman",
         manual_intervention_reason="Human must create the API key.",
     )
@@ -367,7 +398,7 @@ def test_foreman_watcher_direct_alerts_human_intervention_issue(monkeypatch):
 
     assert adapter.sent == [
         {
-            "chat_id": "1504252294495998043",
+            "chat_id": "source-thread",
             "content": "human alert: source-task",
             "metadata": {
                 "foreman_alert_kind": "human_intervention_required",
@@ -377,6 +408,17 @@ def test_foreman_watcher_direct_alerts_human_intervention_issue(monkeypatch):
     ]
     assert adapter.created_goals == []
     assert goal_events == []
+    assert adapter.synced_reactions == [
+        {
+            "board": "discord-source",
+            "thread_id": "source-thread",
+            "chat_id": "source-thread",
+            "message_id": "",
+            "source_message_id": "",
+            "state": "active",
+            "reaction_state": "foreman",
+        }
+    ]
     assert rendered_mentions == ["<@&1503914570077442058>"]
     assert sent == ["source-task"]
     assert failed == []
@@ -388,7 +430,7 @@ def test_foreman_watcher_records_send_result_failure(monkeypatch):
     _patch_no_human_escalations(monkeypatch)
     from hermes_cli import discord_worker_foreman as foreman
 
-    issue = _issue("t1")
+    issue = _issue("t1", thread_id="source-thread")
     sent = []
     failed = []
 

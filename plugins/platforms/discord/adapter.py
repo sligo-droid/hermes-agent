@@ -63,7 +63,7 @@ _DISCORD_SHIP_REACTION_EMOJIS = frozenset({
     "👍🏾",
     "👍🏿",
 })
-_DISCORD_STATUS_REACTION_EMOJIS = ("✅", "❌", "👀", "❓", "⏳")
+_DISCORD_STATUS_REACTION_EMOJIS = ("✅", "❌", "👀", "❓", "⏳", "🔨")
 _DISCORD_GOAL_THREAD_CONTEXT_LIMIT = 25
 _DISCORD_GOAL_THREAD_CONTEXT_MAX_CHARS = 12_000
 _DISCORD_GOAL_THREAD_CONTEXT_MAX_MESSAGE_CHARS = 1_500
@@ -866,6 +866,12 @@ class DiscordAdapter(BasePlatformAdapter):
             "initial_request": str(handle.get("initial_request") or ""),
             "project_context": handle.get("project_context") or None,
             "kanban_board": handle.get("kanban_board") or None,
+            "source_board": str(handle.get("source_board") or ""),
+            "source_task_id": str(handle.get("source_task_id") or ""),
+            "source_task_url": str(handle.get("source_task_url") or ""),
+            "source_kanban_url": str(handle.get("source_kanban_url") or ""),
+            "source_discord_thread_url": str(handle.get("source_discord_thread_url") or ""),
+            "hide_source_links": bool(handle.get("hide_source_links")),
             "updated_at": time.time(),
         }
         state[_DISCORD_FEATURE_SUMMARY_STATE_BUCKET] = bucket
@@ -1125,6 +1131,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     "summary_channel_id",
                     "project_context",
                     "kanban_board",
+                    "source_board",
+                    "source_task_id",
+                    "source_task_url",
+                    "source_kanban_url",
+                    "source_discord_thread_url",
+                    "hide_source_links",
                 ):
                     if field in handle:
                         stored[field] = handle.get(field) or None
@@ -1712,6 +1724,8 @@ class DiscordAdapter(BasePlatformAdapter):
         lower = str(status or "").strip().lower()
         if lower in {"complete", "completed", "done", "success", "succeeded"}:
             return "✅ Done"
+        if lower in {"foreman"}:
+            return "🔨 Foreman"
         if lower in {"blocked", "question", "needs_input", "needs input"}:
             return "❓ Blocked"
         if lower in {"failed", "failure", "error", "errored", "interrupted"}:
@@ -1793,6 +1807,7 @@ class DiscordAdapter(BasePlatformAdapter):
             "running": "⏳",
             "blocked": "❓",
             "errored": "❌",
+            "foreman": "🔨",
         }.get(str(state or ""))
 
     def _build_feature_summary_embed(
@@ -1809,6 +1824,7 @@ class DiscordAdapter(BasePlatformAdapter):
         source_task_url: Optional[str] = None,
         source_kanban_url: Optional[str] = None,
         source_discord_thread_url: Optional[str] = None,
+        hide_source_links: bool = False,
     ):
         metadata = metadata or self._collect_discord_project_metadata()
         embed_kwargs = {
@@ -1827,11 +1843,11 @@ class DiscordAdapter(BasePlatformAdapter):
         source_kanban_url = self._normalize_absolute_public_url(source_kanban_url)
         source_discord_thread_url = self._normalize_absolute_public_url(source_discord_thread_url)
         kanban_url = self._normalize_absolute_public_url(kanban_url)
-        if source_board:
+        if source_board and not hide_source_links:
             fields.append(("Affected Board", self._format_feature_summary_link(source_board, source_kanban_url), False))
-        if source_task_id:
+        if source_task_id and not hide_source_links:
             fields.append(("Affected Task", self._format_feature_summary_link(source_task_id, source_task_url), True))
-        if source_discord_thread_url:
+        if source_discord_thread_url and not hide_source_links:
             fields.append(("Discord Thread", self._format_feature_summary_link("Open source thread", source_discord_thread_url), False))
         branch = self._format_feature_summary_branch(metadata)
         if branch:
@@ -1842,6 +1858,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if (
                 source_board
                 and source_kanban_url
+                and not hide_source_links
                 and not self._same_feature_summary_url(kanban_url, source_kanban_url)
                 and not self._same_feature_summary_url(kanban_url, source_task_url)
             ):
@@ -2089,6 +2106,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 source_task_url=str(handle.get("source_task_url") or "") or None,
                 source_kanban_url=str(handle.get("source_kanban_url") or "") or None,
                 source_discord_thread_url=str(handle.get("source_discord_thread_url") or "") or None,
+                hide_source_links=bool(handle.get("hide_source_links")),
             )
             await msg.edit(embed=embed)
             return True
@@ -2162,6 +2180,8 @@ class DiscordAdapter(BasePlatformAdapter):
         for key in ("source_board", "source_task_id", "source_task_url", "source_kanban_url", "source_discord_thread_url"):
             if target.get(key) and not handle.get(key):
                 handle[key] = str(target.get(key) or "")
+        if target.get("hide_source_links") is not None:
+            handle["hide_source_links"] = bool(target.get("hide_source_links"))
         self._persist_feature_summary_handle_by_scope(handle)
         if self._feature_summary_circuit_matches(handle):
             return str(target.get("sync_key") or board)
@@ -3246,7 +3266,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def sync_kanban_thread_reaction(self, target: Dict[str, Any]) -> Optional[str]:
         """Synchronize a Discord worker thread's origin-message reaction."""
-        state = str(target.get("state") or "").strip() or None
+        state = str(target.get("reaction_state") or target.get("state") or "").strip() or None
         if state is None:
             slug = str(target.get("board") or "").strip()
             if slug:
@@ -6646,6 +6666,7 @@ class DiscordAdapter(BasePlatformAdapter):
         source_task_url: str = "",
         source_kanban_url: str = "",
         source_discord_thread_url: str = "",
+        hide_source_links: bool = False,
         auto_archive_duration: int = 1440,
     ) -> Optional[Dict[str, str]]:
         """Create a #dev worker-task thread and seed it with a feature summary."""
@@ -6731,9 +6752,62 @@ class DiscordAdapter(BasePlatformAdapter):
                 source_task_url=source_task_url,
                 source_kanban_url=source_kanban_url,
                 source_discord_thread_url=source_discord_thread_url,
+                hide_source_links=hide_source_links,
             )
             msg = await thread.send(embed=embed)
             handle["message_id"] = str(getattr(msg, "id", "") or "")
+        except Exception as exc:
+            logger.warning("[%s] Worker task feature summary send failed: %s", self.name, exc)
+        return handle
+
+    async def send_worker_task_embed(
+        self,
+        thread_chat_id: str,
+        *,
+        title: str = "",
+        initial_request: str = "",
+        project_context: Optional[Dict[str, Any]] = None,
+        kanban_url: str = "",
+        source_board: str = "",
+        source_task_id: str = "",
+        source_task_url: str = "",
+        source_kanban_url: str = "",
+        source_discord_thread_url: str = "",
+        hide_source_links: bool = True,
+    ) -> Optional[Dict[str, str]]:
+        """Post a worker-task feature-summary embed into an existing thread."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return None
+        thread = await self._resolve_summary_channel(thread_chat_id)
+        if thread is None or not hasattr(thread, "send"):
+            return None
+        thread_id = str(getattr(thread, "id", "") or thread_chat_id)
+        handle = {
+            "thread_id": thread_id,
+            "thread_name": str(getattr(thread, "name", None) or thread_id),
+            "message_id": "",
+        }
+        try:
+            metadata = self._collect_discord_project_metadata(
+                project_context if isinstance(project_context, dict) else None
+            )
+            embed = self._build_feature_summary_embed(
+                initial_request=initial_request,
+                status="Running",
+                outcome=initial_request or title or "Worker task",
+                title=title or "Worker task",
+                metadata=metadata,
+                kanban_url=kanban_url,
+                source_board=source_board,
+                source_task_id=source_task_id,
+                source_task_url=source_task_url,
+                source_kanban_url=source_kanban_url,
+                source_discord_thread_url=source_discord_thread_url,
+                hide_source_links=hide_source_links,
+            )
+            msg = await thread.send(embed=embed)
+            handle["message_id"] = str(getattr(msg, "id", "") or "")
+            await self._set_message_reaction_state(msg, self._feature_kanban_reaction_emoji("running"))
         except Exception as exc:
             logger.warning("[%s] Worker task feature summary send failed: %s", self.name, exc)
         return handle
@@ -6745,36 +6819,28 @@ class DiscordAdapter(BasePlatformAdapter):
         name: str,
         initial_request: str,
         project_context: Optional[Dict[str, Any]] = None,
+        kanban_board: Optional[Dict[str, Any]] = None,
         source_board: str = "",
         source_task_id: str = "",
         source_task_url: str = "",
         source_kanban_url: str = "",
         source_discord_thread_url: str = "",
-        auto_archive_duration: int = 1440,
+        hide_source_links: bool = True,
     ) -> Optional[Dict[str, Any]]:
-        """Create a #dev goal thread anchored by a feature-summary embed."""
+        """Post a foreman goal feature-summary embed into an existing thread."""
         if not self._client or not DISCORD_AVAILABLE:
             return None
 
-        try:
-            parent_id = int(parent_chat_id)
-        except (TypeError, ValueError):
-            return None
-
-        try:
-            parent = self._client.get_channel(parent_id)
-            if parent is None:
-                parent = await self._client.fetch_channel(parent_id)
-        except Exception as exc:
+        thread = await self._resolve_summary_channel(parent_chat_id)
+        if thread is None or not hasattr(thread, "send"):
             logger.warning(
-                "[%s] Foreman goal thread: cannot resolve parent %s: %s",
+                "[%s] Foreman goal embed: cannot resolve thread %s",
                 self.name,
                 parent_chat_id,
-                exc,
             )
             return None
 
-        if isinstance(parent, getattr(discord, "DMChannel", ())):
+        if isinstance(thread, getattr(discord, "DMChannel", ())):
             return None
 
         thread_name = re.sub(r"\s+", " ", str(name or "Foreman goal")).strip()
@@ -6784,7 +6850,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         resolved_context = project_context if isinstance(project_context, dict) else None
         if resolved_context is None:
-            resolved_context = self._resolve_project_context_for_channel(parent)
+            resolved_context = self._resolve_project_context_for_channel(thread)
         metadata = self._collect_discord_project_metadata(resolved_context)
         embed = self._build_feature_summary_embed(
             initial_request=initial_request,
@@ -6797,40 +6863,42 @@ class DiscordAdapter(BasePlatformAdapter):
             source_task_url=source_task_url,
             source_kanban_url=source_kanban_url,
             source_discord_thread_url=source_discord_thread_url,
+            hide_source_links=hide_source_links,
         )
 
         try:
-            starter = await parent.send(embed=embed)
-            thread = await starter.create_thread(
-                name=thread_name,
-                auto_archive_duration=auto_archive_duration,
-                reason="Hermes foreman internal goal",
-            )
+            msg = await thread.send(embed=embed)
+            await self._set_message_reaction_state(msg, self._feature_kanban_reaction_emoji("active"))
         except Exception as exc:
             logger.warning(
-                "[%s] Foreman goal thread: create failed for parent %s: %s",
+                "[%s] Foreman goal embed: send failed for thread %s: %s",
                 self.name,
                 parent_chat_id,
                 exc,
             )
             return None
 
+        parent = getattr(thread, "parent", None)
         handle = {
             "thread_id": str(getattr(thread, "id", "") or ""),
             "thread_name": str(getattr(thread, "name", None) or thread_name),
             "title": thread_name,
-            "message_id": str(getattr(starter, "id", "") or ""),
-            "summary_channel_id": str(getattr(parent, "id", "") or parent_chat_id),
-            "guild_id": str(getattr(getattr(parent, "guild", None), "id", "") or ""),
-            "parent_channel_id": str(getattr(parent, "id", "") or parent_chat_id),
+            "message_id": str(getattr(msg, "id", "") or ""),
+            "source_message_id": str(getattr(msg, "id", "") or "") or None,
+            "summary_channel_id": str(getattr(thread, "id", "") or parent_chat_id),
+            "guild_id": str(getattr(getattr(thread, "guild", None), "id", "") or ""),
+            "parent_channel_id": str(
+                getattr(parent, "id", "") or getattr(thread, "parent_id", "") or ""
+            ),
             "initial_request": initial_request,
             "project_context": resolved_context,
-            "kanban_board": None,
+            "kanban_board": kanban_board if isinstance(kanban_board, dict) else None,
             "source_board": str(source_board or ""),
             "source_task_id": str(source_task_id or ""),
             "source_task_url": str(source_task_url or ""),
             "source_kanban_url": str(source_kanban_url or ""),
             "source_discord_thread_url": str(source_discord_thread_url or ""),
+            "hide_source_links": bool(hide_source_links),
         }
         try:
             self._persist_feature_summary_handle(thread, handle)

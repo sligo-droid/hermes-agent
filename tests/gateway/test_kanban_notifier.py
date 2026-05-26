@@ -353,6 +353,39 @@ def test_discord_kanban_typing_watcher_skips_completed_status_sync(tmp_path, mon
     assert adapter.synced == []
 
 
+def test_discord_status_targets_keep_source_thread_hammer_during_active_foreman(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    source = dwb.set_goal(
+        thread_id="99020",
+        goal="Original worker request",
+        chat_id="parent-99020",
+    )
+    conn = kb.connect(board=source.slug)
+    try:
+        task = kb.list_tasks(conn, include_archived=False)[0]
+        claimed = kb.claim_task(conn, task.id)
+        assert claimed is not None
+        kb.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+    dwb._update_worker_meta(source.slug, {"goal_status": "done", "phase": "complete"})
+
+    foreman = dwb.set_goal(
+        thread_id="99021",
+        goal=f"/goal Foreman escalation: resolve worker issue\n- Board: {source.slug}",
+        chat_id="parent-99021",
+    )
+
+    targets = dwb.thread_status_targets()
+    by_board = {target["board"]: target for target in targets}
+
+    assert by_board[source.slug]["state"] == "done"
+    assert by_board[source.slug]["reaction_state"] == "foreman"
+    assert by_board[foreman.slug]["hide_source_links"] is True
+
+
 def test_discord_terminal_status_target_syncs_only_when_pending(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb
