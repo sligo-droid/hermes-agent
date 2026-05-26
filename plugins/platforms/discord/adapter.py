@@ -1996,8 +1996,32 @@ class DiscordAdapter(BasePlatformAdapter):
         initial_request: str,
         project_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Regular /goal sources do not post feature-summary embeds."""
-        return None
+        """Create the standard /goal feature-summary embed for a gateway source."""
+        thread_id = str(
+            getattr(source, "thread_id", "")
+            or getattr(source, "chat_id", "")
+            or ""
+        ).strip()
+        if not thread_id:
+            return None
+
+        thread = await self._resolve_channel_by_id(thread_id)
+        if thread is None:
+            return None
+
+        parent = None
+        parent_id = str(getattr(source, "parent_chat_id", "") or "").strip()
+        if parent_id:
+            parent = await self._resolve_channel_by_id(parent_id)
+        if parent is None:
+            parent = self._thread_parent_channel(thread)
+
+        return await self.initialize_feature_summary(
+            thread,
+            parent_channel=parent,
+            initial_request=initial_request,
+            project_context=project_context,
+        )
 
     async def update_feature_summary(
         self,
@@ -5838,6 +5862,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return
 
         is_thread = isinstance(channel, discord.Thread)
+        parent_channel = self._thread_parent_channel(channel) if is_thread else channel
         if is_thread:
             thread_id = str(getattr(channel, "id", None) or getattr(interaction, "channel_id", "") or "")
             thread_name = getattr(channel, "name", None) or self._goal_thread_name(args)
@@ -5862,7 +5887,25 @@ class DiscordAdapter(BasePlatformAdapter):
         goal_thread_context = ""
         if is_thread and thread_channel is not None:
             goal_thread_context = await self._fetch_goal_thread_context(thread_channel)
+        feature_summary_handle = None
+        if thread_channel is not None:
+            project_context = self._resolve_project_context_for_channel(parent_channel)
+            feature_summary_handle = await self.initialize_feature_summary(
+                thread_channel,
+                parent_channel=parent_channel,
+                initial_request=command_text,
+                project_context=project_context,
+                source_message_id=str(getattr(interaction, "id", "") or "") or None,
+            )
+        board_url = ""
+        if isinstance(feature_summary_handle, dict):
+            board_url = str(
+                ((feature_summary_handle.get("kanban_board") or {}).get("public_url"))
+                or ""
+            )
         content = f"Goal started in {link}."
+        if board_url:
+            content = f"{content} Board: {board_url}"
         await interaction.edit_original_response(content=content)
 
         if thread_id:
@@ -5873,7 +5916,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     thread_id,
                     thread_name,
                     command_text,
-                    feature_summary=None,
+                    feature_summary=feature_summary_handle,
                     goal_thread_context=goal_thread_context or None,
                 ),
                 label=f"/goal {thread_id}",
@@ -7548,7 +7591,6 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_threaded_channel is not None
             and not is_meeting_command_message
             and not auto_threaded_direct_question
-            and not slash_command_starts_threaded_work
         ):
             _stage_started = time.perf_counter()
             feature_summary_handle = await self.initialize_feature_summary(
@@ -7560,7 +7602,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 source_message_id=str(message.id),
             )
             self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
-        elif is_thread and feature_request_intent is True and not slash_command_starts_threaded_work:
+        elif is_thread and (slash_command_starts_threaded_work or feature_request_intent is True):
             _stage_started = time.perf_counter()
             feature_summary_handle = await self.initialize_feature_summary(
                 message.channel,
@@ -7571,7 +7613,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 reply_to_message=message,
             )
             self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
-        elif is_thread and not slash_command_starts_threaded_work:
+        elif is_thread:
             feature_summary_handle = self._load_feature_summary_handle_for_thread(
                 message.channel,
                 project_context=project_context,
