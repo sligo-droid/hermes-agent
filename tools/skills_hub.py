@@ -3111,13 +3111,18 @@ def ensure_hub_dirs() -> None:
 def quarantine_bundle(bundle: SkillBundle) -> Path:
     """Write a skill bundle to the quarantine directory for scanning."""
     ensure_hub_dirs()
+    return materialize_bundle(bundle, QUARANTINE_DIR)
+
+
+def materialize_bundle(bundle: SkillBundle, dest_root: Path) -> Path:
+    """Write a skill bundle under ``dest_root`` without installing it."""
     skill_name = _validate_skill_name(bundle.name)
     validated_files: List[Tuple[str, Union[str, bytes]]] = []
     for rel_path, file_content in bundle.files.items():
         safe_rel_path = _validate_bundle_rel_path(rel_path)
         validated_files.append((safe_rel_path, file_content))
 
-    dest = QUARANTINE_DIR / skill_name
+    dest = Path(dest_root) / skill_name
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)

@@ -675,6 +675,7 @@ const sidebars: SidebarsConfig = {
         'guides/automation-templates',
         'guides/cron-troubleshooting',
         'guides/work-with-skills',
+        'guides/audit-external-skills',
         'guides/delegation-patterns',
         'guides/github-pr-review-agent',
         'guides/webhook-github-pr-review',
