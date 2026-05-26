@@ -416,6 +416,16 @@ def _run_review_in_thread(
             review_agent._user_profile_enabled = agent._user_profile_enabled
             review_agent._memory_nudge_interval = 0
             review_agent._skill_nudge_interval = 0
+            # The review fork borrows the parent's session_id for prompt-cache
+            # parity, but its harness prompt and tool outputs are control-plane
+            # work. Keep them out of the user's persisted transcript.
+            def _capture_review_messages(messages, conversation_history=None):
+                review_agent._session_messages = list(messages or [])
+
+            review_agent._persist_session = _capture_review_messages
+            review_agent._save_session_log = _capture_review_messages
+            review_agent._flush_messages_to_session_db = lambda *a, **kw: None
+            review_agent._save_trajectory = lambda *a, **kw: None
             # Suppress all status/warning emits from the fork so the
             # user only sees the final successful-action summary.
             # Without this, mid-review "Iteration budget exhausted",

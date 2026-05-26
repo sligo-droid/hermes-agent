@@ -113,6 +113,32 @@ class TestGenerateTitle:
         user_content = captured_kwargs["messages"][1]["content"]
         assert len(user_content) < 1100  # 500 + 500 + formatting
 
+    def test_uses_new_message_for_gateway_backfill_title(self):
+        """Recent-channel backfill must not dominate generated titles."""
+        captured_kwargs = {}
+
+        def mock_call_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = "OpenFEC Money Adapter"
+            return resp
+
+        user_message = (
+            "[Recent channel messages]\n"
+            "[Gisele] @Sligo Labs /goal let's do a visual refactor\n"
+            "[New message]\n"
+            "[Gisele] what needs to be done to get an adapter filling our Money source family?"
+        )
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            title = generate_title(user_message, "We need an OpenFEC adapter.")
+
+        assert title == "OpenFEC Money Adapter"
+        prompt = captured_kwargs["messages"][1]["content"]
+        assert "Money source family" in prompt
+        assert "visual refactor" not in prompt
+
 
 class TestAutoTitleSession:
     """Tests for auto_title_session() — the sync worker function."""
