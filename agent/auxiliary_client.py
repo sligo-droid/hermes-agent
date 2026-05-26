@@ -282,10 +282,10 @@ _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
 _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = _API_KEY_PROVIDER_AUX_MODELS_FALLBACK
 
 # ChatGPT/Codex-account compression should not inherit a heavyweight main
-# runtime such as gpt-5.5. Compression is a structured summarization task:
-# mini keeps quality acceptable while avoiding the timeout/cost profile of
-# frontier chat models.
-_CODEX_COMPRESSION_MODEL = "gpt-5.4-mini"
+# runtime such as gpt-5.5. Compression is a structured summarization task;
+# older Codex-specialized models have been faster than gpt-5.4-mini for large
+# context checkpoints while keeping the same Codex OAuth context window.
+_CODEX_COMPRESSION_MODEL = "gpt-5.3-codex"
 # Disable reasoning by default because even low reasoning can spend the whole
 # compression timeout before emitting a summary.
 _CODEX_COMPRESSION_REASONING = {"enabled": False}
