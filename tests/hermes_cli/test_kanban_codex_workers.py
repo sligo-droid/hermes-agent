@@ -20,6 +20,32 @@ def _home(monkeypatch, tmp_path: Path) -> Path:
     return root
 
 
+def _pr_view_json(
+    *,
+    number: int = 123,
+    state: str = "MERGED",
+    merge_state: str = "CLEAN",
+    mergeable: str = "MERGEABLE",
+    checks: list[dict] | None = None,
+) -> str:
+    if checks is None:
+        checks = [{"name": "unit", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+    return json.dumps(
+        {
+            "number": number,
+            "url": f"https://github.com/sligo-labs/PID/pull/{number}",
+            "state": state,
+            "mergedAt": "2026-05-26T15:30:17Z" if state == "MERGED" else None,
+            "mergeCommit": {"oid": "abc123"} if state == "MERGED" else None,
+            "mergeStateStatus": merge_state,
+            "mergeable": mergeable,
+            "isDraft": False,
+            "reviewDecision": "",
+            "statusCheckRollup": checks,
+        }
+    )
+
+
 def _claimed_planner(monkeypatch, tmp_path: Path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -1331,6 +1357,7 @@ def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeyp
     workspace = tmp_path / "repo"
     workspace.mkdir()
     calls = []
+    view_states = ["OPEN", "MERGED"]
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
@@ -1338,6 +1365,11 @@ def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeyp
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if cmd[:3] == ["gh", "pr", "create"]:
             return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/123\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            state = view_states.pop(0)
+            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=123, state=state), stderr="")
+        if cmd[:3] == ["gh", "pr", "merge"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
@@ -1352,9 +1384,13 @@ def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeyp
     assert pr_create[pr_create.index("--repo") + 1] == "sligo-labs/PID"
     assert pr_create[pr_create.index("--base") + 1] == "develop"
     assert pr_create[pr_create.index("--head") + 1] == "discord/explicit-pr"
+    pr_merge = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "merge"])
+    assert pr_merge[pr_merge.index("--repo") + 1] == "sligo-labs/PID"
     assert ["git", "push", "-u", "origin", "discord/explicit-pr"] in calls
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_url"] == "https://github.com/sligo-labs/PID/pull/123"
+    assert meta["pr_state"] == "MERGED"
+    assert meta["pr_merge_commit"] == "abc123"
 
 
 def test_ensure_pr_records_merge_checks_and_blocker(monkeypatch, tmp_path):
@@ -1371,7 +1407,10 @@ def test_ensure_pr_records_merge_checks_and_blocker(monkeypatch, tmp_path):
     workspace = tmp_path / "repo"
     workspace.mkdir()
 
+    calls = []
+
     def fake_run(cmd, **kwargs):
+        calls.append(cmd)
         if cmd[:3] == ["gh", "pr", "list"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if cmd[:3] == ["gh", "pr", "create"]:
@@ -1400,7 +1439,7 @@ def test_ensure_pr_records_merge_checks_and_blocker(monkeypatch, tmp_path):
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
-    assert worker._ensure_pr(board.slug, str(workspace)) is True
+    assert worker._ensure_pr(board.slug, str(workspace)) is False
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_url"] == "https://github.com/sligo-labs/PID/pull/125"
@@ -1412,6 +1451,53 @@ def test_ensure_pr_records_merge_checks_and_blocker(monkeypatch, tmp_path):
     assert meta["pr_checks_total"] == 2
     assert meta["pr_checks_failed"] == ["lint"]
     assert meta["pr_blocker"] == "checks failed: lint"
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
+
+
+def test_ensure_pr_waits_for_checks_before_merging(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_PR_MERGE_WAIT_SECONDS", "0")
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="pending-pr",
+        goal="Ship pending PR",
+        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
+    )
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/126\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=_pr_view_json(
+                    number=126,
+                    state="OPEN",
+                    merge_state="UNSTABLE",
+                    checks=[{"name": "ci", "status": "IN_PROGRESS", "conclusion": ""}],
+                ),
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr(board.slug, str(workspace)) is False
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert meta["pr_state"] == "OPEN"
+    assert meta["pr_checks_status"] == "pending"
+    assert meta["pr_blocker"] == "checks pending"
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
 
 
 def test_ensure_pr_falls_back_to_origin_remote_for_repo(monkeypatch, tmp_path):
@@ -1432,6 +1518,8 @@ def test_ensure_pr_falls_back_to_origin_remote_for_repo(monkeypatch, tmp_path):
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if cmd[:3] == ["gh", "pr", "create"]:
             return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/124\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=124), stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
@@ -1466,6 +1554,8 @@ def test_ensure_pr_prefers_checkout_remote_over_stale_project_context(monkeypatc
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if cmd[:3] == ["gh", "pr", "create"]:
             return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/124\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=124), stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
