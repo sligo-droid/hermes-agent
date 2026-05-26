@@ -3291,29 +3291,13 @@ class DiscordAdapter(BasePlatformAdapter):
         return state
 
     async def send_kanban_completion_notice(self, target: Dict[str, Any]) -> Optional[str]:
-        """Post a one-shot text notice when a Discord Kanban goal finishes."""
+        """Clear the legacy one-shot completion notice flag without posting."""
         if str(target.get("state") or "").strip() != "done":
             return None
         if not target.get("terminal_completion_message_pending"):
             return None
         board = str(target.get("board") or "").strip()
-        thread_id = str(target.get("thread_id") or "").strip()
-        chat_id = str(target.get("chat_id") or thread_id).strip()
-        if not board or not thread_id:
-            return None
-
-        result = await self.send(
-            chat_id or thread_id,
-            "Goal completed",
-            metadata={"thread_id": thread_id},
-        )
-        if not getattr(result, "success", False):
-            logger.debug(
-                "[%s] Failed to send Discord Kanban completion notice for board %s: %s",
-                self.name,
-                board,
-                getattr(result, "error", None),
-            )
+        if not board:
             return None
         try:
             from hermes_cli.discord_worker_boards import mark_thread_status_synced

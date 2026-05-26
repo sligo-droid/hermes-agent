@@ -6716,26 +6716,11 @@ class GatewayRunner:
         channel_id: str,
         thread_handle: Dict[str, Any],
     ) -> None:
-        from hermes_cli import kanban_db as _kb
         from hermes_cli.discord_worker_state import write_codex_worker_state
 
         thread_id = str(thread_handle.get("thread_id") or "").strip()
         if not thread_id:
             return
-
-        conn = _kb.connect(board=board)
-        try:
-            _kb.add_notify_sub(
-                conn,
-                task_id=task_id,
-                platform="discord",
-                chat_id=str(channel_id),
-                thread_id=thread_id,
-                user_id="system:foreman",
-                notifier_profile=self._active_profile_name(),
-            )
-        finally:
-            conn.close()
 
         write_codex_worker_state(
             task_id,
@@ -7087,15 +7072,14 @@ class GatewayRunner:
                 sender = getattr(adapter, "send_typing_once", None) if adapter else None
                 reaction_sync = getattr(adapter, "sync_kanban_thread_reaction", None) if adapter else None
                 summary_sync = getattr(adapter, "sync_kanban_feature_summary", None) if adapter else None
-                completion_notice = getattr(adapter, "send_kanban_completion_notice", None) if adapter else None
                 if adapter is not None and (
                     callable(sender)
                     or callable(reaction_sync)
                     or callable(summary_sync)
-                    or callable(completion_notice)
                 ):
                     try:
                         from hermes_cli.discord_worker_boards import (
+                            mark_thread_status_synced,
                             running_worker_thread_targets,
                             thread_status_targets,
                         )
@@ -7195,24 +7179,15 @@ class GatewayRunner:
                                 continue
                             if synced_key:
                                 summary_cache[cache_key] = sync_key
-                    if callable(completion_notice):
-                        for target in reaction_targets:
-                            board = str(target.get("board") or "")
-                            state = str(target.get("state") or "")
-                            if (
-                                not board
-                                or state != "done"
-                                or not target.get("terminal_completion_message_pending")
-                            ):
-                                continue
-                            try:
-                                await completion_notice(target)
-                            except Exception as exc:
-                                logger.debug(
-                                    "discord kanban completion notice: send failed for board %s: %s",
-                                    board,
-                                    exc,
-                                )
+                    for target in reaction_targets:
+                        board = str(target.get("board") or "")
+                        if not board or not target.get("terminal_completion_message_pending"):
+                            continue
+                        await asyncio.to_thread(
+                            mark_thread_status_synced,
+                            board,
+                            completion_message=True,
+                        )
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 logger.debug("discord kanban typing: cancelled")

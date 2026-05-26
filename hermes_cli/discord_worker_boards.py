@@ -2218,7 +2218,6 @@ def mark_thread_status_synced(
     if summary and worker.pop("terminal_summary_sync_pending", None) is not None:
         changed = True
     if completion_message and worker.pop("terminal_completion_message_pending", None) is not None:
-        worker["terminal_completion_message_sent_at"] = _now()
         changed = True
     if not changed:
         return

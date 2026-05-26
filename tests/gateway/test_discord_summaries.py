@@ -1065,7 +1065,7 @@ async def test_sync_kanban_feature_summary_uses_persisted_terminal_summary(adapt
 
 
 @pytest.mark.asyncio
-async def test_send_kanban_completion_notice_posts_goal_completed_and_clears_flag(adapter, monkeypatch, tmp_path):
+async def test_send_kanban_completion_notice_clears_flag_without_posting(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     parent = FakeTextChannel(channel_id=100)
     thread = FakeThread(channel_id=200, parent=parent)
@@ -1095,10 +1095,10 @@ async def test_send_kanban_completion_notice_posts_goal_completed_and_clears_fla
     sent = await adapter.send_kanban_completion_notice(target)
 
     assert sent == board.slug
-    assert thread.sent[-1][0]["content"] == "Goal completed"
+    assert thread.sent == []
     worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert "terminal_completion_message_pending" not in worker
-    assert isinstance(worker["terminal_completion_message_sent_at"], int)
+    assert "terminal_completion_message_sent_at" not in worker
 
 
 @pytest.mark.asyncio
