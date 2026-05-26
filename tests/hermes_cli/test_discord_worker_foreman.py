@@ -1086,6 +1086,21 @@ def test_render_foreman_goal_prompt_is_goal_command_safe_and_informative():
     assert "/home/user" not in rendered
 
 
+def test_foreman_goal_thread_title_names_source_board_and_task():
+    from hermes_cli.discord_worker_foreman import foreman_goal_thread_title
+
+    title = foreman_goal_thread_title(
+        _alert_issue(
+            evidence={
+                "source_board": "discord-source",
+                "source_task_id": "source-task",
+            }
+        )
+    )
+
+    assert title == "Foreman: fix discord-source/source-task"
+
+
 def test_render_foreman_alert_uses_fixed_mention_once_in_normal_alert():
     from hermes_cli.discord_worker_foreman import FOREMAN_DISCORD_MENTION, render_foreman_alert
 

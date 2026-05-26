@@ -607,7 +607,15 @@ def render_foreman_goal_prompt(issue: ForemanIssue) -> str:
 
 def foreman_goal_thread_title(issue: ForemanIssue) -> str:
     """Return a compact Discord thread title for a foreman-created goal."""
-    title = f"Foreman: {issue.kind} {issue.task_id}"
+    evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
+    board = str(evidence.get("source_board") or issue.board or "").strip()
+    task = str(evidence.get("source_task_id") or issue.task_id or "").strip()
+    if board and task:
+        title = f"Foreman: fix {board}/{task}"
+    elif board:
+        title = f"Foreman: fix {board}"
+    else:
+        title = f"Foreman: {issue.kind} {issue.task_id}"
     return _truncate_text(_sanitize_text(re.sub(r"\s+", " ", title).strip()), 80)
 
 

@@ -196,6 +196,11 @@ def test_foreman_spawned_task_creates_dev_thread_and_subscription(monkeypatch, t
     assert "Add filter controls" in created["initial_request"]
     assert created["project_context"] == {"project_name": "Hermes", "project_path": "/repo/hermes"}
     assert created["kanban_url"] == f"https://hermes.example.test/workers/123/tickets/{task_id}"
+    assert created["source_board"] == board.slug
+    assert created["source_task_id"] == task_id
+    assert created["source_task_url"] == f"https://hermes.example.test/workers/123/tickets/{task_id}"
+    assert created["source_kanban_url"] == "https://hermes.example.test/workers/123"
+    assert created["source_discord_thread_url"] == "https://discord.com/channels/guild-1/123"
 
     state = read_codex_worker_state(task_id, board=board.slug)
     assert state["foreman_thread"]["thread_id"] == "thread-1"
@@ -303,6 +308,11 @@ def test_foreman_watcher_starts_due_issue_as_internal_goal(monkeypatch):
             "name": "Foreman t1",
             "initial_request": "/goal Fix t1",
             "project_context": None,
+            "source_board": "discord-1",
+            "source_task_id": "t1",
+            "source_task_url": "",
+            "source_kanban_url": "",
+            "source_discord_thread_url": "",
         }
     ]
     assert len(goal_events) == 1

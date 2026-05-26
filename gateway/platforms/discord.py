@@ -1570,6 +1570,16 @@ class DiscordAdapter(BasePlatformAdapter):
             return f"[{branch}]({branch_url})"
         return branch
 
+    def _format_feature_summary_link(self, label: Optional[str], url: Optional[str]) -> str:
+        text = self._clean_summary_text(label, limit=140, default="Open")
+        public_url = self._normalize_absolute_public_url(url)
+        return f"[{text}]({public_url})" if public_url else text
+
+    def _same_feature_summary_url(self, left: Optional[str], right: Optional[str]) -> bool:
+        left_url = self._normalize_absolute_public_url(left)
+        right_url = self._normalize_absolute_public_url(right)
+        return bool(left_url and right_url and left_url.rstrip("/") == right_url.rstrip("/"))
+
     def _render_project_summary_line(self, metadata: Dict[str, Optional[str]]) -> str:
         repo = self._truncate_summary_value(metadata.get("repo_url"), limit=260)
         prod = self._format_topic_production_url(
@@ -1794,6 +1804,11 @@ class DiscordAdapter(BasePlatformAdapter):
         title: Optional[str] = None,
         metadata: Optional[Dict[str, Optional[str]]] = None,
         kanban_url: Optional[str] = None,
+        source_board: Optional[str] = None,
+        source_task_id: Optional[str] = None,
+        source_task_url: Optional[str] = None,
+        source_kanban_url: Optional[str] = None,
+        source_discord_thread_url: Optional[str] = None,
     ):
         metadata = metadata or self._collect_discord_project_metadata()
         embed_kwargs = {
@@ -1807,14 +1822,32 @@ class DiscordAdapter(BasePlatformAdapter):
             ("Status", self._summary_status_label(status), True),
             ("Concise Outcome", self._clean_summary_text(outcome, limit=420, default="Pending"), False),
         ]
+        source_board = self._clean_summary_text(source_board, limit=180, default="")
+        source_task_id = self._clean_summary_text(source_task_id, limit=120, default="")
+        source_kanban_url = self._normalize_absolute_public_url(source_kanban_url)
+        source_discord_thread_url = self._normalize_absolute_public_url(source_discord_thread_url)
+        kanban_url = self._normalize_absolute_public_url(kanban_url)
+        if source_board:
+            fields.append(("Affected Board", self._format_feature_summary_link(source_board, source_kanban_url), False))
+        if source_task_id:
+            fields.append(("Affected Task", self._format_feature_summary_link(source_task_id, source_task_url), True))
+        if source_discord_thread_url:
+            fields.append(("Discord Thread", self._format_feature_summary_link("Open source thread", source_discord_thread_url), False))
         branch = self._format_feature_summary_branch(metadata)
         if branch:
             fields.append(("Branch", branch, True))
         if metadata.get("pr_url"):
             fields.append(("GitHub PR", metadata["pr_url"], False))
-        kanban_url = self._normalize_absolute_public_url(kanban_url)
         if kanban_url:
-            fields.append(("Kanban Board", kanban_url, False))
+            if (
+                source_board
+                and source_kanban_url
+                and not self._same_feature_summary_url(kanban_url, source_kanban_url)
+                and not self._same_feature_summary_url(kanban_url, source_task_url)
+            ):
+                fields.append(("Foreman Kanban", kanban_url, False))
+            elif not source_board:
+                fields.append(("Kanban Board", kanban_url, False))
         for name, value, inline in fields:
             try:
                 embed.add_field(
@@ -2051,6 +2084,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     handle,
                     kanban_snapshot=kanban_snapshot,
                 ),
+                source_board=str(handle.get("source_board") or "") or None,
+                source_task_id=str(handle.get("source_task_id") or "") or None,
+                source_task_url=str(handle.get("source_task_url") or "") or None,
+                source_kanban_url=str(handle.get("source_kanban_url") or "") or None,
+                source_discord_thread_url=str(handle.get("source_discord_thread_url") or "") or None,
             )
             await msg.edit(embed=embed)
             return True
@@ -2121,6 +2159,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if target.get("public_url"):
             board_handle["public_url"] = target.get("public_url")
         handle["kanban_board"] = board_handle
+        for key in ("source_board", "source_task_id", "source_task_url", "source_kanban_url", "source_discord_thread_url"):
+            if target.get(key) and not handle.get(key):
+                handle[key] = str(target.get(key) or "")
         self._persist_feature_summary_handle_by_scope(handle)
         if self._feature_summary_circuit_matches(handle):
             return str(target.get("sync_key") or board)
@@ -6598,6 +6639,11 @@ class DiscordAdapter(BasePlatformAdapter):
         initial_request: str = "",
         project_context: Optional[Dict[str, Any]] = None,
         kanban_url: str = "",
+        source_board: str = "",
+        source_task_id: str = "",
+        source_task_url: str = "",
+        source_kanban_url: str = "",
+        source_discord_thread_url: str = "",
         auto_archive_duration: int = 1440,
     ) -> Optional[Dict[str, str]]:
         """Create a #dev worker-task thread and seed it with a feature summary."""
@@ -6678,6 +6724,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 title=title or thread_name,
                 metadata=metadata,
                 kanban_url=kanban_url,
+                source_board=source_board,
+                source_task_id=source_task_id,
+                source_task_url=source_task_url,
+                source_kanban_url=source_kanban_url,
+                source_discord_thread_url=source_discord_thread_url,
             )
             msg = await thread.send(embed=embed)
             handle["message_id"] = str(getattr(msg, "id", "") or "")
@@ -6692,6 +6743,11 @@ class DiscordAdapter(BasePlatformAdapter):
         name: str,
         initial_request: str,
         project_context: Optional[Dict[str, Any]] = None,
+        source_board: str = "",
+        source_task_id: str = "",
+        source_task_url: str = "",
+        source_kanban_url: str = "",
+        source_discord_thread_url: str = "",
         auto_archive_duration: int = 1440,
     ) -> Optional[Dict[str, Any]]:
         """Create a #dev goal thread anchored by a feature-summary embed."""
@@ -6734,6 +6790,11 @@ class DiscordAdapter(BasePlatformAdapter):
             outcome=initial_request,
             title=thread_name,
             metadata=metadata,
+            source_board=source_board,
+            source_task_id=source_task_id,
+            source_task_url=source_task_url,
+            source_kanban_url=source_kanban_url,
+            source_discord_thread_url=source_discord_thread_url,
         )
 
         try:
@@ -6755,6 +6816,7 @@ class DiscordAdapter(BasePlatformAdapter):
         handle = {
             "thread_id": str(getattr(thread, "id", "") or ""),
             "thread_name": str(getattr(thread, "name", None) or thread_name),
+            "title": thread_name,
             "message_id": str(getattr(starter, "id", "") or ""),
             "summary_channel_id": str(getattr(parent, "id", "") or parent_chat_id),
             "guild_id": str(getattr(getattr(parent, "guild", None), "id", "") or ""),
@@ -6762,6 +6824,11 @@ class DiscordAdapter(BasePlatformAdapter):
             "initial_request": initial_request,
             "project_context": resolved_context,
             "kanban_board": None,
+            "source_board": str(source_board or ""),
+            "source_task_id": str(source_task_id or ""),
+            "source_task_url": str(source_task_url or ""),
+            "source_kanban_url": str(source_kanban_url or ""),
+            "source_discord_thread_url": str(source_discord_thread_url or ""),
         }
         try:
             self._persist_feature_summary_handle(thread, handle)
