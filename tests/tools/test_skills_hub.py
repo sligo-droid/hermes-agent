@@ -26,6 +26,7 @@ from tools.skills_hub import (
     unified_search,
     append_audit_log,
     _skill_meta_to_dict,
+    materialize_bundle,
     quarantine_bundle,
 )
 
@@ -1542,6 +1543,41 @@ class TestOptionalSkillSourceBinaryAssets:
 
 
 class TestQuarantineBundleBinaryAssets:
+    def test_materialize_bundle_writes_to_supplied_directory(self, tmp_path):
+        bundle = SkillBundle(
+            name="demo",
+            files={
+                "SKILL.md": "---\nname: demo\n---\n",
+                "references/checklist.md": "- verify\n",
+            },
+            source="well-known",
+            identifier="well-known:https://example.com/.well-known/skills/demo",
+            trust_level="community",
+        )
+
+        skill_path = materialize_bundle(bundle, tmp_path / "scratch")
+
+        assert skill_path == tmp_path / "scratch" / "demo"
+        assert (skill_path / "SKILL.md").read_text(encoding="utf-8").startswith("---")
+        assert (skill_path / "references" / "checklist.md").read_text(encoding="utf-8") == "- verify\n"
+
+    def test_materialize_bundle_rejects_traversal_file_paths(self, tmp_path):
+        bundle = SkillBundle(
+            name="demo",
+            files={
+                "SKILL.md": "---\nname: demo\n---\n",
+                "../../escape.txt": "owned",
+            },
+            source="well-known",
+            identifier="well-known:https://example.com/.well-known/skills/demo",
+            trust_level="community",
+        )
+
+        with pytest.raises(ValueError, match="Unsafe bundle file path"):
+            materialize_bundle(bundle, tmp_path / "scratch")
+
+        assert not (tmp_path / "escape.txt").exists()
+
     def test_quarantine_bundle_writes_binary_files(self, tmp_path):
         import tools.skills_hub as hub
 
