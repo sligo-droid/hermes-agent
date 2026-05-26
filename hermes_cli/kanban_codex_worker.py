@@ -83,20 +83,27 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
     outcome = _role_outcome_frame(role)
     schema = _schema_instructions(role)
     git = _git_summary(os.environ.get("HERMES_KANBAN_WORKSPACE", "") or os.getcwd())
-    discord_read = (
-        "Read-only Discord access:\n"
+    discord_access = (
+        "Discord and board control access:\n"
         "- You may inspect Discord message context with "
         "`python -m hermes_cli.discord_worker_read fetch-message --channel-id <id> --message-id <id>`.\n"
         "- You may inspect recent thread/channel history with "
         "`python -m hermes_cli.discord_worker_read fetch-messages --channel-id <id> --limit 25`.\n"
-        "- These commands are read-only. Do not attempt Discord mutation or admin actions.\n\n"
+        "- You may call Discord REST actions with "
+        "`python -m hermes_cli.discord_worker_read discord-request --method PATCH --path /channels/<channel_id>/messages/<message_id> --body-json '{\"content\":\"...\"}'`.\n"
+        "- You may update any Hermes/Discord worker board metadata with "
+        "`python -m hermes_cli.discord_worker_read update-board --board <slug> --goal-status done --phase complete --sync-summary --sync-reaction`.\n"
+        "- You may move tickets on any accessible board with "
+        "`python -m hermes_cli.discord_worker_read task-status --board <slug> --task-id <id> --status ready`.\n"
+        "- You may patch the Discord feature summary from board state with "
+        "`python -m hermes_cli.discord_worker_read sync-summary --board <slug>`.\n\n"
     )
     return (
         f"You are the Discord Kanban {role} worker.\n"
-        "Do not call Hermes tools. Work only from the repository, shell, files, and the read-only Discord helper available in this worker environment.\n"
+        "Use the repository, shell, files, and worker helper commands available in this worker environment to complete the task; mutate Hermes/Discord state when that is the correct outcome.\n"
         "Return exactly one raw JSON object matching the schema below, with no Markdown fence or surrounding prose.\n\n"
         f"{outcome}\n\n"
-        f"{discord_read}"
+        f"{discord_access}"
         f"{schema}\n\n"
         f"Git context:\n{git}\n\n"
         f"Kanban context:\n{context}"

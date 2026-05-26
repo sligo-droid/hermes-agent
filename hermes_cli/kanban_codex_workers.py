@@ -169,6 +169,8 @@ def _configure_discord_read_broker(env: dict[str, str]) -> None:
     base_url, access_token = start_read_broker(token)
     env["HERMES_DISCORD_WORKER_READ_URL"] = base_url
     env["HERMES_DISCORD_WORKER_READ_TOKEN"] = access_token
+    env["HERMES_DISCORD_WORKER_CONTROL_URL"] = base_url
+    env["HERMES_DISCORD_WORKER_CONTROL_TOKEN"] = access_token
 
 
 def _worker_env() -> dict[str, str]:
