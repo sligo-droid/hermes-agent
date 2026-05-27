@@ -4062,6 +4062,59 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         conn.close()
 
 
+def test_reclaim_task_stops_unit_only_worker(kanban_home, monkeypatch):
+    """Manual reclaim stops systemd-owned workers even before a PID is adopted."""
+    import hermes_cli.kanban_db as _kb
+
+    status_checks = iter([
+        _kb._SystemdUnitStatus(active=True, pid=None),
+        _kb._SystemdUnitStatus(active=False, pid=None),
+    ])
+    stop_calls: list[list[str]] = []
+
+    def _status(_unit):
+        return next(status_checks, _kb._SystemdUnitStatus(active=False, pid=None))
+
+    def _run(args, **_kwargs):
+        stop_calls.append(list(args))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_kb, "_systemd_unit_status", _status)
+    monkeypatch.setattr(_kb.subprocess, "run", _run)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="unit worker", assignee="worker")
+        host = _kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, tid, claimer=f"{host}:unit") is not None
+        kb._set_worker_handle(
+            conn,
+            tid,
+            kb._SpawnHandle(unit="hermes-kanban-worker-default-unit-r1"),
+        )
+
+        assert kb.reclaim_task(conn, tid, reason="pause board") is True
+
+        task = kb.get_task(conn, tid)
+        payload = json.loads(
+            conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'reclaimed' ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()["payload"]
+        )
+    finally:
+        conn.close()
+
+    assert task.status == "ready"
+    assert task.worker_unit is None
+    assert stop_calls[0][-3:] == ["--user", "stop", "hermes-kanban-worker-default-unit-r1.service"]
+    assert payload["prev_unit"] == "hermes-kanban-worker-default-unit-r1.service"
+    assert payload["unit_stop_attempted"] is True
+    assert payload["unit_stopped"] is True
+    assert payload["terminated"] is True
+
+
 def test_reclaim_task_returns_false_for_already_ready(kanban_home):
     """Reclaiming a task that's not running returns False (no-op)."""
     conn = kb.connect()

@@ -1460,8 +1460,20 @@ def test_worker_index_start_and_pause_actions(monkeypatch, tmp_path):
     client = TestClient(app)
     client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.list_tasks(conn, include_archived=False)[0].id
+        assert kanban_db.claim_task(conn, task_id) is not None
+    finally:
+        conn.close()
+
     pause_resp = client.post("/workers/7272/pause", follow_redirects=False)
     paused = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        paused_task = kanban_db.get_task(conn, task_id)
+    finally:
+        conn.close()
     start_resp = client.post("/workers/7272/start", follow_redirects=False)
     started = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     missing = client.post("/workers/missing/start", follow_redirects=False)
@@ -1472,6 +1484,9 @@ def test_worker_index_start_and_pause_actions(monkeypatch, tmp_path):
     assert paused["goal_status"] == "paused"
     assert paused["phase"] == "paused"
     assert paused["phase_before_pause"] == "planning"
+    assert paused_task.status == "ready"
+    assert paused_task.claim_lock is None
+    assert paused_task.current_run_id is None
     assert start_resp.status_code == 303
     assert started["paused"] is False
     assert started["cancelled"] is False
@@ -2211,6 +2226,61 @@ def test_discord_worker_dispatch_skips_paused_board(monkeypatch, tmp_path):
     )
 
     assert spawned == [active.slug]
+
+
+def test_pause_board_reclaims_all_running_role_workers(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
+
+    _skip_code_island_preflight(monkeypatch)
+
+    board = _make_discord_board("2303")
+    dev_id = _create_ready_dev_task(board.slug, title="Running dev task")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        planner_id = kanban_db.list_tasks(conn, include_archived=False)[0].id
+        assert kanban_db.claim_task(conn, planner_id) is not None
+        assert kanban_db.claim_task(conn, dev_id) is not None
+    finally:
+        conn.close()
+
+    dwb.pause_board(board.slug, reason="workers-page")
+
+    metadata = kanban_db.read_board_metadata(board.slug)
+    worker = metadata["discord_worker"]
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        planner = kanban_db.get_task(conn, planner_id)
+        dev = kanban_db.get_task(conn, dev_id)
+        reclaim_reasons = [
+            json.loads(row["payload"])["reason"]
+            for row in conn.execute(
+                "SELECT payload FROM task_events WHERE kind = 'reclaimed' ORDER BY id"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    assert worker["goal_status"] == "paused"
+    assert worker["phase"] == "paused"
+    assert worker["paused"] is True
+    assert worker["cancelled"] is False
+    assert {planner.status, dev.status} == {"ready"}
+    assert planner.claim_lock is None
+    assert dev.claim_lock is None
+    assert reclaim_reasons == ["board-paused: workers-page", "board-paused: workers-page"]
+
+    spawned = []
+    dispatch_discord_worker_boards(
+        [board.slug],
+        max_global_workers=2,
+        max_workers_per_board=2,
+        spawn_fn=lambda task, workspace, board=None: spawned.append(board) or 4303,
+    )
+
+    assert spawned == []
 
 
 def test_stop_board_execution_cancels_and_reclaims_running_worker(monkeypatch, tmp_path):

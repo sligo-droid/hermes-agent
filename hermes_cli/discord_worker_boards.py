@@ -3849,6 +3849,23 @@ def status_line(board: str) -> str:
     )
 
 
+def _reclaim_running_role_workers(board: str, *, reason: str) -> list[str]:
+    reclaimed: list[str] = []
+    conn = kanban_db.connect(board=board)
+    try:
+        for task in kanban_db.list_tasks(conn, include_archived=False):
+            if getattr(task, "status", None) != "running":
+                continue
+            assignee = str(getattr(task, "assignee", "") or "").strip().lower()
+            if assignee not in ROLE_ASSIGNEES:
+                continue
+            if kanban_db.reclaim_task(conn, task.id, reason=reason):
+                reclaimed.append(task.id)
+    finally:
+        conn.close()
+    return reclaimed
+
+
 def pause_board(board: str, *, reason: str = "user-paused") -> None:
     worker = _read_worker_meta(board)
     phase = str(worker.get("phase") or "").strip()
@@ -3856,6 +3873,12 @@ def pause_board(board: str, *, reason: str = "user-paused") -> None:
         worker["phase_before_pause"] = phase
     worker.update({"goal_status": "paused", "phase": "paused", "paused": True, "paused_reason": reason})
     _update_worker_meta(board, worker)
+    _reclaim_running_role_workers(board, reason=f"board-paused: {reason}")
+    persist_board_run_summary(board)
+    try:
+        mark_dispatch_dirty(board=board, reason=reason)
+    except Exception:
+        pass
 
 
 def resume_board(board: str) -> None:
@@ -3956,19 +3979,7 @@ def stop_board_execution(board: str, *, reason: str = "user-stopped") -> dict[st
         }
     )
     _update_worker_meta(board, worker)
-    reclaimed: list[str] = []
-    conn = kanban_db.connect(board=board)
-    try:
-        for task in kanban_db.list_tasks(conn, include_archived=False):
-            if getattr(task, "status", None) != "running":
-                continue
-            assignee = str(getattr(task, "assignee", "") or "").strip().lower()
-            if assignee not in ROLE_ASSIGNEES:
-                continue
-            if kanban_db.reclaim_task(conn, task.id, reason=reason):
-                reclaimed.append(task.id)
-    finally:
-        conn.close()
+    reclaimed = _reclaim_running_role_workers(board, reason=reason)
     persist_board_run_summary(board)
     try:
         mark_dispatch_dirty(board=board, reason=reason)

@@ -2789,7 +2789,7 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid, worker_unit FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -2799,7 +2799,7 @@ def reclaim_task(
         return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        row["worker_pid"], prev_lock, worker_unit=row["worker_unit"], signal_fn=signal_fn,
     )
     with write_txn(conn):
         cur = conn.execute(
@@ -4397,19 +4397,25 @@ def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
+    worker_unit: Optional[str] = None,
     signal_fn=None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths."""
     import signal
 
+    unit_ref = _normalize_systemd_unit_ref(worker_unit)
     info: dict[str, Any] = {
         "prev_pid": int(pid) if pid else None,
+        "prev_unit": unit_ref,
         "host_local": False,
         "termination_attempted": False,
         "terminated": False,
         "sigkill": False,
+        "process_group": False,
+        "unit_stop_attempted": False,
+        "unit_stopped": False,
     }
-    if not pid or pid <= 0 or not claim_lock:
+    if not claim_lock:
         return info
 
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -4417,9 +4423,25 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
-    kill = signal_fn if signal_fn is not None else (
-        os.kill if hasattr(os, "kill") else None
-    )
+    if unit_ref:
+        info.update(_stop_reclaimed_worker_unit(unit_ref))
+
+    if not pid or pid <= 0:
+        info["terminated"] = bool(unit_ref and info.get("unit_stopped"))
+        return info
+    kill = signal_fn
+    pgid = None
+    if kill is None:
+        kill, info["process_group"], pgid = _worker_signal_sender(int(pid))
+
+    def _target_alive() -> bool:
+        if pgid is not None:
+            return _process_group_alive(pgid)
+        return _pid_alive(pid)
+
+    if not _target_alive():
+        info["terminated"] = True
+        return info
     if kill is None:
         return info
 
@@ -4430,12 +4452,12 @@ def _terminate_reclaimed_worker(
         return info
 
     for _ in range(10):
-        if not _pid_alive(pid):
+        if not _target_alive():
             info["terminated"] = True
             return info
         time.sleep(0.5)
 
-    if _pid_alive(pid):
+    if _target_alive():
         try:
             # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
             # (which maps to TerminateProcess via the stdlib shim).
@@ -4445,7 +4467,70 @@ def _terminate_reclaimed_worker(
         except (ProcessLookupError, OSError):
             return info
 
-    info["terminated"] = not _pid_alive(pid)
+    info["terminated"] = not _target_alive()
+    return info
+
+
+def _worker_signal_sender(pid: int) -> tuple[Any, bool, Optional[int]]:
+    if os.name != "nt" and hasattr(os, "killpg") and hasattr(os, "getpgid"):
+        try:
+            pgid = os.getpgid(pid)
+        except OSError:
+            pgid = None
+        if pgid and pgid > 0 and pgid != os.getpgrp():
+            return (lambda _pid, sig: os.killpg(pgid, sig)), True, pgid
+    return (os.kill if hasattr(os, "kill") else None), False, None
+
+
+def _process_group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _stop_reclaimed_worker_unit(unit: str) -> dict[str, Any]:
+    unit_ref = _normalize_systemd_unit_ref(unit)
+    info: dict[str, Any] = {
+        "prev_unit": unit_ref,
+        "unit_stop_attempted": False,
+        "unit_stopped": False,
+    }
+    if not unit_ref:
+        return info
+    if not _systemd_unit_status(unit_ref).active:
+        info["unit_stopped"] = True
+        return info
+    systemctl = shutil.which("systemctl") or "systemctl"
+    info["unit_stop_attempted"] = True
+    try:
+        proc = subprocess.run(
+            [systemctl, "--user", "stop", unit_ref],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception as exc:
+        info["unit_stop_error"] = str(exc)[:500]
+        return info
+    if proc.returncode != 0:
+        info["unit_stop_error"] = (
+            proc.stderr or proc.stdout or "systemctl stop failed"
+        ).strip()[:500]
+        return info
+    for _ in range(10):
+        if not _systemd_unit_status(unit_ref).active:
+            info["unit_stopped"] = True
+            return info
+        time.sleep(0.1)
+    info["unit_stopped"] = not _systemd_unit_status(unit_ref).active
     return info
 
 
