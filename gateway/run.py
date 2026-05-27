@@ -8626,13 +8626,18 @@ class GatewayRunner:
             # _interrupt_requested.  Force-clean _running_agents so the session
             # is unlocked and subsequent messages are processed normally.
             if _cmd_def_inner and _cmd_def_inner.name == "stop":
+                stopped_boards = await self._stop_discord_thread_boards_for_event(event)
                 await self._interrupt_and_clear_session(
                     _quick_key,
                     source,
                     interrupt_reason=_INTERRUPT_REASON_STOP,
                     invalidation_reason="stop_command",
                 )
-                logger.info("STOP for session %s — agent interrupted, session lock released", _quick_key)
+                logger.info(
+                    "STOP for session %s — agent interrupted, session lock released, boards_stopped=%s",
+                    _quick_key,
+                    ",".join(stopped_boards) if stopped_boards else "-",
+                )
                 return EphemeralReply(t("gateway.stop.stopped"))
 
             # /reset and /new must bypass the running-agent guard so they
@@ -11597,6 +11602,27 @@ class GatewayRunner:
 
         return "\n".join(lines)
 
+    async def _stop_discord_thread_boards_for_event(self, event: MessageEvent) -> list[str]:
+        """Best-effort /stop bridge from a Discord thread to worker board halt."""
+
+        def _stop() -> list[str]:
+            from hermes_cli import discord_worker_boards as _dwb
+
+            stopped: list[str] = []
+            for board in _dwb.stoppable_boards_for_gateway_event(event):
+                _dwb.stop_board_execution(board.slug, reason="slash-stop")
+                stopped.append(board.slug)
+            return stopped
+
+        try:
+            stopped = await asyncio.to_thread(_stop)
+        except Exception as exc:
+            logger.debug("Discord worker board /stop bridge failed: %s", exc, exc_info=True)
+            return []
+        if stopped:
+            self._signal_kanban_dispatcher_dirty()
+        return stopped
+
     async def _handle_stop_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /stop command - interrupt a running agent.
 
@@ -11611,6 +11637,7 @@ class GatewayRunner:
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        stopped_boards = await self._stop_discord_thread_boards_for_event(event)
 
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:
@@ -11633,8 +11660,14 @@ class GatewayRunner:
                 invalidation_reason="stop_command_handler",
             )
             return EphemeralReply(t("gateway.stop.stopped"))
-        else:
-            return t("gateway.stop.no_active")
+        if stopped_boards:
+            logger.info(
+                "STOP for session %s — Discord worker boards stopped: %s",
+                session_key,
+                ",".join(stopped_boards),
+            )
+            return EphemeralReply(t("gateway.stop.stopped"))
+        return t("gateway.stop.no_active")
 
     async def _handle_platform_command(self, event: MessageEvent) -> str:
         """Handle ``/platform list|pause|resume [name]`` — surface and

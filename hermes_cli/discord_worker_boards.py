@@ -3935,10 +3935,51 @@ def continue_board_after_review_loop_limit(
 
 
 def clear_board_goal(board: str) -> None:
+    stop_board_execution(board, reason="user-cleared")
+
+
+def stop_board_execution(board: str, *, reason: str = "user-stopped") -> dict[str, Any]:
+    """Cancel a Discord worker board and reclaim live role workers."""
     worker = _read_worker_meta(board)
-    worker.update({"goal_status": "cancelled", "phase": "cancelled", "cancelled": True, "paused": True})
+    if worker.get("kind") != "discord_worker_board":
+        return {"board": board, "reclaimed": []}
+    worker.update(
+        {
+            "goal_status": "cancelled",
+            "phase": "cancelled",
+            "cancelled": True,
+            "paused": True,
+            "paused_reason": reason,
+            "stop_reason": reason,
+            "terminal_reaction_sync_pending": True,
+            "terminal_summary_sync_pending": True,
+        }
+    )
     _update_worker_meta(board, worker)
+    reclaimed: list[str] = []
+    conn = kanban_db.connect(board=board)
+    try:
+        for task in kanban_db.list_tasks(conn, include_archived=False):
+            if getattr(task, "status", None) != "running":
+                continue
+            assignee = str(getattr(task, "assignee", "") or "").strip().lower()
+            if assignee not in ROLE_ASSIGNEES:
+                continue
+            if kanban_db.reclaim_task(conn, task.id, reason=reason):
+                reclaimed.append(task.id)
+    finally:
+        conn.close()
     persist_board_run_summary(board)
+    try:
+        mark_dispatch_dirty(board=board, reason=reason)
+    except Exception:
+        pass
+    return {"board": board, "reclaimed": reclaimed}
+
+
+def is_cancelled(board: str) -> bool:
+    worker = _read_worker_meta(board)
+    return bool(worker.get("cancelled") or worker.get("goal_status") == "cancelled")
 
 
 def add_subgoal(board: str, text: str) -> tuple[int, str]:
@@ -4246,3 +4287,62 @@ def board_for_gateway_event(event: Any, *, create: bool = False) -> Optional[Dis
             source_message_id=request_id,
         )
     return DiscordBoard(slug=slug, metadata=kanban_db.read_board_metadata(slug))
+
+
+def stoppable_boards_for_gateway_event(event: Any) -> list[DiscordBoard]:
+    """Return Discord worker boards a plain /stop in this thread should halt."""
+    source = getattr(event, "source", None)
+    platform = getattr(source, "platform", None)
+    platform_value = platform.value if hasattr(platform, "value") else str(platform or "")
+    if platform_value.lower() != "discord":
+        return []
+    chat_type = str(getattr(source, "chat_type", "") or "").lower()
+    source_thread_id = str(getattr(source, "thread_id", "") or "").strip()
+    if not source_thread_id and chat_type != "thread":
+        return []
+    thread_id = str(source_thread_id or getattr(source, "chat_id", "") or "").strip()
+    if not thread_id:
+        return []
+
+    boards: list[DiscordBoard] = []
+    seen: set[str] = set()
+
+    def add_board(slug: str) -> None:
+        if not slug or slug in seen or not kanban_db.board_exists(slug):
+            return
+        worker = _read_worker_meta(slug)
+        if worker.get("kind") != "discord_worker_board":
+            return
+        status = str(worker.get("goal_status") or "").strip().lower()
+        phase = str(worker.get("phase") or "").strip().lower()
+        if (
+            worker.get("cancelled")
+            or status == "cancelled"
+            or status == "done"
+            or phase == "complete"
+        ):
+            return
+        if status not in {"active", "paused", "blocked"} and phase not in {
+            "planning",
+            "dev",
+            "reviewing",
+            "paused",
+            "blocked",
+        }:
+            return
+        seen.add(slug)
+        boards.append(DiscordBoard(slug=slug, metadata=kanban_db.read_board_metadata(slug)))
+
+    try:
+        direct = board_for_gateway_event(event, create=False)
+        if direct is not None:
+            add_board(direct.slug)
+    except Exception:
+        pass
+
+    for board_meta in kanban_db.list_boards(include_archived=False):
+        slug = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
+        worker = _read_worker_meta(slug)
+        if str(worker.get("thread_id") or "").strip() == thread_id:
+            add_board(slug)
+    return boards
