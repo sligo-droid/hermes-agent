@@ -2533,6 +2533,34 @@ class TestVisionAutoSkipsKimiCoding:
 
 
 class TestCodexAuxiliaryAdapterTimeout:
+    def test_recovers_null_output_from_streamed_text_deltas(self):
+        class NullOutputStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                return iter((
+                    SimpleNamespace(type="response.output_text.delta", delta="Short "),
+                    SimpleNamespace(type="response.output_text.delta", delta="Title"),
+                ))
+
+            def get_final_response(self):
+                return SimpleNamespace(output=None, usage=None)
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return NullOutputStream()
+
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+
+        response = adapter.create(messages=[{"role": "user", "content": "title"}])
+
+        assert response.choices[0].message.content == "Short Title"
+
     def test_forwards_timeout_to_responses_stream(self):
         class FakeStream:
             def __enter__(self):
