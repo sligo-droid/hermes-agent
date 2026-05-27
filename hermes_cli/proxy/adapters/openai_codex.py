@@ -203,7 +203,7 @@ class OpenAICodexAdapter(UpstreamAdapter):
             responses_payload["text"] = {"format": text_format}
 
         try:
-            response_obj = await self._run_responses_stream(responses_payload, cred)
+            response_obj = await self._run_responses_stream_with_retry(responses_payload, cred)
             response_json = response_obj.model_dump() if hasattr(response_obj, "model_dump") else {}
         except aiohttp.ClientError as exc:
             logger.warning("proxy: Codex upstream connection failed: %s", exc)
@@ -255,6 +255,26 @@ class OpenAICodexAdapter(UpstreamAdapter):
                 "total_tokens": prompt_tokens + completion_tokens,
             },
         })
+
+    @staticmethod
+    async def _run_responses_stream_with_retry(
+        responses_payload: dict[str, Any],
+        cred: UpstreamCredential,
+    ) -> Any:
+        for attempt in range(2):
+            try:
+                return await OpenAICodexAdapter._run_responses_stream(
+                    responses_payload,
+                    cred,
+                )
+            except TypeError as exc:
+                if attempt or not OpenAICodexAdapter._is_null_output_stream_error(exc):
+                    raise
+                logger.debug(
+                    "proxy: retrying Codex stream after SDK null-output failure without recoverable output: %s",
+                    exc,
+                )
+        raise RuntimeError("unreachable Codex stream retry state")
 
     @staticmethod
     async def _run_responses_stream(

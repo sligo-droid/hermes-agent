@@ -5,6 +5,7 @@ from agent.error_classifier import (
     ClassifiedError,
     FailoverReason,
     classify_api_error,
+    is_upstream_null_iterable_error,
     _extract_status_code,
     _extract_error_body,
     _extract_error_code,
@@ -645,6 +646,14 @@ class TestClassifyApiError:
         e = TimeoutError("timed out")
         result = classify_api_error(e)
         assert result.reason == FailoverReason.timeout
+
+    def test_openai_sdk_null_output_typeerror_is_server_error(self):
+        e = TypeError("'NoneType' object is not iterable")
+        result = classify_api_error(e, provider="openai-codex", model="gpt-5.5")
+        assert is_upstream_null_iterable_error(e) is True
+        assert result.reason == FailoverReason.server_error
+        assert result.retryable is True
+        assert result.should_fallback is True
 
     def test_runtime_error_cli_turn_timed_out_classifies_as_timeout(self):
         # RuntimeError from a local claude-cli shim that wraps a subprocess

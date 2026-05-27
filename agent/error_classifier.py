@@ -19,6 +19,14 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 
+def is_upstream_null_iterable_error(error: BaseException) -> bool:
+    """Return True for OpenAI SDK null-output stream parser failures."""
+    if not isinstance(error, TypeError):
+        return False
+    message = str(error).lower()
+    return "nonetype" in message and "not iterable" in message
+
+
 # ── Error taxonomy ──────────────────────────────────────────────────────
 
 class FailoverReason(enum.Enum):
@@ -483,6 +491,16 @@ def classify_api_error(
         return ClassifiedError(**defaults)
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
+
+    # OpenAI's Responses/Codex streaming helpers can raise this TypeError when
+    # the upstream sends a malformed/null output stream. It is a provider-side
+    # response failure, not a local request-shape bug; let the caller retry.
+    if is_upstream_null_iterable_error(error):
+        return _result(
+            FailoverReason.server_error,
+            retryable=True,
+            should_fallback=True,
+        )
 
     # Anthropic thinking block signature invalid (400).
     # Don't gate on provider — OpenRouter proxies Anthropic errors, so the

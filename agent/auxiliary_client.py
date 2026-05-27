@@ -100,6 +100,7 @@ class _OpenAIProxy:
 OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 
 from agent.credential_pool import load_pool
+from agent.error_classifier import is_upstream_null_iterable_error
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
@@ -806,22 +807,45 @@ class _CodexCompletionsAdapter:
                 timeout_timer.daemon = True
                 timeout_timer.start()
             _check_cancelled()
-            with self._client.responses.stream(**resp_kwargs) as stream:
-                for _event in stream:
+            try:
+                with self._client.responses.stream(**resp_kwargs) as stream:
+                    for _event in stream:
+                        _check_cancelled()
+                        _etype = getattr(_event, "type", "")
+                        if _etype == "response.output_item.done":
+                            _done = getattr(_event, "item", None)
+                            if _done is not None:
+                                collected_output_items.append(_done)
+                        elif "output_text.delta" in _etype:
+                            _delta = getattr(_event, "delta", "")
+                            if _delta:
+                                collected_text_deltas.append(_delta)
+                        elif "function_call" in _etype:
+                            has_function_calls = True
                     _check_cancelled()
-                    _etype = getattr(_event, "type", "")
-                    if _etype == "response.output_item.done":
-                        _done = getattr(_event, "item", None)
-                        if _done is not None:
-                            collected_output_items.append(_done)
-                    elif "output_text.delta" in _etype:
-                        _delta = getattr(_event, "delta", "")
-                        if _delta:
-                            collected_text_deltas.append(_delta)
-                    elif "function_call" in _etype:
-                        has_function_calls = True
-                _check_cancelled()
-                final = stream.get_final_response()
+                    final = stream.get_final_response()
+            except TypeError as exc:
+                if not is_upstream_null_iterable_error(exc):
+                    raise
+                if collected_output_items:
+                    final = SimpleNamespace(output=list(collected_output_items), usage=None)
+                elif collected_text_deltas and not has_function_calls:
+                    assembled = "".join(collected_text_deltas)
+                    final = SimpleNamespace(
+                        output=[SimpleNamespace(
+                            type="message",
+                            role="assistant",
+                            status="completed",
+                            content=[SimpleNamespace(type="output_text", text=assembled)],
+                        )],
+                        usage=None,
+                    )
+                else:
+                    raise
+                logger.debug(
+                    "Codex auxiliary: synthesized stream response after SDK null-output failure: %s",
+                    exc,
+                )
 
             # Backfill empty output from collected stream events
             _output = getattr(final, "output", None)
@@ -2325,6 +2349,8 @@ def _is_connection_error(exc: Exception) -> bool:
     distinct from API errors (4xx/5xx) which indicate the provider IS
     reachable but returned an error.
     """
+    if is_upstream_null_iterable_error(exc):
+        return True
     try:
         from openai import APIConnectionError, APITimeoutError
         if isinstance(exc, (APIConnectionError, APITimeoutError)):
@@ -5031,6 +5057,17 @@ def call_llm(
                     raise
                 first_err = retry_err
 
+        if is_upstream_null_iterable_error(first_err):
+            logger.info(
+                "Auxiliary %s: upstream returned null stream output; retrying once",
+                task or "call",
+            )
+            try:
+                return _validate_llm_response(
+                    client.chat.completions.create(**kwargs), task)
+            except Exception as retry_err:
+                first_err = retry_err
+
         # ── Nous auth refresh parity with main agent ──────────────────
         client_is_nous = (
             resolved_provider == "nous"
@@ -5437,6 +5474,17 @@ async def async_call_llm(
                 # error, fall through to the fallback chain below.
                 if not (_is_payment_error(retry_err) or _is_connection_error(retry_err) or _is_rate_limit_error(retry_err)):
                     raise
+                first_err = retry_err
+
+        if is_upstream_null_iterable_error(first_err):
+            logger.info(
+                "Auxiliary %s (async): upstream returned null stream output; retrying once",
+                task or "call",
+            )
+            try:
+                return _validate_llm_response(
+                    await client.chat.completions.create(**kwargs), task)
+            except Exception as retry_err:
                 first_err = retry_err
 
         # ── Nous auth refresh parity with main agent ──────────────────
