@@ -840,6 +840,7 @@ MEDIA_DELIVERY_SAFE_ROOTS = (
     _HERMES_HOME / "video_cache",
     _HERMES_HOME / "document_cache",
     _HERMES_HOME / "browser_screenshots",
+    _HERMES_HOME / "media_cache",
 )
 
 # Default recency window for trusting freshly-produced files (seconds).
