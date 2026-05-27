@@ -1897,6 +1897,7 @@ def _issue_group_payload(issue: ForemanIssue) -> dict[str, Any]:
         "problem": _canonical_problem_text(problem),
     }
     if issue.kind == "worker_errored":
+        payload["board"] = issue.board
         payload["run_outcome"] = _canonical_problem_text(evidence.get("run_outcome") or "")
     elif issue.kind == "stale_running":
         payload["task_assignee"] = _canonical_problem_text(evidence.get("task_assignee") or "")
