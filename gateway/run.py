@@ -87,6 +87,26 @@ _DISCORD_FEATURE_REQUEST_FAST_PATH_PROMPT = (
 )
 
 
+def _kanban_dispatch_health_candidate(board_slug: str, discord_worker_boards: Any) -> bool:
+    """Return whether a board should count toward dispatcher stuck health.
+
+    The real Discord worker dispatcher skips paused, blocked, cancelled, and
+    otherwise non-executable worker boards. The health probe must mirror that
+    boundary or inactive boards with leftover ready planner tickets produce
+    false stuck-dispatcher warnings.
+    """
+    if discord_worker_boards is None:
+        return True
+    try:
+        if not discord_worker_boards.is_discord_worker_board(board_slug):
+            return True
+        return bool(discord_worker_boards.is_executable_worker_board(board_slug)) and not bool(
+            discord_worker_boards.is_paused_or_cancelled(board_slug)
+        )
+    except Exception:
+        return True
+
+
 def _gateway_flow_route_type(event: Any, command: Optional[str] = None) -> str:
     """Classify a gateway turn for low-cardinality flow telemetry."""
     cmd = str(command or "").strip().lstrip("/").replace("_", "-").lower()
@@ -6185,7 +6205,10 @@ class GatewayRunner:
 
                 for b in boards:
                     slug = b.get("slug") or _kb.DEFAULT_BOARD
-                    if _dwb.is_discord_worker_board(slug):
+                    if (
+                        _dwb.is_discord_worker_board(slug)
+                        and _kanban_dispatch_health_candidate(slug, _dwb)
+                    ):
                         running = running_role_count(slug)
                         discord_running_by_board[slug] = running
                         discord_running_total += running
@@ -6201,6 +6224,8 @@ class GatewayRunner:
                         from hermes_cli import discord_worker_boards as _dwb
 
                         if _dwb.is_discord_worker_board(slug):
+                            if not _kanban_dispatch_health_candidate(slug, _dwb):
+                                continue
                             board_running = discord_running_by_board.get(slug, 0)
                             if (
                                 discord_running_total >= discord_max_global_workers
@@ -6258,6 +6283,8 @@ class GatewayRunner:
                     if not rows:
                         continue
                     is_discord = bool(_dwb and _dwb.is_discord_worker_board(slug))
+                    if is_discord and not _kanban_dispatch_health_candidate(slug, _dwb):
+                        continue
                     extra = set(_dwb.ROLE_ASSIGNEES) if is_discord and _dwb else set()
                     unassigned = 0
                     nonspawnable: set[str] = set()
