@@ -249,10 +249,10 @@ def collect_foreman_issues(
 def coalesce_foreman_issues(issues: Iterable[ForemanIssue]) -> list[ForemanIssue]:
     """Suppress redundant autonomous foreman work for a source board.
 
-    Foreman should make at most one autonomous recovery attempt for a source
-    board at a time. Human-intervention alerts remain exempt because they are
-    the terminal escalation path after an autonomous attempt discovers a
-    human-only blocker.
+    Foreman should make at most one recovery path visible for a source board at
+    a time. Human-intervention alerts are terminal escalations, so when one is
+    present it consumes the source-board slot and suppresses the matching
+    autonomous foreman retry prompt for that tick.
     """
     active_sources = _active_foreman_source_boards()
     seen_sources = set(active_sources)
@@ -266,10 +266,12 @@ def coalesce_foreman_issues(issues: Iterable[ForemanIssue]) -> list[ForemanIssue
             str(getattr(item, "kind", "") or ""),
         ),
     ):
+        source_board = _issue_source_board(issue)
         if getattr(issue, "kind", "") == "human_intervention_required":
             coalesced.append(issue)
+            if source_board:
+                seen_sources.add(source_board)
             continue
-        source_board = _issue_source_board(issue)
         if source_board and source_board in seen_sources:
             continue
         coalesced.append(issue)
@@ -286,9 +288,11 @@ def collect_human_intervention_issues(
 ) -> list[ForemanIssue]:
     """Return human-escalation issues for blocked foreman-generated boards.
 
-    The manual-configuration decision is intentionally made by an auxiliary
-    LLM once per unique foreman-board blockage, then persisted in foreman
-    state so the watcher does not keep spending inference on the same block.
+    A foreman board that is itself stalled after the configured age is already
+    the terminal escalation path: the autonomous foreman attempt has blocked, so
+    alert a human deterministically instead of letting a manual-configuration
+    classifier suppress the alert. Non-stalled foreman failures still use the
+    auxiliary classifier once per unique blockage and persist the result.
     """
     now = int(time.time()) if now is None else int(now)
     min_age = _coerce_nonnegative_int(
@@ -305,10 +309,30 @@ def collect_human_intervention_issues(
     issues: list[ForemanIssue] = []
     seen_keys: set[str] = set()
     for snapshot in collect_board_snapshots(foreman_generated_only=True):
+        stalled = []
+        if _foreman_board_explicitly_blocked(snapshot):
+            stalled = [
+                _with_foreman_source(issue, snapshot)
+                for issue in detect_stalled_blocked_board(
+                    snapshot,
+                    now=now,
+                    min_age_seconds=min_age,
+                    include_worker_error_blockers=True,
+                )
+            ]
+        if stalled:
+            issues.extend(
+                _manual_intervention_issue(
+                    issue,
+                    _foreman_blocked_attention_assessment(issue, now=now),
+                )
+                for issue in stalled
+            )
+            continue
+
         candidates: list[ForemanIssue] = []
         candidates.extend(detect_worker_errored(snapshot))
         candidates.extend(detect_missing_read_broker(snapshot))
-        candidates.extend(detect_stalled_blocked_board(snapshot, now=now, min_age_seconds=min_age))
         candidates = [_with_foreman_source(issue, snapshot) for issue in candidates]
         for issue in candidates:
             key = _manual_assessment_key(issue)
@@ -422,7 +446,13 @@ def alerts_due(
     changed = _gc_alert_state(state, now=now, retention_seconds=int(cfg["retention_seconds"]))
     due: list[ForemanIssue] = []
     due_groups: set[str] = set()
-    for issue in issues:
+    due_human_input_keys: set[str] = set()
+    for _, issue in sorted(enumerate(issues), key=lambda item: _alert_issue_sort_key(item[0], item[1])):
+        human_input_key = _human_input_condition_key(issue)
+        if issue.kind != "human_intervention_required" and (
+            human_input_key in due_human_input_keys or _human_input_already_sent(state, issue)
+        ):
+            continue
         if not _board_created_at_allowed(issue, min_created_at=int(cfg["min_board_created_at"])):
             continue
         fingerprint = _issue_fingerprint(issue)
@@ -447,7 +477,7 @@ def alerts_due(
             continue
         if len(due) >= int(cfg["max_alerts_per_tick"]):
             continue
-        if _board_daily_count(state, issue.board, now) >= int(cfg["daily_cap_per_board"]):
+        if _issue_daily_count(state, issue, now) >= int(cfg["daily_cap_per_board"]):
             continue
         if not _terminal_issue_recent(
             issue,
@@ -462,6 +492,8 @@ def alerts_due(
         ):
             due.append(issue)
             due_groups.add(group_key)
+            if issue.kind == "human_intervention_required":
+                due_human_input_keys.add(human_input_key)
     if changed:
         _write_alert_state(state)
     return due
@@ -518,7 +550,7 @@ def record_alert_sent(issue: ForemanIssue, *, now: Optional[int] = None) -> None
     entry["next_retry_at"] = None
     entry["last_error"] = ""
     daily_counts = state.setdefault("daily_counts", {})
-    key = _daily_key(issue.board, now)
+    key = _issue_daily_key(issue, now)
     daily_counts[key] = int(daily_counts.get(key) or 0) + 1
     group_entry = _group_entry(state, issue, now=now)
     group_entry["last_sent_at"] = now
@@ -529,6 +561,8 @@ def record_alert_sent(issue: ForemanIssue, *, now: Optional[int] = None) -> None
     group_entry["failure_count"] = 0
     group_entry["next_retry_at"] = None
     group_entry["last_error"] = ""
+    if issue.kind == "human_intervention_required":
+        _record_human_input_sent(state, issue, now=now)
     _write_alert_state(state)
 
 
@@ -862,6 +896,7 @@ def detect_stalled_blocked_board(
     *,
     now: int,
     min_age_seconds: int = BLOCKED_BOARD_MIN_AGE_SECONDS,
+    include_worker_error_blockers: bool = False,
 ) -> list[ForemanIssue]:
     """Detect board-level blockers that leave a worker board unable to progress."""
     if snapshot.archived or _board_is_terminal(snapshot):
@@ -884,7 +919,7 @@ def detect_stalled_blocked_board(
         return []
 
     blocker = _board_blocker_task(snapshot)
-    if blocker is not None and _task_has_worker_error_issue(blocker):
+    if blocker is not None and not include_worker_error_blockers and _task_has_worker_error_issue(blocker):
         return []
 
     stalled_since = _board_stalled_since(snapshot, blocker)
@@ -1044,6 +1079,14 @@ def _board_is_terminal(snapshot: BoardSnapshot) -> bool:
         or phase in {"complete", "cancelled"}
         or thread_state in {"done", "archived", "cancelled"}
     )
+
+
+def _foreman_board_explicitly_blocked(snapshot: BoardSnapshot) -> bool:
+    """Return True when the foreman worker board itself advertises a blocked state."""
+    goal_status = _canonical_problem_text(snapshot.goal_status)
+    phase = _canonical_problem_text(snapshot.phase)
+    thread_state = _canonical_problem_text(snapshot.thread_state)
+    return goal_status == "blocked" or phase == "blocked" or thread_state == "blocked"
 
 
 def _board_task_counts(snapshot: BoardSnapshot) -> dict[str, int]:
@@ -1515,6 +1558,40 @@ def _manual_instruction_steps(evidence: dict[str, Any]) -> list[str]:
     )
 
 
+def _foreman_blocked_attention_assessment(issue: ForemanIssue, *, now: int) -> dict[str, Any]:
+    evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
+    problem = (
+        evidence.get("blocked_reason")
+        or evidence.get("sidecar_error")
+        or evidence.get("run_error")
+        or evidence.get("error_excerpt")
+        or issue.title
+        or "The foreman board is blocked."
+    )
+    age = evidence.get("stalled_age_seconds")
+    threshold = evidence.get("stalled_after_seconds")
+    if age not in (None, "") and threshold not in (None, ""):
+        reason = (
+            f"Foreman board {issue.board} has remained blocked for {age} seconds "
+            f"after the {threshold}-second alert threshold. Latest blocker: {problem}"
+        )
+    else:
+        reason = f"Foreman board {issue.board} is blocked. Latest blocker: {problem}"
+    return {
+        "assessed_at": now,
+        "requires_manual_intervention": True,
+        "reason": _truncate_text(_sanitize_text(reason), 300),
+        "intervention_type": "foreman_blocked",
+        "instructions": [
+            "Open the Foreman board linked in this alert and inspect the blocked task.",
+            "Decide whether to retry or reassign the Foreman worker, add missing human context, or cancel the attempt.",
+            "Reply in Discord with the next action Hermes should take, then ask Hermes to retry the blocked source task if appropriate.",
+        ],
+        "confidence": "high",
+        "error": "",
+    }
+
+
 def _safe_foreman_mention(mention: str = "") -> str:
     raw = str(mention or FOREMAN_DISCORD_MENTION or "").strip()
     if "\n" in raw:
@@ -1640,6 +1717,7 @@ def _read_alert_state() -> dict[str, Any]:
             "version": ALERT_STATE_VERSION,
             "alerts": {},
             "issue_groups": {},
+            "human_input_alerts": {},
             "manual_assessments": {},
             "daily_counts": {},
         }
@@ -1649,6 +1727,9 @@ def _read_alert_state() -> dict[str, Any]:
     groups = raw.get("issue_groups")
     if not isinstance(groups, dict):
         raw["issue_groups"] = {}
+    human_input_alerts = raw.get("human_input_alerts")
+    if not isinstance(human_input_alerts, dict):
+        raw["human_input_alerts"] = {}
     assessments = raw.get("manual_assessments")
     if not isinstance(assessments, dict):
         raw["manual_assessments"] = {}
@@ -1662,6 +1743,7 @@ def _write_alert_state(state: dict[str, Any]) -> None:
     state["version"] = ALERT_STATE_VERSION
     state.setdefault("alerts", {})
     state.setdefault("issue_groups", {})
+    state.setdefault("human_input_alerts", {})
     state.setdefault("manual_assessments", {})
     state.setdefault("daily_counts", {})
     atomic_json_write(_alert_state_path(), state, indent=2, sort_keys=True)
@@ -1732,6 +1814,20 @@ def _board_created_at_allowed(issue: ForemanIssue, *, min_created_at: int) -> bo
     return board_created_at >= min_created_at
 
 
+def _alert_issue_sort_key(index: int, issue: ForemanIssue) -> tuple[int, int, int, int, int]:
+    evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
+    board_created_at = _coerce_optional_int(evidence.get("board_created_at")) or 0
+    stalled_since = _coerce_optional_int(evidence.get("stalled_since")) or 0
+    is_human_intervention = issue.kind == "human_intervention_required"
+    return (
+        0 if is_human_intervention else 1,
+        -_severity_rank(issue.severity),
+        -board_created_at,
+        -stalled_since,
+        index,
+    )
+
+
 def _issue_fingerprint(issue: ForemanIssue) -> str:
     payload = {
         "detector_version": ALERT_DETECTOR_VERSION,
@@ -1752,6 +1848,39 @@ def _issue_group_state_key(issue: ForemanIssue) -> str:
         "severity": issue.severity,
     }
     return _stable_digest(payload)
+
+
+def _human_input_condition_key(issue: ForemanIssue) -> str:
+    evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
+    source_issue_kind = str(evidence.get("source_issue_kind") or "").strip()
+    payload = {
+        "detector_version": ALERT_DETECTOR_VERSION,
+        "source_board": _issue_source_board(issue),
+        "source_task_id": str(evidence.get("source_task_id") or issue.task_id or "").strip(),
+        "source_issue_kind": source_issue_kind or str(issue.kind or "").strip(),
+    }
+    return _stable_digest(payload)
+
+
+def _human_input_already_sent(state: dict[str, Any], issue: ForemanIssue) -> bool:
+    alerts = state.setdefault("human_input_alerts", {})
+    entry = alerts.get(_human_input_condition_key(issue))
+    return isinstance(entry, dict) and bool(entry.get("last_sent_at"))
+
+
+def _record_human_input_sent(state: dict[str, Any], issue: ForemanIssue, *, now: int) -> None:
+    alerts = state.setdefault("human_input_alerts", {})
+    key = _human_input_condition_key(issue)
+    entry = alerts.get(key)
+    if not isinstance(entry, dict):
+        entry = _new_alert_entry(now)
+        alerts[key] = entry
+    entry["last_sent_at"] = now
+    entry["last_attempt_at"] = now
+    entry["send_count"] = int(entry.get("send_count") or 0) + 1
+    entry["failure_count"] = 0
+    entry["next_retry_at"] = None
+    entry["last_error"] = ""
 
 
 def _issue_group_payload(issue: ForemanIssue) -> dict[str, Any]:
@@ -1884,13 +2013,29 @@ def _severity_rank(severity: str) -> int:
     return _SEVERITY_RANK.get(str(severity or "").casefold(), 0)
 
 
-def _daily_key(board: str, now: int) -> str:
+def _daily_key(scope: str, now: int) -> str:
     day = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d")
-    return f"{board}:{day}"
+    return f"{scope}:{day}"
 
 
-def _board_daily_count(state: dict[str, Any], board: str, now: int) -> int:
-    return int(state.setdefault("daily_counts", {}).get(_daily_key(board, now)) or 0)
+def _issue_daily_scope(issue: ForemanIssue) -> str:
+    """Return the daily-cap bucket for an alert issue.
+
+    Human-intervention alerts are the terminal escalation path for a Foreman
+    attempt. Keep them in their own per-board bucket so an earlier autonomous
+    warning for the source board cannot consume the day's only notification slot.
+    """
+    if issue.kind == "human_intervention_required":
+        return f"{issue.board}:human_intervention_required"
+    return issue.board
+
+
+def _issue_daily_key(issue: ForemanIssue, now: int) -> str:
+    return _daily_key(_issue_daily_scope(issue), now)
+
+
+def _issue_daily_count(state: dict[str, Any], issue: ForemanIssue, now: int) -> int:
+    return int(state.setdefault("daily_counts", {}).get(_issue_daily_key(issue, now)) or 0)
 
 
 def _gc_alert_state(state: dict[str, Any], *, now: int, retention_seconds: int) -> bool:
@@ -1919,6 +2064,18 @@ def _gc_alert_state(state: dict[str, Any], *, now: int, retention_seconds: int) 
         attempted = int(entry.get("last_attempt_at") or 0)
         if max(seen, sent, attempted) < cutoff:
             groups.pop(fingerprint, None)
+            changed = True
+    human_input_alerts = state.setdefault("human_input_alerts", {})
+    for fingerprint, entry in list(human_input_alerts.items()):
+        if not isinstance(entry, dict):
+            human_input_alerts.pop(fingerprint, None)
+            changed = True
+            continue
+        seen = int(entry.get("first_seen_at") or 0)
+        sent = int(entry.get("last_sent_at") or 0)
+        attempted = int(entry.get("last_attempt_at") or 0)
+        if max(seen, sent, attempted) < cutoff:
+            human_input_alerts.pop(fingerprint, None)
             changed = True
     assessments = state.setdefault("manual_assessments", {})
     for fingerprint, entry in list(assessments.items()):

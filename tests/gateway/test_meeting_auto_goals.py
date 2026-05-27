@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
@@ -37,13 +37,28 @@ class FakeGoalManager:
 class FakeDiscordAdapter:
     def __init__(self):
         self._active_sessions = {}
+        self._post_delivery_callbacks = {}
         self.callback = None
         self.callback_session_key = None
         self.initialized = []
 
     def register_post_delivery_callback(self, session_key, callback, *, generation=None):
         self.callback_session_key = session_key
-        self.callback = callback
+        BasePlatformAdapter.register_post_delivery_callback(
+            self,
+            session_key,
+            callback,
+            generation=generation,
+        )
+        entry = self._post_delivery_callbacks.get(session_key)
+        self.callback = entry[1] if isinstance(entry, tuple) else entry
+
+    def pop_post_delivery_callback(self, session_key, *, generation=None):
+        return BasePlatformAdapter.pop_post_delivery_callback(
+            self,
+            session_key,
+            generation=generation,
+        )
 
     async def initialize_goal_feature_summary_for_source(
         self,
@@ -181,6 +196,59 @@ Next todos
     assert await adapter.callback() is True
     assert len(adapter.initialized) == 1
     assert adapter.initialized[0]["source"].thread_id == "thread-1"
+    assert adapter.initialized[0]["initial_request"] == "/goal Follow up on the todos from this meeting."
+
+
+@pytest.mark.asyncio
+async def test_meeting_auto_goal_chains_with_existing_post_delivery_callback(monkeypatch):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    adapter = FakeDiscordAdapter()
+    runner.adapters = {Platform.DISCORD: adapter}
+    calls = {"subgoals": []}
+    preexisting_fired = []
+
+    from hermes_cli import discord_worker_boards as _dwb
+
+    monkeypatch.setattr(
+        _dwb,
+        "start_direct_goal",
+        lambda **kwargs: SimpleNamespace(
+            slug="discord-thread-1",
+            public_url="https://kanban.example/thread-1",
+            worker={"project_context": kwargs["project_context"]},
+        ),
+    )
+    monkeypatch.setattr(
+        _dwb,
+        "add_subgoal",
+        lambda board, text: calls["subgoals"].append((board, text))
+        or (len(calls["subgoals"]), text),
+    )
+    monkeypatch.setattr(runner, "_session_key_for_source", lambda source: "session-key")
+    adapter.register_post_delivery_callback(
+        "session-key",
+        lambda: preexisting_fired.append("response delivered"),
+    )
+
+    status = await runner._apply_meeting_auto_goal_from_response(
+        _meeting_event(),
+        """
+Next todos
+- Draft the client summary.
+""",
+    )
+
+    assert status == ""
+    assert adapter.initialized == []
+
+    callback = adapter.pop_post_delivery_callback("session-key")
+    assert callback is not None
+    result = callback()
+    if hasattr(result, "__await__"):
+        await result
+
+    assert preexisting_fired == ["response delivered"]
+    assert len(adapter.initialized) == 1
     assert adapter.initialized[0]["initial_request"] == "/goal Follow up on the todos from this meeting."
 
 

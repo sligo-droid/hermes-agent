@@ -2211,3 +2211,85 @@ def test_discord_worker_dispatch_skips_paused_board(monkeypatch, tmp_path):
     )
 
     assert spawned == [active.slug]
+
+
+def test_stop_board_execution_cancels_and_reclaims_running_worker(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
+
+    _skip_code_island_preflight(monkeypatch)
+
+    board = _make_discord_board("2303")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.list_tasks(conn, include_archived=False)[0].id
+        assert kanban_db.claim_task(conn, task_id) is not None
+    finally:
+        conn.close()
+
+    result = dwb.stop_board_execution(board.slug, reason="slash-stop")
+
+    metadata = kanban_db.read_board_metadata(board.slug)
+    worker = metadata["discord_worker"]
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+    finally:
+        conn.close()
+
+    assert result["reclaimed"] == [task_id]
+    assert worker["goal_status"] == "cancelled"
+    assert worker["phase"] == "cancelled"
+    assert worker["paused"] is True
+    assert worker["cancelled"] is True
+    assert task.status == "ready"
+    assert task.claim_lock is None
+    assert task.current_run_id is None
+
+    spawned = []
+    dispatch_discord_worker_boards(
+        [board.slug],
+        max_global_workers=1,
+        max_workers_per_board=1,
+        spawn_fn=lambda task, workspace, board=None: spawned.append(board) or 4303,
+    )
+
+    assert spawned == []
+
+
+def test_queue_reason_defaults_allow_two_per_board_and_eight_global(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    _skip_code_island_preflight(monkeypatch)
+    board = _make_discord_board("2403")
+    ready_id = _create_ready_dev_task(board.slug)
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        conn.execute("UPDATE tasks SET status = 'ready', claim_lock = NULL WHERE id = ?", (ready_id,))
+        running_id = kanban_db.create_task(
+            conn,
+            title="Running dev task",
+            assignee=dwb.ROLE_DEV,
+            tenant=board.slug,
+        )
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (running_id,))
+        conn.commit()
+
+        worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+        counts = {"ready": 1, "review": 0, "todo": 0}
+        monkeypatch.setattr(dwb, "_worker_config", lambda: {})
+        monkeypatch.setattr(dwb, "_active_role_count_across_boards", lambda: 7)
+
+        reason = dwb._queue_reason(worker, counts=counts, running_count=1, conn=conn)
+
+        assert reason == "awaiting next dispatcher tick"
+
+        monkeypatch.setattr(dwb, "_active_role_count_across_boards", lambda: 8)
+
+        assert dwb._queue_reason(worker, counts=counts, running_count=1, conn=conn) == "global worker limit reached"
+    finally:
+        conn.close()

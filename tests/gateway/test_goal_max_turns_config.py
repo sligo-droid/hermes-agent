@@ -22,6 +22,10 @@ class _FakeSessionEntry:
     def session_id(self) -> str:
         return _session_id()
 
+    @property
+    def session_key(self) -> str:
+        return "agent:main:discord:channel:goal-config"
+
 
 class _FakeSessionStore:
     def __init__(self):
@@ -398,6 +402,45 @@ async def test_discord_goal_resume_signals_dirty_dispatch(tmp_path, monkeypatch)
 
     assert response == "Kanban goal resumed."
     assert signals == [True]
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_request_scoped_discord_worker_board(tmp_path, monkeypatch):
+    kanban_home = tmp_path / "kanban-home"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(
+        thread_id="thread-stop",
+        goal="Ship the dashboard",
+        chat_id="parent-channel",
+        request_id="source-message",
+    )
+    assert board.slug == "discord-thread-stop-m-source-message"
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _FakeSessionStore()
+    runner.adapters = {}
+    runner._queued_events = {}
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+
+    response = await GatewayRunner._handle_stop_command(
+        runner,
+        _make_discord_thread_event("/stop", thread_id="thread-stop"),
+    )
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "Stopped" in str(response)
+    assert meta["goal_status"] == "cancelled"
+    assert meta["phase"] == "cancelled"
+    assert meta["cancelled"] is True
+    assert meta["paused"] is True
 
 
 @pytest.mark.asyncio

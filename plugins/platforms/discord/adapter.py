@@ -1858,15 +1858,15 @@ class DiscordAdapter(BasePlatformAdapter):
         if metadata.get("pr_url"):
             fields.append(("GitHub PR", metadata["pr_url"], False))
         if kanban_url:
-            if (
-                source_board
-                and source_kanban_url
-                and not hide_source_links
-                and not self._same_feature_summary_url(kanban_url, source_kanban_url)
-                and not self._same_feature_summary_url(kanban_url, source_task_url)
-            ):
-                fields.append(("Foreman Kanban", kanban_url, False))
-            elif not source_board:
+            if source_board:
+                duplicates_source_url = any(
+                    source_url
+                    and self._same_feature_summary_url(kanban_url, source_url)
+                    for source_url in (source_kanban_url, source_task_url)
+                )
+                if not duplicates_source_url:
+                    fields.append(("Foreman Kanban", kanban_url, False))
+            else:
                 fields.append(("Kanban Board", kanban_url, False))
         for name, value, inline in fields:
             try:
@@ -6885,6 +6885,7 @@ class DiscordAdapter(BasePlatformAdapter):
             outcome=initial_request,
             title=thread_name,
             metadata=metadata,
+            kanban_url=(kanban_board or {}).get("public_url") if isinstance(kanban_board, dict) else None,
             source_board=source_board,
             source_task_id=source_task_id,
             source_task_url=source_task_url,

@@ -403,6 +403,69 @@ def test_foreman_watcher_direct_alerts_human_intervention_issue(monkeypatch):
     assert failed == []
 
 
+def test_foreman_watcher_suppresses_matching_goal_when_human_alert_is_due(monkeypatch):
+    _patch_config(monkeypatch, _enabled_config())
+    _patch_lock(monkeypatch)
+    from hermes_cli import discord_worker_foreman as foreman
+
+    source_issue = _issue(
+        "source-task",
+        source_board="discord-source",
+        source_task_id="source-task",
+        source_issue_kind="worker_errored",
+        thread_id="source-thread",
+        chat_id="source-thread",
+    )
+    human_issue = _human_issue(
+        "source-task",
+        source_board="discord-source",
+        source_task_id="source-task",
+        source_issue_kind="worker_errored",
+        thread_id="source-thread",
+        chat_id="source-thread",
+        foreman_board="discord-foreman",
+        manual_intervention_reason="Human must create the API key.",
+    )
+    sent = []
+    failed = []
+
+    monkeypatch.setattr(foreman, "collect_foreman_issues", lambda now=None, **kwargs: [source_issue])
+    monkeypatch.setattr(foreman, "collect_human_intervention_issues", lambda now=None, **kwargs: [human_issue])
+    monkeypatch.setattr(foreman, "startup_baseline_needed", lambda: False)
+    monkeypatch.setattr(foreman, "alerts_due", lambda issues, *, config=None, now=None: list(issues))
+    monkeypatch.setattr(foreman, "render_foreman_alert", lambda issue, mention="": f"human alert: {issue.task_id}")
+    monkeypatch.setattr(foreman, "render_foreman_goal_prompt", lambda issue: "/goal Fix worker")
+    monkeypatch.setattr(foreman, "foreman_goal_thread_title", lambda issue: "Foreman worker")
+    monkeypatch.setattr(foreman, "record_alert_sent", lambda issue: sent.append(issue.kind))
+    monkeypatch.setattr(foreman, "record_alert_failed", lambda issue, error: failed.append((issue.kind, error)))
+
+    adapter = ForemanAdapter()
+    runner = _runner(adapter)
+    goal_events = []
+
+    async def fake_handle_goal(event):
+        goal_events.append(event)
+        return None
+
+    monkeypatch.setattr(runner, "_handle_goal_command", fake_handle_goal)
+    asyncio.run(_run_one_foreman_tick(monkeypatch, runner))
+
+    assert adapter.sent == [
+        {
+            "chat_id": "source-thread",
+            "content": "human alert: source-task",
+            "metadata": {
+                "foreman_alert_kind": "human_intervention_required",
+                "allowed_role_mentions": ["1503914570077442058"],
+            },
+        }
+    ]
+    assert adapter.created_goals == []
+    assert goal_events == []
+    assert sent == ["human_intervention_required"]
+    assert failed == []
+
+
 def test_foreman_watcher_auto_closes_before_collecting_issues(monkeypatch):
     _patch_config(monkeypatch, _enabled_config())
     _patch_lock(monkeypatch)

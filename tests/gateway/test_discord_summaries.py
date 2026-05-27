@@ -883,6 +883,7 @@ async def test_foreman_goal_embed_posts_to_source_thread_and_hides_source_links(
         source_task_url="https://hermes.example.test/workers/123/tickets/t1",
         source_kanban_url="https://hermes.example.test/workers/123",
         source_discord_thread_url="https://discord.com/channels/5/123",
+        kanban_board={"slug": "foreman-abc", "public_url": "https://hermes.example.test/workers/foreman-abc"},
     )
 
     assert handle is not None
@@ -899,7 +900,7 @@ async def test_foreman_goal_embed_posts_to_source_thread_and_hides_source_links(
     assert "Affected Board" not in fields
     assert "Affected Task" not in fields
     assert "Discord Thread" not in fields
-    assert "Foreman Kanban" not in fields
+    assert fields["Foreman Kanban"] == "https://hermes.example.test/workers/foreman-abc"
     sent_message.add_reaction.assert_awaited_once_with("👀")
 
 

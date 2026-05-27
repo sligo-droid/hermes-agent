@@ -19,6 +19,7 @@ from hermes_cli.discord_worker_boards import (
     ROLE_REVIEWER,
     active_dev_round_for_board,
     format_role_round_title,
+    is_cancelled,
     mark_dispatch_dirty,
     record_codex_worker_event,
     record_codex_worker_result,
@@ -53,6 +54,8 @@ def main() -> int:
         if result.error:
             raise RuntimeError(result.error)
         payload = _parse_json(result.final_text)
+        if board and is_cancelled(board):
+            return 0
         _apply_role_output(
             conn,
             task_id,
@@ -464,6 +467,8 @@ def _apply_role_output(
 ) -> None:
     status = str(payload.get("status") or "").strip().lower()
     summary = str(payload.get("summary") or "").strip()
+    if board and is_cancelled(board):
+        return
     if role == ROLE_PLANNER:
         if status == "blocked":
             kanban_db.block_task(
@@ -481,7 +486,7 @@ def _apply_role_output(
         try:
             created = _create_planned_dev_tasks(conn, specs, created_by=ROLE_PLANNER)
             _merge_criteria(board, criteria)
-            kanban_db.complete_task(
+            completed = kanban_db.complete_task(
                 conn,
                 task_id,
                 summary=summary or f"Planned {len(created)} task(s).",
@@ -489,6 +494,8 @@ def _apply_role_output(
                 created_cards=created,
                 expected_run_id=expected_run_id,
             )
+            if not completed:
+                _cleanup_created_tasks(conn, created)
         except Exception:
             _cleanup_created_tasks(conn, created)
             raise
@@ -496,25 +503,29 @@ def _apply_role_output(
 
     if role == ROLE_REVIEWER:
         if status == "approved":
-            kanban_db.complete_task(
+            completed = kanban_db.complete_task(
                 conn,
                 task_id,
                 summary=summary or "Reviewer approved.",
                 metadata={"raw": payload},
                 expected_run_id=expected_run_id,
             )
+            if not completed:
+                return
             if _ensure_pr(board, workspace):
                 _update_phase(board, "complete", goal_status="done")
             else:
                 _update_phase(board, "blocked", goal_status="blocked")
             return
         if status == "blocked":
-            kanban_db.block_task(
+            blocked = kanban_db.block_task(
                 conn,
                 task_id,
                 reason=payload.get("blocker") or summary,
                 expected_run_id=expected_run_id,
             )
+            if not blocked:
+                return
             _update_phase(board, "blocked", goal_status="blocked")
             return
         new_tasks = payload.get("new_tasks") if isinstance(payload.get("new_tasks"), list) else []
@@ -523,7 +534,7 @@ def _apply_role_output(
         created: list[str] = []
         try:
             created = _create_planned_dev_tasks(conn, specs, created_by=ROLE_REVIEWER)
-            kanban_db.complete_task(
+            completed = kanban_db.complete_task(
                 conn,
                 task_id,
                 summary=summary or "Reviewer requested changes.",
@@ -531,6 +542,9 @@ def _apply_role_output(
                 created_cards=created,
                 expected_run_id=expected_run_id,
             )
+            if not completed:
+                _cleanup_created_tasks(conn, created)
+                return
         except Exception:
             _cleanup_created_tasks(conn, created)
             raise
@@ -538,7 +552,14 @@ def _apply_role_output(
         return
 
     if status == "blocked":
-        kanban_db.block_task(conn, task_id, reason=payload.get("blocker") or summary, expected_run_id=expected_run_id)
+        blocked = kanban_db.block_task(
+            conn,
+            task_id,
+            reason=payload.get("blocker") or summary,
+            expected_run_id=expected_run_id,
+        )
+        if not blocked:
+            return
         _update_phase(board, "blocked", goal_status="blocked")
         return
     _checkpoint_commit(workspace, task_id, summary)
@@ -1186,6 +1207,8 @@ def _update_phase(board: Optional[str], phase: str, *, goal_status: str) -> None
 
     metadata = kanban_db.read_board_metadata(board)
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    if worker.get("cancelled") or worker.get("goal_status") == "cancelled":
+        return
     worker["phase"] = phase
     worker["goal_status"] = goal_status
     worker["updated_at"] = int(time.time())
