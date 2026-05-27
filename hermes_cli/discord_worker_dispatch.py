@@ -105,6 +105,9 @@ def dispatch_discord_worker_boards(
 
     remaining_global_slots = max(0, max_global_workers - sum(running_by_board.values()))
     for board in eligible:
+        if dwb.is_paused_or_cancelled(board):
+            out.append((board, None))
+            continue
         running = running_by_board.get(board, 0)
         board_slots = max(0, max_workers_per_board - running)
         if remaining_global_slots <= 0 or board_slots <= 0:
