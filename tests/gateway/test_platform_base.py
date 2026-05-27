@@ -438,6 +438,26 @@ class TestMediaDeliveryPathValidation:
 
         assert filtered == [(str(safe.resolve()), True)]
 
+    def test_safe_roots_include_legacy_generic_media_cache(self):
+        from gateway.platforms import base as base_mod
+
+        assert base_mod._HERMES_HOME / "media_cache" in base_mod.MEDIA_DELIVERY_SAFE_ROOTS
+
+    def test_filter_keeps_markdown_under_generic_media_cache(self, tmp_path, monkeypatch):
+        media_cache = tmp_path / "media_cache"
+        report = media_cache / "report.md"
+        report.parent.mkdir(parents=True)
+        report.write_text("# report")
+        old_mtime = time.time() - 7200
+        os.utime(report, (old_mtime, old_mtime))
+        self._patch_roots(monkeypatch, media_cache)
+
+        media, cleaned = BasePlatformAdapter.extract_media(f"Sending it again:\n\nMEDIA:{report}")
+        filtered = BasePlatformAdapter.filter_media_delivery_paths(media)
+
+        assert cleaned == "Sending it again:"
+        assert filtered == [(str(report.resolve()), False)]
+
     def test_allows_operator_configured_extra_root(self, tmp_path, monkeypatch):
         extra_root = tmp_path / "operator-media"
         media_file = extra_root / "report.pdf"
