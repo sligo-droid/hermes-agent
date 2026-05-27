@@ -956,17 +956,44 @@ def test_alerts_due_first_send_then_suppresses_unchanged_before_cooldown(monkeyp
     assert alerts_due([issue], now=1200) == []
 
 
-def test_alerts_due_dedupes_same_problem_across_boards(monkeypatch, tmp_path):
+def test_alerts_due_dedupes_same_worker_problem_within_board(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
 
-    first = _alert_issue(board="discord-1", task_id="t1", evidence={**_alert_issue().evidence, "run_error": "pid 1234 not alive"})
-    second = _alert_issue(board="discord-2", task_id="t2", evidence={**_alert_issue().evidence, "run_error": "pid 5678 not alive"})
+    first = _alert_issue(
+        board="discord-1",
+        task_id="t1",
+        evidence={**_alert_issue().evidence, "run_error": "pid 1234 not alive"},
+    )
+    second = _alert_issue(
+        board="discord-1",
+        task_id="t2",
+        evidence={**_alert_issue().evidence, "run_error": "pid 5678 not alive"},
+    )
 
     assert alerts_due([first, second], now=1000) == [first]
     record_alert_sent(first, now=1000)
 
     assert alerts_due([second], now=5000, config={"cooldown_seconds": 1}) == []
+
+
+def test_alerts_due_does_not_suppress_same_worker_problem_on_new_board(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli.discord_worker_foreman import alerts_due, record_alert_sent
+
+    evidence = {
+        "task_status": "blocked",
+        "thread_state": "blocked",
+        "sidecar_error": "codex went silent for 90s after a tool result; retiring app-server session.",
+        "sidecar_timed_out": False,
+    }
+    first = _alert_issue(board="discord-1", task_id="t1", evidence=evidence)
+    second = _alert_issue(board="discord-2", task_id="t2", evidence=evidence)
+
+    assert alerts_due([first], now=1000) == [first]
+    record_alert_sent(first, now=1000)
+
+    assert alerts_due([second], now=5000, config={"cooldown_seconds": 1}) == [second]
 
 
 def test_human_intervention_alert_suppresses_matching_source_warning(monkeypatch, tmp_path):
