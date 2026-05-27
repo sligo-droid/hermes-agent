@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 
+from agent.error_classifier import is_upstream_null_iterable_error
+
 
 def _mirror_agent_predicate(err: BaseException) -> bool:
     """Exact shape of run_agent.py's is_local_validation_error check.
@@ -31,6 +33,7 @@ def _mirror_agent_predicate(err: BaseException) -> bool:
     return (
         isinstance(err, (ValueError, TypeError))
         and not isinstance(err, (UnicodeEncodeError, json.JSONDecodeError))
+        and not is_upstream_null_iterable_error(err)
     )
 
 
@@ -66,6 +69,9 @@ class TestJSONDecodeErrorIsRetryable:
     def test_bare_type_error_is_local_validation(self):
         assert _mirror_agent_predicate(TypeError("wrong type"))
 
+    def test_openai_null_output_type_error_is_not_local_validation(self):
+        assert not _mirror_agent_predicate(TypeError("'NoneType' object is not iterable"))
+
 
 class TestAgentLoopSourceStillHasCarveOut:
     """Belt-and-suspenders: the production source must actually include
@@ -89,4 +95,8 @@ class TestAgentLoopSourceStillHasCarveOut:
         assert "JSONDecodeError" in src, (
             "agent/conversation_loop.py must carve out json.JSONDecodeError "
             "from the is_local_validation_error classification — see #14782."
+        )
+        assert "is_upstream_null_iterable_error" in src, (
+            "agent/conversation_loop.py must retry OpenAI SDK null-output "
+            "TypeError failures instead of treating them as local validation."
         )

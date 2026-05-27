@@ -220,6 +220,86 @@ def test_codex_stream_synthesizes_collected_output_after_sdk_null_output(monkeyp
     assert FakeClient.instances[0].closed is True
 
 
+def test_codex_stream_retries_null_output_without_collected_events(monkeypatch):
+    output_item = SimpleNamespace(
+        type="message",
+        role="assistant",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="after retry")],
+    )
+    calls = {"stream": 0}
+
+    class FailingStream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, exc_tb):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise TypeError("'NoneType' object is not iterable")
+
+        async def get_final_response(self):  # pragma: no cover - iteration fails first
+            raise AssertionError("first stream should fail before final response")
+
+    class GoodStream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, exc_tb):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def get_final_response(self):
+            return SimpleNamespace(
+                status="completed",
+                output=[output_item],
+                output_text="after retry",
+            )
+
+    class FakeResponses:
+        def stream(self, **kwargs):
+            calls["stream"] += 1
+            if calls["stream"] == 1:
+                return FailingStream()
+            return GoodStream()
+
+    class FakeClient:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.responses = FakeResponses()
+            self.closed = False
+            self.instances.append(self)
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.AsyncOpenAI",
+        FakeClient,
+    )
+
+    result = asyncio.run(OpenAICodexAdapter._run_responses_stream_with_retry(
+        {"model": "gpt-5.5", "input": [{"role": "user", "content": "hi"}], "store": False},
+        UpstreamCredential(bearer="token", base_url="https://example.test/v1"),
+    ))
+
+    assert calls["stream"] == 2
+    assert result.status == "completed"
+    assert result.output == [output_item]
+    assert result.output_text == "after retry"
+    assert [client.closed for client in FakeClient.instances] == [True, True]
+
+
 # ---------------------------------------------------------------------------
 # NousPortalAdapter
 # ---------------------------------------------------------------------------

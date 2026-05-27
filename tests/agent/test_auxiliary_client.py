@@ -28,6 +28,7 @@ from agent.auxiliary_client import (
     _resolve_auto,
     _resolve_xai_oauth_for_aux,
     _CodexCompletionsAdapter,
+    _is_connection_error,
 )
 
 
@@ -1300,6 +1301,29 @@ class TestCallLlmPaymentFallback:
         # Fallback client should have been used
         assert fallback_client.chat.completions.create.called
 
+    def test_null_iterable_retries_same_provider_once(self):
+        primary_client = MagicMock()
+        response = MagicMock(choices=[MagicMock(message=MagicMock(content="retry ok"))])
+        primary_client.chat.completions.create.side_effect = [
+            TypeError("'NoneType' object is not iterable"),
+            response,
+        ]
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "gpt-5.5"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", "gpt-5.5", None, None, None),
+        ):
+            result = call_llm(
+                task="title_generation",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result is response
+        assert primary_client.chat.completions.create.call_count == 2
+
 
 class TestAuxiliaryFallbackLayering:
     """Explicit-provider users get layered fallback: configured_chain → main agent → warn."""
@@ -2533,6 +2557,36 @@ class TestVisionAutoSkipsKimiCoding:
 
 
 class TestCodexAuxiliaryAdapterTimeout:
+    def test_recovers_iter_typeerror_from_streamed_text_deltas(self):
+        class NullIterableStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(type="response.output_text.delta", delta="Short ")
+                yield SimpleNamespace(type="response.output_text.delta", delta="Title")
+                raise TypeError("'NoneType' object is not iterable")
+
+            def get_final_response(self):  # pragma: no cover - SDK failure skips this
+                raise AssertionError("null-output stream should synthesize before final response")
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return NullIterableStream()
+
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+
+        response = adapter.create(messages=[{"role": "user", "content": "title"}])
+
+        assert response.choices[0].message.content == "Short Title"
+
+    def test_null_iterable_typeerror_counts_as_connection_error(self):
+        assert _is_connection_error(TypeError("'NoneType' object is not iterable"))
+
     def test_recovers_null_output_from_streamed_text_deltas(self):
         class NullOutputStream:
             def __enter__(self):
