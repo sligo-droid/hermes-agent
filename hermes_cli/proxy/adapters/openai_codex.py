@@ -271,37 +271,84 @@ class OpenAICodexAdapter(UpstreamAdapter):
         has_function_calls = False
         try:
             async with client.responses.stream(**responses_payload) as stream:
-                async for event in stream:
-                    event_type = getattr(event, "type", "")
-                    if event_type == "response.output_item.done":
-                        item = getattr(event, "item", None)
-                        if item is not None:
-                            collected_output_items.append(item)
-                    elif "output_text.delta" in event_type:
-                        delta = getattr(event, "delta", "")
-                        if delta:
-                            collected_text_deltas.append(delta)
-                    elif "function_call" in event_type:
-                        has_function_calls = True
-                final = await stream.get_final_response()
+                try:
+                    async for event in stream:
+                        event_type = getattr(event, "type", "")
+                        if event_type == "response.output_item.done":
+                            item = getattr(event, "item", None)
+                            if item is not None:
+                                collected_output_items.append(item)
+                        elif "output_text.delta" in event_type:
+                            delta = getattr(event, "delta", "")
+                            if delta:
+                                collected_text_deltas.append(delta)
+                        elif "function_call" in event_type:
+                            has_function_calls = True
+                    final = await stream.get_final_response()
+                except TypeError as exc:
+                    if not OpenAICodexAdapter._is_null_output_stream_error(exc):
+                        raise
+                    final = OpenAICodexAdapter._synthesize_stream_response(
+                        collected_output_items,
+                        collected_text_deltas,
+                        has_function_calls=has_function_calls,
+                    )
+                    if final is None:
+                        raise
+                    logger.debug(
+                        "proxy: synthesized Codex stream response after SDK null-output failure: %s",
+                        exc,
+                    )
         finally:
             await client.close()
 
         output = getattr(final, "output", None)
-        if isinstance(output, list) and not output:
-            if collected_output_items:
-                final.output = list(collected_output_items)
-            elif collected_text_deltas and not has_function_calls:
-                final.output = [SimpleNamespace(
-                    type="message",
-                    role="assistant",
-                    status="completed",
-                    content=[SimpleNamespace(
-                        type="output_text",
-                        text="".join(collected_text_deltas),
-                    )],
-                )]
+        if not isinstance(output, list) or not output:
+            synthesized = OpenAICodexAdapter._synthesize_stream_response(
+                collected_output_items,
+                collected_text_deltas,
+                has_function_calls=has_function_calls,
+            )
+            if synthesized is not None:
+                final.output = synthesized.output
+                if not getattr(final, "output_text", None):
+                    final.output_text = synthesized.output_text
         return final
+
+    @staticmethod
+    def _is_null_output_stream_error(exc: TypeError) -> bool:
+        message = str(exc)
+        return "NoneType" in message and "not iterable" in message
+
+    @staticmethod
+    def _synthesize_stream_response(
+        collected_output_items: list[Any],
+        collected_text_deltas: list[str],
+        *,
+        has_function_calls: bool,
+    ) -> Any | None:
+        if collected_output_items:
+            output = list(collected_output_items)
+            text = "".join(collected_text_deltas)
+        elif collected_text_deltas and not has_function_calls:
+            text = "".join(collected_text_deltas)
+            output = [SimpleNamespace(
+                type="message",
+                role="assistant",
+                status="completed",
+                content=[SimpleNamespace(
+                    type="output_text",
+                    text=text,
+                )],
+            )]
+        else:
+            return None
+
+        return SimpleNamespace(
+            status="completed",
+            output=output,
+            output_text=text,
+        )
 
     @staticmethod
     def _split_instructions(messages: list[Any]) -> tuple[str, list[dict[str, Any]]]:
