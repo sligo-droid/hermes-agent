@@ -7,6 +7,7 @@ import json
 import os
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 
@@ -150,6 +151,73 @@ def test_codex_adapter_preserves_minimal_reasoning_effort():
         "summary": "auto",
     }
     assert OpenAICodexAdapter._responses_reasoning("") is None
+
+
+def test_codex_stream_synthesizes_collected_output_after_sdk_null_output(monkeypatch):
+    output_item = SimpleNamespace(
+        type="message",
+        role="assistant",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="hello")],
+    )
+
+    class FakeStream:
+        def __init__(self):
+            self._events = [
+                SimpleNamespace(type="response.output_text.delta", delta="hello"),
+                SimpleNamespace(type="response.output_item.done", item=output_item),
+            ]
+            self._index = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, exc_tb):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._index < len(self._events):
+                event = self._events[self._index]
+                self._index += 1
+                return event
+            raise TypeError("'NoneType' object is not iterable")
+
+        async def get_final_response(self):  # pragma: no cover - regression guard
+            raise AssertionError("SDK failure should bypass final response parsing")
+
+    class FakeResponses:
+        def stream(self, **kwargs):
+            return FakeStream()
+
+    class FakeClient:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.responses = FakeResponses()
+            self.closed = False
+            self.kwargs = kwargs
+            self.instances.append(self)
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.AsyncOpenAI",
+        FakeClient,
+    )
+
+    result = asyncio.run(OpenAICodexAdapter._run_responses_stream(
+        {"model": "gpt-5.5", "input": [{"role": "user", "content": "hi"}], "store": False},
+        UpstreamCredential(bearer="token", base_url="https://example.test/v1"),
+    ))
+
+    assert result.status == "completed"
+    assert result.output == [output_item]
+    assert result.output_text == "hello"
+    assert FakeClient.instances[0].closed is True
 
 
 # ---------------------------------------------------------------------------
