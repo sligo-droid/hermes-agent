@@ -8,6 +8,7 @@ only renders as a voice bubble when explicitly flagged) and via
 """
 
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -128,7 +129,7 @@ def _fake_runner(thread_meta):
         _thread_metadata_for_source=lambda source, anchor=None: thread_meta,
         _reply_anchor_for_event=lambda event: None,
     )
-    return runner
+    return cast(GatewayRunner, runner)
 
 
 @pytest.mark.asyncio
@@ -179,6 +180,36 @@ async def test_streaming_delivery_routes_non_voice_telegram_ogg_media_tag_to_doc
     await GatewayRunner._deliver_media_from_response(
         _fake_runner({"thread_id": "topic-1"}),
         f"MEDIA:{media_file}",
+        event,
+        adapter,
+    )
+
+    adapter.send_document.assert_awaited_once_with(
+        chat_id="chat-1",
+        file_path=str(media_file),
+        metadata={"thread_id": "topic-1"},
+    )
+    adapter.send_voice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_streaming_delivery_routes_markdown_media_tag_to_document_sender(tmp_path, monkeypatch):
+    event = _event(thread_id="topic-1")
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "report.md")
+    adapter = SimpleNamespace(
+        name="test",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
+        send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
+        send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
+        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
+    )
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({"thread_id": "topic-1"}),
+        f"Sure — attached.\n\nMEDIA:{media_file}",
         event,
         adapter,
     )
