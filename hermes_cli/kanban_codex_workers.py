@@ -216,12 +216,12 @@ def _redacted_command(cmd: list[str], env: dict[str, str]) -> str:
     return " ".join(rendered)
 
 
-def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
+def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None) -> Optional[Any]:
     """Spawn a Codex worker for planner/dev/reviewer tasks.
 
-    Returns the host-side subprocess pid so the existing Kanban crash detector
-    can observe the worker lifecycle. Durable state lives in the board DB and
-    mounted worktree.
+    Returns the host-side subprocess pid or systemd unit handle so the existing
+    Kanban crash detector can observe the worker lifecycle. Durable state lives
+    in the board DB and mounted worktree.
     """
     role = str(getattr(task, "assignee", "") or "").strip().lower()
     if role not in ROLE_ASSIGNEES:
@@ -275,7 +275,7 @@ def _spawn_host_worker(
     log_settings: dict[str, str],
     backend: str,
     board: Optional[str],
-) -> Optional[int]:
+) -> Optional[Any]:
     workspace_path = Path(workspace).expanduser().resolve()
     workspace_path.mkdir(parents=True, exist_ok=True)
 
@@ -330,6 +330,7 @@ def _spawn_host_worker(
         settings=log_settings,
         backend=backend,
         board=board,
+        use_systemd=True,
     )
 
 
@@ -418,6 +419,7 @@ def _spawn_docker_worker(
         settings=log_settings,
         backend=backend,
         board=board,
+        use_systemd=False,
     )
 
 
@@ -442,7 +444,8 @@ def _spawn_logged_process(
     settings: dict[str, str],
     backend: str,
     board: Optional[str],
-) -> Optional[int]:
+    use_systemd: bool,
+) -> Optional[Any]:
     from hermes_cli import kanban_db
 
     log_path = kanban_db.worker_log_path(str(getattr(task, "id", "")), board=board)
@@ -458,6 +461,23 @@ def _spawn_logged_process(
         log_path,
         f"[kanban dispatcher] spawning {label} role worker: {_redacted_command(cmd, env)}",
     )
+    if use_systemd and kanban_db._should_use_systemd_worker():
+        unit_name = kanban_db._systemd_worker_unit_name(task, board=board)
+        try:
+            return kanban_db._spawn_systemd_worker(
+                cmd=cmd,
+                workspace=workspace,
+                env=env,
+                log_path=log_path,
+                unit_name=unit_name,
+            )
+        except Exception as exc:
+            kanban_db._append_worker_log_line(
+                log_path,
+                f"[kanban dispatcher] systemd-run role worker launch failed; "
+                f"falling back to direct spawn: {exc}",
+            )
+
     log_f = open(log_path, "ab")
     try:
         proc = subprocess.Popen(

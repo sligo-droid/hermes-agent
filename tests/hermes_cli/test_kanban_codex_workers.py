@@ -17,6 +17,7 @@ def _home(monkeypatch, tmp_path: Path) -> Path:
     monkeypatch.delenv("HERMES_CODING_WORKER_BACKEND", raising=False)
     monkeypatch.delenv("HERMES_CODEX_WORKER_REASONING", raising=False)
     monkeypatch.delenv("HERMES_CODEX_WORKER_SERVICE_TIER", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_WORKER_SYSTEMD", "0")
     return root
 
 
@@ -158,6 +159,147 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     assert captured["env"].get("HERMES_CODEX_WORKER_CREDENTIAL_ID") != "parent-cred"
     assert captured["env"]["GH_CONFIG_DIR"] == str(gh_dir)
     assert captured["start_new_session"] is True
+
+
+def test_codex_role_worker_uses_systemd_worker_handle_when_enabled(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+    from hermes_cli import kanban_db
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    workspace = tmp_path / "repo"
+    monkeypatch.setenv("HERMES_KANBAN_WORKER_SYSTEMD", "1")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "discord-token")
+    captured = {}
+
+    def fake_spawn_systemd_worker(*, cmd, workspace, env, log_path, unit_name):
+        captured.update(
+            {
+                "cmd": cmd,
+                "workspace": workspace,
+                "env": env,
+                "log_path": log_path,
+                "unit_name": unit_name,
+            }
+        )
+        return kanban_db._SpawnHandle(pid=2468, unit=f"{unit_name}.service")
+
+    monkeypatch.setattr(
+        workers,
+        "_worker_config",
+        lambda: {"codex_home_root": str(tmp_path / "homes")},
+    )
+    monkeypatch.setattr(
+        workers,
+        "_configure_discord_read_broker",
+        lambda env: env.update(
+            {
+                "HERMES_DISCORD_WORKER_READ_URL": "http://127.0.0.1:9",
+                "HERMES_DISCORD_WORKER_READ_TOKEN": "broker-secret",
+                "HERMES_DISCORD_WORKER_CONTROL_URL": "http://127.0.0.1:9",
+                "HERMES_DISCORD_WORKER_CONTROL_TOKEN": "broker-secret",
+            }
+        ),
+    )
+    monkeypatch.setattr(kanban_db, "_should_use_systemd_worker", lambda: True)
+    monkeypatch.setattr(kanban_db, "_spawn_systemd_worker", fake_spawn_systemd_worker)
+    monkeypatch.setattr(
+        workers.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("direct Popen fallback should not run"),
+    )
+
+    handle = workers.spawn_codex_worker(task, str(workspace), board=board.slug)
+
+    assert isinstance(handle, kanban_db._SpawnHandle)
+    assert handle.pid == 2468
+    assert handle.unit == f"{captured['unit_name']}.service"
+    assert captured["cmd"][1:] == ["-m", "hermes_cli.kanban_codex_worker"]
+    assert captured["workspace"] == str(workspace.resolve())
+    assert captured["env"]["HERMES_CODEX_WORKER_ROLE"] == "planner"
+    assert captured["env"]["HERMES_CODING_WORKER_BACKEND"] == "codex"
+    assert captured["env"]["HERMES_DISCORD_WORKER_READ_TOKEN"] == "broker-secret"
+    assert captured["env"]["CODEX_HOME"].endswith("/homes/" + task.id)
+
+
+def test_systemd_worker_env_keeps_role_worker_runtime_keys(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_db
+
+    filtered = kanban_db._systemd_worker_env(
+        {
+            "HERMES_KANBAN_TASK": "task-1",
+            "HERMES_CODEX_WORKER_ROLE": "planner",
+            "HERMES_CODEX_WORKER_REASONING": "xhigh",
+            "HERMES_CODEX_WORKER_SERVICE_TIER": "fast",
+            "HERMES_CODEX_WORKER_CREDENTIAL_ID": "cred-1",
+            "HERMES_CODING_WORKER_BACKEND": "opencode",
+            "HERMES_DISCORD_WORKER_READ_URL": "http://127.0.0.1:9",
+            "HERMES_DISCORD_WORKER_READ_TOKEN": "broker-secret",
+            "HERMES_DISCORD_WORKER_CONTROL_URL": "http://127.0.0.1:9",
+            "HERMES_DISCORD_WORKER_CONTROL_TOKEN": "broker-secret",
+            "CODEX_HOME": str(tmp_path / "codex-home"),
+            "DISCORD_BOT_TOKEN": "discord-token",
+            "OPENAI_API_KEY": "openai-secret",
+        }
+    )
+
+    assert filtered["HERMES_KANBAN_TASK"] == "task-1"
+    assert filtered["HERMES_CODEX_WORKER_ROLE"] == "planner"
+    assert filtered["HERMES_CODEX_WORKER_REASONING"] == "xhigh"
+    assert filtered["HERMES_CODEX_WORKER_SERVICE_TIER"] == "fast"
+    assert filtered["HERMES_CODEX_WORKER_CREDENTIAL_ID"] == "cred-1"
+    assert filtered["HERMES_CODING_WORKER_BACKEND"] == "opencode"
+    assert filtered["HERMES_DISCORD_WORKER_READ_TOKEN"] == "broker-secret"
+    assert filtered["HERMES_DISCORD_WORKER_CONTROL_TOKEN"] == "broker-secret"
+    assert filtered["CODEX_HOME"] == str(tmp_path / "codex-home")
+    assert "DISCORD_BOT_TOKEN" not in filtered
+    assert "OPENAI_API_KEY" not in filtered
+
+
+def test_codex_role_worker_falls_back_to_direct_spawn_when_systemd_launch_fails(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+    from hermes_cli import kanban_db
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    workspace = tmp_path / "repo"
+    monkeypatch.setenv("HERMES_KANBAN_WORKER_SYSTEMD", "1")
+    captured = {}
+
+    class Proc:
+        pid = 5432
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, cwd, stdout, stderr, env, start_new_session):
+        captured.update(
+            {"cmd": cmd, "cwd": cwd, "env": env, "start_new_session": start_new_session}
+        )
+        return Proc()
+
+    monkeypatch.setattr(
+        workers,
+        "_worker_config",
+        lambda: {"codex_home_root": str(tmp_path / "homes")},
+    )
+    monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(kanban_db, "_should_use_systemd_worker", lambda: True)
+    monkeypatch.setattr(
+        kanban_db,
+        "_spawn_systemd_worker",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("no user manager")),
+    )
+    monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
+
+    pid = workers.spawn_codex_worker(task, str(workspace), board=board.slug)
+
+    assert pid == 5432
+    assert captured["cwd"] == str(workspace.resolve())
+    assert captured["start_new_session"] is True
+    log = kanban_db.read_worker_log(task.id, board=board.slug)
+    assert log is not None
+    assert "systemd-run role worker launch failed" in log
+    assert "falling back to direct spawn: no user manager" in log
 
 
 def test_codex_role_worker_inherits_available_pool_credential(monkeypatch, tmp_path):

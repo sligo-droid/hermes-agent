@@ -6141,11 +6141,14 @@ def _worker_terminal_timeout_env(
 
 
 _SYSTEMD_WORKER_ENV_EXACT = frozenset({
+    "CODEX_HOME",
     "GH_CONFIG_DIR",
     "HOME",
+    "HERMES_CODING_WORKER_BACKEND",
     "HERMES_HOME",
     "HERMES_PROFILE",
     "HERMES_TENANT",
+    "HERMES_WORKER_CONSOLE",
     "LANG",
     "LC_ALL",
     "LOGNAME",
@@ -6155,6 +6158,11 @@ _SYSTEMD_WORKER_ENV_EXACT = frozenset({
     "USER",
     "VIRTUAL_ENV",
 })
+
+_SYSTEMD_WORKER_ENV_PREFIXES = (
+    "HERMES_CODEX_WORKER_",
+    "HERMES_DISCORD_WORKER_",
+)
 
 
 def _systemd_worker_env(env: dict[str, str]) -> dict[str, str]:
@@ -6169,7 +6177,11 @@ def _systemd_worker_env(env: dict[str, str]) -> dict[str, str]:
     for key, value in env.items():
         if not value:
             continue
-        if key in _SYSTEMD_WORKER_ENV_EXACT or key.startswith("HERMES_KANBAN_"):
+        if (
+            key in _SYSTEMD_WORKER_ENV_EXACT
+            or key.startswith("HERMES_KANBAN_")
+            or key.startswith(_SYSTEMD_WORKER_ENV_PREFIXES)
+        ):
             out[key] = str(value)
     return out
 
