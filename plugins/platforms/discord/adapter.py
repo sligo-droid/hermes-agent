@@ -54,7 +54,6 @@ _DISCORD_AUDIO_CONTENT_TYPES = {
     ".webm": "audio/webm",
 }
 _DISCORD_VOICE_MESSAGE_FLAG = 1 << 13
-_TRUTHY_ENV_VALUES = {"true", "1", "yes", "on"}
 _DISCORD_SHIP_REACTION_NAMES = frozenset({"+1", "thumbsup"})
 _DISCORD_SHIP_REACTION_EMOJIS = frozenset({
     "👍",
@@ -72,10 +71,7 @@ _DISCORD_GOAL_THREAD_CONTEXT_MAX_MESSAGE_CHARS = 1_500
 
 def _discord_live_voice_enabled() -> bool:
     """Return whether Discord voice-channel join/listen support is enabled."""
-    return (
-        os.getenv("HERMES_DISCORD_LIVE_VOICE_ENABLED", "").strip().lower()
-        in _TRUTHY_ENV_VALUES
-    )
+    return is_truthy_value(os.getenv("HERMES_DISCORD_LIVE_VOICE_ENABLED"), default=False)
 
 
 _DISCORD_PROJECT_SUMMARY_STATE_FILENAME = "discord_project_summaries.json"
@@ -127,11 +123,12 @@ import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
+from hermes_cli.discord_worker_roles import GOAL_CONTROL_COMMANDS
 from gateway.config import Platform, PlatformConfig
 
 from gateway.discord_project_mapping import resolve_discord_project_context
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker, strip_markdown
-from utils import atomic_json_write
+from utils import atomic_json_write, is_truthy_value
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -2375,7 +2372,7 @@ class DiscordAdapter(BasePlatformAdapter):
         lower_args = args.strip().lower()
         return bool(
             lower_args
-            and lower_args not in {"status", "pause", "resume", "clear", "stop", "done"}
+            and lower_args not in GOAL_CONTROL_COMMANDS
         )
 
     def _slash_goal_uses_text_attachment_body(self, text: str, attachments: Iterable[Any]) -> bool:
@@ -5981,7 +5978,7 @@ class DiscordAdapter(BasePlatformAdapter):
         args = (args or "").strip()
         lower = args.lower()
         command_text = f"/goal {args}".strip()
-        control = not args or lower in {"status", "pause", "resume", "clear", "stop", "done"}
+        control = not args or lower in GOAL_CONTROL_COMMANDS
         if control:
             await self._run_simple_slash(interaction, command_text)
             return
