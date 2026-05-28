@@ -1544,6 +1544,7 @@ class BasePlatformAdapter(ABC):
     - Sending messages/responses
     - Handling media
     """
+    STREAMING_MESSAGE_HEADROOM = 100
     
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
@@ -4404,9 +4405,14 @@ class BasePlatformAdapter(ABC):
             else:
                 _cp_limit = headroom
             region = remaining[:_cp_limit]
-            split_at = region.rfind("\n")
+            near_limit_floor = max(1, int(_cp_limit * 0.9))
+            split_at = region.rfind("\n", near_limit_floor)
+            if split_at < 1:
+                split_at = region.rfind(" ", near_limit_floor)
+            if split_at < 1:
+                split_at = max(region.rfind("\n"), region.rfind(" "))
             if split_at < _cp_limit // 2:
-                split_at = region.rfind(" ")
+                split_at = _cp_limit
             if split_at < 1:
                 split_at = _cp_limit
 

@@ -85,6 +85,31 @@ class TestCleanForDisplay:
         assert result == text
 
 
+class TestMessageContentLimit:
+    def test_default_headroom_preserved_for_streaming_limits(self):
+        adapter = MagicMock()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor="xx"),
+        )
+
+        assert consumer._message_content_limit(2000, len, include_cursor=True) == 1898
+        assert consumer._message_content_limit(2000, len, include_cursor=False) == 1900
+
+    def test_zero_headroom_uses_discord_boundary(self):
+        adapter = MagicMock()
+        adapter.STREAMING_MESSAGE_HEADROOM = 0
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor="xx"),
+        )
+
+        assert consumer._message_content_limit(2000, len, include_cursor=True) == 1998
+        assert consumer._message_content_limit(2000, len, include_cursor=False) == 2000
+
+
 # ── Integration: _send_or_edit strips MEDIA: ─────────────────────────────
 
 
@@ -1780,4 +1805,3 @@ class TestUtf16OverflowDetection:
         # auto-attr mock. Verified indirectly by all the other tests in
         # this file passing — they all use MagicMock adapters.
         assert consumer is not None
-

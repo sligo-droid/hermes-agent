@@ -714,6 +714,17 @@ class TestTruncateMessage:
                 f"Chunk {i} too long: {len(chunk)} > {max_len}"
             )
 
+    def test_prefers_late_space_over_early_newline(self):
+        adapter = self._adapter()
+        max_len = 2000
+        msg = "a" * 1200 + "\n" + ("word " * 200)
+
+        chunks = adapter.truncate_message(msg, max_length=max_len)
+
+        assert len(chunks) == 2
+        assert len(chunks[0]) >= 1900
+        assert len(chunks[0]) <= max_len
+
 
 # ---------------------------------------------------------------------------
 # _get_human_delay
