@@ -1037,6 +1037,24 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         stored = bucket.get(self._feature_summary_state_key(thread_channel))
         if not isinstance(stored, dict):
+            matches = [
+                item
+                for item in bucket.values()
+                if isinstance(item, dict)
+                and str(item.get("thread_id") or "").strip() == thread_id
+            ]
+            if matches:
+                def _updated_at(item: Dict[str, Any]) -> float:
+                    try:
+                        return float(item.get("updated_at") or 0.0)
+                    except (TypeError, ValueError):
+                        return 0.0
+
+                stored = max(
+                    matches,
+                    key=_updated_at,
+                )
+        if not isinstance(stored, dict):
             return None
         handle = dict(stored)
         handle.setdefault("thread_id", thread_id)

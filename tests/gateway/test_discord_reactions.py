@@ -716,6 +716,85 @@ def _thread_status_event(message_id: str, thread: _StatusThread) -> MessageEvent
     return event
 
 
+def test_feature_summary_loader_falls_back_to_source_scoped_thread_handle(adapter):
+    thread = _StatusThread(thread_id=1000, name="Build dashboard")
+    state = {
+        discord_platform._DISCORD_FEATURE_SUMMARY_STATE_BUCKET: {
+            "10:1000:1000": {
+                "thread_id": "1000",
+                "message_id": "2000",
+                "source_message_id": "1000",
+                "guild_id": "10",
+                "parent_channel_id": "55",
+                "kanban_board": {"slug": "discord-1000"},
+                "updated_at": 123.0,
+            }
+        }
+    }
+    adapter._read_project_summary_state = MagicMock(return_value=state)
+    adapter._write_project_summary_state = MagicMock()
+
+    handle = adapter._load_feature_summary_handle_for_thread(thread)
+
+    assert handle is not None
+    assert handle["message_id"] == "2000"
+    assert handle["source_message_id"] == "1000"
+    assert handle["kanban_board"] == {"slug": "discord-1000"}
+    assert handle["_thread_obj"] is thread
+
+
+@pytest.mark.asyncio
+async def test_goal_thread_followup_uses_loaded_kanban_reaction(adapter):
+    origin_message = SimpleNamespace(
+        id=1000,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    followup_message = SimpleNamespace(
+        id=3000,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    parent = SimpleNamespace(id=55, fetch_message=AsyncMock(return_value=origin_message))
+    thread = _StatusThread(thread_id=1000, name="Build dashboard")
+    thread.parent = parent
+    thread.parent_id = parent.id
+    thread.fetch_message = AsyncMock(side_effect=LookupError("not cached in thread"))
+    followup_message.channel = thread
+    state = {
+        discord_platform._DISCORD_FEATURE_SUMMARY_STATE_BUCKET: {
+            "10:1000:1000": {
+                "thread_id": "1000",
+                "message_id": "2000",
+                "source_message_id": "1000",
+                "guild_id": "10",
+                "parent_channel_id": "55",
+                "kanban_board": {"slug": "discord-1000"},
+                "updated_at": 123.0,
+            }
+        }
+    }
+    adapter._read_project_summary_state = MagicMock(return_value=state)
+    adapter._write_project_summary_state = MagicMock()
+    adapter._feature_kanban_reaction_state = MagicMock(return_value="active")
+
+    event = _make_event("3000", followup_message)
+    event.source.chat_type = "thread"
+    event.source.thread_id = str(thread.id)
+    event.source.parent_chat_id = str(parent.id)
+    event.feature_summary = adapter._load_feature_summary_handle_for_thread(thread)
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    followup_message.add_reaction.assert_not_awaited()
+    followup_message.remove_reaction.assert_not_awaited()
+    assert [call.args for call in origin_message.add_reaction.await_args_list] == [
+        ("👀",),
+        ("👀",),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_processing_lifecycle_does_not_rename_discord_thread(adapter):
     thread = _StatusThread(name="Build dashboard")
