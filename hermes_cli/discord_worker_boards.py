@@ -4309,11 +4309,11 @@ def stoppable_boards_for_gateway_event(event: Any) -> list[DiscordBoard]:
         return []
     chat_type = str(getattr(source, "chat_type", "") or "").lower()
     source_thread_id = str(getattr(source, "thread_id", "") or "").strip()
-    if not source_thread_id and chat_type != "thread":
+    channel_id = str(getattr(source, "chat_id", "") or "").strip()
+    thread_id = str(source_thread_id or (channel_id if chat_type == "thread" else "")).strip()
+    if not thread_id and not channel_id:
         return []
-    thread_id = str(source_thread_id or getattr(source, "chat_id", "") or "").strip()
-    if not thread_id:
-        return []
+    guild_id = str(getattr(source, "guild_id", "") or "").strip()
 
     boards: list[DiscordBoard] = []
     seen: set[str] = set()
@@ -4354,6 +4354,15 @@ def stoppable_boards_for_gateway_event(event: Any) -> list[DiscordBoard]:
     for board_meta in kanban_db.list_boards(include_archived=False):
         slug = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
         worker = _read_worker_meta(slug)
-        if str(worker.get("thread_id") or "").strip() == thread_id:
+        if guild_id and str(worker.get("guild_id") or "").strip() not in {"", guild_id}:
+            continue
+        worker_thread_id = str(worker.get("thread_id") or "").strip()
+        if thread_id and worker_thread_id == thread_id:
+            add_board(slug)
+            continue
+        if not thread_id and channel_id and channel_id in {
+            str(worker.get("chat_id") or "").strip(),
+            str(worker.get("parent_channel_id") or "").strip(),
+        }:
             add_board(slug)
     return boards
