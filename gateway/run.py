@@ -71,7 +71,6 @@ _DISCORD_FOREMAN_DEFAULT_CHANNEL_ID = "1504252294495998043"
 _DISCORD_FOREMAN_DEFAULT_MENTION = "<@&1503914570077442058>"
 _DISCORD_FOREMAN_THREAD_STATE_KEY = "foreman_thread"
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
-_TRUTHY_ENV_VALUES = {"true", "1", "yes", "on"}
 _CODEX_APP_SERVER_ACTIVITY_PREFIX = "Codex app-server event:"
 _MEETING_GOAL_SKILL_NAMES = {"meeting", "discord-meeting-intake"}
 _MEETING_AUTO_GOAL_TEXT = "Follow up on the todos from this meeting."
@@ -223,10 +222,7 @@ def _format_gateway_flow_telemetry(fields: dict[str, Any]) -> str:
 
 def _discord_live_voice_enabled() -> bool:
     """Return whether Discord voice-channel join/listen support is enabled."""
-    return (
-        os.getenv("HERMES_DISCORD_LIVE_VOICE_ENABLED", "").strip().lower()
-        in _TRUTHY_ENV_VALUES
-    )
+    return is_truthy_value(os.getenv("HERMES_DISCORD_LIVE_VOICE_ENABLED"), default=False)
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
@@ -8852,7 +8848,9 @@ class GatewayRunner:
             # continuation prompt against the current turn.
             if _cmd_def_inner and _cmd_def_inner.name == "goal":
                 _goal_arg = (event.get_command_args() or "").strip().lower()
-                if not _goal_arg or _goal_arg in {"status", "pause", "resume", "clear", "stop", "done"}:
+                from hermes_cli.discord_worker_roles import GOAL_CONTROL_COMMANDS
+
+                if not _goal_arg or _goal_arg in GOAL_CONTROL_COMMANDS:
                     return await self._handle_goal_command(event)
                 try:
                     from hermes_cli.discord_worker_boards import board_for_gateway_event
@@ -12942,8 +12940,9 @@ class GatewayRunner:
 
         try:
             from hermes_cli import discord_worker_boards as _dwb
+            from hermes_cli.discord_worker_roles import GOAL_CONTROL_COMMANDS
 
-            is_set = bool(args and lower not in {"status", "pause", "resume", "clear", "stop", "done"})
+            is_set = bool(args and lower not in GOAL_CONTROL_COMMANDS)
             board = _dwb.board_for_gateway_event(event, create=is_set)
             if board is not None:
                 if not args or lower == "status":

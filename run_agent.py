@@ -33,7 +33,6 @@ except ModuleNotFoundError:
 
 import asyncio
 import base64
-import concurrent.futures
 import contextvars
 import copy
 import hashlib
@@ -41,18 +40,13 @@ import json
 import logging
 logger = logging.getLogger(__name__)
 import os
-import random
 import re
-import ssl
 import sys
 import tempfile
 import time
 import threading
-from types import SimpleNamespace
-import urllib.request
 import uuid
 from typing import List, Dict, Any, Optional
-from urllib.parse import urlparse, parse_qs, urlunparse
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
 # that imports the SDK on first call/isinstance check. This preserves:

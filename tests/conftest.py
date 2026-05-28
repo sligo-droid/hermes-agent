@@ -312,9 +312,9 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 def _hermetic_environment(tmp_path, monkeypatch):
     """Blank out all credential/behavioral env vars so local and CI match.
 
-    Also redirects HOME and HERMES_HOME to per-test tempdirs so code that
-    reads ``~/.hermes/*`` can't touch the real one, and pins TZ/LANG so
-    datetime/locale-sensitive tests are deterministic.
+    Also redirects HERMES_HOME to a per-test tempdir so profile-aware code
+    can't touch the real one, and pins TZ/LANG so datetime/locale-sensitive
+    tests are deterministic.
     """
     # 1. Blank every credential-shaped env var that's currently set.
     for name in list(os.environ.keys()):
