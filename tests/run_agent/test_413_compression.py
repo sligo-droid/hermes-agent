@@ -415,8 +415,8 @@ class TestHTTP413Compression:
 class TestPreflightCompression:
     """Preflight compression should compress history before the first API call."""
 
-    def test_compress_context_emits_lifecycle_status_before_work(self, agent):
-        """Direct context compression should tell gateway users why the turn paused."""
+    def test_compress_context_does_not_emit_start_lifecycle_status(self, agent):
+        """Direct context compression should stay quiet unless it hits a warning path."""
         events = []
         agent.status_callback = lambda ev, msg: events.append((ev, msg))
 
@@ -437,9 +437,7 @@ class TestPreflightCompression:
 
         assert compressed == [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}]
         assert new_system_prompt == "new system prompt"
-        assert events[0][0] == "lifecycle"
-        assert "Compacting context" in events[0][1]
-        assert events[1] == ("compress", "started")
+        assert events == [("compress", "started")]
 
     def test_preflight_compresses_oversized_history(self, agent):
         """When loaded history exceeds the model's context threshold, compress before API call."""
