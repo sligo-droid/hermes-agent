@@ -10,7 +10,7 @@ def _home(monkeypatch, tmp_path: Path) -> Path:
     return root
 
 
-def _prepare_board(monkeypatch, tmp_path: Path, *, thread_id: str):
+def _prepare_board(monkeypatch, tmp_path: Path, *, thread_id: str, running_role: str | None = "dev"):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_db
@@ -20,11 +20,25 @@ def _prepare_board(monkeypatch, tmp_path: Path, *, thread_id: str):
     conn = kanban_db.connect(board=board.slug)
     try:
         tasks = kanban_db.list_tasks(conn, include_archived=False)
-        running_id = tasks[0].id
-        conn.execute(
-            "UPDATE tasks SET status = 'running', assignee = ? WHERE id = ?",
-            (dwb.ROLE_PLANNER, running_id),
-        )
+        planner_id = tasks[0].id
+        planner_is_running = False
+        if running_role:
+            if running_role == dwb.ROLE_PLANNER:
+                running_id = planner_id
+                planner_is_running = True
+            else:
+                running_id = kanban_db.create_task(
+                    conn,
+                    title=f"Running dev {thread_id}",
+                    assignee=dwb.ROLE_DEV,
+                    tenant=board.slug,
+                )
+            conn.execute(
+                "UPDATE tasks SET status = 'running', assignee = ? WHERE id = ?",
+                (running_role, running_id),
+            )
+        if not planner_is_running:
+            conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (planner_id,))
         for idx in range(2):
             ready_id = kanban_db.create_task(
                 conn,
@@ -56,6 +70,7 @@ def test_discord_worker_board_cap_counts_already_running(monkeypatch, tmp_path):
         [board.slug],
         max_global_workers=4,
         max_workers_per_board=2,
+        max_dev_workers_per_board=2,
         spawn_fn=spawn_fn,
     )
 
@@ -79,6 +94,7 @@ def test_discord_worker_dispatch_respects_global_live_cap(monkeypatch, tmp_path)
         [board_a.slug, board_b.slug],
         max_global_workers=3,
         max_workers_per_board=2,
+        max_dev_workers_per_board=2,
         spawn_fn=spawn_fn,
     )
 
@@ -86,7 +102,7 @@ def test_discord_worker_dispatch_respects_global_live_cap(monkeypatch, tmp_path)
     assert sum(len(result.spawned) for _board, result in results if result is not None) == 1
 
 
-def test_discord_worker_dispatch_defaults_allow_eight_global_workers(monkeypatch, tmp_path):
+def test_discord_worker_dispatch_default_dev_cap_keeps_boards_serial(monkeypatch, tmp_path):
     from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
 
     boards = [_prepare_board(monkeypatch, tmp_path, thread_id=f"default-{idx}") for idx in range(5)]
@@ -101,8 +117,8 @@ def test_discord_worker_dispatch_defaults_allow_eight_global_workers(monkeypatch
         spawn_fn=spawn_fn,
     )
 
-    assert len(spawned) == 3
-    assert sum(len(result.spawned) for _board, result in results if result is not None) == 3
+    assert len(spawned) == 0
+    assert sum(len(result.spawned) for _board, result in results if result is not None) == 0
 
 
 def test_discord_worker_dispatch_invalid_caps_fall_back_to_defaults(monkeypatch, tmp_path):
@@ -119,8 +135,134 @@ def test_discord_worker_dispatch_invalid_caps_fall_back_to_defaults(monkeypatch,
         [board.slug for board in boards],
         max_global_workers=0,
         max_workers_per_board=0,
+        max_dev_workers_per_board=0,
         spawn_fn=spawn_fn,
     )
 
-    assert len(spawned) == 3
-    assert sum(len(result.spawned) for _board, result in results if result is not None) == 3
+    assert len(spawned) == 0
+    assert sum(len(result.spawned) for _board, result in results if result is not None) == 0
+
+
+def test_discord_worker_dispatch_dev_cap_allows_distinct_workspace_parallelism(monkeypatch, tmp_path):
+    from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
+
+    board = _prepare_board(monkeypatch, tmp_path, thread_id="parallel", running_role=None)
+    conn = None
+    try:
+        from hermes_cli import kanban_db
+
+        conn = kanban_db.connect(board=board.slug)
+        for idx, task in enumerate(
+            task for task in kanban_db.list_tasks(conn, include_archived=False) if task.assignee == "dev"
+        ):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', workspace_path = ? WHERE id = ?",
+                (str(tmp_path / f"workspace-{idx}"), task.id),
+            )
+        conn.commit()
+    finally:
+        if conn is not None:
+            conn.close()
+    spawned = []
+
+    def spawn_fn(task, _workspace, board=None):
+        spawned.append((board, task.id))
+        return 5000 + len(spawned)
+
+    results = dispatch_discord_worker_boards(
+        [board.slug],
+        max_global_workers=4,
+        max_workers_per_board=3,
+        max_dev_workers_per_board=2,
+        spawn_fn=spawn_fn,
+    )
+
+    assert len(spawned) == 2
+    assert sum(len(result.spawned) for _board, result in results if result is not None) == 2
+
+
+def test_discord_worker_dispatch_shared_workspace_caps_dev_fanout(monkeypatch, tmp_path):
+    from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
+
+    board = _prepare_board(monkeypatch, tmp_path, thread_id="shared", running_role=None)
+    conn = None
+    try:
+        from hermes_cli import kanban_db
+
+        conn = kanban_db.connect(board=board.slug)
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE assignee = 'dev'",
+            (str(tmp_path / "shared-worktree"),),
+        )
+        conn.commit()
+    finally:
+        if conn is not None:
+            conn.close()
+    spawned = []
+
+    def spawn_fn(task, _workspace, board=None):
+        spawned.append((board, task.id))
+        return 5500 + len(spawned)
+
+    results = dispatch_discord_worker_boards(
+        [board.slug],
+        max_global_workers=4,
+        max_workers_per_board=3,
+        max_dev_workers_per_board=2,
+        spawn_fn=spawn_fn,
+    )
+
+    assert len(spawned) == 1
+    assert sum(len(result.spawned) for _board, result in results if result is not None) == 1
+
+
+def test_discord_worker_dispatch_planner_running_blocks_dev_spawn(monkeypatch, tmp_path):
+    from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
+
+    board = _prepare_board(monkeypatch, tmp_path, thread_id="planner", running_role="planner")
+    spawned = []
+
+    results = dispatch_discord_worker_boards(
+        [board.slug],
+        max_global_workers=4,
+        max_workers_per_board=3,
+        max_dev_workers_per_board=2,
+        spawn_fn=lambda task, workspace, board=None: spawned.append((task.assignee, board)) or 6000,
+    )
+
+    assert spawned == []
+    assert sum(len(result.spawned) for _board, result in results if result is not None) == 0
+
+
+def test_discord_worker_dispatch_reviewer_lane_is_singleton(monkeypatch, tmp_path):
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
+
+    board = _prepare_board(monkeypatch, tmp_path, thread_id="reviewer", running_role=None)
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        conn.execute("UPDATE tasks SET status = 'done' WHERE assignee = ?", (dwb.ROLE_DEV,))
+        for idx in range(2):
+            task_id = kanban_db.create_task(
+                conn,
+                title=f"Review task {idx}",
+                assignee=dwb.ROLE_REVIEWER,
+                tenant=board.slug,
+            )
+            conn.execute("UPDATE tasks SET status = 'review', claim_lock = NULL WHERE id = ?", (task_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    spawned = []
+
+    results = dispatch_discord_worker_boards(
+        [board.slug],
+        max_global_workers=4,
+        max_workers_per_board=3,
+        max_dev_workers_per_board=2,
+        spawn_fn=lambda task, workspace, board=None: spawned.append((task.assignee, board)) or 7000,
+    )
+
+    assert spawned == [(dwb.ROLE_REVIEWER, board.slug)]
+    assert sum(len(result.spawned) for _board, result in results if result is not None) == 1

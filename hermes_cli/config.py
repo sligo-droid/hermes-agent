@@ -1716,11 +1716,14 @@ DEFAULT_CONFIG = {
             "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
             "docker_bin": "docker",
             "codex_home_root": "",
-            # Allow limited per-board parallelism so independent dev-lane
-            # tickets from one /goal can move together. Planner/reviewer
-            # ordering is still enforced by ticket dependencies.
+            "service_tier": "auto",  # auto | normal | fast; explicit role/env values win
+            # Overall live role-worker cap per board. Planner/reviewer lanes
+            # remain singleton; dev parallelism is controlled separately below.
             "max_global_workers": 8,
             "max_workers_per_board": 2,
+            # Safe default is serial dev work per board. Raise only when dev
+            # tickets use isolated workspaces; shared checkout fanout is guarded.
+            "max_dev_workers_per_board": 1,
             "review_loop_limit": 5,
             "foreman": {
                 "enabled": False,
@@ -1738,9 +1741,9 @@ DEFAULT_CONFIG = {
                 "terminal_suppression_age_seconds": 7 * 24 * 3600,
             },
             "roles": {
-                "planner": {"reasoning": "xhigh", "service_tier": "normal", "max_runtime_seconds": 1800},
-                "dev": {"reasoning": "medium", "service_tier": "normal", "max_runtime_seconds": 3600},
-                "reviewer": {"reasoning": "xhigh", "service_tier": "normal", "max_runtime_seconds": 1800},
+                "planner": {"reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
+                "dev": {"reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 3600},
+                "reviewer": {"reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
             },
         },
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve

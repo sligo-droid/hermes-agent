@@ -826,7 +826,7 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
-        return agent._run_codex_app_server_turn(
+        _codex_result = agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
             messages=messages,
@@ -834,6 +834,18 @@ def run_conversation(
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
         )
+        _log_turn_runtime_summary(
+            agent,
+            total_elapsed_s=time.perf_counter() - _turn_runtime_started_at,
+            exit_reason=(
+                "codex_app_server_completed"
+                if _codex_result.get("completed")
+                else "codex_app_server_incomplete"
+            ),
+            interrupted=bool(_codex_result.get("interrupted")),
+            response_len=len(_codex_result.get("final_response") or ""),
+        )
+        return _codex_result
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
@@ -1355,6 +1367,7 @@ def run_conversation(
                     # Log response with provider info if available
                     resp_model = getattr(response, 'model', 'N/A') if response else 'N/A'
                     logging.debug(f"API Response received - Model: {resp_model}, Usage: {response.usage if hasattr(response, 'usage') else 'N/A'}")
+                _api_runtime_recorded = False
                 
                 # Validate response shape before proceeding
                 response_invalid = False
@@ -1859,6 +1872,7 @@ def run_conversation(
                     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
                     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
                     _record_turn_api_runtime(agent, api_duration, canonical_usage, prompt_tokens)
+                    _api_runtime_recorded = True
 
                     # Log API call details for debugging/observability
                     _cache_pct = ""
@@ -1951,6 +1965,13 @@ def run_conversation(
                             f"{cached:,}/{prompt:,} tokens "
                             f"({hit_pct:.0f}% hit, {written:,} written)"
                         )
+
+                if not _api_runtime_recorded:
+                    # Some transports (notably Codex-backed Responses paths)
+                    # can return a valid response without usage metadata. Still
+                    # account for latency so runtime summaries do not report
+                    # api_ms=0 with the entire turn classified as overhead.
+                    _record_turn_api_runtime(agent, api_duration, None, 0)
                 
                 has_retried_429 = False  # Reset on success
                 # Clear Nous rate limit state on successful request —

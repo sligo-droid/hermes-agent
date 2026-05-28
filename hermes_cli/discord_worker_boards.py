@@ -2826,11 +2826,27 @@ def _queue_reason(
     except (TypeError, ValueError):
         max_per_board = 2
     try:
+        max_dev_per_board = int(worker_cfg.get("max_dev_workers_per_board") or 1)
+    except (TypeError, ValueError):
+        max_dev_per_board = 1
+    try:
         max_global = int(worker_cfg.get("max_global_workers") or 8)
     except (TypeError, ValueError):
         max_global = 8
     if max_per_board > 0 and running_count >= max_per_board:
         return "board worker limit reached"
+    if max_dev_per_board > 0:
+        try:
+            running_dev = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running' AND lower(assignee) = ?",
+                (ROLE_DEV,),
+            ).fetchone()[0]
+        except Exception:
+            running_dev = 0
+        if int(running_dev or 0) >= max_dev_per_board:
+            return "dev worker limit reached"
+        if max_dev_per_board > 1 and _shared_dev_workspace_limited(conn):
+            return "shared worktree dev worker limit reached"
     if max_global > 0:
         try:
             if _active_role_count_across_boards() >= max_global:
@@ -2841,6 +2857,20 @@ def _queue_reason(
     if not kanban_db.has_spawnable_ready(conn, additional_spawnable_assignees=ROLE_ASSIGNEES):
         return "ready tickets are assigned to non-spawnable lanes"
     return "awaiting next dispatcher tick"
+
+
+def _shared_dev_workspace_limited(conn: Any) -> bool:
+    try:
+        rows = conn.execute(
+            "SELECT workspace_path FROM tasks "
+            "WHERE status IN ('ready', 'running') AND lower(assignee) = ?",
+            (ROLE_DEV,),
+        ).fetchall()
+    except Exception:
+        return False
+    paths = [str(row["workspace_path"] or "").strip() for row in rows]
+    paths = [path for path in paths if path]
+    return len(paths) > 1 and len(set(paths)) == 1
 
 
 def _running_ticket_snapshot(conn: Any) -> list[dict[str, Any]]:

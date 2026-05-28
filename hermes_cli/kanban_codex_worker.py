@@ -348,12 +348,15 @@ def _run_opencode(
     )
     if role == ROLE_PLANNER:
         cfg = load_opencode_config()
+        reasoning_level = _scheduled_opencode_reasoning(
+            cfg["complex_plan_reasoning_level"]
+        )
         result = run_opencode_single_pass(
             prompt,
             workspace,
             timeout=_role_timeout(role),
             agent=cfg["plan_agent"],
-            reasoning_level=cfg["complex_plan_reasoning_level"],
+            reasoning_level=reasoning_level,
             title=f"kanban {task_id}",
             on_event=on_event,
         )
@@ -365,6 +368,7 @@ def _run_opencode(
             context_for_classification=context,
             force_plan=False,
             title=f"kanban {task_id}",
+            worker_config=_scheduled_opencode_worker_config(),
             on_event=on_event,
         )
     _attach_scheduled_runtime(result, role)
@@ -373,6 +377,47 @@ def _run_opencode(
     except Exception:
         pass
     return result
+
+
+def _scheduled_opencode_reasoning(default: str) -> str:
+    effort = str(os.environ.get("HERMES_CODEX_WORKER_REASONING") or "").strip().lower()
+    if effort in {"minimal", "low", "medium", "high", "xhigh", "max"}:
+        return effort
+    return default
+
+
+def _scheduled_opencode_worker_config() -> Optional[dict[str, str]]:
+    if os.environ.get("HERMES_CODEX_WORKER_REASONING_SOURCE") != "adaptive":
+        return None
+    if _raw_opencode_pass_configured():
+        return None
+    effort = _scheduled_opencode_reasoning("")
+    if not effort:
+        return None
+    return {
+        "simple_build_reasoning_level": effort,
+        "complex_build_reasoning_level": effort,
+    }
+
+
+def _raw_opencode_pass_configured() -> bool:
+    try:
+        from hermes_cli.config import read_raw_config
+
+        raw = read_raw_config() or {}
+    except Exception:
+        return False
+    coding = raw.get("coding_worker") if isinstance(raw, dict) else None
+    if not isinstance(coding, dict):
+        return False
+    return any(
+        key in coding
+        for key in (
+            "simple_build_reasoning_level",
+            "complex_plan_reasoning_level",
+            "complex_build_reasoning_level",
+        )
+    )
 
 
 def _role_extra_args(role: str) -> list[str]:

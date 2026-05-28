@@ -94,6 +94,19 @@ def _close_codex_app_server_session(agent) -> None:
     agent._codex_worker_home_lease = None
 
 
+def _record_codex_app_server_runtime(agent, duration: float) -> None:
+    stats = getattr(agent, "_turn_runtime_stats", None)
+    if not isinstance(stats, dict):
+        return
+    try:
+        stats["api_calls"] = int(stats.get("api_calls") or 0) + 1
+        stats["api_duration_s"] = float(stats.get("api_duration_s") or 0.0) + max(
+            0.0, float(duration or 0.0)
+        )
+    except Exception:
+        logger.debug("codex app-server runtime accounting failed", exc_info=True)
+
+
 def _codex_kanban_worker_bootstrap() -> str:
     """Return concise Codex-only guidance for kanban worker sessions."""
     if not os.environ.get("HERMES_KANBAN_TASK"):
@@ -252,12 +265,19 @@ def run_codex_app_server_turn(
 
         _ensure_codex_session()
 
+        codex_api_start = time.perf_counter()
         try:
             turn = agent._codex_session.run_turn(
                 user_input=codex_input,
                 turn_timeout=turn_timeout,
             )
+            _record_codex_app_server_runtime(
+                agent, time.perf_counter() - codex_api_start
+            )
         except Exception as exc:
+            _record_codex_app_server_runtime(
+                agent, time.perf_counter() - codex_api_start
+            )
             logger.exception("codex app-server turn failed")
             # Crash -> unconditionally drop the session so the next turn
             # respawns from scratch instead of reusing a dead client.
