@@ -1716,6 +1716,7 @@ DEFAULT_CONFIG = {
             "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
             "docker_bin": "docker",
             "codex_home_root": "",
+            "service_tier": "auto",  # auto | normal | fast; explicit role/env values win
             # Overall live role-worker cap per board. Planner/reviewer lanes
             # remain singleton; dev parallelism is controlled separately below.
             "max_global_workers": 8,
@@ -1740,9 +1741,9 @@ DEFAULT_CONFIG = {
                 "terminal_suppression_age_seconds": 7 * 24 * 3600,
             },
             "roles": {
-                "planner": {"reasoning": "xhigh", "service_tier": "normal", "max_runtime_seconds": 1800},
-                "dev": {"reasoning": "medium", "service_tier": "normal", "max_runtime_seconds": 3600},
-                "reviewer": {"reasoning": "xhigh", "service_tier": "normal", "max_runtime_seconds": 1800},
+                "planner": {"reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
+                "dev": {"reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 3600},
+                "reviewer": {"reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
             },
         },
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve

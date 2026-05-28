@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from hermes_cli.discord_worker_boards import ROLE_ASSIGNEES, ROLE_DEV, ROLE_PLANNER
+from hermes_cli.discord_worker_boards import ROLE_ASSIGNEES, ROLE_DEV, ROLE_PLANNER, ROLE_REVIEWER
 
 _OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV}
 _SENSITIVE_ENV_FRAGMENTS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "ACCESS_KEY")
@@ -37,6 +37,8 @@ _ROLE_DEFAULT_REASONING = {
     "dev": "medium",
     "reviewer": "xhigh",
 }
+_VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh"}
+_AUTO_RUNTIME = "auto"
 
 
 def _repo_root() -> Path:
@@ -74,31 +76,138 @@ def _role_backend(role: str, configured_backend: str) -> str:
     return "codex"
 
 
-def _role_runtime_settings(role: str, cfg: dict[str, Any]) -> dict[str, str]:
+def _role_runtime_settings(
+    role: str,
+    cfg: dict[str, Any],
+    task: Any = None,
+) -> dict[str, str]:
     roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
     role_cfg = roles.get(role) if isinstance(roles.get(role), dict) else {}
 
-    reasoning = str(
-        os.getenv("HERMES_CODEX_WORKER_REASONING")
-        or role_cfg.get("reasoning")
-        or _ROLE_DEFAULT_REASONING.get(role)
-        or "medium"
-    ).strip().lower()
-    if reasoning not in {"minimal", "low", "medium", "high", "xhigh"}:
-        reasoning = _ROLE_DEFAULT_REASONING.get(role, "medium")
-
-    raw_tier = (
-        os.getenv("HERMES_CODEX_WORKER_SERVICE_TIER")
-        or role_cfg.get("service_tier")
-        or role_cfg.get("mode")
-        or role_cfg.get("fast")
-        or cfg.get("service_tier")
-        or cfg.get("mode")
-        or cfg.get("fast")
-        or "normal"
+    raw_reasoning = _first_configured_value(
+        os.getenv("HERMES_CODEX_WORKER_REASONING"),
+        role_cfg.get("reasoning"),
     )
-    tier = _normalize_service_tier(raw_tier)
-    return {"reasoning": reasoning, "service_tier": tier, "mode": tier}
+    reasoning_source = "explicit" if raw_reasoning is not None else "adaptive"
+    if raw_reasoning is None or _is_auto(raw_reasoning):
+        reasoning = _adaptive_reasoning(role, task)
+    else:
+        reasoning = str(raw_reasoning).strip().lower()
+        if reasoning not in _VALID_REASONING_LEVELS:
+            reasoning = _ROLE_DEFAULT_REASONING.get(role, "medium")
+            reasoning_source = "default"
+
+    raw_tier = _first_configured_value(
+        os.getenv("HERMES_CODEX_WORKER_SERVICE_TIER"),
+        role_cfg.get("service_tier"),
+        role_cfg.get("mode"),
+        role_cfg.get("fast"),
+        cfg.get("service_tier"),
+        cfg.get("mode"),
+        cfg.get("fast"),
+    )
+    tier_source = "explicit" if raw_tier is not None else "adaptive"
+    tier = (
+        _adaptive_service_tier(role, task)
+        if raw_tier is None or _is_auto(raw_tier)
+        else _normalize_service_tier(raw_tier)
+    )
+    return {
+        "reasoning": reasoning,
+        "reasoning_source": reasoning_source,
+        "service_tier": tier,
+        "service_tier_source": tier_source,
+        "mode": tier,
+    }
+
+
+def _first_configured_value(*values: Any) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
+
+
+def _is_auto(value: Any) -> bool:
+    return str(value).strip().lower() == _AUTO_RUNTIME
+
+
+def _adaptive_reasoning(role: str, task: Any = None) -> str:
+    if role in {ROLE_PLANNER, ROLE_REVIEWER}:
+        return "xhigh"
+    if role != ROLE_DEV:
+        return _ROLE_DEFAULT_REASONING.get(role, "medium")
+    if _task_needs_escalation(task):
+        return "xhigh"
+    if _task_is_risky(task):
+        return "high"
+    return "medium"
+
+
+def _adaptive_service_tier(role: str, task: Any = None) -> str:
+    if role == ROLE_DEV and not _task_is_risky(task) and not _task_needs_escalation(task):
+        return "fast"
+    return "normal"
+
+
+def _task_text(task: Any = None) -> str:
+    if task is None:
+        return ""
+    return "\n".join(
+        str(part or "")
+        for part in (
+            getattr(task, "title", ""),
+            getattr(task, "body", ""),
+            getattr(task, "result", ""),
+            getattr(task, "last_failure_error", ""),
+        )
+    )
+
+
+def _task_is_risky(task: Any = None) -> bool:
+    try:
+        from agent.opencode_worker import looks_complex_or_risky
+
+        return looks_complex_or_risky(_task_text(task))
+    except Exception:
+        lower = _task_text(task).lower()
+        return any(
+            signal in lower
+            for signal in (
+                "security",
+                "auth",
+                "migration",
+                "performance",
+                "reviewer",
+                "planner",
+            )
+        )
+
+
+def _task_needs_escalation(task: Any = None) -> bool:
+    if task is None:
+        return False
+    if int(getattr(task, "consecutive_failures", 0) or 0) > 0:
+        return True
+    if str(getattr(task, "last_failure_error", "") or "").strip():
+        return True
+    created_by = str(getattr(task, "created_by", "") or "").strip().lower()
+    if created_by == "reviewer":
+        return True
+    lower = _task_text(task).lower()
+    return any(
+        phrase in lower
+        for phrase in (
+            "changes requested",
+            "reviewer requested",
+            "review feedback",
+            "follow-up",
+            "retry",
+        )
+    )
 
 
 def _role_log_settings(
@@ -117,7 +226,9 @@ def _role_log_settings(
     except Exception:
         return settings
     if role == ROLE_PLANNER:
-        reasoning = pass_cfg["complex_plan_reasoning_level"]
+        reasoning = settings.get("reasoning") or pass_cfg["complex_plan_reasoning_level"]
+    elif settings.get("reasoning_source") == "adaptive":
+        reasoning = settings.get("reasoning", pass_cfg["simple_build_reasoning_level"])
     else:
         reasoning = (
             f"simple={pass_cfg['simple_build_reasoning_level']},"
@@ -229,7 +340,7 @@ def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None
     cfg = _worker_config()
     configured_backend = _coding_backend(cfg)
     backend = _role_backend(role, configured_backend)
-    settings = _role_runtime_settings(role, cfg)
+    settings = _role_runtime_settings(role, cfg, task)
     log_settings = _role_log_settings(role, cfg, backend=backend, settings=settings)
     if backend == "opencode":
         try:
@@ -299,7 +410,9 @@ def _spawn_host_worker(
             "HERMES_KANBAN_WORKSPACES_ROOT": str(kanban_db.workspaces_root(board=board)),
             "HERMES_CODEX_WORKER_ROLE": str(getattr(task, "assignee", "") or "").strip().lower(),
             "HERMES_CODEX_WORKER_REASONING": settings["reasoning"],
+            "HERMES_CODEX_WORKER_REASONING_SOURCE": settings["reasoning_source"],
             "HERMES_CODEX_WORKER_SERVICE_TIER": settings["service_tier"],
+            "HERMES_CODEX_WORKER_SERVICE_TIER_SOURCE": settings["service_tier_source"],
             "HERMES_CODING_WORKER_BACKEND": backend,
             "PYTHONPATH": (
                 f"{_repo_root()}{os.pathsep}{existing_pythonpath}"
@@ -365,7 +478,9 @@ def _spawn_docker_worker(
             "HERMES_KANBAN_WORKSPACE": str(workspace_path),
             "HERMES_CODEX_WORKER_ROLE": role,
             "HERMES_CODEX_WORKER_REASONING": settings["reasoning"],
+            "HERMES_CODEX_WORKER_REASONING_SOURCE": settings["reasoning_source"],
             "HERMES_CODEX_WORKER_SERVICE_TIER": settings["service_tier"],
+            "HERMES_CODEX_WORKER_SERVICE_TIER_SOURCE": settings["service_tier_source"],
             "HERMES_CODING_WORKER_BACKEND": backend,
             "CODEX_HOME": "/codex-home",
             "HERMES_CODEX_WORKER_CLEANUP_HOME": "1",

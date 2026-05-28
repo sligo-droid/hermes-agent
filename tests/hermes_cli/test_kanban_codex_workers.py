@@ -597,6 +597,113 @@ def test_role_extra_args_use_scheduled_runtime_env(monkeypatch):
     ]
 
 
+def test_dev_runtime_auto_uses_fast_medium_for_simple_task(monkeypatch):
+    from hermes_cli import kanban_codex_workers as workers
+
+    monkeypatch.delenv("HERMES_CODEX_WORKER_REASONING", raising=False)
+    monkeypatch.delenv("HERMES_CODEX_WORKER_SERVICE_TIER", raising=False)
+    task = SimpleNamespace(
+        title="Fix typo",
+        body="Correct a README typo",
+        result=None,
+        last_failure_error=None,
+        consecutive_failures=0,
+        created_by="planner",
+    )
+
+    settings = workers._role_runtime_settings("dev", {}, task)
+
+    assert settings["reasoning"] == "medium"
+    assert settings["reasoning_source"] == "adaptive"
+    assert settings["service_tier"] == "fast"
+    assert settings["service_tier_source"] == "adaptive"
+
+
+def test_dev_runtime_auto_keeps_risky_and_retry_work_high(monkeypatch):
+    from hermes_cli import kanban_codex_workers as workers
+
+    monkeypatch.delenv("HERMES_CODEX_WORKER_REASONING", raising=False)
+    monkeypatch.delenv("HERMES_CODEX_WORKER_SERVICE_TIER", raising=False)
+    risky = SimpleNamespace(
+        title="Fix auth migration performance regression",
+        body="Production auth path is slow after schema migration",
+        result=None,
+        last_failure_error=None,
+        consecutive_failures=0,
+        created_by="planner",
+    )
+    retry = SimpleNamespace(
+        title="Fix parser",
+        body="Small parser fix",
+        result=None,
+        last_failure_error="previous worker crashed",
+        consecutive_failures=1,
+        created_by="planner",
+    )
+
+    risky_settings = workers._role_runtime_settings("dev", {}, risky)
+    retry_settings = workers._role_runtime_settings("dev", {}, retry)
+
+    assert risky_settings["reasoning"] == "high"
+    assert risky_settings["service_tier"] == "normal"
+    assert retry_settings["reasoning"] == "xhigh"
+    assert retry_settings["service_tier"] == "normal"
+
+
+def test_runtime_explicit_config_and_env_override_auto(monkeypatch):
+    from hermes_cli import kanban_codex_workers as workers
+
+    task = SimpleNamespace(title="Fix typo", body="", consecutive_failures=0)
+    cfg = {
+        "roles": {"dev": {"reasoning": "low", "service_tier": "normal"}},
+        "service_tier": "auto",
+    }
+
+    settings = workers._role_runtime_settings("dev", cfg, task)
+    assert settings["reasoning"] == "low"
+    assert settings["service_tier"] == "normal"
+    assert settings["reasoning_source"] == "explicit"
+    assert settings["service_tier_source"] == "explicit"
+
+    monkeypatch.setenv("HERMES_CODEX_WORKER_REASONING", "xhigh")
+    monkeypatch.setenv("HERMES_CODEX_WORKER_SERVICE_TIER", "fast")
+
+    settings = workers._role_runtime_settings("dev", cfg, task)
+    assert settings["reasoning"] == "xhigh"
+    assert settings["service_tier"] == "fast"
+
+
+def test_planner_and_reviewer_auto_remain_xhigh(monkeypatch):
+    from hermes_cli import kanban_codex_workers as workers
+
+    monkeypatch.delenv("HERMES_CODEX_WORKER_REASONING", raising=False)
+    task = SimpleNamespace(title="Plan work", body="", consecutive_failures=0)
+
+    assert workers._role_runtime_settings("planner", {}, task)["reasoning"] == "xhigh"
+    assert workers._role_runtime_settings("reviewer", {}, task)["reasoning"] == "xhigh"
+
+
+def test_opencode_adaptive_dev_reasoning_does_not_override_raw_config(monkeypatch):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import config as config_mod
+
+    monkeypatch.setenv("HERMES_CODEX_WORKER_REASONING", "medium")
+    monkeypatch.setenv("HERMES_CODEX_WORKER_REASONING_SOURCE", "adaptive")
+    monkeypatch.setattr(config_mod, "read_raw_config", lambda: {})
+
+    assert worker._scheduled_opencode_worker_config() == {
+        "simple_build_reasoning_level": "medium",
+        "complex_build_reasoning_level": "medium",
+    }
+
+    monkeypatch.setattr(
+        config_mod,
+        "read_raw_config",
+        lambda: {"coding_worker": {"simple_build_reasoning_level": "xhigh"}},
+    )
+    assert worker._scheduled_opencode_worker_config() is None
+
+
 def test_role_extra_args_default_reasoning_by_role(monkeypatch):
     from hermes_cli import kanban_codex_worker as worker
 
