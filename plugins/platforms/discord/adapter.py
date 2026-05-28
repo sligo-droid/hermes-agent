@@ -3404,7 +3404,7 @@ class DiscordAdapter(BasePlatformAdapter):
         return state
 
     async def send_kanban_completion_notice(self, target: Dict[str, Any]) -> Optional[str]:
-        """Clear the legacy one-shot completion notice flag without posting."""
+        """Post one visible completion notice for a finished Kanban goal."""
         if str(target.get("state") or "").strip() != "done":
             return None
         if not target.get("terminal_completion_message_pending"):
@@ -3412,6 +3412,19 @@ class DiscordAdapter(BasePlatformAdapter):
         board = str(target.get("board") or "").strip()
         if not board:
             return None
+        thread = await self._resolve_summary_channel(str(target.get("thread_id") or ""))
+        if thread is None or not hasattr(thread, "send"):
+            return None
+        content = self._kanban_completion_notice_content(target)
+        chunks = self.truncate_message(content, self.MAX_MESSAGE_LENGTH)
+        send_kwargs: Dict[str, Any] = {"content": chunks[0] if chunks else content[: self.MAX_MESSAGE_LENGTH]}
+        try:
+            allowed_mentions = _build_allowed_mentions()
+            if allowed_mentions is not None:
+                send_kwargs["allowed_mentions"] = allowed_mentions
+        except Exception:
+            pass
+        await thread.send(**send_kwargs)
         try:
             from hermes_cli.discord_worker_boards import mark_thread_status_synced
 
@@ -3420,6 +3433,17 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("[%s] Failed to clear Discord terminal completion notice flag", self.name, exc_info=True)
             return None
         return board
+
+    def _kanban_completion_notice_content(self, target: Dict[str, Any]) -> str:
+        outcome = str(target.get("outcome") or "").strip() or "Done. Kanban work completed."
+        lines = [outcome]
+        pr_url = str(target.get("pr_url") or "").strip()
+        if pr_url and pr_url not in outcome:
+            lines.append(f"PR: {pr_url}")
+        public_url = str(target.get("public_url") or "").strip()
+        if public_url:
+            lines.append(f"Kanban: {public_url}")
+        return "\n".join(lines)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Mark a Discord turn as in-progress.
