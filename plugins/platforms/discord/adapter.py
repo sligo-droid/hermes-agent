@@ -2265,6 +2265,8 @@ class DiscordAdapter(BasePlatformAdapter):
             board=board,
         )
         if not handle:
+            if self._clear_terminal_kanban_sync_flags(target, summary=True):
+                return str(target.get("sync_key") or board)
             return None
         if not self._feature_summary_target_matches_handle(handle, target):
             logger.warning(
@@ -2287,6 +2289,7 @@ class DiscordAdapter(BasePlatformAdapter):
             handle["hide_source_links"] = bool(target.get("hide_source_links"))
         self._persist_feature_summary_handle_by_scope(handle)
         if self._feature_summary_circuit_matches(handle):
+            self._clear_terminal_kanban_sync_flags(target, summary=True)
             return str(target.get("sync_key") or board)
         ok = await self.update_feature_summary(
             handle,
@@ -2296,6 +2299,7 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         if not ok:
             if self._feature_summary_circuit_matches(handle):
+                self._clear_terminal_kanban_sync_flags(target, summary=True)
                 return str(target.get("sync_key") or board)
             return None
         if str(target.get("state") or "") in {"done", "blocked", "errored"}:
@@ -3407,8 +3411,16 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         message = await self._kanban_reaction_target_message(thread, target)
         if message is None:
+            if self._clear_terminal_kanban_sync_flags(target, reaction=True):
+                return state
             return None
-        await self._set_message_reaction_state(message, emoji)
+        try:
+            await self._set_message_reaction_state(message, emoji)
+        except Exception as exc:
+            permanent = self._is_permanent_feature_summary_error(exc)
+            if permanent and self._clear_terminal_kanban_sync_flags(target, reaction=True):
+                return state
+            raise
         if state in {"done", "blocked", "errored"}:
             try:
                 from hermes_cli.discord_worker_boards import mark_thread_status_synced
@@ -3448,6 +3460,33 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("[%s] Failed to clear Discord terminal completion notice flag", self.name, exc_info=True)
             return None
         return board
+
+    def _clear_terminal_kanban_sync_flags(
+        self,
+        target: Dict[str, Any],
+        *,
+        reaction: bool = False,
+        summary: bool = False,
+    ) -> bool:
+        """Clear terminal one-shot sync flags when Discord cannot reach their target."""
+        state = str(target.get("state") or target.get("reaction_state") or "").strip()
+        if state not in {"done", "blocked", "errored"}:
+            return False
+        board = str(target.get("board") or "").strip()
+        if not board:
+            return False
+        reaction = reaction and bool(target.get("terminal_reaction_sync_pending"))
+        summary = summary and bool(target.get("terminal_summary_sync_pending"))
+        if not (reaction or summary):
+            return False
+        try:
+            from hermes_cli.discord_worker_boards import mark_thread_status_synced
+
+            mark_thread_status_synced(board, reaction=reaction, summary=summary)
+        except Exception:
+            logger.debug("[%s] Failed to clear unreachable Discord terminal sync flag", self.name, exc_info=True)
+            return False
+        return True
 
     def _kanban_completion_notice_content(self, target: Dict[str, Any]) -> str:
         outcome = str(target.get("outcome") or "").strip() or "Done. Kanban work completed."

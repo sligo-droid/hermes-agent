@@ -494,6 +494,42 @@ async def test_kanban_thread_reaction_prefers_explicit_reaction_state(adapter):
 
 
 @pytest.mark.asyncio
+async def test_kanban_thread_reaction_clears_terminal_flag_when_message_missing(
+    adapter,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="123", goal="Ship it")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_reaction_sync_pending": True,
+        },
+    )
+    adapter._resolve_summary_channel = AsyncMock(return_value=SimpleNamespace(id=123))
+    adapter._kanban_reaction_target_message = AsyncMock(return_value=None)
+
+    synced = await adapter.sync_kanban_thread_reaction(
+        {
+            "board": board.slug,
+            "thread_id": "123",
+            "state": "done",
+            "terminal_reaction_sync_pending": True,
+        }
+    )
+
+    assert synced == "done"
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "terminal_reaction_sync_pending" not in worker
+
+
+@pytest.mark.asyncio
 async def test_status_reaction_state_preserves_existing_target(adapter):
     raw_message = SimpleNamespace(
         add_reaction=AsyncMock(),
