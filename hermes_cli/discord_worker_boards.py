@@ -55,6 +55,8 @@ from utils import atomic_json_write
 
 
 logger = logging.getLogger(__name__)
+DEFAULT_REVIEW_LOOP_LIMIT = 5
+FOREMAN_REVIEW_LOOP_LIMIT = 3
 _DISCORD_MESSAGE_URL_RE = re.compile(
     r"https?://(?:canary\.|ptb\.)?discord(?:app)?\.com/channels/"
     r"(?P<guild>\d+)/(?P<channel>\d+)/(?P<message>\d+)"
@@ -77,6 +79,11 @@ class TicketMoveConflict(RuntimeError):
 
 def _now() -> int:
     return int(time.time())
+
+
+def _is_foreman_generated_request(request: object) -> bool:
+    text = str(request or "").lstrip()
+    return text.startswith("Foreman escalation:") or text.startswith("/goal Foreman escalation:")
 
 
 def active_dev_round_for_board(board: Optional[str]) -> int:
@@ -389,6 +396,7 @@ def ensure_discord_thread_board(
     worktree_path = previous_worktree_path
     if not worktree_path or (project_path_changed and not worker.get("code_island_ready")):
         worktree_path = _default_worktree_path(project_path, request_suffix or str(thread_id))
+    request_text = str(initial_request or worker.get("initial_request") or "")
     worker.update(
         {
             "kind": "discord_worker_board",
@@ -399,7 +407,7 @@ def ensure_discord_thread_board(
             "chat_id": str(chat_id or ""),
             "guild_id": str(guild_id or ""),
             "parent_channel_id": str(parent_channel_id or ""),
-            "initial_request": str(initial_request or worker.get("initial_request") or ""),
+            "initial_request": request_text,
             "project_context": merged_project_context,
             "project_path": project_path,
             "base_branch": worker.get("base_branch") or merged_project_context.get("base_branch") or "main",
@@ -410,7 +418,7 @@ def ensure_discord_thread_board(
             "goal_status": worker.get("goal_status") or "unset",
             "criteria": worker.get("criteria") or [],
             "review_loop_count": int(worker.get("review_loop_count") or 0),
-            "review_loop_limit": int(worker.get("review_loop_limit") or _review_loop_limit()),
+            "review_loop_limit": int(worker.get("review_loop_limit") or _review_loop_limit_for_request(request_text)),
             "share_token": token,
             "public_url": public_session_board_url(route_id),
             "created_at": worker.get("created_at") or _now(),
@@ -1878,10 +1886,8 @@ def _public_board_summary_html(summary: dict[str, Any]) -> str:
 
 def _public_review_text(worker: dict[str, Any]) -> str:
     count = worker.get("review_loop_count")
-    limit = worker.get("review_loop_limit")
-    if limit not in (None, ""):
-        return f"{count or 0}/{limit}"
-    return str(count or 0)
+    limit = _review_loop_limit_for_worker(worker)
+    return f"{count or 0}/{limit}"
 
 
 def _public_count_text(counts: dict[str, Any]) -> str:
@@ -1976,8 +1982,8 @@ def _is_foreman_generated_worker(worker: dict[str, Any]) -> bool:
         or worker.get("root_goal")
         or worker.get("latest_planner_request")
         or ""
-    ).lstrip()
-    return request.startswith("Foreman escalation:") or request.startswith("/goal Foreman escalation:")
+    )
+    return _is_foreman_generated_request(request)
 
 
 def _foreman_source_board_from_request(text: str) -> str:
@@ -2311,7 +2317,7 @@ def build_board_run_summary(board: str) -> dict[str, Any]:
         },
         "review": {
             "loop_count": int(worker.get("review_loop_count") or 0),
-            "loop_limit": int(worker.get("review_loop_limit") or _review_loop_limit()),
+            "loop_limit": _review_loop_limit_for_worker(worker),
             "final_verdict": _final_reviewer_verdict(tasks, runs_by_task),
         },
         "pr": _pr_summary(worker),
@@ -4011,9 +4017,30 @@ def _review_loop_limit() -> int:
 
         cfg = load_config() or {}
         value = ((cfg.get("kanban") or {}).get("discord_worker") or {}).get("review_loop_limit")
-        return int(value or 5)
+        return int(value or DEFAULT_REVIEW_LOOP_LIMIT)
     except Exception:
-        return 5
+        return DEFAULT_REVIEW_LOOP_LIMIT
+
+
+def _review_loop_limit_for_request(request: object) -> int:
+    if _is_foreman_generated_request(request):
+        return FOREMAN_REVIEW_LOOP_LIMIT
+    return _review_loop_limit()
+
+
+def _review_loop_limit_for_worker(worker: dict[str, Any]) -> int:
+    value = worker.get("review_loop_limit")
+    if value not in (None, ""):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    return _review_loop_limit_for_request(
+        worker.get("initial_request")
+        or worker.get("root_goal")
+        or worker.get("latest_planner_request")
+        or ""
+    )
 
 
 def _is_review_loop_limit_blocker(worker: dict[str, Any]) -> bool:
@@ -4118,9 +4145,9 @@ def continue_board_after_review_loop_limit(
     except (TypeError, ValueError):
         loops = 0
     try:
-        limit = max(0, int(worker.get("review_loop_limit") or _review_loop_limit()))
+        limit = max(0, _review_loop_limit_for_worker(worker))
     except (TypeError, ValueError):
-        limit = _review_loop_limit()
+        limit = _review_loop_limit_for_worker(worker)
     try:
         extension = max(1, int(extra_loops))
     except (TypeError, ValueError):
@@ -4315,7 +4342,8 @@ def reconcile_board(board: str) -> Optional[str]:
             return "planner_created"
 
         loops = int(worker.get("review_loop_count") or 0)
-        if loops >= int(worker.get("review_loop_limit") or 5):
+        loop_limit = _review_loop_limit_for_worker(worker)
+        if loops >= loop_limit:
             worker.update({
                 "phase": "blocked",
                 "goal_status": "blocked",
@@ -4339,7 +4367,7 @@ def reconcile_board(board: str) -> Optional[str]:
                     "root_goal": worker.get("root_goal") or worker.get("initial_request") or "",
                     "acceptance_criteria": worker.get("criteria") or [],
                     "review_loop": loops,
-                    "loop_limit": int(worker.get("review_loop_limit") or 5),
+                    "loop_limit": loop_limit,
                 },
                 indent=2,
                 ensure_ascii=False,

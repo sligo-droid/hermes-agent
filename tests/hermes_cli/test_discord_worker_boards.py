@@ -182,6 +182,60 @@ def test_set_goal_creates_planner_task_for_role_lane(monkeypatch, tmp_path):
     assert tasks[0].workspace_kind == "dir"
 
 
+def test_foreman_goal_uses_three_review_loops_but_regular_keeps_default(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    regular = dwb.set_goal(thread_id="7771", goal="Implement durable workers")
+    foreman = dwb.set_goal(
+        thread_id="7772",
+        goal="Foreman escalation: resolve a Discord worker issue.",
+        board_slug="foreman-review-limit",
+    )
+
+    regular_worker = kanban_db.read_board_metadata(regular.slug)["discord_worker"]
+    foreman_worker = kanban_db.read_board_metadata(foreman.slug)["discord_worker"]
+    assert regular_worker["review_loop_limit"] == 5
+    assert foreman_worker["review_loop_limit"] == 3
+
+
+def test_foreman_board_blocks_at_three_review_rounds(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.ensure_discord_thread_board(
+        thread_id="7773",
+        initial_request="Foreman escalation: resolve a Discord worker issue.",
+        board_slug="foreman-review-cap",
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        done = kanban_db.create_task(conn, title="Previous work", assignee="dev", tenant=board.slug)
+        claimed = kanban_db.claim_task(conn, done)
+        assert claimed is not None
+        kanban_db.complete_task(conn, done, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "active",
+            "phase": "reviewing",
+            "execution_mode": "kanban_pipeline",
+            "review_loop_count": 3,
+        },
+    )
+
+    result = dwb.reconcile_board(board.slug)
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert result == "blocked_review_loop_limit"
+    assert worker["goal_status"] == "blocked"
+    assert worker["blocked_reason"] == dwb.REVIEW_LOOP_LIMIT_BLOCKED_REASON
+
+
 def test_role_round_title_prefix_is_idempotent():
     from hermes_cli import discord_worker_boards as dwb
 
