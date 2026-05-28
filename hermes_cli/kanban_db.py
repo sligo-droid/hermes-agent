@@ -5719,7 +5719,12 @@ def dispatch_once(
             from hermes_cli.profiles import profile_exists
         except Exception:
             profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        row_assignee = str(row["assignee"] or "").strip().lower()
+        if (
+            profile_exists is not None
+            and row_assignee not in additional_spawnable
+            and not profile_exists(row["assignee"])
+        ):
             result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
