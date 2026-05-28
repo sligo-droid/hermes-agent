@@ -344,6 +344,8 @@ def test_foreman_watcher_direct_alerts_human_intervention_issue(monkeypatch):
         source_board="discord-source",
         thread_id="source-thread",
         chat_id="source-thread",
+        guild_id="guild-1",
+        source_message_id="source-message",
         foreman_board="discord-foreman",
         manual_intervention_reason="Human must create the API key.",
     )
@@ -359,12 +361,19 @@ def test_foreman_watcher_direct_alerts_human_intervention_issue(monkeypatch):
     monkeypatch.setattr(
         foreman,
         "render_foreman_alert",
-        lambda issue, mention="": rendered_mentions.append(mention) or f"human alert: {issue.task_id}",
+        lambda issue, mention="": rendered_mentions.append(mention) or f"{mention}\nhuman alert: {issue.task_id}",
+    )
+    embed_issues = []
+    monkeypatch.setattr(
+        foreman,
+        "render_foreman_human_intervention_embed",
+        lambda issue: embed_issues.append(issue) or {"title": "Foreman needs human input"},
     )
     monkeypatch.setattr(foreman, "record_alert_sent", lambda issue: sent.append(issue.task_id))
     monkeypatch.setattr(foreman, "record_alert_failed", lambda issue, error: failed.append((issue.task_id, error)))
 
     adapter = ForemanAdapter()
+    adapter.supports_metadata_embeds = True
     runner = _runner(adapter)
     goal_events = []
 
@@ -378,10 +387,11 @@ def test_foreman_watcher_direct_alerts_human_intervention_issue(monkeypatch):
     assert adapter.sent == [
         {
             "chat_id": "source-thread",
-            "content": "human alert: source-task",
+            "content": "<@&1503914570077442058>",
             "metadata": {
                 "foreman_alert_kind": "human_intervention_required",
                 "allowed_role_mentions": ["1503914570077442058"],
+                "_discord_embed": {"title": "Foreman needs human input"},
             },
         }
     ]
@@ -390,15 +400,18 @@ def test_foreman_watcher_direct_alerts_human_intervention_issue(monkeypatch):
     assert adapter.synced_reactions == [
         {
             "board": "discord-source",
-            "thread_id": "source-thread",
-            "chat_id": "source-thread",
-            "message_id": "",
-            "source_message_id": "",
-            "state": "active",
-            "reaction_state": "foreman",
-        }
+                "thread_id": "source-thread",
+                "chat_id": "source-thread",
+                "message_id": "",
+                "source_message_id": "source-message",
+                "state": "active",
+                "reaction_state": "foreman",
+            }
     ]
     assert rendered_mentions == ["<@&1503914570077442058>"]
+    assert embed_issues[0].evidence["source_discord_thread_url"] == (
+        "https://discord.com/channels/guild-1/source-thread/source-message"
+    )
     assert sent == ["source-task"]
     assert failed == []
 

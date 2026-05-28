@@ -18,7 +18,11 @@ from hermes_cli.discord_worker_boards import (
     public_session_board_url,
     read_board_run_summary,
 )
-from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY, ROLE_REVIEWER
+from hermes_cli.discord_worker_roles import (
+    DISCORD_WORKER_META_KEY,
+    REVIEW_LOOP_LIMIT_BLOCKED_REASON,
+    ROLE_REVIEWER,
+)
 from hermes_cli.discord_worker_state import read_codex_worker_state
 from utils import atomic_json_write
 
@@ -126,7 +130,13 @@ _ALLOWED_RENDER_EVIDENCE_KEYS = frozenset(
         "todo_count",
         "running_count",
         "source_board",
+        "source_blocked_reason",
+        "source_discord_thread_url",
+        "source_error_excerpt",
         "source_issue_kind",
+        "source_run_error",
+        "source_sidecar_error",
+        "source_summary",
         "source_task_id",
     }
 )
@@ -638,51 +648,124 @@ def _render_human_intervention_alert(
     evidence: dict[str, Any],
     mention: str,
 ) -> str:
-    source_board = str(evidence.get("source_board") or issue.board or "").strip()
     source_task = str(evidence.get("source_task_id") or issue.task_id or "").strip()
-    foreman_board = str(evidence.get("foreman_board") or "").strip()
-    reason = str(
-        evidence.get("manual_intervention_reason")
-        or issue.title
-        or "Manual intervention is required."
-    )
-    session_url = evidence.get("session_url")
-    steps = _manual_instruction_steps(evidence)
-    if not steps:
-        steps = [
-            "Review the reason above and add the missing credential, access grant, or configuration in the approved secret/config location.",
-            "Reply that the manual setup is complete, then ask Hermes to retry the blocked source task.",
-        ]
-
     lines = [
         mention,
         "**Foreman needs human input**",
         "",
-        f"Source board: `{_truncate_text(_sanitize_text(source_board), 120)}`",
-        f"Source task: `{_truncate_text(_sanitize_text(source_task), 80)}`",
+        f"Source thread: {_human_intervention_source_value(issue, evidence)}",
+        f"Why: {_truncate_text(_human_intervention_reason(issue, evidence), 280)}",
     ]
-    if foreman_board:
-        lines.append(f"Foreman attempt: `{_truncate_text(_sanitize_text(foreman_board), 120)}`")
-    if isinstance(session_url, str) and _is_public_url(session_url):
-        lines.append(f"Foreman board: {session_url}")
-    lines.extend(
-        [
-            "",
-            "**Why this needs a human**",
-            _truncate_text(_sanitize_text(reason), 420),
-            "",
-            "**Do this next**",
-        ]
-    )
-    for index, step in enumerate(steps[:8], start=1):
-        lines.append(f"{index}. {_truncate_text(_sanitize_text(step), 260)}")
-    lines.extend(
-        [
-            "",
-            f"When complete, ask Hermes to retry `{_truncate_text(_sanitize_text(source_task), 80)}`.",
-        ]
-    )
+    foreman_value = _human_intervention_foreman_value(evidence)
+    if foreman_value:
+        lines.append(f"Foreman attempt: {foreman_value}")
+    next_text = _human_intervention_next_text(evidence, source_task)
+    if next_text:
+        lines.append(f"Next: {next_text}")
     return _truncate_text("\n".join(lines), DISCORD_ALERT_LIMIT)
+
+
+def render_foreman_human_intervention_embed(issue: ForemanIssue) -> dict[str, Any]:
+    """Return a Discord embed payload for human-intervention alerts."""
+    if issue.kind != "human_intervention_required":
+        return {}
+    evidence = _renderable_evidence(issue.evidence)
+    source_task = str(evidence.get("source_task_id") or issue.task_id or "").strip()
+    fields = [
+        {
+            "name": "Source thread",
+            "value": _human_intervention_source_value(issue, evidence),
+            "inline": False,
+        },
+        {
+            "name": "Why",
+            "value": _truncate_text(_human_intervention_reason(issue, evidence), 900),
+            "inline": False,
+        },
+    ]
+    foreman_value = _human_intervention_foreman_value(evidence)
+    if foreman_value:
+        fields.append({"name": "Foreman attempt", "value": foreman_value, "inline": False})
+    next_text = _human_intervention_next_text(evidence, source_task)
+    if next_text:
+        fields.append({"name": "Next", "value": next_text, "inline": False})
+    return {
+        "title": "Foreman needs human input",
+        "color": 0xF59E0B,
+        "fields": fields,
+    }
+
+
+def _human_intervention_source_value(issue: ForemanIssue, evidence: dict[str, Any]) -> str:
+    source_board = str(evidence.get("source_board") or issue.board or "").strip()
+    source_task = str(evidence.get("source_task_id") or issue.task_id or "").strip()
+    if source_board and source_task:
+        label = f"{source_board}/{source_task}"
+    else:
+        label = source_board or source_task or "source thread"
+    label = _truncate_text(_sanitize_text(label), 160)
+    url = str(evidence.get("source_discord_thread_url") or "").strip()
+    return _markdown_link(label, url) if _is_public_url(url) else f"`{label}`"
+
+
+def _human_intervention_foreman_value(evidence: dict[str, Any]) -> str:
+    foreman_board = _truncate_text(_sanitize_text(str(evidence.get("foreman_board") or "").strip()), 120)
+    if not foreman_board:
+        return ""
+    session_url = str(evidence.get("session_url") or "").strip()
+    return _markdown_link(foreman_board, session_url) if _is_public_url(session_url) else f"`{foreman_board}`"
+
+
+def _human_intervention_reason(issue: ForemanIssue, evidence: dict[str, Any]) -> str:
+    reason = str(evidence.get("manual_intervention_reason") or "").strip()
+    if reason and not _mentions_review_loop_limit(reason):
+        return _truncate_text(_sanitize_text(reason), 900)
+    return _truncate_text(_source_object_level_problem(issue, evidence), 900)
+
+
+def _source_object_level_problem(issue: ForemanIssue, evidence: dict[str, Any]) -> str:
+    blocked_reason = str(evidence.get("blocked_reason") or "").strip()
+    candidates = [] if _mentions_review_loop_limit(blocked_reason) else [blocked_reason]
+    candidates.extend(
+        str(evidence.get(key) or "").strip()
+        for key in (
+            "source_blocked_reason",
+            "source_run_error",
+            "source_sidecar_error",
+            "source_error_excerpt",
+            "source_summary",
+        )
+    )
+    for candidate in candidates:
+        if candidate and not _mentions_review_loop_limit(candidate):
+            return _sanitize_text(candidate)
+    source_issue_kind = str(evidence.get("source_issue_kind") or "").strip()
+    source_task = str(evidence.get("source_task_id") or issue.task_id or "").strip()
+    if source_issue_kind and source_task:
+        return _sanitize_text(f"{source_issue_kind} is still blocking {source_task}.")
+    if source_issue_kind:
+        return _sanitize_text(f"{source_issue_kind} is still blocking the source thread.")
+    return _sanitize_text(str(issue.title or "Manual intervention is required."))
+
+
+def _human_intervention_next_text(evidence: dict[str, Any], source_task: str) -> str:
+    steps = _manual_instruction_steps(evidence)
+    if not steps:
+        steps = [
+            "Add the missing credential, access grant, or configuration in the approved location.",
+        ]
+    text = "; ".join(_truncate_text(_sanitize_text(step), 180) for step in steps[:3])
+    if source_task:
+        text = f"{text}; then ask Hermes to retry `{_truncate_text(_sanitize_text(source_task), 80)}`."
+    return _truncate_text(text, 700)
+
+
+def _markdown_link(label: str, url: str) -> str:
+    return f"[{label}]({url})"
+
+
+def _mentions_review_loop_limit(value: Any) -> bool:
+    return REVIEW_LOOP_LIMIT_BLOCKED_REASON.casefold() in str(value or "").casefold()
 
 
 def render_foreman_goal_prompt(issue: ForemanIssue) -> str:
@@ -1368,6 +1451,11 @@ def _foreman_source_from_request(text: str) -> dict[str, str]:
         "board": "source_board",
         "task": "source_task_id",
         "detector": "source_issue_kind",
+        "summary": "source_summary",
+        "blocked_reason": "source_blocked_reason",
+        "run_error": "source_run_error",
+        "sidecar_error": "source_sidecar_error",
+        "error_excerpt": "source_error_excerpt",
     }
     for raw_line in str(text or "").splitlines():
         line = raw_line.strip().lstrip("- ").strip()
@@ -1376,7 +1464,7 @@ def _foreman_source_from_request(text: str) -> dict[str, str]:
         key, value = line.split(":", 1)
         target = mapping.get(key.strip().casefold())
         if target and value.strip():
-            source[target] = _truncate_text(_sanitize_text(value.strip()), 120)
+            source[target] = _truncate_text(_sanitize_text(value.strip()), 300)
     return source
 
 
@@ -1560,23 +1648,11 @@ def _manual_instruction_steps(evidence: dict[str, Any]) -> list[str]:
 
 def _foreman_blocked_attention_assessment(issue: ForemanIssue, *, now: int) -> dict[str, Any]:
     evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
-    problem = (
-        evidence.get("blocked_reason")
-        or evidence.get("sidecar_error")
-        or evidence.get("run_error")
-        or evidence.get("error_excerpt")
-        or issue.title
-        or "The foreman board is blocked."
-    )
-    age = evidence.get("stalled_age_seconds")
-    threshold = evidence.get("stalled_after_seconds")
-    if age not in (None, "") and threshold not in (None, ""):
-        reason = (
-            f"Foreman board {issue.board} has remained blocked for {age} seconds "
-            f"after the {threshold}-second alert threshold. Latest blocker: {problem}"
-        )
-    else:
-        reason = f"Foreman board {issue.board} is blocked. Latest blocker: {problem}"
+    problem = _source_object_level_problem(issue, evidence)
+    source_board = str(evidence.get("source_board") or issue.board or "").strip()
+    source_task = str(evidence.get("source_task_id") or issue.task_id or "").strip()
+    source = "/".join(part for part in (source_board, source_task) if part) or "the source thread"
+    reason = f"{source} is blocked on: {problem}"
     return {
         "assessed_at": now,
         "requires_manual_intervention": True,

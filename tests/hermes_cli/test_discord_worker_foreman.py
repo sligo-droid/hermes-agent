@@ -493,6 +493,7 @@ def test_human_intervention_scan_alerts_blocked_foreman_board_without_assessment
     board = _discord_board(monkeypatch, tmp_path)
     from hermes_cli import kanban_db
     from hermes_cli.discord_worker_foreman import collect_human_intervention_issues, render_foreman_goal_prompt
+    from hermes_cli.discord_worker_roles import REVIEW_LOOP_LIMIT_BLOCKED_REASON
 
     source = _alert_issue(
         kind="board_stalled",
@@ -514,7 +515,7 @@ def test_human_intervention_scan_alerts_blocked_foreman_board_without_assessment
             "root_goal": render_foreman_goal_prompt(source),
             "goal_status": "blocked",
             "phase": "blocked",
-            "blocked_reason": "Cannot continue without a human-created API key.",
+            "blocked_reason": REVIEW_LOOP_LIMIT_BLOCKED_REASON,
             "updated_at": 100,
         }
     )
@@ -569,8 +570,9 @@ def test_human_intervention_scan_alerts_blocked_foreman_board_without_assessment
         ("human_intervention_required", "discord-source", "source-task")
     ]
     assert first[0].evidence["foreman_board"] == board
-    assert "has remained blocked" in first[0].evidence["manual_intervention_reason"]
-    assert "Cannot continue without a human-created API key." in first[0].evidence["manual_intervention_reason"]
+    assert REVIEW_LOOP_LIMIT_BLOCKED_REASON not in first[0].evidence["manual_intervention_reason"]
+    assert "Need external API credentials." in first[0].evidence["manual_intervention_reason"]
+    assert first[0].evidence["source_blocked_reason"] == "Need external API credentials."
     assert first[0].evidence["manual_intervention_type"] == "foreman_blocked"
     assert first[0].evidence["manual_intervention_steps"] == [
         "Open the Foreman board linked in this alert and inspect the blocked task.",
@@ -1431,7 +1433,16 @@ def test_render_foreman_alert_is_safe_bounded_and_informative():
 
 
 def test_render_human_intervention_alert_includes_explicit_steps():
-    from hermes_cli.discord_worker_foreman import ForemanIssue, render_foreman_alert
+    from hermes_cli.discord_worker_foreman import (
+        ForemanIssue,
+        render_foreman_alert,
+        render_foreman_human_intervention_embed,
+    )
+
+    source_thread_url = (
+        "https://discord.com/channels/1502787243230756904/"
+        "1509357480361070814/1509374379501289502"
+    )
 
     issue = ForemanIssue(
         kind="human_intervention_required",
@@ -1444,6 +1455,7 @@ def test_render_human_intervention_alert_includes_explicit_steps():
             "foreman_board": "discord-foreman",
             "source_board": "discord-source",
             "source_task_id": "source-task",
+            "source_discord_thread_url": source_thread_url,
             "session_url": "https://example.test/workers/discord-foreman",
             "manual_intervention_reason": "Create a vendor API key.",
             "manual_intervention_type": "api_key",
@@ -1459,18 +1471,25 @@ def test_render_human_intervention_alert_includes_explicit_steps():
     rendered = render_foreman_alert(issue, mention="<@&admin>")
 
     assert rendered.startswith("<@&admin>\n**Foreman needs human input**")
-    assert "Source board: `discord-source`" in rendered
-    assert "Source task: `source-task`" in rendered
-    assert "Foreman attempt: `discord-foreman`" in rendered
-    assert "Foreman board: https://example.test/workers/discord-foreman" in rendered
-    assert "**Why this needs a human**" in rendered
-    assert "**Do this next**" in rendered
-    assert "1. Open the vendor developer console." in rendered
-    assert "2. Create a project-scoped API key with read-only access." in rendered
-    assert "3. Store it as PID_VENDOR_API_KEY, not in chat." in rendered
-    assert "When complete, ask Hermes to retry `source-task`." in rendered
+    assert f"Source thread: [discord-source/source-task]({source_thread_url})" in rendered
+    assert "Source board:" not in rendered
+    assert "Why: Create a vendor API key." in rendered
+    assert "Foreman attempt: [discord-foreman](https://example.test/workers/discord-foreman)" in rendered
+    assert (
+        "Next: Open the vendor developer console.; Create a project-scoped API key with read-only access.; "
+        "Store it as PID_VENDOR_API_KEY, not in chat.; then ask Hermes to retry `source-task`."
+    ) in rendered
+    assert "**Why this needs a human**" not in rendered
+    assert len(rendered) < 600
     assert "Evidence:" not in rendered
     assert "manual_intervention_steps" not in rendered
+
+    embed = render_foreman_human_intervention_embed(issue)
+    fields = {field["name"]: field["value"] for field in embed["fields"]}
+    assert embed["title"] == "Foreman needs human input"
+    assert fields["Source thread"] == f"[discord-source/source-task]({source_thread_url})"
+    assert fields["Why"] == "Create a vendor API key."
+    assert "Open the vendor developer console." in fields["Next"]
 
 
 def test_render_foreman_goal_prompt_is_goal_command_safe_and_informative():
