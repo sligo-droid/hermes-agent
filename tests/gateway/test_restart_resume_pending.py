@@ -1137,20 +1137,15 @@ async def test_startup_auto_resume_skips_when_adapter_unavailable():
 
 
 @pytest.mark.asyncio
-async def test_restart_banner_uses_try_to_resume_wording():
-    """The notification sent before drain should hedge the resume promise
-    — the session-continuity fix is best-effort (stuck-loop counter can
-    still escalate to suspended)."""
+async def test_restart_banner_not_sent_to_active_session():
+    """Restart lifecycle warnings are not posted into active task sessions."""
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     runner._running_agents["agent:main:telegram:dm:999"] = MagicMock()
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert len(adapter.sent) == 1
-    msg = adapter.sent[0]
-    assert "restarting" in msg
-    assert "try to resume" in msg
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio
@@ -1188,7 +1183,7 @@ async def test_restart_home_channel_notification_dedupes_active_chat():
 
 
 @pytest.mark.asyncio
-async def test_restart_home_channel_notification_not_deduped_across_threads():
+async def test_restart_home_channel_notification_uses_top_level_channel():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     session_key = "agent:main:telegram:group:999"
@@ -1206,13 +1201,14 @@ async def test_restart_home_channel_notification_not_deduped_across_threads():
         platform=Platform.TELEGRAM,
         chat_id="999",
         name="Ops Home",
+        thread_id="topic-7",
     )
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert len(adapter.sent) == 2
-    assert adapter.sent_calls[0][2] == {"thread_id": "topic-7"}
-    assert adapter.sent_calls[1][2] is None
+    assert len(adapter.sent) == 1
+    assert adapter.sent_calls[0][0] == "999"
+    assert adapter.sent_calls[0][2] is None
 
 
 @pytest.mark.asyncio

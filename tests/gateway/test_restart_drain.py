@@ -208,27 +208,31 @@ async def test_launch_detached_restart_command_uses_setsid(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_shutdown_notification_sent_to_active_sessions():
-    """Active sessions receive a notification when the gateway starts shutting down."""
+async def test_shutdown_notification_not_sent_to_active_sessions():
+    """Active sessions do not receive gateway lifecycle warnings."""
     runner, adapter = make_restart_runner()
-    source = make_restart_source(chat_id="999", chat_type="dm")
     session_key = f"agent:main:telegram:dm:999"
     runner._running_agents[session_key] = MagicMock()
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert len(adapter.sent) == 1
-    assert "shutting down" in adapter.sent[0]
-    assert "interrupted" in adapter.sent[0]
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio
-async def test_shutdown_notification_says_restarting_when_restart_requested():
-    """When _restart_requested is True, the message says 'restarting' and mentions /retry."""
+async def test_home_shutdown_notification_says_restarting_when_restart_requested():
+    """The operator home channel still gets the restart lifecycle notice."""
+    from gateway.config import HomeChannel, Platform
+
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     session_key = "agent:main:telegram:dm:999"
     runner._running_agents[session_key] = MagicMock()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
 
     await runner._notify_active_sessions_of_shutdown()
 
@@ -238,8 +242,8 @@ async def test_shutdown_notification_says_restarting_when_restart_requested():
 
 
 @pytest.mark.asyncio
-async def test_shutdown_notification_deduplicates_per_chat():
-    """Multiple sessions in the same chat only get one notification."""
+async def test_shutdown_notification_ignores_multiple_active_sessions():
+    """Multiple active sessions still do not trigger session-scoped warnings."""
     runner, adapter = make_restart_runner()
     # Two sessions (different users) in the same chat
     runner._running_agents["agent:main:telegram:group:chat1:u1"] = MagicMock()
@@ -247,7 +251,7 @@ async def test_shutdown_notification_deduplicates_per_chat():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert len(adapter.sent) == 1
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio
@@ -258,6 +262,27 @@ async def test_shutdown_notification_skipped_when_no_active_agents():
     await runner._notify_active_sessions_of_shutdown()
 
     assert len(adapter.sent) == 0
+
+
+@pytest.mark.asyncio
+async def test_shutdown_notification_sent_to_home_channel_only():
+    """The operator home channel still gets the shutdown lifecycle notice."""
+    from gateway.config import HomeChannel, Platform
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert adapter.sent == [
+        "⚠️ Gateway shutting down — Your current task will be interrupted."
+    ]
+    assert adapter.sent_calls[0][0] == "home-42"
+    assert adapter.sent_calls[0][2] is None
 
 
 @pytest.mark.asyncio
@@ -275,19 +300,25 @@ async def test_shutdown_notification_ignores_pending_sentinels():
 
 @pytest.mark.asyncio
 async def test_shutdown_notification_send_failure_does_not_block():
-    """If sending a notification fails, the method still completes."""
+    """If sending the home-channel notification fails, the method still completes."""
+    from gateway.config import HomeChannel, Platform
+
     runner, adapter = make_restart_runner()
     adapter.send = AsyncMock(side_effect=Exception("network error"))
-    session_key = "agent:main:telegram:dm:999"
-    runner._running_agents[session_key] = MagicMock()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
 
     # Should not raise
     await runner._notify_active_sessions_of_shutdown()
+    adapter.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_shutdown_notification_suppressed_when_flag_disabled():
-    """Active-session ping is muted when gateway_restart_notification=False on the platform."""
+    """Active sessions stay muted when gateway_restart_notification=False."""
     from gateway.config import Platform
 
     runner, adapter = make_restart_runner()
@@ -321,7 +352,7 @@ async def test_shutdown_notification_home_channel_suppressed_when_flag_disabled(
 
 @pytest.mark.asyncio
 async def test_shutdown_notification_uses_persisted_origin_for_colon_ids():
-    """Shutdown notifications should route from persisted origin, not reparsed keys."""
+    """Persisted active-session origins no longer receive lifecycle warnings."""
     runner, adapter = make_restart_runner()
     adapter.send = AsyncMock()
     source = make_restart_source(chat_id="!room123:example.org", chat_type="group")
@@ -343,5 +374,4 @@ async def test_shutdown_notification_uses_persisted_origin_for_colon_ids():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert adapter.send.await_count == 1
-    assert adapter.send.await_args.args[0] == "!room123:example.org"
+    adapter.send.assert_not_awaited()
