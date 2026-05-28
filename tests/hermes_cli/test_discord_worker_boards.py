@@ -300,10 +300,12 @@ def test_board_thread_state_reflects_kanban_tasks(monkeypatch, tmp_path):
     try:
         task = kanban_db.list_tasks(conn, include_archived=False)[0]
         assert dwb.board_thread_state(board.slug) == "active"
+        assert dwb.board_thread_reaction_state(board.slug) == "active"
 
         claimed = kanban_db.claim_task(conn, task.id)
         assert claimed is not None
         assert dwb.board_thread_state(board.slug) == "running"
+        assert dwb.board_thread_reaction_state(board.slug) == "running"
         kanban_db.block_task(
             conn,
             task.id,
@@ -311,14 +313,20 @@ def test_board_thread_state_reflects_kanban_tasks(monkeypatch, tmp_path):
             expected_run_id=claimed.current_run_id,
         )
         assert dwb.board_thread_state(board.slug) == "blocked"
+        assert dwb.board_thread_reaction_state(board.slug) == "blocked"
 
         kanban_db.unblock_task(conn, task.id)
         claimed = kanban_db.claim_task(conn, task.id)
         assert claimed is not None
         kanban_db.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
         assert dwb.board_thread_state(board.slug) == "active"
+        assert dwb.board_thread_reaction_state(board.slug) == "running"
+        target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
+        assert target["state"] == "active"
+        assert target["reaction_state"] == "running"
         dwb._update_worker_meta(board.slug, {"goal_status": "done", "phase": "complete"})
         assert dwb.board_thread_state(board.slug) == "done"
+        assert dwb.board_thread_reaction_state(board.slug) == "done"
 
         failed = kanban_db.create_task(conn, title="Broken ticket", tenant=board.slug)
         conn.execute(
@@ -327,8 +335,36 @@ def test_board_thread_state_reflects_kanban_tasks(monkeypatch, tmp_path):
         )
         conn.commit()
         assert dwb.board_thread_state(board.slug) == "errored"
+        assert dwb.board_thread_reaction_state(board.slug) == "errored"
     finally:
         conn.close()
+
+
+def test_board_thread_reaction_state_keeps_started_scheduled_work_running(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(thread_id="7802", goal="Wait for external scheduled evidence")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        claimed = kanban_db.claim_task(conn, task.id)
+        assert claimed is not None
+        assert kanban_db.schedule_task(
+            conn,
+            task.id,
+            reason="waiting for tomorrow's dry-run tick",
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    assert dwb.board_thread_state(board.slug) == "active"
+    assert dwb.board_thread_reaction_state(board.slug) == "running"
+    target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
+    assert target["state"] == "active"
+    assert target["reaction_state"] == "running"
 
 
 def test_board_thread_state_completed_board_ignores_stale_worker_blocker(monkeypatch, tmp_path):

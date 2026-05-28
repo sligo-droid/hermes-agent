@@ -1777,9 +1777,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if not slug:
             return None
         try:
-            from hermes_cli.discord_worker_boards import board_thread_state
+            from hermes_cli.discord_worker_boards import board_thread_reaction_state
 
-            return board_thread_state(slug)
+            return board_thread_reaction_state(slug)
         except Exception as exc:
             logger.debug("[%s] Failed to read Discord kanban board state: %s", self.name, exc)
             return None
