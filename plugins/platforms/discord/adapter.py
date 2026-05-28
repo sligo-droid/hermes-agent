@@ -254,6 +254,40 @@ def _allowed_mentions_for_metadata(metadata: Optional[Dict[str, Any]] = None):
     )
 
 
+def _discord_embed_for_metadata(metadata: Optional[Dict[str, Any]] = None):
+    if not DISCORD_AVAILABLE or not isinstance(metadata, dict):
+        return None
+    raw = metadata.get("_discord_embed")
+    if not isinstance(raw, dict):
+        return None
+    kwargs: Dict[str, Any] = {}
+    title = str(raw.get("title") or "").strip()
+    description = str(raw.get("description") or "").strip()
+    if title:
+        kwargs["title"] = title[:256]
+    if description:
+        kwargs["description"] = description[:4096]
+    color = raw.get("color")
+    if isinstance(color, int):
+        kwargs["color"] = color
+    if not kwargs and not raw.get("fields"):
+        return None
+    embed = discord.Embed(**kwargs)
+    add_field = getattr(embed, "add_field", None)
+    if callable(add_field):
+        fields = raw.get("fields")
+        if isinstance(fields, (list, tuple)):
+            for field in fields[:25]:
+                if not isinstance(field, dict):
+                    continue
+                name = str(field.get("name") or "").strip()[:256]
+                value = str(field.get("value") or "").strip()[:1024]
+                if not name or not value:
+                    continue
+                add_field(name=name, value=value, inline=bool(field.get("inline")))
+    return embed
+
+
 class VoiceReceiver:
     """Captures and decodes voice audio from a Discord voice channel.
 
@@ -651,6 +685,7 @@ class DiscordAdapter(BasePlatformAdapter):
     # Discord message limits
     MAX_MESSAGE_LENGTH = 2000
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
+    supports_metadata_embeds = True
 
     # Auto-disconnect from voice channel after this many seconds of inactivity
     VOICE_TIMEOUT = 300
@@ -1774,9 +1809,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if not slug:
             return None
         try:
-            from hermes_cli.discord_worker_boards import board_thread_state
+            from hermes_cli.discord_worker_boards import board_thread_reaction_state
 
-            return board_thread_state(slug)
+            return board_thread_reaction_state(slug)
         except Exception as exc:
             logger.debug("[%s] Failed to read Discord kanban board state: %s", self.name, exc)
             return None
@@ -3603,6 +3638,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             message_ids = []
             reference = None
+            metadata_embed = _discord_embed_for_metadata(metadata)
 
             if reply_to and self._reply_to_mode != "off":
                 try:
@@ -3625,6 +3661,8 @@ class DiscordAdapter(BasePlatformAdapter):
                         "content": chunk,
                         "reference": chunk_reference,
                     }
+                    if metadata_embed is not None and i == 0:
+                        send_kwargs["embed"] = metadata_embed
                     if allowed_mentions is not None:
                         send_kwargs["allowed_mentions"] = allowed_mentions
                     msg = await channel.send(**send_kwargs)
@@ -3650,6 +3688,8 @@ class DiscordAdapter(BasePlatformAdapter):
                             "content": chunk,
                             "reference": None,
                         }
+                        if metadata_embed is not None and i == 0:
+                            retry_kwargs["embed"] = metadata_embed
                         if allowed_mentions is not None:
                             retry_kwargs["allowed_mentions"] = allowed_mentions
                         msg = await channel.send(**retry_kwargs)

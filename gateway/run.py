@@ -6709,7 +6709,34 @@ class GatewayRunner:
         thread_id = str(worker.get("thread_id") or "").strip()
         if not guild_id or not thread_id:
             return ""
-        return f"https://discord.com/channels/{_quote(guild_id, safe='')}/{_quote(thread_id, safe='')}"
+        message_id = str(worker.get("source_message_id") or worker.get("request_id") or "").strip()
+        base = f"https://discord.com/channels/{_quote(guild_id, safe='')}/{_quote(thread_id, safe='')}"
+        if message_id:
+            return f"{base}/{_quote(message_id, safe='')}"
+        return base
+
+    @staticmethod
+    def _discord_foreman_issue_with_source_thread_url(issue: Any, source_context: Dict[str, Any]) -> Any:
+        evidence = getattr(issue, "evidence", None)
+        evidence = dict(evidence) if isinstance(evidence, dict) else {}
+        source_url = GatewayRunner._discord_foreman_board_thread_url(source_context)
+        if source_url:
+            evidence["source_discord_thread_url"] = source_url
+        try:
+            from dataclasses import replace as _replace
+
+            return _replace(issue, evidence=evidence)
+        except Exception:
+            from types import SimpleNamespace
+
+            return SimpleNamespace(
+                kind=str(getattr(issue, "kind", "") or ""),
+                board=str(getattr(issue, "board", "") or ""),
+                task_id=str(getattr(issue, "task_id", "") or ""),
+                severity=str(getattr(issue, "severity", "") or ""),
+                title=str(getattr(issue, "title", "") or ""),
+                evidence=evidence,
+            )
 
     def _discord_foreman_issue_embed_context(self, issue: Any) -> Dict[str, str]:
         from urllib.parse import quote as _quote
@@ -7126,16 +7153,26 @@ class GatewayRunner:
                                         source_thread_id = str(source_context.get("thread_id") or "").strip()
                                         if not source_thread_id:
                                             raise RuntimeError("Discord foreman human alert has no source thread")
+                                        alert_issue = self._discord_foreman_issue_with_source_thread_url(
+                                            issue,
+                                            source_context,
+                                        )
+                                        rendered_alert = _foreman.render_foreman_alert(
+                                            alert_issue,
+                                            mention=watcher_cfg["mention"],
+                                        )
+                                        metadata = {
+                                            "foreman_alert_kind": getattr(issue, "kind", ""),
+                                            "allowed_role_mentions": ["1503914570077442058"],
+                                        }
+                                        embed_payload = _foreman.render_foreman_human_intervention_embed(alert_issue)
+                                        if embed_payload and getattr(adapter, "supports_metadata_embeds", False):
+                                            metadata["_discord_embed"] = embed_payload
+                                            rendered_alert = (rendered_alert.splitlines() or [watcher_cfg["mention"]])[0]
                                         result = await sender(
                                             source_thread_id,
-                                            _foreman.render_foreman_alert(
-                                                issue,
-                                                mention=watcher_cfg["mention"],
-                                            ),
-                                            metadata={
-                                                "foreman_alert_kind": getattr(issue, "kind", ""),
-                                                "allowed_role_mentions": ["1503914570077442058"],
-                                            },
+                                            rendered_alert,
+                                            metadata=metadata,
                                         )
                                         await self._discord_foreman_sync_source_reaction(adapter, source_context)
                                         if getattr(result, "success", True) is False:

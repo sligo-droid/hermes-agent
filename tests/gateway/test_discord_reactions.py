@@ -468,6 +468,14 @@ async def test_feature_summary_reactions_follow_kanban_state(adapter, state, emo
     ]
 
 
+def test_feature_kanban_reaction_state_uses_reaction_specific_board_state(adapter, monkeypatch):
+    from hermes_cli import discord_worker_boards as dwb
+
+    monkeypatch.setattr(dwb, "board_thread_reaction_state", lambda slug: "running")
+
+    assert adapter._feature_kanban_reaction_state({"kanban_board": {"slug": "discord-123"}}) == "running"
+
+
 @pytest.mark.asyncio
 async def test_kanban_thread_reaction_prefers_explicit_reaction_state(adapter):
     message = SimpleNamespace(

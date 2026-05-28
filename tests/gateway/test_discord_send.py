@@ -161,6 +161,62 @@ async def test_send_does_not_retry_on_unrelated_errors():
     assert send_calls[0]["reference"] is reference_obj
 
 
+@pytest.mark.asyncio
+async def test_send_attaches_metadata_embed_with_allowed_role_mention(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    class FakeEmbed:
+        calls = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.fields = []
+            FakeEmbed.calls.append(kwargs)
+
+        def add_field(self, **kwargs):
+            self.fields.append(kwargs)
+
+    monkeypatch.setattr(discord_adapter_module.discord, "Embed", FakeEmbed)
+
+    sent_msg = SimpleNamespace(id=1234)
+    channel = SimpleNamespace(send=AsyncMock(return_value=sent_msg))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send(
+        "555",
+        "<@&123>",
+        metadata={
+            "allowed_role_mentions": ["123"],
+            "_discord_embed": {
+                "title": "Foreman needs human input",
+                "color": 0xF59E0B,
+                "fields": [
+                    {
+                        "name": "Source thread",
+                        "value": "[source](https://discord.com/channels/1/2/3)",
+                    },
+                    {"name": "Why", "value": "Create a vendor API key."},
+                ],
+            },
+        },
+    )
+
+    assert result.success is True
+    kwargs = channel.send.await_args.kwargs
+    assert kwargs["content"] == "<@&123>"
+    assert "allowed_mentions" in kwargs
+    assert "embed" in kwargs
+    assert FakeEmbed.calls == [{"title": "Foreman needs human input", "color": 0xF59E0B}]
+    assert kwargs["embed"].fields[0] == {
+        "name": "Source thread",
+        "value": "[source](https://discord.com/channels/1/2/3)",
+        "inline": False,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Forum channel tests
 # ---------------------------------------------------------------------------

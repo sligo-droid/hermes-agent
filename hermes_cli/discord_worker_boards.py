@@ -1976,6 +1976,28 @@ def board_thread_state(board: str) -> str:
     return "active"
 
 
+def board_thread_reaction_state(board: str) -> str:
+    """Return the Discord reaction state for a worker board.
+
+    ``active`` covers both never-started queues and boards that are between
+    worker claims. Reactions need to distinguish those: once any ticket has
+    started or completed, keep the visible marker in the working state instead
+    of falling back to the pickup/queued eyes marker.
+    """
+    state = board_thread_state(board)
+    if state != "active":
+        return state
+
+    conn = kanban_db.connect(board=board)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+        if any(getattr(task, "started_at", None) or getattr(task, "completed_at", None) for task in tasks):
+            return "running"
+    finally:
+        conn.close()
+    return "active"
+
+
 def _is_foreman_generated_worker(worker: dict[str, Any]) -> bool:
     request = str(
         worker.get("initial_request")
@@ -2578,6 +2600,7 @@ def thread_status_targets() -> list[dict[str, Any]]:
             and board not in active_foreman_sources
         ):
             continue
+        reaction_state = board_thread_reaction_state(board)
         target = {
             "board": board,
             "thread_id": thread_id,
@@ -2599,6 +2622,8 @@ def thread_status_targets() -> list[dict[str, Any]]:
             "terminal_summary_sync_pending": bool(worker.get("terminal_summary_sync_pending")),
             "terminal_completion_message_pending": terminal_completion_message_pending,
         }
+        if reaction_state != state:
+            target["reaction_state"] = reaction_state
         if board in active_foreman_sources:
             target["reaction_state"] = "foreman"
         if _is_foreman_generated_worker(worker):
