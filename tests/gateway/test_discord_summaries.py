@@ -1332,6 +1332,87 @@ async def test_sync_kanban_feature_summary_circuits_permanent_fetch_failure(adap
 
 
 @pytest.mark.asyncio
+async def test_sync_kanban_feature_summary_clears_terminal_flag_after_permanent_fetch_failure(
+    adapter,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 200 else None
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="/goal Ship the dashboard",
+    )
+    assert handle is not None
+    handle.pop("_message_obj", None)
+    thread.fetch_message = AsyncMock(side_effect=discord_platform.discord.NotFound("unknown message"))
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="200", goal="Ship the dashboard")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_summary_sync_pending": True,
+        },
+    )
+
+    assert await adapter.sync_kanban_feature_summary(
+        {
+            "board": board.slug,
+            "thread_id": "200",
+            "state": "done",
+            "sync_key": "sync-terminal",
+            "terminal_summary_sync_pending": True,
+        }
+    ) == "sync-terminal"
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "terminal_summary_sync_pending" not in worker
+
+
+@pytest.mark.asyncio
+async def test_sync_kanban_feature_summary_clears_terminal_flag_without_handle(
+    adapter,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="200", goal="Ship the dashboard")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_summary_sync_pending": True,
+        },
+    )
+
+    assert await adapter.sync_kanban_feature_summary(
+        {
+            "board": board.slug,
+            "thread_id": "200",
+            "state": "done",
+            "sync_key": "sync-missing-handle",
+            "terminal_summary_sync_pending": True,
+        }
+    ) == "sync-missing-handle"
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "terminal_summary_sync_pending" not in worker
+
+
+@pytest.mark.asyncio
 async def test_sync_kanban_feature_summary_transient_failure_remains_retriable(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     parent = FakeTextChannel(channel_id=100)
