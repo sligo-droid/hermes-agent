@@ -35,6 +35,78 @@ def running_role_count(board: str) -> int:
         conn.close()
 
 
+def running_role_counts(board: str) -> dict[str, int]:
+    """Return running Discord role-lane counts keyed by role."""
+    conn = kanban_db.connect(board=board)
+    try:
+        placeholders = ",".join("?" for _ in dwb.ROLE_ASSIGNEES)
+        rows = conn.execute(
+            "SELECT lower(assignee) AS role, COUNT(*) AS count FROM tasks "
+            f"WHERE status = 'running' AND lower(assignee) IN ({placeholders}) "
+            "GROUP BY lower(assignee)",
+            tuple(sorted(dwb.ROLE_ASSIGNEES)),
+        ).fetchall()
+        counts = {role: 0 for role in dwb.ROLE_ASSIGNEES}
+        for row in rows:
+            counts[str(row["role"] or "")] = int(row["count"] or 0)
+        return counts
+    finally:
+        conn.close()
+
+
+def _ready_role_counts(board: str) -> dict[str, int]:
+    conn = kanban_db.connect(board=board)
+    try:
+        rows = conn.execute(
+            "SELECT status, lower(assignee) AS role, COUNT(*) AS count FROM tasks "
+            "WHERE status IN ('ready', 'review') AND claim_lock IS NULL "
+            "GROUP BY status, lower(assignee)"
+        ).fetchall()
+        counts = {role: 0 for role in dwb.ROLE_ASSIGNEES}
+        for row in rows:
+            role = str(row["role"] or "")
+            status = str(row["status"] or "")
+            if role == dwb.ROLE_REVIEWER and status == "review":
+                counts[role] += int(row["count"] or 0)
+            elif role in {dwb.ROLE_PLANNER, dwb.ROLE_DEV} and status == "ready":
+                counts[role] += int(row["count"] or 0)
+        return counts
+    finally:
+        conn.close()
+
+
+def _dev_shared_workspace_limited(board: str) -> bool:
+    """True when queued/running dev tasks share one checkout path."""
+    conn = kanban_db.connect(board=board)
+    try:
+        rows = conn.execute(
+            "SELECT workspace_path FROM tasks "
+            "WHERE status IN ('ready', 'running') AND lower(assignee) = ?",
+            (dwb.ROLE_DEV,),
+        ).fetchall()
+    finally:
+        conn.close()
+    paths = [str(row["workspace_path"] or "").strip() for row in rows]
+    paths = [path for path in paths if path]
+    return len(paths) > 1 and len(set(paths)) == 1
+
+
+def _configured_dev_cap(value: object, max_workers_per_board: int) -> int:
+    if value is not None:
+        return _coerce_positive_int(value, 1)
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        worker_cfg = ((cfg.get("kanban") or {}).get("discord_worker") or {})
+        configured = worker_cfg.get("max_dev_workers_per_board")
+        if configured is not None:
+            return _coerce_positive_int(configured, 1)
+    except Exception:
+        pass
+    return min(1, max_workers_per_board)
+
+
 def _dispatch_board(
     board: str,
     *,
@@ -61,6 +133,7 @@ def dispatch_discord_worker_boards(
     *,
     max_global_workers: int = 8,
     max_workers_per_board: int = 2,
+    max_dev_workers_per_board: Optional[int] = None,
     failure_limit: int = kanban_db.DEFAULT_FAILURE_LIMIT,
     spawn_fn: Optional[Callable] = None,
 ) -> list[tuple[str, Optional[kanban_db.DispatchResult]]]:
@@ -73,6 +146,7 @@ def dispatch_discord_worker_boards(
     """
     max_global_workers = _coerce_positive_int(max_global_workers, 8)
     max_workers_per_board = _coerce_positive_int(max_workers_per_board, 2)
+    max_dev_workers_per_board = _configured_dev_cap(max_dev_workers_per_board, max_workers_per_board)
     if spawn_fn is None:
         from hermes_cli.kanban_codex_workers import spawn_or_default
 
@@ -81,6 +155,8 @@ def dispatch_discord_worker_boards(
     out: list[tuple[str, Optional[kanban_db.DispatchResult]]] = []
     eligible: list[str] = []
     running_by_board: dict[str, int] = {}
+    running_roles_by_board: dict[str, dict[str, int]] = {}
+    ready_roles_by_board: dict[str, dict[str, int]] = {}
 
     for board in boards:
         try:
@@ -98,6 +174,8 @@ def dispatch_discord_worker_boards(
                 continue
             running = running_role_count(board)
             running_by_board[board] = running
+            running_roles_by_board[board] = running_role_counts(board)
+            ready_roles_by_board[board] = _ready_role_counts(board)
             eligible.append(board)
         except Exception:
             logger.exception("kanban dispatcher: Discord worker prep failed on board %s", board)
@@ -109,13 +187,30 @@ def dispatch_discord_worker_boards(
             out.append((board, None))
             continue
         running = running_by_board.get(board, 0)
+        running_roles = running_roles_by_board.get(board, {})
+        ready_roles = ready_roles_by_board.get(board, {})
+        control_running = int(running_roles.get(dwb.ROLE_PLANNER, 0) or 0) + int(
+            running_roles.get(dwb.ROLE_REVIEWER, 0) or 0
+        )
+        control_ready = int(ready_roles.get(dwb.ROLE_PLANNER, 0) or 0) + int(
+            ready_roles.get(dwb.ROLE_REVIEWER, 0) or 0
+        )
+        running_dev = int(running_roles.get(dwb.ROLE_DEV, 0) or 0)
+        effective_dev_cap = max_dev_workers_per_board
+        if effective_dev_cap > 1 and _dev_shared_workspace_limited(board):
+            effective_dev_cap = 1
         board_slots = max(0, max_workers_per_board - running)
+        dev_slots = max(0, effective_dev_cap - running_dev)
         if remaining_global_slots <= 0 or board_slots <= 0:
             # Still run maintenance paths: reclaim stale/crashed/timed-out work
             # and promote dependency-satisfied tasks, but do not spawn.
             max_spawn = 0
+        elif control_running:
+            max_spawn = running
+        elif control_ready:
+            max_spawn = running + min(1, remaining_global_slots, board_slots)
         else:
-            max_spawn = min(max_workers_per_board, running + remaining_global_slots)
+            max_spawn = running + min(dev_slots, remaining_global_slots, board_slots)
         try:
             result = _dispatch_board(
                 board,

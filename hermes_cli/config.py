@@ -1716,11 +1716,13 @@ DEFAULT_CONFIG = {
             "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
             "docker_bin": "docker",
             "codex_home_root": "",
-            # Allow limited per-board parallelism so independent dev-lane
-            # tickets from one /goal can move together. Planner/reviewer
-            # ordering is still enforced by ticket dependencies.
+            # Overall live role-worker cap per board. Planner/reviewer lanes
+            # remain singleton; dev parallelism is controlled separately below.
             "max_global_workers": 8,
             "max_workers_per_board": 2,
+            # Safe default is serial dev work per board. Raise only when dev
+            # tickets use isolated workspaces; shared checkout fanout is guarded.
+            "max_dev_workers_per_board": 1,
             "review_loop_limit": 5,
             "foreman": {
                 "enabled": False,

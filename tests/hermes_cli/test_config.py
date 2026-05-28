@@ -778,6 +778,7 @@ class TestDiscordWorkerConcurrencyConfig:
 
         assert worker["max_global_workers"] == 8
         assert worker["max_workers_per_board"] == 2
+        assert worker["max_dev_workers_per_board"] == 1
 
 
 class TestUserMessagePreviewConfig:

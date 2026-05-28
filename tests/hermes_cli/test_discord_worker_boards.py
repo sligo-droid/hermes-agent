@@ -2451,7 +2451,7 @@ def test_stop_board_execution_cancels_and_reclaims_running_worker(monkeypatch, t
     assert spawned == []
 
 
-def test_queue_reason_defaults_allow_two_per_board_and_eight_global(monkeypatch, tmp_path):
+def test_queue_reason_defaults_keep_dev_lane_serial(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_db
@@ -2478,10 +2478,45 @@ def test_queue_reason_defaults_allow_two_per_board_and_eight_global(monkeypatch,
 
         reason = dwb._queue_reason(worker, counts=counts, running_count=1, conn=conn)
 
-        assert reason == "awaiting next dispatcher tick"
+        assert reason == "dev worker limit reached"
 
         monkeypatch.setattr(dwb, "_active_role_count_across_boards", lambda: 8)
 
-        assert dwb._queue_reason(worker, counts=counts, running_count=1, conn=conn) == "global worker limit reached"
+        assert dwb._queue_reason(worker, counts=counts, running_count=1, conn=conn) == "dev worker limit reached"
+    finally:
+        conn.close()
+
+
+def test_queue_reason_reports_shared_worktree_dev_guard(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    _skip_code_island_preflight(monkeypatch)
+    board = _make_discord_board("2404")
+    workspace = str(tmp_path / "shared-worktree")
+    _create_ready_dev_task(board.slug, "Implement first")
+    _create_ready_dev_task(board.slug, "Implement second")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, workspace_path = ? WHERE assignee = ?",
+            (workspace, dwb.ROLE_DEV),
+        )
+        conn.commit()
+
+        worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+        counts = {"ready": 2, "review": 0, "todo": 0}
+        monkeypatch.setattr(
+            dwb,
+            "_worker_config",
+            lambda: {"max_dev_workers_per_board": 2, "max_workers_per_board": 2, "max_global_workers": 8},
+        )
+        monkeypatch.setattr(dwb, "_active_role_count_across_boards", lambda: 0)
+
+        assert (
+            dwb._queue_reason(worker, counts=counts, running_count=0, conn=conn)
+            == "shared worktree dev worker limit reached"
+        )
     finally:
         conn.close()
