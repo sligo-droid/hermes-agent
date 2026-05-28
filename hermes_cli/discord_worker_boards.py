@@ -917,6 +917,46 @@ def ticket_terminal_feed_for_session(session_id: str, task_id: str) -> dict[str,
     return _ticket_terminal_feed_for_board(board, task_id, worker=worker)
 
 
+def worker_ticket_console_for_session(session_id: str, task_id: str) -> dict[str, Any]:
+    """Return authenticated operator-console state for one worker ticket."""
+    board = resolve_public_session_board(session_id)
+    worker = _read_worker_meta(board)
+    return _worker_ticket_console_for_board(board, task_id, worker=worker)
+
+
+def worker_ticket_console_shell_for_session(session_id: str, task_id: str) -> dict[str, Any]:
+    """Return argv/cwd/env for an operator shell scoped to one worker ticket."""
+    board = resolve_public_session_board(session_id)
+    worker = _read_worker_meta(board)
+    task, runs, _events, current_run, codex_state = _ticket_console_parts(board, task_id)
+    workspace_path = _ticket_workspace_path(task, board=board)
+    if not workspace_path or not Path(workspace_path).expanduser().is_dir():
+        raise FileNotFoundError("worker workspace is not available")
+    backend = _worker_state_backend(codex_state)
+    shell = os.getenv("SHELL") or "/bin/bash"
+    argv = [shell, "-l"] if Path(shell).name in {"bash", "zsh", "fish", "sh"} else [shell]
+    return {
+        "argv": argv,
+        "cwd": str(Path(workspace_path).expanduser()),
+        "env": _worker_console_shell_env(
+            board,
+            task,
+            workspace_path=str(Path(workspace_path).expanduser()),
+            backend=backend,
+            current_run=current_run,
+        ),
+        "snapshot": _worker_ticket_console_payload(
+            board,
+            task,
+            runs=runs,
+            events=_events,
+            current_run=current_run,
+            codex_state=codex_state,
+            worker=worker,
+        ),
+    }
+
+
 def render_public_session_ticket_terminal_html(session_id: str, task_id: str) -> str:
     """Render a shareable, sanitized terminal page for one worker ticket."""
     feed = ticket_terminal_feed_for_session(session_id, task_id)
@@ -1107,6 +1147,151 @@ def _ticket_terminal_feed_for_board(
         "lines": lines,
     }
     return _redact_terminal_state(payload)
+
+
+def _ticket_console_parts(board: str, task_id: str) -> tuple[Any, list[Any], list[Any], Optional[dict[str, Any]], dict[str, Any]]:
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        raise KeyError("unknown ticket")
+    conn = kanban_db.connect(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            raise KeyError("unknown ticket")
+        runs = kanban_db.list_runs(conn, task_id)
+        events = kanban_db.list_events(conn, task_id)
+        current_run = _current_run_state(task, runs)
+        codex_state = _read_codex_worker_state(task_id, board=board)
+    finally:
+        conn.close()
+    return task, runs, events, current_run, codex_state
+
+
+def _worker_ticket_console_for_board(
+    board: str,
+    task_id: str,
+    *,
+    worker: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    task, runs, events, current_run, codex_state = _ticket_console_parts(board, task_id)
+    return _worker_ticket_console_payload(
+        board,
+        task,
+        runs=runs,
+        events=events,
+        current_run=current_run,
+        codex_state=codex_state,
+        worker=worker,
+    )
+
+
+def _worker_ticket_console_payload(
+    board: str,
+    task: Any,
+    *,
+    runs: list[Any],
+    events: list[Any],
+    current_run: Optional[dict[str, Any]],
+    codex_state: dict[str, Any],
+    worker: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    workspace_path = _ticket_workspace_path(task, board=board)
+    workspace_available = bool(workspace_path and Path(workspace_path).expanduser().is_dir())
+    log_text = kanban_db.read_worker_log(
+        task.id,
+        tail_bytes=CODEX_STATE_LOG_TAIL_BYTES,
+        board=board,
+    )
+    return {
+        "board": board,
+        "worker": _public_worker_meta(worker or _read_worker_meta(board)),
+        "task": _task_state_dict(task),
+        "workspace": {
+            "path": workspace_path,
+            "kind": task.workspace_kind,
+            "available": workspace_available,
+        },
+        "backend": _worker_state_backend(codex_state),
+        "current_run": _public_terminal_run(current_run),
+        "runs": [_run_state_dict(run) for run in runs[-20:]],
+        "events": [_event_state_dict(event) for event in events[-200:]],
+        "worker_log_path": str(kanban_db.worker_log_path(task.id, board=board)),
+        "worker_log_tail": log_text or "",
+        "codex_state": codex_state if isinstance(codex_state, dict) else {},
+        "updated_at": _now(),
+    }
+
+
+def _ticket_workspace_path(task: Any, *, board: str) -> str:
+    raw_path = str(getattr(task, "workspace_path", "") or "").strip()
+    if raw_path:
+        return str(Path(raw_path).expanduser())
+    kind = str(getattr(task, "workspace_kind", "") or "scratch")
+    if kind == "scratch":
+        return str(kanban_db.workspaces_root(board=board) / str(task.id))
+    if kind == "worktree":
+        return str(Path.cwd() / ".worktrees" / str(task.id))
+    return ""
+
+
+def _worker_console_shell_env(
+    board: str,
+    task: Any,
+    *,
+    workspace_path: str,
+    backend: str,
+    current_run: Optional[dict[str, Any]],
+) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "HERMES_KANBAN_BOARD": str(board),
+            "HERMES_KANBAN_TASK": str(task.id),
+            "HERMES_KANBAN_DB": str(kanban_db.kanban_db_path(board=board)),
+            "HERMES_KANBAN_WORKSPACE": workspace_path,
+            "HERMES_KANBAN_WORKSPACES_ROOT": str(kanban_db.workspaces_root(board=board)),
+            "HERMES_CODING_WORKER_BACKEND": backend,
+            "HERMES_WORKER_CONSOLE": "1",
+        }
+    )
+    run_id = (current_run or {}).get("id") or getattr(task, "current_run_id", None)
+    if run_id is not None:
+        env["HERMES_KANBAN_RUN_ID"] = str(run_id)
+    if getattr(task, "claim_lock", None):
+        env["HERMES_KANBAN_CLAIM_LOCK"] = str(task.claim_lock)
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else repo_root
+    if backend == "codex":
+        codex_home = _ticket_codex_home_path(str(task.id))
+        if codex_home is not None:
+            env["CODEX_HOME"] = str(codex_home)
+    try:
+        from hermes_constants import get_github_cli_config_dir
+
+        gh_config_dir = get_github_cli_config_dir(env)
+        if gh_config_dir:
+            env["GH_CONFIG_DIR"] = gh_config_dir
+    except Exception:
+        pass
+    return env
+
+
+def _ticket_codex_home_path(task_id: str) -> Optional[Path]:
+    try:
+        from hermes_cli.config import load_config
+        from hermes_constants import get_hermes_home
+
+        cfg = load_config() or {}
+        worker_cfg = (cfg.get("kanban") or {}).get("discord_worker") or {}
+        root = Path(
+            worker_cfg.get("codex_home_root")
+            or (get_hermes_home() / "tmp" / "codex-worker-homes")
+        )
+        path = root / str(task_id)
+        return path if path.is_dir() else None
+    except Exception:
+        return None
 
 
 def _public_terminal_run(run: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -2769,11 +2954,15 @@ def _workers_page_css() -> str:
     .ticket-card { cursor: grab; touch-action: manipulation; }
     .ticket-card.dragging { opacity: 0.48; }
     .ticket-card:active { cursor: grabbing; }
+    .ticket-shell { align-items: flex-start; display: grid; gap: 8px; grid-template-columns: minmax(0, 1fr) auto; }
     .ticket { appearance: none; background: transparent; border: 0; color: inherit; cursor: pointer; display: block; font: inherit; padding: 0; text-align: left; width: 100%; }
     .ticket:hover strong { color: var(--link); text-decoration: underline; }
     .ticket:focus-visible { outline: 2px solid var(--code); outline-offset: 3px; }
     .ticket strong { display: block; font-size: 14px; line-height: 1.25; }
     .ticket p { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .ticket-console { align-items: center; background: #111827; border: 1px solid #374151; border-radius: 6px; color: #f9fafb; display: inline-flex; font: 700 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; justify-content: center; min-height: 28px; min-width: 32px; padding: 6px 7px; text-decoration: none; }
+    .ticket-console:hover { background: #1f2937; color: #ffffff; text-decoration: none; }
+    .ticket-console:focus-visible { outline: 2px solid var(--code); outline-offset: 2px; }
     .move-error { background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; color: #991b1b; font-size: 13px; margin-bottom: 12px; padding: 10px 12px; }
     .move-error[hidden] { display: none; }
     .criteria { margin-bottom: 18px; padding: 14px; }
@@ -2832,13 +3021,19 @@ def _render_public_board_html(
             "<li class=\"ticket-card\" draggable=\"true\" data-ticket-item "
             "data-ticket-id=\"{id}\" data-ticket-status=\"{status}\" "
             "data-ticket-move-url=\"{move_url}\">"
+            "<div class=\"ticket-shell\">"
             "<button type=\"button\" class=\"ticket\" data-ticket-id=\"{id}\" "
             "data-ticket-title=\"{title}\" data-ticket-url=\"{ticket_url}\" "
             "data-ticket-state-url=\"{state_url}\" "
             "data-ticket-terminal-page-url=\"{terminal_page_url}\" "
             "data-ticket-terminal-url=\"{terminal_url}\">"
             "<strong>{title}</strong><br><code>{id}</code> {assignee}{brief}{summary}"
-            "</button></li>".format(
+            "</button>"
+            "<a class=\"ticket-console\" href=\"{console_url}\" "
+            "data-ticket-console-url=\"{console_url}\" "
+            "title=\"Open worker console\" aria-label=\"Open worker console for {title}\">"
+            "<span aria-hidden=\"true\">&gt;_</span>"
+            "</a></div></li>".format(
                 title=esc(item["title"]),
                 id=esc(ticket_id),
                 status=esc(status),
@@ -2846,6 +3041,7 @@ def _render_public_board_html(
                 state_url=esc(f"{ticket_url}/state"),
                 terminal_page_url=esc(f"{ticket_url}/terminal"),
                 terminal_url=esc(f"{ticket_url}/terminal.json"),
+                console_url=esc(f"{ticket_url}/console"),
                 move_url=esc(f"{ticket_url}/move"),
                 assignee=esc(item["assignee"] or ""),
                 brief=brief_html,

@@ -1117,6 +1117,8 @@ def test_public_session_board_does_not_auto_refresh(monkeypatch, tmp_path):
     assert html.count('data-ticket-terminal-url="/workers/6160/tickets/') == 2
     assert html.count('data-ticket-state-url="/workers/6160/tickets/') == 2
     assert 'data-ticket-terminal-page-url="/workers/6160/tickets/' in html
+    assert html.count('data-ticket-console-url="/workers/6160/tickets/') == 2
+    assert html.count('class="ticket-console"') == 2
     assert html.count('data-ticket-url="/workers/6160/tickets/') == 2
     assert html.count('data-ticket-move-url="/workers/6160/tickets/') == 2
     assert html.count('class="ticket-card"') == 2
@@ -1711,6 +1713,72 @@ def test_worker_ticket_terminal_endpoint_returns_auth_scoped_feed(monkeypatch, t
     assert "sk-proj-A1B2C3D4E5F6G7H8I9J0" not in rendered
     assert missing.status_code == 404
     assert missing_page.status_code == 404
+
+
+def test_worker_ticket_console_returns_operator_state_and_shell_env(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    board = dwb.set_goal(thread_id="8186", goal="Inspect operator console")
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        conn.execute(
+            "UPDATE tasks SET workspace_kind = 'dir', workspace_path = ? WHERE id = ?",
+            (str(workspace), task.id),
+        )
+        conn.commit()
+        claimed = kanban_db.claim_task(conn, task.id)
+        assert claimed is not None
+    finally:
+        conn.close()
+    log_path = kanban_db.worker_log_path(task.id, board=board.slug)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    kanban_db._append_worker_log_line(
+        log_path,
+        "worker raw secret sk-proj-console-visible in operator log",
+    )
+    dwb.record_codex_worker_event(
+        task.id,
+        board=board.slug,
+        event={
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "commandExecution",
+                    "cwd": str(workspace),
+                    "aggregatedOutput": "raw event sk-proj-console-event",
+                }
+            },
+        },
+    )
+
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    resp = client.get(f"/api/workers/8186/tickets/{task.id}/console")
+    shell = dwb.worker_ticket_console_shell_for_session("8186", task.id)
+
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+    data = resp.json()
+    rendered = json.dumps(data)
+    assert data["task"]["id"] == task.id
+    assert data["workspace"] == {
+        "path": str(workspace),
+        "kind": "dir",
+        "available": True,
+    }
+    assert "sk-proj-console-visible" in data["worker_log_tail"]
+    assert "sk-proj-console-event" in rendered
+    assert shell["cwd"] == str(workspace)
+    assert shell["env"]["HERMES_KANBAN_TASK"] == task.id
+    assert shell["env"]["HERMES_KANBAN_BOARD"] == board.slug
+    assert shell["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
 
 
 def test_worker_ticket_terminal_labels_opencode_state(monkeypatch, tmp_path):

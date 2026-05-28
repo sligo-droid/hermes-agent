@@ -538,6 +538,26 @@ async def worker_ticket_terminal_json(session_id: str, task_id: str):
         raise HTTPException(status_code=500, detail="Ticket terminal unavailable")
 
 
+@app.get("/api/workers/{session_id}/tickets/{task_id}/console", response_class=JSONResponse)
+async def worker_ticket_console_api(request: Request, session_id: str, task_id: str):
+    """Authenticated operator-console state for one Discord worker ticket."""
+    _require_token(request)
+    try:
+        from hermes_cli.discord_worker_boards import worker_ticket_console_for_session
+
+        return JSONResponse(
+            worker_ticket_console_for_session(session_id, task_id),
+            headers={"Cache-Control": "no-store"},
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Ticket console not found")
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Ticket console not found")
+    except Exception as exc:
+        _log.warning("worker ticket console render failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Ticket console unavailable")
+
+
 @app.get("/{session_id:int}", response_class=HTMLResponse)
 async def public_worker_session_board_root_legacy(session_id: int):
     """Backward-compatible redirect for old /<session_id> worker board links."""
@@ -3854,6 +3874,17 @@ def _resolve_chat_argv(
     return list(argv), str(cwd) if cwd else None, env
 
 
+def _resolve_worker_console_argv(
+    session_id: str,
+    task_id: str,
+) -> tuple[list[str], Optional[str], Optional[dict]]:
+    """Resolve argv/cwd/env for a ticket-scoped operator shell."""
+    from hermes_cli.discord_worker_boards import worker_ticket_console_shell_for_session
+
+    shell = worker_ticket_console_shell_for_session(session_id, task_id)
+    return list(shell["argv"]), str(shell["cwd"]), dict(shell["env"])
+
+
 def _build_sidecar_url(channel: str) -> Optional[str]:
     """ws:// URL the PTY child should publish events to, or None when unbound."""
     host = getattr(app.state, "bound_host", None)
@@ -3985,6 +4016,104 @@ async def pty_ws(ws: WebSocket) -> None:
                 continue
 
             # Resize escape is consumed locally, never written to the PTY.
+            match = _RESIZE_RE.match(raw)
+            if match and match.end() == len(raw):
+                cols = int(match.group(1))
+                rows = int(match.group(2))
+                bridge.resize(cols=cols, rows=rows)
+                continue
+
+            bridge.write(raw)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        reader_task.cancel()
+        try:
+            await reader_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        bridge.close()
+
+
+@app.websocket("/api/workers/{session_id}/tickets/{task_id}/console/pty")
+async def worker_console_pty_ws(ws: WebSocket, session_id: str, task_id: str) -> None:
+    token = ws.query_params.get("token", "")
+    if not hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+        await ws.close(code=4401)
+        return
+
+    if not _ws_request_is_allowed(ws):
+        await ws.close(code=4403)
+        return
+
+    await ws.accept()
+
+    if not _PTY_BRIDGE_AVAILABLE:
+        await ws.send_text(
+            "\r\n\x1b[31mWorker console unavailable: POSIX PTY support is missing.\x1b[0m\r\n"
+        )
+        await ws.close(code=1011)
+        return
+
+    try:
+        argv, cwd, env = _resolve_worker_console_argv(session_id, task_id)
+    except (KeyError, ValueError):
+        await ws.send_text("\r\n\x1b[31mWorker console unavailable: ticket not found.\x1b[0m\r\n")
+        await ws.close(code=1008)
+        return
+    except FileNotFoundError as exc:
+        await ws.send_text(f"\r\n\x1b[33mWorker console unavailable: {exc}\x1b[0m\r\n")
+        await ws.close(code=1011)
+        return
+    except Exception as exc:
+        _log.warning("worker console argv resolution failed: %s", exc)
+        await ws.send_text("\r\n\x1b[31mWorker console failed to resolve.\x1b[0m\r\n")
+        await ws.close(code=1011)
+        return
+
+    try:
+        bridge = PtyBridge.spawn(argv, cwd=cwd, env=env)
+    except PtyUnavailableError as exc:
+        await ws.send_text(f"\r\n\x1b[31mWorker console unavailable: {exc}\x1b[0m\r\n")
+        await ws.close(code=1011)
+        return
+    except (FileNotFoundError, OSError) as exc:
+        await ws.send_text(f"\r\n\x1b[31mWorker console failed to start: {exc}\x1b[0m\r\n")
+        await ws.close(code=1011)
+        return
+
+    loop = asyncio.get_running_loop()
+
+    async def pump_pty_to_ws() -> None:
+        while True:
+            chunk = await loop.run_in_executor(
+                None, bridge.read, _PTY_READ_CHUNK_TIMEOUT
+            )
+            if chunk is None:
+                return
+            if not chunk:
+                await asyncio.sleep(0)
+                continue
+            try:
+                await ws.send_bytes(chunk)
+            except Exception:
+                return
+
+    reader_task = asyncio.create_task(pump_pty_to_ws())
+
+    try:
+        while True:
+            msg = await ws.receive()
+            msg_type = msg.get("type")
+            if msg_type == "websocket.disconnect":
+                break
+            raw = msg.get("bytes")
+            if raw is None:
+                text = msg.get("text")
+                raw = text.encode("utf-8") if isinstance(text, str) else b""
+            if not raw:
+                continue
+
             match = _RESIZE_RE.match(raw)
             if match and match.end() == len(raw):
                 cols = int(match.group(1))
