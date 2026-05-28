@@ -795,6 +795,43 @@ class TestSessionRetirement:
         assert r.should_retire is False
         assert r.interrupted is False
 
+    def test_post_tool_watchdog_resets_on_unprojected_activity(self):
+        """Raw app-server events still count as activity after a tool result."""
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution",
+                "id": "ex1",
+                "command": "echo hi",
+                "cwd": "/tmp",
+                "status": "completed",
+                "aggregatedOutput": "hi",
+                "exitCode": 0,
+                "commandActions": [],
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "item/commandExecution/outputDelta",
+            threadId="t",
+            turnId="tu1",
+            itemId="ex2",
+            delta="still producing terminal output",
+        )
+        s = make_session(client)
+        r = s.run_turn(
+            "tool then raw event",
+            turn_timeout=0.08,
+            notification_poll_timeout=0.01,
+            post_tool_quiet_timeout=0.02,
+        )
+        assert r.interrupted is True
+        assert r.timed_out is True
+        assert r.error and "timed out" in r.error
+        assert "silent" not in r.error
+
     def test_turn_aborted_marker_in_text_is_terminal(self):
         """If codex emits `<turn_aborted>` in agent text and never sends
         turn/completed, we still exit promptly instead of burning the

@@ -566,10 +566,10 @@ class CodexAppServerSession:
                 # tool-shaped item completes.
                 last_tool_completion_at = time.monotonic()
             else:
-                # Any non-tool projected activity (assistant message,
-                # status update, etc.) means codex is still producing
-                # output — clear the quiet timer so we don't fast-fail.
-                if projection.messages or projection.final_text is not None:
+                # Any notification after a tool completion means codex is not
+                # quiet, even when the projector does not turn it into chat
+                # history (reasoning, token usage, command output, etc.).
+                if last_tool_completion_at is not None:
                     last_tool_completion_at = None
             if projection.final_text is not None:
                 # Codex can emit multiple agentMessage items in one turn
