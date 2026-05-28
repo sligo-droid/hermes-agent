@@ -141,6 +141,18 @@ class FakeThread:
         return self._messages[int(message_id)]
 
 
+class FakeAttachment:
+    def __init__(self, *, filename, content_type, data):
+        self.filename = filename
+        self.content_type = content_type
+        self.size = len(data)
+        self.url = "https://cdn.discordapp.com/attachments/fake/file"
+        self._data = data
+
+    async def read(self):
+        return self._data
+
+
 @pytest.fixture
 def adapter(monkeypatch):
     monkeypatch.setattr(discord_platform.discord, "DMChannel", FakeDMChannel, raising=False)
@@ -202,12 +214,12 @@ def adapter(monkeypatch):
     return instance
 
 
-def _make_message(adapter, *, channel, content, message_id=123):
+def _make_message(adapter, *, channel, content, message_id=123, attachments=None):
     return SimpleNamespace(
         id=message_id,
         content=content,
         mentions=[adapter._client.user],
-        attachments=[],
+        attachments=attachments or [],
         reference=None,
         created_at=datetime.now(timezone.utc),
         channel=channel,
@@ -398,6 +410,43 @@ async def test_thread_goal_message_creates_per_message_feature_summary(adapter, 
     latest = adapter._load_feature_summary_handle_by_thread_id("200")
     assert latest["message_id"] == "302"
     assert latest["source_message_id"] == "502"
+
+
+@pytest.mark.asyncio
+async def test_parent_goal_with_markdown_attachment_creates_goal_feature_summary(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://kanban.example")
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+    attachment = FakeAttachment(
+        filename="goalplan.md",
+        content_type="text/markdown",
+        data=b"# Goalplan\nShip the dashboard safely.",
+    )
+
+    await adapter._handle_message(
+        _make_message(
+            adapter,
+            channel=parent,
+            content="<@999> /goal",
+            message_id=601,
+            attachments=[attachment],
+        )
+    )
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert len(thread.sent) == 1
+    fields = {field.name: field.value for field in thread.sent[0][0]["embed"].fields}
+    assert "Kanban Board" in fields
+    assert event.text.startswith("/goal\n\n[Content of goalplan.md]:")
+    assert "# Goalplan" in event.text
+    assert event.message_type == MessageType.COMMAND
+    assert event.feature_summary["thread_id"] == "200"
+    assert event.feature_summary["source_message_id"] == "601"
+    assert event.feature_summary["kanban_board"]["slug"] == "discord-200-m-601"
 
 
 @pytest.mark.asyncio

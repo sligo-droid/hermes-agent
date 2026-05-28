@@ -23,7 +23,7 @@ import threading
 import time
 from collections import defaultdict
 from types import SimpleNamespace
-from typing import Callable, Dict, List, Optional, Any, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Any, Tuple
 from urllib.parse import quote, urlparse
 
 logger = logging.getLogger(__name__)
@@ -2359,6 +2359,31 @@ class DiscordAdapter(BasePlatformAdapter):
             lower_args
             and lower_args not in {"status", "pause", "resume", "clear", "stop", "done"}
         )
+
+    def _slash_goal_uses_text_attachment_body(self, text: str, attachments: Iterable[Any]) -> bool:
+        cleaned = str(text or "").strip()
+        match = re.match(r"^/([^\s]+)(?:\s+(.*))?$", cleaned, re.DOTALL)
+        if not match or match.group(1).lower() != "goal":
+            return False
+        if (match.group(2) or "").strip():
+            return False
+        max_text_inject_bytes = 100 * 1024
+        mime_to_ext = {v: k for k, v in SUPPORTED_DOCUMENT_TYPES.items()}
+        for att in attachments or []:
+            ext = self._attachment_ext(att)
+            if not ext:
+                content_type = (getattr(att, "content_type", None) or "").lower()
+                ext = mime_to_ext.get(content_type, "")
+            if ext not in {".md", ".txt", ".log"}:
+                continue
+            try:
+                size = int(getattr(att, "size", 0) or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if size and size > max_text_inject_bytes:
+                continue
+            return True
+        return False
 
     async def _classify_discord_feature_request(self, text: str) -> bool:
         if not str(text or "").strip():
@@ -7489,7 +7514,14 @@ class DiscordAdapter(BasePlatformAdapter):
             is_slash_command_message = True
             is_meeting_command_message = True
         meeting_audio_attachments = all_audio_attachments if is_meeting_command_message else []
-        slash_command_starts_threaded_work = self._slash_command_starts_threaded_work(normalized_content)
+        slash_goal_uses_attachment_body = self._slash_goal_uses_text_attachment_body(
+            normalized_content,
+            all_attachments,
+        )
+        slash_command_starts_threaded_work = (
+            self._slash_command_starts_threaded_work(normalized_content)
+            or slash_goal_uses_attachment_body
+        )
 
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
@@ -7664,6 +7696,7 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_threaded_channel is not None
             and not is_meeting_command_message
             and not auto_threaded_direct_question
+            and not slash_goal_uses_attachment_body
         ):
             _stage_started = time.perf_counter()
             feature_summary_handle = await self.initialize_feature_summary(
@@ -7675,7 +7708,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 source_message_id=str(message.id),
             )
             self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
-        elif is_thread and (slash_command_starts_threaded_work or feature_request_intent is True):
+        elif (
+            is_thread
+            and not slash_goal_uses_attachment_body
+            and (slash_command_starts_threaded_work or feature_request_intent is True)
+        ):
             _stage_started = time.perf_counter()
             feature_summary_handle = await self.initialize_feature_summary(
                 message.channel,
@@ -7895,6 +7932,29 @@ class DiscordAdapter(BasePlatformAdapter):
         event_text = normalized_content
         if pending_text_injection:
             event_text = f"{event_text}\n\n{pending_text_injection}" if event_text else pending_text_injection
+        if (
+            slash_goal_uses_attachment_body
+            and feature_summary_handle is None
+            and is_thread
+            and not is_meeting_command_message
+            and self._slash_command_starts_threaded_work(event_text)
+        ):
+            _stage_started = time.perf_counter()
+            summary_channel = auto_threaded_channel or message.channel
+            parent_for_summary = (
+                message.channel
+                if auto_threaded_channel is not None
+                else self._thread_parent_channel(message.channel)
+            )
+            feature_summary_handle = await self.initialize_feature_summary(
+                summary_channel,
+                parent_channel=parent_for_summary,
+                initial_request=event_text,
+                project_context=project_context,
+                source_message_id=str(message.id),
+                reply_to_message=None if auto_threaded_channel is not None else message,
+            )
+            self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
         # ── History backfill ─────────────────────────────────────────
         # When require_mention is active, the bot only processes messages
         # that @mention it.  Messages in the channel between bot turns are
