@@ -59,6 +59,20 @@ def _make_discord_thread_event(text: str, *, thread_id: str = "thread-100") -> M
     )
 
 
+def _make_discord_parent_event(text: str, *, channel_id: str = "parent-channel") -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id=channel_id,
+            chat_type="group",
+            user_id="user-goal-config",
+        ),
+        message_id=f"msg-{channel_id}",
+    )
+
+
 @pytest.mark.asyncio
 async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monkeypatch):
     """Gateway /goal should honor top-level goals.max_turns from config.yaml."""
@@ -433,6 +447,45 @@ async def test_stop_cancels_request_scoped_discord_worker_board(tmp_path, monkey
     response = await GatewayRunner._handle_stop_command(
         runner,
         _make_discord_thread_event("/stop", thread_id="thread-stop"),
+    )
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "Stopped" in str(response)
+    assert meta["goal_status"] == "cancelled"
+    assert meta["phase"] == "cancelled"
+    assert meta["cancelled"] is True
+    assert meta["paused"] is True
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_parent_channel_discord_worker_board(tmp_path, monkeypatch):
+    kanban_home = tmp_path / "kanban-home"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(
+        thread_id="thread-stop-parent",
+        goal="Ship the dashboard",
+        chat_id="thread-stop-parent",
+        parent_channel_id="parent-channel",
+        request_id="source-message",
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _FakeSessionStore()
+    runner.adapters = {}
+    runner._queued_events = {}
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+
+    response = await GatewayRunner._handle_stop_command(
+        runner,
+        _make_discord_parent_event("/stop", channel_id="parent-channel"),
     )
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
