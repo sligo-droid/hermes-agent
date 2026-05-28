@@ -53,6 +53,19 @@ class DiscordStatusSyncAdapter(FeatureSummarySyncAdapter, ReactionSyncAdapter):
     pass
 
 
+class CompletionNoticeAdapter(DiscordStatusSyncAdapter):
+    def __init__(self):
+        super().__init__()
+        self.completions = []
+
+    async def send_kanban_completion_notice(self, target):
+        self.completions.append(dict(target))
+        from hermes_cli import discord_worker_boards as dwb
+
+        dwb.mark_thread_status_synced(str(target.get("board") or ""), completion_message=True)
+        return target.get("board")
+
+
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
 
@@ -486,6 +499,45 @@ def test_discord_kanban_typing_watcher_clears_stale_completion_notice_flag(tmp_p
 
     asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
 
+    worker = kb.read_board_metadata(board.slug)["discord_worker"]
+    assert "terminal_completion_message_pending" not in worker
+
+
+def test_discord_kanban_typing_watcher_sends_completion_notice(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(
+        thread_id="99020",
+        goal="Announce completed goal",
+        chat_id="parent-99020",
+    )
+    conn = kb.connect(board=board.slug)
+    try:
+        task = kb.list_tasks(conn, include_archived=False)[0]
+        claimed = kb.claim_task(conn, task.id)
+        assert claimed is not None
+        kb.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_reaction_sync_pending": True,
+            "terminal_summary_sync_pending": True,
+            "terminal_completion_message_pending": True,
+        },
+    )
+
+    adapter = CompletionNoticeAdapter()
+    runner = _make_discord_runner(adapter)
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert len(adapter.completions) == 1
+    assert adapter.completions[0]["board"] == board.slug
     worker = kb.read_board_metadata(board.slug)["discord_worker"]
     assert "terminal_completion_message_pending" not in worker
 

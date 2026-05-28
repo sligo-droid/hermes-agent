@@ -1190,7 +1190,7 @@ async def test_sync_kanban_feature_summary_uses_persisted_terminal_summary(adapt
 
 
 @pytest.mark.asyncio
-async def test_send_kanban_completion_notice_clears_flag_without_posting(adapter, monkeypatch, tmp_path):
+async def test_send_kanban_completion_notice_posts_once(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     parent = FakeTextChannel(channel_id=100)
     thread = FakeThread(channel_id=200, parent=parent)
@@ -1215,15 +1215,21 @@ async def test_send_kanban_completion_notice_clears_flag_without_posting(adapter
         "thread_id": "200",
         "chat_id": "200",
         "state": "done",
+        "outcome": "Done. Tasks: done:1 total:1. PR: https://github.example/pr/1.",
+        "pr_url": "https://github.example/pr/1",
+        "public_url": "https://hermes.example/workers/200",
         "terminal_completion_message_pending": True,
     }
     sent = await adapter.send_kanban_completion_notice(target)
 
     assert sent == board.slug
-    assert thread.sent == []
+    assert len(thread.sent) == 1
+    kwargs, _message = thread.sent[0]
+    assert "Done. Tasks: done:1 total:1." in kwargs["content"]
+    assert "https://github.example/pr/1" in kwargs["content"]
+    assert "Kanban: https://hermes.example/workers/200" in kwargs["content"]
     worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert "terminal_completion_message_pending" not in worker
-    assert "terminal_completion_message_sent_at" not in worker
 
 
 @pytest.mark.asyncio

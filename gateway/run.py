@@ -7194,10 +7194,12 @@ class GatewayRunner:
                 sender = getattr(adapter, "send_typing_once", None) if adapter else None
                 reaction_sync = getattr(adapter, "sync_kanban_thread_reaction", None) if adapter else None
                 summary_sync = getattr(adapter, "sync_kanban_feature_summary", None) if adapter else None
+                completion_notice = getattr(adapter, "send_kanban_completion_notice", None) if adapter else None
                 if adapter is not None and (
                     callable(sender)
                     or callable(reaction_sync)
                     or callable(summary_sync)
+                    or callable(completion_notice)
                 ):
                     try:
                         from hermes_cli.discord_worker_boards import (
@@ -7304,6 +7306,19 @@ class GatewayRunner:
                     for target in reaction_targets:
                         board = str(target.get("board") or "")
                         if not board or not target.get("terminal_completion_message_pending"):
+                            continue
+                        if callable(completion_notice):
+                            try:
+                                sent = await completion_notice(target)
+                            except Exception as exc:
+                                logger.debug(
+                                    "discord kanban completion notice: send failed for board %s: %s",
+                                    board,
+                                    exc,
+                                )
+                                continue
+                            if sent:
+                                continue
                             continue
                         await asyncio.to_thread(
                             mark_thread_status_synced,
