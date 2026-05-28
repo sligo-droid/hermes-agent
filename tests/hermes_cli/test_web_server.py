@@ -2305,6 +2305,50 @@ class TestPtyWebSocket:
                     break
             assert b"hermes-ws-ok" in buf
 
+    def test_worker_console_pty_streams_child_stdout(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_resolve(session_id, task_id):
+            captured["session_id"] = session_id
+            captured["task_id"] = task_id
+            return (["/bin/sh", "-c", "printf worker-console-ok"], None, None)
+
+        monkeypatch.setattr(self.ws_module, "_resolve_worker_console_argv", fake_resolve)
+        with self.client.websocket_connect(
+            f"/api/workers/sess-1/tickets/t_1/console/pty?token={self.token}"
+        ) as conn:
+            buf = b""
+            import time
+
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                try:
+                    frame = conn.receive_bytes()
+                except Exception:
+                    break
+                if frame:
+                    buf += frame
+                if b"worker-console-ok" in buf:
+                    break
+
+        assert captured == {"session_id": "sess-1", "task_id": "t_1"}
+        assert b"worker-console-ok" in buf
+
+    def test_worker_console_pty_rejects_bad_token(self, monkeypatch):
+        monkeypatch.setattr(
+            self.ws_module,
+            "_resolve_worker_console_argv",
+            lambda session_id, task_id: (["/bin/cat"], None, None),
+        )
+        from starlette.websockets import WebSocketDisconnect
+
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with self.client.websocket_connect(
+                "/api/workers/sess-1/tickets/t_1/console/pty?token=wrong"
+            ):
+                pass
+        assert exc.value.code == 4401
+
     def test_client_input_reaches_child_stdin(self, monkeypatch):
         # ``cat`` echoes stdin back, so a write → read round-trip proves
         # the full duplex path.
