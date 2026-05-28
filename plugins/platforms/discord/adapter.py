@@ -684,6 +684,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
     # Discord message limits
     MAX_MESSAGE_LENGTH = 2000
+    STREAMING_MESSAGE_HEADROOM = 0
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
     supports_metadata_embeds = True
 

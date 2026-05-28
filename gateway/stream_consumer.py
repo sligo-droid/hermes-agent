@@ -148,6 +148,7 @@ class GatewayStreamConsumer:
         self._last_sent_text = ""   # Track last-sent text to skip redundant edits
         self._fallback_final_send = False
         self._fallback_prefix = ""
+        self._split_overflow_delivered = False
         self._flood_strikes = 0         # Consecutive flood-control edit failures
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
         self._final_response_sent = False
@@ -260,6 +261,7 @@ class GatewayStreamConsumer:
         self._last_sent_text = ""
         self._fallback_final_send = False
         self._fallback_prefix = ""
+        self._split_overflow_delivered = False
         # Native draft streaming: bump the draft_id so the next text segment
         # animates as a fresh preview below the tool-progress bubbles, not
         # over the prior segment's already-finalized draft.  This is how
@@ -393,6 +395,32 @@ class GatewayStreamConsumer:
             self._accumulated += self._think_buffer
             self._think_buffer = ""
 
+    def _message_content_limit(
+        self,
+        raw_limit: int,
+        len_fn: "Callable[[str], int]",
+        *,
+        include_cursor: bool,
+    ) -> int:
+        raw_headroom = getattr(self.adapter, "STREAMING_MESSAGE_HEADROOM", None)
+        if not isinstance(raw_headroom, (int, float)):
+            raw_headroom = getattr(type(self.adapter), "STREAMING_MESSAGE_HEADROOM", 100)
+        headroom = int(raw_headroom or 0)
+        cursor_len = len_fn(self.cfg.cursor) if include_cursor and self.cfg.cursor else 0
+        limit = raw_limit - headroom - cursor_len
+        floor = min(500, raw_limit)
+        return max(floor, min(raw_limit, limit))
+
+    def _truncate_message_chunks(
+        self,
+        text: str,
+        limit: int,
+        len_fn: "Callable[[str], int]",
+    ) -> list[str]:
+        if len_fn is len:
+            return self.adapter.truncate_message(text, limit)
+        return self.adapter.truncate_message(text, limit, len_fn=len_fn)
+
     async def run(self) -> None:
         """Async task that drains the queue and edits the platform message."""
         # Platform message length limit — leave room for cursor + formatting.
@@ -406,7 +434,6 @@ class GatewayStreamConsumer:
             else len
         )
         _raw_limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
-        _safe_limit = max(500, _raw_limit - _len_fn(self.cfg.cursor) - 100)
 
         # Resolve native draft streaming once per run.  When enabled the
         # consumer routes mid-stream frames through adapter.send_draft and
@@ -471,6 +498,16 @@ class GatewayStreamConsumer:
 
                 current_update_visible = False
                 if should_edit and self._accumulated:
+                    _include_cursor = (
+                        not got_done
+                        and not got_segment_break
+                        and commentary_text is None
+                    )
+                    _safe_limit = self._message_content_limit(
+                        _raw_limit,
+                        _len_fn,
+                        include_cursor=_include_cursor,
+                    )
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     if (
@@ -482,8 +519,8 @@ class GatewayStreamConsumer:
                         # helper the non-streaming path uses — to split with
                         # proper word/code-fence boundaries and chunk
                         # indicators like "(1/2)".
-                        chunks = self.adapter.truncate_message(
-                            self._accumulated, _safe_limit, len_fn=_len_fn,
+                        chunks = self._truncate_message_chunks(
+                            self._accumulated, _safe_limit, _len_fn,
                         )
                         chunks_delivered = False
                         reply_to = self._message_id or self._initial_reply_to_id
@@ -507,6 +544,9 @@ class GatewayStreamConsumer:
                             self._message_id = None
                             self._fallback_final_send = False
                             self._fallback_prefix = ""
+                            self._split_overflow_delivered = False
+                        elif chunks_delivered:
+                            self._split_overflow_delivered = True
                         continue
 
                     # Existing message: edit it with the first chunk, then
@@ -582,6 +622,9 @@ class GatewayStreamConsumer:
                             )
                         elif not self._already_sent:
                             self._final_response_sent = await self._send_or_edit(self._accumulated)
+                    elif self._split_overflow_delivered:
+                        self._final_response_sent = True
+                        self._final_content_delivered = True
                     return
 
                 if commentary_text is not None:
@@ -786,7 +829,7 @@ class GatewayStreamConsumer:
             if isinstance(self.adapter, _BasePlatformAdapter)
             else len
         )
-        safe_limit = max(500, raw_limit - 100)
+        safe_limit = self._message_content_limit(raw_limit, _len_fn, include_cursor=False)
         chunks = self._split_text_chunks(continuation, safe_limit, len_fn=_len_fn)
 
         stale_message_id = self._message_id  # partial message to clean up
