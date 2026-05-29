@@ -216,6 +216,10 @@ async def test_mentioned_text_without_audio_does_not_trigger_meeting_intake(adap
     monkeypatch.setattr(adapter, "handle_message", fake_handle)
     classifier = AsyncMock(return_value=False)
     monkeypatch.setattr(adapter, "_classify_discord_feature_request", classifier)
+    # This test isolates the meeting-intake gate: plain mentioned text should
+    # not be promoted to /meeting. Disable the separate generic auto-thread
+    # path so its direct-question thread creation does not mask that assertion.
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
     adapter._text_batch_delay_seconds = 0
 
     guild = SimpleNamespace(id=42, name="Guild")

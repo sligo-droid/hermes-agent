@@ -225,7 +225,15 @@ async def test_discord_feature_request_cache_signature_records_fast_path(monkeyp
     runner = _make_runner()
     captured_cache_keys = []
 
-    def capture_signature(model, runtime, enabled_toolsets, ephemeral_prompt, cache_keys=None):
+    def capture_signature(
+        model,
+        runtime,
+        enabled_toolsets,
+        ephemeral_prompt,
+        cache_keys=None,
+        user_id=None,
+        user_id_alt=None,
+    ):
         captured_cache_keys.append(dict(cache_keys or {}))
         return "captured-signature"
 

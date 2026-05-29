@@ -88,18 +88,15 @@ class TestBundledPluginsRegister:
         ]
 
     @pytest.mark.parametrize(
-        "plugin_name,expected_search,expected_extract,expected_crawl",
+        "plugin_name,expected_search,expected_extract",
         [
-            ("brave-free", True, False, False),
-            ("ddgs", True, False, False),
-            ("searxng", True, False, False),
-            ("exa", True, True, False),
-            ("parallel", True, True, False),
-            ("tavily", True, True, True),
-            # firecrawl: search + extract + crawl. Crawl was originally
-            # disabled in the migration (fell through to a legacy inline
-            # path); the follow-up commit enabled it natively.
-            ("firecrawl", True, True, True),
+            ("brave-free", True, False),
+            ("ddgs", True, False),
+            ("searxng", True, False),
+            ("exa", True, True),
+            ("parallel", True, True),
+            ("tavily", True, True),
+            ("firecrawl", True, True),
         ],
     )
     def test_capability_flags_match_spec(
@@ -107,7 +104,6 @@ class TestBundledPluginsRegister:
         plugin_name: str,
         expected_search: bool,
         expected_extract: bool,
-        expected_crawl: bool,
     ) -> None:
         _ensure_plugins_loaded()
         from agent.web_search_registry import get_provider
@@ -116,7 +112,6 @@ class TestBundledPluginsRegister:
         assert provider is not None, f"plugin {plugin_name!r} not registered"
         assert provider.supports_search() is expected_search
         assert provider.supports_extract() is expected_extract
-        assert provider.supports_crawl() is expected_crawl
 
     @pytest.mark.parametrize(
         "plugin_name",
@@ -442,18 +437,22 @@ class TestErrorResponseShapes:
         if result:  # if anything came back, it should be an error entry
             assert "error" in result[0]
 
-    def test_tavily_crawl_returns_error_dict_when_unconfigured(self) -> None:
-        _ensure_plugins_loaded()
-        from agent.web_search_registry import get_provider
+    def test_firecrawl_config_error_points_paid_users_to_nous_subscription(self, monkeypatch):
+        from plugins.web.firecrawl import provider as firecrawl_provider
 
-        p = get_provider("tavily")
-        assert p is not None
-        result = p.crawl("https://example.com")
-        assert isinstance(result, dict)
-        assert "results" in result
-        assert isinstance(result["results"], list)
-        if result["results"]:
-            assert "error" in result["results"][0]
+        monkeypatch.setattr(
+            "tools.web_tools.managed_nous_tools_enabled",
+            lambda: True,
+            raising=False,
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            firecrawl_provider._raise_web_backend_configuration_error()
+
+        message = str(exc_info.value)
+        assert "With your Nous subscription you can also use the Tool Gateway" in message
+        assert "select Nous Subscription as the web provider" in message
+        assert "managed Firecrawl web tools is unavailable" not in message
 
     def test_firecrawl_crawl_returns_error_dict_when_unconfigured(self) -> None:
         """firecrawl crawl is async (wraps SDK in to_thread); error must be
@@ -473,3 +472,22 @@ class TestErrorResponseShapes:
         assert len(result["results"]) >= 1
         assert "error" in result["results"][0]
         assert result["results"][0]["url"] == "https://example.com"
+
+    def test_firecrawl_config_error_uses_entitlement_message_when_not_paid(self, monkeypatch):
+        from plugins.web.firecrawl import provider as firecrawl_provider
+
+        monkeypatch.setattr(
+            "tools.web_tools.managed_nous_tools_enabled",
+            lambda: False,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "tools.web_tools.nous_tool_gateway_unavailable_message",
+            lambda capability: f"{capability} denied by test entitlement.",
+            raising=False,
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            firecrawl_provider._raise_web_backend_configuration_error()
+
+        assert "managed Firecrawl web tools denied by test entitlement" in str(exc_info.value)

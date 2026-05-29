@@ -5,7 +5,7 @@ Covers:
 - DDGSWebSearchProvider.search() — happy path, missing package, runtime error
 - Result normalization (title, url, description, position)
 - _is_backend_available("ddgs") / _get_backend() integration
-- web_extract / web_crawl return search-only errors when ddgs is active
+- web_extract returns a search-only error when ddgs is active
 """
 from __future__ import annotations
 
@@ -205,7 +205,7 @@ class TestDDGSBackendWiring:
 
 
 # ---------------------------------------------------------------------------
-# ddgs is search-only: web_extract / web_crawl return clear errors
+# ddgs is search-only: web_extract returns a clear error
 # ---------------------------------------------------------------------------
 
 

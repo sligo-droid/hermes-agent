@@ -207,8 +207,6 @@ class TestTildeExpansion:
         }
         result = _simulate_config_bridge(cfg)
         assert result["TERMINAL_CWD"] == os.path.expanduser("~/nested")
-
-
 class TestVercelTerminalBridge:
     def test_vercel_terminal_settings_bridge(self):
         cfg = {

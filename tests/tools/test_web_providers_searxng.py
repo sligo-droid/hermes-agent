@@ -18,6 +18,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+def register_all_web_providers():
+    from agent.web_search_registry import register_provider
+    from plugins.web.searxng.provider import SearXNGWebSearchProvider
+
+    register_provider(SearXNGWebSearchProvider())
+
+
 # ---------------------------------------------------------------------------
 # SearXNGWebSearchProvider unit tests
 # ---------------------------------------------------------------------------
@@ -290,16 +297,26 @@ class TestCheckWebApiKey:
         monkeypatch.delenv("SEARXNG_URL", raising=False)
         monkeypatch.setattr(web_tools, "_is_tool_gateway_ready", lambda: False)
         monkeypatch.setattr(web_tools, "check_firecrawl_api_key", lambda: False)
+        monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: False)
         assert web_tools.check_web_api_key() is False
 
 
 # ---------------------------------------------------------------------------
-# searxng-only: web_extract and web_crawl return clear errors
+# searxng-only: web_extract returns a clear error
 # ---------------------------------------------------------------------------
 
 
 class TestSearXNGOnlyExtractCrawlErrors:
     """When searxng is the active backend, extract/crawl must return clear errors."""
+
+    _register_providers = staticmethod(register_all_web_providers)
+
+    @pytest.fixture(autouse=True)
+    def _populate_web_registry(self):
+        self._register_providers()
+        yield
+        from agent.web_search_registry import _reset_for_tests
+        _reset_for_tests()
 
     def test_web_crawl_searxng_returns_clear_error(self, monkeypatch):
         import asyncio
