@@ -196,6 +196,17 @@ def _require_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def _require_dashboard_request(request: Request) -> None:
+    """Validate dashboard API access in loopback or gated mode."""
+    if getattr(request.app.state, "auth_required", False):
+        # gated_auth_middleware already verified the cookie session and
+        # attached request.state.session before this endpoint runs.
+        if getattr(request.state, "session", None) is None:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        return
+    _require_token(request)
+
+
 # Accepted Host header values for loopback binds. DNS rebinding attacks
 # point a victim browser at an attacker-controlled hostname (evil.test)
 # which resolves to 127.0.0.1 after a TTL flip — bypassing same-origin
@@ -564,7 +575,7 @@ async def worker_ticket_terminal_json(session_id: str, task_id: str):
 @app.get("/api/workers/{session_id}/tickets/{task_id}/console", response_class=JSONResponse)
 async def worker_ticket_console_api(request: Request, session_id: str, task_id: str):
     """Authenticated operator-console state for one Discord worker ticket."""
-    _require_token(request)
+    _require_dashboard_request(request)
     try:
         from hermes_cli.discord_worker_boards import worker_ticket_console_for_session
 
@@ -4146,8 +4157,7 @@ async def pty_ws(ws: WebSocket) -> None:
 
 @app.websocket("/api/workers/{session_id}/tickets/{task_id}/console/pty")
 async def worker_console_pty_ws(ws: WebSocket, session_id: str, task_id: str) -> None:
-    token = ws.query_params.get("token", "")
-    if not hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+    if not _ws_auth_ok(ws):
         await ws.close(code=4401)
         return
 

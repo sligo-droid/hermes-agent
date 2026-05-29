@@ -4,7 +4,7 @@ import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@/components/NouiTypography";
-import { HERMES_BASE_PATH, fetchJSON } from "@/lib/api";
+import { HERMES_BASE_PATH, buildWsAuthParam, fetchJSON } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { ArrowLeft, ExternalLink, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -51,9 +51,13 @@ function dashboardHref(path: string): string {
   return `${HERMES_BASE_PATH}${path}`;
 }
 
-function buildConsoleWsUrl(sessionId: string, taskId: string, token: string): string {
+function buildConsoleWsUrl(
+  sessionId: string,
+  taskId: string,
+  authParam: [string, string],
+): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const qs = new URLSearchParams({ token });
+  const qs = new URLSearchParams({ [authParam[0]]: authParam[1] });
   return (
     `${proto}//${window.location.host}${HERMES_BASE_PATH}` +
     `/api/workers/${encodeURIComponent(sessionId)}` +
@@ -74,11 +78,7 @@ export default function WorkerConsolePage() {
   const [snapshot, setSnapshot] = useState<WorkerConsoleSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [terminalStatus, setTerminalStatus] = useState(() =>
-    typeof window !== "undefined" && !window.__HERMES_SESSION_TOKEN__
-      ? "missing session token"
-      : "connecting",
-  );
+  const [terminalStatus, setTerminalStatus] = useState("connecting");
 
   const boardUrl = useMemo(() => dashboardHref(workerPath(sessionId)), [sessionId]);
   const ticketUrl = useMemo(
@@ -133,8 +133,7 @@ export default function WorkerConsolePage() {
 
   useEffect(() => {
     const host = hostRef.current;
-    const token = window.__HERMES_SESSION_TOKEN__;
-    if (!host || !sessionId || !taskId || !token) return;
+    if (!host || !sessionId || !taskId) return;
 
     const term = new Terminal({
       cursorBlink: true,
@@ -172,35 +171,49 @@ export default function WorkerConsolePage() {
     resizeObserver.observe(host);
     requestAnimationFrame(fitNow);
 
-    const ws = new WebSocket(buildConsoleWsUrl(sessionId, taskId, token));
-    ws.binaryType = "arraybuffer";
-    wsRef.current = ws;
+    let unmounting = false;
+    let ws: WebSocket | null = null;
     const inputDisposable = term.onData((data) => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(data);
+      if (ws?.readyState === WebSocket.OPEN) ws.send(data);
     });
     const resizeDisposable = term.onResize(({ cols, rows }) => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(`\x1b[RESIZE:${cols};${rows}]`);
+      if (ws?.readyState === WebSocket.OPEN) ws.send(`\x1b[RESIZE:${cols};${rows}]`);
     });
 
-    ws.onopen = () => {
-      setTerminalStatus("connected");
-      fitNow();
-    };
-    ws.onmessage = (event) => {
-      if (typeof event.data === "string") {
-        term.write(event.data);
-      } else if (event.data instanceof ArrayBuffer) {
-        term.write(new Uint8Array(event.data));
+    void (async () => {
+      try {
+        const authParam = await buildWsAuthParam();
+        if (unmounting) return;
+        ws = new WebSocket(buildConsoleWsUrl(sessionId, taskId, authParam));
+        ws.binaryType = "arraybuffer";
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          setTerminalStatus("connected");
+          fitNow();
+        };
+        ws.onmessage = (event) => {
+          if (typeof event.data === "string") {
+            term.write(event.data);
+          } else if (event.data instanceof ArrayBuffer) {
+            term.write(new Uint8Array(event.data));
+          }
+        };
+        ws.onerror = () => setTerminalStatus("error");
+        ws.onclose = () => setTerminalStatus("closed");
+      } catch (err) {
+        if (!unmounting) {
+          setTerminalStatus(err instanceof Error ? err.message : "auth error");
+        }
       }
-    };
-    ws.onerror = () => setTerminalStatus("error");
-    ws.onclose = () => setTerminalStatus("closed");
+    })();
 
     return () => {
+      unmounting = true;
       inputDisposable.dispose();
       resizeDisposable.dispose();
       resizeObserver.disconnect();
-      ws.close();
+      ws?.close();
       term.dispose();
       if (wsRef.current === ws) wsRef.current = null;
       if (termRef.current === term) termRef.current = null;
