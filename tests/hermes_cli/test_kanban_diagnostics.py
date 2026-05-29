@@ -117,6 +117,51 @@ def test_prose_phantom_refs_fires_after_clean_completion():
     assert diags[0].data["phantom_refs"] == ["t_deadbeef99"]
 
 
+def test_prose_phantom_refs_ignores_foreman_source_task_ref():
+    task = _task(
+        status="done",
+        idempotency_key=(
+            "discord-foreman:discord-source:t_deadbeef99:"
+            "worker_errored:abc123"
+        ),
+    )
+    events = [
+        _event("completed", ts=100, summary="recovered t_deadbeef99"),
+        _event(
+            "suspected_hallucinated_references",
+            ts=101,
+            phantom_refs=["t_deadbeef99"],
+            source="completion_summary",
+        ),
+    ]
+
+    assert kd.compute_task_diagnostics(task, events, []) == []
+
+
+def test_prose_phantom_refs_keeps_other_refs_on_foreman_task():
+    task = _task(
+        status="done",
+        idempotency_key=(
+            "discord-foreman:discord-source:t_deadbeef99:"
+            "worker_errored:abc123"
+        ),
+    )
+    events = [
+        _event("completed", ts=100, summary="recovered t_deadbeef99 and t_feedface00"),
+        _event(
+            "suspected_hallucinated_references",
+            ts=101,
+            phantom_refs=["t_deadbeef99", "t_feedface00"],
+            source="completion_summary",
+        ),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [])
+
+    assert len(diags) == 1
+    assert diags[0].data["phantom_refs"] == ["t_feedface00"]
+
+
 def test_prose_phantom_refs_clears_on_later_clean_edit():
     task = _task(status="done")
     events = [
