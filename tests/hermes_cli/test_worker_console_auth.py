@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -81,42 +82,40 @@ def test_worker_console_api_accepts_gated_cookie_session(gated_app, tmp_path: Pa
     assert "operator console log line" in data["worker_log_tail"]
 
 
-def test_worker_console_pty_accepts_gated_ws_ticket(gated_app, monkeypatch):
+def test_worker_console_log_accepts_gated_ws_ticket(gated_app, monkeypatch, tmp_path: Path):
     captured: dict[str, object] = {}
+    log_path = tmp_path / "worker.log"
+    state_path = tmp_path / "worker.codex-state.json"
+    log_path.write_text("gated-worker-console-log-ok\n", encoding="utf-8")
+    state_path.write_text(
+        json.dumps(
+            {
+                "events": [
+                    {
+                        "method": "opencode/message",
+                        "payload": {"params": {"item": {"text": "gated-event-ok"}}},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
 
     def fake_resolve(session_id: str, task_id: str):
         captured["session_id"] = session_id
         captured["task_id"] = task_id
-        return (["worker-shell"], "/tmp", {"HERMES_WORKER_CONSOLE": "1"})
+        return (
+            log_path,
+            state_path,
+            {
+                "task": {"id": task_id, "title": "Ticket", "status": "running"},
+                "backend": "opencode",
+                "workspace": {"path": str(tmp_path), "available": True},
+                "current_run": {"id": 1, "worker_pid": 123},
+            },
+        )
 
-    class FakeBridge:
-        def __init__(self):
-            self.sent = False
-
-        def read(self, _timeout: float):
-            if self.sent:
-                return None
-            self.sent = True
-            return b"gated-worker-console-ok"
-
-        def write(self, _raw: bytes) -> None:
-            return None
-
-        def resize(self, *, cols: int, rows: int) -> None:
-            captured["resize"] = (cols, rows)
-
-        def close(self) -> None:
-            captured["closed"] = True
-
-    class FakePtyBridge:
-        @classmethod
-        def spawn(cls, argv, *, cwd=None, env=None):
-            captured["spawn"] = {"argv": argv, "cwd": cwd, "env": env}
-            return FakeBridge()
-
-    monkeypatch.setattr(web_server, "_resolve_worker_console_argv", fake_resolve)
-    monkeypatch.setattr(web_server, "_PTY_BRIDGE_AVAILABLE", True)
-    monkeypatch.setattr(web_server, "PtyBridge", FakePtyBridge)
+    monkeypatch.setattr(web_server, "_resolve_worker_console_log", fake_resolve)
 
     _logged_in(gated_app)
     ticket = gated_app.post("/api/auth/ws-ticket").json()["ticket"]
@@ -135,14 +134,43 @@ def test_worker_console_pty_accepts_gated_ws_ticket(gated_app, monkeypatch):
                 break
             if frame:
                 buf += frame
-            if b"gated-worker-console-ok" in buf:
+            if b"gated-worker-console-log-ok" in buf and b"gated-event-ok" in buf:
+                break
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write("gated-worker-console-later-ok\n")
+        state_path.write_text(
+            json.dumps(
+                {
+                    "events": [
+                        {
+                            "method": "opencode/message",
+                            "payload": {"params": {"item": {"text": "gated-event-ok"}}},
+                        },
+                        {
+                            "method": "opencode/message",
+                            "payload": {
+                                "params": {"item": {"text": "gated-event-later-ok"}}
+                            },
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                frame = conn.receive_bytes()
+            except Exception:
+                break
+            if frame:
+                buf += frame
+            if b"gated-worker-console-later-ok" in buf and b"gated-event-later-ok" in buf:
                 break
 
     assert captured["session_id"] == "sess-1"
     assert captured["task_id"] == "t_1"
-    assert captured["spawn"] == {
-        "argv": ["worker-shell"],
-        "cwd": "/tmp",
-        "env": {"HERMES_WORKER_CONSOLE": "1"},
-    }
-    assert b"gated-worker-console-ok" in buf
+    assert b"gated-worker-console-log-ok" in buf
+    assert b"gated-event-ok" in buf
+    assert b"gated-worker-console-later-ok" in buf
+    assert b"gated-event-later-ok" in buf

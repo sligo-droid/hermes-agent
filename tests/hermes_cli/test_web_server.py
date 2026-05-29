@@ -2299,15 +2299,47 @@ class TestPtyWebSocket:
                     break
             assert b"hermes-ws-ok" in buf
 
-    def test_worker_console_pty_streams_child_stdout(self, monkeypatch):
+    def test_worker_console_streams_worker_log_and_backend_events(self, monkeypatch, tmp_path):
         captured: dict = {}
+        log_path = tmp_path / "worker.log"
+        state_path = tmp_path / "worker.codex-state.json"
+        log_path.write_text("worker-console-log-ok\n", encoding="utf-8")
+        state_path.write_text(
+            json.dumps(
+                {
+                    "events": [
+                        {
+                            "method": "item/completed",
+                            "payload": {
+                                "params": {
+                                    "item": {
+                                        "type": "commandExecution",
+                                        "aggregatedOutput": "backend-event-ok",
+                                    }
+                                }
+                            },
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
 
         def fake_resolve(session_id, task_id):
             captured["session_id"] = session_id
             captured["task_id"] = task_id
-            return (["/bin/sh", "-c", "printf worker-console-ok"], None, None)
+            return (
+                log_path,
+                state_path,
+                {
+                    "task": {"id": task_id, "title": "Ticket", "status": "running"},
+                    "backend": "codex",
+                    "workspace": {"path": str(tmp_path), "available": True},
+                    "current_run": {"id": 1, "worker_pid": 123},
+                },
+            )
 
-        monkeypatch.setattr(self.ws_module, "_resolve_worker_console_argv", fake_resolve)
+        monkeypatch.setattr(self.ws_module, "_resolve_worker_console_log", fake_resolve)
         with self.client.websocket_connect(
             f"/api/workers/sess-1/tickets/t_1/console/pty?token={self.token}"
         ) as conn:
@@ -2322,17 +2354,63 @@ class TestPtyWebSocket:
                     break
                 if frame:
                     buf += frame
-                if b"worker-console-ok" in buf:
+                if b"worker-console-log-ok" in buf and b"backend-event-ok" in buf:
+                    break
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write("worker-console-later-ok\n")
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "events": [
+                            {
+                                "method": "item/completed",
+                                "payload": {
+                                    "params": {
+                                        "item": {
+                                            "type": "commandExecution",
+                                            "aggregatedOutput": "backend-event-ok",
+                                        }
+                                    }
+                                },
+                            },
+                            {
+                                "method": "item/completed",
+                                "payload": {
+                                    "params": {
+                                        "item": {
+                                            "type": "commandExecution",
+                                            "aggregatedOutput": "backend-event-later-ok",
+                                        }
+                                    }
+                                },
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                try:
+                    frame = conn.receive_bytes()
+                except Exception:
+                    break
+                if frame:
+                    buf += frame
+                if b"worker-console-later-ok" in buf and b"backend-event-later-ok" in buf:
                     break
 
         assert captured == {"session_id": "sess-1", "task_id": "t_1"}
-        assert b"worker-console-ok" in buf
+        assert b"worker-console-log-ok" in buf
+        assert b"backend-event-ok" in buf
+        assert b"worker-console-later-ok" in buf
+        assert b"backend-event-later-ok" in buf
 
     def test_worker_console_pty_rejects_bad_token(self, monkeypatch):
         monkeypatch.setattr(
             self.ws_module,
-            "_resolve_worker_console_argv",
-            lambda session_id, task_id: (["/bin/cat"], None, None),
+            "_resolve_worker_console_log",
+            lambda session_id, task_id: (Path("/tmp/no.log"), Path("/tmp/no.json"), {}),
         )
         from starlette.websockets import WebSocketDisconnect
 

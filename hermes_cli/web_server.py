@@ -3816,6 +3816,9 @@ except ImportError as _pty_import_err:  # pragma: no cover - Windows-only path
 
 _RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
 _PTY_READ_CHUNK_TIMEOUT = 0.2
+_WORKER_CONSOLE_POLL_SECONDS = 0.5
+_WORKER_CONSOLE_INITIAL_TAIL_BYTES = 256_000
+_WORKER_CONSOLE_READ_CHUNK_BYTES = 64_000
 _VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 # Starlette's TestClient reports the peer as "testclient"; treat it as
 # loopback so tests don't need to rewrite request scope.
@@ -3974,15 +3977,220 @@ def _resolve_chat_argv(
     return list(argv), str(cwd) if cwd else None, env
 
 
-def _resolve_worker_console_argv(
+def _resolve_worker_console_log(
     session_id: str,
     task_id: str,
-) -> tuple[list[str], Optional[str], Optional[dict]]:
-    """Resolve argv/cwd/env for a ticket-scoped operator shell."""
-    from hermes_cli.discord_worker_boards import worker_ticket_console_shell_for_session
+) -> tuple[Path, Path, dict[str, Any]]:
+    """Resolve log/state paths for a ticket-scoped operator console."""
+    from hermes_cli.discord_worker_boards import worker_ticket_console_log_for_session
 
-    shell = worker_ticket_console_shell_for_session(session_id, task_id)
-    return list(shell["argv"]), str(shell["cwd"]), dict(shell["env"])
+    info = worker_ticket_console_log_for_session(session_id, task_id)
+    return (
+        Path(str(info["log_path"])),
+        Path(str(info["state_path"])),
+        dict(info["snapshot"]),
+    )
+
+
+def _worker_console_intro(snapshot: dict[str, Any], log_path: Path, state_path: Path) -> bytes:
+    task = snapshot.get("task") if isinstance(snapshot.get("task"), dict) else {}
+    workspace = snapshot.get("workspace") if isinstance(snapshot.get("workspace"), dict) else {}
+    run = snapshot.get("current_run") if isinstance(snapshot.get("current_run"), dict) else {}
+    lines = [
+        "Hermes worker console (read-only)",
+        f"ticket: {task.get('id') or '-'}",
+        f"title: {task.get('title') or '-'}",
+        f"status: {task.get('status') or '-'}",
+        f"backend: {snapshot.get('backend') or 'unknown'}",
+        f"run: {run.get('id') or task.get('current_run_id') or '-'}",
+        f"pid: {run.get('worker_pid') or task.get('worker_pid') or '-'}",
+        f"workspace: {workspace.get('path') or '-'}",
+        f"worker log: {log_path}",
+        f"backend state: {state_path}",
+        "stream: worker stdout/stderr plus raw OpenCode/Codex events",
+        "",
+    ]
+    return _worker_console_bytes("\n".join(lines))
+
+
+def _worker_console_bytes(text: str) -> bytes:
+    return _worker_console_terminal_bytes(text.encode("utf-8", errors="replace"))
+
+
+def _worker_console_terminal_bytes(data: bytes) -> bytes:
+    if not data:
+        return b""
+    normalized = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return normalized.replace(b"\n", b"\r\n")
+
+
+def _read_worker_console_log_tail(path: Path) -> tuple[bytes, int, bool]:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return b"", 0, False
+    start = max(0, size - _WORKER_CONSOLE_INITIAL_TAIL_BYTES)
+    clipped = start > 0
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(start)
+            if clipped:
+                probe = handle.tell()
+                partial = handle.readline()
+                if not partial.endswith(b"\n") and handle.tell() >= size:
+                    handle.seek(probe)
+            data = handle.read()
+            offset = handle.tell()
+    except OSError:
+        return b"", 0, False
+    return data, offset, clipped
+
+
+def _read_worker_console_log_delta(path: Path, offset: int) -> tuple[bytes, int, bool]:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return b"", offset, False
+    rotated = size < offset
+    if rotated:
+        offset = 0
+    if size <= offset:
+        return b"", offset, rotated
+    chunks: list[bytes] = []
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(offset)
+            while True:
+                chunk = handle.read(_WORKER_CONSOLE_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            offset = handle.tell()
+    except OSError:
+        return b"", offset, rotated
+    return b"".join(chunks), offset, rotated
+
+
+def _read_worker_console_state(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _worker_console_json_line(label: str, value: Any) -> bytes:
+    try:
+        payload = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        payload = str(value)
+    return _worker_console_bytes(f"[{label}] {payload}\n")
+
+
+async def _send_worker_console_backend_updates(
+    ws: WebSocket,
+    state_path: Path,
+    *,
+    event_cursor: int,
+    truncated_cursor: int,
+    result_fingerprint: str,
+) -> tuple[int, int, str]:
+    state = _read_worker_console_state(state_path)
+    if not state:
+        return event_cursor, truncated_cursor, result_fingerprint
+
+    truncated = int(state.get("truncated_events") or 0)
+    events = state.get("events") if isinstance(state.get("events"), list) else []
+    if truncated_cursor < 0:
+        if truncated > 0:
+            await ws.send_bytes(
+                _worker_console_bytes(
+                    "[backend events] showing current retained event window\n"
+                )
+            )
+    elif truncated != truncated_cursor or len(events) < event_cursor:
+        await ws.send_bytes(
+            _worker_console_bytes(
+                "[backend events] retention window changed; showing current event window\n"
+            )
+        )
+        event_cursor = 0
+    for event in events[event_cursor:]:
+        method = "backend event"
+        if isinstance(event, dict) and event.get("method"):
+            method = str(event.get("method"))
+        await ws.send_bytes(_worker_console_json_line(method, event))
+    event_cursor = len(events)
+    truncated_cursor = truncated
+
+    result = state.get("result") if isinstance(state.get("result"), dict) else None
+    if result:
+        try:
+            fingerprint = json.dumps(result, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            fingerprint = str(result)
+        if fingerprint != result_fingerprint:
+            await ws.send_bytes(_worker_console_json_line("backend result", result))
+            result_fingerprint = fingerprint
+    return event_cursor, truncated_cursor, result_fingerprint
+
+
+async def _stream_worker_console_log(
+    ws: WebSocket,
+    log_path: Path,
+    state_path: Path,
+    snapshot: dict[str, Any],
+) -> None:
+    await ws.send_bytes(_worker_console_intro(snapshot, log_path, state_path))
+
+    initial, offset, clipped = _read_worker_console_log_tail(log_path)
+    if clipped:
+        await ws.send_bytes(
+            _worker_console_bytes(
+                f"[worker log] showing last {_WORKER_CONSOLE_INITIAL_TAIL_BYTES} bytes\n"
+            )
+        )
+    if initial:
+        await ws.send_bytes(_worker_console_terminal_bytes(initial))
+    else:
+        await ws.send_bytes(
+            _worker_console_bytes("[worker log] waiting for worker output\n")
+        )
+
+    event_cursor = 0
+    truncated_cursor = -1
+    result_fingerprint = ""
+    event_cursor, truncated_cursor, result_fingerprint = await _send_worker_console_backend_updates(
+        ws,
+        state_path,
+        event_cursor=event_cursor,
+        truncated_cursor=truncated_cursor,
+        result_fingerprint=result_fingerprint,
+    )
+
+    while True:
+        await asyncio.sleep(_WORKER_CONSOLE_POLL_SECONDS)
+        delta, offset, rotated = _read_worker_console_log_delta(log_path, offset)
+        if rotated:
+            await ws.send_bytes(
+                _worker_console_bytes("[worker log] log rotated; following new file\n")
+            )
+        if delta:
+            await ws.send_bytes(_worker_console_terminal_bytes(delta))
+        event_cursor, truncated_cursor, result_fingerprint = await _send_worker_console_backend_updates(
+            ws,
+            state_path,
+            event_cursor=event_cursor,
+            truncated_cursor=truncated_cursor,
+            result_fingerprint=result_fingerprint,
+        )
+
+
+async def _drain_worker_console_client(ws: WebSocket) -> None:
+    while True:
+        msg = await ws.receive()
+        if msg.get("type") == "websocket.disconnect":
+            return
 
 
 def _build_sidecar_url(channel: str) -> Optional[str]:
@@ -4155,8 +4363,10 @@ async def pty_ws(ws: WebSocket) -> None:
         bridge.close()
 
 
+# The path keeps the original /console/pty suffix for deployed clients, but the
+# operator console is now a read-only worker log stream rather than a shell PTY.
 @app.websocket("/api/workers/{session_id}/tickets/{task_id}/console/pty")
-async def worker_console_pty_ws(ws: WebSocket, session_id: str, task_id: str) -> None:
+async def worker_console_log_ws(ws: WebSocket, session_id: str, task_id: str) -> None:
     if not _ws_auth_ok(ws):
         await ws.close(code=4401)
         return
@@ -4167,89 +4377,49 @@ async def worker_console_pty_ws(ws: WebSocket, session_id: str, task_id: str) ->
 
     await ws.accept()
 
-    if not _PTY_BRIDGE_AVAILABLE:
-        await ws.send_text(
-            "\r\n\x1b[31mWorker console unavailable: POSIX PTY support is missing.\x1b[0m\r\n"
-        )
-        await ws.close(code=1011)
-        return
-
     try:
-        argv, cwd, env = _resolve_worker_console_argv(session_id, task_id)
+        log_path, state_path, snapshot = _resolve_worker_console_log(session_id, task_id)
     except (KeyError, ValueError):
-        await ws.send_text("\r\n\x1b[31mWorker console unavailable: ticket not found.\x1b[0m\r\n")
+        await ws.send_text(
+            "\r\n\x1b[31mWorker console unavailable: ticket not found.\x1b[0m\r\n"
+        )
         await ws.close(code=1008)
         return
-    except FileNotFoundError as exc:
-        await ws.send_text(f"\r\n\x1b[33mWorker console unavailable: {exc}\x1b[0m\r\n")
-        await ws.close(code=1011)
-        return
     except Exception as exc:
-        _log.warning("worker console argv resolution failed: %s", exc)
+        _log.warning("worker console log resolution failed: %s", exc)
         await ws.send_text("\r\n\x1b[31mWorker console failed to resolve.\x1b[0m\r\n")
         await ws.close(code=1011)
         return
 
+    stream_task = asyncio.create_task(
+        _stream_worker_console_log(ws, log_path, state_path, snapshot)
+    )
+    drain_task = asyncio.create_task(_drain_worker_console_client(ws))
     try:
-        bridge = PtyBridge.spawn(argv, cwd=cwd, env=env)
-    except PtyUnavailableError as exc:
-        await ws.send_text(f"\r\n\x1b[31mWorker console unavailable: {exc}\x1b[0m\r\n")
-        await ws.close(code=1011)
-        return
-    except (FileNotFoundError, OSError) as exc:
-        await ws.send_text(f"\r\n\x1b[31mWorker console failed to start: {exc}\x1b[0m\r\n")
-        await ws.close(code=1011)
-        return
-
-    loop = asyncio.get_running_loop()
-
-    async def pump_pty_to_ws() -> None:
-        while True:
-            chunk = await loop.run_in_executor(
-                None, bridge.read, _PTY_READ_CHUNK_TIMEOUT
-            )
-            if chunk is None:
-                return
-            if not chunk:
-                await asyncio.sleep(0)
-                continue
+        done, pending = await asyncio.wait(
+            {stream_task, drain_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        for task in pending:
             try:
-                await ws.send_bytes(chunk)
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        for task in done:
+            try:
+                await task
+            except WebSocketDisconnect:
+                pass
             except Exception:
-                return
-
-    reader_task = asyncio.create_task(pump_pty_to_ws())
-
-    try:
-        while True:
-            msg = await ws.receive()
-            msg_type = msg.get("type")
-            if msg_type == "websocket.disconnect":
-                break
-            raw = msg.get("bytes")
-            if raw is None:
-                text = msg.get("text")
-                raw = text.encode("utf-8") if isinstance(text, str) else b""
-            if not raw:
-                continue
-
-            match = _RESIZE_RE.match(raw)
-            if match and match.end() == len(raw):
-                cols = int(match.group(1))
-                rows = int(match.group(2))
-                bridge.resize(cols=cols, rows=rows)
-                continue
-
-            bridge.write(raw)
-    except WebSocketDisconnect:
-        pass
+                if task is stream_task:
+                    _log.warning("worker console log stream failed", exc_info=True)
     finally:
-        reader_task.cancel()
-        try:
-            await reader_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        bridge.close()
+        if not stream_task.done():
+            stream_task.cancel()
+        if not drain_task.done():
+            drain_task.cancel()
 
 
 # ---------------------------------------------------------------------------

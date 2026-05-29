@@ -1805,7 +1805,7 @@ def test_worker_ticket_terminal_endpoint_returns_auth_scoped_feed(monkeypatch, t
     assert missing_page.status_code == 404
 
 
-def test_worker_ticket_console_returns_operator_state_and_shell_env(monkeypatch, tmp_path):
+def test_worker_ticket_console_returns_operator_state_and_log_paths(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from fastapi.testclient import TestClient
     from hermes_cli import discord_worker_boards as dwb
@@ -1851,7 +1851,7 @@ def test_worker_ticket_console_returns_operator_state_and_shell_env(monkeypatch,
     client = TestClient(app)
     client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
     resp = client.get(f"/api/workers/8186/tickets/{task.id}/console")
-    shell = dwb.worker_ticket_console_shell_for_session("8186", task.id)
+    stream = dwb.worker_ticket_console_log_for_session("8186", task.id)
 
     assert resp.status_code == 200
     assert resp.headers["cache-control"] == "no-store"
@@ -1865,10 +1865,10 @@ def test_worker_ticket_console_returns_operator_state_and_shell_env(monkeypatch,
     }
     assert "sk-proj-console-visible" in data["worker_log_tail"]
     assert "sk-proj-console-event" in rendered
-    assert shell["cwd"] == str(workspace)
-    assert shell["env"]["HERMES_KANBAN_TASK"] == task.id
-    assert shell["env"]["HERMES_KANBAN_BOARD"] == board.slug
-    assert shell["env"]["HERMES_KANBAN_WORKSPACE"] == str(workspace)
+    assert stream["log_path"] == str(log_path)
+    assert stream["state_path"].endswith(f"{task.id}.codex-state.json")
+    assert stream["snapshot"]["workspace"]["path"] == str(workspace)
+    assert stream["snapshot"]["task"]["id"] == task.id
 
 
 def test_worker_ticket_terminal_labels_opencode_state(monkeypatch, tmp_path):
