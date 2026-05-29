@@ -35,6 +35,9 @@ import json
 import time
 
 
+_FOREMAN_MASTER_TASK_KEY_PREFIX = "discord-foreman:"
+
+
 # Severity rungs, ordered least → most urgent. The UI colors them
 # amber (warning), orange (error), red (critical). Sorted outputs put
 # critical first so operators see the worst fires at the top.
@@ -513,6 +516,11 @@ def _rule_prose_phantom_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
         for pid in _parse_payload(ev).get("phantom_refs", []) or []:
             if pid not in phantom_refs:
                 phantom_refs.append(pid)
+    allowed_external_refs = _allowed_external_task_refs(task)
+    if allowed_external_refs:
+        phantom_refs = [pid for pid in phantom_refs if pid not in allowed_external_refs]
+        if not phantom_refs:
+            return []
     running = _task_field(task, "status") == "running"
     return [Diagnostic(
         kind="prose_phantom_refs",
@@ -530,6 +538,18 @@ def _rule_prose_phantom_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
         count=len(hits),
         data={"phantom_refs": phantom_refs},
     )]
+
+
+def _allowed_external_task_refs(task) -> set[str]:
+    """Return cross-board task ids intentionally referenced by this task."""
+    key = str(_task_field(task, "idempotency_key", "") or "")
+    if not key.startswith(_FOREMAN_MASTER_TASK_KEY_PREFIX):
+        return set()
+    parts = key.split(":", 5)
+    if len(parts) < 3:
+        return set()
+    source_task = parts[2].strip()
+    return {source_task} if source_task else set()
 
 
 def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
