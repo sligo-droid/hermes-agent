@@ -386,6 +386,46 @@ def test_discord_status_targets_keep_source_thread_hammer_during_active_foreman(
     assert by_board[foreman.slug]["hide_source_links"] is True
 
 
+def test_discord_status_targets_keep_source_thread_hammer_during_master_foreman_task(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli.discord_worker_foreman import ForemanIssue, create_foreman_master_task
+
+    source = dwb.set_goal(
+        thread_id="99022",
+        goal="Original worker request",
+        chat_id="parent-99022",
+    )
+    conn = kb.connect(board=source.slug)
+    try:
+        task = kb.list_tasks(conn, include_archived=False)[0]
+        claimed = kb.claim_task(conn, task.id)
+        assert claimed is not None
+        kb.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+    dwb._update_worker_meta(source.slug, {"goal_status": "done", "phase": "complete"})
+
+    create_foreman_master_task(
+        ForemanIssue(
+            kind="worker_errored",
+            board=source.slug,
+            task_id="source-task",
+            severity="error",
+            title="Worker execution failed",
+            evidence={"thread_id": "99022", "task_status": "blocked"},
+        ),
+        master_board="default",
+        assignee="default",
+    )
+
+    targets = dwb.thread_status_targets()
+    by_board = {target["board"]: target for target in targets}
+
+    assert by_board[source.slug]["state"] == "done"
+    assert by_board[source.slug]["reaction_state"] == "foreman"
+
+
 def test_discord_terminal_status_target_syncs_only_when_pending(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb
