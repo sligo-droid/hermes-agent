@@ -3509,6 +3509,15 @@ class DiscordAdapter(BasePlatformAdapter):
         board = str(target.get("board") or "").strip()
         if not board:
             return None
+        if target.get("foreman_generated"):
+            try:
+                from hermes_cli.discord_worker_boards import mark_thread_status_synced
+
+                mark_thread_status_synced(board, completion_message=True)
+            except Exception:
+                logger.debug("[%s] Failed to clear foreman completion notice flag", self.name, exc_info=True)
+                return None
+            return board
         thread = await self._resolve_summary_channel(str(target.get("thread_id") or ""))
         if thread is None or not hasattr(thread, "send"):
             return None

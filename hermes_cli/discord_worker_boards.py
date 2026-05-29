@@ -2628,6 +2628,7 @@ def thread_status_targets() -> list[dict[str, Any]]:
             target["reaction_state"] = "foreman"
         if _is_foreman_generated_worker(worker):
             target["hide_source_links"] = True
+            target["foreman_generated"] = True
         targets.append(target)
     return targets
 

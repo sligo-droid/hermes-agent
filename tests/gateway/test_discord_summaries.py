@@ -1233,6 +1233,48 @@ async def test_send_kanban_completion_notice_posts_once(adapter, monkeypatch, tm
 
 
 @pytest.mark.asyncio
+async def test_send_kanban_completion_notice_suppresses_foreman_success(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 200 else None
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="200",
+        goal="Foreman escalation: resolve a Discord worker issue.",
+        board_slug="foreman-success-notice",
+    )
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_completion_message_pending": True,
+        },
+    )
+
+    target = {
+        "board": board.slug,
+        "thread_id": "200",
+        "chat_id": "200",
+        "state": "done",
+        "outcome": "Done. Foreman recovered the source board.",
+        "terminal_completion_message_pending": True,
+        "foreman_generated": True,
+    }
+    sent = await adapter.send_kanban_completion_notice(target)
+
+    assert sent == board.slug
+    assert thread.sent == []
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "terminal_completion_message_pending" not in worker
+
+
+@pytest.mark.asyncio
 async def test_sync_kanban_feature_summary_refuses_mismatched_board(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     parent = FakeTextChannel(channel_id=100)

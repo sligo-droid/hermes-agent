@@ -542,6 +542,36 @@ def test_discord_kanban_typing_watcher_sends_completion_notice(tmp_path, monkeyp
     assert "terminal_completion_message_pending" not in worker
 
 
+def test_discord_thread_status_targets_mark_foreman_generated_completion(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.start_direct_goal(
+        thread_id="99021",
+        goal="Foreman escalation: resolve a Discord worker issue.",
+        chat_id="parent-99021",
+        board_slug="foreman-success-target",
+    )
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_reaction_sync_pending": True,
+            "terminal_summary_sync_pending": True,
+            "terminal_completion_message_pending": True,
+        },
+    )
+
+    target = dwb.thread_status_targets()[0]
+
+    assert target["board"] == board.slug
+    assert target["state"] == "done"
+    assert target["foreman_generated"] is True
+    assert target["hide_source_links"] is True
+    assert target["terminal_completion_message_pending"] is True
+
+
 def test_discord_kanban_typing_watcher_skips_blocked_status_sync(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb
