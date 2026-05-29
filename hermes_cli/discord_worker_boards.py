@@ -932,27 +932,16 @@ def worker_ticket_console_for_session(session_id: str, task_id: str) -> dict[str
     return _worker_ticket_console_for_board(board, task_id, worker=worker)
 
 
-def worker_ticket_console_shell_for_session(session_id: str, task_id: str) -> dict[str, Any]:
-    """Return argv/cwd/env for an operator shell scoped to one worker ticket."""
+def worker_ticket_console_log_for_session(session_id: str, task_id: str) -> dict[str, Any]:
+    """Return paths and snapshot data for the authenticated operator log."""
     board = resolve_public_session_board(session_id)
     worker = _read_worker_meta(board)
     task, runs, _events, current_run, codex_state = _ticket_console_parts(board, task_id)
-    workspace_path = _ticket_workspace_path(task, board=board)
-    if not workspace_path or not Path(workspace_path).expanduser().is_dir():
-        raise FileNotFoundError("worker workspace is not available")
-    backend = _worker_state_backend(codex_state)
-    shell = os.getenv("SHELL") or "/bin/bash"
-    argv = [shell, "-l"] if Path(shell).name in {"bash", "zsh", "fish", "sh"} else [shell]
     return {
-        "argv": argv,
-        "cwd": str(Path(workspace_path).expanduser()),
-        "env": _worker_console_shell_env(
-            board,
-            task,
-            workspace_path=str(Path(workspace_path).expanduser()),
-            backend=backend,
-            current_run=current_run,
-        ),
+        "board": board,
+        "task_id": str(task.id),
+        "log_path": str(kanban_db.worker_log_path(task.id, board=board)),
+        "state_path": str(codex_worker_state_path(task.id, board=board)),
         "snapshot": _worker_ticket_console_payload(
             board,
             task,
@@ -1240,66 +1229,6 @@ def _ticket_workspace_path(task: Any, *, board: str) -> str:
     if kind == "worktree":
         return str(Path.cwd() / ".worktrees" / str(task.id))
     return ""
-
-
-def _worker_console_shell_env(
-    board: str,
-    task: Any,
-    *,
-    workspace_path: str,
-    backend: str,
-    current_run: Optional[dict[str, Any]],
-) -> dict[str, str]:
-    env = os.environ.copy()
-    env.update(
-        {
-            "HERMES_KANBAN_BOARD": str(board),
-            "HERMES_KANBAN_TASK": str(task.id),
-            "HERMES_KANBAN_DB": str(kanban_db.kanban_db_path(board=board)),
-            "HERMES_KANBAN_WORKSPACE": workspace_path,
-            "HERMES_KANBAN_WORKSPACES_ROOT": str(kanban_db.workspaces_root(board=board)),
-            "HERMES_CODING_WORKER_BACKEND": backend,
-            "HERMES_WORKER_CONSOLE": "1",
-        }
-    )
-    run_id = (current_run or {}).get("id") or getattr(task, "current_run_id", None)
-    if run_id is not None:
-        env["HERMES_KANBAN_RUN_ID"] = str(run_id)
-    if getattr(task, "claim_lock", None):
-        env["HERMES_KANBAN_CLAIM_LOCK"] = str(task.claim_lock)
-    existing_pythonpath = env.get("PYTHONPATH", "")
-    repo_root = str(Path(__file__).resolve().parent.parent)
-    env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else repo_root
-    if backend == "codex":
-        codex_home = _ticket_codex_home_path(str(task.id))
-        if codex_home is not None:
-            env["CODEX_HOME"] = str(codex_home)
-    try:
-        from hermes_constants import get_github_cli_config_dir
-
-        gh_config_dir = get_github_cli_config_dir(env)
-        if gh_config_dir:
-            env["GH_CONFIG_DIR"] = gh_config_dir
-    except Exception:
-        pass
-    return env
-
-
-def _ticket_codex_home_path(task_id: str) -> Optional[Path]:
-    try:
-        from hermes_cli.config import load_config
-        from hermes_constants import get_hermes_home
-
-        cfg = load_config() or {}
-        worker_cfg = (cfg.get("kanban") or {}).get("discord_worker") or {}
-        root = Path(
-            worker_cfg.get("codex_home_root")
-            or (get_hermes_home() / "tmp" / "codex-worker-homes")
-        )
-        path = root / str(task_id)
-        return path if path.is_dir() else None
-    except Exception:
-        return None
 
 
 def _public_terminal_run(run: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:

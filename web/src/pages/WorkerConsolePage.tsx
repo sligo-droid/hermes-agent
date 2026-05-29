@@ -136,7 +136,8 @@ export default function WorkerConsolePage() {
     if (!host || !sessionId || !taskId) return;
 
     const term = new Terminal({
-      cursorBlink: true,
+      cursorBlink: false,
+      disableStdin: true,
       fontFamily:
         "'JetBrains Mono', 'Cascadia Mono', 'Fira Code', Menlo, Consolas, monospace",
       fontSize: 13,
@@ -162,9 +163,6 @@ export default function WorkerConsolePage() {
       } catch {
         return;
       }
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
-      }
     };
 
     const resizeObserver = new ResizeObserver(fitNow);
@@ -173,13 +171,6 @@ export default function WorkerConsolePage() {
 
     let unmounting = false;
     let ws: WebSocket | null = null;
-    const inputDisposable = term.onData((data) => {
-      if (ws?.readyState === WebSocket.OPEN) ws.send(data);
-    });
-    const resizeDisposable = term.onResize(({ cols, rows }) => {
-      if (ws?.readyState === WebSocket.OPEN) ws.send(`\x1b[RESIZE:${cols};${rows}]`);
-    });
-
     void (async () => {
       try {
         const authParam = await buildWsAuthParam();
@@ -210,8 +201,6 @@ export default function WorkerConsolePage() {
 
     return () => {
       unmounting = true;
-      inputDisposable.dispose();
-      resizeDisposable.dispose();
       resizeObserver.disconnect();
       ws?.close();
       term.dispose();
@@ -244,7 +233,7 @@ export default function WorkerConsolePage() {
             <span>ticket: {taskId}</span>
             <span>backend: {snapshot?.backend || "unknown"}</span>
             <span>status: {snapshot?.task.status || "unknown"}</span>
-            <span>shell: {terminalStatus}</span>
+            <span>stream: {terminalStatus}</span>
           </div>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -277,7 +266,7 @@ export default function WorkerConsolePage() {
       <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,1fr)_390px]">
         <section className="flex min-h-[520px] min-w-0 flex-col overflow-hidden rounded-lg border border-current/20 bg-black/70">
           <div className="flex items-center justify-between border-b border-current/15 px-3 py-2 text-xs text-text-secondary">
-            <span>Operator shell in ticket workspace</span>
+            <span>OpenCode/Codex worker log (read-only)</span>
             <span>{snapshot?.workspace.available ? snapshot.workspace.path : "workspace unavailable"}</span>
           </div>
           <div ref={hostRef} className="min-h-0 flex-1 p-2" />
