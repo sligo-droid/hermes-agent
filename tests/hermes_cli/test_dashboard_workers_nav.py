@@ -14,3 +14,19 @@ def test_workers_nav_link_appears_under_plugins_and_reload_document():
     assert "reloadDocument: true" in content
     assert "pluginItems: [WORKERS_NAV_ITEM, ...nav.pluginItems]" in content
     assert "reloadDocument={item.reloadDocument}" in content
+
+
+def test_worker_console_uses_shared_dashboard_websocket_auth():
+    page_tsx = (
+        Path(__file__).resolve().parents[2]
+        / "web"
+        / "src"
+        / "pages"
+        / "WorkerConsolePage.tsx"
+    )
+
+    content = page_tsx.read_text(encoding="utf-8")
+
+    assert "buildWsAuthParam" in content
+    assert "new URLSearchParams({ [authParam[0]]: authParam[1] })" in content
+    assert "__HERMES_SESSION_TOKEN__" not in content
