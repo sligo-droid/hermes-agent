@@ -41,11 +41,14 @@ function truncateUserId(id: string): string {
 }
 
 export function AuthWidget({ className }: AuthWidgetProps) {
+  const authRequired = Boolean(window.__HERMES_AUTH_REQUIRED__);
   const [me, setMe] = useState<AuthMeResponse | null>(null);
-  const [hidden, setHidden] = useState(false);
+  const [hidden, setHidden] = useState(!authRequired);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (!authRequired) return;
+
     let cancelled = false;
     api
       .getAuthMe()
@@ -55,11 +58,9 @@ export function AuthWidget({ className }: AuthWidgetProps) {
       })
       .catch((err: unknown) => {
         if (cancelled) return;
-        // 401 from /api/auth/me means the gate isn't engaged in this
-        // process (loopback mode) — render nothing. fetchJSON throws an
-        // Error with the status code as a prefix; the global 401
-        // handler only redirects on the structured envelope, so a plain
-        // 401 from /api/auth/me with no envelope bubbles up here.
+        // 401/403 from /api/auth/me means the gate state changed after
+        // the page loaded or the session vanished; render nothing rather
+        // than treating the sidebar identity probe as a page-level error.
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.startsWith("401:") || msg.startsWith("403:")) {
           setHidden(true);
@@ -70,7 +71,7 @@ export function AuthWidget({ className }: AuthWidgetProps) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [authRequired]);
 
   if (hidden) return null;
 
