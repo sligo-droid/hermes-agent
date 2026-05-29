@@ -2575,6 +2575,12 @@ def thread_status_targets() -> list[dict[str, Any]]:
     """Return Discord thread targets with their current board state."""
     targets: list[dict[str, Any]] = []
     active_foreman_sources = _active_foreman_source_boards()
+    try:
+        from hermes_cli.discord_worker_foreman import active_master_foreman_source_boards
+
+        active_foreman_sources.update(active_master_foreman_source_boards())
+    except Exception:
+        pass
     for board_meta in kanban_db.list_boards(include_archived=False):
         board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
         worker = _read_worker_meta(board)

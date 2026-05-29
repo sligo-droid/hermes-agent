@@ -306,6 +306,73 @@ def test_coalesce_foreman_issues_keeps_one_autonomous_issue_per_source(monkeypat
     assert foreman.coalesce_foreman_issues([warning, error]) == [error]
 
 
+def test_create_foreman_master_task_uses_configurable_board_and_reuses(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_db
+    from hermes_cli import discord_worker_foreman as foreman
+
+    issue = _alert_issue()
+
+    first = foreman.create_foreman_master_task(issue, master_board="ops", assignee="default")
+    second = foreman.create_foreman_master_task(issue, master_board="ops", assignee="default")
+
+    assert first["created"] is True
+    assert second["created"] is False
+    assert second["task_id"] == first["task_id"]
+    assert first["master_board"] == "ops"
+
+    conn = kanban_db.connect(board="ops")
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task.id == first["task_id"]
+    assert task.created_by == "discord-worker-foreman"
+    assert task.assignee == "default"
+    assert task.status == "ready"
+    assert task.tenant == "discord-123"
+    assert "<foreman-metadata>" in (task.body or "")
+    assert foreman.active_master_foreman_source_boards(master_board="ops") == {"discord-123"}
+
+
+def test_blocked_master_foreman_task_becomes_human_intervention(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_db
+    from hermes_cli import discord_worker_foreman as foreman
+
+    created = foreman.create_foreman_master_task(_alert_issue(), master_board="ops", assignee="default")
+    conn = kanban_db.connect(board="ops")
+    try:
+        assert kanban_db.block_task(
+            conn,
+            created["task_id"],
+            reason="Human must rotate the vendor credential.",
+        )
+    finally:
+        conn.close()
+
+    issues = foreman.collect_human_intervention_issues(
+        now=10_000,
+        blocked_board_min_age_seconds=0,
+        master_board="ops",
+    )
+
+    assert [(issue.kind, issue.board, issue.task_id) for issue in issues] == [
+        ("human_intervention_required", "discord-123", "t1")
+    ]
+    assert issues[0].evidence["foreman_board"] == "ops"
+    assert issues[0].evidence["foreman_task_id"] == created["task_id"]
+    assert "vendor credential" in issues[0].evidence["manual_intervention_reason"]
+    assert foreman.active_master_foreman_source_boards(master_board="ops") == set()
+    assert foreman.active_master_foreman_source_boards(
+        master_board="ops",
+        statuses=foreman.FOREMAN_MASTER_TASK_SUPPRESS_STATUSES,
+    ) == {"discord-123"}
+
+
 def test_missing_read_broker_detector_matches_allowlisted_errors():
     from hermes_cli.discord_worker_foreman import TaskSnapshot, detect_missing_read_broker
 
@@ -575,8 +642,8 @@ def test_human_intervention_scan_alerts_blocked_foreman_board_without_assessment
     assert first[0].evidence["source_blocked_reason"] == "Need external API credentials."
     assert first[0].evidence["manual_intervention_type"] == "foreman_blocked"
     assert first[0].evidence["manual_intervention_steps"] == [
-        "Open the Foreman board linked in this alert and inspect the blocked task.",
-        "Decide whether to retry or reassign the Foreman worker, add missing human context, or cancel the attempt.",
+        "Open the master Kanban recovery task linked in this alert and inspect the blocked task.",
+        "Decide whether to retry or reassign the recovery worker, add missing human context, or cancel the attempt.",
         "Reply in Discord with the next action Hermes should take, then ask Hermes to retry the blocked source task if appropriate.",
     ]
     assert first[0].evidence["llm_confidence"] == "high"

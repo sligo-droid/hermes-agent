@@ -6576,6 +6576,7 @@ class GatewayRunner:
             "enabled": is_truthy_value(raw.get("enabled"), default=False),
             "channel_id": _DISCORD_FOREMAN_DEFAULT_CHANNEL_ID,
             "mention": _DISCORD_FOREMAN_DEFAULT_MENTION,
+            "master_board": str(raw.get("master_board") or "default").strip() or "default",
             "scan_interval_seconds": self._discord_foreman_clamped_int(
                 raw.get("scan_interval_seconds"), 300, 10, 3600,
             ),
@@ -7023,6 +7024,29 @@ class GatewayRunner:
         )
         await self._handle_goal_command(event)
 
+    async def _discord_foreman_enqueue_master_task(
+        self,
+        adapter: Any,
+        *,
+        issue: Any,
+        master_board: str,
+    ) -> None:
+        source_context = self._discord_foreman_issue_source_context(issue)
+        if not str(source_context.get("thread_id") or "").strip():
+            raise RuntimeError("Discord foreman issue has no source thread")
+        from hermes_cli import discord_worker_foreman as _foreman
+
+        enriched_issue = self._discord_foreman_issue_with_source_thread_url(
+            issue,
+            source_context,
+        )
+        await asyncio.to_thread(
+            _foreman.create_foreman_master_task,
+            enriched_issue,
+            master_board=master_board,
+        )
+        await self._discord_foreman_sync_source_reaction(adapter, source_context)
+
     async def _discord_worker_foreman_watcher(self) -> None:
         """Optionally scan Discord worker boards and send foreman alerts."""
         if getattr(self, "_discord_worker_foreman_watcher_active", False):
@@ -7105,6 +7129,7 @@ class GatewayRunner:
                                         blocked_board_min_age_seconds=int(
                                             watcher_cfg["blocked_board_min_age_seconds"]
                                         ),
+                                        master_board=watcher_cfg["master_board"],
                                     )
                                 )
                                 if not startup_baseline_checked:
@@ -7122,7 +7147,10 @@ class GatewayRunner:
                                             )
                                         return []
                                 due = _foreman.alerts_due(issues, config=alert_config, now=now)
-                                return _foreman.coalesce_foreman_issues(due)
+                                return _foreman.coalesce_foreman_issues(
+                                    due,
+                                    master_board=watcher_cfg["master_board"],
+                                )
 
                             due = await asyncio.to_thread(_collect_due_alerts)
                             for issue in due:
@@ -7162,12 +7190,10 @@ class GatewayRunner:
                                                 getattr(result, "error", "foreman human alert send failed")
                                             )
                                     else:
-                                        await self._discord_foreman_start_goal(
+                                        await self._discord_foreman_enqueue_master_task(
                                             adapter,
-                                            channel_id=watcher_cfg["channel_id"],
                                             issue=issue,
-                                            prompt=_foreman.render_foreman_goal_prompt(issue),
-                                            title=_foreman.foreman_goal_thread_title(issue),
+                                            master_board=watcher_cfg["master_board"],
                                         )
                                 except Exception as exc:
                                     safe_error = self._discord_foreman_safe_log_text(exc)

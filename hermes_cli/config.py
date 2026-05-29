@@ -1818,6 +1818,7 @@ DEFAULT_CONFIG = {
                 "enabled": False,
                 "channel_id": "1504252294495998043",
                 "mention": "<@&1503914570077442058>",
+                "master_board": "default",
                 "scan_interval_seconds": 300,
                 "blocked_board_min_age_seconds": 600,
                 "cooldown_seconds": 3600,

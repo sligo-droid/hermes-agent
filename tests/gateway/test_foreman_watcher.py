@@ -143,6 +143,7 @@ def test_foreman_defaults_are_disabled_with_expected_discord_target():
     assert foreman["enabled"] is False
     assert foreman["channel_id"] == "1504252294495998043"
     assert foreman["mention"] == "<@&1503914570077442058>"
+    assert foreman["master_board"] == "default"
     assert foreman["blocked_board_min_age_seconds"] == 600
 
 
@@ -252,11 +253,13 @@ def test_foreman_watcher_requires_discord_adapter_and_connection(monkeypatch):
     assert disconnected.sent == []
 
 
-def test_foreman_watcher_starts_due_issue_as_internal_goal(monkeypatch):
+def test_foreman_watcher_enqueues_due_issue_on_master_board(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     _patch_config(monkeypatch, _enabled_config())
     _patch_lock(monkeypatch)
     _patch_no_human_escalations(monkeypatch)
     from hermes_cli import discord_worker_foreman as foreman
+    from hermes_cli import kanban_db
 
     first = _issue(
         "t1",
@@ -277,20 +280,11 @@ def test_foreman_watcher_starts_due_issue_as_internal_goal(monkeypatch):
         return [first]
 
     monkeypatch.setattr(foreman, "alerts_due", fake_alerts_due)
-    monkeypatch.setattr(foreman, "render_foreman_goal_prompt", lambda issue: f"/goal Fix {issue.task_id}")
-    monkeypatch.setattr(foreman, "foreman_goal_thread_title", lambda issue: f"Foreman {issue.task_id}")
     monkeypatch.setattr(foreman, "record_alert_sent", lambda issue: sent.append(issue.task_id))
     monkeypatch.setattr(foreman, "record_alert_failed", lambda issue, error: failed.append((issue.task_id, error)))
 
     adapter = ForemanAdapter()
     runner = _runner(adapter)
-    goal_events = []
-
-    async def fake_handle_goal(event):
-        goal_events.append(event)
-        return None
-
-    monkeypatch.setattr(runner, "_handle_goal_command", fake_handle_goal)
     asyncio.run(_run_one_foreman_tick(monkeypatch, runner))
 
     assert [issue.task_id for issue in due_calls[0][0]] == ["t1", "t2"]
@@ -298,27 +292,19 @@ def test_foreman_watcher_starts_due_issue_as_internal_goal(monkeypatch):
     assert due_calls[0][1]["daily_cap_per_board"] == 200
     assert due_calls[0][1]["terminal_suppression_age_seconds"] == 0
     assert adapter.sent == []
-    assert len(adapter.created_goals) == 1
-    created_goal = adapter.created_goals[0]
-    assert created_goal["parent_chat_id"] == "source-thread-1"
-    assert created_goal["name"] == "Foreman t1"
-    assert created_goal["initial_request"] == "/goal Fix t1"
-    assert created_goal["project_context"] is None
-    assert created_goal["kanban_board"]["slug"].startswith("foreman-")
-    assert created_goal["hide_source_links"] is True
-    assert created_goal["source_board"] == "discord-1"
-    assert created_goal["source_task_id"] == "t1"
-    assert created_goal["source_task_url"] == ""
-    assert created_goal["source_kanban_url"] == ""
-    assert created_goal["source_discord_thread_url"] == ""
-    assert len(goal_events) == 1
-    event = goal_events[0]
-    assert event.text == "/goal Fix t1"
-    assert event.internal is True
-    assert event.source.thread_id == "source-thread-1"
-    assert event.source.parent_chat_id == "source-parent"
-    assert event.source.user_id == "system:foreman"
-    assert event.feature_summary["message_id"] == "goal-message-1"
+    assert adapter.created_goals == []
+    conn = kanban_db.connect(board="default")
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task.created_by == "discord-worker-foreman"
+    assert task.status == "ready"
+    assert task.tenant == "discord-1"
+    assert task.idempotency_key.startswith("discord-foreman:discord-1:t1:worker_errored:")
+    assert "create child tickets on this same master board" in (task.body or "")
     assert adapter.synced_reactions == [
         {
             "board": "discord-1",
@@ -523,14 +509,17 @@ def test_foreman_watcher_records_send_result_failure(monkeypatch):
     monkeypatch.setattr(foreman, "collect_foreman_issues", lambda now=None, **kwargs: [issue])
     monkeypatch.setattr(foreman, "startup_baseline_needed", lambda: False)
     monkeypatch.setattr(foreman, "alerts_due", lambda issues, *, config=None, now=None: list(issues))
-    monkeypatch.setattr(foreman, "render_foreman_goal_prompt", lambda issue: "/goal Fix worker")
-    monkeypatch.setattr(foreman, "foreman_goal_thread_title", lambda issue: "Foreman worker")
+    monkeypatch.setattr(
+        foreman,
+        "create_foreman_master_task",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("Authorization: Bearer abc123 ghp_abcdefghijklmnopqrst ~/.hermes/config.yaml")
+        ),
+    )
     monkeypatch.setattr(foreman, "record_alert_sent", lambda issue: sent.append(issue.task_id))
     monkeypatch.setattr(foreman, "record_alert_failed", lambda issue, error: failed.append((issue.task_id, error)))
 
-    adapter = ForemanAdapter(
-        error=RuntimeError("Authorization: Bearer abc123 ghp_abcdefghijklmnopqrst ~/.hermes/config.yaml")
-    )
+    adapter = ForemanAdapter()
     asyncio.run(_run_one_foreman_tick(monkeypatch, _runner(adapter)))
 
     assert sent == []

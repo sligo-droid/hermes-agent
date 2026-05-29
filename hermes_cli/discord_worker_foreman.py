@@ -1,4 +1,4 @@
-"""Read-only foreman scanner for Discord worker Kanban boards."""
+"""Foreman scanner and recovery-ticket writer for Discord worker boards."""
 
 from __future__ import annotations
 
@@ -36,6 +36,10 @@ FOREMAN_DISCORD_CHANNEL_ID = "1504252294495998043"
 FOREMAN_DISCORD_MENTION = "<@&1503914570077442058>"
 BLOCKED_BOARD_MIN_AGE_SECONDS = 10 * 60
 MANUAL_ESCALATION_TASK = "foreman_manual_escalation"
+FOREMAN_MASTER_TASK_CREATED_BY = "discord-worker-foreman"
+FOREMAN_MASTER_TASK_KEY_PREFIX = "discord-foreman"
+FOREMAN_MASTER_TASK_ACTIVE_STATUSES = frozenset({"triage", "todo", "ready", "running", "review"})
+FOREMAN_MASTER_TASK_SUPPRESS_STATUSES = FOREMAN_MASTER_TASK_ACTIVE_STATUSES | {"blocked"}
 _ACTIVE_BOARD_TASK_STATUSES = frozenset(
     {"triage", "todo", "scheduled", "ready", "running", "blocked", "review"}
 )
@@ -256,7 +260,11 @@ def collect_foreman_issues(
     return sorted(issues, key=lambda issue: (issue.board, issue.task_id, issue.kind))
 
 
-def coalesce_foreman_issues(issues: Iterable[ForemanIssue]) -> list[ForemanIssue]:
+def coalesce_foreman_issues(
+    issues: Iterable[ForemanIssue],
+    *,
+    master_board: Optional[str] = None,
+) -> list[ForemanIssue]:
     """Suppress redundant autonomous foreman work for a source board.
 
     Foreman should make at most one recovery path visible for a source board at
@@ -265,6 +273,12 @@ def coalesce_foreman_issues(issues: Iterable[ForemanIssue]) -> list[ForemanIssue
     autonomous foreman retry prompt for that tick.
     """
     active_sources = _active_foreman_source_boards()
+    active_sources.update(
+        active_master_foreman_source_boards(
+            master_board=master_board,
+            statuses=FOREMAN_MASTER_TASK_SUPPRESS_STATUSES,
+        )
+    )
     seen_sources = set(active_sources)
     coalesced: list[ForemanIssue] = []
     for issue in sorted(
@@ -295,6 +309,7 @@ def collect_human_intervention_issues(
     *,
     blocked_board_min_age_seconds: int = BLOCKED_BOARD_MIN_AGE_SECONDS,
     assessment_fn: Optional[Any] = None,
+    master_board: Optional[str] = None,
 ) -> list[ForemanIssue]:
     """Return human-escalation issues for blocked foreman-generated boards.
 
@@ -318,6 +333,7 @@ def collect_human_intervention_issues(
     )
     issues: list[ForemanIssue] = []
     seen_keys: set[str] = set()
+    issues.extend(_collect_blocked_master_foreman_tasks(master_board=master_board, now=now))
     for snapshot in collect_board_snapshots(foreman_generated_only=True):
         stalled = []
         if _foreman_board_explicitly_blocked(snapshot):
@@ -802,6 +818,128 @@ def render_foreman_goal_prompt(issue: ForemanIssue) -> str:
     return _truncate_text("\n".join(lines), DISCORD_ALERT_LIMIT)
 
 
+def create_foreman_master_task(
+    issue: ForemanIssue,
+    *,
+    master_board: Optional[str] = None,
+    assignee: Optional[str] = None,
+) -> dict[str, Any]:
+    """Create or reuse the master-board task for a Discord worker issue."""
+    board = _resolve_master_board(master_board)
+    owner = _resolve_master_assignee(assignee)
+    source_board = _issue_source_board(issue)
+    source_task = _issue_source_task_id(issue)
+    idempotency_key = _foreman_master_task_idempotency_key(issue)
+    if board == kanban_db.DEFAULT_BOARD:
+        kanban_db.init_db(board=board)
+    else:
+        kanban_db.create_board(
+            board,
+            name="Hermes Foreman",
+            description="Hermes-controlled recovery tasks for blocked worker boards",
+        )
+    conn = kanban_db.connect(board=board)
+    try:
+        existing = _find_master_task_by_key(conn, idempotency_key)
+        if existing is not None:
+            return {
+                "task_id": existing.id,
+                "created": False,
+                "master_board": board,
+                "source_board": source_board,
+                "source_task_id": source_task,
+                "idempotency_key": idempotency_key,
+            }
+        task_id = kanban_db.create_task(
+            conn,
+            title=_foreman_master_task_title(issue),
+            body=render_foreman_master_task_body(issue),
+            assignee=owner,
+            created_by=FOREMAN_MASTER_TASK_CREATED_BY,
+            workspace_kind="dir",
+            workspace_path=str(_repo_root()),
+            tenant=source_board or None,
+            priority=100,
+            idempotency_key=idempotency_key,
+            max_runtime_seconds=1800,
+            board=board,
+        )
+        return {
+            "task_id": task_id,
+            "created": True,
+            "master_board": board,
+            "source_board": source_board,
+            "source_task_id": source_task,
+            "idempotency_key": idempotency_key,
+        }
+    finally:
+        conn.close()
+
+
+def render_foreman_master_task_body(issue: ForemanIssue) -> str:
+    """Render the body for a master-board recovery task."""
+    evidence = _renderable_evidence(issue.evidence)
+    source_board = _issue_source_board(issue)
+    source_task = _issue_source_task_id(issue)
+    source_url = str(evidence.get("session_url") or "").strip()
+    metadata = {
+        "source_board": source_board,
+        "source_task_id": source_task,
+        "source_issue_kind": str(issue.kind or ""),
+        "source_summary": _truncate_text(_sanitize_text(str(issue.title or "")), 300),
+        "session_url": source_url,
+        "run_id": evidence.get("run_id"),
+        "run_outcome": evidence.get("run_outcome"),
+        "run_error": evidence.get("run_error"),
+        "sidecar_error": evidence.get("sidecar_error"),
+        "error_excerpt": evidence.get("error_excerpt"),
+        "thread_id": evidence.get("thread_id"),
+        "source_discord_thread_url": evidence.get("source_discord_thread_url"),
+    }
+    metadata = {k: v for k, v in metadata.items() if v not in (None, "")}
+    lines = [
+        "Resolve a blocked Discord worker board from the Hermes master Kanban board.",
+        "",
+        "Source:",
+        f"- Board: {source_board or issue.board}",
+        f"- Task: {source_task or issue.task_id}",
+        f"- Detector: {issue.kind}",
+        f"- Summary: {_truncate_text(_sanitize_text(str(issue.title or '')), 240)}",
+    ]
+    if source_url:
+        lines.append(f"- Board URL: {source_url}")
+    lines.extend(
+        [
+            "",
+            "Instructions:",
+            "- Inspect the source board and task from live Kanban state before changing anything.",
+            "- Make one autonomous recovery attempt when safe: repair board state, unblock, retry, close, or reassign as appropriate.",
+            "- If the fix needs multiple steps, create child tickets on this same master board instead of creating a new foreman board.",
+            "- If progress requires human-only credentials, admin access, or external infrastructure, block this master task with the exact manual-intervention reason.",
+            "- Keep Discord quiet unless human input is required.",
+            "- Verify the source board can progress or is correctly terminal, then complete this task with concise evidence.",
+        ]
+    )
+    if evidence:
+        lines.extend(["", "Evidence:"])
+        for key in sorted(evidence):
+            value = evidence[key]
+            if key == "manual_intervention_steps":
+                continue
+            if key == "session_url" and (not isinstance(value, str) or not _is_public_url(value)):
+                continue
+            lines.append(f"- {key}: {_truncate_text(_sanitize_text(str(value)), 300)}")
+    lines.extend(
+        [
+            "",
+            "<foreman-metadata>",
+            json.dumps(metadata, sort_keys=True, ensure_ascii=False),
+            "</foreman-metadata>",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def foreman_goal_thread_title(issue: ForemanIssue) -> str:
     """Return a compact Discord thread title for a foreman-created goal."""
     evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
@@ -1136,6 +1274,35 @@ def _active_foreman_source_boards() -> set[str]:
         if not _is_active_foreman_board(snapshot):
             continue
         source = _foreman_source_from_request(snapshot.request_text).get("source_board")
+        if source:
+            sources.add(source)
+    return sources
+
+
+def active_master_foreman_source_boards(
+    *,
+    master_board: Optional[str] = None,
+    statuses: Optional[Iterable[str]] = None,
+) -> set[str]:
+    board = _resolve_master_board(master_board)
+    wanted = set(statuses or FOREMAN_MASTER_TASK_ACTIVE_STATUSES)
+    try:
+        conn = kanban_db.connect(board=board)
+    except Exception:
+        return set()
+    try:
+        rows = conn.execute(
+            "SELECT idempotency_key, body FROM tasks "
+            "WHERE idempotency_key LIKE ? AND status IN ("
+            + ",".join("?" for _ in wanted)
+            + ")",
+            (f"{FOREMAN_MASTER_TASK_KEY_PREFIX}:%", *sorted(wanted)),
+        ).fetchall()
+    finally:
+        conn.close()
+    sources: set[str] = set()
+    for row in rows:
+        source = _source_board_from_master_task_row(row)
         if source:
             sources.add(source)
     return sources
@@ -1659,8 +1826,8 @@ def _foreman_blocked_attention_assessment(issue: ForemanIssue, *, now: int) -> d
         "reason": _truncate_text(_sanitize_text(reason), 300),
         "intervention_type": "foreman_blocked",
         "instructions": [
-            "Open the Foreman board linked in this alert and inspect the blocked task.",
-            "Decide whether to retry or reassign the Foreman worker, add missing human context, or cancel the attempt.",
+            "Open the master Kanban recovery task linked in this alert and inspect the blocked task.",
+            "Decide whether to retry or reassign the recovery worker, add missing human context, or cancel the attempt.",
             "Reply in Discord with the next action Hermes should take, then ask Hermes to retry the blocked source task if appropriate.",
         ],
         "confidence": "high",
@@ -1709,6 +1876,200 @@ def _manual_intervention_issue(issue: ForemanIssue, assessment: dict[str, Any]) 
         title="Foreman attempt requires human manual intervention",
         evidence=_sanitize_evidence(evidence),
     )
+
+
+_FOREMAN_METADATA_RE = re.compile(
+    r"<foreman-metadata>\s*(\{.*?\})\s*</foreman-metadata>",
+    re.DOTALL,
+)
+
+
+def _collect_blocked_master_foreman_tasks(
+    *,
+    master_board: Optional[str],
+    now: int,
+) -> list[ForemanIssue]:
+    board = _resolve_master_board(master_board)
+    try:
+        conn = kanban_db.connect(board=board)
+    except Exception:
+        return []
+    try:
+        tasks = []
+        for task in kanban_db.list_tasks(conn, include_archived=False):
+            if task.status != "blocked":
+                continue
+            if not str(task.idempotency_key or "").startswith(f"{FOREMAN_MASTER_TASK_KEY_PREFIX}:"):
+                continue
+            tasks.append((task, kanban_db.latest_run(conn, task.id)))
+    finally:
+        conn.close()
+    issues: list[ForemanIssue] = []
+    for task, latest in tasks:
+        metadata = _extract_master_task_metadata(task.body or {})
+        source_board = str(metadata.get("source_board") or _source_board_from_master_key(task.idempotency_key) or "").strip()
+        source_task = str(metadata.get("source_task_id") or "").strip()
+        reason = str(
+            task.last_failure_error
+            or task.result
+            or (getattr(latest, "error", None) if latest else None)
+            or (getattr(latest, "summary", None) if latest else None)
+            or "Master recovery task is blocked."
+        ).strip()
+        source_issue = ForemanIssue(
+            kind="master_task_blocked",
+            board=board,
+            task_id=task.id,
+            severity="critical",
+            title="Master recovery task is blocked",
+            evidence=_sanitize_evidence(
+                {
+                    **metadata,
+                    "source_board": source_board,
+                    "source_task_id": source_task,
+                    "source_issue_kind": metadata.get("source_issue_kind") or "master_task_blocked",
+                    "blocked_reason": reason,
+                    "foreman_board": board,
+                    "foreman_task_id": task.id,
+                    "llm_assessed_at": now,
+                }
+            ),
+        )
+        issues.append(
+            _manual_intervention_issue(
+                source_issue,
+                {
+                    "assessed_at": now,
+                    "requires_manual_intervention": True,
+                    "reason": reason or "Master recovery task is blocked.",
+                    "intervention_type": "master_task_blocked",
+                    "instructions": [
+                        "Open the master Kanban recovery task and resolve its blocker.",
+                        "Then retry or close the original Discord worker board task as appropriate.",
+                    ],
+                    "confidence": "high",
+                },
+            )
+        )
+    return issues
+
+
+def _extract_master_task_metadata(body: Any) -> dict[str, Any]:
+    match = _FOREMAN_METADATA_RE.search(str(body or ""))
+    if not match:
+        return {}
+    try:
+        parsed = json.loads(match.group(1))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return _sanitize_evidence(parsed) if isinstance(parsed, dict) else {}
+
+
+def _resolve_master_board(master_board: Optional[str] = None) -> str:
+    explicit = str(master_board or "").strip()
+    if explicit:
+        return explicit
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        raw = (((cfg.get("kanban") or {}).get("discord_worker") or {}).get("foreman") or {})
+        if isinstance(raw, dict):
+            configured = str(raw.get("master_board") or "").strip()
+            if configured:
+                return configured
+    except Exception:
+        pass
+    return kanban_db.DEFAULT_BOARD
+
+
+def _resolve_master_assignee(assignee: Optional[str] = None) -> str:
+    explicit = str(assignee or "").strip()
+    if explicit:
+        return explicit
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.kanban_decompose import _resolve_orchestrator_profile
+
+        return _resolve_orchestrator_profile(load_config() or {})
+    except Exception:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            return get_active_profile_name() or "default"
+        except Exception:
+            return "default"
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _issue_source_task_id(issue: ForemanIssue) -> str:
+    evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
+    return str(evidence.get("source_task_id") or issue.task_id or "").strip()
+
+
+def _foreman_master_task_title(issue: ForemanIssue) -> str:
+    source_board = _issue_source_board(issue)
+    source_task = _issue_source_task_id(issue)
+    if source_board and source_task:
+        return _truncate_text(f"Recover {source_board}/{source_task}", 80)
+    return _truncate_text(f"Recover {source_board or issue.board or 'Discord worker board'}", 80)
+
+
+def _foreman_master_task_idempotency_key(issue: ForemanIssue) -> str:
+    source_board = _issue_source_board(issue) or "unknown-board"
+    source_task = _issue_source_task_id(issue) or "unknown-task"
+    evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
+    problem = (
+        evidence.get("run_error")
+        or evidence.get("sidecar_error")
+        or evidence.get("error_excerpt")
+        or evidence.get("blocked_reason")
+        or issue.title
+    )
+    payload = {
+        "detector_version": ALERT_DETECTOR_VERSION,
+        "kind": issue.kind,
+        "source_board": source_board,
+        "source_task_id": source_task,
+        "run_id": evidence.get("run_id"),
+        "run_outcome": evidence.get("run_outcome"),
+        "sidecar_exit_code": evidence.get("sidecar_exit_code"),
+        "problem": _canonical_problem_text(problem),
+    }
+    digest = _stable_digest(payload)[:16]
+    return f"{FOREMAN_MASTER_TASK_KEY_PREFIX}:{source_board}:{source_task}:{issue.kind}:{digest}"
+
+
+def _find_master_task_by_key(conn: Any, idempotency_key: str) -> Optional[Any]:
+    row = conn.execute(
+        "SELECT * FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (idempotency_key,),
+    ).fetchone()
+    return kanban_db.Task.from_row(row) if row is not None else None
+
+
+def _source_board_from_master_task_row(row: Any) -> str:
+    try:
+        key_source = _source_board_from_master_key(row["idempotency_key"])
+        if key_source:
+            return key_source
+        metadata = _extract_master_task_metadata(row["body"])
+        return str(metadata.get("source_board") or "").strip()
+    except Exception:
+        return ""
+
+
+def _source_board_from_master_key(idempotency_key: Any) -> str:
+    raw = str(idempotency_key or "")
+    prefix = f"{FOREMAN_MASTER_TASK_KEY_PREFIX}:"
+    if not raw.startswith(prefix):
+        return ""
+    parts = raw.split(":", 4)
+    return parts[1].strip() if len(parts) >= 2 else ""
 
 
 def _task_error_texts(task: TaskSnapshot) -> Iterable[str]:
