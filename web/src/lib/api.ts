@@ -41,21 +41,26 @@ function setSessionHeader(headers: Headers, token: string): void {
   }
 }
 
-export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
+type FetchJSONInit = RequestInit & {
+  reloadOnStaleToken401?: boolean;
+};
+
+export async function fetchJSON<T>(url: string, init?: FetchJSONInit): Promise<T> {
+  const { reloadOnStaleToken401 = true, ...fetchInit } = init ?? {};
   // Inject the session token into all /api/ requests.
-  const headers = new Headers(init?.headers);
+  const headers = new Headers(fetchInit.headers);
   const token = window.__HERMES_SESSION_TOKEN__;
   if (token) {
     setSessionHeader(headers, token);
   }
   const res = await fetch(`${BASE}${url}`, {
-    ...init,
+    ...fetchInit,
     headers,
     // ``credentials: 'include'`` so the cookie-auth path (gated mode) works
     // for any fetch routed through here. Loopback mode is unaffected — the
     // server doesn't read cookies and the legacy session-token header is
     // already attached above.
-    credentials: init?.credentials ?? "include",
+    credentials: fetchInit.credentials ?? "include",
   });
   if (res.status === 401) {
     // Phase 6: the gated middleware emits a structured envelope so the
@@ -100,7 +105,7 @@ export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> 
     // that reload once on the first stale-token 401 — gated mode is
     // handled above, so reaching here in gated mode means a real
     // middleware failure that should not reload-loop.
-    if (!window.__HERMES_AUTH_REQUIRED__) {
+    if (!window.__HERMES_AUTH_REQUIRED__ && reloadOnStaleToken401) {
       let alreadyReloaded = false;
       try {
         alreadyReloaded =
@@ -196,10 +201,13 @@ export const api = {
    * Returns the verified Session as JSON when gated mode is active and a
    * valid cookie is attached. Loopback mode is unaffected — the endpoint
    * still exists but is never useful there (no Session, no cookie). The
-   * AuthWidget component swallows 401s from this call: if the gate isn't
-   * engaged, /api/auth/me returns 401 and the widget renders nothing.
+   * This endpoint can legitimately return 401 when the OAuth gate is not
+   * engaged, so it opts out of the loopback stale-token reload path.
    */
-  getAuthMe: () => fetchJSON<AuthMeResponse>("/api/auth/me"),
+  getAuthMe: () =>
+    fetchJSON<AuthMeResponse>("/api/auth/me", {
+      reloadOnStaleToken401: false,
+    }),
   logout: () =>
     fetch(`${BASE}/auth/logout`, {
       method: "POST",
