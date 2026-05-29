@@ -3804,14 +3804,11 @@ class GatewayRunner:
         messages can be delivered. Best-effort: individual send failures are
         logged and swallowed so they never block the shutdown sequence.
         """
-        action = "restarting" if self._restart_requested else "shutting down"
-        hint = (
-            "Your current task will be interrupted. "
-            "Send any message after restart and I'll try to resume where you left off."
+        msg = (
+            "⚠️ Gateway restarting"
             if self._restart_requested
-            else "Your current task will be interrupted."
+            else "⚠️ Gateway shutting down — Your current task will be interrupted."
         )
-        msg = f"⚠️ Gateway {action} — {hint}"
 
         # Snapshot adapters up front: adapter.send() can hit a fatal error
         # path that pops the adapter from self.adapters (see _handle_fatal
