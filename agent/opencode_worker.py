@@ -525,6 +525,11 @@ def _run_opencode_once(
     result.exit_code = proc.returncode
     result.stdout = proc.stdout or ""
     result.stderr = proc.stderr or ""
+    if proc.returncode == 0 and result.error is None and not result.final_text.strip():
+        result.final_text = _load_final_text_from_export(
+            binary_or_error,
+            result.thread_id or _last_session_id(result.events),
+        )
     if proc.returncode != 0 and result.error is None:
         result.error = _classify_opencode_error(
             result.stdout,
@@ -586,6 +591,66 @@ def _parse_opencode_output(
         thread_id=session_id,
         turn_id=session_id,
     )
+
+
+def _load_final_text_from_export(binary: str, session_id: Optional[str]) -> str:
+    """Recover assistant text from ``opencode export`` when JSONL output is sparse."""
+    if not session_id:
+        return ""
+    try:
+        proc = subprocess.run(
+            [binary, "export", session_id],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return _parse_opencode_export_text(proc.stdout)
+
+
+def _parse_opencode_export_text(stdout: str) -> str:
+    text = (stdout or "").strip()
+    if not text:
+        return ""
+    json_start = text.find("{")
+    if json_start > 0:
+        text = text[json_start:]
+    try:
+        exported = json.loads(text)
+    except json.JSONDecodeError:
+        return ""
+    messages = exported.get("messages") if isinstance(exported, dict) else None
+    if not isinstance(messages, list):
+        return ""
+
+    assistant_texts: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        info_raw = message.get("info")
+        info = info_raw if isinstance(info_raw, dict) else {}
+        if str(info.get("role") or message.get("role") or "").lower() != "assistant":
+            continue
+        part_texts: list[str] = []
+        for part in message.get("parts") or []:
+            if not isinstance(part, dict):
+                continue
+            if str(part.get("type") or "").lower() != "text":
+                continue
+            if part.get("synthetic") is True:
+                continue
+            content = str(part.get("text") or "").strip()
+            if content:
+                part_texts.append(content)
+        if part_texts:
+            assistant_texts.append("\n".join(part_texts).strip())
+    return "\n".join(filter(None, assistant_texts)).strip()
 
 
 def _write_brief(prompt: str) -> Path:
