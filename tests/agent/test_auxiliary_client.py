@@ -1434,6 +1434,67 @@ class TestAuxiliaryFallbackLayering:
         setattr(exc, "status_code", 401)
         return exc
 
+    def test_explicit_provider_unavailable_uses_configured_chain_at_resolution(self):
+        """No-client primary resolution should still honor auxiliary.<task>.fallback_chain."""
+        chain_client = MagicMock()
+        resolve_calls = []
+
+        def fake_resolve(provider, model="", **kwargs):
+            resolve_calls.append((provider, model, kwargs))
+            if provider == "anthropic":
+                return None, None
+            if provider == "openai-codex":
+                return chain_client, model
+            return None, None
+
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("anthropic", "claude-sonnet-4-6", None, None, None)), \
+             patch("agent.auxiliary_client._get_auxiliary_task_config",
+                   return_value={"fallback_chain": [
+                       {"provider": "openai-codex", "model": "gpt-5.4-mini"},
+                   ]}), \
+             patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve):
+            client, model = get_text_auxiliary_client("compression")
+
+        assert client is chain_client
+        assert model == "gpt-5.4-mini"
+        assert resolve_calls[0][0] == "anthropic"
+        assert resolve_calls[1][0] == "openai-codex"
+        assert resolve_calls[1][1] == "gpt-5.4-mini"
+        assert "base_url" not in resolve_calls[1][2]
+        assert "api_key" not in resolve_calls[1][2]
+        assert resolve_calls[1][2]["explicit_base_url"] == ""
+        assert resolve_calls[1][2]["explicit_api_key"] == ""
+
+    def test_explicit_provider_unavailable_async_converts_configured_chain(self):
+        """Async text helper mirrors resolution-time configured fallback."""
+        from agent.auxiliary_client import get_async_text_auxiliary_client
+
+        chain_client = MagicMock()
+        async_chain_client = MagicMock()
+
+        def fake_resolve(provider, model="", **kwargs):
+            if provider == "anthropic":
+                return None, None
+            if provider == "openai-codex":
+                return chain_client, model
+            return None, None
+
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("anthropic", "claude-sonnet-4-6", None, None, None)), \
+             patch("agent.auxiliary_client._get_auxiliary_task_config",
+                   return_value={"fallback_chain": [
+                       {"provider": "openai-codex", "model": "gpt-5.4-mini"},
+                   ]}), \
+             patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve), \
+             patch("agent.auxiliary_client._to_async_client",
+                   return_value=(async_chain_client, "gpt-5.4-mini")) as to_async:
+            client, model = get_async_text_auxiliary_client("compression")
+
+        assert client is async_chain_client
+        assert model == "gpt-5.4-mini"
+        to_async.assert_called_once_with(chain_client, "gpt-5.4-mini")
+
     def test_explicit_provider_uses_configured_chain_first(self, monkeypatch, caplog):
         """When a user has fallback_chain configured, it's tried BEFORE the main agent model."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
