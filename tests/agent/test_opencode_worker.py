@@ -55,7 +55,8 @@ def test_simple_task_runs_build_only(monkeypatch, tmp_path):
     }
     assert _option(calls[0], "--agent") == "build"
     assert _option(calls[0], "--variant") == "xhigh"
-    assert calls[0][2] == "Read the attached Hermes worker brief and follow it exactly."
+    assert "--pure" in calls[0]
+    assert calls[0][3] == "Read the attached Hermes worker brief and follow it exactly."
     assert calls[0].index("--file") == len(calls[0]) - 2
 
 
