@@ -476,6 +476,7 @@ def _run_opencode_once(
     cmd = [
         binary_or_error,
         "run",
+        "--pure",
         "Read the attached Hermes worker brief and follow it exactly.",
         "--format",
         "json",
