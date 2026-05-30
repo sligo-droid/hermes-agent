@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from types import SimpleNamespace
 from typing import Any, FrozenSet
 
@@ -155,12 +156,7 @@ class OpenAICodexAdapter(UpstreamAdapter):
             return _chat_json_error(400, "Request body must be JSON.", code="invalid_request")
         if not isinstance(payload, dict):
             return _chat_json_error(400, "Request body must be a JSON object.", code="invalid_request")
-        if payload.get("stream") is True:
-            return _chat_json_error(
-                400,
-                "The OpenAI Codex proxy does not support streaming chat completions yet.",
-                code="streaming_not_supported",
-            )
+        wants_stream = payload.get("stream") is True
 
         try:
             cred = self.get_credential()
@@ -239,7 +235,7 @@ class OpenAICodexAdapter(UpstreamAdapter):
         usage = response_json.get("usage") if isinstance(response_json, dict) else {}
         prompt_tokens = int((usage or {}).get("input_tokens") or 0)
         completion_tokens = int((usage or {}).get("output_tokens") or 0)
-        return web.json_response({
+        completion = {
             "id": response_json.get("id", "chatcmpl-codex-proxy"),
             "object": "chat.completion",
             "created": response_json.get("created_at", 0),
@@ -254,7 +250,79 @@ class OpenAICodexAdapter(UpstreamAdapter):
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,
             },
+        }
+        if wants_stream:
+            return await self._stream_chat_completion(request, completion)
+        return web.json_response(completion)
+
+    @staticmethod
+    def _chat_completion_stream_chunks(completion: dict[str, Any]) -> list[bytes]:
+        """Serialize a completed chat response as OpenAI-style SSE chunks.
+
+        The Codex upstream is already consumed via the Responses streaming API so
+        the proxy can normalize tool calls. Some local clients, including
+        OpenCode, always request ``stream: true`` from OpenAI-compatible
+        providers.  Emit a short, delayed-until-complete SSE stream rather than
+        rejecting those clients.
+        """
+        chunk_base = {
+            "id": completion.get("id", "chatcmpl-codex-proxy"),
+            "object": "chat.completion.chunk",
+            "created": completion.get("created") or int(time.time()),
+            "model": completion.get("model", ""),
+        }
+        choice = (completion.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        finish_reason = choice.get("finish_reason") or "stop"
+
+        chunks: list[dict[str, Any]] = []
+        chunks.append({
+            **chunk_base,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
         })
+        content = message.get("content")
+        if content:
+            chunks.append({
+                **chunk_base,
+                "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+            })
+        for index, tool_call in enumerate(message.get("tool_calls") or []):
+            streamed_call = dict(tool_call)
+            streamed_call["index"] = index
+            chunks.append({
+                **chunk_base,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"tool_calls": [streamed_call]},
+                    "finish_reason": None,
+                }],
+            })
+        chunks.append({
+            **chunk_base,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+        })
+
+        return [f"data: {json.dumps(chunk, separators=(',', ':'))}\n\n".encode("utf-8") for chunk in chunks] + [b"data: [DONE]\n\n"]
+
+    @classmethod
+    async def _stream_chat_completion(
+        cls,
+        request: web.Request,
+        completion: dict[str, Any],
+    ) -> web.StreamResponse:
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+        await response.prepare(request)
+        for chunk in cls._chat_completion_stream_chunks(completion):
+            await response.write(chunk)
+        await response.write_eof()
+        return response
 
     @staticmethod
     async def _run_responses_stream_with_retry(

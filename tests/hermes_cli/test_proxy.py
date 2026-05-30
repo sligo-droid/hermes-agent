@@ -153,6 +153,26 @@ def test_codex_adapter_preserves_minimal_reasoning_effort():
     assert OpenAICodexAdapter._responses_reasoning("") is None
 
 
+def test_codex_adapter_serializes_streaming_chat_chunks():
+    chunks = OpenAICodexAdapter._chat_completion_stream_chunks({
+        "id": "chatcmpl-test",
+        "created": 123,
+        "model": "gpt-5.3-codex",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "hello"},
+            "finish_reason": "stop",
+        }],
+    })
+
+    assert chunks[-1] == b"data: [DONE]\n\n"
+    decoded = [chunk.decode("utf-8") for chunk in chunks]
+    assert '"object":"chat.completion.chunk"' in decoded[0]
+    assert '"role":"assistant"' in decoded[0]
+    assert '"content":"hello"' in decoded[1]
+    assert '"finish_reason":"stop"' in decoded[-2]
+
+
 def test_codex_stream_synthesizes_collected_output_after_sdk_null_output(monkeypatch):
     output_item = SimpleNamespace(
         type="message",
