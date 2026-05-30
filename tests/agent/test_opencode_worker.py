@@ -153,6 +153,54 @@ def test_nested_text_part_is_used_as_final_text(monkeypatch, tmp_path):
     }
 
 
+def test_sparse_json_output_recovers_final_text_from_export(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        if cmd[1] == "export":
+            return SimpleNamespace(
+                returncode=0,
+                stdout="Exporting session: ses-export\n"
+                + json.dumps({
+                    "messages": [
+                        {"info": {"role": "user"}, "parts": [{"type": "text", "text": "brief"}]},
+                        {
+                            "info": {"role": "assistant"},
+                            "parts": [
+                                {"type": "text", "synthetic": True, "text": "tool chatter"},
+                                {"type": "text", "text": "exported final"},
+                            ],
+                        },
+                    ]
+                })
+                + "\n",
+                stderr="",
+            )
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"type": "step_start", "sessionID": "ses-export"}) + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+
+    result = ow.run_opencode_single_pass(
+        "say done",
+        str(tmp_path),
+        timeout=60,
+        agent="build",
+        reasoning_level="xhigh",
+        config=_cfg(),
+    )
+
+    assert result.error is None
+    assert result.final_text == "exported final"
+    assert result.thread_id == "ses-export"
+    assert calls[1] == ["/bin/opencode", "export", "ses-export"]
+
+
 def test_reasoning_levels_are_configurable_by_mode(monkeypatch, tmp_path):
     calls = []
 
