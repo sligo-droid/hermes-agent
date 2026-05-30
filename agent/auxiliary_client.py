@@ -5188,6 +5188,26 @@ def call_llm(
                     else:
                         raise
 
+        # ── Authentication fallback for explicit auxiliary providers ───
+        # Auth errors first get normal credential refresh + credential-pool
+        # rotation above.  If those cannot recover and the operator configured
+        # an auxiliary.<task>.fallback_chain, honor it for this task.  Do not
+        # silently jump to the main agent model on auth errors; that would hide
+        # broken credentials for explicitly configured auxiliary providers.
+        if (_is_auth_error(first_err)
+                and resolved_provider not in {"auto", "", None}):
+            fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                task, resolved_provider or "auto", reason="authentication error")
+            if fb_client is not None:
+                fb_kwargs = _build_call_kwargs(
+                    fb_label, fb_model or "", messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, timeout=effective_timeout,
+                    extra_body=effective_extra_body,
+                    base_url=str(getattr(fb_client, "base_url", "") or ""))
+                return _validate_llm_response(
+                    fb_client.chat.completions.create(**fb_kwargs), task)
+
         # ── Payment / credit exhaustion fallback ──────────────────────
         # When the resolved provider returns 402 or a credit-related error,
         # try alternative providers instead of giving up.  This handles the
@@ -5628,6 +5648,31 @@ async def async_call_llm(
                         first_err = retry2_err
                     else:
                         raise
+
+        # ── Authentication fallback for explicit auxiliary providers ───
+        # Auth errors first get normal credential refresh + credential-pool
+        # rotation above.  If those cannot recover and the operator configured
+        # an auxiliary.<task>.fallback_chain, honor it for this task.  Do not
+        # silently jump to the main agent model on auth errors; that would hide
+        # broken credentials for explicitly configured auxiliary providers.
+        if (_is_auth_error(first_err)
+                and resolved_provider not in {"auto", "", None}):
+            fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                task, resolved_provider or "auto", reason="authentication error")
+            if fb_client is not None:
+                fb_kwargs = _build_call_kwargs(
+                    fb_label, fb_model or "", messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, timeout=effective_timeout,
+                    extra_body=effective_extra_body,
+                    base_url=str(getattr(fb_client, "base_url", "") or ""))
+                async_fb, async_fb_model = _to_async_client(
+                    fb_client, fb_model or "", is_vision=(task == "vision")
+                )
+                if async_fb_model and async_fb_model != fb_kwargs.get("model"):
+                    fb_kwargs["model"] = async_fb_model
+                return _validate_llm_response(
+                    await async_fb.chat.completions.create(**fb_kwargs), task)
 
         # ── Payment / connection / rate-limit fallback (mirrors sync call_llm) ──
         should_fallback = (
