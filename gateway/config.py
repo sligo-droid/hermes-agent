@@ -931,6 +931,8 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["DISCORD_REQUIRE_MENTION"] = str(discord_cfg["require_mention"]).lower()
                 if "thread_require_mention" in discord_cfg and not os.getenv("DISCORD_THREAD_REQUIRE_MENTION"):
                     os.environ["DISCORD_THREAD_REQUIRE_MENTION"] = str(discord_cfg["thread_require_mention"]).lower()
+                if "voice_auto_tag" in discord_cfg and not os.getenv("DISCORD_VOICE_AUTO_TAG"):
+                    os.environ["DISCORD_VOICE_AUTO_TAG"] = str(discord_cfg["voice_auto_tag"]).lower()
                 frc = discord_cfg.get("free_response_channels")
                 if frc is not None and not os.getenv("DISCORD_FREE_RESPONSE_CHANNELS"):
                     if isinstance(frc, list):

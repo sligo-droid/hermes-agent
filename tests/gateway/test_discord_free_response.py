@@ -8,6 +8,7 @@ import sys
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms.base import MessageType
 
 
 def _ensure_discord_mock():
@@ -113,6 +114,7 @@ def adapter(monkeypatch):
     for _var in (
         "DISCORD_REQUIRE_MENTION",
         "DISCORD_THREAD_REQUIRE_MENTION",
+        "DISCORD_VOICE_AUTO_TAG",
         "DISCORD_FREE_RESPONSE_CHANNELS",
         "DISCORD_AUTO_THREAD",
         "DISCORD_NO_THREAD_CHANNELS",
@@ -475,8 +477,8 @@ async def test_discord_auto_thread_can_be_disabled(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_discord_bot_thread_skips_mention_requirement(adapter, monkeypatch):
-    """Messages in a thread the bot has participated in should not require @mention."""
+async def test_discord_bot_thread_requires_mention_by_default(adapter, monkeypatch):
+    """Default behavior: participated threads still require explicit @mention."""
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
@@ -489,10 +491,7 @@ async def test_discord_bot_thread_skips_mention_requirement(adapter, monkeypatch
 
     await adapter._handle_message(message)
 
-    adapter.handle_message.assert_awaited_once()
-    event = adapter.handle_message.await_args.args[0]
-    assert event.text == "follow-up without mention"
-    assert event.source.chat_type == "thread"
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -696,14 +695,30 @@ async def test_discord_voice_linked_parent_thread_still_requires_mention(adapter
 
 
 @pytest.mark.asyncio
-async def test_discord_thread_default_keeps_responding_after_participation(adapter, monkeypatch):
-    """Default behavior: once the bot is in a thread, it auto-responds without @mention."""
+async def test_discord_thread_default_requires_mention_after_participation(adapter, monkeypatch):
+    """Default behavior: participated threads still require explicit @mention."""
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
     monkeypatch.delenv("DISCORD_THREAD_REQUIRE_MENTION", raising=False)
 
     thread = FakeThread(channel_id=456, name="follow-up")
     adapter._threads.mark("456")  # bot has previously participated
+
+    message = make_message(channel=thread, content="follow-up without mention")
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_require_mention_false_restores_participated_thread_followups(adapter, monkeypatch):
+    """Explicit thread_require_mention=false restores legacy mention-free followups."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "false")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    thread = FakeThread(channel_id=456, name="follow-up")
+    adapter._threads.mark("456")
 
     message = make_message(channel=thread, content="follow-up without mention")
     await adapter._handle_message(message)
@@ -763,6 +778,182 @@ async def test_discord_thread_require_mention_via_config_extra(adapter, monkeypa
     await adapter._handle_message(message)
 
     adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_slash_like_text_requires_mention_in_guild_channels(adapter, monkeypatch):
+    """Raw '/goal ...' text no longer bypasses mention gating in guild channels."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=123),
+        content="/goal ship this",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_meeting_text_command_requires_mention_in_guild_channels(adapter, monkeypatch):
+    """Raw '/meeting ...' text + audio is also gated unless explicitly mentioned."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=123),
+        content="/meeting summarize this",
+    )
+    message.attachments = [
+        SimpleNamespace(
+            filename="meeting.ogg",
+            content_type="audio/ogg",
+            url="https://cdn.discordapp.com/attachments/fake/meeting.ogg",
+        )
+    ]
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_native_voice_requires_mention_by_default(adapter, monkeypatch):
+    """Untagged native voice messages are gated by default for multi-bot safety."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.setenv("DISCORD_VOICE_AUTO_TAG", "false")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=123),
+        content="",
+    )
+    message.flags = SimpleNamespace(voice=True, value=8192)
+    message.attachments = [
+        SimpleNamespace(
+            filename="voice-message.ogg",
+            content_type="audio/ogg",
+            url="https://cdn.discordapp.com/attachments/fake/voice-message.ogg",
+        )
+    ]
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_native_voice_auto_tag_can_be_enabled(adapter, monkeypatch):
+    """voice_auto_tag=true preserves legacy untagged native voice behavior."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.setenv("DISCORD_VOICE_AUTO_TAG", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=123),
+        content="",
+    )
+    message.flags = SimpleNamespace(voice=True, value=8192)
+    message.attachments = [
+        SimpleNamespace(
+            filename="voice-message.ogg",
+            content_type="audio/ogg",
+            url="https://cdn.discordapp.com/attachments/fake/voice-message.ogg",
+        )
+    ]
+
+    adapter._cache_discord_audio = AsyncMock(return_value="/tmp/voice.ogg")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_type == MessageType.VOICE
+
+
+@pytest.mark.asyncio
+async def test_discord_native_voice_in_free_response_channel_auto_threads(adapter, monkeypatch):
+    """Accepted top-level native voice prompts in free-response channels should thread."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_VOICE_AUTO_TAG", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "789")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    created_thread = FakeThread(channel_id=777, parent=FakeTextChannel(channel_id=789))
+    adapter._auto_create_thread = AsyncMock(return_value=created_thread)
+    adapter._classify_discord_feature_request = AsyncMock(return_value=False)
+    adapter._preprocess_voice_for_feature_triage = AsyncMock(return_value=({}, "quick status check"))
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=789),
+        content="",
+    )
+    message.flags = SimpleNamespace(voice=True, value=8192)
+    message.attachments = [
+        SimpleNamespace(
+            filename="voice-message.ogg",
+            content_type="audio/ogg",
+            url="https://cdn.discordapp.com/attachments/fake/voice-message.ogg",
+        )
+    ]
+
+    adapter._cache_discord_audio = AsyncMock(return_value="/tmp/voice.ogg")
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once_with(message)
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "777"
+    assert event.source.chat_id == "777"
+    assert event.source.parent_chat_id == "789"
+
+
+@pytest.mark.asyncio
+async def test_discord_native_voice_auto_tag_non_free_channel_auto_threads(adapter, monkeypatch):
+    """Accepted top-level native voice prompts should thread outside free channels."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_VOICE_AUTO_TAG", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    parent_channel = FakeTextChannel(channel_id=123)
+    created_thread = FakeThread(channel_id=888, parent=parent_channel)
+    adapter._auto_create_thread = AsyncMock(return_value=created_thread)
+    adapter._classify_discord_feature_request = AsyncMock(return_value=False)
+    adapter._preprocess_voice_for_feature_triage = AsyncMock(return_value=({}, "quick status check"))
+
+    message = make_message(
+        channel=parent_channel,
+        content="",
+    )
+    message.flags = SimpleNamespace(voice=True, value=8192)
+    message.attachments = [
+        SimpleNamespace(
+            filename="voice-message.ogg",
+            content_type="audio/ogg",
+            url="https://cdn.discordapp.com/attachments/fake/voice-message.ogg",
+        )
+    ]
+
+    adapter._cache_discord_audio = AsyncMock(return_value="/tmp/voice.ogg")
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once_with(message)
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "888"
+    assert event.source.chat_id == "888"
+    assert event.source.parent_chat_id == "123"
 
 
 
@@ -1045,11 +1236,11 @@ async def test_mentioned_existing_thread_still_backfills_thread_history(adapter,
 
 
 @pytest.mark.asyncio
-async def test_discord_participated_thread_backfills_without_mention(adapter, monkeypatch):
-    """Known threads still need recent thread context when mention gating is bypassed."""
+async def test_discord_participated_thread_backfills_with_explicit_opt_out(adapter, monkeypatch):
+    """Known-thread backfill still applies when thread_require_mention is explicitly disabled."""
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
-    monkeypatch.delenv("DISCORD_THREAD_REQUIRE_MENTION", raising=False)
+    monkeypatch.setenv("DISCORD_THREAD_REQUIRE_MENTION", "false")
     adapter.config.extra["history_backfill"] = True
     adapter._fetch_channel_context = AsyncMock(return_value="[Recent channel messages]\n[Alice] thread context")
 

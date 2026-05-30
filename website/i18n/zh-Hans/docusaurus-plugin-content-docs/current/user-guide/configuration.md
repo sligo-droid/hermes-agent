@@ -1493,11 +1493,15 @@ discord:
   require_mention: true          # 在服务器频道中需要 @提及才能响应
   free_response_channels: ""     # 逗号分隔的频道 ID，bot 在这些频道无需 @提及即可响应
   auto_thread: true              # 在频道中 @提及时自动创建线程
+  thread_require_mention: true   # 在线程中也需要 @提及（多 bot 安全默认值）
+  voice_auto_tag: false          # 将原生 Discord 语音消息视为无需 @提及的调用
 ```
 
 - `require_mention` —— 为 `true`（默认）时，bot 仅在服务器频道中被 `@BotName` 提及时响应。DM 始终无需提及即可工作。
 - `free_response_channels` —— 逗号分隔的频道 ID 列表，bot 在这些频道对每条消息响应，无需提及。
 - `auto_thread` —— 为 `true`（默认）时，频道中的提及会自动为对话创建线程，保持频道整洁（类似 Slack 线程）。
+- `thread_require_mention` —— 为 `true`（默认）时，线程中的后续消息也需要显式 @ 提及 bot；设置为 `false` 可保留旧的一 bot 线程中参与过就自动响应的行为。
+- `voice_auto_tag` —— 为 `false`（默认）时，服务器频道中的原生 Discord 语音消息仍需要显式提及。设置为 `true` 可让原生语音消息上传在没有提及时也触发 bot。
 
 ## 安全
 

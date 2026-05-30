@@ -260,6 +260,8 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `DISCORD_HOME_CHANNEL_NAME` | Discord 主频道的显示名称 |
 | `DISCORD_COMMAND_SYNC_POLICY` | Discord 斜杠命令启动同步策略：`safe`（差异对比并协调）、`bulk`（旧版 `tree.sync()`）或 `off` |
 | `DISCORD_REQUIRE_MENTION` | 在服务器频道中响应前要求 @mention |
+| `DISCORD_THREAD_REQUIRE_MENTION` | 在 Discord 线程中响应前要求 @mention（默认：`true`） |
+| `DISCORD_VOICE_AUTO_TAG` | 将原生 Discord 语音消息视为已定向给 bot，即使没有 @mention（默认：`false`） |
 | `DISCORD_FREE_RESPONSE_CHANNELS` | 不需要 mention 的逗号分隔频道 ID |
 | `DISCORD_AUTO_THREAD` | 支持时自动将长回复转为线程 |
 | `DISCORD_ALLOW_ANY_ATTACHMENT` | 设为 `true` 时接受任意文件类型的附件（不仅限于内置的 PDF/文本/zip/office 白名单）。未知类型被缓存并以本地路径形式提供给 agent，供其通过 `terminal`/`read_file`/`ffprobe` 检查。默认 `false`。 |

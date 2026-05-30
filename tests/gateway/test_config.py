@@ -343,6 +343,42 @@ class TestLoadGatewayConfig:
         # Env value preserved, not clobbered by yaml.
         assert os.environ.get("DISCORD_THREAD_REQUIRE_MENTION") == "true"
 
+    def test_bridges_discord_voice_auto_tag_from_config_yaml(self, tmp_path, monkeypatch):
+        """discord.voice_auto_tag in config.yaml should reach the runtime env var."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  voice_auto_tag: true\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("DISCORD_VOICE_AUTO_TAG", raising=False)
+
+        load_gateway_config()
+
+        assert os.environ.get("DISCORD_VOICE_AUTO_TAG") == "true"
+
+    def test_discord_voice_auto_tag_yaml_does_not_overwrite_env(self, tmp_path, monkeypatch):
+        """Explicit env var should win over discord.voice_auto_tag in YAML."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  voice_auto_tag: false\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("DISCORD_VOICE_AUTO_TAG", "true")
+
+        load_gateway_config()
+
+        assert os.environ.get("DISCORD_VOICE_AUTO_TAG") == "true"
+
     def test_bridges_quoted_false_platform_enabled_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

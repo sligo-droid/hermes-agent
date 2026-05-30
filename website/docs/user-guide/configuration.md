@@ -1511,11 +1511,15 @@ discord:
   require_mention: true          # Require @mention to respond in server channels
   free_response_channels: ""     # Comma-separated channel IDs where bot responds without @mention
   auto_thread: true              # Auto-create threads on @mention in channels
+  thread_require_mention: true   # Require @mention in threads too (multi-bot safe default)
+  voice_auto_tag: false          # Treat native Discord voice messages as addressed without @mention
 ```
 
 - `require_mention` — when `true` (default), the bot only responds in server channels when mentioned with `@BotName`. DMs always work without mention.
 - `free_response_channels` — comma-separated list of channel IDs where the bot responds to every message without requiring a mention.
 - `auto_thread` — when `true` (default), mentions in channels automatically create a thread for the conversation, keeping channels clean (similar to Slack threading).
+- `thread_require_mention` — when `true` (default), thread follow-ups also require an explicit bot mention; set to `false` to preserve legacy one-bot thread conversations where participated threads auto-respond.
+- `voice_auto_tag` — when `false` (default), native Discord voice messages in server channels still need an explicit mention. Set to `true` to let native voice-message uploads trigger the bot without a mention.
 
 ## Security
 

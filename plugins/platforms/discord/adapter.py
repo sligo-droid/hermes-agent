@@ -6302,7 +6302,7 @@ class DiscordAdapter(BasePlatformAdapter):
     def _discord_thread_require_mention(self) -> bool:
         """Return whether thread participation requires @mention to follow up.
 
-        When ``False`` (default), once the bot has participated in a thread it
+        When ``False``, once the bot has participated in a thread it
         keeps responding to every message in that thread without needing to be
         mentioned again — useful for one-on-one conversations.
 
@@ -6316,7 +6316,16 @@ class DiscordAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
-        return os.getenv("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+        return os.getenv("DISCORD_THREAD_REQUIRE_MENTION", "true").lower() in {"true", "1", "yes", "on"}
+
+    def _discord_voice_auto_tag(self) -> bool:
+        """Return whether native Discord voice messages auto-trigger without @mention."""
+        configured = self.config.extra.get("voice_auto_tag")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("DISCORD_VOICE_AUTO_TAG", "false").lower() in {"true", "1", "yes", "on"}
 
     def _discord_history_backfill(self) -> bool:
         """Return whether history backfill is enabled for shared sessions."""
@@ -7737,13 +7746,13 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             replies_to_self = self._message_replies_to_self(message)
 
+            voice_auto_tag = self._discord_voice_auto_tag()
+
             if require_mention and not is_free_channel and not in_bot_thread:
                 if (
                     self._client.user not in message.mentions
                     and not mention_prefix
-                    and not is_slash_command_message
-                    and not (is_meeting_command_message and meeting_audio_attachments)
-                    and not message_is_voice
+                    and not (message_is_voice and voice_auto_tag)
                     and not replies_to_self
                 ):
                     return
@@ -7780,6 +7789,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not mention_prefix
                 and not has_discord_message_link
                 and not slash_command_starts_threaded_work
+                and not message_is_voice
             )
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
@@ -7810,7 +7820,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
             should_auto_thread_direct_question = bool(
                 direct_question_prompt
-                and mention_prefix
+                and (
+                    mention_prefix
+                    or message_is_voice
+                )
             )
             if should_consider_auto_thread and (
                 feature_request_intent or should_auto_thread_direct_question
@@ -9456,7 +9469,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     ``DISCORD_ALLOWED_CHANNELS``, ``DISCORD_NO_THREAD_CHANNELS``,
     ``DISCORD_HISTORY_BACKFILL``, ``DISCORD_HISTORY_BACKFILL_LIMIT``,
     ``DISCORD_ALLOW_MENTION_*``, ``DISCORD_REPLY_TO_MODE``,
-    ``DISCORD_THREAD_REQUIRE_MENTION``).  Rather than rewrite ~50 call sites
+    ``DISCORD_THREAD_REQUIRE_MENTION``, ``DISCORD_VOICE_AUTO_TAG``).
+    Rather than rewrite ~50 call sites
     inside the adapter to read from ``PlatformConfig.extra`` instead, this
     hook keeps the existing env-driven model and merely owns the
     YAML→env translation here, next to the adapter that consumes it.
@@ -9470,6 +9484,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         os.environ["DISCORD_REQUIRE_MENTION"] = str(discord_cfg["require_mention"]).lower()
     if "thread_require_mention" in discord_cfg and not os.getenv("DISCORD_THREAD_REQUIRE_MENTION"):
         os.environ["DISCORD_THREAD_REQUIRE_MENTION"] = str(discord_cfg["thread_require_mention"]).lower()
+    if "voice_auto_tag" in discord_cfg and not os.getenv("DISCORD_VOICE_AUTO_TAG"):
+        os.environ["DISCORD_VOICE_AUTO_TAG"] = str(discord_cfg["voice_auto_tag"]).lower()
     frc = discord_cfg.get("free_response_channels")
     if frc is not None and not os.getenv("DISCORD_FREE_RESPONSE_CHANNELS"):
         if isinstance(frc, list):

@@ -1607,7 +1607,8 @@ DEFAULT_CONFIG = {
         "project_mapping_ignored_channel_names": "",  # Comma-separated channel name/glob patterns ignored by project auto-mapping
         "project_mapping_ignored_category_names": "", # Comma-separated category name/glob patterns ignored by project auto-mapping
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
-        "thread_require_mention": False,  # If True, require @mention in threads too (multi-bot threads)
+        "thread_require_mention": True,   # If True, require @mention in threads too (default multi-bot safety)
+        "voice_auto_tag": False,          # If True, native Discord voice messages auto-trigger without @mention
         "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
         "history_backfill_feature_channels": False, # Skip scrollback in known feature-request channels by default
