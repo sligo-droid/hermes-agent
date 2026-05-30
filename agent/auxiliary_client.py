@@ -2906,17 +2906,18 @@ def _try_configured_fallback_chain(
         label = f"fallback_chain[{i}]({fb_provider})"
 
         try:
-            fb_client = _resolve_single_provider(
+            fb_client, fb_resolved_model = _resolve_single_provider(
                 fb_provider, fb_model, fb_base_url, fb_api_key)
         except Exception:
-            fb_client = None
+            fb_client, fb_resolved_model = None, None
 
         if fb_client is not None:
+            final_model = fb_resolved_model or fb_model
             logger.info(
                 "Auxiliary %s: %s on %s — configured fallback to %s (%s)",
-                task, reason, failed_provider, label, fb_model or "default",
+                task, reason, failed_provider, label, final_model or "default",
             )
-            return fb_client, fb_model, label
+            return fb_client, final_model, label
         tried.append(label)
 
     if tried:
@@ -2932,19 +2933,18 @@ def _resolve_single_provider(
     model: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
-) -> Optional[Any]:
+) -> Tuple[Optional[Any], Optional[str]]:
     """Resolve a single provider entry from fallback_chain to an OpenAI client.
 
     Uses the existing provider resolution infrastructure where possible.
     """
-    # Reuse resolve_provider_client which handles provider→client mapping
-    client, resolved_model = resolve_provider_client(
+    # Reuse resolve_provider_client which handles provider→client mapping.
+    return resolve_provider_client(
         provider=provider,
-        model=model,
-        base_url=base_url,
-        api_key=api_key,
+        model=model or "",
+        explicit_base_url=base_url or "",
+        explicit_api_key=api_key or "",
     )
-    return client
 
 
 def _resolve_auto(
@@ -3800,6 +3800,41 @@ def resolve_provider_client(
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
+def _resolve_text_auxiliary_client(
+    task: str = "",
+    *,
+    main_runtime: Optional[Dict[str, Any]] = None,
+    async_mode: bool = False,
+) -> Tuple[Optional[Any], Optional[str]]:
+    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or "")
+    client, resolved_model = resolve_provider_client(
+        provider,
+        model=model or "",
+        async_mode=async_mode,
+        explicit_base_url=base_url or "",
+        explicit_api_key=api_key or "",
+        api_mode=api_mode or "",
+        main_runtime=main_runtime,
+        task=task or None,
+    )
+    if client is not None or not task or provider in {"auto", "", None}:
+        return client, resolved_model
+
+    # If a user explicitly pins an auxiliary provider but that provider cannot
+    # even be constructed (for example, Anthropic is configured but no usable
+    # credentials are present), honor auxiliary.<task>.fallback_chain at client
+    # resolution time.  The call-time fallback path only runs after a request
+    # reaches a primary client, so it cannot recover from this no-client case.
+    fb_client, fb_model, _fb_label = _try_configured_fallback_chain(
+        task, provider or "auto", reason="provider unavailable"
+    )
+    if fb_client is None:
+        return client, resolved_model
+    if async_mode:
+        return _to_async_client(fb_client, fb_model or "")
+    return fb_client, fb_model
+
+
 def get_text_auxiliary_client(
     task: str = "",
     *,
@@ -3814,15 +3849,8 @@ def get_text_auxiliary_client(
     Callers may override the returned model via config.yaml
     (e.g. auxiliary.compression.model, auxiliary.web_extract.model).
     """
-    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
-    return resolve_provider_client(
-        provider,
-        model=model,
-        explicit_base_url=base_url,
-        explicit_api_key=api_key,
-        api_mode=api_mode,
-        main_runtime=main_runtime,
-        task=task or None,
+    return _resolve_text_auxiliary_client(
+        task, main_runtime=main_runtime, async_mode=False
     )
 
 
@@ -3833,16 +3861,8 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
     (AsyncCodexAuxiliaryClient, model) which wraps the Responses API.
     Returns (None, None) when no provider is available.
     """
-    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
-    return resolve_provider_client(
-        provider,
-        model=model,
-        async_mode=True,
-        explicit_base_url=base_url,
-        explicit_api_key=api_key,
-        api_mode=api_mode,
-        main_runtime=main_runtime,
-        task=task or None,
+    return _resolve_text_auxiliary_client(
+        task, main_runtime=main_runtime, async_mode=True
     )
 
 
@@ -5188,6 +5208,26 @@ def call_llm(
                     else:
                         raise
 
+        # ── Authentication fallback for explicit auxiliary providers ───
+        # Auth errors first get normal credential refresh + credential-pool
+        # rotation above.  If those cannot recover and the operator configured
+        # an auxiliary.<task>.fallback_chain, honor it for this task.  Do not
+        # silently jump to the main agent model on auth errors; that would hide
+        # broken credentials for explicitly configured auxiliary providers.
+        if (_is_auth_error(first_err)
+                and resolved_provider not in {"auto", "", None}):
+            fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                task, resolved_provider or "auto", reason="authentication error")
+            if fb_client is not None:
+                fb_kwargs = _build_call_kwargs(
+                    fb_label, fb_model or "", messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, timeout=effective_timeout,
+                    extra_body=effective_extra_body,
+                    base_url=str(getattr(fb_client, "base_url", "") or ""))
+                return _validate_llm_response(
+                    fb_client.chat.completions.create(**fb_kwargs), task)
+
         # ── Payment / credit exhaustion fallback ──────────────────────
         # When the resolved provider returns 402 or a credit-related error,
         # try alternative providers instead of giving up.  This handles the
@@ -5628,6 +5668,31 @@ async def async_call_llm(
                         first_err = retry2_err
                     else:
                         raise
+
+        # ── Authentication fallback for explicit auxiliary providers ───
+        # Auth errors first get normal credential refresh + credential-pool
+        # rotation above.  If those cannot recover and the operator configured
+        # an auxiliary.<task>.fallback_chain, honor it for this task.  Do not
+        # silently jump to the main agent model on auth errors; that would hide
+        # broken credentials for explicitly configured auxiliary providers.
+        if (_is_auth_error(first_err)
+                and resolved_provider not in {"auto", "", None}):
+            fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                task, resolved_provider or "auto", reason="authentication error")
+            if fb_client is not None:
+                fb_kwargs = _build_call_kwargs(
+                    fb_label, fb_model or "", messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, timeout=effective_timeout,
+                    extra_body=effective_extra_body,
+                    base_url=str(getattr(fb_client, "base_url", "") or ""))
+                async_fb, async_fb_model = _to_async_client(
+                    fb_client, fb_model or "", is_vision=(task == "vision")
+                )
+                if async_fb_model and async_fb_model != fb_kwargs.get("model"):
+                    fb_kwargs["model"] = async_fb_model
+                return _validate_llm_response(
+                    await async_fb.chat.completions.create(**fb_kwargs), task)
 
         # ── Payment / connection / rate-limit fallback (mirrors sync call_llm) ──
         should_fallback = (
