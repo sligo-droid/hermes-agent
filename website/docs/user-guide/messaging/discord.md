@@ -277,7 +277,8 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `DISCORD_HOME_CHANNEL_NAME` | No | `"Home"` | Display name for the home channel in logs and status output. |
 | `DISCORD_COMMAND_SYNC_POLICY` | No | `"safe"` | Controls native slash-command startup sync. `"safe"` diffs existing global commands and only updates what changed, recreating commands when Discord metadata changes cannot be applied via patch. `"bulk"` preserves the old `tree.sync()` behavior. `"off"` skips startup sync entirely. |
 | `DISCORD_REQUIRE_MENTION` | No | `true` | When `true`, the bot only responds in server channels when `@mentioned`. Set to `false` to respond to all messages in every channel. |
-| `DISCORD_THREAD_REQUIRE_MENTION` | No | `false` | When `true`, the in-thread mention shortcut is disabled — threads are gated the same as channels, requiring `@mention` even after the bot has already participated. Use this when multiple bots share a thread and you want each to fire only on explicit `@mention`. |
+| `DISCORD_THREAD_REQUIRE_MENTION` | No | `true` | When `true`, the in-thread mention shortcut is disabled — threads are gated the same as channels, requiring `@mention` even after the bot has already participated. Set to `false` only for legacy one-bot threads where participated threads should auto-respond. |
+| `DISCORD_VOICE_AUTO_TAG` | No | `false` | When `true`, native Discord voice-message posts in server channels are treated as addressed to the bot even without `@mention`. Leave `false` in multi-bot channels unless voice messages should auto-trigger this bot. |
 | `DISCORD_FREE_RESPONSE_CHANNELS` | No | — | Comma-separated channel IDs where the bot responds without requiring an `@mention`, even when `DISCORD_REQUIRE_MENTION` is `true`. |
 | `DISCORD_IGNORE_NO_MENTION` | No | `true` | When `true`, the bot stays silent if a message `@mentions` other users but does **not** mention the bot. Prevents the bot from jumping into conversations directed at other people. Only applies in server channels, not DMs. |
 | `DISCORD_AUTO_THREAD` | No | `true` | When `true`, automatically creates a new thread for every `@mention` in a text channel, so each conversation is isolated (similar to Slack behavior). Messages already inside threads or DMs are unaffected. |
@@ -307,7 +308,8 @@ The `discord` section in `~/.hermes/config.yaml` mirrors the env vars above. Con
 # Discord-specific settings
 discord:
   require_mention: true           # Require @mention in server channels
-  thread_require_mention: false   # If true, require @mention in threads too (multi-bot threads)
+  thread_require_mention: true    # Require @mention in threads too (multi-bot safe default)
+  voice_auto_tag: false           # Native Discord voice messages still need @mention
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
   auto_thread: true               # Auto-create threads on @mention
   reactions: true                 # Add emoji reactions during processing
@@ -334,16 +336,29 @@ When enabled, the bot only responds in server channels when directly `@mentioned
 
 #### `discord.thread_require_mention`
 
-**Type:** boolean — **Default:** `false`
+**Type:** boolean — **Default:** `true`
 
-By default, once the bot has participated in a thread (auto-created on `@mention` or replied in once), it keeps responding to every subsequent message in that thread without needing to be `@mentioned` again. That's the right default for one-on-one conversations.
+By default, threads are gated the same as channels: the bot needs an explicit `@mention` even after it has participated in the thread. This is the safe default when multiple bots share Discord servers or threads.
 
-In **multi-bot threads** where users address one bot per turn, this default becomes a footgun — every other bot in the thread also fires on every message, burning credits and spamming the channel. Set `thread_require_mention: true` to disable the in-thread shortcut and gate threads the same way channels are gated. Explicit `@mentions` still work as before.
+Set `thread_require_mention: false` only for legacy one-bot threads where, once the bot has participated in a thread (auto-created on `@mention` or replied in once), it should keep responding to subsequent messages without needing to be `@mentioned` again. Explicit `@mentions` still work either way.
 
 ```yaml
 discord:
   require_mention: true
-  thread_require_mention: true    # multi-bot setup
+  thread_require_mention: false   # legacy one-bot thread follow-ups
+```
+
+#### `discord.voice_auto_tag`
+
+**Type:** boolean — **Default:** `false`
+
+When disabled, native Discord voice messages in server channels follow the normal mention gate and need an explicit `@mention`. This prevents untagged voice recordings from waking every bot in a shared server.
+
+Set `voice_auto_tag: true` only when native voice-message uploads should automatically trigger this bot without a mention.
+
+```yaml
+discord:
+  voice_auto_tag: true
 ```
 
 #### `discord.free_response_channels`
@@ -372,7 +387,7 @@ Free-response channels also **skip auto-threading** — the bot replies inline r
 
 **Type:** boolean — **Default:** `true`
 
-When enabled, every `@mention` in a regular text channel automatically creates a new thread for the conversation. This keeps the main channel clean and gives each conversation its own isolated session history. Once a thread is created, subsequent messages in that thread don't require `@mention` — the bot knows it's already participating. Set [`thread_require_mention`](#discordthread_require_mention) to `true` to disable this in-thread shortcut for multi-bot setups.
+When enabled, every `@mention` in a regular text channel automatically creates a new thread for the conversation. This keeps the main channel clean and gives each conversation its own isolated session history. By default, follow-ups in that thread still require `@mention`; set [`thread_require_mention`](#discordthread_require_mention) to `false` only for legacy one-bot threads that should auto-respond after participation.
 
 Messages sent in existing threads or DMs are unaffected by this setting. Channels listed in `discord.free_response_channels` or `discord.no_thread_channels` also bypass auto-threading and get inline replies instead.
 
@@ -797,5 +812,4 @@ Leave `everyone` and `roles` at `false` unless you know exactly why you need the
 :::
 
 For more information on securing your Hermes Agent deployment, see the [Security Guide](../security.md).
-
 

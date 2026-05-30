@@ -277,7 +277,8 @@ Discord 行为通过两个文件控制：**`~/.hermes/.env`** 用于凭据和环
 | `DISCORD_HOME_CHANNEL_NAME` | 否 | `"Home"` | 主频道在日志和状态输出中的显示名称。 |
 | `DISCORD_COMMAND_SYNC_POLICY` | 否 | `"safe"` | 控制原生斜杠命令启动同步。`"safe"` 对现有全局命令进行差异比较，仅更新已更改的内容，当 Discord 元数据更改无法通过补丁应用时重新创建命令。`"bulk"` 保留旧的 `tree.sync()` 行为。`"off"` 完全跳过启动同步。 |
 | `DISCORD_REQUIRE_MENTION` | 否 | `true` | 为 `true` 时，机器人仅在服务器频道中被 `@提及` 时响应。设置为 `false` 可响应每个频道中的所有消息。 |
-| `DISCORD_THREAD_REQUIRE_MENTION` | 否 | `false` | 为 `true` 时，禁用线程内的提及快捷方式——线程与频道的门控方式相同，即使机器人已经参与其中，也需要 `@提及`。当多个机器人共享一个线程且你希望每个机器人仅在明确 `@提及` 时触发时使用此设置。 |
+| `DISCORD_THREAD_REQUIRE_MENTION` | 否 | `true` | 为 `true` 时，禁用线程内的提及快捷方式——线程与频道的门控方式相同，即使机器人已经参与其中，也需要 `@提及`。仅在旧的一 bot 线程需要参与后自动响应时设置为 `false`。 |
+| `DISCORD_VOICE_AUTO_TAG` | 否 | `false` | 为 `true` 时，服务器频道中的原生 Discord 语音消息即使没有 `@提及` 也会被视为发给该 bot。多 bot 频道中除非希望语音消息自动触发此 bot，否则保持 `false`。 |
 | `DISCORD_FREE_RESPONSE_CHANNELS` | 否 | — | 机器人无需 `@提及` 即可响应的频道 ID，逗号分隔，即使 `DISCORD_REQUIRE_MENTION` 为 `true` 也适用。 |
 | `DISCORD_IGNORE_NO_MENTION` | 否 | `true` | 为 `true` 时，如果消息 `@提及` 了其他用户但**未**提及机器人，机器人保持沉默。防止机器人介入针对其他人的对话。仅适用于服务器频道，不适用于私信。 |
 | `DISCORD_AUTO_THREAD` | 否 | `true` | 为 `true` 时，自动为文本频道中的每次 `@提及` 创建新线程，使每个对话相互隔离（类似 Slack 行为）。已在线程或私信中的消息不受影响。 |
@@ -307,7 +308,8 @@ Discord 行为通过两个文件控制：**`~/.hermes/.env`** 用于凭据和环
 # Discord 特定设置
 discord:
   require_mention: true           # 在服务器频道中需要 @提及
-  thread_require_mention: false   # 为 true 时，线程中也需要 @提及（多机器人线程）
+  thread_require_mention: true    # 线程中也需要 @提及（多 bot 安全默认值）
+  voice_auto_tag: false           # 原生 Discord 语音消息仍需要 @提及
   free_response_channels: ""      # 逗号分隔的频道 ID（或 YAML 列表）
   auto_thread: true               # 在 @提及 时自动创建线程
   reactions: true                 # 处理过程中添加 emoji 反应
@@ -334,16 +336,29 @@ group_sessions_per_user: true     # 在共享频道中按用户隔离会话
 
 #### `discord.thread_require_mention`
 
-**类型：** 布尔值 — **默认值：** `false`
+**类型：** 布尔值 — **默认值：** `true`
 
-默认情况下，一旦机器人参与了某个线程（通过 `@提及` 自动创建或回复过一次），它就会继续响应该线程中的每条后续消息，无需再次 `@提及`。这对于一对一对话来说是正确的默认行为。
+默认情况下，线程与频道使用相同门控：即使机器人已经参与该线程，也需要显式 `@提及` 才会响应。这是在多个 bot 共享 Discord 服务器或线程时的安全默认值。
 
-在**多机器人线程**中，用户每次只与一个机器人交流，这个默认行为会成为隐患——线程中的每个其他机器人也会对每条消息触发，消耗额度并刷屏。将 `thread_require_mention: true` 设置为禁用线程内快捷方式，使线程与频道的门控方式相同。显式 `@提及` 仍然有效。
+仅在旧的一 bot 线程中需要参与后自动响应时设置 `thread_require_mention: false`：一旦机器人参与了某个线程（通过 `@提及` 自动创建或回复过一次），它会继续响应后续消息，无需再次 `@提及`。无论此设置如何，显式 `@提及` 仍然有效。
 
 ```yaml
 discord:
   require_mention: true
-  thread_require_mention: true    # 多机器人设置
+  thread_require_mention: false   # 旧的一 bot 线程后续消息
+```
+
+#### `discord.voice_auto_tag`
+
+**类型：** 布尔值 — **默认值：** `false`
+
+禁用时，服务器频道中的原生 Discord 语音消息遵循普通提及门控，需要显式 `@提及`。这可以防止未标记的语音录音唤醒共享服务器中的每个 bot。
+
+仅当原生语音消息上传应在没有提及时自动触发此 bot 时，才设置 `voice_auto_tag: true`。
+
+```yaml
+discord:
+  voice_auto_tag: true
 ```
 
 #### `discord.free_response_channels`
@@ -372,7 +387,7 @@ discord:
 
 **类型：** 布尔值 — **默认值：** `true`
 
-启用后，普通文本频道中的每次 `@提及` 都会自动为对话创建新线程。这保持主频道整洁，并为每个对话提供独立的会话历史。一旦创建线程，该线程中的后续消息不需要 `@提及`——机器人知道它已经在参与其中。对于多机器人设置，将 [`thread_require_mention`](#discordthread_require_mention) 设置为 `true` 可禁用此线程内快捷方式。
+启用后，普通文本频道中的每次 `@提及` 都会自动为对话创建新线程。这保持主频道整洁，并为每个对话提供独立的会话历史。默认情况下，该线程中的后续消息仍需要 `@提及`；仅在旧的一 bot 线程需要参与后自动响应时，才将 [`thread_require_mention`](#discordthread_require_mention) 设置为 `false`。
 
 在现有线程或私信中发送的消息不受此设置影响。`discord.free_response_channels` 或 `discord.no_thread_channels` 中列出的频道也会绕过自动创建线程，改为直接回复。
 
