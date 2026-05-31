@@ -8052,6 +8052,16 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> Optional[Run]:
     return Run.from_row(row) if row else None
 
 
+def active_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
+    """Return the currently-open run for ``task_id`` (``ended_at IS NULL``)."""
+    row = conn.execute(
+        "SELECT * FROM task_runs WHERE task_id = ? AND ended_at IS NULL "
+        "ORDER BY started_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return Run.from_row(row) if row else None
+
+
 def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
     """Return the most recent run regardless of outcome (active or closed)."""
     row = conn.execute(
