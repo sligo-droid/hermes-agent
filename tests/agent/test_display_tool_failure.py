@@ -127,6 +127,19 @@ class TestDetectToolFailureStructured:
         result = json.dumps({"success": True, "data": "hello"})
         assert _detect_tool_failure("web_search", result) == (False, "")
 
+    def test_successful_result_with_null_error_not_flagged(self):
+        result = json.dumps({
+            "success": True,
+            "status": "completed",
+            "summary": "changed files and ran tests",
+            "error": None,
+        })
+        assert _detect_tool_failure("delegate_coding_task", result) == (False, "")
+
+    def test_success_false_without_error_is_flagged(self):
+        result = json.dumps({"success": False, "status": "partial"})
+        assert _detect_tool_failure("delegate_coding_task", result) == (True, " [error]")
+
     def test_dict_without_error_or_success_uses_generic_heuristic(self):
         # Plain successful dict — should pass through the generic
         # heuristic which only fires on the string "Error" / '"error"' / etc.
