@@ -6013,6 +6013,8 @@ class DiscordAdapter(BasePlatformAdapter):
         text: str,
         feature_summary: Optional[Dict[str, Any]] = None,
         goal_thread_context: Optional[str] = None,
+        native_slash_command: bool = False,
+        project_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Build a MessageEvent pointing at a thread and send it through handle_message."""
         guild_name = ""
@@ -6027,7 +6029,7 @@ class DiscordAdapter(BasePlatformAdapter):
         _parent_channel = self._thread_parent_channel(_chan)
         _parent_id = str(getattr(_parent_channel, "id", "") or "")
         _guild = getattr(interaction, "guild", None) or getattr(_parent_channel, "guild", None)
-        project_context = self._resolve_project_context_for_channel(_parent_channel)
+        project_context = project_context or self._resolve_project_context_for_channel(_parent_channel)
 
         source = self.build_source(
             chat_id=thread_id,
@@ -6054,6 +6056,7 @@ class DiscordAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             feature_summary=feature_summary,
             goal_thread_context=goal_thread_context,
+            native_slash_command=native_slash_command,
         )
         await self.handle_message(event)
 
@@ -6107,7 +6110,88 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         args = (args or "").strip()
         command_text = f"/goal {args}".strip()
-        await self._run_simple_slash(interaction, command_text)
+        if not args or args.lower() in GOAL_CONTROL_COMMANDS:
+            await self._run_simple_slash(interaction, command_text)
+            return
+
+        if not await self._check_slash_authorization(interaction, command_text):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        channel = await self._resolve_interaction_channel(interaction)
+        if channel is None or isinstance(channel, discord.DMChannel):
+            event = self._build_slash_event(interaction, command_text)
+            await self.handle_message(event)
+            try:
+                await interaction.edit_original_response(content="Goal started in this conversation.")
+            except Exception as exc:
+                logger.debug("Discord /goal fallback ack failed: %s", exc)
+            return
+
+        thread_channel = channel if isinstance(channel, discord.Thread) else None
+        thread_id = str(getattr(thread_channel, "id", "") or "") if thread_channel is not None else ""
+        thread_name = str(getattr(thread_channel, "name", "") or "") if thread_channel is not None else ""
+
+        if thread_channel is None:
+            result = await self._create_thread(
+                interaction,
+                name=self._goal_thread_name(args),
+                message="",
+            )
+            if not result.get("success"):
+                error = result.get("error", "unknown error")
+                event = self._build_slash_event(interaction, command_text)
+                await self.handle_message(event)
+                try:
+                    await interaction.edit_original_response(
+                        content=(
+                            f"Could not create a goal thread ({error}). "
+                            "Starting the goal in this channel instead."
+                        )
+                    )
+                except Exception as exc:
+                    logger.debug("Discord /goal thread fallback ack failed: %s", exc)
+                return
+            thread_id = str(result.get("thread_id") or "")
+            thread_name = str(result.get("thread_name") or self._goal_thread_name(args))
+            thread_channel = await self._resolve_channel_by_id(thread_id)
+        else:
+            thread_id = str(getattr(thread_channel, "id", "") or getattr(interaction, "channel_id", "") or "")
+            thread_name = str(getattr(thread_channel, "name", "") or self._goal_thread_name(args))
+        parent_channel = self._thread_parent_channel(thread_channel or channel)
+        project_context = self._resolve_project_context_for_channel(parent_channel)
+
+        if not thread_id:
+            event = self._build_slash_event(interaction, command_text)
+            await self.handle_message(event)
+            try:
+                await interaction.edit_original_response(content="Goal started in this conversation.")
+            except Exception as exc:
+                logger.debug("Discord /goal fallback ack failed: %s", exc)
+            return
+
+        self._threads.mark(thread_id)
+        goal_thread_context = ""
+        if thread_channel is not None:
+            goal_thread_context = await self._fetch_goal_thread_context(thread_channel)
+
+        try:
+            await interaction.edit_original_response(content=f"Goal started in <#{thread_id}>.")
+        except Exception as exc:
+            logger.debug("Discord /goal thread ack failed: %s", exc)
+
+        self._schedule_discord_background(
+            self._dispatch_thread_session(
+                interaction,
+                thread_id,
+                thread_name,
+                command_text,
+                goal_thread_context=goal_thread_context or None,
+                native_slash_command=True,
+                project_context=project_context,
+            ),
+            label=f"/goal {thread_id}",
+        )
 
     def _resolve_channel_skills(self, channel_id: str, parent_id: str | None = None) -> list[str] | None:
         """Look up auto-skill bindings for a Discord channel/forum thread.
