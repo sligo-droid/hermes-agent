@@ -63,6 +63,12 @@ export interface ConfigDisplayConfig {
   streaming?: boolean
   terminal_notify_on_complete?: boolean
   thinking_mode?: string
+  /**
+   * Nudge the user toward the /agents spawn-tree dashboard the first time a
+   * turn starts delegating, via a one-time transient activity hint.  Opens
+   * nothing — just advertises the command.  Default true.
+   */
+  tui_agents_nudge?: boolean
   tui_auto_resume_recent?: boolean
   tui_compact?: boolean
   /** Legacy alias for display.mouse_tracking. */

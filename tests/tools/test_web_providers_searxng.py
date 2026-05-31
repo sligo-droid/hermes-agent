@@ -12,7 +12,6 @@ Covers:
 from __future__ import annotations
 
 import json
-import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -345,7 +344,6 @@ class TestSearXNGOnlyExtractCrawlErrors:
         monkeypatch.setattr(web_tools, "_is_tool_gateway_ready", lambda: False)
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False, raising=False)
 
-        import json
         result_str = asyncio.get_event_loop().run_until_complete(
             web_tools.web_extract_tool(["https://example.com"])
         )

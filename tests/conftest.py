@@ -22,12 +22,10 @@ test runner at ``scripts/run_tests.sh``.
 import asyncio
 import logging
 import os
-import re
 import signal
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -218,6 +216,8 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "TERMINAL_CONTAINER_DISK",
     "TERMINAL_CONTAINER_MEMORY",
     "TERMINAL_CONTAINER_PERSISTENT",
+    "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
+    "TERMINAL_DOCKER_ORPHAN_REAPER",
     "TERMINAL_DOCKER_RUN_AS_HOST_USER",
     "BROWSER_CDP_URL",
     "CAMOFOX_URL",

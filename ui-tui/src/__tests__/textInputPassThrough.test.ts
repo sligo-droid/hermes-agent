@@ -8,12 +8,13 @@ import {
   TextInput,
   shouldBufferInputAsPaste,
   shouldInsertPlainBurst,
-  shouldPassThroughToGlobalHandler
+  shouldPassThroughToGlobalHandler,
+  shouldPreserveCtrlJNewline
 } from '../components/textInput.js'
 import { DEFAULT_VOICE_RECORD_KEY, parseVoiceRecordKey } from '../lib/platform.js'
 
 const key = (overrides: Record<string, unknown> = {}) => ({ ctrl: false, meta: false, ...overrides }) as any
-const tick = () => new Promise<void>(resolve => setTimeout(resolve, 0))
+const tick = () => new Promise<void>(resolve => setTimeout(resolve, 25))
 
 function ttyStream() {
   const stream = new PassThrough() as PassThrough & {
@@ -40,6 +41,22 @@ function ttyStream() {
 
   return stream
 }
+
+describe('shouldPreserveCtrlJNewline', () => {
+  it('preserves Ctrl+J as newline in Ghostty even when tmux masks TERM/TERM_PROGRAM', () => {
+    expect(
+      shouldPreserveCtrlJNewline({
+        GHOSTTY_RESOURCES_DIR: '/usr/share/ghostty',
+        TERM: 'tmux-256color',
+        TERM_PROGRAM: 'tmux'
+      })
+    ).toBe(true)
+  })
+
+  it('keeps bare local POSIX LF-compatible prompts submitting on Ctrl+J', () => {
+    expect(shouldPreserveCtrlJNewline({ TERM: 'xterm-256color' })).toBe(false)
+  })
+})
 
 describe('shouldPassThroughToGlobalHandler', () => {
   it('passes through the configured voice shortcut while composer is focused', () => {

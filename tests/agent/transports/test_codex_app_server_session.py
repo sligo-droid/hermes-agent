@@ -7,7 +7,6 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 
 from __future__ import annotations
 
-import threading
 import time
 from unittest.mock import patch
 from typing import Any, Optional

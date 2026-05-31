@@ -3,7 +3,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-import pytest
 
 from gateway.config import Platform
 from gateway.run import (

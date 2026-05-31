@@ -9,7 +9,7 @@ only renders as a voice bubble when explicitly flagged) and via
 
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 

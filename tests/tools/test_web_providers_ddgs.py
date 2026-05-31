@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import sys
 import types
-from unittest.mock import MagicMock
 
 
 def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None):
