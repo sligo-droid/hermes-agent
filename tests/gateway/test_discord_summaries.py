@@ -1776,6 +1776,7 @@ async def test_tagged_thread_question_gets_direct_answer_prompt(adapter, monkeyp
 @pytest.mark.asyncio
 async def test_native_voice_feature_request_triages_from_transcript(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_VOICE_AUTO_TAG", "true")
     parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
     thread = FakeThread(channel_id=200, parent=parent)
     adapter._auto_create_thread = AsyncMock(return_value=thread)
