@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from agent.tool_executor import _coding_worker_mutation_block
+from agent.tool_executor import _coding_worker_mutation_block, _coding_worker_result_succeeded
 
 
 def _agent(**overrides):
@@ -40,3 +40,9 @@ def test_coding_worker_guardrail_allows_terminal_after_delegate():
         "terminal",
         {"command": "git add . && git commit -m fix"},
     ) is None
+
+
+def test_coding_worker_success_with_null_error_counts_as_success():
+    result = '{"success": true, "status": "completed", "summary": "ok", "error": null}'
+
+    assert _coding_worker_result_succeeded(result) is True
