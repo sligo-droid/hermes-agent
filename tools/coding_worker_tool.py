@@ -280,6 +280,13 @@ def delegate_coding_task(
         "Work in the requested repository, make direct file edits when needed, "
         "and run focused checks that fit the task.",
         "Do not create commits or pull requests.",
+        "Closeout review: after non-trivial code edits and focused checks, "
+        "use the OpenClaw autoreview skill when available "
+        "(https://github.com/openclaw/agent-skills/blob/main/skills/autoreview/SKILL.md). "
+        "Treat findings as advisory, verify actionable findings in the real code path, "
+        "fix only concrete in-scope issues, and rerun affected checks after any "
+        "review-triggered edit. If the autoreview helper/skill is unavailable, "
+        "say so in the final summary.",
         "Final response must summarize changed files, checks run, and any "
         "remaining blockers.",
     ]

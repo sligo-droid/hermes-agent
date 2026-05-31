@@ -103,6 +103,8 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     assert "Always use the repo test wrapper." in prompt
     assert "Worker boundary" in prompt
     assert "parent Hermes owns all git and PR lifecycle steps" in prompt
+    assert "OpenClaw autoreview skill" in prompt
+    assert "after non-trivial code edits and focused checks" in prompt
     assert prompt.index("Open PRs and merge them yourself") < prompt.index("Worker boundary")
     assert result["agents"] == ["build"]
     assert result["plan_used"] is False
@@ -229,6 +231,7 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
     def fake_run(prompt, workspace, **kwargs):
         assert "fix the parser" in prompt
         assert "OpenCode should see repo rules." in prompt
+        assert "OpenClaw autoreview skill" in prompt
         assert workspace == str(tmp_path)
         assert kwargs["context_for_classification"]
         return SimpleNamespace(
