@@ -387,6 +387,60 @@ async def test_discord_goal_set_signals_dirty_dispatch(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_native_discord_goal_slash_uses_hermes_loop_not_kanban(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    kanban_home = tmp_path / "kanban-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    goals._DB_CACHE.clear()
+    goals.GoalManager(_session_id()).clear()
+
+    board_lookup_calls = []
+
+    def fake_board_for_gateway_event(*args, **kwargs):
+        board_lookup_calls.append((args, kwargs))
+        return None
+
+    monkeypatch.setattr(
+        "hermes_cli.discord_worker_boards.board_for_gateway_event",
+        fake_board_for_gateway_event,
+    )
+
+    adapter = _FakeAdapter()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _FakeSessionStore()  # type: ignore[assignment]
+    runner.adapters = {Platform.DISCORD: adapter}  # type: ignore[assignment]
+    runner._queued_events = {}
+    runner._log_gateway_flow_telemetry = lambda **kwargs: None
+
+    event = _make_discord_thread_event("/goal Ship the dashboard", thread_id="thread-native")
+    event.native_slash_command = True
+
+    try:
+        response = await GatewayRunner._handle_goal_command(runner, event)
+
+        from hermes_cli import discord_worker_boards as dwb
+        from hermes_cli import kanban_db
+
+        board = dwb.board_slug_for_discord_request("thread-native", "msg-thread-native")
+        session_key = runner._session_key_for_source(event.source)
+
+        assert response is not None
+        assert board_lookup_calls == []
+        assert "⊙ Goal set" in response
+        assert not kanban_db.board_exists(board)
+        assert adapter._pending_messages[session_key].text.startswith(
+            "[Starting work toward your standing goal]\nGoal:\nShip the dashboard"
+        )
+    finally:
+        goals._DB_CACHE.clear()
+
+
+@pytest.mark.asyncio
 async def test_discord_goal_resume_signals_dirty_dispatch(tmp_path, monkeypatch):
     kanban_home = tmp_path / "kanban-home"
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))

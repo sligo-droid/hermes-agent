@@ -488,6 +488,7 @@ def test_build_slash_event_preserves_thread_context(adapter):
     event = adapter._build_slash_event(interaction, "/status")
 
     assert event.text == "/status"
+    assert event.native_slash_command is True
     assert event.source.chat_id == "555"
     assert event.source.chat_type == "thread"
     assert event.source.thread_id == "555"
@@ -760,101 +761,29 @@ class _FakeThreadChannel(_discord_mod.Thread):
 
 
 @pytest.mark.asyncio
-async def test_goal_slash_acks_thread_before_background_dispatch(adapter):
-    parent = _FakeTextChannel(channel_id=123, name="features")
-    thread = _FakeThreadChannel(channel_id=555, name="Ship faster", parent_id=123)
-    interaction = SimpleNamespace(
-        channel=parent,
-        channel_id=123,
-        user=SimpleNamespace(display_name="Jezza", id=42),
-        guild=SimpleNamespace(name="TestGuild", id=1),
-        response=SimpleNamespace(defer=AsyncMock()),
-        edit_original_response=AsyncMock(),
-    )
-
-    adapter._create_thread = AsyncMock(
-        return_value={"success": True, "thread_id": "555", "thread_name": "Ship faster"}
-    )
-    adapter._resolve_channel_by_id = AsyncMock(return_value=thread)
-    project_context = {"project_path": "/home/droid/hermes", "source": "configured_channel_cwd"}
-    adapter._resolve_project_context_for_channel = MagicMock(return_value=project_context)
-    adapter.initialize_feature_summary = AsyncMock(
-        return_value={"kanban_board": {"public_url": "https://example.test/workers/555"}}
-    )
+async def test_goal_slash_routes_official_command_to_hermes_goal_loop(adapter):
+    interaction = SimpleNamespace()
+    adapter._run_simple_slash = AsyncMock()
+    adapter._create_thread = AsyncMock()
+    adapter.initialize_feature_summary = AsyncMock()
     adapter._dispatch_thread_session = AsyncMock()
-    scheduled = []
-
-    def capture_background(coro, *, label):
-        scheduled.append((coro, label))
-        coro.close()
-
-    adapter._schedule_discord_background = capture_background
 
     await adapter._handle_goal_slash(interaction, "Ship faster")
 
-    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
-    interaction.edit_original_response.assert_awaited_once()
-    content = interaction.edit_original_response.await_args.kwargs["content"]
-    assert "<#555>" in content
-    assert "https://example.test/workers/555" in content
-    assert scheduled and scheduled[0][1] == "/goal 555"
-    adapter._resolve_project_context_for_channel.assert_called_once_with(parent)
-    adapter.initialize_feature_summary.assert_awaited_once()
-    feature_args, feature_kwargs = adapter.initialize_feature_summary.await_args
-    assert feature_args == (thread,)
-    assert feature_kwargs["parent_channel"] is parent
-    assert feature_kwargs["project_context"] == project_context
-    assert feature_kwargs["initial_request"] == "/goal Ship faster"
-    assert adapter._dispatch_thread_session.call_args.kwargs["feature_summary"] == {
-        "kanban_board": {"public_url": "https://example.test/workers/555"}
-    }
-    adapter._dispatch_thread_session.assert_not_awaited()
+    adapter._run_simple_slash.assert_awaited_once_with(interaction, "/goal Ship faster")
+    adapter._create_thread.assert_not_awaited()
+    adapter.initialize_feature_summary.assert_not_awaited()
+    adapter._dispatch_thread_session.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_goal_slash_from_thread_uses_thread_parent_for_project_context(adapter):
-    thread = _FakeThreadChannel(channel_id=555, name="Ship faster", parent_id=123)
-    interaction = SimpleNamespace(
-        channel=thread,
-        channel_id=555,
-        user=SimpleNamespace(display_name="Jezza", id=42),
-        guild=SimpleNamespace(name="TestGuild", id=1),
-        response=SimpleNamespace(defer=AsyncMock()),
-        edit_original_response=AsyncMock(),
-    )
+async def test_goal_slash_without_args_routes_to_hermes_goal_loop(adapter):
+    interaction = SimpleNamespace()
+    adapter._run_simple_slash = AsyncMock()
 
-    adapter._create_thread = AsyncMock()
-    adapter._resolve_channel_by_id = AsyncMock()
-    project_context = {"project_path": "/home/droid/hermes", "source": "configured_channel_cwd"}
-    adapter._resolve_project_context_for_channel = MagicMock(return_value=project_context)
-    adapter.initialize_feature_summary = AsyncMock(return_value={})
-    adapter._fetch_goal_thread_context = AsyncMock(return_value="[Goal thread context]\n[Alice] prior detail")
-    adapter._dispatch_thread_session = AsyncMock()
-    scheduled = []
+    await adapter._handle_goal_slash(interaction, "")
 
-    def capture_background(coro, *, label):
-        scheduled.append((coro, label))
-        coro.close()
-
-    adapter._schedule_discord_background = capture_background
-
-    await adapter._handle_goal_slash(interaction, "Ship faster")
-
-    adapter._create_thread.assert_not_awaited()
-    adapter._resolve_channel_by_id.assert_not_awaited()
-    adapter._resolve_project_context_for_channel.assert_called_once_with(thread.parent)
-    adapter.initialize_feature_summary.assert_awaited_once()
-    feature_args, feature_kwargs = adapter.initialize_feature_summary.await_args
-    assert feature_args == (thread,)
-    assert feature_kwargs["parent_channel"] is thread.parent
-    assert feature_kwargs["project_context"] == project_context
-    assert feature_kwargs["initial_request"] == "/goal Ship faster"
-    adapter._fetch_goal_thread_context.assert_awaited_once_with(thread)
-    assert adapter._dispatch_thread_session.call_args.kwargs["goal_thread_context"] == (
-        "[Goal thread context]\n[Alice] prior detail"
-    )
-    assert scheduled and scheduled[0][1] == "/goal 555"
-    adapter._dispatch_thread_session.assert_not_awaited()
+    adapter._run_simple_slash.assert_awaited_once_with(interaction, "/goal")
 
 
 @pytest.mark.asyncio

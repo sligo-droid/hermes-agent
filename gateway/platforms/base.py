@@ -1358,6 +1358,14 @@ class MessageEvent:
     invoked_skill_name: Optional[str] = None
     invoked_skill_command: Optional[str] = None
     skip_post_turn_goal_once: bool = False
+
+    # True when this event came from the platform's native slash-command
+    # interaction surface (rather than a user-typed text message that merely
+    # starts with "/command"). Discord uses this to keep the official /goal
+    # app command on the Hermes/Ralph-style goal loop while user text such as
+    # ``/goal build this`` in a worker thread can continue to route to the
+    # Discord Kanban worker board.
+    native_slash_command: bool = False
     
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.

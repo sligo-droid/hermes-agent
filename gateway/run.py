@@ -13227,8 +13227,18 @@ class GatewayRunner:
             from hermes_cli import discord_worker_boards as _dwb
             from hermes_cli.discord_worker_roles import GOAL_CONTROL_COMMANDS
 
-            is_set = bool(args and lower not in GOAL_CONTROL_COMMANDS)
-            board = _dwb.board_for_gateway_event(event, create=is_set)
+            # The official Discord application command /goal is reserved for
+            # the Hermes/Ralph-style goal loop. Only user-typed Discord text
+            # commands (and synthetic worker-thread events) should enter the
+            # Discord Kanban board backend.
+            native_discord_slash_goal = (
+                getattr(event, "native_slash_command", False)
+                and getattr(getattr(event, "source", None), "platform", None) == Platform.DISCORD
+            )
+            board = None
+            if not native_discord_slash_goal:
+                is_set = bool(args and lower not in GOAL_CONTROL_COMMANDS)
+                board = _dwb.board_for_gateway_event(event, create=is_set)
             if board is not None:
                 if not args or lower == "status":
                     return _dwb.status_line(board.slug)

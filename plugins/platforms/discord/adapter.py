@@ -5362,7 +5362,7 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_background(interaction: discord.Interaction, prompt: str):
             await self._run_simple_slash(interaction, f"/background {prompt}", "Background task started~")
 
-        @tree.command(name="goal", description="Start or manage a durable /goal worker")
+        @tree.command(name="goal", description="Start or manage the Hermes goal loop")
         @discord.app_commands.describe(args="Goal text, or status/pause/resume/clear/stop/done")
         async def slash_goal(interaction: discord.Interaction, args: str = ""):
             await self._handle_goal_slash(interaction, args)
@@ -5769,6 +5769,7 @@ class DiscordAdapter(BasePlatformAdapter):
             source=source,
             raw_message=interaction,
             channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
+            native_slash_command=True,
         )
 
     @staticmethod
@@ -6097,89 +6098,16 @@ class DiscordAdapter(BasePlatformAdapter):
         interaction: discord.Interaction,
         args: str = "",
     ) -> None:
-        """Fast-path Discord /goal so acknowledgement is not tied to worker startup."""
+        """Route the official Discord /goal command to Hermes' goal loop.
+
+        User-typed Discord messages that begin with ``/goal`` are still
+        handled downstream by the Kanban worker-board path. Native Discord
+        slash invocations are the one surface reserved for the Ralph-style
+        Hermes goal loop.
+        """
         args = (args or "").strip()
-        lower = args.lower()
         command_text = f"/goal {args}".strip()
-        control = not args or lower in GOAL_CONTROL_COMMANDS
-        if control:
-            await self._run_simple_slash(interaction, command_text)
-            return
-
-        if not await self._check_slash_authorization(interaction, command_text):
-            return
-        await interaction.response.defer(ephemeral=True)
-
-        channel = await self._resolve_interaction_channel(interaction)
-        if channel is None or isinstance(channel, discord.DMChannel):
-            event = self._build_slash_event(interaction, command_text)
-            await self.handle_message(event)
-            try:
-                await interaction.edit_original_response(content="Goal started.")
-            except Exception:
-                pass
-            return
-
-        is_thread = isinstance(channel, discord.Thread)
-        parent_channel = self._thread_parent_channel(channel) if is_thread else channel
-        if is_thread:
-            thread_id = str(getattr(channel, "id", None) or getattr(interaction, "channel_id", "") or "")
-            thread_name = getattr(channel, "name", None) or self._goal_thread_name(args)
-            thread_channel = channel
-        else:
-            result = await self._create_thread(
-                interaction,
-                name=self._goal_thread_name(args),
-                message="",
-                auto_archive_duration=1440,
-            )
-            if not result.get("success"):
-                await interaction.edit_original_response(
-                    content=f"Failed to create goal thread: {result.get('error', 'unknown error')}"
-                )
-                return
-            thread_id = str(result.get("thread_id") or "")
-            thread_name = str(result.get("thread_name") or self._goal_thread_name(args))
-            thread_channel = await self._resolve_channel_by_id(thread_id)
-
-        link = f"<#{thread_id}>" if thread_id else f"**{thread_name}**"
-        goal_thread_context = ""
-        if is_thread and thread_channel is not None:
-            goal_thread_context = await self._fetch_goal_thread_context(thread_channel)
-        feature_summary_handle = None
-        if thread_channel is not None:
-            project_context = self._resolve_project_context_for_channel(parent_channel)
-            feature_summary_handle = await self.initialize_feature_summary(
-                thread_channel,
-                parent_channel=parent_channel,
-                initial_request=command_text,
-                project_context=project_context,
-                source_message_id=str(getattr(interaction, "id", "") or "") or None,
-            )
-        board_url = ""
-        if isinstance(feature_summary_handle, dict):
-            board_url = str(
-                ((feature_summary_handle.get("kanban_board") or {}).get("public_url"))
-                or ""
-            )
-        content = f"Goal started in {link}."
-        if board_url:
-            content = f"{content} Board: {board_url}"
-        await interaction.edit_original_response(content=content)
-
-        if thread_id:
-            self._threads.mark(thread_id)
-            self._schedule_discord_background(
-                self._dispatch_thread_session(
-                    interaction,
-                    thread_id,
-                    thread_name,
-                    command_text,
-                    feature_summary=feature_summary_handle,
-                    goal_thread_context=goal_thread_context or None,
-                ),
-                label=f"/goal {thread_id}",
-            )
+        await self._run_simple_slash(interaction, command_text)
 
     def _resolve_channel_skills(self, channel_id: str, parent_id: str | None = None) -> list[str] | None:
         """Look up auto-skill bindings for a Discord channel/forum thread.
