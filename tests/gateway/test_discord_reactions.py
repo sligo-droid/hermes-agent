@@ -497,7 +497,10 @@ async def test_kanban_thread_reaction_prefers_explicit_reaction_state(adapter):
     )
 
     assert synced == "foreman"
-    message.remove_reaction.assert_awaited_once_with("👀", adapter._client.user)
+    assert [call.args for call in message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="🔨",
+    )
     message.add_reaction.assert_awaited_once_with("🔨")
 
 
@@ -543,7 +546,10 @@ async def test_kanban_thread_reaction_repairs_source_op_not_summary_embed(adapte
     )
 
     assert synced == "running"
-    op_message.remove_reaction.assert_awaited_once_with("✅", adapter._client.user)
+    assert [call.args for call in op_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="⏳",
+    )
     op_message.add_reaction.assert_awaited_once_with("⏳")
     summary_message.remove_reaction.assert_not_awaited()
     summary_message.add_reaction.assert_not_awaited()
@@ -591,7 +597,10 @@ async def test_kanban_thread_reaction_ignores_summary_id_when_op_is_thread_origi
 
     assert synced == "running"
     parent.fetch_message.assert_awaited_once_with(origin_message.id)
-    origin_message.remove_reaction.assert_awaited_once_with("✅", adapter._client.user)
+    assert [call.args for call in origin_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="⏳",
+    )
     origin_message.add_reaction.assert_awaited_once_with("⏳")
     summary_message.remove_reaction.assert_not_awaited()
     summary_message.add_reaction.assert_not_awaited()
@@ -643,7 +652,27 @@ async def test_status_reaction_state_preserves_existing_target(adapter):
 
     await adapter._set_message_reaction_state(raw_message, "👀")
 
-    raw_message.remove_reaction.assert_not_awaited()
+    assert [call.args for call in raw_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="👀",
+    )
+    raw_message.add_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_status_reaction_state_removes_uncached_stale_reactions(adapter):
+    raw_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="✅", me=True)],
+    )
+
+    await adapter._set_message_reaction_state(raw_message, "✅")
+
+    assert [call.args for call in raw_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="✅",
+    )
     raw_message.add_reaction.assert_not_awaited()
 
 
@@ -657,10 +686,10 @@ async def test_status_reaction_state_replaces_different_target(adapter):
 
     await adapter._set_message_reaction_state(raw_message, "❓")
 
-    assert [call.args for call in raw_message.remove_reaction.await_args_list] == [
-        ("👀", adapter._client.user),
-        ("⏳", adapter._client.user),
-    ]
+    assert [call.args for call in raw_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="❓",
+    )
     raw_message.add_reaction.assert_awaited_once_with("❓")
 
 

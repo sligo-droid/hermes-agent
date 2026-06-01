@@ -3475,8 +3475,6 @@ class DiscordAdapter(BasePlatformAdapter):
         for existing in _DISCORD_STATUS_REACTION_EMOJIS:
             if emoji and existing == emoji:
                 continue
-            if self._message_has_own_reaction(message, existing) is False:
-                continue
             await self._remove_reaction(message, existing)
         if emoji and target_present is not True:
             await self._add_reaction(message, emoji)
