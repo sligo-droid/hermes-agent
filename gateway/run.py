@@ -4228,6 +4228,87 @@ class GatewayRunner:
         {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
     )
 
+    def _resume_pending_entry_is_fresh(self, entry: Any, *, now: Optional[datetime] = None) -> bool:
+        if entry is None:
+            return False
+        if not getattr(entry, "resume_pending", False):
+            return False
+        if getattr(entry, "suspended", False):
+            return False
+        if getattr(entry, "resume_reason", None) not in self._AUTO_RESUME_REASONS:
+            return False
+        marker = getattr(entry, "last_resume_marked_at", None) or getattr(entry, "updated_at", None)
+        if marker is None:
+            return True
+        try:
+            age = ((now or datetime.now()) - marker).total_seconds()
+            return age <= _auto_continue_freshness_window()
+        except Exception:
+            return True
+
+    def _resume_pending_entry_for_session(self, session_key: str) -> Any | None:
+        if not session_key:
+            return None
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return None
+        try:
+            entry = getattr(store, "_entries", {}).get(session_key)
+        except Exception:
+            return None
+        return entry if self._resume_pending_entry_is_fresh(entry) else None
+
+    def _discord_resume_work_item_for_session(self, session_key: str) -> Optional[Dict[str, Any]]:
+        if not session_key:
+            return None
+        try:
+            items = [
+                item for item in self._ledger().incomplete_items()
+                if item.get("platform") == "discord"
+                and str(item.get("session_key") or "") == session_key
+            ]
+        except Exception:
+            return None
+        if not items:
+            return None
+
+        def _rank(item: Dict[str, Any]) -> tuple[int, int, float, float]:
+            status = str(item.get("status") or "")
+            final_response = str(item.get("final_response") or "")
+            return (
+                1 if status == "agent_done" and not final_response else 0,
+                1 if status in {"accepted", "claimed", "agent_running", "agent_done"} else 0,
+                float(item.get("updated_at") or 0),
+                float(item.get("created_at") or 0),
+            )
+
+        return max(items, key=_rank)
+
+    @staticmethod
+    def _hydrate_discord_resume_event_from_work_item(
+        event: MessageEvent,
+        item: Optional[Dict[str, Any]],
+    ) -> None:
+        if not item:
+            return
+        work_id = str(item.get("id") or "")
+        if work_id:
+            event.work_item_id = work_id
+            event.work_replay = True
+        feature_summary = item.get("feature_summary")
+        project_summary = item.get("project_summary")
+        event.feature_summary = feature_summary if isinstance(feature_summary, dict) else None
+        event.project_summary = project_summary if isinstance(project_summary, dict) else None
+        event.channel_prompt = item.get("channel_prompt")
+        event.channel_context = item.get("channel_context")
+        event.goal_thread_context = item.get("goal_thread_context")
+        event.reply_to_message_id = item.get("reply_to_message_id")
+        event.reply_to_text = item.get("reply_to_text")
+        if item.get("message_id"):
+            event.message_id = str(item.get("message_id"))
+            if getattr(event.source, "message_id", None) is None:
+                event.source.message_id = event.message_id
+
     def _schedule_resume_pending_sessions(self) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
@@ -4243,7 +4324,6 @@ class GatewayRunner:
         ``resume_pending`` and will auto-resume on the next real user
         message, or on the next gateway startup.
         """
-        window = _auto_continue_freshness_window()
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
@@ -4261,8 +4341,7 @@ class GatewayRunner:
         now = datetime.now()
         scheduled = 0
         for entry in candidates:
-            marker = entry.last_resume_marked_at or entry.updated_at
-            if marker is not None and (now - marker).total_seconds() > window:
+            if not self._resume_pending_entry_is_fresh(entry, now=now):
                 continue
 
             source = entry.origin
@@ -4288,6 +4367,11 @@ class GatewayRunner:
                 source=source,
                 internal=True,
             )
+            if source.platform == Platform.DISCORD:
+                self._hydrate_discord_resume_event_from_work_item(
+                    event,
+                    self._discord_resume_work_item_for_session(entry.session_key),
+                )
             task = asyncio.create_task(adapter.handle_message(event))
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
@@ -4315,7 +4399,17 @@ class GatewayRunner:
                 continue
             status = str(item.get("status") or "")
             lease_until = float(item.get("lease_until") or 0)
-            if status in {"claimed", "agent_running"} and lease_until > time.time() and ledger.claim_pid_alive(item):
+            if (
+                status in {"claimed", "agent_running"}
+                and lease_until > time.time()
+                and ledger.claim_pid_alive(item)
+            ):
+                continue
+            if self._resume_pending_entry_for_session(str(item.get("session_key") or "")):
+                logger.debug(
+                    "Deferring Discord work item replay for resume-pending session %s",
+                    item.get("session_key"),
+                )
                 continue
             try:
                 event = ledger.event_from_item(item)

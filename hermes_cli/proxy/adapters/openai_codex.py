@@ -421,9 +421,10 @@ class OpenAICodexAdapter(UpstreamAdapter):
                 has_function_calls=has_function_calls,
             )
             if synthesized is not None:
-                final.output = synthesized.output
-                if not getattr(final, "output_text", None):
-                    final.output_text = synthesized.output_text
+                return OpenAICodexAdapter._response_with_synthesized_output(
+                    final,
+                    synthesized,
+                )
         return final
 
     @staticmethod
@@ -460,6 +461,32 @@ class OpenAICodexAdapter(UpstreamAdapter):
             output=output,
             output_text=text,
         )
+
+    @staticmethod
+    def _response_with_synthesized_output(final: Any, synthesized: Any) -> Any:
+        output_text = getattr(final, "output_text", None) or getattr(synthesized, "output_text", "")
+        attrs = {
+            "status": getattr(final, "status", getattr(synthesized, "status", "completed")),
+            "output": getattr(synthesized, "output", []),
+            "output_text": output_text,
+        }
+        for name in ("id", "object", "created", "created_at", "model", "usage", "error"):
+            if hasattr(final, name):
+                attrs[name] = getattr(final, name)
+
+        if hasattr(final, "model_dump"):
+            def _model_dump(*args: Any, **kwargs: Any) -> dict[str, Any]:
+                data = final.model_dump(*args, **kwargs)
+                if not isinstance(data, dict):
+                    return {}
+                data = dict(data)
+                data["output"] = getattr(synthesized, "output", [])
+                data["output_text"] = output_text
+                return data
+
+            attrs["model_dump"] = _model_dump
+
+        return SimpleNamespace(**attrs)
 
     @staticmethod
     def _split_instructions(messages: list[Any]) -> tuple[str, list[dict[str, Any]]]:

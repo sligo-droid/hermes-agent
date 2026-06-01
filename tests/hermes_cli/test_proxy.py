@@ -335,6 +335,86 @@ def test_codex_stream_synthesizes_collected_output_after_sdk_null_output(monkeyp
     assert FakeClient.instances[0].closed is True
 
 
+def test_codex_stream_wraps_immutable_empty_final_response(monkeypatch):
+    output_item = SimpleNamespace(
+        type="message",
+        role="assistant",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="hello")],
+    )
+
+    class ImmutableFinalResponse:
+        def __init__(self):
+            self.status = "completed"
+            self.output = []
+            self.usage = {"input_tokens": 3, "output_tokens": 1}
+
+        @property
+        def output_text(self):
+            return ""
+
+        def model_dump(self, *args, **kwargs):
+            return {"usage": self.usage, "output": [], "output_text": ""}
+
+    class FakeStream:
+        def __init__(self):
+            self._events = [
+                SimpleNamespace(type="response.output_text.delta", delta="hello"),
+                SimpleNamespace(type="response.output_item.done", item=output_item),
+            ]
+            self._index = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, exc_tb):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._index < len(self._events):
+                event = self._events[self._index]
+                self._index += 1
+                return event
+            raise StopAsyncIteration
+
+        async def get_final_response(self):
+            return ImmutableFinalResponse()
+
+    class FakeResponses:
+        def stream(self, **kwargs):
+            return FakeStream()
+
+    class FakeClient:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.responses = FakeResponses()
+            self.closed = False
+            self.instances.append(self)
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex.AsyncOpenAI",
+        FakeClient,
+    )
+
+    result = asyncio.run(OpenAICodexAdapter._run_responses_stream(
+        {"model": "gpt-5.5", "input": [{"role": "user", "content": "hi"}], "store": False},
+        UpstreamCredential(bearer="token", base_url="https://example.test/v1"),
+    ))
+
+    assert result.status == "completed"
+    assert result.output == [output_item]
+    assert result.output_text == "hello"
+    assert result.model_dump()["usage"] == {"input_tokens": 3, "output_tokens": 1}
+    assert FakeClient.instances[0].closed is True
+
+
 def test_codex_stream_retries_null_output_without_collected_events(monkeypatch):
     output_item = SimpleNamespace(
         type="message",
