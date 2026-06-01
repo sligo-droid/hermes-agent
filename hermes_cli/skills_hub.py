@@ -163,6 +163,10 @@ def _scan_result_to_dict(result) -> dict:
     }
 
 
+def _print_json(console: Console, payload: Any) -> None:
+    console.out(json.dumps(payload, indent=2, sort_keys=True))
+
+
 def _find_local_skill_dirs(root: Path, include_nested: bool = False) -> list[Path]:
     """Return skill directories under ``root``, excluding caches and deps."""
     if root.is_file():
@@ -844,7 +848,7 @@ def do_vet(
             results = [(path, scan_skill(path, source=scan_source)) for path in skill_dirs]
             if json_output:
                 payload = _skill_pack_result_to_dict(target_path, results, scan_source)
-                c.print(json.dumps(payload, indent=2, sort_keys=True))
+                _print_json(c, payload)
             else:
                 table, summary = _format_skill_pack_report(target_path, results, scan_source)
                 c.print(table)
@@ -858,7 +862,7 @@ def do_vet(
 
         result = scan_skill(target_path, source=scan_source)
         if json_output:
-            c.print(json.dumps(_scan_result_to_dict(result), indent=2, sort_keys=True))
+            _print_json(c, _scan_result_to_dict(result))
         else:
             c.print(format_scan_report(result))
             c.print("[dim]No files were installed and no config was changed.[/]\n")
@@ -888,7 +892,7 @@ def do_vet(
         result = scan_skill(skill_path, source=scan_source)
 
     if json_output:
-        c.print(json.dumps(_scan_result_to_dict(result), indent=2, sort_keys=True))
+        _print_json(c, _scan_result_to_dict(result))
     else:
         c.print(format_scan_report(result))
         c.print("[dim]Fetched into a temporary directory only; no files were installed and no config was changed.[/]\n")
