@@ -23,12 +23,29 @@ def test_telegram_status_suppresses_auxiliary_and_retry_noise():
         assert _prepare_gateway_status_message(Platform.TELEGRAM, "warn", message) is None
 
 
-def test_non_telegram_status_is_unchanged():
-    """The Telegram quieting policy must not hide CLI/Discord diagnostics."""
+def test_local_status_is_unchanged():
+    """Local/CLI diagnostics should remain visible."""
     message = "⏳ Retrying in 4.2s (attempt 1/3)..."
 
-    assert _prepare_gateway_status_message(Platform.DISCORD, "lifecycle", message) == message
     assert _prepare_gateway_status_message("local", "lifecycle", message) == message
+
+
+def test_discord_status_suppresses_internal_lifecycle_noise():
+    """Internal compression/compaction status should not be posted to Discord."""
+    noisy_messages = [
+        "📦 Preflight compression: ~271,951 tokens >= 231,200 threshold. This may take a moment.",
+        "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
+    ]
+
+    for message in noisy_messages:
+        assert _prepare_gateway_status_message(Platform.DISCORD, "lifecycle", message) is None
+
+
+def test_discord_status_keeps_non_internal_status():
+    """Discord should not drop every status callback indiscriminately."""
+    message = "Working on your request now."
+
+    assert _prepare_gateway_status_message(Platform.DISCORD, "lifecycle", message) == message
 
 
 def test_telegram_status_sanitizes_raw_provider_security_errors():

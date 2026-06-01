@@ -224,8 +224,8 @@ def _discord_live_voice_enabled() -> bool:
     """Return whether Discord voice-channel join/listen support is enabled."""
     return is_truthy_value(os.getenv("HERMES_DISCORD_LIVE_VOICE_ENABLED"), default=False)
 
-_TELEGRAM_NOISY_STATUS_RE = re.compile(
-    r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
+_GATEWAY_NOISY_STATUS_RE = re.compile(
+    r"("  # transient/auxiliary status that should stay in logs, not public chat
     r"auxiliary\s+.+\s+failed"
     r"|compression\s+summary\s+failed"
     r"|fallback\s+context\s+marker"
@@ -465,11 +465,17 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     text = str(message or "").strip()
     if not text:
         return None
-    if _gateway_platform_value(platform) != "telegram":
+
+    platform_value = _gateway_platform_value(platform)
+    if platform_value == "discord":
+        if _GATEWAY_NOISY_STATUS_RE.search(text):
+            return None
+        return text
+    if platform_value != "telegram":
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
-    if _TELEGRAM_NOISY_STATUS_RE.search(text):
+    if _GATEWAY_NOISY_STATUS_RE.search(text):
         return None
     if _looks_like_gateway_provider_error(text):
         return _gateway_provider_error_reply(text)
