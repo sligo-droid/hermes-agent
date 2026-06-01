@@ -149,7 +149,103 @@ def test_codex_adapter_preserves_minimal_reasoning_effort():
         "effort": "low",
         "summary": "auto",
     }
+    assert OpenAICodexAdapter._responses_reasoning("off") == {
+        "effort": "none",
+        "summary": "auto",
+    }
     assert OpenAICodexAdapter._responses_reasoning("") is None
+
+
+def test_codex_adapter_rejects_invalid_reasoning_effort():
+    with pytest.raises(ValueError, match="Invalid reasoning_effort"):
+        OpenAICodexAdapter._responses_reasoning("maximum")
+
+
+def test_codex_adapter_resolves_speed_and_service_tier():
+    assert OpenAICodexAdapter._responses_service_tier({"speed": "fast"}) == "priority"
+    assert OpenAICodexAdapter._responses_service_tier({"speed": "normal"}) == "default"
+    assert (
+        OpenAICodexAdapter._responses_service_tier({
+            "speed": "fast",
+            "service_tier": "flex",
+        })
+        == "flex"
+    )
+    assert (
+        OpenAICodexAdapter._responses_service_tier({
+            "speed": "fast",
+            "service_tier": "",
+        })
+        == "priority"
+    )
+
+
+def test_codex_adapter_rejects_invalid_speed():
+    with pytest.raises(ValueError, match="Invalid speed"):
+        OpenAICodexAdapter._responses_service_tier({"speed": "urgent"})
+
+
+@pytest.mark.parametrize(
+    "reasoning_effort",
+    ["none", "minimal", "low", "medium", "high", "xhigh"],
+)
+def test_codex_adapter_chat_completion_forwards_model_reasoning_and_tier(
+    monkeypatch,
+    reasoning_effort,
+):
+    captured: dict[str, Any] = {}
+
+    class FakeRequest:
+        async def json(self):
+            return {
+                "model": "gpt-5.4-mini",
+                "messages": [{"role": "user", "content": "hello"}],
+                "reasoning_effort": reasoning_effort,
+                "speed": "fast",
+            }
+
+    class FakeResponse:
+        def model_dump(self):
+            return {
+                "id": "resp-test",
+                "created_at": 123,
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+            }
+
+    async def fake_run(responses_payload, cred):
+        captured["payload"] = responses_payload
+        captured["cred"] = cred
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        OpenAICodexAdapter,
+        "get_credential",
+        lambda self: UpstreamCredential(
+            bearer="token",
+            base_url="https://example.test/backend-api/codex",
+        ),
+    )
+    monkeypatch.setattr(
+        OpenAICodexAdapter,
+        "_run_responses_stream_with_retry",
+        staticmethod(fake_run),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex._normalize_codex_response",
+        lambda _response: (SimpleNamespace(content="ok", tool_calls=[]), "stop"),
+    )
+
+    response = asyncio.run(OpenAICodexAdapter()._handle_chat_completions(FakeRequest()))
+    body = json.loads(response.text)
+
+    assert response.status == 200
+    assert body["model"] == "gpt-5.4-mini"
+    assert captured["payload"]["model"] == "gpt-5.4-mini"
+    assert captured["payload"]["reasoning"] == {
+        "effort": reasoning_effort,
+        "summary": "auto",
+    }
+    assert captured["payload"]["service_tier"] == "priority"
 
 
 def test_codex_adapter_serializes_streaming_chat_chunks():
