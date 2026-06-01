@@ -38,6 +38,24 @@ _ALLOWED_PATHS: FrozenSet[str] = frozenset({
     "/chat/completions",
     "/models",
 })
+_REASONING_EFFORTS: FrozenSet[str] = frozenset({
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+})
+_SERVICE_TIERS: FrozenSet[str] = frozenset({
+    "auto",
+    "default",
+    "flex",
+    "priority",
+})
+_SPEED_SERVICE_TIERS = {
+    "normal": "default",
+    "fast": "priority",
+}
 
 
 def _to_namespace(value: Any) -> Any:
@@ -188,11 +206,16 @@ class OpenAICodexAdapter(UpstreamAdapter):
             if payload.get("tool_choice") is not None:
                 responses_payload["tool_choice"] = payload["tool_choice"]
 
-        reasoning_effort = payload.get("reasoning_effort")
-        reasoning = self._responses_reasoning(reasoning_effort)
+        try:
+            reasoning = self._responses_reasoning(payload.get("reasoning_effort"))
+            service_tier = self._responses_service_tier(payload)
+        except ValueError as exc:
+            return _chat_json_error(400, str(exc), code="invalid_request")
         if reasoning:
             responses_payload["reasoning"] = reasoning
             responses_payload["include"] = ["reasoning.encrypted_content"]
+        if service_tier:
+            responses_payload["service_tier"] = service_tier
 
         text_format = self._responses_text_format(payload.get("response_format"))
         if text_format:
@@ -478,12 +501,59 @@ class OpenAICodexAdapter(UpstreamAdapter):
 
     @staticmethod
     def _responses_reasoning(reasoning_effort: Any) -> dict[str, str] | None:
-        if not isinstance(reasoning_effort, str):
-            return None
-        effort = reasoning_effort.strip()
-        if not effort:
+        effort = OpenAICodexAdapter._normalized_reasoning_effort(reasoning_effort)
+        if effort is None:
             return None
         return {"effort": effort, "summary": "auto"}
+
+    @staticmethod
+    def _normalized_reasoning_effort(reasoning_effort: Any) -> str | None:
+        if reasoning_effort is None:
+            return None
+        if not isinstance(reasoning_effort, str):
+            msg = "reasoning_effort must be a string."
+            raise ValueError(msg)
+        effort = reasoning_effort.strip().lower()
+        if not effort:
+            return None
+        if effort == "off":
+            effort = "none"
+        if effort not in _REASONING_EFFORTS:
+            allowed = ", ".join(sorted(_REASONING_EFFORTS))
+            msg = f"Invalid reasoning_effort: {reasoning_effort!r}. Allowed: {allowed}."
+            raise ValueError(msg)
+        return effort
+
+    @staticmethod
+    def _responses_service_tier(payload: dict[str, Any]) -> str | None:
+        service_tier = payload.get("service_tier")
+        if service_tier is not None:
+            if not isinstance(service_tier, str):
+                msg = "service_tier must be a string."
+                raise ValueError(msg)
+            tier = service_tier.strip().lower()
+            if tier:
+                if tier not in _SERVICE_TIERS:
+                    allowed = ", ".join(sorted(_SERVICE_TIERS))
+                    msg = f"Invalid service_tier: {service_tier!r}. Allowed: {allowed}."
+                    raise ValueError(msg)
+                return tier
+
+        speed = payload.get("speed")
+        if speed is None:
+            return None
+        if not isinstance(speed, str):
+            msg = "speed must be a string."
+            raise ValueError(msg)
+        normalized_speed = speed.strip().lower()
+        if not normalized_speed:
+            return None
+        service_tier = _SPEED_SERVICE_TIERS.get(normalized_speed)
+        if service_tier is None:
+            allowed = ", ".join(sorted(_SPEED_SERVICE_TIERS))
+            msg = f"Invalid speed: {speed!r}. Allowed: {allowed}."
+            raise ValueError(msg)
+        return service_tier
 
 
 __all__ = ["OpenAICodexAdapter"]
