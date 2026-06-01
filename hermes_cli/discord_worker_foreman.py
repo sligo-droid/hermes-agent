@@ -1447,12 +1447,12 @@ def _refresh_source_pr_status_for_auto_closure(board: str, worker: dict[str, Any
         if not repo:
             return worker
         _refresh_pr_status(worker, root=root, repo=repo)
-        metadata = kanban_db.read_board_metadata(board)
-        current = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
-        current.update(worker)
-        metadata[DISCORD_WORKER_META_KEY] = current
-        metadata.pop("db_path", None)
-        atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
+        from hermes_cli.discord_worker_boards import _update_worker_meta
+
+        metadata = _update_worker_meta(board, worker)
+        refreshed = metadata.get(DISCORD_WORKER_META_KEY)
+        if isinstance(refreshed, dict):
+            worker = dict(refreshed)
     except Exception as exc:
         worker["pr_status_error"] = _truncate_text(_sanitize_text(str(exc)), 240)
         worker["pr_blocker"] = worker["pr_status_error"]

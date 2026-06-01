@@ -150,17 +150,77 @@ def _read_worker_meta(board: str) -> dict[str, Any]:
     return dict(raw) if isinstance(raw, dict) else {}
 
 
+_TERMINAL_SUMMARY_SYNC_FIELDS = frozenset(
+    {
+        "goal_status",
+        "phase",
+        "concise_outcome",
+        "deployment_status",
+        "final_discord_response",
+        "final_discord_response_at",
+        "final_discord_session_id",
+        "final_discord_work_item_id",
+        "final_discord_message_id",
+        "blocked_reason",
+        "pr_url",
+        "pr_number",
+        "pr_error",
+        "pr_status_error",
+        "pr_state",
+        "pr_merge_state",
+        "pr_mergeable",
+        "pr_is_draft",
+        "pr_review_decision",
+        "pr_merged_at",
+        "pr_merge_commit",
+        "pr_checks_status",
+        "pr_checks_total",
+        "pr_checks_failed",
+        "pr_blocker",
+    }
+)
+
+
+def _is_terminal_worker_meta(worker: dict[str, Any]) -> bool:
+    status = str(worker.get("goal_status") or "").strip().lower()
+    phase = str(worker.get("phase") or "").strip().lower()
+    return bool(worker.get("cancelled") or status in TERMINAL_GOAL_STATUSES or phase == "complete")
+
+
 def _update_worker_meta(board: str, updates: dict[str, Any]) -> dict[str, Any]:
     metadata = kanban_db.read_board_metadata(board)
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    previous = dict(worker)
     for key, value in updates.items():
         if value is _DELETE_META:
             worker.pop(key, None)
         else:
             worker[key] = value
+    changed_keys = {key for key in set(previous) | set(worker) if previous.get(key) != worker.get(key)}
+    if not changed_keys:
+        metadata[DISCORD_WORKER_META_KEY] = worker
+        return metadata
+    terminal_summary_changed = bool(changed_keys & _TERMINAL_SUMMARY_SYNC_FIELDS)
+    became_terminal = not _is_terminal_worker_meta(previous) and _is_terminal_worker_meta(worker)
+    if worker.get("kind") == "discord_worker_board" and _is_terminal_worker_meta(worker):
+        if terminal_summary_changed:
+            worker["terminal_summary_sync_pending"] = True
+        if became_terminal:
+            worker["terminal_reaction_sync_pending"] = True
     worker["updated_at"] = _now()
     metadata[DISCORD_WORKER_META_KEY] = worker
-    return _write_metadata(board, metadata)
+    written = _write_metadata(board, metadata)
+    if worker.get("kind") == "discord_worker_board" and _is_terminal_worker_meta(worker) and terminal_summary_changed:
+        try:
+            persist_board_run_summary(board)
+        except Exception:
+            logger.debug("Failed to refresh Discord board run summary for %s", board, exc_info=True)
+        try:
+            mark_dispatch_dirty(board=board, reason="terminal-summary-metadata-updated")
+        except Exception:
+            logger.debug("Failed to mark Discord worker dispatch dirty for %s", board, exc_info=True)
+        written = kanban_db.read_board_metadata(board)
+    return written
 
 
 def _clear_terminal_summary_fields(worker: dict[str, Any]) -> None:

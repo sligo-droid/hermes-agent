@@ -343,6 +343,7 @@ def test_discord_kanban_typing_watcher_skips_completed_status_sync(tmp_path, mon
     finally:
         conn.close()
     dwb._update_worker_meta(board.slug, {"goal_status": "done", "phase": "complete"})
+    dwb.mark_thread_status_synced(board.slug, reaction=True, summary=True)
 
     adapter = DiscordStatusSyncAdapter()
     runner = _make_discord_runner(adapter)
@@ -461,6 +462,60 @@ def test_discord_terminal_status_target_syncs_only_when_pending(tmp_path, monkey
 
     dwb.mark_thread_status_synced(board.slug, summary=True)
     assert dwb.thread_status_targets() == []
+
+
+def test_discord_terminal_pr_refresh_requeues_summary_sync(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(
+        thread_id="99023",
+        goal="Refresh merged PR status",
+        chat_id="parent-99023",
+    )
+    conn = kb.connect(board=board.slug)
+    try:
+        task = kb.list_tasks(conn, include_archived=False)[0]
+        claimed = kb.claim_task(conn, task.id)
+        assert claimed is not None
+        kb.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "pr_url": "https://github.com/acme/hermes/pull/185",
+            "pr_checks_status": "pending",
+            "pr_checks_total": 2,
+        },
+    )
+    dwb.mark_thread_status_synced(board.slug, reaction=True, summary=True)
+    assert dwb.thread_status_targets() == []
+
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "pr_checks_status": "passed",
+            "pr_merge_state": "MERGED",
+            "pr_state": "merged",
+            "pr_merged_at": "2026-06-01T17:35:13Z",
+            "pr_merge_commit": "abc123",
+        },
+    )
+
+    targets = dwb.thread_status_targets()
+    assert [target["board"] for target in targets] == [board.slug]
+    assert targets[0]["state"] == "done"
+    assert targets[0]["terminal_summary_sync_pending"] is True
+    assert targets[0]["terminal_reaction_sync_pending"] is False
+
+    worker = kb.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["terminal_summary_sync_pending"] is True
+    assert worker["board_summary"]["pr"]["checks_status"] == "passed"
+    assert worker["board_summary"]["pr"]["merge_state"] == "MERGED"
+    assert worker["board_summary"]["pr"]["merge_commit"] == "abc123"
 
 
 def test_discord_stale_completion_notice_flag_keeps_terminal_target_until_cleared(tmp_path, monkeypatch):
