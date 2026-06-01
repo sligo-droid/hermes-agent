@@ -315,8 +315,8 @@ export default function ProfilesPage() {
                 <Checkbox
                   checked={cloneFromDefault}
                   id="clone-from-default"
-                  onChange={(e) =>
-                    setCloneFromDefault(e.currentTarget.checked)
+                  onCheckedChange={(checked) =>
+                    setCloneFromDefault(checked === true)
                   }
                 />
 

@@ -17,6 +17,15 @@ function readBasePath(): string {
 export const HERMES_BASE_PATH = readBasePath();
 const BASE = HERMES_BASE_PATH;
 
+function sameOriginUrl(path: string): string {
+  const suffix = path.startsWith("/") ? path : `/${path}`;
+  const pathname = `${BASE}${suffix}`;
+  if (typeof window === "undefined") return pathname;
+  if (!window.location.host) return pathname;
+  const origin = `${window.location.protocol}//${window.location.host}`;
+  return new URL(pathname, origin).toString();
+}
+
 import type { DashboardTheme } from "@/themes/types";
 
 // Ephemeral session token for protected endpoints.
@@ -46,13 +55,14 @@ export async function fetchJSON<T>(
   init?: RequestInit,
   options?: FetchJSONOptions,
 ): Promise<T> {
+  const fetchInit: RequestInit = init ?? {};
   // Inject the session token into all /api/ requests.
   const headers = new Headers(fetchInit.headers);
   const token = window.__HERMES_SESSION_TOKEN__;
   if (token) {
     setSessionHeader(headers, token);
   }
-  const res = await fetch(`${BASE}${url}`, {
+  const res = await fetch(sameOriginUrl(url), {
     ...fetchInit,
     headers,
     // ``credentials: 'include'`` so the cookie-auth path (gated mode) works
@@ -168,7 +178,7 @@ async function getSessionToken(): Promise<string> {
  * fetch a fresh ticket.
  */
 export async function getWsTicket(): Promise<{ ticket: string; ttl_seconds: number }> {
-  const res = await fetch(`${BASE}/api/auth/ws-ticket`, {
+  const res = await fetch(sameOriginUrl("/api/auth/ws-ticket"), {
     method: "POST",
     credentials: "include",
   });
@@ -216,7 +226,7 @@ export const api = {
       allowUnauthorized: true,
     }),
   logout: () =>
-    fetch(`${BASE}/auth/logout`, {
+    fetch(sameOriginUrl("/auth/logout"), {
       method: "POST",
       credentials: "include",
     }).then((r) => {

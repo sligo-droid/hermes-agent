@@ -3,7 +3,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { Button } from "@nous-research/ui/ui/components/button";
-import { Typography } from "@/components/NouiTypography";
+import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { HERMES_BASE_PATH, buildWsAuthParam, fetchJSON } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { ArrowLeft, ExternalLink, RefreshCw } from "lucide-react";
@@ -70,11 +70,51 @@ function formatTimestamp(value?: number | null): string {
   return new Date(value * 1000).toLocaleString();
 }
 
+function terminalSafeLine(value: unknown): string {
+  return String(value ?? "-").replace(/\r/g, " ").replace(/\n/g, " ");
+}
+
+function snapshotConsoleText(snapshot: WorkerConsoleSnapshot, reason: string): string {
+  const run = snapshot.current_run;
+  const lines = [
+    "Hermes worker console (read-only)",
+    `ticket: ${terminalSafeLine(snapshot.task.id)}`,
+    `title: ${terminalSafeLine(snapshot.task.title)}`,
+    `status: ${terminalSafeLine(snapshot.task.status)}`,
+    `backend: ${terminalSafeLine(snapshot.backend || "unknown")}`,
+    `run: ${terminalSafeLine(run?.id || snapshot.task.current_run_id || "-")}`,
+    `pid: ${terminalSafeLine(run?.worker_pid || snapshot.task.worker_pid || "-")}`,
+    `workspace: ${terminalSafeLine(snapshot.workspace.path || "-")}`,
+    `worker log: ${terminalSafeLine(snapshot.worker_log_path || "-")}`,
+    `stream: ${reason}`,
+    "",
+  ];
+  const log = snapshot.worker_log_tail?.trimEnd();
+  if (log) {
+    lines.push(log);
+  } else {
+    lines.push("[worker log] waiting for worker output");
+  }
+  return `${lines.join("\r\n")}\r\n`;
+}
+
+function writeSnapshotFallback(
+  term: Terminal,
+  snapshot: WorkerConsoleSnapshot,
+  reason: string,
+) {
+  term.reset();
+  term.write(snapshotConsoleText(snapshot, reason));
+}
+
 export default function WorkerConsolePage() {
   const { sessionId = "", taskId = "" } = useParams();
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const snapshotRef = useRef<WorkerConsoleSnapshot | null>(null);
+  const streamReceivedRef = useRef(false);
+  const fallbackSnapshotRef = useRef("");
   const [snapshot, setSnapshot] = useState<WorkerConsoleSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -132,6 +172,23 @@ export default function WorkerConsolePage() {
   }, [sessionId, taskId]);
 
   useEffect(() => {
+    snapshotRef.current = snapshot;
+    const term = termRef.current;
+    if (!snapshot || !term || streamReceivedRef.current) return;
+    if (terminalStatus === "connected") return;
+    const marker = `${snapshot.updated_at}:${snapshot.worker_log_tail.length}:${terminalStatus}`;
+    if (fallbackSnapshotRef.current === marker) return;
+    fallbackSnapshotRef.current = marker;
+    writeSnapshotFallback(
+      term,
+      snapshot,
+      terminalStatus === "connecting"
+        ? "REST snapshot while websocket connects"
+        : `websocket ${terminalStatus}; showing REST snapshot`,
+    );
+  }, [snapshot, terminalStatus]);
+
+  useEffect(() => {
     const host = hostRef.current;
     if (!host || !sessionId || !taskId) return;
 
@@ -155,6 +212,12 @@ export default function WorkerConsolePage() {
     term.loadAddon(new WebLinksAddon());
     term.open(host);
     termRef.current = term;
+    streamReceivedRef.current = false;
+    fallbackSnapshotRef.current = "";
+    if (snapshotRef.current) {
+      fallbackSnapshotRef.current = `${snapshotRef.current.updated_at}:${snapshotRef.current.worker_log_tail.length}:connecting`;
+      writeSnapshotFallback(term, snapshotRef.current, "REST snapshot while websocket connects");
+    }
 
     const fitNow = () => {
       if (!host.isConnected || host.clientWidth <= 0 || host.clientHeight <= 0) return;
@@ -184,17 +247,43 @@ export default function WorkerConsolePage() {
           fitNow();
         };
         ws.onmessage = (event) => {
+          streamReceivedRef.current = true;
           if (typeof event.data === "string") {
             term.write(event.data);
           } else if (event.data instanceof ArrayBuffer) {
             term.write(new Uint8Array(event.data));
           }
         };
-        ws.onerror = () => setTerminalStatus("error");
-        ws.onclose = () => setTerminalStatus("closed");
+        ws.onerror = () => {
+          setTerminalStatus("error");
+          if (!streamReceivedRef.current && snapshotRef.current) {
+            writeSnapshotFallback(
+              term,
+              snapshotRef.current,
+              "websocket error; showing REST snapshot",
+            );
+          }
+        };
+        ws.onclose = () => {
+          setTerminalStatus("closed");
+          if (!streamReceivedRef.current && snapshotRef.current) {
+            writeSnapshotFallback(
+              term,
+              snapshotRef.current,
+              "websocket closed; showing REST snapshot",
+            );
+          }
+        };
       } catch (err) {
         if (!unmounting) {
           setTerminalStatus(err instanceof Error ? err.message : "auth error");
+          if (!streamReceivedRef.current && snapshotRef.current) {
+            writeSnapshotFallback(
+              term,
+              snapshotRef.current,
+              "websocket auth failed; showing REST snapshot",
+            );
+          }
         }
       }
     })();
