@@ -1568,6 +1568,7 @@ DEFAULT_CONFIG = {
             "plan_agent": "plan",
             "build_agent": "build",
             "dangerously_skip_permissions": False,
+            "startup_timeout_seconds": 90,
         },
     },
 

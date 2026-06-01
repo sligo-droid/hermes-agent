@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import subprocess
+import sys
 from types import SimpleNamespace
 
 from agent import opencode_worker as ow
@@ -18,6 +18,19 @@ def _option(cmd, name):
     return cmd[cmd.index(name) + 1] if name in cmd else None
 
 
+def _process_result(stdout: str = "", stderr: str = "", returncode: int = 0, **overrides):
+    data = {
+        "returncode": returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "timed_out": False,
+        "startup_timed_out": False,
+        "duration_seconds": 0.1,
+    }
+    data.update(overrides)
+    return ow._OpenCodeProcessResult(**data)
+
+
 def test_simple_task_runs_build_only(monkeypatch, tmp_path):
     calls = []
 
@@ -25,16 +38,14 @@ def test_simple_task_runs_build_only(monkeypatch, tmp_path):
 
     def fake_run(cmd, **_kwargs):
         calls.append(cmd)
-        return SimpleNamespace(
-            returncode=0,
+        return _process_result(
             stdout=json.dumps(
                 {"type": "message", "sessionID": "ses-build", "message": "done"}
             )
             + "\n",
-            stderr="",
         )
 
-    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
 
     result = ow.run_opencode_task(
         "fix typo in README",
@@ -77,13 +88,11 @@ def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
         else:
             text = '{"status":"completed","summary":"built","changed_files":[],"tests":[]}'
             sid = "ses-build"
-        return SimpleNamespace(
-            returncode=0,
+        return _process_result(
             stdout=json.dumps({"type": "message", "sessionID": sid, "message": text}) + "\n",
-            stderr="",
         )
 
-    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
 
     result = ow.run_opencode_task(
         "fix auth credential handling",
@@ -114,8 +123,7 @@ def test_nested_text_part_is_used_as_final_text(monkeypatch, tmp_path):
     monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
 
     def fake_run(cmd, **_kwargs):
-        return SimpleNamespace(
-            returncode=0,
+        return _process_result(
             stdout=json.dumps(
                 {
                     "type": "text",
@@ -127,10 +135,9 @@ def test_nested_text_part_is_used_as_final_text(monkeypatch, tmp_path):
                 }
             )
             + "\n",
-            stderr="",
         )
 
-    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
 
     result = ow.run_opencode_single_pass(
         "plan work",
@@ -158,6 +165,12 @@ def test_sparse_json_output_recovers_final_text_from_export(monkeypatch, tmp_pat
     calls = []
     monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
 
+    def fake_process(cmd, **_kwargs):
+        calls.append(cmd)
+        return _process_result(
+            stdout=json.dumps({"type": "step_start", "sessionID": "ses-export"}) + "\n",
+        )
+
     def fake_run(cmd, **_kwargs):
         calls.append(cmd)
         if cmd[1] == "export":
@@ -179,12 +192,8 @@ def test_sparse_json_output_recovers_final_text_from_export(monkeypatch, tmp_pat
                 + "\n",
                 stderr="",
             )
-        return SimpleNamespace(
-            returncode=0,
-            stdout=json.dumps({"type": "step_start", "sessionID": "ses-export"}) + "\n",
-            stderr="",
-        )
 
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_process)
     monkeypatch.setattr(ow.subprocess, "run", fake_run)
 
     result = ow.run_opencode_single_pass(
@@ -209,16 +218,14 @@ def test_reasoning_levels_are_configurable_by_mode(monkeypatch, tmp_path):
 
     def fake_run(cmd, **_kwargs):
         calls.append(cmd)
-        return SimpleNamespace(
-            returncode=0,
+        return _process_result(
             stdout=json.dumps(
                 {"type": "message", "sessionID": "ses-build", "message": "done"}
             )
             + "\n",
-            stderr="",
         )
 
-    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
 
     cfg = _cfg(
         simple_build_reasoning_level="medium",
@@ -262,8 +269,7 @@ def test_auth_error_is_classified(monkeypatch, tmp_path):
     monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
 
     def fake_run(cmd, **_kwargs):
-        return SimpleNamespace(
-            returncode=0,
+        return _process_result(
             stdout=json.dumps(
                 {
                     "type": "error",
@@ -278,10 +284,9 @@ def test_auth_error_is_classified(monkeypatch, tmp_path):
                 }
             )
             + "\n",
-            stderr="",
         )
 
-    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
 
     result = ow.run_opencode_task(
         "fix parser.py",
@@ -299,8 +304,7 @@ def test_context_overflow_is_not_classified_as_auth(monkeypatch, tmp_path):
     monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
 
     def fake_run(cmd, **_kwargs):
-        return SimpleNamespace(
-            returncode=0,
+        return _process_result(
             stdout=json.dumps(
                 {
                     "type": "error",
@@ -315,7 +319,7 @@ def test_context_overflow_is_not_classified_as_auth(monkeypatch, tmp_path):
             stderr="OpenCode authentication failed from a previous summary\n" + ("x" * 10000),
         )
 
-    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
 
     result = ow.run_opencode_task(
         "fix parser.py",
@@ -336,9 +340,13 @@ def test_timeout_becomes_worker_error(monkeypatch, tmp_path):
     monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
 
     def fake_run(cmd, **_kwargs):
-        raise subprocess.TimeoutExpired(cmd, 30, output="", stderr="")
+        return _process_result(
+            timed_out=True,
+            startup_timed_out=True,
+            duration_seconds=30.0,
+        )
 
-    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
 
     result = ow.run_opencode_task(
         "fix parser.py",
@@ -349,7 +357,41 @@ def test_timeout_becomes_worker_error(monkeypatch, tmp_path):
 
     assert result.timed_out is True
     assert result.should_retire is True
-    assert "timed out" in result.error
+    assert "produced no JSON events" in result.error
+
+
+def test_process_startup_timeout_kills_no_output_child(tmp_path):
+    result = ow._run_opencode_process(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        workdir=str(tmp_path),
+        timeout=5,
+        startup_timeout=0.2,
+    )
+
+    assert result.timed_out is True
+    assert result.startup_timed_out is True
+    assert result.duration_seconds < 2
+
+
+def test_process_timeout_preserves_partial_stdout(tmp_path):
+    result = ow._run_opencode_process(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, time; "
+                "print(json.dumps({'type':'message','message':'started'}), flush=True); "
+                "time.sleep(5)"
+            ),
+        ],
+        workdir=str(tmp_path),
+        timeout=0.4,
+        startup_timeout=2,
+    )
+
+    assert result.timed_out is True
+    assert result.startup_timed_out is False
+    assert '"started"' in result.stdout
 
 
 def test_missing_binary_becomes_worker_error(monkeypatch, tmp_path):
