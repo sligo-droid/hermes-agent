@@ -1564,10 +1564,11 @@ DEFAULT_CONFIG = {
         "complex_build_reasoning_level": "medium",
         "opencode": {
             "binary": "opencode",
-            "model": "",
+            "model": "openai/gpt-5.5",
             "plan_agent": "plan",
             "build_agent": "build",
             "dangerously_skip_permissions": False,
+            "isolated_config": True,
             "startup_timeout_seconds": 90,
         },
     },
