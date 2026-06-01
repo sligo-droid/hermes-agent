@@ -67,6 +67,14 @@ def _positive_float(value: Any, default: float) -> float:
     return parsed if parsed > 0 else default
 
 
+def _non_negative_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def load_coding_worker_backend(
     config: Optional[dict[str, Any]] = None,
     *,
@@ -174,7 +182,7 @@ def load_opencode_config(
         "complex_plan_reasoning_level": pass_cfg["complex_plan_reasoning_level"],
         "complex_build_reasoning_level": pass_cfg["complex_build_reasoning_level"],
         "dangerously_skip_permissions": bool(opencode_cfg.get("dangerously_skip_permissions", False)),
-        "startup_timeout_seconds": _positive_float(
+        "startup_timeout_seconds": _non_negative_float(
             os.getenv("HERMES_OPENCODE_STARTUP_TIMEOUT_SECONDS")
             or opencode_cfg.get("startup_timeout_seconds"),
             _DEFAULT_STARTUP_TIMEOUT_SECONDS,
@@ -497,8 +505,9 @@ def _run_opencode_once(
     if not ok:
         return OpenCodeRunResult(error=binary_or_error)
 
-    workdir = str(Path(workspace).expanduser().resolve())
-    brief_path = _write_brief(prompt)
+    workdir_path = Path(workspace).expanduser().resolve()
+    workdir = str(workdir_path)
+    brief_path = _write_brief(prompt, workspace=workdir_path)
     cmd = [
         binary_or_error,
         "run",
@@ -522,19 +531,20 @@ def _run_opencode_once(
     cmd.extend(["--file", str(brief_path)])
 
     try:
+        configured_startup_timeout = float(
+            cfg.get("startup_timeout_seconds")
+            if cfg.get("startup_timeout_seconds") is not None
+            else _DEFAULT_STARTUP_TIMEOUT_SECONDS
+        )
+        startup_timeout = (
+            0.0
+            if configured_startup_timeout <= 0
+            else min(max(10.0, configured_startup_timeout), timeout)
+        )
         proc = _run_opencode_process(
             cmd,
             timeout=timeout,
-            startup_timeout=min(
-                max(
-                    10.0,
-                    float(
-                        cfg.get("startup_timeout_seconds")
-                        or _DEFAULT_STARTUP_TIMEOUT_SECONDS
-                    ),
-                ),
-                timeout,
-            ),
+            startup_timeout=startup_timeout,
             workdir=workdir,
         )
     except Exception as exc:
@@ -651,7 +661,7 @@ def _run_opencode_process(
             if elapsed >= timeout:
                 timed_out = True
                 _terminate()
-            elif not stdout_lines and elapsed >= startup_timeout:
+            elif startup_timeout > 0 and not stdout_lines and elapsed >= startup_timeout:
                 timed_out = True
                 startup_timed_out = True
                 _terminate()
@@ -795,8 +805,12 @@ def _parse_opencode_export_text(stdout: str) -> str:
     return "\n".join(filter(None, assistant_texts)).strip()
 
 
-def _write_brief(prompt: str) -> Path:
-    root = Path(tempfile.gettempdir()) / "opencode"
+def _write_brief(prompt: str, *, workspace: Optional[Path] = None) -> Path:
+    root = (
+        workspace / ".hermes-opencode"
+        if workspace is not None
+        else Path(tempfile.gettempdir()) / "opencode"
+    )
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         "w",

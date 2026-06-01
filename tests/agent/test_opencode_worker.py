@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 from agent import opencode_worker as ow
@@ -69,6 +70,42 @@ def test_simple_task_runs_build_only(monkeypatch, tmp_path):
     assert "--pure" in calls[0]
     assert calls[0][3] == "Read the attached Hermes worker brief and follow it exactly."
     assert calls[0].index("--file") == len(calls[0]) - 2
+
+
+def test_worker_brief_is_workspace_scoped_and_cleaned(monkeypatch, tmp_path):
+    calls = []
+    brief_paths = []
+
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        brief_path = Path(_option(cmd, "--file"))
+        brief_paths.append(brief_path)
+        assert brief_path.is_relative_to(tmp_path)
+        assert brief_path.parent == tmp_path / ".hermes-opencode"
+        assert brief_path.exists()
+        assert brief_path.read_text(encoding="utf-8").startswith("fix typo in README")
+        return _process_result(
+            stdout=json.dumps(
+                {"type": "message", "sessionID": "ses-build", "message": "done"}
+            )
+            + "\n",
+        )
+
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
+
+    result = ow.run_opencode_task(
+        "fix typo in README",
+        str(tmp_path),
+        timeout=60,
+        config=_cfg(),
+    )
+
+    assert result.error is None
+    assert calls
+    assert brief_paths
+    assert not brief_paths[0].exists()
 
 
 def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
@@ -360,6 +397,41 @@ def test_timeout_becomes_worker_error(monkeypatch, tmp_path):
     assert "produced no JSON events" in result.error
 
 
+def test_startup_timeout_zero_is_preserved(monkeypatch):
+    monkeypatch.delenv("HERMES_OPENCODE_STARTUP_TIMEOUT_SECONDS", raising=False)
+
+    cfg = ow.load_opencode_config(_cfg(opencode={"startup_timeout_seconds": 0}))
+
+    assert cfg["startup_timeout_seconds"] == 0
+
+
+def test_startup_timeout_zero_is_passed_to_process(monkeypatch, tmp_path):
+    calls = []
+
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+
+    def fake_run(cmd, **kwargs):
+        calls.append(kwargs)
+        return _process_result(
+            stdout=json.dumps(
+                {"type": "message", "sessionID": "ses-build", "message": "done"}
+            )
+            + "\n",
+        )
+
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
+
+    result = ow.run_opencode_task(
+        "fix typo in README",
+        str(tmp_path),
+        timeout=60,
+        config=_cfg(opencode={"startup_timeout_seconds": 0}),
+    )
+
+    assert result.error is None
+    assert calls[0]["startup_timeout"] == 0
+
+
 def test_process_startup_timeout_kills_no_output_child(tmp_path):
     result = ow._run_opencode_process(
         [sys.executable, "-c", "import time; time.sleep(5)"],
@@ -370,6 +442,19 @@ def test_process_startup_timeout_kills_no_output_child(tmp_path):
 
     assert result.timed_out is True
     assert result.startup_timed_out is True
+    assert result.duration_seconds < 2
+
+
+def test_process_startup_timeout_zero_waits_for_turn_timeout(tmp_path):
+    result = ow._run_opencode_process(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        workdir=str(tmp_path),
+        timeout=0.3,
+        startup_timeout=0,
+    )
+
+    assert result.timed_out is True
+    assert result.startup_timed_out is False
     assert result.duration_seconds < 2
 
 
