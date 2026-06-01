@@ -1,7 +1,8 @@
 import asyncio
 import os
+from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -185,6 +186,104 @@ async def test_startup_replays_only_incomplete_discord_work(tmp_path):
     assert replay.work_item_id == item["id"]
     assert replay.text == "do the work"
     assert replay.goal_thread_context == event.goal_thread_context
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_reuses_original_discord_work_item(tmp_path):
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    runner._background_tasks = set()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner.adapters = {Platform.DISCORD: adapter}
+
+    event = _discord_event(message_id="m1")
+    event.feature_summary = {
+        "message_id": "summary-1",
+        "initial_request": "do the work",
+    }
+    event.goal_thread_context = "[Goal thread context]\n[Alice] details"
+    session_key = build_session_key(event.source)
+    item = runner.work_ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+    runner.work_ledger.mark_agent_done(
+        item["id"],
+        final_response="",
+        session_id="session-1",
+        summary_status="Interrupted",
+        feature_summary=event.feature_summary,
+    )
+    entry = SimpleNamespace(
+        session_key=session_key,
+        origin=event.source,
+        resume_pending=True,
+        suspended=False,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+        updated_at=datetime.now(),
+    )
+    runner.session_store = MagicMock()
+    runner.session_store._entries = {session_key: entry}
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    adapter.handle_message.assert_awaited_once()
+    resumed = adapter.handle_message.await_args.args[0]
+    assert resumed.internal is True
+    assert resumed.work_item_id == item["id"]
+    assert resumed.work_replay is True
+    assert resumed.feature_summary == event.feature_summary
+    assert resumed.goal_thread_context == event.goal_thread_context
+    assert resumed.message_id == "m1"
+
+
+@pytest.mark.asyncio
+async def test_startup_defers_interrupted_discord_work_for_resume_pending_session(tmp_path):
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    runner._background_tasks = set()
+    adapter = SimpleNamespace(
+        handle_message=AsyncMock(),
+        _send_with_retry=AsyncMock(),
+        update_feature_summary=AsyncMock(return_value=True),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+
+    event = _discord_event(message_id="m1")
+    event.feature_summary = {
+        "message_id": "summary-1",
+        "initial_request": "do the work",
+    }
+    session_key = build_session_key(event.source)
+    item = runner.work_ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+    runner.work_ledger.mark_agent_done(
+        item["id"],
+        final_response="",
+        session_id="session-1",
+        summary_status="Interrupted",
+        feature_summary=event.feature_summary,
+    )
+    runner.session_store = SimpleNamespace(
+        _entries={
+            session_key: SimpleNamespace(
+                resume_pending=True,
+                suspended=False,
+                resume_reason="restart_timeout",
+                last_resume_marked_at=datetime.now(),
+                updated_at=datetime.now(),
+            )
+        }
+    )
+
+    scheduled = runner._schedule_incomplete_discord_work_items()
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    adapter._send_with_retry.assert_not_awaited()
+    adapter.update_feature_summary.assert_not_awaited()
+    assert runner.work_ledger.get(item["id"])["status"] == "agent_done"
 
 
 @pytest.mark.asyncio
