@@ -205,6 +205,37 @@ async def test_run_process_watcher_respects_notification_mode(
 
 
 @pytest.mark.asyncio
+async def test_completion_notice_suppresses_process_output(monkeypatch, tmp_path):
+    """Direct chat completion notices should not dump process output tails."""
+    import tools.process_registry as pr_module
+
+    sessions = [
+        SimpleNamespace(
+            output_buffer="Traceback (most recent call last):\nSECRET_OR_NOISY_DETAIL\n",
+            exited=True,
+            exit_code=1,
+        )
+    ]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "result")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    await runner._run_process_watcher(_watcher_dict())
+
+    adapter.send.assert_awaited_once()
+    sent_message = adapter.send.await_args.args[1]
+    assert "finished with exit code 1" in sent_message
+    assert "was not posted to chat" in sent_message
+    assert "Traceback" not in sent_message
+    assert "SECRET_OR_NOISY_DETAIL" not in sent_message
+
+
+@pytest.mark.asyncio
 async def test_thread_id_passed_to_send(monkeypatch, tmp_path):
     """thread_id from watcher dict is forwarded as metadata to adapter.send()."""
     import tools.process_registry as pr_module

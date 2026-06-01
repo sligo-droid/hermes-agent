@@ -17699,10 +17699,17 @@ class GatewayRunner:
                     or (notify_mode == "error" and session.exit_code not in {0, None})
                 )
                 if should_notify:
-                    new_output = session.output_buffer[-1000:] if session.output_buffer else ""
+                    # Direct user-facing completion notices should never dump
+                    # captured process output into a chat. The process log is
+                    # still available to the agent/operator via the process
+                    # tools, and notify_on_complete=True already injects output
+                    # privately into an internal agent turn above. Posting the
+                    # raw tail here can leak noisy tracebacks or sensitive build
+                    # output into Discord/Telegram.
                     message_text = (
-                        f"[Background process {session_id} finished with exit code {session.exit_code}~ "
-                        f"Here's the final output:\n{new_output}]"
+                        f"[Background process {session_id} finished with exit code "
+                        f"{session.exit_code}. Process output was retained in the "
+                        "process log and was not posted to chat.]"
                     )
                     adapter = None
                     for p, a in self.adapters.items():
