@@ -4362,42 +4362,44 @@ class GatewayRunner:
         if status == "agent_done":
             final_response = str(item.get("final_response") or "")
             if not final_response:
-                logger.warning("Finished Discord work item %s has no final response", work_id)
-                return
-            try:
-                metadata = {"notify": True}
+                if not item.get("feature_summary") and not item.get("project_summary"):
+                    logger.warning("Finished Discord work item %s has no final response", work_id)
+                    return
+            else:
                 try:
-                    from gateway.platforms.base import _reply_anchor_for_event, _thread_metadata_for_source
+                    metadata = {"notify": True}
+                    try:
+                        from gateway.platforms.base import _reply_anchor_for_event, _thread_metadata_for_source
 
-                    metadata = _thread_metadata_for_source(
-                        event.source,
-                        _reply_anchor_for_event(event),
-                    ) or {}
-                    metadata = dict(metadata)
-                    metadata["notify"] = True
-                    reply_to = _reply_anchor_for_event(event)
-                except Exception:
-                    reply_to = item.get("reply_to_message_id") or item.get("message_id")
-                result = await adapter._send_with_retry(
-                    chat_id=event.source.chat_id,
-                    content=final_response,
-                    reply_to=reply_to,
-                    metadata=metadata,
-                )
-            except Exception as exc:
-                logger.warning("Failed to deliver finished Discord work item %s: %s", work_id, exc)
-                return
-            if not getattr(result, "success", False):
-                logger.warning(
-                    "Failed to deliver finished Discord work item %s: %s",
+                        metadata = _thread_metadata_for_source(
+                            event.source,
+                            _reply_anchor_for_event(event),
+                        ) or {}
+                        metadata = dict(metadata)
+                        metadata["notify"] = True
+                        reply_to = _reply_anchor_for_event(event)
+                    except Exception:
+                        reply_to = item.get("reply_to_message_id") or item.get("message_id")
+                    result = await adapter._send_with_retry(
+                        chat_id=event.source.chat_id,
+                        content=final_response,
+                        reply_to=reply_to,
+                        metadata=metadata,
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to deliver finished Discord work item %s: %s", work_id, exc)
+                    return
+                if not getattr(result, "success", False):
+                    logger.warning(
+                        "Failed to deliver finished Discord work item %s: %s",
+                        work_id,
+                        getattr(result, "error", None),
+                    )
+                    return
+                ledger.mark_response_delivered(
                     work_id,
-                    getattr(result, "error", None),
+                    result_message_id=str(getattr(result, "message_id", "") or "") or None,
                 )
-                return
-            ledger.mark_response_delivered(
-                work_id,
-                result_message_id=str(getattr(result, "message_id", "") or "") or None,
-            )
 
         summary_ok = await self._update_discord_summaries(
             source=event.source,
