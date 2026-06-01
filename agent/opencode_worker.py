@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +20,7 @@ BACKEND_CODEX = "codex"
 BACKEND_OPENCODE = "opencode"
 _VALID_BACKENDS = {BACKEND_CODEX, BACKEND_OPENCODE}
 _VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max"}
+_DEFAULT_STARTUP_TIMEOUT_SECONDS = 90.0
 
 
 @dataclass
@@ -41,9 +44,27 @@ class OpenCodeRunResult:
     run_profile: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class _OpenCodeProcessResult:
+    returncode: Optional[int]
+    stdout: str = ""
+    stderr: str = ""
+    timed_out: bool = False
+    startup_timed_out: bool = False
+    duration_seconds: float = 0.0
+
+
 def normalize_coding_worker_backend(value: Any) -> str:
     raw = str(value or "").strip().lower()
     return raw if raw in _VALID_BACKENDS else BACKEND_CODEX
+
+
+def _positive_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def load_coding_worker_backend(
@@ -153,6 +174,11 @@ def load_opencode_config(
         "complex_plan_reasoning_level": pass_cfg["complex_plan_reasoning_level"],
         "complex_build_reasoning_level": pass_cfg["complex_build_reasoning_level"],
         "dangerously_skip_permissions": bool(opencode_cfg.get("dangerously_skip_permissions", False)),
+        "startup_timeout_seconds": _positive_float(
+            os.getenv("HERMES_OPENCODE_STARTUP_TIMEOUT_SECONDS")
+            or opencode_cfg.get("startup_timeout_seconds"),
+            _DEFAULT_STARTUP_TIMEOUT_SECONDS,
+        ),
     }
 
 
@@ -496,23 +522,20 @@ def _run_opencode_once(
     cmd.extend(["--file", str(brief_path)])
 
     try:
-        proc = subprocess.run(
+        proc = _run_opencode_process(
             cmd,
-            cwd=workdir,
-            capture_output=True,
-            text=True,
             timeout=timeout,
-            check=False,
-            encoding="utf-8",
-            errors="replace",
-        )
-    except subprocess.TimeoutExpired as exc:
-        return OpenCodeRunResult(
-            error=f"OpenCode {agent} run timed out after {timeout:g}s.",
-            timed_out=True,
-            should_retire=True,
-            stdout=exc.stdout or "",
-            stderr=exc.stderr or "",
+            startup_timeout=min(
+                max(
+                    10.0,
+                    float(
+                        cfg.get("startup_timeout_seconds")
+                        or _DEFAULT_STARTUP_TIMEOUT_SECONDS
+                    ),
+                ),
+                timeout,
+            ),
+            workdir=workdir,
         )
     except Exception as exc:
         return OpenCodeRunResult(error=f"OpenCode {agent} run failed to start: {exc}")
@@ -526,6 +549,20 @@ def _run_opencode_once(
     result.exit_code = proc.returncode
     result.stdout = proc.stdout or ""
     result.stderr = proc.stderr or ""
+    if proc.timed_out:
+        result.timed_out = True
+        result.should_retire = True
+        if result.error is None:
+            if proc.startup_timed_out and not result.events:
+                result.error = (
+                    f"OpenCode {agent} produced no JSON events for "
+                    f"{proc.duration_seconds:g}s during startup and was killed "
+                    f"before the full {timeout:g}s turn timeout. This usually "
+                    "means OpenCode is stuck bootstrapping the repository "
+                    "(snapshot/file watcher setup) before reaching the model."
+                )
+            else:
+                result.error = f"OpenCode {agent} run timed out after {timeout:g}s."
     if proc.returncode == 0 and result.error is None and not result.final_text.strip():
         result.final_text = _load_final_text_from_export(
             binary_or_error,
@@ -543,6 +580,110 @@ def _run_opencode_once(
     result.turn_id = result.thread_id
     result.tool_iterations = len(result.events)
     return result
+
+
+def _run_opencode_process(
+    cmd: list[str],
+    *,
+    workdir: str,
+    timeout: float,
+    startup_timeout: float,
+) -> _OpenCodeProcessResult:
+    """Run OpenCode while watching for no-output startup stalls.
+
+    ``opencode run --format json`` emits JSONL on stdout only after the run
+    reaches the session/model path. In large repos it can hang during
+    bootstrap before any JSON is emitted, which used to burn the whole worker
+    timeout and report zero tool iterations. Kill that case separately so the
+    caller gets a concrete infrastructure failure.
+    """
+    started = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=workdir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception:
+        raise
+
+    line_queue: queue.Queue[tuple[str, Optional[str]]] = queue.Queue()
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    def _reader(name: str, stream: Any) -> None:
+        try:
+            if stream is not None:
+                for line in iter(stream.readline, ""):
+                    if line == "":
+                        break
+                    line_queue.put((name, line))
+        finally:
+            line_queue.put((name, None))
+
+    threads = [
+        threading.Thread(target=_reader, args=("stdout", proc.stdout), daemon=True),
+        threading.Thread(target=_reader, args=("stderr", proc.stderr), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    closed_streams: set[str] = set()
+    timed_out = False
+    startup_timed_out = False
+
+    def _terminate() -> None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+
+    while True:
+        now = time.monotonic()
+        elapsed = now - started
+        if proc.poll() is None:
+            if elapsed >= timeout:
+                timed_out = True
+                _terminate()
+            elif not stdout_lines and elapsed >= startup_timeout:
+                timed_out = True
+                startup_timed_out = True
+                _terminate()
+
+        try:
+            name, line = line_queue.get(timeout=0.1)
+        except queue.Empty:
+            if proc.poll() is not None and len(closed_streams) >= 2:
+                break
+            continue
+
+        if line is None:
+            closed_streams.add(name)
+        elif name == "stdout":
+            stdout_lines.append(line)
+        elif name == "stderr":
+            stderr_lines.append(line)
+
+        if proc.poll() is not None and len(closed_streams) >= 2:
+            break
+
+    for thread in threads:
+        thread.join(timeout=1)
+
+    return _OpenCodeProcessResult(
+        returncode=proc.returncode,
+        stdout="".join(stdout_lines),
+        stderr="".join(stderr_lines),
+        timed_out=timed_out,
+        startup_timed_out=startup_timed_out,
+        duration_seconds=round(time.monotonic() - started, 2),
+    )
 
 
 def _parse_opencode_output(
