@@ -1890,6 +1890,48 @@ class DiscordAdapter(BasePlatformAdapter):
             "foreman": "🔨",
         }.get(str(state or ""))
 
+    @staticmethod
+    def _summary_status_reaction_emoji(status: str) -> Optional[str]:
+        lower = str(status or "").strip().lower()
+        if lower in {"complete", "completed", "done", "success", "succeeded"}:
+            return "✅"
+        if lower in {"foreman"}:
+            return "🔨"
+        if lower in {"blocked", "question", "needs_input", "needs input"}:
+            return "❓"
+        if lower in {"failed", "failure", "error", "errored", "interrupted"}:
+            return "❌"
+        if lower in {"running", "working"}:
+            return "⏳"
+        return "👀"
+
+    def _feature_summary_reaction_emoji(
+        self,
+        handle: Optional[Dict[str, Any]],
+        status: str,
+    ) -> Optional[str]:
+        kanban_emoji = self._feature_kanban_reaction_emoji(
+            self._feature_kanban_reaction_state(handle)
+        )
+        return kanban_emoji or self._summary_status_reaction_emoji(status)
+
+    async def _sync_feature_summary_message_reaction(
+        self,
+        handle: Optional[Dict[str, Any]],
+        message: Any,
+        *,
+        status: str,
+    ) -> None:
+        if not self._reactions_enabled() or not hasattr(message, "add_reaction"):
+            return
+        emoji = self._feature_summary_reaction_emoji(handle, status)
+        if not emoji:
+            return
+        try:
+            await self._set_message_reaction_state(message, emoji)
+        except Exception as exc:
+            logger.debug("[%s] Failed to sync Discord feature summary reaction: %s", self.name, exc)
+
     def _build_feature_summary_embed(
         self,
         *,
@@ -2098,6 +2140,7 @@ class DiscordAdapter(BasePlatformAdapter):
             "_thread_obj": thread_channel,
             "_message_obj": msg,
         }
+        await self._sync_feature_summary_message_reaction(handle, msg, status="In progress")
         try:
             self._persist_feature_summary_handle(thread_channel, handle)
             if board_handle and board_handle.get("slug"):
@@ -2250,6 +2293,7 @@ class DiscordAdapter(BasePlatformAdapter):
             current_payload = self._current_feature_summary_embed_payload(msg)
             if payload is not None and (cached_payload == payload or current_payload == payload):
                 self._feature_summary_edit_payloads[edit_key] = payload
+                await self._sync_feature_summary_message_reaction(handle, msg, status=status)
                 return True
             await msg.edit(embed=embed)
             if payload is not None:
@@ -2258,6 +2302,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 setattr(msg, "embeds", [embed])
             except Exception:
                 pass
+            await self._sync_feature_summary_message_reaction(handle, msg, status=status)
             return True
         except Exception as exc:
             if self._is_discord_rate_limit(exc):
@@ -3449,17 +3494,14 @@ class DiscordAdapter(BasePlatformAdapter):
         return False
 
     async def _kanban_reaction_target_message(self, thread: Any, target: Dict[str, Any]) -> Optional[Any]:
-        message_ids = [
-            str(target.get("source_message_id") or "").strip(),
-            str(target.get("message_id") or "").strip(),
-        ]
-        for message_id in [item for item in message_ids if item]:
+        source_message_id = str(target.get("source_message_id") or "").strip()
+        if source_message_id:
             for channel in (thread, getattr(thread, "parent", None)):
                 fetch = getattr(channel, "fetch_message", None)
                 if not callable(fetch):
                     continue
                 try:
-                    message = await fetch(int(message_id))
+                    message = await fetch(int(source_message_id))
                 except Exception:
                     continue
                 if message is not None and hasattr(message, "add_reaction"):

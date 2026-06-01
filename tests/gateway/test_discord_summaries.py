@@ -306,6 +306,37 @@ async def test_goal_feature_summary_keeps_worker_board_handle(adapter):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_request", "expects_board"),
+    [
+        ("Build a deploy dashboard", False),
+        ("/goal Build a deploy dashboard", True),
+    ],
+)
+async def test_feature_summary_adds_status_reaction_to_embed_message(
+    adapter,
+    monkeypatch,
+    tmp_path,
+    initial_request,
+    expects_board,
+):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request=initial_request,
+    )
+
+    assert handle is not None
+    assert bool(handle["kanban_board"]) is expects_board
+    message = handle["_message_obj"]
+    message.add_reaction.assert_awaited_once_with("👀")
+
+
+@pytest.mark.asyncio
 async def test_goal_feature_summary_for_source_uses_standard_goal_embed(adapter, monkeypatch):
     monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://kanban.example")
     parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
@@ -1185,6 +1216,7 @@ async def test_sync_kanban_feature_summary_uses_persisted_terminal_summary(adapt
     assert fields["Status"] == "✅ Done"
     assert "Checks: passed" in fields["Concise Outcome"]
     assert "Deployment: not checked" in fields["Concise Outcome"]
+    assert message.add_reaction.await_args_list[-1].args == ("✅",)
     worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert "terminal_summary_sync_pending" not in worker
 

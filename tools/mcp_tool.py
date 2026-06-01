@@ -504,6 +504,21 @@ def _cache_mcp_image_block(block) -> str:
     return f"MEDIA:{image_path}"
 
 
+def _extract_mcp_embedded_resource_text_block(block) -> str:
+    """Return text from an MCP ``EmbeddedResource`` content block.
+
+    Some MCP servers (including QMD's ``get`` tool) return document payloads
+    as embedded text resources instead of plain ``TextContent`` blocks.  The
+    agent still needs that text in the normal tool result; otherwise a valid
+    tool call serializes as an empty string.
+    """
+    resource = getattr(block, "resource", None)
+    text = getattr(resource, "text", None)
+    if isinstance(text, str) and text:
+        return text
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Remote MCP URL validation
 # ---------------------------------------------------------------------------
@@ -2529,6 +2544,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             for block in (result.content or []):
                 if hasattr(block, "text") and block.text:
                     parts.append(block.text)
+                    continue
+                resource_text = _extract_mcp_embedded_resource_text_block(block)
+                if resource_text:
+                    parts.append(resource_text)
                     continue
                 image_tag = _cache_mcp_image_block(block)
                 if image_tag:
