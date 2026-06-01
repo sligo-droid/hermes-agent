@@ -21,6 +21,7 @@ BACKEND_OPENCODE = "opencode"
 _VALID_BACKENDS = {BACKEND_CODEX, BACKEND_OPENCODE}
 _VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max"}
 _DEFAULT_STARTUP_TIMEOUT_SECONDS = 90.0
+_DEFAULT_OPENCODE_MODEL = "openai/gpt-5.5"
 
 
 @dataclass
@@ -73,6 +74,26 @@ def _non_negative_float(value: Any, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return parsed if parsed >= 0 else default
+
+
+def _bool_config(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raw = str(value).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _direct_opencode_model(value: Any) -> str:
+    model = str(value or "").strip()
+    if not model or model == "hermes-codex/gpt-5.5":
+        return _DEFAULT_OPENCODE_MODEL
+    return model
 
 
 def load_coding_worker_backend(
@@ -175,13 +196,14 @@ def load_opencode_config(
     pass_cfg = load_coding_worker_pass_config(cfg, worker_config=worker_config)
     return {
         "binary": str(opencode_cfg.get("binary") or "opencode"),
-        "model": str(opencode_cfg.get("model") or "").strip(),
+        "model": _direct_opencode_model(opencode_cfg.get("model")),
         "plan_agent": str(opencode_cfg.get("plan_agent") or "plan").strip() or "plan",
         "build_agent": str(opencode_cfg.get("build_agent") or "build").strip() or "build",
         "simple_build_reasoning_level": pass_cfg["simple_build_reasoning_level"],
         "complex_plan_reasoning_level": pass_cfg["complex_plan_reasoning_level"],
         "complex_build_reasoning_level": pass_cfg["complex_build_reasoning_level"],
         "dangerously_skip_permissions": bool(opencode_cfg.get("dangerously_skip_permissions", False)),
+        "isolated_config": _bool_config(opencode_cfg.get("isolated_config"), True),
         "startup_timeout_seconds": _non_negative_float(
             os.getenv("HERMES_OPENCODE_STARTUP_TIMEOUT_SECONDS")
             or opencode_cfg.get("startup_timeout_seconds"),
@@ -508,6 +530,11 @@ def _run_opencode_once(
     workdir_path = Path(workspace).expanduser().resolve()
     workdir = str(workdir_path)
     brief_path = _write_brief(prompt, workspace=workdir_path)
+    config_home = (
+        _write_worker_config(str(cfg.get("model") or _DEFAULT_OPENCODE_MODEL))
+        if cfg.get("isolated_config")
+        else None
+    )
     cmd = [
         binary_or_error,
         "run",
@@ -546,6 +573,7 @@ def _run_opencode_once(
             timeout=timeout,
             startup_timeout=startup_timeout,
             workdir=workdir,
+            env=_opencode_process_env(config_home),
         )
     except Exception as exc:
         return OpenCodeRunResult(error=f"OpenCode {agent} run failed to start: {exc}")
@@ -554,6 +582,8 @@ def _run_opencode_once(
             brief_path.unlink()
         except OSError:
             pass
+        if config_home is not None:
+            shutil.rmtree(config_home, ignore_errors=True)
 
     result = _parse_opencode_output(proc.stdout, proc.stderr, on_event=on_event)
     result.exit_code = proc.returncode
@@ -598,6 +628,7 @@ def _run_opencode_process(
     workdir: str,
     timeout: float,
     startup_timeout: float,
+    env: Optional[dict[str, str]] = None,
 ) -> _OpenCodeProcessResult:
     """Run OpenCode while watching for no-output startup stalls.
 
@@ -612,6 +643,7 @@ def _run_opencode_process(
         proc = subprocess.Popen(
             cmd,
             cwd=workdir,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -823,6 +855,33 @@ def _write_brief(prompt: str, *, workspace: Optional[Path] = None) -> Path:
         handle.write(prompt)
         handle.write("\n")
         return Path(handle.name)
+
+
+def _write_worker_config(model: str) -> Path:
+    """Create an isolated OpenCode config with no remote MCP startup work."""
+    root = Path(tempfile.mkdtemp(prefix="hermes-opencode-config-"))
+    config_dir = root / "opencode"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "$schema": "https://opencode.ai/config.json",
+        "plugin": [],
+        "permission": "allow",
+        "mcp": {},
+        "model": model or _DEFAULT_OPENCODE_MODEL,
+    }
+    (config_dir / "opencode.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def _opencode_process_env(config_home: Optional[Path]) -> Optional[dict[str, str]]:
+    if config_home is None:
+        return None
+    env = os.environ.copy()
+    env["XDG_CONFIG_HOME"] = str(config_home)
+    return env
 
 
 def _plan_prompt(prompt: str) -> str:

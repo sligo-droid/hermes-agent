@@ -34,11 +34,13 @@ def _process_result(stdout: str = "", stderr: str = "", returncode: int = 0, **o
 
 def test_simple_task_runs_build_only(monkeypatch, tmp_path):
     calls = []
+    process_envs = []
 
     monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
 
-    def fake_run(cmd, **_kwargs):
+    def fake_run(cmd, **kwargs):
         calls.append(cmd)
+        process_envs.append(kwargs.get("env"))
         return _process_result(
             stdout=json.dumps(
                 {"type": "message", "sessionID": "ses-build", "message": "done"}
@@ -67,9 +69,85 @@ def test_simple_task_runs_build_only(monkeypatch, tmp_path):
     }
     assert _option(calls[0], "--agent") == "build"
     assert _option(calls[0], "--variant") == "xhigh"
+    assert _option(calls[0], "--model") == "openai/gpt-5.5"
     assert "--pure" in calls[0]
     assert calls[0][3] == "Read the attached Hermes worker brief and follow it exactly."
     assert calls[0].index("--file") == len(calls[0]) - 2
+    assert process_envs[0] is not None
+    config_home = process_envs[0]["XDG_CONFIG_HOME"]
+    assert not (ow.Path(config_home) / "opencode" / "opencode.json").exists()
+
+
+def test_isolated_config_contains_direct_openai_model_without_mcps(monkeypatch, tmp_path):
+    seen_config_home = None
+    seen_payload = None
+
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+
+    def fake_run(_cmd, **kwargs):
+        nonlocal seen_config_home, seen_payload
+        seen_config_home = ow.Path(kwargs["env"]["XDG_CONFIG_HOME"])
+        config_path = seen_config_home / "opencode" / "opencode.json"
+        seen_payload = json.loads(config_path.read_text(encoding="utf-8"))
+        return _process_result(
+            stdout=json.dumps(
+                {"type": "message", "sessionID": "ses-build", "message": "done"}
+            )
+            + "\n",
+        )
+
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
+
+    result = ow.run_opencode_task(
+        "fix typo in README",
+        str(tmp_path),
+        timeout=60,
+        config=_cfg(),
+    )
+
+    assert result.error is None
+    assert seen_payload == {
+        "$schema": "https://opencode.ai/config.json",
+        "plugin": [],
+        "permission": "allow",
+        "mcp": {},
+        "model": "openai/gpt-5.5",
+    }
+    assert seen_config_home is not None
+    assert not seen_config_home.exists()
+
+
+def test_legacy_proxy_model_is_mapped_to_direct_openai():
+    cfg = ow.load_opencode_config(_cfg(opencode={"model": "hermes-codex/gpt-5.5"}))
+
+    assert cfg["model"] == "openai/gpt-5.5"
+
+
+def test_isolated_config_can_be_disabled(monkeypatch, tmp_path):
+    process_envs = []
+
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+
+    def fake_run(_cmd, **kwargs):
+        process_envs.append(kwargs.get("env"))
+        return _process_result(
+            stdout=json.dumps(
+                {"type": "message", "sessionID": "ses-build", "message": "done"}
+            )
+            + "\n",
+        )
+
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
+
+    result = ow.run_opencode_task(
+        "fix typo in README",
+        str(tmp_path),
+        timeout=60,
+        config=_cfg(opencode={"isolated_config": False}),
+    )
+
+    assert result.error is None
+    assert process_envs == [None]
 
 
 def test_worker_brief_is_workspace_scoped_and_cleaned(monkeypatch, tmp_path):
