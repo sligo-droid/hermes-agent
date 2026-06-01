@@ -842,6 +842,69 @@ def test_discord_kanban_typing_watcher_keeps_recent_reaction_cache(tmp_path, mon
     assert board.slug not in runner._discord_kanban_reaction_states
 
 
+def test_discord_kanban_typing_watcher_ignores_legacy_cache_for_message_target(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setattr("gateway.run.time.monotonic", lambda: 100.0)
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(
+        thread_id="99007",
+        goal="Repair stale Discord reaction on the actual OP",
+        chat_id="parent-996",
+    )
+    dwb.set_feature_summary_handle(board.slug, message_id="222", source_message_id="111")
+
+    adapter = ReactionSyncAdapter()
+    runner = _make_discord_runner(adapter)
+    runner._discord_kanban_reaction_states = {
+        board.slug: {"state": "active", "synced_at": 90.0},
+    }
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert len(adapter.synced) == 1
+    assert adapter.synced[0]["source_message_id"] == "111"
+    assert adapter.synced[0]["message_id"] == "222"
+    cache_key = runner._discord_kanban_target_cache_key(adapter.synced[0])
+    assert runner._discord_kanban_reaction_states[cache_key] == {
+        "state": "active",
+        "synced_at": 100.0,
+    }
+    assert board.slug not in runner._discord_kanban_reaction_states
+
+
+def test_discord_kanban_reaction_cache_key_includes_message_identity():
+    runner = GatewayRunner.__new__(GatewayRunner)
+
+    source_key = runner._discord_kanban_target_cache_key(
+        {
+            "board": "discord-1",
+            "thread_id": "1",
+            "source_message_id": "10",
+            "message_id": "20",
+        }
+    )
+    other_source_key = runner._discord_kanban_target_cache_key(
+        {
+            "board": "discord-1",
+            "thread_id": "1",
+            "source_message_id": "11",
+            "message_id": "20",
+        }
+    )
+    other_summary_key = runner._discord_kanban_target_cache_key(
+        {
+            "board": "discord-1",
+            "thread_id": "1",
+            "source_message_id": "10",
+            "message_id": "21",
+        }
+    )
+
+    assert source_key != other_source_key
+    assert source_key != other_summary_key
+
+
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):
     db_path = tmp_path / "single-owner.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

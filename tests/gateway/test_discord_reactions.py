@@ -502,6 +502,102 @@ async def test_kanban_thread_reaction_prefers_explicit_reaction_state(adapter):
 
 
 @pytest.mark.asyncio
+async def test_kanban_thread_reaction_repairs_source_op_not_summary_embed(adapter):
+    op_message = SimpleNamespace(
+        id=111,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="✅", me=True)],
+    )
+    summary_message = SimpleNamespace(
+        id=222,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[],
+    )
+
+    async def fetch_parent_message(message_id):
+        if int(message_id) == op_message.id:
+            return op_message
+        if int(message_id) == summary_message.id:
+            return summary_message
+        raise LookupError(message_id)
+
+    parent = SimpleNamespace(fetch_message=AsyncMock(side_effect=fetch_parent_message))
+    thread = SimpleNamespace(
+        id=333,
+        parent=parent,
+        fetch_message=AsyncMock(side_effect=LookupError("not cached in thread")),
+    )
+    adapter._resolve_summary_channel = AsyncMock(return_value=thread)
+
+    synced = await adapter.sync_kanban_thread_reaction(
+        {
+            "board": "discord-333",
+            "thread_id": "333",
+            "state": "active",
+            "reaction_state": "running",
+            "message_id": str(summary_message.id),
+            "source_message_id": str(op_message.id),
+        }
+    )
+
+    assert synced == "running"
+    op_message.remove_reaction.assert_awaited_once_with("✅", adapter._client.user)
+    op_message.add_reaction.assert_awaited_once_with("⏳")
+    summary_message.remove_reaction.assert_not_awaited()
+    summary_message.add_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_kanban_thread_reaction_ignores_summary_id_when_op_is_thread_origin(adapter):
+    origin_message = SimpleNamespace(
+        id=333,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="✅", me=True)],
+    )
+    summary_message = SimpleNamespace(
+        id=222,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[],
+    )
+
+    async def fetch_parent_message(message_id):
+        if int(message_id) == origin_message.id:
+            return origin_message
+        if int(message_id) == summary_message.id:
+            return summary_message
+        raise LookupError(message_id)
+
+    parent = SimpleNamespace(fetch_message=AsyncMock(side_effect=fetch_parent_message))
+    thread = SimpleNamespace(
+        id=origin_message.id,
+        parent=parent,
+        fetch_message=AsyncMock(side_effect=LookupError("not cached in thread")),
+    )
+    adapter._resolve_summary_channel = AsyncMock(return_value=thread)
+
+    synced = await adapter.sync_kanban_thread_reaction(
+        {
+            "board": "discord-333",
+            "thread_id": "333",
+            "state": "active",
+            "reaction_state": "running",
+            "message_id": str(summary_message.id),
+        }
+    )
+
+    assert synced == "running"
+    parent.fetch_message.assert_awaited_once_with(origin_message.id)
+    origin_message.remove_reaction.assert_awaited_once_with("✅", adapter._client.user)
+    origin_message.add_reaction.assert_awaited_once_with("⏳")
+    summary_message.remove_reaction.assert_not_awaited()
+    summary_message.add_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_kanban_thread_reaction_clears_terminal_flag_when_message_missing(
     adapter,
     monkeypatch,

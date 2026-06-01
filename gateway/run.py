@@ -6658,6 +6658,8 @@ class GatewayRunner:
             {
                 "board": str(target.get("board") or ""),
                 "thread_id": str(target.get("thread_id") or ""),
+                "message_id": str(target.get("message_id") or ""),
+                "source_message_id": str(target.get("source_message_id") or ""),
                 "guild_id": str(target.get("guild_id") or ""),
                 "parent_channel_id": str(target.get("parent_channel_id") or ""),
             },
@@ -7422,9 +7424,15 @@ class GatewayRunner:
                             state = str(target.get("reaction_state") or target.get("state") or "")
                             cache_key = self._discord_kanban_target_cache_key(target)
                             cache_entry = reaction_cache.get(cache_key)
+                            has_message_identity = bool(
+                                str(target.get("source_message_id") or target.get("message_id") or "").strip()
+                            )
                             if cache_entry is None and board in reaction_cache:
-                                cache_entry = reaction_cache.pop(board)
-                                reaction_cache[cache_key] = cache_entry
+                                if has_message_identity:
+                                    reaction_cache.pop(board, None)
+                                else:
+                                    cache_entry = reaction_cache.pop(board)
+                                    reaction_cache[cache_key] = cache_entry
                             if (
                                 not board
                                 or not self._discord_kanban_reaction_sync_due(
@@ -7465,9 +7473,19 @@ class GatewayRunner:
                             sync_key = self._discord_kanban_summary_sync_key(target_for_sync)
                             cache_key = self._discord_kanban_target_cache_key(target_for_sync)
                             cached_sync_key = summary_cache.get(cache_key)
+                            has_message_identity = bool(
+                                str(
+                                    target_for_sync.get("source_message_id")
+                                    or target_for_sync.get("message_id")
+                                    or ""
+                                ).strip()
+                            )
                             if cached_sync_key is None and board in summary_cache:
-                                cached_sync_key = summary_cache.pop(board)
-                                summary_cache[cache_key] = cached_sync_key
+                                if has_message_identity:
+                                    summary_cache.pop(board, None)
+                                else:
+                                    cached_sync_key = summary_cache.pop(board)
+                                    summary_cache[cache_key] = cached_sync_key
                             if cached_sync_key == sync_key:
                                 continue
                             try:
