@@ -877,6 +877,8 @@ hermes config set auxiliary.vision.model <model_name>
 
 For occasional contributors and PR authors. Full developer docs: https://hermes-agent.nousresearch.com/docs/developer-guide/
 
+When locating Hermes source, search the checked-out repo first; do not use web/community forums for file locations unless local context is missing or stale.
+
 ### Project Layout
 
 ```
@@ -893,8 +895,10 @@ hermes-agent/
 │   └── main.py           # CLI entry point and argparse
 ├── tools/                # One file per tool
 │   └── registry.py       # Central tool registry
-├── gateway/              # Messaging gateway
-│   └── platforms/        # Platform adapters (telegram, discord, etc.)
+├── gateway/              # Messaging gateway/session orchestration and core platform helpers
+│   └── platforms/        # Core helpers and non-pluginized adapters
+├── plugins/              # Plugin systems; platform adapters may live here
+│   └── platforms/discord/adapter.py  # DiscordAdapter; not discord.py package bytecode
 ├── cron/                 # Job scheduler
 ├── tests/                # ~3000 pytest tests
 └── website/              # Docusaurus docs site

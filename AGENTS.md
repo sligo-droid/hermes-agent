@@ -11,6 +11,7 @@ Instructions for AI coding assistants and developers working on the `hermes-agen
 - When developing Hermes itself, work in a git worktree based on `main`; keep the main checkout clean. Merge changes back to `main` when done unless the user asks to pause.
 - Prefer config changes over code changes when the desired behavior is already configurable.
 - Inspect structure/status first, preserve unrelated local edits, and verify with the project test wrapper before reporting completion.
+- When locating Hermes source, search the checked-out repo first; do not use web/community forums for file locations unless local context is missing or stale.
 
 ## Load-Bearing Repo Map
 
@@ -25,8 +26,8 @@ File counts shift constantly; use the filesystem as source of truth. Common entr
 - `hermes_logging.py` — profile-aware logs in `$HERMES_HOME/logs/`.
 - `tools/registry.py` + `tools/*.py` — native tool registration.
 - `tools/environments/` — terminal backends.
-- `gateway/` — messaging gateway, platform adapters, sessions, built-in hooks.
-- `plugins/` — plugin systems: memory, context engine, model providers, kanban, observability, image generation, etc.
+- `gateway/` — messaging gateway/session orchestration and core platform helpers; platform adapters may live in plugins (Discord: `plugins/platforms/discord/adapter.py`, `DiscordAdapter`; do not infer missing Hermes source from `discord.py` package bytecode).
+- `plugins/` — plugin systems: platform adapters, memory, context engine, model providers, kanban, observability, image generation, etc.
 - `skills/` — bundled default skills; `optional-skills/` — heavier/niche skills installed explicitly.
 - `ui-tui/` + `tui_gateway/` — Ink TUI and Python JSON-RPC gateway.
 - `hermes_cli/pty_bridge.py` + `hermes_cli/web_server.py` — dashboard `/chat` embeds the real TUI through a PTY.
