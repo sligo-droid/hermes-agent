@@ -829,6 +829,62 @@ async def test_feature_summary_update_edits_initial_message(adapter, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_feature_summary_resumed_completion_updates_source_reaction(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    source_message = SimpleNamespace(
+        id=501,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[],
+    )
+    parent.fetch_message = AsyncMock(return_value=source_message)
+    thread = FakeThread(channel_id=200, parent=parent)
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="Ship project links",
+        source_message_id=str(source_message.id),
+    )
+    assert handle is not None
+    assert handle["kanban_board"] is None
+
+    assert await adapter.update_feature_summary(
+        handle,
+        final_response="The first attempt crashed.",
+        status="Failed",
+        title="Project Links",
+    )
+    message = handle["_message_obj"]
+    failed_fields = {field.name: field.value for field in message.edit.await_args.kwargs["embed"].fields}
+    assert failed_fields["Status"] == "❌ Failed"
+    assert message.add_reaction.await_args_list[-1].args == ("❌",)
+    assert source_message.add_reaction.await_args_list[-1].args == ("❌",)
+
+    message.reactions = [SimpleNamespace(emoji="❌", me=True)]
+    source_message.reactions = [SimpleNamespace(emoji="❌", me=True)]
+    message.edit.reset_mock()
+    message.add_reaction.reset_mock()
+    message.remove_reaction.reset_mock()
+    source_message.add_reaction.reset_mock()
+    source_message.remove_reaction.reset_mock()
+
+    assert await adapter.update_feature_summary(
+        handle,
+        final_response="Done. The repo and production links are visible.",
+        status="Complete",
+        title="Project Links",
+    )
+
+    complete_fields = {field.name: field.value for field in message.edit.await_args.kwargs["embed"].fields}
+    assert complete_fields["Status"] == "✅ Done"
+    message.remove_reaction.assert_any_await("❌", adapter._client.user)
+    message.add_reaction.assert_awaited_once_with("✅")
+    source_message.remove_reaction.assert_any_await("❌", adapter._client.user)
+    source_message.add_reaction.assert_awaited_once_with("✅")
+
+
+@pytest.mark.asyncio
 async def test_feature_summary_update_skips_unchanged_embed(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     parent = FakeTextChannel(channel_id=100)
@@ -1217,6 +1273,73 @@ async def test_sync_kanban_feature_summary_uses_persisted_terminal_summary(adapt
     assert "Checks: passed" in fields["Concise Outcome"]
     assert "Deployment: not checked" in fields["Concise Outcome"]
     assert message.add_reaction.await_args_list[-1].args == ("✅",)
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "terminal_summary_sync_pending" not in worker
+
+
+@pytest.mark.asyncio
+async def test_sync_kanban_feature_summary_updates_status_after_terminal_recovery(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=101)
+    thread = FakeThread(channel_id=201, parent=parent)
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 201 else None
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="/goal Recover after failure",
+    )
+    assert handle is not None
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="201", goal="Recover after failure")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "blocked",
+            "phase": "blocked",
+            "blocked_reason": "worker crashed",
+        },
+    )
+    blocked_sync = await adapter.sync_kanban_feature_summary(
+        {
+            "board": board.slug,
+            "thread_id": "201",
+            "state": "blocked",
+            "sync_key": "blocked-sync",
+        }
+    )
+    assert blocked_sync == "blocked-sync"
+    message = handle["_message_obj"]
+    blocked_fields = {field.name: field.value for field in message.edit.await_args.kwargs["embed"].fields}
+    assert blocked_fields["Status"] == "❓ Blocked"
+
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "blocked_reason": "",
+        },
+    )
+    target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
+    assert target["state"] == "done"
+    assert target["terminal_summary_sync_pending"] is True
+
+    done_sync = await adapter.sync_kanban_feature_summary(
+        {
+            "board": board.slug,
+            "thread_id": "201",
+            "state": "done",
+            "sync_key": "done-sync",
+        }
+    )
+
+    assert done_sync == "done-sync"
+    done_fields = {field.name: field.value for field in message.edit.await_args.kwargs["embed"].fields}
+    assert done_fields["Status"] == "✅ Done"
     worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert "terminal_summary_sync_pending" not in worker
 
