@@ -2022,7 +2022,7 @@ def test_worker_run_profile_renders_without_fastapi():
             "label": "1-pass simple build",
             "pass_count": 1,
             "plan_used": False,
-            "passes": [{"name": "build", "agent": "build", "reasoning": "xhigh"}],
+            "passes": [{"name": "build", "agent": "build", "reasoning": "medium"}],
         },
         "service_tier": "normal",
         "fast_mode": False,
@@ -2044,9 +2044,9 @@ def test_worker_run_profile_renders_without_fastapi():
         codex_state={"result": result},
     )
 
-    assert line == "1-pass simple build; build reasoning=x-high; fast mode=off"
+    assert line == "1-pass simple build; build reasoning=medium; fast mode=off"
     assert state["summary"] == line
-    assert "worker_run: 1-pass simple build; build reasoning=x-high; fast mode=off" in feed
+    assert "worker_run: 1-pass simple build; build reasoning=medium; fast mode=off" in feed
 
 
 def test_worker_ticket_terminal_page_explains_sparse_feed(monkeypatch, tmp_path):

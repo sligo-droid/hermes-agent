@@ -92,7 +92,7 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     assert FakeSession.instances[0].kwargs["cwd"] == str(tmp_path)
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
-        'model_reasoning_effort="xhigh"',
+        'model_reasoning_effort="medium"',
     ]
     assert FakeSession.instances[0].run_calls[0]["turn_timeout"] == 123.0
     prompt = FakeSession.instances[0].run_calls[0]["user_input"]

@@ -159,7 +159,7 @@ def load_coding_worker_pass_config(
 
     return {
         "simple_build_reasoning_level": _normalize_reasoning_level(
-            coding_cfg.get("simple_build_reasoning_level") or "xhigh"
+            coding_cfg.get("simple_build_reasoning_level") or "medium"
         ),
         "complex_plan_reasoning_level": _normalize_reasoning_level(
             coding_cfg.get("complex_plan_reasoning_level") or "xhigh"
