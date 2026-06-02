@@ -82,6 +82,20 @@ _HERMES_WEBHOOK_SAFE_TOOLS = [
     "clarify",
 ]
 
+_DISCORD_READ_TOOLS = [
+    "discord",
+    "discord_list_guilds",
+    "discord_list_channels",
+    "discord_get_channel",
+    "discord_get_message",
+    "discord_list_recent",
+    "discord_get_thread",
+    "discord_search_messages",
+    "discord_get_reactions",
+]
+
+_DISCORD_ADMIN_TOOLS = ["discord_admin"]
+
 
 # Core toolset definitions
 # These can include individual tools or reference other toolsets
@@ -275,14 +289,14 @@ TOOLSETS = {
     },
 
     "discord": {
-        "description": "Discord read and participate tools (fetch messages, search members, create threads)",
-        "tools": ["discord"],
+        "description": "Discord read/query tools plus legacy participate actions",
+        "tools": _DISCORD_READ_TOOLS,
         "includes": [],
     },
 
     "discord_admin": {
         "description": "Discord server management (list channels/roles, pin messages, assign roles)",
-        "tools": ["discord_admin"],
+        "tools": _DISCORD_ADMIN_TOOLS,
         "includes": [],
     },
 
@@ -421,10 +435,7 @@ TOOLSETS = {
     
     "hermes-discord": {
         "description": "Discord bot toolset - full access (terminal has safety checks via dangerous command approval)",
-        "tools": _HERMES_CORE_TOOLS + [
-            "discord",
-            "discord_admin",
-        ],
+        "tools": _HERMES_CORE_TOOLS + _DISCORD_READ_TOOLS + _DISCORD_ADMIN_TOOLS,
         "includes": []
     },
     

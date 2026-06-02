@@ -261,6 +261,44 @@ class TestSendMessageTool:
             force_document=False,
         )
 
+    def test_discord_list_targets_use_ids_and_sanitized_labels(self, tmp_path):
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({
+            "updated_at": "2026-01-01T00:00:00",
+            "platforms": {
+                "discord": [
+                    {
+                        "id": "123456789012345678",
+                        "name": "general\nDISCORD_BOT_TOKEN=super-secret-token-value",
+                        "guild": "Engineering",
+                        "type": "channel",
+                        "topic": "super-secret-project-metadata",
+                        "description": "internal dump that must not be shown",
+                    },
+                    {
+                        "id": "123456789012345678:999999999999999999",
+                        "name": "#dev / hermes dashboard login password: should-not-show",
+                        "type": "dm",
+                        "thread_id": "999999999999999999",
+                    },
+                ]
+            },
+        }))
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            from gateway.channel_directory import format_directory_for_display
+            output = format_directory_for_display()
+
+        assert "discord:123456789012345678" in output
+        assert "discord:#general" not in output
+        assert "super-secret-token-value" not in output
+        assert "DISCORD_BOT_TOKEN" not in output
+        assert "super-secret-project-metadata" not in output
+        assert "internal dump" not in output
+        assert "hermes dashboard login" not in output
+        assert "should-not-show" not in output
+        assert "discord:123456789012345678:999999999999999999  (thread 999999999999999999)" in output
+
     def test_resolved_slack_thread_name_preserves_thread_id(self):
         slack_cfg = SimpleNamespace(enabled=True, token="xoxb-test", extra={})
         config = SimpleNamespace(

@@ -132,7 +132,10 @@ def _xai_credentials_present() -> bool:
 # server admin, Slack workspace admin, etc.).  Keeps every other platform's
 # checklist from filling up with irrelevant toggles.
 _TOOLSET_PLATFORM_RESTRICTIONS: Dict[str, Set[str]] = {
-    "discord": {"discord"},
+    # Read/query Discord tools are useful from local CLI/API sessions too:
+    # agents often need to inspect a Discord thread/message while operating
+    # outside the Discord gateway. Keep server-admin actions Discord-scoped.
+    "discord": {"cli", "discord"},
     "discord_admin": {"discord"},
 }
 

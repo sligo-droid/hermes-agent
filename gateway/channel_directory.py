@@ -8,9 +8,11 @@ action="list" and for resolving human-friendly channel names to numeric IDs.
 
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from agent.redact import redact_sensitive_text
 from hermes_cli.config import get_hermes_home
 from utils import atomic_json_write
 
@@ -31,6 +33,44 @@ def _channel_target_name(platform_name: str, channel: Dict[str, Any]) -> str:
     if platform_name != "discord" and channel.get("type"):
         return f"{name} ({channel['type']})"
     return name
+
+
+def _safe_display_text(value: Any, max_length: int = 80) -> str:
+    """Return a short, single-line, redacted display label."""
+    text = redact_sensitive_text(str(value or ""))
+    text = re.sub(
+        r"\b[A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_?KEY|AUTH)[A-Za-z0-9_]*\s*=\s*\S+",
+        "[redacted]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"[\r\n\t]+", " ", text)
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    if len(text) > max_length:
+        text = text[: max_length - 3].rstrip() + "..."
+    return text
+
+
+def _discord_display_line(channel: Dict[str, Any]) -> str:
+    """Format a Discord target using a stable ID plus a safe label.
+
+    Real guild channel names are useful and usually low-risk. Session-derived
+    Discord entries can contain arbitrary user/thread text (including pasted
+    credentials), so never echo those names in the model-visible target list.
+    """
+    entry_id = str(channel.get("id") or "").strip()
+    label = ""
+    if channel.get("guild"):
+        label = _safe_display_text(_channel_target_name("discord", channel))
+    elif channel.get("thread_id"):
+        label = f"thread {channel.get('thread_id')}"
+    elif channel.get("type"):
+        label = _safe_display_text(str(channel.get("type")), max_length=40)
+    if entry_id:
+        if label and label != entry_id:
+            return f"  discord:{entry_id}  ({label})"
+        return f"  discord:{entry_id}"
+    return f"  discord:{label}" if label else "  discord:<unknown>"
 
 
 def _session_entry_id(origin: Dict[str, Any]) -> Optional[str]:
@@ -337,13 +377,13 @@ def format_directory_for_display() -> str:
                     dms.append(ch)
 
             for guild_name, guild_channels in sorted(guilds.items()):
-                lines.append(f"Discord ({guild_name}):")
-                for ch in sorted(guild_channels, key=lambda c: c["name"]):
-                    lines.append(f"  discord:{_channel_target_name(plat_name, ch)}")
+                lines.append(f"Discord ({_safe_display_text(guild_name)}):")
+                for ch in sorted(guild_channels, key=lambda c: c.get("name", "")):
+                    lines.append(_discord_display_line(ch))
             if dms:
                 lines.append("Discord (DMs):")
                 for ch in dms:
-                    lines.append(f"  discord:{_channel_target_name(plat_name, ch)}")
+                    lines.append(_discord_display_line(ch))
             lines.append("")
         else:
             lines.append(f"{plat_name.title()}:")

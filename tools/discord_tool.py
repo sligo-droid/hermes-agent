@@ -28,6 +28,7 @@ actionable guidance the model can relay to the user.
 import json
 import logging
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -38,6 +39,18 @@ from tools.registry import registry
 logger = logging.getLogger(__name__)
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
+_DISCORD_MESSAGE_URL_RE = re.compile(
+    r"^https?://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/channels/"
+    r"(?P<guild_id>[^/]+)/(?P<channel_id>\d+)/(?P<message_id>\d+)"
+    r"(?:[/?#].*)?$"
+)
+_DISCORD_SNOWFLAKE_RE = re.compile(r"^\d{5,}$")
+
+_MESSAGE_CONTENT_NOTE = (
+    "Discord bot REST can read message metadata with normal channel access, "
+    "but `content` may be empty unless the bot has the MESSAGE_CONTENT "
+    "privileged intent or the message is in a DM/mentions the bot."
+)
 
 # Application flag bits (from GET /applications/@me → "flags").
 # Source: https://discord.com/developers/docs/resources/application#application-object-application-flags
@@ -51,8 +64,30 @@ _FLAG_GATEWAY_MESSAGE_CONTENT_LIMITED = 1 << 19
 # ---------------------------------------------------------------------------
 
 def _get_bot_token() -> Optional[str]:
-    """Resolve the Discord bot token from environment."""
-    return os.getenv("DISCORD_BOT_TOKEN", "").strip() or None
+    """Resolve the Discord bot token from env/.env, then loaded gateway config."""
+    token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+    if token:
+        return token
+
+    try:
+        from hermes_cli.config import get_env_value
+        token = str(get_env_value("DISCORD_BOT_TOKEN") or "").strip()
+        if token:
+            return token
+    except Exception as exc:
+        logger.debug("discord: could not read DISCORD_BOT_TOKEN from Hermes env: %s", exc)
+
+    try:
+        from gateway.config import Platform, load_gateway_config
+        cfg = load_gateway_config()
+        pconfig = cfg.platforms.get(Platform.DISCORD)
+        token = str(getattr(pconfig, "token", "") or "").strip() if pconfig else ""
+        if token:
+            return token
+    except Exception as exc:
+        logger.debug("discord: could not read gateway token from config: %s", exc)
+
+    return None
 
 
 def _discord_request(
@@ -125,6 +160,152 @@ _CHANNEL_TYPE_NAMES = {
 
 def _channel_type_name(type_id: int) -> str:
     return _CHANNEL_TYPE_NAMES.get(type_id, f"unknown({type_id})")
+
+
+def _coerce_int_range(
+    value: Any,
+    default: int,
+    *,
+    minimum: int = 1,
+    maximum: int = 100,
+) -> int:
+    """Coerce a numeric tool argument into a safe inclusive range."""
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        coerced = default
+    return max(minimum, min(coerced, maximum))
+
+
+def _format_user(user: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": user.get("id"),
+        "username": user.get("username"),
+        "display_name": user.get("global_name"),
+        "bot": user.get("bot", False),
+    }
+
+
+def _format_reaction(reaction: Dict[str, Any]) -> Dict[str, Any]:
+    emoji = reaction.get("emoji") or {}
+    return {
+        "emoji": {
+            "id": emoji.get("id"),
+            "name": emoji.get("name"),
+            "animated": emoji.get("animated", False),
+        },
+        "count": reaction.get("count", 0),
+        "me": reaction.get("me", False),
+    }
+
+
+def _format_channel(channel: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        type_id = int(channel.get("type"))
+    except (TypeError, ValueError):
+        type_id = -1
+    result = {
+        "id": channel.get("id"),
+        "name": channel.get("name"),
+        "type": _channel_type_name(type_id),
+        "guild_id": channel.get("guild_id"),
+        "topic": channel.get("topic"),
+        "nsfw": channel.get("nsfw", False),
+        "position": channel.get("position"),
+        "parent_id": channel.get("parent_id"),
+        "rate_limit_per_user": channel.get("rate_limit_per_user", 0),
+        "last_message_id": channel.get("last_message_id"),
+    }
+    for key in ("owner_id", "message_count", "member_count", "thread_metadata"):
+        if key in channel:
+            result[key] = channel.get(key)
+    return result
+
+
+def _format_message(message: Dict[str, Any]) -> Dict[str, Any]:
+    author = message.get("author") or {}
+    result = {
+        "id": message.get("id"),
+        "channel_id": message.get("channel_id"),
+        "guild_id": message.get("guild_id"),
+        "content": message.get("content", ""),
+        "author": _format_user(author),
+        "timestamp": message.get("timestamp"),
+        "edited_timestamp": message.get("edited_timestamp"),
+        "type": message.get("type"),
+        "pinned": message.get("pinned", False),
+        "attachments": [
+            {
+                "id": attachment.get("id"),
+                "filename": attachment.get("filename"),
+                "url": attachment.get("url"),
+                "content_type": attachment.get("content_type"),
+                "size": attachment.get("size"),
+            }
+            for attachment in message.get("attachments", [])
+        ],
+        "embeds": [
+            {
+                "type": embed.get("type"),
+                "title": embed.get("title"),
+                "description": embed.get("description"),
+                "url": embed.get("url"),
+            }
+            for embed in message.get("embeds", [])
+        ],
+        "mentions": [_format_user(user) for user in message.get("mentions", [])],
+        "reactions": [
+            _format_reaction(reaction)
+            for reaction in message.get("reactions", [])
+        ],
+    }
+    if message.get("message_reference"):
+        result["message_reference"] = message.get("message_reference")
+    if message.get("referenced_message"):
+        result["referenced_message"] = _format_message(message["referenced_message"])
+    if message.get("thread"):
+        result["thread"] = _format_channel(message["thread"])
+    return result
+
+
+def _fetch_channel_messages(
+    token: str,
+    channel_id: str,
+    limit: int = 50,
+    before: Optional[str] = None,
+    after: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    params: Dict[str, str] = {"limit": str(_coerce_int_range(limit, 50))}
+    if before:
+        params["before"] = before
+    if after:
+        params["after"] = after
+    return _discord_request("GET", f"/channels/{channel_id}/messages", token, params=params)
+
+
+def _parse_message_reference(
+    message_url_or_id: str,
+    channel_id: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Return (channel_id, message_id, guild_id, error) for a URL or snowflake."""
+    value = str(message_url_or_id or "").strip()
+    if not value:
+        return None, None, None, "message_url_or_id is required."
+
+    match = _DISCORD_MESSAGE_URL_RE.match(value)
+    if match:
+        return (
+            match.group("channel_id"),
+            match.group("message_id"),
+            match.group("guild_id"),
+            None,
+        )
+
+    if not _DISCORD_SNOWFLAKE_RE.match(value):
+        return None, None, None, "message_url_or_id must be a Discord message URL or numeric message ID."
+    if not channel_id:
+        return None, None, None, "channel_id is required when message_url_or_id is only a message ID."
+    return str(channel_id).strip(), value, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -277,18 +458,7 @@ def _list_channels(token: str, guild_id: str, **_kwargs: Any) -> str:
 def _channel_info(token: str, channel_id: str, **_kwargs: Any) -> str:
     """Get detailed info about a specific channel."""
     ch = _discord_request("GET", f"/channels/{channel_id}", token)
-    return json.dumps({
-        "id": ch["id"],
-        "name": ch.get("name"),
-        "type": _channel_type_name(ch["type"]),
-        "guild_id": ch.get("guild_id"),
-        "topic": ch.get("topic"),
-        "nsfw": ch.get("nsfw", False),
-        "position": ch.get("position"),
-        "parent_id": ch.get("parent_id"),
-        "rate_limit_per_user": ch.get("rate_limit_per_user", 0),
-        "last_message_id": ch.get("last_message_id"),
-    })
+    return json.dumps(_format_channel(ch))
 
 
 def _list_roles(token: str, guild_id: str, **_kwargs: Any) -> str:
@@ -354,40 +524,8 @@ def _fetch_messages(
     **_kwargs: Any,
 ) -> str:
     """Fetch recent messages from a channel."""
-    try:
-        limit = int(limit)
-    except (TypeError, ValueError):
-        limit = 50
-    params: Dict[str, str] = {"limit": str(min(limit, 100))}
-    if before:
-        params["before"] = before
-    if after:
-        params["after"] = after
-    messages = _discord_request("GET", f"/channels/{channel_id}/messages", token, params=params)
-    result = []
-    for msg in messages:
-        author = msg.get("author", {})
-        result.append({
-            "id": msg["id"],
-            "content": msg.get("content", ""),
-            "author": {
-                "id": author.get("id"),
-                "username": author.get("username"),
-                "display_name": author.get("global_name"),
-                "bot": author.get("bot", False),
-            },
-            "timestamp": msg.get("timestamp"),
-            "edited_timestamp": msg.get("edited_timestamp"),
-            "attachments": [
-                {"filename": a.get("filename"), "url": a.get("url"), "size": a.get("size")}
-                for a in msg.get("attachments", [])
-            ],
-            "reactions": [
-                {"emoji": r.get("emoji", {}).get("name"), "count": r.get("count", 0)}
-                for r in msg.get("reactions", [])
-            ] if msg.get("reactions") else [],
-            "pinned": msg.get("pinned", False),
-        })
+    messages = _fetch_channel_messages(token, channel_id, limit, before, after)
+    result = [_format_message(msg) for msg in messages]
     return json.dumps({"messages": result, "count": len(result)})
 
 
@@ -451,6 +589,141 @@ def _create_thread(
         "success": True,
         "thread_id": thread["id"],
         "name": thread.get("name"),
+    })
+
+
+def _get_message(
+    token: str,
+    message_url_or_id: str,
+    channel_id: Optional[str] = None,
+) -> str:
+    """Fetch a single message by Discord URL or message ID + channel ID."""
+    resolved_channel_id, message_id, guild_id, error = _parse_message_reference(
+        message_url_or_id,
+        channel_id,
+    )
+    if error:
+        return json.dumps({"error": error})
+    message = _discord_request(
+        "GET",
+        f"/channels/{resolved_channel_id}/messages/{message_id}",
+        token,
+    )
+    return json.dumps({
+        "channel_id": resolved_channel_id,
+        "guild_id": guild_id or message.get("guild_id"),
+        "message": _format_message(message),
+        "content_note": _MESSAGE_CONTENT_NOTE,
+    })
+
+
+def _get_thread(
+    token: str,
+    thread_id: str,
+    limit: int = 50,
+    before: Optional[str] = None,
+    after: Optional[str] = None,
+) -> str:
+    """Fetch thread metadata and recent messages from a Discord thread."""
+    thread = _discord_request("GET", f"/channels/{thread_id}", token)
+    messages = _fetch_channel_messages(token, thread_id, limit, before, after)
+    formatted = [_format_message(msg) for msg in messages]
+    return json.dumps({
+        "thread": _format_channel(thread),
+        "messages": formatted,
+        "count": len(formatted),
+        "content_note": _MESSAGE_CONTENT_NOTE,
+    })
+
+
+def _search_messages(
+    token: str,
+    channel_id: str,
+    query: str,
+    limit: int = 50,
+    max_pages: int = 5,
+    before: Optional[str] = None,
+) -> str:
+    """Bounded local search over recent/paginated channel messages."""
+    needle = str(query or "").strip().lower()
+    if not needle:
+        return json.dumps({"error": "query is required."})
+
+    result_limit = _coerce_int_range(limit, 50)
+    page_limit = 100
+    page_cap = _coerce_int_range(max_pages, 5, minimum=1, maximum=20)
+    cursor = before
+    matches: List[Dict[str, Any]] = []
+    searched_messages = 0
+    searched_pages = 0
+
+    for _page in range(page_cap):
+        params = {"limit": str(page_limit)}
+        if cursor:
+            params["before"] = cursor
+        messages = _discord_request(
+            "GET",
+            f"/channels/{channel_id}/messages",
+            token,
+            params=params,
+        )
+        searched_pages += 1
+        if not messages:
+            break
+
+        for message in messages:
+            searched_messages += 1
+            author = message.get("author") or {}
+            searchable_parts = [
+                str(message.get("content") or ""),
+                str(author.get("username") or ""),
+                str(author.get("global_name") or ""),
+                " ".join(
+                    str(attachment.get("filename") or "")
+                    for attachment in message.get("attachments", [])
+                ),
+            ]
+            if needle in "\n".join(searchable_parts).lower():
+                matches.append(_format_message(message))
+                if len(matches) >= result_limit:
+                    break
+
+        if len(matches) >= result_limit or len(messages) < page_limit:
+            break
+        cursor = messages[-1].get("id")
+        if not cursor:
+            break
+
+    return json.dumps({
+        "matches": matches,
+        "count": len(matches),
+        "query": query,
+        "channel_id": channel_id,
+        "bounded": True,
+        "searched_pages": searched_pages,
+        "searched_messages": searched_messages,
+        "max_pages": page_cap,
+        "note": (
+            "Discord bot REST does not provide arbitrary historical full-text search; "
+            "this scanned only recent/paginated messages available within max_pages."
+        ),
+        "content_note": _MESSAGE_CONTENT_NOTE,
+    })
+
+
+def _get_reactions(token: str, channel_id: str, message_id: str) -> str:
+    """Return reaction counts from the message payload."""
+    message = _discord_request(
+        "GET",
+        f"/channels/{channel_id}/messages/{message_id}",
+        token,
+    )
+    reactions = [_format_reaction(reaction) for reaction in message.get("reactions", [])]
+    return json.dumps({
+        "channel_id": channel_id,
+        "message_id": message_id,
+        "reactions": reactions,
+        "count": len(reactions),
     })
 
 
@@ -580,6 +853,26 @@ def _load_allowed_actions_config() -> Optional[List[str]]:
             ", ".join(invalid), ", ".join(_ACTIONS.keys()),
         )
     return valid
+
+
+def _action_allowed_error(action: str) -> Optional[str]:
+    """Return an allowlist error for an action, or None when allowed."""
+    allowlist = _load_allowed_actions_config()
+    if allowlist is None or action in allowlist:
+        return None
+    return (
+        f"Action '{action}' is disabled by config (discord.server_actions). "
+        f"Allowed: {', '.join(allowlist) if allowlist else '<none>'}"
+    )
+
+
+def _make_action_check(action: str):
+    """Build a check_fn for first-class tools that mirrors action allowlists."""
+    def _check() -> bool:
+        return check_discord_tool_requirements() and _action_allowed_error(action) is None
+
+    _check._hermes_skip_check_cache = True  # type: ignore[attr-defined]
+    return _check
 
 
 def _available_actions(
@@ -855,14 +1148,9 @@ def _run_discord_action(
     # Config-level allowlist gate (defense in depth — schema already filtered,
     # but a stale cached schema from a prior config should not let denied
     # actions through).
-    allowlist = _load_allowed_actions_config()
-    if allowlist is not None and action not in allowlist:
-        return json.dumps({
-            "error": (
-                f"Action '{action}' is disabled by config (discord.server_actions). "
-                f"Allowed: {', '.join(allowlist) if allowlist else '<none>'}"
-            ),
-        })
+    allowlist_error = _action_allowed_error(action)
+    if allowlist_error:
+        return json.dumps({"error": allowlist_error})
 
     local_vars = {
         "guild_id": guild_id,
@@ -915,6 +1203,50 @@ def discord_admin_handler(action: str, **kwargs) -> str:
     return _run_discord_action(action, _ADMIN_ACTIONS, "discord_admin", **kwargs)
 
 
+def _run_first_class_tool(
+    tool_label: str,
+    action: str,
+    required: List[str],
+    handler_fn,
+    args: Dict[str, Any],
+) -> str:
+    """Shared runtime wrapper for single-purpose Discord tools."""
+    token = _get_bot_token()
+    if not token:
+        return json.dumps({"error": "DISCORD_BOT_TOKEN not configured."})
+
+    allowlist_error = _action_allowed_error(action)
+    if allowlist_error:
+        return json.dumps({"error": allowlist_error})
+
+    missing = [name for name in required if not str(args.get(name, "") or "").strip()]
+    if missing:
+        return json.dumps({
+            "error": f"Missing required parameters for '{tool_label}': {', '.join(missing)}",
+        })
+
+    try:
+        return handler_fn(token, args)
+    except DiscordAPIError as e:
+        logger.warning("Discord API error in %s: %s", tool_label, e)
+        if e.status == 403:
+            return json.dumps({"error": _enrich_403(action, e.body)})
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        logger.exception("Unexpected error in %s", tool_label)
+        return json.dumps({"error": f"Unexpected error: {e}"})
+
+
+def _make_first_class_handler(tool_label: str, action: str, required: List[str], handler_fn):
+    return lambda args, **kw: _run_first_class_tool(
+        tool_label,
+        action,
+        required,
+        handler_fn,
+        args,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tool registration
 # ---------------------------------------------------------------------------
@@ -940,6 +1272,241 @@ _STATIC_ADMIN_SCHEMA = _build_schema(
     list(_ADMIN_ACTIONS.keys()), caps={"detected": False}, tool_name="discord_admin",
 )
 
+
+def _single_schema(
+    name: str,
+    description: str,
+    properties: Dict[str, Any],
+    required: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "description": description,
+        "parameters": {
+            "type": "object",
+            "properties": properties,
+            "required": required or [],
+        },
+    }
+
+
+_PROP_GUILD_ID = {
+    "type": "string",
+    "description": "Discord server (guild) ID.",
+}
+_PROP_CHANNEL_ID = {
+    "type": "string",
+    "description": "Discord channel ID. Threads are channels in Discord REST.",
+}
+_PROP_LIMIT = {
+    "type": "integer",
+    "minimum": 1,
+    "maximum": 100,
+    "description": "Maximum messages to return. Defaults to 50; capped at 100.",
+}
+_PROP_BEFORE = {
+    "type": "string",
+    "description": "Return messages before this Discord snowflake ID.",
+}
+_PROP_AFTER = {
+    "type": "string",
+    "description": "Return messages after this Discord snowflake ID.",
+}
+
+
+DISCORD_LIST_GUILDS_SCHEMA = _single_schema(
+    "discord_list_guilds",
+    "List Discord servers (guilds) the configured bot can access.",
+    {},
+)
+
+DISCORD_LIST_CHANNELS_SCHEMA = _single_schema(
+    "discord_list_channels",
+    "List channels in a Discord guild, grouped by category.",
+    {"guild_id": _PROP_GUILD_ID},
+    ["guild_id"],
+)
+
+DISCORD_GET_CHANNEL_SCHEMA = _single_schema(
+    "discord_get_channel",
+    "Get metadata for a Discord channel or thread by channel ID.",
+    {"channel_id": _PROP_CHANNEL_ID},
+    ["channel_id"],
+)
+
+DISCORD_GET_MESSAGE_SCHEMA = _single_schema(
+    "discord_get_message",
+    f"Get one Discord message by URL or by message ID plus channel_id. {_MESSAGE_CONTENT_NOTE}",
+    {
+        "message_url_or_id": {
+            "type": "string",
+            "description": (
+                "Discord message URL like "
+                "https://discord.com/channels/<guild>/<channel>/<message>, "
+                "or a numeric message ID."
+            ),
+        },
+        "channel_id": {
+            "type": "string",
+            "description": "Required when message_url_or_id is only a message ID.",
+        },
+    },
+    ["message_url_or_id"],
+)
+
+DISCORD_LIST_RECENT_SCHEMA = _single_schema(
+    "discord_list_recent",
+    f"List recent Discord channel messages with optional before/after pagination. {_MESSAGE_CONTENT_NOTE}",
+    {
+        "channel_id": _PROP_CHANNEL_ID,
+        "limit": _PROP_LIMIT,
+        "before": _PROP_BEFORE,
+        "after": _PROP_AFTER,
+    },
+    ["channel_id"],
+)
+
+DISCORD_GET_THREAD_SCHEMA = _single_schema(
+    "discord_get_thread",
+    f"Get Discord thread metadata and recent thread messages. Threads are channels in Discord REST. {_MESSAGE_CONTENT_NOTE}",
+    {
+        "thread_id": {
+            "type": "string",
+            "description": "Discord thread ID.",
+        },
+        "limit": _PROP_LIMIT,
+        "before": _PROP_BEFORE,
+        "after": _PROP_AFTER,
+    },
+    ["thread_id"],
+)
+
+DISCORD_SEARCH_MESSAGES_SCHEMA = _single_schema(
+    "discord_search_messages",
+    (
+        "Bounded local search over recent/paginated Discord channel messages. "
+        "Discord bot REST has no arbitrary historical full-text search, so this scans "
+        "only messages reachable within max_pages. "
+        f"{_MESSAGE_CONTENT_NOTE}"
+    ),
+    {
+        "channel_id": _PROP_CHANNEL_ID,
+        "query": {
+            "type": "string",
+            "description": "Case-insensitive text to match in message content, author names, or attachment filenames.",
+        },
+        "limit": _PROP_LIMIT,
+        "max_pages": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "description": "Maximum 100-message pages to scan. Defaults to 5; capped at 20.",
+        },
+        "before": _PROP_BEFORE,
+    },
+    ["channel_id", "query"],
+)
+
+DISCORD_GET_REACTIONS_SCHEMA = _single_schema(
+    "discord_get_reactions",
+    "Get reaction counts for a Discord message from the message payload.",
+    {
+        "channel_id": _PROP_CHANNEL_ID,
+        "message_id": {
+            "type": "string",
+            "description": "Discord message ID.",
+        },
+    },
+    ["channel_id", "message_id"],
+)
+
+
+_FIRST_CLASS_DISCORD_TOOLS = [
+    (
+        "discord_list_guilds",
+        DISCORD_LIST_GUILDS_SCHEMA,
+        "list_guilds",
+        [],
+        lambda token, args: _list_guilds(token),
+    ),
+    (
+        "discord_list_channels",
+        DISCORD_LIST_CHANNELS_SCHEMA,
+        "list_channels",
+        ["guild_id"],
+        lambda token, args: _list_channels(token, guild_id=args.get("guild_id", "")),
+    ),
+    (
+        "discord_get_channel",
+        DISCORD_GET_CHANNEL_SCHEMA,
+        "channel_info",
+        ["channel_id"],
+        lambda token, args: _channel_info(token, channel_id=args.get("channel_id", "")),
+    ),
+    (
+        "discord_get_message",
+        DISCORD_GET_MESSAGE_SCHEMA,
+        "fetch_messages",
+        ["message_url_or_id"],
+        lambda token, args: _get_message(
+            token,
+            message_url_or_id=args.get("message_url_or_id", ""),
+            channel_id=args.get("channel_id") or None,
+        ),
+    ),
+    (
+        "discord_list_recent",
+        DISCORD_LIST_RECENT_SCHEMA,
+        "fetch_messages",
+        ["channel_id"],
+        lambda token, args: _fetch_messages(
+            token,
+            channel_id=args.get("channel_id", ""),
+            limit=args.get("limit", 50),
+            before=args.get("before") or None,
+            after=args.get("after") or None,
+        ),
+    ),
+    (
+        "discord_get_thread",
+        DISCORD_GET_THREAD_SCHEMA,
+        "fetch_messages",
+        ["thread_id"],
+        lambda token, args: _get_thread(
+            token,
+            thread_id=args.get("thread_id", ""),
+            limit=args.get("limit", 50),
+            before=args.get("before") or None,
+            after=args.get("after") or None,
+        ),
+    ),
+    (
+        "discord_search_messages",
+        DISCORD_SEARCH_MESSAGES_SCHEMA,
+        "fetch_messages",
+        ["channel_id", "query"],
+        lambda token, args: _search_messages(
+            token,
+            channel_id=args.get("channel_id", ""),
+            query=args.get("query", ""),
+            limit=args.get("limit", 50),
+            max_pages=args.get("max_pages", 5),
+            before=args.get("before") or None,
+        ),
+    ),
+    (
+        "discord_get_reactions",
+        DISCORD_GET_REACTIONS_SCHEMA,
+        "fetch_messages",
+        ["channel_id", "message_id"],
+        lambda token, args: _get_reactions(
+            token,
+            channel_id=args.get("channel_id", ""),
+            message_id=args.get("message_id", ""),
+        ),
+    ),
+]
+
 registry.register(
     name="discord",
     toolset="discord",
@@ -957,3 +1524,13 @@ registry.register(
     check_fn=check_discord_tool_requirements,
     requires_env=["DISCORD_BOT_TOKEN"],
 )
+
+for _tool_name, _schema, _action, _required, _handler_fn in _FIRST_CLASS_DISCORD_TOOLS:
+    registry.register(
+        name=_tool_name,
+        toolset="discord",
+        schema=_schema,
+        handler=_make_first_class_handler(_tool_name, _action, _required, _handler_fn),
+        check_fn=_make_action_check(_action),
+        requires_env=["DISCORD_BOT_TOKEN"],
+    )

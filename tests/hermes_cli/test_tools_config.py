@@ -1185,19 +1185,27 @@ def test_discord_toolsets_in_default_off():
     assert "discord_admin" in _DEFAULT_OFF_TOOLSETS
 
 
-def test_discord_toolsets_not_available_on_other_platforms():
-    """Platform-scoping: discord / discord_admin should not appear on CLI,
-    Telegram, etc. — not even as an opt-in."""
+def test_discord_toolsets_available_on_cli_and_discord_only():
+    """Discord read/query should be opt-in from CLI and Discord sessions.
+
+    Local operators often need to inspect Discord messages/threads while not
+    currently running inside the Discord gateway. Server-admin actions stay
+    Discord-platform scoped so unrelated platforms do not see moderation tools.
+    """
     from hermes_cli.tools_config import _toolset_allowed_for_platform
-    for plat in ["cli", "telegram", "slack", "whatsapp", "signal"]:
+
+    assert _toolset_allowed_for_platform("discord", "cli")
+    assert _toolset_allowed_for_platform("discord", "discord")
+    assert _toolset_allowed_for_platform("discord_admin", "discord")
+    assert not _toolset_allowed_for_platform("discord_admin", "cli")
+
+    for plat in ["telegram", "slack", "whatsapp", "signal"]:
         assert not _toolset_allowed_for_platform("discord", plat), (
             f"`discord` toolset leaked onto {plat}"
         )
         assert not _toolset_allowed_for_platform("discord_admin", plat), (
             f"`discord_admin` toolset leaked onto {plat}"
         )
-    assert _toolset_allowed_for_platform("discord", "discord")
-    assert _toolset_allowed_for_platform("discord_admin", "discord")
 
 
 def test_discord_toolsets_user_enabled_are_honored():

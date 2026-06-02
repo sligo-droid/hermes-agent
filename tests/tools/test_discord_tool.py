@@ -3,6 +3,7 @@
 import json
 import urllib.error
 from io import BytesIO
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -67,6 +68,24 @@ class TestCheckRequirements:
     def test_get_bot_token_missing(self, monkeypatch):
         monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
         assert _get_bot_token() is None
+
+    def test_get_bot_token_from_hermes_env_file(self, monkeypatch):
+        monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+        monkeypatch.setattr("hermes_cli.config.get_env_value", lambda key: "env-file-token" if key == "DISCORD_BOT_TOKEN" else None)
+        assert _get_bot_token() == "env-file-token"
+
+    def test_get_bot_token_from_gateway_config(self, monkeypatch):
+        monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+        from gateway.config import Platform
+
+        config = SimpleNamespace(
+            platforms={
+                Platform.DISCORD: SimpleNamespace(token="  config-token-123  "),
+            },
+        )
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+
+        assert _get_bot_token() == "config-token-123"
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +414,151 @@ class TestFetchMessages:
 
 
 # ---------------------------------------------------------------------------
+# First-class Discord read/query tools
+# ---------------------------------------------------------------------------
+
+class TestFirstClassDiscordTools:
+    @pytest.fixture(autouse=True)
+    def _allow_all_actions(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {"server_actions": ""}},
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_get_message_accepts_discord_url(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {
+            "id": "333",
+            "channel_id": "222",
+            "guild_id": "111",
+            "content": "hello from url",
+            "author": {"id": "42", "username": "user1", "global_name": "User One"},
+            "timestamp": "2024-01-01T12:00:00Z",
+            "attachments": [],
+        }
+
+        from tools.registry import registry
+        result = json.loads(registry.dispatch("discord_get_message", {
+            "message_url_or_id": "https://discord.com/channels/111/222/333",
+        }))
+
+        assert result["channel_id"] == "222"
+        assert result["guild_id"] == "111"
+        assert result["message"]["id"] == "333"
+        assert result["message"]["content"] == "hello from url"
+        mock_req.assert_called_once_with(
+            "GET",
+            "/channels/222/messages/333",
+            "test-token",
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_get_message_id_requires_channel_id(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+
+        from tools.registry import registry
+        result = json.loads(registry.dispatch("discord_get_message", {
+            "message_url_or_id": "333333333333333333",
+        }))
+
+        assert "channel_id is required" in result["error"]
+        mock_req.assert_not_called()
+
+    @patch("tools.discord_tool._discord_request")
+    def test_get_thread_fetches_metadata_and_messages(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": "800", "name": "topic", "type": 11, "parent_id": "222", "guild_id": "111"},
+            [
+                {
+                    "id": "1001",
+                    "channel_id": "800",
+                    "content": "thread message",
+                    "author": {"id": "42", "username": "user1"},
+                    "attachments": [],
+                },
+            ],
+        ]
+
+        from tools.registry import registry
+        result = json.loads(registry.dispatch("discord_get_thread", {
+            "thread_id": "800",
+            "limit": 10,
+        }))
+
+        assert result["thread"]["id"] == "800"
+        assert result["thread"]["type"] == "public_thread"
+        assert result["messages"][0]["content"] == "thread message"
+        assert mock_req.call_args_list[0].args == ("GET", "/channels/800", "test-token")
+        assert mock_req.call_args_list[1].args == ("GET", "/channels/800/messages", "test-token")
+        assert mock_req.call_args_list[1].kwargs["params"] == {"limit": "10"}
+
+    @patch("tools.discord_tool._discord_request")
+    def test_search_messages_is_bounded_local_scan(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = [
+            {
+                "id": "1001",
+                "content": "needle in content",
+                "author": {"id": "42", "username": "user1"},
+                "attachments": [],
+            },
+            {
+                "id": "1000",
+                "content": "other",
+                "author": {"id": "43", "username": "user2"},
+                "attachments": [],
+            },
+        ]
+
+        from tools.registry import registry
+        result = json.loads(registry.dispatch("discord_search_messages", {
+            "channel_id": "222",
+            "query": "Needle",
+            "limit": 5,
+            "max_pages": 3,
+        }))
+
+        assert result["bounded"] is True
+        assert result["count"] == 1
+        assert result["searched_messages"] == 2
+        assert result["matches"][0]["id"] == "1001"
+        assert "does not provide arbitrary historical full-text search" in result["note"]
+        mock_req.assert_called_once_with(
+            "GET",
+            "/channels/222/messages",
+            "test-token",
+            params={"limit": "100"},
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_get_reactions_reads_message_reaction_counts(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {
+            "id": "333",
+            "reactions": [
+                {"emoji": {"name": "thumbsup", "id": None}, "count": 2, "me": True},
+            ],
+        }
+
+        from tools.registry import registry
+        result = json.loads(registry.dispatch("discord_get_reactions", {
+            "channel_id": "222",
+            "message_id": "333",
+        }))
+
+        assert result["count"] == 1
+        assert result["reactions"][0]["emoji"]["name"] == "thumbsup"
+        assert result["reactions"][0]["count"] == 2
+        mock_req.assert_called_once_with(
+            "GET",
+            "/channels/222/messages/333",
+            "test-token",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Action: list_pins
 # ---------------------------------------------------------------------------
 
@@ -553,6 +717,27 @@ class TestRegistration:
         assert entry.check_fn is not None
         assert entry.requires_env == ["DISCORD_BOT_TOKEN"]
 
+    def test_first_class_read_tools_registered(self):
+        from tools.registry import registry
+        expected = {
+            "discord_list_guilds",
+            "discord_list_channels",
+            "discord_get_channel",
+            "discord_get_message",
+            "discord_list_recent",
+            "discord_get_thread",
+            "discord_search_messages",
+            "discord_get_reactions",
+        }
+
+        for name in expected:
+            entry = registry._tools.get(name)
+            assert entry is not None, name
+            assert entry.schema["name"] == name
+            assert entry.toolset == "discord"
+            assert entry.check_fn is not None
+            assert entry.requires_env == ["DISCORD_BOT_TOKEN"]
+
     def test_core_schema_actions(self):
         """Core static schema should list only core actions."""
         from tools.registry import registry
@@ -622,11 +807,21 @@ class TestToolsetInclusion:
         from toolsets import TOOLSETS
         assert "discord" in TOOLSETS["hermes-discord"]["tools"]
         assert "discord_admin" in TOOLSETS["hermes-discord"]["tools"]
+        assert "discord_list_recent" in TOOLSETS["hermes-discord"]["tools"]
+        assert "discord_search_messages" in TOOLSETS["hermes-discord"]["tools"]
+
+    def test_first_class_read_tools_in_discord_toolset(self):
+        from toolsets import TOOLSETS
+        tools = set(TOOLSETS["discord"]["tools"])
+        assert "discord_list_guilds" in tools
+        assert "discord_get_message" in tools
+        assert "discord_get_reactions" in tools
 
     def test_discord_tools_not_in_core_tools(self):
         from toolsets import _HERMES_CORE_TOOLS
         assert "discord" not in _HERMES_CORE_TOOLS
         assert "discord_admin" not in _HERMES_CORE_TOOLS
+        assert "discord_list_recent" not in _HERMES_CORE_TOOLS
 
     def test_discord_tools_not_in_other_toolsets(self):
         from toolsets import TOOLSETS
@@ -1087,9 +1282,65 @@ class Test403Enrichment:
 class TestModelToolsIntegration:
     def setup_method(self):
         _reset_capability_cache()
+        from model_tools import _clear_tool_defs_cache
+        from tools.registry import invalidate_check_fn_cache
+        invalidate_check_fn_cache()
+        _clear_tool_defs_cache()
 
     def teardown_method(self):
         _reset_capability_cache()
+        from model_tools import _clear_tool_defs_cache
+        from tools.registry import invalidate_check_fn_cache
+        invalidate_check_fn_cache()
+        _clear_tool_defs_cache()
+
+    @patch("tools.discord_tool._discord_request")
+    def test_first_class_discord_schemas_appear_when_token_configured(
+        self, mock_req, monkeypatch,
+    ):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {"server_actions": ""}},
+        )
+        mock_req.return_value = {"flags": (1 << 14) | (1 << 18)}
+
+        from model_tools import _clear_tool_defs_cache, get_tool_definitions
+        from tools.registry import invalidate_check_fn_cache
+
+        invalidate_check_fn_cache()
+        _clear_tool_defs_cache()
+        tools = get_tool_definitions(enabled_toolsets=["discord"], quiet_mode=True)
+        names = {t.get("function", {}).get("name") for t in tools}
+
+        assert "discord_list_guilds" in names
+        assert "discord_get_message" in names
+        assert "discord_list_recent" in names
+        assert "discord_search_messages" in names
+        assert "discord_get_reactions" in names
+
+    @patch("tools.discord_tool._discord_request")
+    def test_first_class_discord_schemas_follow_action_allowlist(
+        self, mock_req, monkeypatch,
+    ):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {"server_actions": "list_guilds"}},
+        )
+        mock_req.return_value = {"flags": (1 << 14) | (1 << 18)}
+
+        from model_tools import _clear_tool_defs_cache, get_tool_definitions
+        from tools.registry import invalidate_check_fn_cache
+
+        invalidate_check_fn_cache()
+        _clear_tool_defs_cache()
+        tools = get_tool_definitions(enabled_toolsets=["discord"], quiet_mode=True)
+        names = {t.get("function", {}).get("name") for t in tools}
+
+        assert "discord_list_guilds" in names
+        assert "discord_list_channels" not in names
+        assert "discord_list_recent" not in names
 
     @patch("tools.discord_tool._discord_request")
     def test_discord_admin_schema_rebuilt_by_get_tool_definitions(
