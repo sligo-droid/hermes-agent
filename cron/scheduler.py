@@ -14,6 +14,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +43,84 @@ from hermes_cli.config import load_config, _expand_env_vars
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+
+_GITHUB_PR_URL_RE = re.compile(
+    r"https://github\.com/"
+    r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+"
+    r"(?:[/?#][^\s<>()\[\]{}\"']*)?"
+)
+
+
+def _extract_github_pr_urls(text: str) -> list[str]:
+    """Return unique GitHub PR URLs mentioned in a cron result."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in _GITHUB_PR_URL_RE.finditer(str(text or "")):
+        url = match.group(0).rstrip(".,;:")
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+def _github_repo_url_from_pr_url(pr_url: str) -> Optional[str]:
+    match = re.match(
+        r"^(https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/\d+",
+        str(pr_url or ""),
+    )
+    return match.group(1) if match else None
+
+
+def _github_pr_number(pr_url: str) -> Optional[str]:
+    match = re.search(r"/pull/(\d+)(?:\D|$)", str(pr_url or ""))
+    return match.group(1) if match else None
+
+
+def _cron_discord_feature_project_context(job: dict, pr_url: str) -> dict:
+    context: dict = {}
+    workdir = str(job.get("workdir") or "").strip()
+    if workdir:
+        context.update(
+            {
+                "project_name": Path(workdir).name,
+                "project_path": workdir,
+                "project_mapping_source": "cron",
+                "project_mapping_resolved": True,
+            }
+        )
+    repo_url = _github_repo_url_from_pr_url(pr_url)
+    if repo_url:
+        context["project_github_url"] = repo_url
+    return context
+
+
+def _cron_discord_feature_title(job: dict, pr_url: str) -> str:
+    job_name = str(job.get("name") or job.get("id") or "Cron job").strip()
+    pr_number = _github_pr_number(pr_url)
+    if pr_number:
+        return f"{job_name} PR #{pr_number}"
+    return job_name
+
+
+def _cron_discord_feature_initial_request(job: dict, pr_url: str) -> str:
+    job_name = str(job.get("name") or job.get("id") or "Cron job").strip()
+    return f"Cron job '{job_name}' shipped a change: {pr_url}"
+
+
+def _cron_discord_feature_outcome(content: str, pr_url: str) -> str:
+    lines = [line.strip() for line in str(content or "").splitlines() if line.strip()]
+    selected = ""
+    for index, line in enumerate(lines):
+        if pr_url in line:
+            window = lines[max(0, index - 2): index + 3]
+            selected = " ".join(window)
+            break
+    if not selected and lines:
+        selected = " ".join(lines[:3])
+    if pr_url not in selected:
+        selected = f"{selected} PR: {pr_url}".strip()
+    return selected or f"PR: {pr_url}"
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -553,6 +632,49 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     return targets[0] if targets else None
 
 
+def _target_is_explicit_top_level(job: dict, target: dict) -> bool:
+    """True when the stored deliver string intentionally names a channel only."""
+    if target.get("thread_id"):
+        return False
+    target_platform = str(target.get("platform") or "").strip().lower()
+    target_chat_id = str(target.get("chat_id") or "").strip()
+    if not target_platform or not target_chat_id:
+        return False
+
+    deliver = _normalize_deliver_value(job.get("deliver", "local"))
+    for raw in [p.strip() for p in deliver.split(",") if p.strip()]:
+        for part in _expand_routing_tokens(raw):
+            if ":" not in part:
+                continue
+            platform_name, rest = part.split(":", 1)
+            platform_key = platform_name.lower()
+            if platform_key != target_platform:
+                continue
+
+            from tools.send_message_tool import _parse_target_ref
+
+            parsed_chat_id, parsed_thread_id, is_explicit = _parse_target_ref(platform_key, rest)
+            if is_explicit:
+                if parsed_thread_id is None and str(parsed_chat_id) == target_chat_id:
+                    return True
+                continue
+            try:
+                from gateway.channel_directory import resolve_channel_name
+
+                resolved = resolve_channel_name(platform_key, rest)
+            except Exception:
+                resolved = None
+            if not resolved:
+                continue
+            parsed_chat_id, parsed_thread_id, resolved_is_explicit = _parse_target_ref(platform_key, resolved)
+            if resolved_is_explicit:
+                if parsed_thread_id is None and str(parsed_chat_id) == target_chat_id:
+                    return True
+            elif str(resolved).strip() == target_chat_id:
+                return True
+    return False
+
+
 # Media extension sets — audio routing is centralized in gateway.platforms.base
 # via should_send_media_as_audio() so Telegram-specific rules stay in one place.
 _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
@@ -615,7 +737,78 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+async def _send_discord_cron_feature_summaries(
+    adapter,
+    *,
+    chat_id: str,
+    thread_id: Optional[str],
+    job: dict,
+    content: str,
+    pr_urls: list[str],
+) -> int:
+    """Create standard non-goal Discord feature-summary embeds for cron PRs."""
+    if not pr_urls:
+        return 0
+    resolve_channel = getattr(adapter, "_resolve_channel_by_id", None)
+    initialize = getattr(adapter, "initialize_feature_summary", None)
+    update = getattr(adapter, "update_feature_summary", None)
+    if not callable(resolve_channel) or not callable(initialize) or not callable(update):
+        return 0
+
+    summary_channel_id = str(thread_id or chat_id or "").strip()
+    if not summary_channel_id:
+        return 0
+    channel = await resolve_channel(summary_channel_id)
+    if channel is None:
+        return 0
+
+    parent = None
+    if thread_id:
+        parent_id = str(chat_id or "").strip()
+        if parent_id and parent_id != summary_channel_id:
+            parent = await resolve_channel(parent_id)
+        if parent is None:
+            parent = getattr(channel, "parent", None)
+
+    created = 0
+    for pr_url in pr_urls:
+        project_context = _cron_discord_feature_project_context(job, pr_url)
+        handle = await initialize(
+            channel,
+            parent_channel=parent,
+            initial_request=_cron_discord_feature_initial_request(job, pr_url),
+            project_context=project_context or None,
+        )
+        if not handle:
+            continue
+        handle["pr_url"] = pr_url
+        if project_context and not handle.get("project_context"):
+            handle["project_context"] = project_context
+        ok = await update(
+            handle,
+            final_response=_cron_discord_feature_outcome(content, pr_url),
+            status="Complete",
+            title=_cron_discord_feature_title(job, pr_url),
+        )
+        if ok is False:
+            logger.warning(
+                "Job '%s': Discord cron feature-summary update failed for %s",
+                job.get("id", "?"),
+                pr_url,
+            )
+            continue
+        created += 1
+    return created
+
+
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    *,
+    cron_feature_summaries: bool = True,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -682,7 +875,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
         origin_thread = origin.get("thread_id")
-        if origin_thread and not thread_id:
+        if origin_thread and not thread_id and not _target_is_explicit_top_level(job, target):
             logger.warning(
                 "Job '%s': origin has thread_id=%s but delivery target lost it "
                 "(deliver=%s, target=%s)",
@@ -717,6 +910,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         delivered = False
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
             send_metadata = {"thread_id": thread_id} if thread_id else None
+            cron_pr_urls = _extract_github_pr_urls(content) if cron_feature_summaries else []
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
                 text_to_send = cleaned_delivery_content.strip()
@@ -769,6 +963,37 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
 
                 if adapter_ok:
+                    if platform == Platform.DISCORD and cron_pr_urls:
+                        from agent.async_utils import safe_schedule_threadsafe
+
+                        future = safe_schedule_threadsafe(
+                            _send_discord_cron_feature_summaries(
+                                runtime_adapter,
+                                chat_id=str(chat_id),
+                                thread_id=str(thread_id) if thread_id else None,
+                                job=job,
+                                content=content,
+                                pr_urls=cron_pr_urls,
+                            ),
+                            loop,
+                        )
+                        if future is None:
+                            msg = "Discord cron feature-summary embed scheduling failed"
+                            logger.warning("Job '%s': %s", job["id"], msg)
+                            delivery_errors.append(msg)
+                        else:
+                            try:
+                                created = future.result(timeout=30)
+                            except TimeoutError:
+                                future.cancel()
+                                raise
+                            if created < len(cron_pr_urls):
+                                msg = (
+                                    "Discord cron feature-summary embeds created "
+                                    f"{created}/{len(cron_pr_urls)}"
+                                )
+                                logger.warning("Job '%s': %s", job["id"], msg)
+                                delivery_errors.append(msg)
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
             except Exception as e:
@@ -1952,7 +2177,13 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 delivery_error = None
                 if should_deliver:
                     try:
-                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                        delivery_error = _deliver_result(
+                            job,
+                            deliver_content,
+                            adapters=adapters,
+                            loop=loop,
+                            cron_feature_summaries=success,
+                        )
                     except Exception as de:
                         delivery_error = str(de)
                         logger.error("Delivery failed for job %s: %s", job["id"], de)

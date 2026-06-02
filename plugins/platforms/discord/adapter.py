@@ -935,6 +935,7 @@ class DiscordAdapter(BasePlatformAdapter):
             "source_task_url": str(handle.get("source_task_url") or ""),
             "source_kanban_url": str(handle.get("source_kanban_url") or ""),
             "source_discord_thread_url": str(handle.get("source_discord_thread_url") or ""),
+            "pr_url": str(handle.get("pr_url") or ""),
             "hide_source_links": bool(handle.get("hide_source_links")),
             "updated_at": time.time(),
         }
@@ -1222,6 +1223,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     "source_task_url",
                     "source_kanban_url",
                     "source_discord_thread_url",
+                    "pr_url",
                     "hide_source_links",
                 ):
                     if field in handle:
@@ -2487,6 +2489,9 @@ class DiscordAdapter(BasePlatformAdapter):
         kanban_snapshot: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Optional[str]]:
         metadata = self._collect_discord_project_metadata(handle.get("project_context"))
+        explicit_pr_url = self._normalize_public_url(str(handle.get("pr_url") or ""))
+        if explicit_pr_url:
+            metadata["pr_url"] = explicit_pr_url
         if not kanban_snapshot:
             return metadata
         branch = str(kanban_snapshot.get("branch") or "").strip()

@@ -299,6 +299,34 @@ async def test_non_goal_feature_summary_does_not_start_kanban_pipeline(adapter, 
 
 
 @pytest.mark.asyncio
+async def test_non_goal_feature_summary_can_render_explicit_pr_url(adapter):
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+    pr_url = "https://github.com/acme/PID/pull/42"
+
+    handle = await adapter.initialize_feature_summary(
+        thread,
+        parent_channel=parent,
+        initial_request="Cron job shipped a change",
+    )
+    assert handle is not None
+    handle["pr_url"] = pr_url
+
+    assert await adapter.update_feature_summary(
+        handle,
+        final_response="Opened a PID UX bugfix PR.",
+        status="Complete",
+        title="Daily PID admin dogfood UX bugfix PR #42",
+    )
+
+    message = handle["_message_obj"]
+    edited_embed = message.edit.await_args.kwargs["embed"]
+    fields = {field.name: field.value for field in edited_embed.fields}
+    assert fields["GitHub PR"] == pr_url
+    assert "Kanban Board" not in fields
+
+
+@pytest.mark.asyncio
 async def test_goal_feature_summary_keeps_worker_board_handle(adapter):
     parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
     thread = FakeThread(channel_id=200, parent=parent)

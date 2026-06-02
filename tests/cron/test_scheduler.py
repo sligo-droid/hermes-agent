@@ -836,6 +836,102 @@ class TestDeliverResultWrapping:
         send_mock.assert_called_once()
         assert send_mock.call_args.kwargs["thread_id"] == "17585"
 
+    def test_explicit_top_level_target_does_not_warn_about_origin_thread(self, caplog):
+        """Explicit platform:channel delivery intentionally drops origin thread context."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+
+        job = {
+            "id": "top-level-job",
+            "name": "PID top-level report",
+            "deliver": "discord:1505275259006484570",
+            "origin": {
+                "platform": "discord",
+                "chat_id": "1505275259006484570",
+                "thread_id": "1511223881820799046",
+            },
+        }
+
+        caplog.set_level(logging.WARNING, logger="cron.scheduler")
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})):
+            _deliver_result(job, "hello")
+
+        assert "delivery target lost it" not in caplog.text
+
+    def test_discord_cron_delivery_creates_non_goal_feature_summaries_for_prs(self, tmp_path):
+        """Cron PR links delivered through a live Discord adapter get feature embeds."""
+        import asyncio
+        from concurrent.futures import Future
+        from gateway.config import Platform
+
+        channel = MagicMock()
+        channel.id = 1505275259006484570
+        handles = [
+            {"thread_id": str(channel.id), "message_id": "embed-1"},
+            {"thread_id": str(channel.id), "message_id": "embed-2"},
+        ]
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=MagicMock(success=True))
+        adapter._resolve_channel_by_id = AsyncMock(return_value=channel)
+        adapter.initialize_feature_summary = AsyncMock(side_effect=handles)
+        adapter.update_feature_summary = AsyncMock(return_value=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            try:
+                future.set_result(asyncio.run(coro))
+            except Exception as exc:  # pragma: no cover - surfaced by future.result
+                future.set_exception(exc)
+            return future
+
+        pr_42 = "https://github.com/acme/PID/pull/42"
+        pr_43 = "https://github.com/acme/PID/pull/43"
+        job = {
+            "id": "pid-dogfood",
+            "name": "Daily PID admin dogfood UX bugfix",
+            "deliver": "discord:1505275259006484570",
+            "workdir": str(tmp_path / "PID"),
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            result = _deliver_result(
+                job,
+                f"Opened PR {pr_42}\nDuplicate mention {pr_42}\nShipped fix {pr_43}",
+                adapters={Platform.DISCORD: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        adapter.send.assert_called_once()
+        assert adapter._resolve_channel_by_id.await_args.args == ("1505275259006484570",)
+        assert adapter.initialize_feature_summary.await_count == 2
+        first_init = adapter.initialize_feature_summary.await_args_list[0].kwargs
+        assert first_init["parent_channel"] is None
+        assert first_init["initial_request"].startswith("Cron job 'Daily PID admin dogfood UX bugfix'")
+        assert not first_init["initial_request"].startswith("/goal")
+        assert first_init["project_context"]["project_path"] == str(tmp_path / "PID")
+        assert first_init["project_context"]["project_github_url"] == "https://github.com/acme/PID"
+        assert handles[0]["pr_url"] == pr_42
+        assert handles[1]["pr_url"] == pr_43
+        assert adapter.update_feature_summary.await_count == 2
+        assert adapter.update_feature_summary.await_args_list[0].kwargs["status"] == "Complete"
+        assert adapter.update_feature_summary.await_args_list[0].kwargs["title"].endswith("PR #42")
+
 
 class TestDeliverResultErrorReturns:
     """Verify _deliver_result returns error strings on failure, None on success."""
