@@ -253,6 +253,75 @@ def test_discord_kanban_typing_watcher_pulses_running_thread(tmp_path, monkeypat
     assert targets[0]["state"] == "running"
 
 
+def test_discord_kanban_typing_watcher_pulses_when_source_task_is_running(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    conn = kb.connect()
+    try:
+        source_tid = kb.create_task(conn, title="Default-board source work", assignee="default")
+        claimed = kb.claim_task(conn, source_tid)
+        assert claimed is not None
+    finally:
+        conn.close()
+
+    board = dwb.set_goal(
+        thread_id="99030",
+        goal="Worker board backed by a running source task",
+        chat_id="parent-99030",
+    )
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "source_board": kb.DEFAULT_BOARD,
+            "source_task_id": source_tid,
+        },
+    )
+
+    adapter = TypingAdapter()
+    runner = _make_discord_runner(adapter)
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert adapter.typing == [
+        {
+            "chat_id": "parent-99030",
+            "metadata": {"thread_id": "99030"},
+        }
+    ]
+
+
+def test_discord_kanban_typing_watcher_pulses_running_notify_thread(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="Dev intake work", assignee="default")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="discord",
+            chat_id="parent-dev",
+            thread_id="thread-dev",
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+    finally:
+        conn.close()
+
+    adapter = TypingAdapter()
+    runner = _make_discord_runner(adapter)
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert adapter.typing == [
+        {
+            "chat_id": "parent-dev",
+            "metadata": {"thread_id": "thread-dev"},
+        }
+    ]
+
+
 def test_discord_kanban_typing_watcher_syncs_feature_summary(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb

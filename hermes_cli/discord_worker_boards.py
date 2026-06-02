@@ -4610,7 +4610,14 @@ def running_worker_thread_targets() -> list[dict[str, Any]]:
             running = int(row[0] or 0) if row else 0
         finally:
             conn.close()
-        if running <= 0:
+        source_context = _worker_source_task_context(worker)
+        source_state = None
+        if source_context.get("source_board") and source_context.get("source_task_id"):
+            source_state = source_task_reaction_state(
+                source_context["source_board"],
+                source_context["source_task_id"],
+            )
+        if running <= 0 and source_state != "running":
             continue
         targets.append(
             {
@@ -4618,8 +4625,76 @@ def running_worker_thread_targets() -> list[dict[str, Any]]:
                 "thread_id": thread_id,
                 "chat_id": str(worker.get("chat_id") or thread_id),
                 "running": running,
+                **source_context,
             }
         )
+    return targets
+
+
+def running_notify_thread_targets() -> list[dict[str, Any]]:
+    """Return Discord notification thread targets for running Kanban tasks.
+
+    Default/control-plane boards such as #dev intake do not always have a
+    Discord worker-board metadata file, but their tasks can still carry a
+    ``kanban_notify_subs`` row pointing back to the originating Discord thread.
+    Those active tasks should pulse the same native typing indicator as normal
+    project worker boards while the work is actually running.
+    """
+    targets: list[dict[str, Any]] = []
+    for board_meta in kanban_db.list_boards(include_archived=False):
+        board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
+        conn = kanban_db.connect(board=board)
+        try:
+            rows = conn.execute(
+                """
+                SELECT t.id AS task_id,
+                       n.chat_id AS chat_id,
+                       n.thread_id AS thread_id
+                  FROM tasks t
+                  JOIN kanban_notify_subs n ON n.task_id = t.id
+                 WHERE t.status = 'running'
+                   AND lower(n.platform) = 'discord'
+                   AND COALESCE(n.thread_id, '') != ''
+                """
+            ).fetchall()
+        except Exception:
+            rows = []
+        finally:
+            conn.close()
+        for row in rows:
+            thread_id = str(row["thread_id"] or "").strip()
+            if not thread_id:
+                continue
+            targets.append(
+                {
+                    "board": board,
+                    "task_id": str(row["task_id"] or ""),
+                    "thread_id": thread_id,
+                    "chat_id": str(row["chat_id"] or thread_id),
+                    "running": 1,
+                    "source": "notify_sub",
+                }
+            )
+    return targets
+
+
+def running_discord_thread_typing_targets() -> list[dict[str, Any]]:
+    """Return all Discord thread targets that should show native typing."""
+    targets: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for target in [*running_worker_thread_targets(), *running_notify_thread_targets()]:
+        thread_id = str(target.get("thread_id") or "").strip()
+        if not thread_id:
+            continue
+        chat_id = str(target.get("chat_id") or thread_id).strip() or thread_id
+        key = (chat_id, thread_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized = dict(target)
+        normalized["chat_id"] = chat_id
+        normalized["thread_id"] = thread_id
+        targets.append(normalized)
     return targets
 
 
