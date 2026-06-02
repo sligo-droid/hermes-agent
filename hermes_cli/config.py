@@ -1559,7 +1559,7 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "backend": "codex",  # codex | opencode
         "turn_timeout_seconds": 1800,
-        "simple_build_reasoning_level": "xhigh",
+        "simple_build_reasoning_level": "medium",
         "complex_plan_reasoning_level": "xhigh",
         "complex_build_reasoning_level": "medium",
         "opencode": {

@@ -66,10 +66,10 @@ def test_simple_task_runs_build_only(monkeypatch, tmp_path):
         "label": "1-pass simple build",
         "pass_count": 1,
         "plan_used": False,
-        "passes": [{"name": "build", "agent": "build", "reasoning": "xhigh"}],
+        "passes": [{"name": "build", "agent": "build", "reasoning": "medium"}],
     }
     assert _option(calls[0], "--agent") == "build"
-    assert _option(calls[0], "--variant") == "xhigh"
+    assert _option(calls[0], "--variant") == "medium"
     assert _option(calls[0], "--model") == "openai/gpt-5.5"
     assert "--pure" in calls[0]
     assert calls[0][3] == "Read the attached Hermes worker brief and follow it exactly."
