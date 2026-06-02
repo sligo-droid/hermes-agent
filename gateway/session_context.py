@@ -61,6 +61,11 @@ _PROJECT_PATH: ContextVar = ContextVar("HERMES_PROJECT_PATH", default=_UNSET)
 _PROJECT_NAME: ContextVar = ContextVar("HERMES_PROJECT_NAME", default=_UNSET)
 _PROJECT_GITHUB_URL: ContextVar = ContextVar("HERMES_PROJECT_GITHUB_URL", default=_UNSET)
 _PROJECT_CHANNEL_ID: ContextVar = ContextVar("HERMES_PROJECT_CHANNEL_ID", default=_UNSET)
+_SESSION_GUILD_ID: ContextVar = ContextVar("HERMES_SESSION_GUILD_ID", default=_UNSET)
+_SESSION_PARENT_CHAT_ID: ContextVar = ContextVar("HERMES_SESSION_PARENT_CHAT_ID", default=_UNSET)
+_KANBAN_DEFAULT_INTAKE: ContextVar = ContextVar("HERMES_KANBAN_DEFAULT_INTAKE", default=_UNSET)
+_KANBAN_DEFAULT_INTAKE_ASSIGNEE: ContextVar = ContextVar("HERMES_KANBAN_DEFAULT_INTAKE_ASSIGNEE", default=_UNSET)
+_KANBAN_NOTIFY_PROFILE: ContextVar = ContextVar("HERMES_KANBAN_NOTIFY_PROFILE", default=_UNSET)
 # ID of the message that triggered the current turn. Used as a reply anchor
 # so background-process notifications stay inside the originating Telegram
 # private-chat topic (those lanes route only with thread id + reply anchor).
@@ -86,6 +91,11 @@ _VAR_MAP = {
     "HERMES_PROJECT_NAME": _PROJECT_NAME,
     "HERMES_PROJECT_GITHUB_URL": _PROJECT_GITHUB_URL,
     "HERMES_PROJECT_CHANNEL_ID": _PROJECT_CHANNEL_ID,
+    "HERMES_SESSION_GUILD_ID": _SESSION_GUILD_ID,
+    "HERMES_SESSION_PARENT_CHAT_ID": _SESSION_PARENT_CHAT_ID,
+    "HERMES_KANBAN_DEFAULT_INTAKE": _KANBAN_DEFAULT_INTAKE,
+    "HERMES_KANBAN_DEFAULT_INTAKE_ASSIGNEE": _KANBAN_DEFAULT_INTAKE_ASSIGNEE,
+    "HERMES_KANBAN_NOTIFY_PROFILE": _KANBAN_NOTIFY_PROFILE,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
@@ -121,6 +131,11 @@ def set_session_vars(
     project_name: str = "",
     project_github_url: str = "",
     project_channel_id: str = "",
+    guild_id: str = "",
+    parent_chat_id: str = "",
+    kanban_default_intake: str = "",
+    kanban_default_intake_assignee: str = "",
+    kanban_notify_profile: str = "",
     message_id: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
@@ -144,6 +159,11 @@ def set_session_vars(
         _PROJECT_NAME.set(project_name),
         _PROJECT_GITHUB_URL.set(project_github_url),
         _PROJECT_CHANNEL_ID.set(project_channel_id),
+        _SESSION_GUILD_ID.set(guild_id),
+        _SESSION_PARENT_CHAT_ID.set(parent_chat_id),
+        _KANBAN_DEFAULT_INTAKE.set(kanban_default_intake),
+        _KANBAN_DEFAULT_INTAKE_ASSIGNEE.set(kanban_default_intake_assignee),
+        _KANBAN_NOTIFY_PROFILE.set(kanban_notify_profile),
         _SESSION_MESSAGE_ID.set(message_id),
     ]
     return tokens
@@ -174,6 +194,11 @@ def clear_session_vars(tokens: list) -> None:
         _PROJECT_NAME,
         _PROJECT_GITHUB_URL,
         _PROJECT_CHANNEL_ID,
+        _SESSION_GUILD_ID,
+        _SESSION_PARENT_CHAT_ID,
+        _KANBAN_DEFAULT_INTAKE,
+        _KANBAN_DEFAULT_INTAKE_ASSIGNEE,
+        _KANBAN_NOTIFY_PROFILE,
         _SESSION_MESSAGE_ID,
     ):
         var.set("")

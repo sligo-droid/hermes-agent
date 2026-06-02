@@ -241,7 +241,8 @@ _LEGACY_TOOLSET_MAP = {
 # =============================================================================
 
 # Module-level memoization for get_tool_definitions(). Keyed on
-# (frozenset(enabled_toolsets), frozenset(disabled_toolsets), registry._generation).
+# (frozenset(enabled_toolsets), frozenset(disabled_toolsets), registry._generation,
+# config fingerprint, and kanban-mode flags).
 # Hot callers (gateway runner, AIAgent.__init__) invoke this on every turn
 # with quiet_mode=True; caching avoids ~7 ms of registry walking + schema
 # filtering + check_fn probing per call. Only active when quiet_mode=True
@@ -301,12 +302,21 @@ def get_tool_definitions(
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
+        try:
+            from gateway.session_context import get_session_env as _get_gateway_session_env
+
+            _default_kanban_intake = bool(
+                str(_get_gateway_session_env("HERMES_KANBAN_DEFAULT_INTAKE", "") or "").strip()
+            )
+        except Exception:
+            _default_kanban_intake = False
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
+            _default_kanban_intake,
             bool(skip_tool_search_assembly),
         )
         cached = _tool_defs_cache.get(cache_key)
