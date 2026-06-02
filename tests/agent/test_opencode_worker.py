@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import sys
 from pathlib import Path
@@ -508,6 +509,64 @@ def test_startup_timeout_zero_is_passed_to_process(monkeypatch, tmp_path):
 
     assert result.error is None
     assert calls[0]["startup_timeout"] == 0
+
+
+def test_default_startup_watchdog_is_disabled(monkeypatch, tmp_path):
+    calls = []
+
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+
+    def fake_run(cmd, **kwargs):
+        calls.append(kwargs)
+        return _process_result(
+            stdout=json.dumps(
+                {"type": "message", "sessionID": "ses-build", "message": "done"}
+            )
+            + "\n",
+        )
+
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
+
+    result = ow.run_opencode_task(
+        "fix typo in README",
+        str(tmp_path),
+        timeout=60,
+        config=_cfg(),
+    )
+
+    assert result.error is None
+    assert calls[0]["startup_timeout"] == 0
+
+
+def test_opencode_process_closes_stdin(monkeypatch, tmp_path):
+    popen_kwargs = {}
+
+    class FakeProcess:
+        stdout = io.StringIO("")
+        stderr = io.StringIO("")
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(_cmd, **kwargs):
+        popen_kwargs.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(ow.subprocess, "Popen", fake_popen)
+
+    result = ow._run_opencode_process(
+        [sys.executable, "-c", "print('unused')"],
+        workdir=str(tmp_path),
+        timeout=5,
+        startup_timeout=0,
+    )
+
+    assert result.returncode == 0
+    assert popen_kwargs["stdin"] == ow.subprocess.DEVNULL
 
 
 def test_process_startup_timeout_kills_no_output_child(tmp_path):

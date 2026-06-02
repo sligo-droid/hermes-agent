@@ -20,7 +20,7 @@ BACKEND_CODEX = "codex"
 BACKEND_OPENCODE = "opencode"
 _VALID_BACKENDS = {BACKEND_CODEX, BACKEND_OPENCODE}
 _VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max"}
-_DEFAULT_STARTUP_TIMEOUT_SECONDS = 90.0
+_DEFAULT_STARTUP_TIMEOUT_SECONDS = 0.0
 _DEFAULT_OPENCODE_MODEL = "openai/gpt-5.5"
 
 
@@ -601,6 +601,20 @@ def _run_opencode_once(
                     "means OpenCode is stuck bootstrapping the repository "
                     "(snapshot/file watcher setup) before reaching the model."
                 )
+            elif not result.events:
+                detail = _shorten_opencode_error_details(
+                    "\n".join(
+                        part.strip()
+                        for part in (proc.stderr, proc.stdout)
+                        if part and part.strip()
+                    ),
+                    limit=1000,
+                )
+                suffix = f" Output: {detail}" if detail else ""
+                result.error = (
+                    f"OpenCode {agent} produced no JSON events and timed out "
+                    f"after {timeout:g}s.{suffix}"
+                )
             else:
                 result.error = f"OpenCode {agent} run timed out after {timeout:g}s."
     if proc.returncode == 0 and result.error is None and not result.final_text.strip():
@@ -633,10 +647,9 @@ def _run_opencode_process(
     """Run OpenCode while watching for no-output startup stalls.
 
     ``opencode run --format json`` emits JSONL on stdout only after the run
-    reaches the session/model path. In large repos it can hang during
-    bootstrap before any JSON is emitted, which used to burn the whole worker
-    timeout and report zero tool iterations. Kill that case separately so the
-    caller gets a concrete infrastructure failure.
+    reaches the session/model path. The process is intentionally launched with
+    stdin closed so gateway/service workers cannot hang on an inherited
+    interactive prompt before JSON output starts.
     """
     started = time.monotonic()
     try:
@@ -644,6 +657,7 @@ def _run_opencode_process(
             cmd,
             cwd=workdir,
             env=env,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
