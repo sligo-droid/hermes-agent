@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from hermes_cli.discord_time import discord_message_exceeds_age_limit
 from gateway.session import Platform, SessionSource
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -91,6 +92,11 @@ def _discord_board_slug_for_item(item: dict[str, Any]) -> str:
         return slug if kanban_db.board_exists(slug) else ""
     except Exception:
         return ""
+
+
+def _discord_source_message_id_for_item(item: dict[str, Any]) -> str:
+    source = item.get("source") if isinstance(item.get("source"), dict) else {}
+    return str(item.get("message_id") or source.get("message_id") or "").strip()
 
 
 def _record_discord_board_final_response(
@@ -371,6 +377,12 @@ class GatewayWorkLedger:
             if not isinstance(item, dict):
                 continue
             if item.get("status") not in INCOMPLETE_STATUSES:
+                continue
+            if item.get("platform") == "discord" and discord_message_exceeds_age_limit(
+                _discord_source_message_id_for_item(item),
+                now=now,
+            ):
+                self.mark_expired(str(item.get("id") or ""))
                 continue
             if float(item.get("expires_at") or 0) <= now:
                 self.mark_expired(str(item.get("id") or ""))

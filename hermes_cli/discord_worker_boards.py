@@ -23,6 +23,7 @@ from typing import Any, Optional
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from hermes_cli import kanban_db
+from hermes_cli.discord_time import discord_message_exceeds_age_limit
 from hermes_cli.discord_worker_roles import (
     BOARD_RUN_SUMMARY_FILENAME,
     DEV_TICKET_BODY_GUIDANCE,
@@ -148,6 +149,34 @@ def _read_worker_meta(board: str) -> dict[str, Any]:
     metadata = kanban_db.read_board_metadata(board)
     raw = metadata.get(DISCORD_WORKER_META_KEY)
     return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _worker_source_message_id(worker: dict[str, Any]) -> str:
+    return str(
+        worker.get("source_message_id")
+        or worker.get("request_id")
+        or worker.get("thread_id")
+        or ""
+    ).strip()
+
+
+def _worker_source_message_too_old(worker: dict[str, Any]) -> bool:
+    return discord_message_exceeds_age_limit(_worker_source_message_id(worker))
+
+
+def _clear_stale_terminal_sync_flags(board: str, worker: dict[str, Any]) -> None:
+    if not (
+        worker.get("terminal_reaction_sync_pending")
+        or worker.get("terminal_summary_sync_pending")
+        or worker.get("terminal_completion_message_pending")
+    ):
+        return
+    mark_thread_status_synced(
+        board,
+        reaction=True,
+        summary=True,
+        completion_message=True,
+    )
 
 
 _TERMINAL_SUMMARY_SYNC_FIELDS = frozenset(
@@ -2591,6 +2620,9 @@ def thread_status_targets() -> list[dict[str, Any]]:
         thread_id = str(worker.get("thread_id") or "").strip()
         if not thread_id:
             continue
+        if _worker_source_message_too_old(worker):
+            _clear_stale_terminal_sync_flags(board, worker)
+            continue
         try:
             summary = feature_summary_snapshot(board)
         except Exception:
@@ -4460,6 +4492,7 @@ def is_executable_worker_board(board: str) -> bool:
         worker.get("kind") == "discord_worker_board"
         and worker.get("execution_mode") == "kanban_pipeline"
         and worker.get("goal_status") == "active"
+        and not _worker_source_message_too_old(worker)
     )
 
 
@@ -4478,6 +4511,8 @@ def running_worker_thread_targets() -> list[dict[str, Any]]:
             continue
         thread_id = str(worker.get("thread_id") or "").strip()
         if not thread_id:
+            continue
+        if _worker_source_message_too_old(worker):
             continue
         conn = kanban_db.connect(board=board)
         try:
@@ -4564,6 +4599,12 @@ def board_for_gateway_event(event: Any, *, create: bool = False) -> Optional[Dis
         slug = board_slug_for_discord_thread(thread_id)
     if not create and not kanban_db.board_exists(slug):
         return None
+    if not create:
+        metadata = kanban_db.read_board_metadata(slug)
+        worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+        if _worker_source_message_too_old(worker):
+            return None
+        return DiscordBoard(slug=slug, metadata=metadata)
     if create:
         project_context = {
             "project_name": getattr(source, "project_name", None),

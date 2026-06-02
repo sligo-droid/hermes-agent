@@ -26,6 +26,8 @@ from types import SimpleNamespace
 from typing import Callable, Dict, Iterable, List, Optional, Any, Tuple
 from urllib.parse import quote, urlparse
 
+from hermes_cli.discord_time import discord_message_exceeds_age_limit
+
 logger = logging.getLogger(__name__)
 
 VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
@@ -1117,6 +1119,10 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         handle = dict(stored)
         handle.setdefault("thread_id", thread_id)
+        if discord_message_exceeds_age_limit(
+            handle.get("source_message_id") or thread_id,
+        ):
+            return None
         identity = self._feature_summary_channel_identity(thread_channel)
         repaired_identity = False
         for field in ("guild_id", "parent_channel_id"):
@@ -2489,6 +2495,10 @@ class DiscordAdapter(BasePlatformAdapter):
         board = str(target.get("board") or "").strip()
         if not thread_id or not board:
             return None
+        if discord_message_exceeds_age_limit(target.get("source_message_id") or thread_id):
+            if self._clear_terminal_kanban_sync_flags(target, summary=True):
+                return str(target.get("sync_key") or board)
+            return None
         handle = self._load_feature_summary_handle_by_thread_id(
             thread_id,
             message_id=str(target.get("message_id") or "") or None,
@@ -3705,6 +3715,10 @@ class DiscordAdapter(BasePlatformAdapter):
         emoji = self._feature_kanban_reaction_emoji(state)
         if not emoji:
             return None
+        if discord_message_exceeds_age_limit(target.get("source_message_id") or target.get("thread_id")):
+            if self._clear_terminal_kanban_sync_flags(target, reaction=True):
+                return state
+            return None
         thread = await self._resolve_summary_channel(str(target.get("thread_id") or ""))
         if thread is None:
             return None
@@ -3738,6 +3752,15 @@ class DiscordAdapter(BasePlatformAdapter):
         board = str(target.get("board") or "").strip()
         if not board:
             return None
+        if discord_message_exceeds_age_limit(target.get("source_message_id") or target.get("thread_id")):
+            try:
+                from hermes_cli.discord_worker_boards import mark_thread_status_synced
+
+                mark_thread_status_synced(board, completion_message=True)
+            except Exception:
+                logger.debug("[%s] Failed to clear stale Discord completion notice flag", self.name, exc_info=True)
+                return None
+            return board
         if target.get("foreman_generated"):
             try:
                 from hermes_cli.discord_worker_boards import mark_thread_status_synced

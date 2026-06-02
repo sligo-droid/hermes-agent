@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
+
+
+DISCORD_EPOCH_SECONDS = 1_420_070_400.0
+
+
+def _discord_snowflake_at(timestamp: float) -> str:
+    return str(int((timestamp - DISCORD_EPOCH_SECONDS) * 1000) << 22)
 
 
 def _home(monkeypatch, tmp_path: Path) -> Path:
@@ -34,6 +42,67 @@ def test_ensure_discord_thread_board_creates_public_metadata(monkeypatch, tmp_pa
     assert worker["initial_request"] == "Build the thing"
     assert worker["worktree_path"].endswith("app-discord-12345")
     assert worker["code_island_pending"] is False
+
+
+def test_old_discord_worker_boards_are_not_status_targets(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    old_id = _discord_snowflake_at(time.time() - (8 * 24 * 60 * 60))
+    board = dwb.set_goal(
+        thread_id=old_id,
+        goal="Old goal should stay quiet",
+        chat_id=old_id,
+        request_id=old_id,
+    )
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_summary_sync_pending": True,
+            "terminal_reaction_sync_pending": True,
+            "terminal_completion_message_pending": True,
+        },
+    )
+
+    assert dwb.thread_status_targets() == []
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "terminal_summary_sync_pending" not in worker
+    assert "terminal_reaction_sync_pending" not in worker
+    assert "terminal_completion_message_pending" not in worker
+
+
+def test_old_discord_worker_boards_are_not_executable(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    old_id = _discord_snowflake_at(time.time() - (8 * 24 * 60 * 60))
+    board = dwb.start_direct_goal(
+        thread_id=old_id,
+        goal="Old goal should not dispatch",
+        chat_id=old_id,
+        request_id=old_id,
+    )
+
+    assert dwb.is_executable_worker_board(board.slug) is False
+
+
+def test_fresh_request_in_old_discord_thread_stays_executable(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    old_thread_id = _discord_snowflake_at(time.time() - (8 * 24 * 60 * 60))
+    fresh_request_id = _discord_snowflake_at(time.time())
+    board = dwb.start_direct_goal(
+        thread_id=old_thread_id,
+        goal="Fresh work in an old thread should still dispatch",
+        chat_id=old_thread_id,
+        request_id=fresh_request_id,
+    )
+
+    assert dwb.is_executable_worker_board(board.slug) is True
 
 
 def test_ensure_discord_thread_board_defers_code_island(monkeypatch, tmp_path):
