@@ -1821,6 +1821,15 @@ class AIAgent:
             return
 
         try:
+            # Keep the derived JSON log path in sync if tests or callers
+            # redirect logs_dir after agent construction.
+            logs_dir = Path(getattr(self, "logs_dir"))
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            session_id = getattr(self, "session_id")
+            expected_log_file = logs_dir / f"session_{session_id}.json"
+            if Path(getattr(self, "session_log_file")) != expected_log_file:
+                self.session_log_file = expected_log_file
+
             # Clean assistant content for session logs
             cleaned = []
             for msg in messages:
