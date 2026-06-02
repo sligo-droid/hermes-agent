@@ -542,10 +542,113 @@ async def test_post_connect_initialization_skips_sync_when_policy_off(monkeypatc
 
     fake_tree = SimpleNamespace(sync=AsyncMock())
     adapter._client = SimpleNamespace(tree=fake_tree)
+    recovery = AsyncMock(return_value=0)
+    monkeypatch.setattr(adapter, "_recover_recent_missed_thread_mentions", recovery)
 
     await adapter._run_post_connect_initialization()
 
     fake_tree.sync.assert_not_called()
+    recovery.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_missed_mention_recovery_replays_unworked_thread_mentions(tmp_path, monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("DISCORD_MISSED_MENTION_RECOVERY", "true")
+
+    bot_user = SimpleNamespace(id=999)
+    author = SimpleNamespace(id=42, bot=False)
+    recovered_message = SimpleNamespace(
+        id=123,
+        author=author,
+        mentions=[bot_user],
+        type=discord_platform.discord.MessageType.default,
+    )
+    unmentioned_message = SimpleNamespace(
+        id=124,
+        author=author,
+        mentions=[],
+        type=discord_platform.discord.MessageType.default,
+        reference=None,
+    )
+
+    class FakeThread:
+        def history(self, *, limit):
+            assert limit == 25
+
+            async def _iter():
+                yield recovered_message
+                yield unmentioned_message
+
+            return _iter()
+
+    adapter._client = SimpleNamespace(
+        user=bot_user,
+        get_channel=lambda channel_id: FakeThread() if channel_id == 555 else None,
+    )
+    adapter._threads._threads = {"555": None}
+    adapter._handle_message = AsyncMock()
+
+    recovered = await adapter._recover_recent_missed_thread_mentions()
+
+    assert recovered == 1
+    adapter._handle_message.assert_awaited_once_with(recovered_message)
+
+
+@pytest.mark.asyncio
+async def test_missed_mention_recovery_skips_messages_already_in_work_ledger(tmp_path, monkeypatch):
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import Platform, SessionSource
+    from gateway.work_ledger import GatewayWorkLedger
+
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="555",
+        chat_type="thread",
+        user_id="42",
+        user_name="Tester",
+        thread_id="555",
+        message_id="123",
+    )
+    event = MessageEvent(
+        text="already accepted",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="123",
+    )
+    GatewayWorkLedger().accept_event(
+        event,
+        session_key="agent:main:discord:thread:555:555",
+        freshness_seconds=3600,
+    )
+
+    bot_user = SimpleNamespace(id=999)
+    message = SimpleNamespace(
+        id=123,
+        author=SimpleNamespace(id=42, bot=False),
+        mentions=[bot_user],
+        type=discord_platform.discord.MessageType.default,
+    )
+
+    class FakeThread:
+        def history(self, *, limit):
+            async def _iter():
+                yield message
+
+            return _iter()
+
+    adapter._client = SimpleNamespace(user=bot_user, get_channel=lambda _channel_id: FakeThread())
+    adapter._threads._threads = {"555": None}
+    adapter._handle_message = AsyncMock()
+
+    recovered = await adapter._recover_recent_missed_thread_mentions()
+
+    assert recovered == 0
+    adapter._handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

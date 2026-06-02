@@ -181,6 +181,18 @@ _TERMINAL_SUMMARY_SYNC_FIELDS = frozenset(
 )
 
 
+def _terminal_worker_reaction_state(worker: dict[str, Any]) -> str:
+    status = str(worker.get("goal_status") or "").strip().lower()
+    phase = str(worker.get("phase") or "").strip().lower()
+    if worker.get("cancelled") or status == "cancelled":
+        return "errored"
+    if status == "done" or phase == "complete":
+        return "done"
+    if status == "blocked":
+        return "blocked"
+    return ""
+
+
 def _is_terminal_worker_meta(worker: dict[str, Any]) -> bool:
     status = str(worker.get("goal_status") or "").strip().lower()
     phase = str(worker.get("phase") or "").strip().lower()
@@ -202,10 +214,11 @@ def _update_worker_meta(board: str, updates: dict[str, Any]) -> dict[str, Any]:
         return metadata
     terminal_summary_changed = bool(changed_keys & _TERMINAL_SUMMARY_SYNC_FIELDS)
     became_terminal = not _is_terminal_worker_meta(previous) and _is_terminal_worker_meta(worker)
+    terminal_reaction_changed = _terminal_worker_reaction_state(previous) != _terminal_worker_reaction_state(worker)
     if worker.get("kind") == "discord_worker_board" and _is_terminal_worker_meta(worker):
         if terminal_summary_changed:
             worker["terminal_summary_sync_pending"] = True
-        if became_terminal:
+        if became_terminal or terminal_reaction_changed:
             worker["terminal_reaction_sync_pending"] = True
     worker["updated_at"] = _now()
     metadata[DISCORD_WORKER_META_KEY] = worker

@@ -1932,6 +1932,118 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[%s] Failed to sync Discord feature summary reaction: %s", self.name, exc)
 
+    async def _feature_summary_source_reaction_messages(
+        self,
+        handle: Dict[str, Any],
+        thread: Any,
+        *,
+        summary_message: Any = None,
+    ) -> List[Any]:
+        messages: List[Any] = []
+        seen: set[Tuple[str, str]] = set()
+        summary_message_id = str(handle.get("message_id") or "").strip()
+        summary_identity = self._message_identity(summary_message) if summary_message is not None else None
+
+        def add_message(message: Any) -> bool:
+            if message is None or not hasattr(message, "add_reaction"):
+                return False
+            identity = self._message_identity(message)
+            if summary_identity is not None and identity == summary_identity:
+                return False
+            if summary_message_id and identity == ("id", summary_message_id):
+                return False
+            if identity in seen:
+                return False
+            seen.add(identity)
+            messages.append(message)
+            return True
+
+        source_thread = thread
+        handle_thread_id = str(handle.get("thread_id") or "").strip()
+        if handle_thread_id and str(getattr(source_thread, "id", "") or "") != handle_thread_id:
+            fallback = handle.get("_thread_obj")
+            if str(getattr(fallback, "id", "") or "") == handle_thread_id:
+                source_thread = fallback
+            else:
+                resolved = await self._resolve_summary_channel(handle_thread_id)
+                if resolved is not None:
+                    source_thread = resolved
+
+        parent = getattr(source_thread, "parent", None)
+        parent_id = str(
+            handle.get("parent_channel_id")
+            or getattr(source_thread, "parent_id", "")
+            or ""
+        ).strip()
+        if parent is None and parent_id:
+            parent = await self._resolve_summary_channel(parent_id)
+
+        source_message_id = str(handle.get("source_message_id") or "").strip()
+        if source_message_id and source_message_id != summary_message_id:
+            for channel in (source_thread, parent):
+                fetch_message = getattr(channel, "fetch_message", None)
+                if not callable(fetch_message):
+                    continue
+                try:
+                    message = await fetch_message(int(source_message_id))
+                except Exception as exc:
+                    logger.debug("[%s] Discord feature summary source message fetch failed: %s", self.name, exc)
+                    continue
+                if add_message(message):
+                    return messages
+
+        try:
+            if add_message(await self._thread_origin_message(source_thread)):
+                return messages
+        except Exception as exc:
+            logger.debug("[%s] Discord feature summary origin message fetch failed: %s", self.name, exc)
+        fetch_message = getattr(parent, "fetch_message", None)
+        if callable(fetch_message):
+            candidate_ids = []
+            for value in (
+                getattr(source_thread, "starter_message_id", None),
+                getattr(source_thread, "id", None),
+            ):
+                if value is not None and str(value) not in candidate_ids:
+                    candidate_ids.append(str(value))
+            for message_id in candidate_ids:
+                try:
+                    message = await fetch_message(int(message_id))
+                except Exception as exc:
+                    logger.debug("[%s] Discord feature summary origin message fetch failed: %s", self.name, exc)
+                    continue
+                if add_message(message):
+                    return messages
+        return messages
+
+    async def _sync_feature_summary_source_reaction(
+        self,
+        handle: Optional[Dict[str, Any]],
+        thread: Any,
+        *,
+        status: str,
+        summary_message: Any = None,
+    ) -> None:
+        if not handle or not self._reactions_enabled():
+            return
+        emoji = self._feature_summary_reaction_emoji(handle, status)
+        if not emoji:
+            return
+        try:
+            messages = await self._feature_summary_source_reaction_messages(
+                handle,
+                thread,
+                summary_message=summary_message,
+            )
+        except Exception as exc:
+            logger.debug("[%s] Failed to resolve Discord feature summary source reaction: %s", self.name, exc)
+            return
+        for message in messages:
+            try:
+                await self._set_message_reaction_state(message, emoji)
+            except Exception as exc:
+                logger.debug("[%s] Failed to sync Discord feature summary source reaction: %s", self.name, exc)
+
     def _build_feature_summary_embed(
         self,
         *,
@@ -2294,6 +2406,12 @@ class DiscordAdapter(BasePlatformAdapter):
             if payload is not None and (cached_payload == payload or current_payload == payload):
                 self._feature_summary_edit_payloads[edit_key] = payload
                 await self._sync_feature_summary_message_reaction(handle, msg, status=status)
+                await self._sync_feature_summary_source_reaction(
+                    handle,
+                    thread,
+                    status=status,
+                    summary_message=msg,
+                )
                 return True
             await msg.edit(embed=embed)
             if payload is not None:
@@ -2303,6 +2421,12 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             await self._sync_feature_summary_message_reaction(handle, msg, status=status)
+            await self._sync_feature_summary_source_reaction(
+                handle,
+                thread,
+                status=status,
+                summary_message=msg,
+            )
             return True
         except Exception as exc:
             if self._is_discord_rate_limit(exc):
@@ -3098,11 +3222,13 @@ class DiscordAdapter(BasePlatformAdapter):
             sync_policy = self._get_discord_command_sync_policy()
             if sync_policy == "off":
                 logger.info("[%s] Skipping Discord slash command sync (policy=off)", self.name)
+                await self._recover_recent_missed_thread_mentions()
                 return
 
             if sync_policy == "bulk":
                 synced = await asyncio.wait_for(self._client.tree.sync(), timeout=30)
                 logger.info("[%s] Synced %d slash command(s) via bulk tree sync", self.name, len(synced))
+                await self._recover_recent_missed_thread_mentions()
                 return
 
             app_id = getattr(self._client, "application_id", None) or getattr(getattr(self._client, "user", None), "id", None)
@@ -3110,6 +3236,7 @@ class DiscordAdapter(BasePlatformAdapter):
             skip_reason = self._command_sync_skip_reason(app_id, fingerprint)
             if skip_reason:
                 logger.info("[%s] Skipping Discord slash command sync: %s", self.name, skip_reason)
+                await self._recover_recent_missed_thread_mentions()
                 return
             self._record_command_sync_attempt(app_id, fingerprint)
 
@@ -3139,6 +3266,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     self.name,
                     retry_after,
                 )
+                await self._recover_recent_missed_thread_mentions()
                 return
             finally:
                 if has_ratelimit_timeout:
@@ -3165,6 +3293,12 @@ class DiscordAdapter(BasePlatformAdapter):
             raise
         except Exception as e:  # pragma: no cover - defensive logging
             logger.warning("[%s] Slash command sync failed: %s", self.name, e, exc_info=True)
+        try:
+            await self._recover_recent_missed_thread_mentions()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # pragma: no cover - defensive logging
+            logger.warning("[%s] Discord missed-mention recovery failed: %s", self.name, e, exc_info=True)
 
     def _get_discord_command_sync_policy(self) -> str:
         raw = str(os.getenv("DISCORD_COMMAND_SYNC_POLICY", "safe") or "").strip().lower()
@@ -3491,20 +3625,85 @@ class DiscordAdapter(BasePlatformAdapter):
                 return True
         return False
 
-    async def _kanban_reaction_target_message(self, thread: Any, target: Dict[str, Any]) -> Optional[Any]:
+    @staticmethod
+    def _message_identity(message: Any) -> Tuple[str, str]:
+        message_id = getattr(message, "id", None)
+        if message_id is not None:
+            return ("id", str(message_id))
+        return ("obj", str(id(message)))
+
+    async def _fetch_kanban_reaction_message(self, thread: Any, message_id: Any) -> Tuple[Optional[Any], bool]:
+        raw_message_id = str(message_id or "").strip()
+        if not raw_message_id:
+            return None, True
+        try:
+            discord_message_id = int(raw_message_id)
+        except (TypeError, ValueError):
+            return None, True
+
+        attempted = False
+        permanent_failure = False
+        transient_failure = False
+        for channel in (thread, getattr(thread, "parent", None)):
+            fetch = getattr(channel, "fetch_message", None)
+            if not callable(fetch):
+                continue
+            attempted = True
+            try:
+                message = await fetch(discord_message_id)
+            except Exception as exc:
+                if self._is_permanent_feature_summary_error(exc):
+                    permanent_failure = True
+                else:
+                    transient_failure = True
+                    logger.debug("[%s] Discord Kanban reaction message fetch failed", self.name, exc_info=True)
+                continue
+            if message is not None and hasattr(message, "add_reaction"):
+                return message, True
+            if message is not None:
+                permanent_failure = True
+            else:
+                transient_failure = True
+        return None, bool((permanent_failure or not attempted) and not transient_failure)
+
+    async def _kanban_reaction_target_messages(self, thread: Any, target: Dict[str, Any]) -> Tuple[List[Any], bool]:
+        messages: List[Any] = []
+        seen: set[Tuple[str, str]] = set()
+        targets_final = True
+
+        def add_message(message: Any) -> None:
+            if message is None or not hasattr(message, "add_reaction"):
+                return
+            identity = self._message_identity(message)
+            if identity in seen:
+                return
+            seen.add(identity)
+            messages.append(message)
+
         source_message_id = str(target.get("source_message_id") or "").strip()
-        if source_message_id:
-            for channel in (thread, getattr(thread, "parent", None)):
-                fetch = getattr(channel, "fetch_message", None)
-                if not callable(fetch):
-                    continue
-                try:
-                    message = await fetch(int(source_message_id))
-                except Exception:
-                    continue
-                if message is not None and hasattr(message, "add_reaction"):
-                    return message
-        return await self._thread_origin_message(thread)
+        fetched_by_id: Dict[str, Optional[Any]] = {}
+        source_message_fetched = False
+        for field in ("message_id", "source_message_id"):
+            candidate_id = str(target.get(field) or "").strip()
+            if not candidate_id:
+                continue
+            if candidate_id in fetched_by_id:
+                message = fetched_by_id[candidate_id]
+            else:
+                message, final = await self._fetch_kanban_reaction_message(thread, candidate_id)
+                targets_final = targets_final and final
+                fetched_by_id[candidate_id] = message
+                add_message(message)
+            if field == "source_message_id" and message is not None and hasattr(message, "add_reaction"):
+                source_message_fetched = True
+
+        if not source_message_id or not source_message_fetched:
+            add_message(await self._thread_origin_message(thread))
+        return messages, targets_final
+
+    async def _kanban_reaction_target_message(self, thread: Any, target: Dict[str, Any]) -> Optional[Any]:
+        messages, _targets_final = await self._kanban_reaction_target_messages(thread, target)
+        return messages[0] if messages else None
 
     async def sync_kanban_thread_reaction(self, target: Dict[str, Any]) -> Optional[str]:
         """Synchronize a Discord worker thread's origin-message reaction."""
@@ -3519,26 +3718,26 @@ class DiscordAdapter(BasePlatformAdapter):
         thread = await self._resolve_summary_channel(str(target.get("thread_id") or ""))
         if thread is None:
             return None
-        message = await self._kanban_reaction_target_message(thread, target)
-        if message is None:
-            if self._clear_terminal_kanban_sync_flags(target, reaction=True):
+        messages, targets_final = await self._kanban_reaction_target_messages(thread, target)
+        if not messages:
+            if targets_final and self._clear_terminal_kanban_sync_flags(target, reaction=True):
                 return state
             return None
-        try:
-            await self._set_message_reaction_state(message, emoji)
-        except Exception as exc:
-            permanent = self._is_permanent_feature_summary_error(exc)
-            if permanent and self._clear_terminal_kanban_sync_flags(target, reaction=True):
-                return state
-            raise
-        if state in {"done", "blocked", "errored"}:
+        for message in messages:
+            try:
+                await self._set_message_reaction_state(message, emoji)
+            except Exception as exc:
+                if self._is_permanent_feature_summary_error(exc):
+                    continue
+                raise
+        if state in {"done", "blocked", "errored"} and targets_final:
             try:
                 from hermes_cli.discord_worker_boards import mark_thread_status_synced
 
                 mark_thread_status_synced(str(target.get("board") or ""), reaction=True)
             except Exception:
                 logger.debug("[%s] Failed to clear Discord terminal reaction sync flag", self.name, exc_info=True)
-        return state
+        return state if targets_final else None
 
     async def send_kanban_completion_notice(self, target: Dict[str, Any]) -> Optional[str]:
         """Post one visible completion notice for a finished Kanban goal."""
@@ -6407,6 +6606,101 @@ class DiscordAdapter(BasePlatformAdapter):
             return int(raw)
         except (ValueError, TypeError):
             return 50
+
+    def _discord_missed_mention_recovery(self) -> bool:
+        """Return whether startup should recover unprocessed thread mentions."""
+        configured = self.config.extra.get("missed_mention_recovery")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in {"false", "0", "no", "off"}
+            return bool(configured)
+        return os.getenv("DISCORD_MISSED_MENTION_RECOVERY", "true").lower() in {"true", "1", "yes", "on"}
+
+    def _discord_missed_mention_recovery_limit(self) -> int:
+        """Return the per-thread message scan cap for missed mention recovery."""
+        configured = self.config.extra.get("missed_mention_recovery_limit")
+        if configured is None:
+            configured = os.getenv("DISCORD_MISSED_MENTION_RECOVERY_LIMIT", "25")
+        try:
+            return max(1, min(int(configured), 100))
+        except (TypeError, ValueError):
+            return 25
+
+    def _discord_known_thread_ids(self) -> list[str]:
+        """Return recently tracked Discord thread ids without exposing tracker internals broadly."""
+        tracked = getattr(self._threads, "_threads", {})
+        if isinstance(tracked, dict):
+            return [str(thread_id) for thread_id in tracked.keys()]
+        return []
+
+    def _discord_message_already_worked(self, message_id: str) -> bool:
+        """Return True when a Discord message already has durable work state."""
+        if not message_id:
+            return True
+        try:
+            from gateway.work_ledger import GatewayWorkLedger
+
+            data = GatewayWorkLedger()._read()  # noqa: SLF001 - narrow recovery probe
+            for item in data.get("items", {}).values():
+                if isinstance(item, dict) and str(item.get("message_id") or "") == message_id:
+                    return True
+        except Exception:
+            logger.debug("[%s] Failed to inspect Discord work ledger", self.name, exc_info=True)
+        return False
+
+    async def _recover_recent_missed_thread_mentions(self) -> int:
+        """Replay recent direct mentions that Discord delivered but Hermes never accepted.
+
+        The normal gateway event stream is still authoritative. This is a bounded
+        startup safety net for known participated threads: if a direct mention is
+        visible in recent Discord history but absent from the work ledger, send it
+        through the ordinary Discord intake path so all existing allowlist,
+        mention, project, batching, and work-ledger gates still apply.
+        """
+        if not self._discord_missed_mention_recovery() or not self._client or not self._client.user:
+            return 0
+        limit = self._discord_missed_mention_recovery_limit()
+        recovered = 0
+        for thread_id in self._discord_known_thread_ids()[-200:]:
+            channel = None
+            try:
+                channel = self._client.get_channel(int(thread_id))
+            except Exception:
+                channel = None
+            if channel is None and hasattr(self._client, "fetch_channel"):
+                try:
+                    channel = await self._client.fetch_channel(int(thread_id))
+                except Exception:
+                    logger.debug("[%s] Could not fetch Discord thread %s for recovery", self.name, thread_id)
+                    continue
+            history = getattr(channel, "history", None)
+            if channel is None or history is None:
+                continue
+            try:
+                async for message in history(limit=limit):
+                    message_id = str(getattr(message, "id", "") or "")
+                    if not message_id or self._discord_message_already_worked(message_id):
+                        continue
+                    if getattr(message, "author", None) == self._client.user:
+                        continue
+                    if getattr(message, "type", None) not in {discord.MessageType.default, discord.MessageType.reply}:
+                        continue
+                    mentions_self = self._client.user in (getattr(message, "mentions", None) or [])
+                    if not mentions_self and not self._message_replies_to_self(message):
+                        continue
+                    logger.info(
+                        "[%s] Recovering missed Discord thread mention message_id=%s thread_id=%s",
+                        self.name,
+                        message_id,
+                        thread_id,
+                    )
+                    await self._handle_message(message)
+                    recovered += 1
+            except Exception:
+                logger.debug("[%s] Failed Discord missed-mention scan for thread %s", self.name, thread_id, exc_info=True)
+        if recovered:
+            logger.info("[%s] Recovered %d missed Discord thread mention(s)", self.name, recovered)
+        return recovered
 
     async def _fetch_goal_thread_context(
         self,

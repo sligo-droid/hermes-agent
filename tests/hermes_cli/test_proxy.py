@@ -248,6 +248,92 @@ def test_codex_adapter_chat_completion_forwards_model_reasoning_and_tier(
     assert captured["payload"]["service_tier"] == "priority"
 
 
+def test_codex_adapter_cools_down_failed_model_and_routes_to_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv(
+        "HERMES_CODEX_PROXY_MODEL_COOLDOWNS",
+        "gpt-5.3-codex-spark:gpt-5.4-mini:3600",
+    )
+    calls: list[str] = []
+
+    class FakeRequest:
+        async def json(self):
+            return {
+                "model": "gpt-5.3-codex-spark",
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+
+    class FakeResponse:
+        def model_dump(self):
+            return {"id": "resp-test", "created_at": 123, "usage": {}}
+
+    async def fake_run(responses_payload, cred):
+        calls.append(responses_payload["model"])
+        if responses_payload["model"] == "gpt-5.3-codex-spark":
+            raise RuntimeError("spark quota exhausted")
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        OpenAICodexAdapter,
+        "get_credential",
+        lambda self: UpstreamCredential(
+            bearer="token",
+            base_url="https://example.test/backend-api/codex",
+        ),
+    )
+    monkeypatch.setattr(
+        OpenAICodexAdapter,
+        "_run_responses_stream_with_retry",
+        staticmethod(fake_run),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex._normalize_codex_response",
+        lambda _response: (SimpleNamespace(content="ok", tool_calls=[]), "stop"),
+    )
+
+    first = asyncio.run(OpenAICodexAdapter()._handle_chat_completions(FakeRequest()))  # type: ignore[arg-type]
+    assert first.status == 502
+
+    state_file = tmp_path / "state" / "codex-proxy-model-cooldowns.json"
+    state = json.loads(state_file.read_text())
+    assert state["models"]["gpt-5.3-codex-spark"]["fallback_model"] == "gpt-5.4-mini"
+
+    second = asyncio.run(OpenAICodexAdapter()._handle_chat_completions(FakeRequest()))  # type: ignore[arg-type]
+    body = json.loads(second.text or "{}")
+
+    assert second.status == 200
+    assert calls == ["gpt-5.3-codex-spark", "gpt-5.4-mini"]
+    assert body["model"] == "gpt-5.4-mini"
+
+
+def test_codex_adapter_expired_model_cooldown_is_pruned(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv(
+        "HERMES_CODEX_PROXY_MODEL_COOLDOWNS",
+        "gpt-5.3-codex-spark:gpt-5.4-mini:3600",
+    )
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    state_file = state_dir / "codex-proxy-model-cooldowns.json"
+    state_file.write_text(json.dumps({
+        "models": {
+            "gpt-5.3-codex-spark": {
+                "fallback_model": "gpt-5.4-mini",
+                "expires_at": 1,
+            }
+        }
+    }))
+
+    assert (
+        OpenAICodexAdapter._effective_model_for_cooldown("gpt-5.3-codex-spark")
+        == "gpt-5.3-codex-spark"
+    )
+    assert json.loads(state_file.read_text())["models"] == {}
+
+
 def test_codex_adapter_serializes_streaming_chat_chunks():
     chunks = OpenAICodexAdapter._chat_completion_stream_chunks({
         "id": "chatcmpl-test",

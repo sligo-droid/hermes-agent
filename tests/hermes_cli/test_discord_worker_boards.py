@@ -340,6 +340,64 @@ def test_board_thread_state_reflects_kanban_tasks(monkeypatch, tmp_path):
         conn.close()
 
 
+def test_terminal_to_terminal_meta_update_marks_discord_reaction_pending(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="7803", goal="Recover after failed worker")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "blocked",
+            "phase": "blocked",
+            "blocked_reason": "worker crashed",
+        },
+    )
+    dwb.mark_thread_status_synced(board.slug, reaction=True, summary=True)
+
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "blocked_reason": "",
+        },
+    )
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["terminal_reaction_sync_pending"] is True
+    assert worker["terminal_summary_sync_pending"] is True
+    target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
+    assert target["state"] == "done"
+    assert target["terminal_reaction_sync_pending"] is True
+    assert target["terminal_summary_sync_pending"] is True
+
+
+def test_terminal_phase_complete_with_stale_blocker_marks_discord_reaction_pending(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="7804", goal="Recover with stale blocker")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "blocked",
+            "phase": "blocked",
+            "blocked_reason": "old blocker",
+        },
+    )
+    dwb.mark_thread_status_synced(board.slug, reaction=True, summary=True)
+
+    dwb._update_worker_meta(board.slug, {"phase": "complete"})
+
+    assert dwb.board_thread_state(board.slug) == "done"
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["terminal_reaction_sync_pending"] is True
+    assert worker["terminal_summary_sync_pending"] is True
+
+
 def test_board_thread_reaction_state_keeps_started_scheduled_work_running(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

@@ -483,9 +483,8 @@ async def test_kanban_thread_reaction_prefers_explicit_reaction_state(adapter):
         remove_reaction=AsyncMock(),
         reactions=[SimpleNamespace(emoji="👀", me=True)],
     )
-    thread = SimpleNamespace(id=123)
+    thread = SimpleNamespace(id=123, starter_message=message)
     adapter._resolve_summary_channel = AsyncMock(return_value=thread)
-    adapter._kanban_reaction_target_message = AsyncMock(return_value=message)
 
     synced = await adapter.sync_kanban_thread_reaction(
         {
@@ -505,7 +504,7 @@ async def test_kanban_thread_reaction_prefers_explicit_reaction_state(adapter):
 
 
 @pytest.mark.asyncio
-async def test_kanban_thread_reaction_repairs_source_op_not_summary_embed(adapter):
+async def test_kanban_thread_reaction_repairs_summary_embed_and_source_op(adapter):
     op_message = SimpleNamespace(
         id=111,
         add_reaction=AsyncMock(),
@@ -551,12 +550,143 @@ async def test_kanban_thread_reaction_repairs_source_op_not_summary_embed(adapte
         except_emoji="⏳",
     )
     op_message.add_reaction.assert_awaited_once_with("⏳")
-    summary_message.remove_reaction.assert_not_awaited()
-    summary_message.add_reaction.assert_not_awaited()
+    assert [call.args for call in summary_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="⏳",
+    )
+    summary_message.add_reaction.assert_awaited_once_with("⏳")
 
 
 @pytest.mark.asyncio
-async def test_kanban_thread_reaction_ignores_summary_id_when_op_is_thread_origin(adapter):
+async def test_kanban_thread_reaction_clears_flag_after_syncing_reachable_target(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="334", goal="Ship it")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_reaction_sync_pending": True,
+        },
+    )
+    summary_message = SimpleNamespace(
+        id=222,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="❌", me=True)],
+    )
+
+    async def fetch_parent_message(message_id):
+        if int(message_id) == summary_message.id:
+            return summary_message
+        raise RuntimeError("404 not found: unknown message")
+
+    parent = SimpleNamespace(fetch_message=AsyncMock(side_effect=fetch_parent_message))
+    thread = SimpleNamespace(
+        id=334,
+        parent=parent,
+        fetch_message=AsyncMock(side_effect=RuntimeError("404 not found: unknown message")),
+    )
+    adapter._resolve_summary_channel = AsyncMock(return_value=thread)
+
+    synced = await adapter.sync_kanban_thread_reaction(
+        {
+            "board": board.slug,
+            "thread_id": "334",
+            "state": "done",
+            "message_id": str(summary_message.id),
+            "source_message_id": "111",
+            "terminal_reaction_sync_pending": True,
+        }
+    )
+
+    assert synced == "done"
+    assert [call.args for call in summary_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="✅",
+    )
+    summary_message.add_reaction.assert_awaited_once_with("✅")
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "terminal_reaction_sync_pending" not in worker
+
+
+@pytest.mark.asyncio
+async def test_kanban_thread_reaction_uses_origin_fallback_when_source_fetch_is_transient(
+    adapter,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="335", goal="Ship it")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_reaction_sync_pending": True,
+        },
+    )
+    summary_message = SimpleNamespace(
+        id=222,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="❌", me=True)],
+    )
+    origin_message = SimpleNamespace(
+        id=333,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="❌", me=True)],
+    )
+
+    async def fetch_parent_message(message_id):
+        if int(message_id) == summary_message.id:
+            return summary_message
+        raise RuntimeError("temporary Discord fetch outage")
+
+    parent = SimpleNamespace(fetch_message=AsyncMock(side_effect=fetch_parent_message))
+    thread = SimpleNamespace(
+        id=335,
+        parent=parent,
+        starter_message=origin_message,
+        fetch_message=AsyncMock(side_effect=RuntimeError("temporary Discord fetch outage")),
+    )
+    adapter._resolve_summary_channel = AsyncMock(return_value=thread)
+
+    synced = await adapter.sync_kanban_thread_reaction(
+        {
+            "board": board.slug,
+            "thread_id": "335",
+            "state": "done",
+            "message_id": str(summary_message.id),
+            "source_message_id": "111",
+            "terminal_reaction_sync_pending": True,
+        }
+    )
+
+    assert synced is None
+    assert [call.args for call in summary_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="✅",
+    )
+    summary_message.add_reaction.assert_awaited_once_with("✅")
+    assert [call.args for call in origin_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="✅",
+    )
+    origin_message.add_reaction.assert_awaited_once_with("✅")
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["terminal_reaction_sync_pending"] is True
+
+
+@pytest.mark.asyncio
+async def test_kanban_thread_reaction_uses_summary_and_origin_when_source_missing(adapter):
     origin_message = SimpleNamespace(
         id=333,
         add_reaction=AsyncMock(),
@@ -596,14 +726,16 @@ async def test_kanban_thread_reaction_ignores_summary_id_when_op_is_thread_origi
     )
 
     assert synced == "running"
-    parent.fetch_message.assert_awaited_once_with(origin_message.id)
     assert [call.args for call in origin_message.remove_reaction.await_args_list] == _status_remove_calls(
         adapter,
         except_emoji="⏳",
     )
     origin_message.add_reaction.assert_awaited_once_with("⏳")
-    summary_message.remove_reaction.assert_not_awaited()
-    summary_message.add_reaction.assert_not_awaited()
+    assert [call.args for call in summary_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="⏳",
+    )
+    summary_message.add_reaction.assert_awaited_once_with("⏳")
 
 
 @pytest.mark.asyncio
@@ -626,7 +758,6 @@ async def test_kanban_thread_reaction_clears_terminal_flag_when_message_missing(
         },
     )
     adapter._resolve_summary_channel = AsyncMock(return_value=SimpleNamespace(id=123))
-    adapter._kanban_reaction_target_message = AsyncMock(return_value=None)
 
     synced = await adapter.sync_kanban_thread_reaction(
         {
