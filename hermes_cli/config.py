@@ -1868,6 +1868,11 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        "discord_intake": {
+            # Channel IDs where accepted human Discord messages are captured as
+            # top-level default-board intake instead of running a normal agent turn.
+            "default_board_channels": "",
+        },
         "discord_worker": {
             # Public base URL for Discord embed links. Expected shape:
             # https://hermes.example or https://hermes.example/workers. The
