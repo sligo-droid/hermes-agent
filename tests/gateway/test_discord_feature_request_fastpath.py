@@ -147,6 +147,11 @@ async def test_discord_feature_request_fast_path_adds_guidance_and_zero_tool_del
     init = _CapturingAgent.last_init
     assert init is not None
     assert init["tool_delay"] == 0.0
+    assert init["enabled_toolsets"] == gateway_run._discord_fast_mainline_toolsets({})
+    assert "skills" not in init["enabled_toolsets"]
+    assert "memory" not in init["enabled_toolsets"]
+    assert "cronjob" not in init["enabled_toolsets"]
+    assert "discord_admin" not in init["enabled_toolsets"]
     assert init["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
     assert init.get("skip_memory", False) is False
     assert "Discord feature-request thread guidance" in init["ephemeral_system_prompt"]

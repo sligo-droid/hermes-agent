@@ -125,3 +125,34 @@ def test_save_config_sets_owner_only_permissions(tmp_path, monkeypatch):
     assert config_file.exists()
     mode = stat.S_IMODE(config_file.stat().st_mode)
     assert mode == 0o600, f"Expected 0o600 (owner-only), got {oct(mode)}"
+
+
+def test_memory_file_migration_defers_discord_by_default():
+    cfg = type("Cfg", (), {"raw": {}})()
+
+    assert HonchoMemoryProvider._memory_file_migration_mode(cfg, "discord") == "async"
+    assert HonchoMemoryProvider._memory_file_migration_mode(cfg, "cli") == "sync"
+
+
+def test_memory_file_migration_mode_config_overrides_platform_default():
+    assert (
+        HonchoMemoryProvider._memory_file_migration_mode(
+            type("Cfg", (), {"raw": {"memoryFileMigration": "off"}})(),
+            "discord",
+        )
+        == "off"
+    )
+    assert (
+        HonchoMemoryProvider._memory_file_migration_mode(
+            type("Cfg", (), {"raw": {"memoryFileMigration": "sync"}})(),
+            "discord",
+        )
+        == "sync"
+    )
+    assert (
+        HonchoMemoryProvider._memory_file_migration_mode(
+            type("Cfg", (), {"raw": {"deferMemoryFileMigrationPlatforms": "telegram slack"}})(),
+            "discord",
+        )
+        == "sync"
+    )
