@@ -1,4 +1,3 @@
-import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 import sys
@@ -460,8 +459,8 @@ async def test_typing_task_removed_after_api_error():
     adapter._client.http.request = AsyncMock(side_effect=Exception("rate limited"))
     adapter._typing_tasks = {}
 
-    await adapter.send_typing("12345")
-    await asyncio.sleep(0.1)
+    with pytest.raises(Exception, match="rate limited"):
+        await adapter.send_typing("12345")
 
     assert "12345" not in adapter._typing_tasks, \
         "Stale task should be removed after API error"
@@ -496,7 +495,7 @@ async def test_send_typing_once_routes_to_metadata_thread(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_persistent_typing_uses_thread_key_and_parent_alias(monkeypatch):
-    """Persistent typing loops route to metadata thread and remain stoppable by parent."""
+    """Persistent typing sends immediately to metadata thread and remains stoppable by parent."""
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     routes = []
 
@@ -510,15 +509,41 @@ async def test_persistent_typing_uses_thread_key_and_parent_alias(monkeypatch):
     adapter._typing_aliases = {}
 
     await adapter.send_typing("parent-123", metadata={"thread_id": "thread-456"})
-    await asyncio.sleep(0.05)
 
     assert "thread-456" in adapter._typing_tasks
     assert "parent-123" not in adapter._typing_tasks
-    assert routes[0]["channel_id"] == "thread-456"
+    assert routes == [
+        {
+            "method": "POST",
+            "path": "/channels/{channel_id}/typing",
+            "channel_id": "thread-456",
+        }
+    ]
+    adapter._client.http.request.assert_awaited_once()
 
     await adapter.stop_typing("parent-123")
 
     assert adapter._typing_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_send_typing_reuses_existing_task_without_duplicate_loop():
+    """Repeated typing refreshes should not create duplicate Discord loops."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = MagicMock()
+    adapter._client.http = MagicMock()
+    adapter._client.http.request = AsyncMock()
+    adapter._typing_tasks = {}
+    adapter._typing_aliases = {}
+
+    await adapter.send_typing("12345")
+    first_task = adapter._typing_tasks["12345"]
+    await adapter.send_typing("12345")
+
+    assert adapter._typing_tasks["12345"] is first_task
+    adapter._client.http.request.assert_awaited_once()
+
+    await adapter.stop_typing("12345")
 
 
 @pytest.mark.asyncio
@@ -531,8 +556,8 @@ async def test_typing_restartable_after_error():
 
     # First call fails
     adapter._client.http.request = AsyncMock(side_effect=Exception("503"))
-    await adapter.send_typing("12345")
-    await asyncio.sleep(0.1)
+    with pytest.raises(Exception, match="503"):
+        await adapter.send_typing("12345")
 
     # Second call should work
     adapter._client.http.request = AsyncMock()
@@ -540,6 +565,8 @@ async def test_typing_restartable_after_error():
 
     assert "12345" in adapter._typing_tasks, \
         "Should restart typing after previous failure"
+
+    await adapter.stop_typing("12345")
 
 
 @pytest.mark.asyncio

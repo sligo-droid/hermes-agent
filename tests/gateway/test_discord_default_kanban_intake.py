@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 from gateway.config import Platform
@@ -5,6 +6,31 @@ from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner, _assign_default_board_intake_ready_tasks
 from gateway.session import SessionSource
 from hermes_cli import kanban_db
+
+
+class _RecordingAdapter:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, chat_id, text, metadata=None):
+        self.sent.append({
+            "chat_id": chat_id,
+            "text": text,
+            "metadata": metadata or {},
+        })
+
+
+async def _run_one_notifier_tick(monkeypatch, runner):
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):
+        if delay == 5:
+            return None
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    await runner._kanban_notifier_watcher(interval=1)
 
 
 def _runner(channel_id: str) -> Any:
@@ -50,6 +76,7 @@ def _event(
 def test_discord_default_kanban_intake_creates_blocked_default_task(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     runner = _runner("dev-channel")
+    runner._kanban_notifier_profile = "discord-profile"
 
     response = runner._maybe_route_discord_default_kanban_intake(
         _event("<@123> make #dev feed the top board")
@@ -61,6 +88,7 @@ def test_discord_default_kanban_intake_creates_blocked_default_task(tmp_path, mo
     conn = kanban_db.connect(board=kanban_db.DEFAULT_BOARD)
     try:
         tasks = kanban_db.list_tasks(conn, include_archived=True)
+        subs = kanban_db.list_notify_subs(conn)
     finally:
         conn.close()
 
@@ -76,6 +104,58 @@ def test_discord_default_kanban_intake_creates_blocked_default_task(tmp_path, mo
     assert task.idempotency_key == "discord-default-intake:guild-1:thread-1:message-1"
     assert "https://discord.com/channels/guild-1/thread-1/message-1" in (task.body or "")
     assert "GitHub: https://github.com/sligo-droid/hermes-agent" in (task.body or "")
+    assert len(subs) == 1
+    sub = subs[0]
+    assert sub["task_id"] == task.id
+    assert sub["platform"] == "discord"
+    assert sub["chat_id"] == "thread-1"
+    assert sub["thread_id"] == "thread-1"
+    assert sub["user_id"] == "user-1"
+    assert sub["notifier_profile"] == "discord-profile"
+
+
+def test_completed_discord_default_intake_is_picked_up_by_notifier(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    intake_runner = _runner("dev-channel")
+    intake_runner._kanban_notifier_profile = "discord-profile"
+
+    response = intake_runner._maybe_route_discord_default_kanban_intake(
+        _event("ship default board notifications")
+    )
+
+    assert response is not None
+    conn = kanban_db.connect(board=kanban_db.DEFAULT_BOARD)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=True)[0]
+        assert kanban_db.complete_task(
+            conn, task.id, summary="worker finished intake",
+        ) is True
+    finally:
+        conn.close()
+
+    adapter = _RecordingAdapter()
+    notifier_runner = GatewayRunner.__new__(GatewayRunner)
+    notifier_runner._running = True
+    notifier_runner.adapters = {Platform.DISCORD: adapter}
+    notifier_runner._kanban_sub_fail_counts = {}
+    notifier_runner._kanban_notifier_profile = "discord-profile"
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, notifier_runner))
+
+    assert len(adapter.sent) == 1
+    sent = adapter.sent[0]
+    assert sent["chat_id"] == "thread-1"
+    assert sent["metadata"] == {"thread_id": "thread-1"}
+    assert task.id in sent["text"]
+    assert "done" in sent["text"]
+    assert "worker finished intake" in sent["text"]
+
+    conn = kanban_db.connect(board=kanban_db.DEFAULT_BOARD)
+    try:
+        subs = kanban_db.list_notify_subs(conn, task.id)
+    finally:
+        conn.close()
+    assert subs == []
 
 
 def test_discord_default_kanban_intake_is_idempotent_by_message_id(tmp_path, monkeypatch):
