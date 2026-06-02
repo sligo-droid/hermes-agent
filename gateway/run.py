@@ -7805,7 +7805,7 @@ class GatewayRunner:
                     try:
                         from hermes_cli.discord_worker_boards import (
                             mark_thread_status_synced,
-                            running_worker_thread_targets,
+                            running_discord_thread_typing_targets,
                             thread_status_targets,
                         )
                     except Exception:
@@ -7817,7 +7817,7 @@ class GatewayRunner:
                         reaction_targets = []
                     else:
                         targets, reaction_targets = await asyncio.gather(
-                            asyncio.to_thread(running_worker_thread_targets),
+                            asyncio.to_thread(running_discord_thread_typing_targets),
                             asyncio.to_thread(thread_status_targets),
                         )
                     if callable(sender):
