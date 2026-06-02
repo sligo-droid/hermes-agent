@@ -543,7 +543,8 @@ CODING_WORKER_SCHEMA = {
                 "type": "number",
                 "description": (
                     "Optional per-call timeout. Defaults to "
-                    "coding_worker.turn_timeout_seconds, minimum 30 seconds."
+                    "coding_worker.turn_timeout_seconds (1800 seconds by default), "
+                    "minimum 30 seconds."
                 ),
             },
         },

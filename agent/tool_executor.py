@@ -169,15 +169,9 @@ def _coding_worker_mutation_block(agent, function_name: str, function_args: Opti
     )
 
 
-def _coding_worker_result_succeeded(result: object) -> bool:
-    """Return True only for explicit successful delegate JSON."""
-    if not isinstance(result, str):
-        return False
-    try:
-        payload = json.loads(result)
-    except Exception:
-        return False
-    return isinstance(payload, dict) and payload.get("success") is True
+def _coding_worker_result_attempted(result: object) -> bool:
+    """Return True once delegate_coding_task actually returned a result."""
+    return isinstance(result, str)
 
 
 def _record_turn_tool_runtime(
@@ -645,7 +639,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if not blocked:
                 if (
                     function_name == "delegate_coding_task"
-                    and _coding_worker_result_succeeded(function_result)
+                    and _coding_worker_result_attempted(function_result)
                 ):
                     agent._coding_worker_used_this_turn = True
 
@@ -1032,7 +1026,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 function_result = agent._dispatch_coding_task(function_args)
                 _coding_worker_result = function_result
-                if _coding_worker_result_succeeded(function_result):
+                if _coding_worker_result_attempted(function_result):
                     agent._coding_worker_used_this_turn = True
             finally:
                 tool_duration = time.time() - tool_start_time

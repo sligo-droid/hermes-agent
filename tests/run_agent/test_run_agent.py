@@ -3198,7 +3198,7 @@ class TestRunConversation:
         assert tool_messages
         assert "delegate_coding_task first" in tool_messages[0]["content"]
 
-    def test_hermes_coding_worker_guardrail_stays_after_partial_delegate(
+    def test_hermes_coding_worker_guardrail_allows_mutation_after_partial_delegate(
         self, agent, monkeypatch, tmp_path
     ):
         self._setup_agent(agent)
@@ -3235,18 +3235,20 @@ class TestRunConversation:
             finish_reason="tool_calls",
             tool_calls=[patch_tc],
         )
-        resp3 = _mock_response(content="Blocked", finish_reason="stop")
+        resp3 = _mock_response(content="Completed", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3]
 
         with (
             patch.object(
                 agent,
                 "_dispatch_coding_task",
-                return_value=json.dumps({"summary": "partial result"}),
+                return_value=json.dumps(
+                    {"success": False, "status": "partial", "summary": "partial result"}
+                ),
             ),
             patch(
                 "run_agent.handle_function_call",
-                return_value="should not run",
+                return_value="patch ran",
             ) as mock_handle_function_call,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -3254,12 +3256,13 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("tighten the heuristic")
 
-        assert result["final_response"] == "Blocked"
-        assert mock_handle_function_call.call_count == 0
+        assert result["final_response"] == "Completed"
+        assert mock_handle_function_call.call_count == 1
         tool_messages = [m for m in result["messages"] if m.get("role") == "tool"]
         assert len(tool_messages) >= 2
-        assert "success" not in json.loads(tool_messages[0]["content"])
-        assert "delegate_coding_task first" in tool_messages[1]["content"]
+        assert json.loads(tool_messages[0]["content"])["success"] is False
+        assert "patch ran" in tool_messages[1]["content"]
+        assert "delegate_coding_task first" not in tool_messages[1]["content"]
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)

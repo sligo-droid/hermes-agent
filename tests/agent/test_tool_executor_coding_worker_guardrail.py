@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from agent import tool_executor as te
-from agent.tool_executor import _coding_worker_mutation_block, _coding_worker_result_succeeded
+from agent.tool_executor import _coding_worker_mutation_block, _coding_worker_result_attempted
 
 
 def _agent(**overrides):
@@ -85,7 +85,26 @@ def test_coding_worker_guardrail_still_blocks_repo_service_file(monkeypatch, tmp
     assert "delegate_coding_task" in message
 
 
-def test_coding_worker_success_with_null_error_counts_as_success():
+def test_coding_worker_success_with_null_error_counts_as_attempt():
     result = '{"success": true, "status": "completed", "summary": "ok", "error": null}'
 
-    assert _coding_worker_result_succeeded(result) is True
+    assert _coding_worker_result_attempted(result) is True
+
+
+def test_coding_worker_partial_result_counts_as_attempt_and_unblocks():
+    result = '{"success": false, "status": "partial", "summary": "edited", "error": "timeout"}'
+    agent = _agent()
+
+    if _coding_worker_result_attempted(result):
+        agent._coding_worker_used_this_turn = True
+
+    assert _coding_worker_mutation_block(
+        agent,
+        "terminal",
+        {"command": "git add . && git commit -m fix"},
+    ) is None
+
+
+def test_coding_worker_plain_string_result_counts_as_attempt():
+    assert _coding_worker_result_attempted("worker returned an error") is True
+    assert _coding_worker_result_attempted({"success": False}) is False

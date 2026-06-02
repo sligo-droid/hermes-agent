@@ -1558,7 +1558,7 @@ DEFAULT_CONFIG = {
     "coding_worker": {
         "enabled": True,
         "backend": "codex",  # codex | opencode
-        "turn_timeout_seconds": 1800,
+        "turn_timeout_seconds": 1800,  # 30 minutes
         "simple_build_reasoning_level": "medium",
         "complex_plan_reasoning_level": "xhigh",
         "complex_build_reasoning_level": "medium",
