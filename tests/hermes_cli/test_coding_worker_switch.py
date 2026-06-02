@@ -191,6 +191,43 @@ def test_hermes_coding_request_mandates_coding_worker(monkeypatch, tmp_path):
     assert "must call `delegate_coding_task`" in decision.guidance
 
 
+def test_qmd_service_setup_in_hermes_cwd_stays_operational(monkeypatch, tmp_path):
+    hermes_root = tmp_path / "hermes"
+    hermes_root.mkdir()
+    monkeypatch.setattr(cws, "_known_hermes_roots", lambda: (hermes_root,))
+    monkeypatch.setattr(cws, "_git_common_dir", lambda cwd: None)
+
+    decision = cws.assess_worker_routing(
+        "fix QMD service persistence by creating qmd-pid.service",
+        enabled=True,
+        tool_available=True,
+        api_mode="chat_completions",
+        cwd=str(hermes_root),
+    )
+
+    assert decision.required is False
+    assert decision.should_delegate is False
+    assert decision.guidance == ""
+
+
+def test_qmd_repo_docs_request_still_mandates_worker(monkeypatch, tmp_path):
+    hermes_root = tmp_path / "hermes"
+    hermes_root.mkdir()
+    monkeypatch.setattr(cws, "_known_hermes_roots", lambda: (hermes_root,))
+    monkeypatch.setattr(cws, "_git_common_dir", lambda cwd: None)
+
+    decision = cws.assess_worker_routing(
+        "update optional-skills/research/qmd/SKILL.md for the systemd service section",
+        enabled=True,
+        tool_available=True,
+        api_mode="chat_completions",
+        cwd=str(hermes_root),
+    )
+
+    assert decision.required is True
+    assert decision.should_delegate is True
+
+
 def test_hermes_coding_request_ignores_disabled_toggle(monkeypatch, tmp_path):
     hermes_root = tmp_path / "hermes"
     hermes_root.mkdir()

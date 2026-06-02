@@ -20,6 +20,7 @@ import random
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 from agent.display import (
@@ -101,6 +102,49 @@ def _terminal_command_may_mutate(function_args: dict[str, Any]) -> bool:
     return bool(_TERMINAL_MUTATION_PATTERNS.search(command))
 
 
+def _path_inside(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except Exception:
+        return False
+
+
+def _known_hermes_roots_for_guard() -> tuple[Path, ...]:
+    try:
+        from hermes_cli.coding_worker_switch import _known_hermes_roots
+
+        return tuple(_known_hermes_roots())
+    except Exception:
+        return (Path(__file__).resolve().parents[1],)
+
+
+def _is_user_systemd_service_path(path: object) -> bool:
+    raw = str(path or "").strip()
+    if not raw:
+        return False
+    try:
+        target = Path(raw).expanduser()
+        if not target.is_absolute():
+            return False
+        target = target.resolve(strict=False)
+        user_unit_dir = (Path.home() / ".config" / "systemd" / "user").resolve(strict=False)
+    except Exception:
+        return False
+
+    if target.parent != user_unit_dir or target.suffix != ".service":
+        return False
+    return not any(_path_inside(target, root) for root in _known_hermes_roots_for_guard())
+
+
+def _coding_worker_allows_host_service_mutation(function_name: str, function_args: dict[str, Any]) -> bool:
+    if function_name == "write_file":
+        return _is_user_systemd_service_path(function_args.get("path"))
+    if function_name == "patch" and str(function_args.get("mode") or "replace") == "replace":
+        return _is_user_systemd_service_path(function_args.get("path"))
+    return False
+
+
 def _coding_worker_mutation_block(agent, function_name: str, function_args: Optional[dict[str, Any]] = None) -> Optional[str]:
     """Return a guardrail message when Hermes-codebase work skipped the worker."""
     if function_name == "delegate_coding_task":
@@ -115,6 +159,8 @@ def _coding_worker_mutation_block(agent, function_name: str, function_args: Opti
     if not getattr(agent, "_coding_worker_required_this_turn", False):
         return None
     if getattr(agent, "_coding_worker_used_this_turn", False):
+        return None
+    if _coding_worker_allows_host_service_mutation(function_name, function_args):
         return None
     return (
         "Hermes codebase coding requests must use delegate_coding_task "

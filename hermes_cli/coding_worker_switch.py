@@ -354,6 +354,43 @@ def looks_like_hermes_coding_improvement_request(message: str) -> bool:
     return bool(re.search(action_re, lower) and re.search(target_re, lower))
 
 
+def looks_like_qmd_service_setup_request(message: str) -> bool:
+    """Return True for host QMD daemon/service setup, not repo editing."""
+    if not isinstance(message, str):
+        return False
+    lower = message.strip().lower()
+    if "qmd" not in lower:
+        return False
+
+    service_terms = (
+        "systemd",
+        "systemctl",
+        "qmd-pid.service",
+        "qmd-daemon.service",
+        "user unit",
+        "unit file",
+        "service persistence",
+        "survive reboot",
+        "across reboot",
+        "daemon process",
+    )
+    if not any(term in lower for term in service_terms):
+        return False
+
+    repo_edit_terms = (
+        "repo",
+        "codebase",
+        "source",
+        "tests",
+        "regression",
+        "docs",
+        "documentation",
+        "readme",
+        "skill",
+    )
+    return not any(re.search(rf"\b{re.escape(term)}\b", lower) for term in repo_edit_terms)
+
+
 def _inside_path(path: Path, root: Path) -> bool:
     try:
         path.resolve().relative_to(root.resolve())
@@ -438,8 +475,11 @@ def assess_worker_routing(
         return CodingWorkerRoutingDecision()
 
     hermes_context = cwd_is_hermes_repo(cwd) or message_references_hermes_repo(message)
-    coding_request = looks_like_coding_request(message) or (
-        hermes_context and looks_like_hermes_coding_improvement_request(message)
+    host_setup_request = looks_like_qmd_service_setup_request(message)
+    coding_request = False if host_setup_request else (
+        looks_like_coding_request(message) or (
+            hermes_context and looks_like_hermes_coding_improvement_request(message)
+        )
     )
     required = bool(coding_request and hermes_context)
 
