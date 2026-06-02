@@ -2,7 +2,7 @@ from typing import Any
 
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _assign_default_board_intake_ready_tasks
 from gateway.session import SessionSource
 from hermes_cli import kanban_db
 
@@ -67,6 +67,7 @@ def test_discord_default_kanban_intake_creates_blocked_default_task(tmp_path, mo
     assert len(tasks) == 1
     task = tasks[0]
     assert task.status == "blocked"
+    assert task.assignee == "default"
     assert task.title == "#dev intake: make #dev feed the top board"
     assert task.created_by == "discord-default-intake"
     assert task.tenant == "discord-default-intake"
@@ -108,3 +109,46 @@ def test_discord_default_kanban_intake_skips_unconfigured_channels_and_bots(tmp_
     finally:
         conn.close()
     assert tasks == []
+
+
+def test_legacy_ready_unassigned_default_intake_gets_assigned(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    conn = kanban_db.connect(board=kanban_db.DEFAULT_BOARD)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="legacy intake",
+            created_by="discord-default-intake",
+            tenant="discord-default-intake",
+        )
+
+        assigned = _assign_default_board_intake_ready_tasks(conn, "default")
+        res = kanban_db.dispatch_once(conn, spawn_fn=lambda task, workspace: 123)
+        task = kanban_db.get_task(conn, task_id)
+    finally:
+        conn.close()
+
+    assert assigned == [task_id]
+    assert len(res.spawned) == 1
+    assert res.spawned[0][0] == task_id
+    assert res.spawned[0][1] == "default"
+    assert task is not None
+    assert task.status == "running"
+    assert task.assignee == "default"
+
+
+def test_default_intake_assignment_ignores_generic_unassigned_ready(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    conn = kanban_db.connect(board=kanban_db.DEFAULT_BOARD)
+    try:
+        task_id = kanban_db.create_task(conn, title="generic floater")
+
+        assigned = _assign_default_board_intake_ready_tasks(conn, "default")
+        task = kanban_db.get_task(conn, task_id)
+    finally:
+        conn.close()
+
+    assert assigned == []
+    assert task is not None
+    assert task.status == "ready"
+    assert task.assignee is None

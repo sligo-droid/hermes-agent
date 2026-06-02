@@ -6077,6 +6077,7 @@ def has_spawnable_ready(
     conn: sqlite3.Connection,
     *,
     additional_spawnable_assignees: Optional[Iterable[str]] = None,
+    include_unassigned: bool = False,
 ) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -6087,10 +6088,23 @@ def has_spawnable_ready(
     lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
     that pull tasks via ``claim_task`` directly).
 
+    When ``include_unassigned`` is true, ready+unassigned work also counts
+    as stuck-health-worthy because it needs operator routing; dispatch still
+    preserves the existing skip-unassigned behavior unless a fallback
+    assignee is explicitly supplied.
+
     Falls back to "any ready+assigned" if ``profile_exists`` is not
     importable (e.g. partial install) — preserves the old behavior so
     the warning still fires in degraded environments.
     """
+    if include_unassigned:
+        unassigned = conn.execute(
+            "SELECT 1 FROM tasks "
+            "WHERE status = 'ready' AND claim_lock IS NULL "
+            "AND (assignee IS NULL OR trim(assignee) = '') LIMIT 1"
+        ).fetchone()
+        if unassigned:
+            return True
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "

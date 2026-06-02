@@ -1405,6 +1405,13 @@ def test_dispatch_skips_unassigned(kanban_home):
     assert not res.spawned
 
 
+def test_has_spawnable_ready_can_count_unassigned_for_health(kanban_home):
+    with kb.connect() as conn:
+        kb.create_task(conn, title="floater")
+        assert kb.has_spawnable_ready(conn) is False
+        assert kb.has_spawnable_ready(conn, include_unassigned=True) is True
+
+
 def test_dispatch_skips_nonspawnable_into_separate_bucket(kanban_home, monkeypatch):
     """Tasks whose assignee fails profile_exists() must NOT land in
     ``skipped_unassigned`` (which is operator-actionable) — they go in

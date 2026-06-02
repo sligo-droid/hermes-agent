@@ -1799,6 +1799,75 @@ def _discord_default_kanban_intake_channels(config: Optional[dict] = None) -> se
     return _configured_id_set(raw)
 
 
+def _resolve_default_board_intake_assignee(config: Optional[dict] = None) -> str:
+    """Return a valid profile for default-board Discord intake tasks."""
+    cfg = config or {}
+    raw_default = cfg_get(cfg, "kanban", "default_assignee", default="")
+    candidates = [str(raw_default or "").strip()]
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        candidates.append(get_active_profile_name())
+    except Exception:
+        pass
+    candidates.append("default")
+
+    try:
+        from hermes_cli.profiles import normalize_profile_name, profile_exists
+    except Exception:
+        return "default"
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            normalized = normalize_profile_name(candidate)
+        except Exception:
+            continue
+        try:
+            if profile_exists(normalized):
+                return normalized
+        except Exception:
+            continue
+    return "default"
+
+
+def _assign_default_board_intake_ready_tasks(
+    conn: sqlite3.Connection,
+    assignee: str,
+) -> list[str]:
+    """Assign legacy READY+unassigned default-board Discord intake tasks."""
+    profile = str(assignee or "").strip()
+    if not profile:
+        return []
+    rows = conn.execute(
+        "SELECT id FROM tasks "
+        "WHERE status = 'ready' AND claim_lock IS NULL "
+        "AND (assignee IS NULL OR trim(assignee) = '') "
+        "AND (created_by = 'discord-default-intake' "
+        "OR tenant = 'discord-default-intake') "
+        "ORDER BY priority DESC, created_at ASC"
+    ).fetchall()
+    if not rows:
+        return []
+    try:
+        from hermes_cli import kanban_db as _kb
+    except Exception:
+        return []
+    assigned: list[str] = []
+    for row in rows:
+        task_id = str(row["id"])
+        try:
+            if _kb.assign_task(conn, task_id, profile):
+                assigned.append(task_id)
+        except Exception:
+            logger.debug(
+                "kanban dispatcher: failed to assign default-board intake task %s",
+                task_id,
+                exc_info=True,
+            )
+    return assigned
+
+
 def _resolve_gateway_session_cwd(
     source: Any,
     config: Optional[dict] = None,
@@ -6316,6 +6385,24 @@ class GatewayRunner:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
+                # Legacy Discord default-board intake rows were created as
+                # blocked+unassigned; if an operator unblocks one, route only
+                # that intake tenant instead of generic unassigned work.
+                if slug == _kb.DEFAULT_BOARD:
+                    intake_assignee = _resolve_default_board_intake_assignee(cfg)
+                    assigned_intake = _assign_default_board_intake_ready_tasks(
+                        conn,
+                        intake_assignee,
+                    )
+                    if assigned_intake:
+                        logger.info(
+                            "kanban dispatcher [%s]: assigned %d default-board "
+                            "intake task(s) to %s: %s",
+                            slug,
+                            len(assigned_intake),
+                            intake_assignee,
+                            ", ".join(assigned_intake[:8]),
+                        )
                 return _kb.dispatch_once(
                     conn,
                     board=slug,
@@ -6414,9 +6501,12 @@ class GatewayRunner:
             return out
 
         def _ready_nonempty() -> bool:
-            """Cheap probe: is there at least one ready+assigned+unclaimed
-            task on ANY board whose assignee maps to a real Hermes profile
-            (i.e. one the dispatcher would actually spawn for)?
+            """Cheap probe: is there ready work the dispatcher must explain?
+
+            Counts ready+assigned+unclaimed tasks whose assignee maps to a
+            real Hermes profile (i.e. work the dispatcher would actually
+            spawn for). On the top-level default board, also counts
+            READY+unassigned tasks as operator-actionable routing blockers.
 
             Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
             ``orion-research``) are pulled by terminals via
@@ -6466,6 +6556,7 @@ class GatewayRunner:
                                 continue
                         ready = _kb.has_spawnable_ready(
                             conn,
+                            include_unassigned=(slug == _kb.DEFAULT_BOARD),
                             additional_spawnable_assignees=(
                                 _dwb.ROLE_ASSIGNEES if _dwb.is_discord_worker_board(slug) else None
                             ),
@@ -6473,7 +6564,11 @@ class GatewayRunner:
                         if ready or _kb.has_spawnable_review(conn):
                             return True
                     except Exception:
-                        if _kb.has_spawnable_ready(conn) or _kb.has_spawnable_review(conn):
+                        ready = _kb.has_spawnable_ready(
+                            conn,
+                            include_unassigned=(slug == _kb.DEFAULT_BOARD),
+                        )
+                        if ready or _kb.has_spawnable_review(conn):
                             return True
                 except Exception:
                     continue
@@ -6824,12 +6919,14 @@ class GatewayRunner:
         try:
             from hermes_cli import kanban_db as _kb
 
+            assignee = _resolve_default_board_intake_assignee(cfg)
             conn = _kb.connect(board=_kb.DEFAULT_BOARD)
             try:
                 task_id = _kb.create_task(
                     conn,
                     title=title,
                     body=body,
+                    assignee=assignee,
                     created_by="discord-default-intake",
                     workspace_kind="dir" if project_path else "scratch",
                     workspace_path=project_path or None,
