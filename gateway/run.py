@@ -6839,6 +6839,73 @@ class GatewayRunner:
             logger.debug("Failed to load gateway runtime config", exc_info=True)
             return {}
 
+    def _is_discord_default_kanban_intake_event(
+        self,
+        event: MessageEvent,
+        config: Optional[dict] = None,
+    ) -> bool:
+        """Return true when a Discord message is in a default-board intake channel."""
+        source = getattr(event, "source", None)
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return False
+        if getattr(event, "internal", False) or getattr(source, "is_bot", False):
+            return False
+        if event.is_command():
+            return False
+        cfg = config if isinstance(config, dict) else self._runtime_config_dict()
+        intake_channels = _discord_default_kanban_intake_channels(cfg)
+        if not intake_channels:
+            return False
+        source_channel_ids = _discord_source_channel_ids(source)
+        if not any(channel_id in intake_channels for channel_id in source_channel_ids):
+            return False
+        raw_text = str(getattr(event, "text", "") or "").strip()
+        if not raw_text and getattr(event, "media_urls", None):
+            raw_text = "[media attachment]"
+        return bool(raw_text)
+
+    def _mark_discord_default_kanban_intake_context(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        config: Optional[dict] = None,
+    ) -> bool:
+        """Attach per-turn default-board intake metadata to the source."""
+        cfg = config if isinstance(config, dict) else self._runtime_config_dict()
+        if not self._is_discord_default_kanban_intake_event(event, cfg):
+            return False
+        setattr(source, "default_kanban_intake", True)
+        if not getattr(source, "message_id", None) and getattr(event, "message_id", None):
+            setattr(source, "message_id", str(getattr(event, "message_id")))
+        setattr(source, "default_kanban_intake_assignee", _resolve_default_board_intake_assignee(cfg))
+        notifier_profile = getattr(self, "_kanban_notifier_profile", None)
+        if not notifier_profile:
+            try:
+                notifier_profile = self._active_profile_name()
+            except Exception:
+                notifier_profile = ""
+        setattr(source, "kanban_notifier_profile", notifier_profile or "")
+        return True
+
+    def _discord_default_kanban_intake_prompt(self, source: SessionSource) -> str:
+        assignee = str(getattr(source, "default_kanban_intake_assignee", "") or "default")
+        return (
+            "**Discord default-board intake mode:** This Discord channel is configured "
+            "as an intake surface for the top-level Kanban board. Answer ordinary "
+            "questions and quick conversational requests directly. When the user is "
+            "asking Hermes to do coding, research, operations, or other durable work "
+            "that should be tracked asynchronously, create a Kanban task with "
+            "`kanban_create` instead of doing the long-running work inline. Use "
+            "`board=\"default\"`, the default assignee "
+            f"`{assignee}`, and include the user's request plus relevant Discord "
+            "source context in the task body. If a mapped project path is present, "
+            "use `workspace_kind=\"dir\"` and that absolute path. After creating a "
+            "task, reply concisely with the task id. Completion and blocker "
+            "notifications are subscribed back to this Discord thread automatically. "
+            "Do not create a task for normal questions, clarification, status checks, "
+            "or messages you can answer directly."
+        )
+
     def _maybe_route_discord_default_kanban_intake(self, event: MessageEvent) -> Optional[str]:
         """Capture configured Discord channel messages as default-board intake.
 
@@ -6847,20 +6914,11 @@ class GatewayRunner:
         board or an immediate agent turn. Slash commands and bot/system events
         continue through their existing paths.
         """
-        source = getattr(event, "source", None)
-        if getattr(source, "platform", None) != Platform.DISCORD:
-            return None
-        if getattr(event, "internal", False) or getattr(source, "is_bot", False):
-            return None
-        if event.is_command():
-            return None
         cfg = self._runtime_config_dict()
-        intake_channels = _discord_default_kanban_intake_channels(cfg)
-        if not intake_channels:
+        if not self._is_discord_default_kanban_intake_event(event, cfg):
             return None
+        source = getattr(event, "source", None)
         source_channel_ids = _discord_source_channel_ids(source)
-        if not any(channel_id in intake_channels for channel_id in source_channel_ids):
-            return None
 
         raw_text = str(getattr(event, "text", "") or "").strip()
         if not raw_text and getattr(event, "media_urls", None):
@@ -10057,11 +10115,6 @@ class GatewayRunner:
                 return self._telegram_topic_root_lobby_message()
             return None
 
-        if not command:
-            default_kanban_intake_response = self._maybe_route_discord_default_kanban_intake(event)
-            if default_kanban_intake_response is not None:
-                return default_kanban_intake_response
-
         _flow_admission_ts = time.time()
         _flow_route_type = _gateway_flow_route_type(event, command)
         # ── Claim this session before any await ───────────────────────
@@ -10577,9 +10630,6 @@ class GatewayRunner:
                 "session_key": session_key,
             })
         
-        # Build session context
-        context = build_session_context(source, self.config, session_entry)
-
         _pcfg = {}
         _redact_pii = False
         try:
@@ -10587,6 +10637,15 @@ class GatewayRunner:
             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
         except Exception:
             pass
+
+        default_kanban_intake = self._mark_discord_default_kanban_intake_context(
+            event,
+            source,
+            _pcfg,
+        )
+
+        # Build session context
+        context = build_session_context(source, self.config, session_entry)
 
         session_cwd = _resolve_gateway_session_cwd(source, _pcfg)
 
@@ -10605,6 +10664,12 @@ class GatewayRunner:
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        if default_kanban_intake:
+            context_prompt = (
+                context_prompt
+                + "\n\n"
+                + self._discord_default_kanban_intake_prompt(source)
+            ).strip()
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
@@ -17636,6 +17701,17 @@ class GatewayRunner:
             project_name=str(context.source.project_name) if context.source.project_name else "",
             project_github_url=str(context.source.project_github_url) if context.source.project_github_url else "",
             project_channel_id=str(context.source.project_channel_id) if context.source.project_channel_id else "",
+            guild_id=str(context.source.guild_id) if context.source.guild_id else "",
+            parent_chat_id=str(context.source.parent_chat_id) if context.source.parent_chat_id else "",
+            kanban_default_intake=(
+                "1" if getattr(context.source, "default_kanban_intake", False) else ""
+            ),
+            kanban_default_intake_assignee=str(
+                getattr(context.source, "default_kanban_intake_assignee", "") or ""
+            ),
+            kanban_notify_profile=str(
+                getattr(context.source, "kanban_notifier_profile", "") or ""
+            ),
             message_id=str(context.source.message_id) if context.source.message_id else "",
         )
 
@@ -19031,6 +19107,11 @@ class GatewayRunner:
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        default_discord_kanban_intake = bool(
+            getattr(source, "default_kanban_intake", False)
+        )
+        if default_discord_kanban_intake and "kanban" not in enabled_toolsets:
+            enabled_toolsets = sorted([*enabled_toolsets, "kanban"])
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
@@ -19856,6 +19937,7 @@ class GatewayRunner:
                     **self._extract_cache_busting_config(user_config),
                     "gateway.session_cwd": session_cwd,
                     "gateway.discord_feature_request_fast_path": standard_discord_feature_request,
+                    "gateway.discord_default_kanban_intake": default_discord_kanban_intake,
                     "gateway.tool_delay": 0.0 if standard_discord_feature_request else None,
                 },
                 user_id=getattr(source, "user_id", None),

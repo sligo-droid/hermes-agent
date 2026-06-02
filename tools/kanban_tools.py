@@ -48,8 +48,8 @@ KANBAN_LIST_MAX_LIMIT = 200
 
 def _profile_has_kanban_toolset() -> bool:
     # Uses load_config() which has mtime-based caching, so this adds
-    # negligible overhead. The check_fn results are further TTL-cached
-    # (~30s) by the tool registry.
+    # negligible overhead. The kanban check_fns opt out of registry TTL
+    # caching because gateway intake mode is context-local per turn.
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
@@ -59,11 +59,34 @@ def _profile_has_kanban_toolset() -> bool:
         return False
 
 
+def _gateway_session_env(name: str, default: str = "") -> str:
+    try:
+        from gateway.session_context import get_session_env
+
+        return get_session_env(name, default)
+    except Exception:
+        return os.environ.get(name, default)
+
+
+def _truthy_session_env(name: str) -> bool:
+    return str(_gateway_session_env(name, "") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _is_default_intake_mode() -> bool:
+    return _truthy_session_env("HERMES_KANBAN_DEFAULT_INTAKE")
+
+
 def _check_kanban_mode() -> bool:
     """Task-lifecycle tools are available when:
 
     1. ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), OR
-    2. The current profile has ``kanban`` in its toolsets config
+    2. The current gateway turn is a Discord default-board intake turn, OR
+    3. The current profile has ``kanban`` in its toolsets config
        (orchestrator profiles like techlead that route work via Kanban).
 
     Humans running ``hermes chat`` without the kanban toolset see zero
@@ -72,6 +95,8 @@ def _check_kanban_mode() -> bool:
     toolset enabled see the Kanban lifecycle tool surface.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
+        return True
+    if _is_default_intake_mode():
         return True
     return _profile_has_kanban_toolset()
 
@@ -82,12 +107,19 @@ def _check_kanban_orchestrator_mode() -> bool:
 
     Dispatcher-spawned workers should close their own task via the
     lifecycle tools (complete/block/heartbeat), not enumerate or unblock
-    board state. Profiles that explicitly opt into the kanban toolset
-    and are NOT scoped to a single task are the orchestrator surface.
+    board state. Profiles that explicitly opt into the kanban toolset, and
+    Discord default-board intake turns that temporarily expose it, are the
+    orchestrator surface when they are NOT scoped to a single task.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
         return False
+    if _is_default_intake_mode():
+        return True
     return _profile_has_kanban_toolset()
+
+
+_check_kanban_mode._hermes_skip_check_cache = True
+_check_kanban_orchestrator_mode._hermes_skip_check_cache = True
 
 
 # ---------------------------------------------------------------------------
@@ -725,6 +757,95 @@ def _handle_comment(args: dict, **kw) -> str:
         return tool_error(f"kanban_comment: {e}")
 
 
+def _default_intake_idempotency_key() -> Optional[str]:
+    message_id = _gateway_session_env("HERMES_SESSION_MESSAGE_ID", "").strip()
+    if not message_id:
+        return None
+    guild_id = _gateway_session_env("HERMES_SESSION_GUILD_ID", "").strip()
+    thread_id = _gateway_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+    chat_id = _gateway_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    target_id = thread_id or chat_id
+    if not target_id:
+        return None
+    return f"discord-default-intake:{guild_id}:{target_id}:{message_id}"
+
+
+def _default_intake_source_context() -> str:
+    platform = _gateway_session_env("HERMES_SESSION_PLATFORM", "").strip()
+    guild_id = _gateway_session_env("HERMES_SESSION_GUILD_ID", "").strip()
+    chat_id = _gateway_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    thread_id = _gateway_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+    parent_chat_id = _gateway_session_env("HERMES_SESSION_PARENT_CHAT_ID", "").strip()
+    message_id = _gateway_session_env("HERMES_SESSION_MESSAGE_ID", "").strip()
+    user = (
+        _gateway_session_env("HERMES_SESSION_USER_NAME", "").strip()
+        or _gateway_session_env("HERMES_SESSION_USER_ID", "").strip()
+    )
+    project_path = _gateway_session_env("HERMES_PROJECT_PATH", "").strip()
+    project_github = _gateway_session_env("HERMES_PROJECT_GITHUB_URL", "").strip()
+
+    url_channel_id = thread_id or chat_id or parent_chat_id
+    source_url = ""
+    if guild_id and url_channel_id and message_id:
+        source_url = f"https://discord.com/channels/{guild_id}/{url_channel_id}/{message_id}"
+
+    lines = ["Discord default-board intake.", ""]
+    if source_url:
+        lines.append(f"Source URL: {source_url}")
+    if platform:
+        lines.append(f"Platform: {platform}")
+    if guild_id:
+        lines.append(f"Guild ID: {guild_id}")
+    channel_ids = [cid for cid in (chat_id, parent_chat_id) if cid]
+    if channel_ids:
+        lines.append(f"Channel IDs: {', '.join(dict.fromkeys(channel_ids))}")
+    if thread_id:
+        lines.append(f"Thread ID: {thread_id}")
+    if message_id:
+        lines.append(f"Message ID: {message_id}")
+    if user:
+        lines.append(f"User: {user}")
+    if project_path:
+        lines.append(f"Workspace: {project_path}")
+    if project_github:
+        lines.append(f"GitHub: {project_github}")
+    return "\n".join(lines).strip()
+
+
+def _with_default_intake_source_context(body: Any) -> str:
+    source_context = _default_intake_source_context()
+    body_text = str(body or "").strip()
+    if not source_context:
+        return body_text
+    if body_text:
+        return f"{source_context}\n\nTask request:\n{body_text}"
+    return source_context
+
+
+def _add_default_intake_notify_sub(kb: Any, conn: Any, task_id: str) -> bool:
+    platform = _gateway_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    chat_id = _gateway_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    thread_id = _gateway_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+    user_id = _gateway_session_env("HERMES_SESSION_USER_ID", "").strip() or None
+    notifier_profile = (
+        _gateway_session_env("HERMES_KANBAN_NOTIFY_PROFILE", "").strip()
+        or os.environ.get("HERMES_PROFILE")
+        or None
+    )
+    if not platform or not chat_id:
+        return False
+    kb.add_notify_sub(
+        conn,
+        task_id=task_id,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id or None,
+        user_id=user_id,
+        notifier_profile=notifier_profile,
+    )
+    return True
+
+
 def _handle_create(args: dict, **kw) -> str:
     """Create a child task. Orchestrator workers use this to fan out.
 
@@ -734,7 +855,13 @@ def _handle_create(args: dict, **kw) -> str:
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
+    default_intake = _is_default_intake_mode()
     assignee = args.get("assignee")
+    if default_intake and not assignee:
+        assignee = _gateway_session_env(
+            "HERMES_KANBAN_DEFAULT_INTAKE_ASSIGNEE",
+            "default",
+        ) or "default"
     if not assignee:
         return tool_error(
             "assignee is required — name the profile that should execute this "
@@ -742,7 +869,9 @@ def _handle_create(args: dict, **kw) -> str:
         )
     body = args.get("body")
     parents = args.get("parents") or []
-    tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
+    tenant = args.get("tenant") or (
+        "discord-default-intake" if default_intake else os.environ.get("HERMES_TENANT")
+    )
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
     # CLI / dashboard paths and on legacy hosts that don't set the env.
@@ -750,10 +879,17 @@ def _handle_create(args: dict, **kw) -> str:
     priority = args.get("priority")
     workspace_kind = args.get("workspace_kind") or "scratch"
     workspace_path = args.get("workspace_path")
+    if default_intake and not workspace_path:
+        project_path = _gateway_session_env("HERMES_PROJECT_PATH", "").strip()
+        if project_path:
+            workspace_kind = "dir"
+            workspace_path = project_path
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
-    idempotency_key = args.get("idempotency_key")
+    idempotency_key = args.get("idempotency_key") or (
+        _default_intake_idempotency_key() if default_intake else None
+    )
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
@@ -770,7 +906,9 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
-    board = args.get("board")
+    board = args.get("board") or ("default" if default_intake else None)
+    if default_intake:
+        body = _with_default_intake_source_context(body)
     try:
         kb, conn = _connect(board=board)
         try:
@@ -792,14 +930,23 @@ def _handle_create(args: dict, **kw) -> str:
                 ),
                 skills=skills,
                 initial_status=str(initial_status),
-                created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                created_by=(
+                    "discord-default-intake"
+                    if default_intake else os.environ.get("HERMES_PROFILE") or "worker"
+                ),
                 session_id=session_id,
             )
+            notify_subscribed = False
+            if default_intake:
+                notify_subscribed = _add_default_intake_notify_sub(kb, conn, new_tid)
             new_task = kb.get_task(conn, new_tid)
-            return _ok(
-                task_id=new_tid,
-                status=new_task.status if new_task else None,
-            )
+            fields = {
+                "task_id": new_tid,
+                "status": new_task.status if new_task else None,
+            }
+            if default_intake:
+                fields["notify_subscribed"] = notify_subscribed
+            return _ok(**fields)
         finally:
             conn.close()
     except ValueError as e:
