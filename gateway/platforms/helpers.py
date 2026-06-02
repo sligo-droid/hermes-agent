@@ -258,6 +258,10 @@ class ThreadParticipationTracker:
     def __contains__(self, thread_id: str) -> bool:
         return thread_id in self._threads
 
+    def ids(self) -> list[str]:
+        """Return tracked thread IDs in persisted order."""
+        return list(self._threads)
+
     def clear(self) -> None:
         self._threads.clear()
 

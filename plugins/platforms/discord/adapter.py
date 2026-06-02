@@ -23,7 +23,7 @@ import threading
 import time
 from collections import defaultdict
 from types import SimpleNamespace
-from typing import Callable, Dict, Iterable, List, Optional, Any, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Any, Tuple, cast
 from urllib.parse import quote, urlparse
 
 from hermes_cli.discord_time import discord_message_exceeds_age_limit
@@ -69,6 +69,9 @@ _DISCORD_STATUS_REACTION_EMOJIS = ("✅", "❌", "👀", "❓", "⏳", "🔨")
 _DISCORD_GOAL_THREAD_CONTEXT_LIMIT = 25
 _DISCORD_GOAL_THREAD_CONTEXT_MAX_CHARS = 12_000
 _DISCORD_GOAL_THREAD_CONTEXT_MAX_MESSAGE_CHARS = 1_500
+_DISCORD_MISSED_THREAD_BACKFILL_LIMIT = 20
+_DISCORD_MISSED_THREAD_BACKFILL_THREAD_LIMIT = 50
+_DISCORD_MISSED_THREAD_BACKFILL_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
 def _discord_live_voice_enabled() -> bool:
@@ -752,6 +755,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._typing_aliases: Dict[str, set[str]] = {}
         self._bot_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None
+        self._thread_backfill_task: Optional[asyncio.Task] = None
         # Dedup cache: prevents duplicate bot responses when Discord
         # RESUME replays events after reconnects.
         self._dedup = MessageDeduplicator()
@@ -3001,6 +3005,28 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._handle_message(message)
 
             @self._client.event
+            async def on_disconnect():
+                logger.warning("[%s] Discord gateway disconnected; discord.py should attempt to resume", adapter_self.name)
+
+            @self._client.event
+            async def on_resumed():
+                logger.info("[%s] Discord gateway session resumed", adapter_self.name)
+                if adapter_self._thread_backfill_task and not adapter_self._thread_backfill_task.done():
+                    adapter_self._thread_backfill_task.cancel()
+                adapter_self._thread_backfill_task = asyncio.create_task(
+                    adapter_self._run_tracked_thread_backfill_task()
+                )
+
+            @self._client.event
+            async def on_error(event_method, *args, **kwargs):
+                logger.error(
+                    "[%s] Discord event handler error in %s",
+                    adapter_self.name,
+                    event_method,
+                    exc_info=True,
+                )
+
+            @self._client.event
             async def on_raw_reaction_add(payload):
                 await adapter_self._handle_raw_reaction_add(payload)
 
@@ -3081,10 +3107,18 @@ class DiscordAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
 
+        if self._thread_backfill_task and not self._thread_backfill_task.done():
+            self._thread_backfill_task.cancel()
+            try:
+                await self._thread_backfill_task
+            except asyncio.CancelledError:
+                pass
+
         self._running = False
         self._client = None
         self._ready_event.clear()
         self._post_connect_task = None
+        self._thread_backfill_task = None
 
         self._release_platform_lock()
 
@@ -3251,11 +3285,21 @@ class DiscordAdapter(BasePlatformAdapter):
         if interval > 0:
             await asyncio.sleep(interval)
 
+    async def _run_tracked_thread_backfill_task(self) -> None:
+        try:
+            await self._backfill_missed_tracked_thread_messages()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("[%s] Discord tracked-thread backfill failed: %s", self.name, e, exc_info=True)
+
     async def _run_post_connect_initialization(self) -> None:
         """Finish non-critical startup work after Discord is connected."""
         if not self._client:
             return
         try:
+            await self._run_tracked_thread_backfill_task()
+
             sync_policy = self._get_discord_command_sync_policy()
             if sync_policy == "off":
                 logger.info("[%s] Skipping Discord slash command sync (policy=off)", self.name)
@@ -6653,6 +6697,404 @@ class DiscordAdapter(BasePlatformAdapter):
             return int(raw)
         except (ValueError, TypeError):
             return 50
+
+    def _discord_missed_thread_backfill_enabled(self) -> bool:
+        """Return whether startup/reconnect should replay missed thread mentions."""
+        configured = self.config.extra.get("missed_thread_backfill")
+        if configured is not None:
+            return is_truthy_value(configured, default=True)
+        return is_truthy_value(os.getenv("DISCORD_MISSED_THREAD_BACKFILL"), default=True)
+
+    def _discord_missed_thread_backfill_limit(self) -> int:
+        configured = self.config.extra.get("missed_thread_backfill_limit")
+        raw = configured if configured is not None else os.getenv("DISCORD_MISSED_THREAD_BACKFILL_LIMIT")
+        try:
+            value = int(raw) if raw is not None else _DISCORD_MISSED_THREAD_BACKFILL_LIMIT
+        except (TypeError, ValueError):
+            value = _DISCORD_MISSED_THREAD_BACKFILL_LIMIT
+        return max(0, min(value, 100))
+
+    def _discord_missed_thread_backfill_thread_limit(self) -> int:
+        configured = self.config.extra.get("missed_thread_backfill_thread_limit")
+        raw = configured if configured is not None else os.getenv("DISCORD_MISSED_THREAD_BACKFILL_THREAD_LIMIT")
+        try:
+            value = int(raw) if raw is not None else _DISCORD_MISSED_THREAD_BACKFILL_THREAD_LIMIT
+        except (TypeError, ValueError):
+            value = _DISCORD_MISSED_THREAD_BACKFILL_THREAD_LIMIT
+        return max(0, min(value, 500))
+
+    def _discord_missed_thread_backfill_max_age_seconds(self) -> float:
+        configured = self.config.extra.get("missed_thread_backfill_max_age_seconds")
+        raw = configured if configured is not None else os.getenv("DISCORD_MISSED_THREAD_BACKFILL_MAX_AGE_SECONDS")
+        try:
+            value = float(raw) if raw is not None else _DISCORD_MISSED_THREAD_BACKFILL_MAX_AGE_SECONDS
+        except (TypeError, ValueError):
+            value = _DISCORD_MISSED_THREAD_BACKFILL_MAX_AGE_SECONDS
+        return max(0.0, value)
+
+    def _tracked_discord_thread_ids(self) -> List[str]:
+        ids = getattr(self._threads, "ids", None)
+        if callable(ids):
+            raw_ids = [str(thread_id) for thread_id in cast(Iterable[Any], ids())]
+        else:
+            raw_ids = [str(thread_id) for thread_id in getattr(self._threads, "_threads", {})]
+        raw_ids.sort(key=lambda value: int(value) if str(value).isdigit() else 0, reverse=True)
+        thread_limit = self._discord_missed_thread_backfill_thread_limit()
+        if thread_limit <= 0:
+            return []
+        return raw_ids[:thread_limit]
+
+    def _discord_author_is_self(self, author: Any) -> bool:
+        bot_user = getattr(self._client, "user", None) if self._client else None
+        if bot_user is None or author is None:
+            return False
+        return author == bot_user or getattr(author, "id", None) == getattr(bot_user, "id", None)
+
+    def _message_mentions_self(self, message: Any) -> bool:
+        bot_user = getattr(self._client, "user", None) if self._client else None
+        if bot_user is None:
+            return False
+        bot_id = getattr(bot_user, "id", None)
+        for mention in getattr(message, "mentions", None) or []:
+            if mention == bot_user or getattr(mention, "id", None) == bot_id:
+                return True
+        if bot_id is None:
+            return False
+        content = str(getattr(message, "content", "") or "")
+        return f"<@{bot_id}>" in content or f"<@!{bot_id}>" in content
+
+    def _ensure_self_mention_visible_to_handle_message(self, message: Any) -> None:
+        """Ensure replayed messages satisfy _handle_message's mention-list gate."""
+        if self._message_replies_to_self(message):
+            return
+        bot_user = getattr(self._client, "user", None) if self._client else None
+        if bot_user is None:
+            return
+        mentions = list(getattr(message, "mentions", None) or [])
+        bot_id = getattr(bot_user, "id", None)
+        if any(mention == bot_user or getattr(mention, "id", None) == bot_id for mention in mentions):
+            return
+        try:
+            setattr(message, "mentions", [*mentions, bot_user])
+        except Exception:
+            pass
+
+    async def _message_replies_to_self_for_replay(self, message: Any) -> bool:
+        if self._message_replies_to_self(message):
+            return True
+
+        bot_user = getattr(self._client, "user", None) if self._client else None
+        if bot_user is None:
+            return False
+        reference = getattr(message, "reference", None)
+        if reference is None:
+            return False
+        reply_to_id = getattr(reference, "message_id", None)
+        if reply_to_id is None:
+            return False
+
+        channel = getattr(message, "channel", None)
+        reference_channel_id = getattr(reference, "channel_id", None)
+        if reference_channel_id is not None and self._client is not None:
+            current_channel_id = getattr(channel, "id", None)
+            if current_channel_id != reference_channel_id:
+                try:
+                    get_channel = getattr(self._client, "get_channel", None)
+                    channel = get_channel(int(reference_channel_id)) if callable(get_channel) else None
+                    if channel is None:
+                        fetch_channel = getattr(self._client, "fetch_channel", None)
+                        if callable(fetch_channel):
+                            channel = fetch_channel(int(reference_channel_id))
+                            if inspect.isawaitable(channel):
+                                channel = await channel
+                except Exception as exc:
+                    logger.debug("[%s] Discord backfill reply channel fetch failed: %s", self.name, exc)
+
+        fetch_message = getattr(channel, "fetch_message", None)
+        if not callable(fetch_message):
+            return False
+        try:
+            resolved = fetch_message(int(reply_to_id))
+            if inspect.isawaitable(resolved):
+                resolved = await resolved
+        except Exception as exc:
+            logger.debug("[%s] Discord backfill reply message fetch failed: %s", self.name, exc)
+            return False
+
+        author = getattr(resolved, "author", None)
+        if not self._discord_author_is_self(author):
+            return False
+        try:
+            setattr(reference, "resolved", resolved)
+        except Exception:
+            pass
+        self._ensure_self_mention_visible_to_handle_message(message)
+        return True
+
+    def _discord_message_within_missed_backfill_age(self, message: Any) -> bool:
+        max_age = self._discord_missed_thread_backfill_max_age_seconds()
+        if max_age <= 0:
+            return True
+        message_id = str(getattr(message, "id", "") or "")
+        if discord_message_exceeds_age_limit(message_id, max_age_seconds=max_age):
+            return False
+        created_at = getattr(message, "created_at", None)
+        timestamp = None
+        if created_at is not None:
+            try:
+                timestamp = float(created_at.timestamp())
+            except Exception:
+                timestamp = None
+        if timestamp is not None and time.time() - timestamp > max_age:
+            return False
+        return True
+
+    def _discord_message_seen_in_session_history(self, message_id: str, *, thread_id: Optional[str] = None) -> bool:
+        """Best-effort persistent dedup against the gateway work ledger.
+
+        Do not scan full session transcripts here. Post-connect backfill runs on
+        the Discord event loop, and transcript scans can be large enough to
+        stall startup/reconnect handling. The work ledger is the durable source
+        for accepted Discord message ids and is bounded enough for this path.
+        """
+        message_id = str(message_id or "").strip()
+        if not message_id:
+            return False
+        thread_id = str(thread_id or "").strip()
+        runner = getattr(self, "gateway_runner", None)
+        ledger = getattr(runner, "work_ledger", None)
+        if ledger is None:
+            try:
+                from gateway.work_ledger import GatewayWorkLedger
+                ledger = GatewayWorkLedger()
+            except Exception as exc:
+                logger.debug("[%s] Discord backfill could not open work ledger: %s", self.name, exc)
+                return False
+        try:
+            data = ledger._read()  # type: ignore[attr-defined]
+            items = data.get("items", {}) if isinstance(data, dict) else {}
+        except Exception as exc:
+            logger.debug("[%s] Discord backfill could not inspect work ledger: %s", self.name, exc)
+            return False
+        if not isinstance(items, dict):
+            return False
+        for item in items.values():
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("platform") or "") != Platform.DISCORD.value:
+                continue
+            if str(item.get("message_id") or "") != message_id:
+                continue
+            if thread_id:
+                source = item.get("source") if isinstance(item.get("source"), dict) else {}
+                candidate_thread_ids = {
+                    str(item.get("thread_id") or ""),
+                    str(item.get("chat_id") or ""),
+                    str(source.get("thread_id") or "") if isinstance(source, dict) else "",
+                    str(source.get("chat_id") or "") if isinstance(source, dict) else "",
+                }
+                if thread_id not in candidate_thread_ids:
+                    continue
+            return True
+        return False
+
+    async def _resolve_tracked_thread_for_backfill(self, thread_id: str) -> Optional[Any]:
+        if not self._client:
+            return None
+        try:
+            numeric_id = int(thread_id)
+        except (TypeError, ValueError):
+            return None
+
+        channel = None
+        get_channel = getattr(self._client, "get_channel", None)
+        if callable(get_channel):
+            try:
+                channel = get_channel(numeric_id)
+            except Exception:
+                channel = None
+        if channel is None:
+            fetch_channel = getattr(self._client, "fetch_channel", None)
+            if callable(fetch_channel):
+                try:
+                    channel = fetch_channel(numeric_id)
+                    if inspect.isawaitable(channel):
+                        channel = await channel
+                except Exception as exc:
+                    logger.debug("[%s] Discord tracked thread %s fetch failed: %s", self.name, thread_id, exc)
+                    return None
+        if channel is None or not callable(getattr(channel, "history", None)):
+            return None
+
+        return channel
+
+    def _discord_history_after_object(self, message_id: str) -> Optional[Any]:
+        try:
+            numeric_id = int(message_id)
+        except (TypeError, ValueError):
+            return None
+        object_cls = getattr(discord, "Object", None)
+        if callable(object_cls):
+            try:
+                return object_cls(id=numeric_id)
+            except Exception:
+                pass
+        return SimpleNamespace(id=numeric_id)
+
+    @staticmethod
+    def _discord_sortable_message_id(message: Any) -> int:
+        try:
+            return int(getattr(message, "id", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    async def _recent_tracked_thread_messages_for_backfill(self, thread: Any, thread_id: str) -> List[Any]:
+        limit = self._discord_missed_thread_backfill_limit()
+        if limit <= 0:
+            return []
+        history = getattr(thread, "history", None)
+        if not callable(history):
+            return []
+
+        kwargs: Dict[str, Any] = {"limit": limit, "oldest_first": False}
+        cached_self_id = self._last_self_message_id.get(thread_id)
+        after_obj = self._discord_history_after_object(cached_self_id) if cached_self_id else None
+        if after_obj is not None:
+            kwargs["after"] = after_obj
+
+        messages: List[Any] = []
+        try:
+            async for msg in history(**kwargs):
+                messages.append(msg)
+        except TypeError:
+            kwargs.pop("after", None)
+            async for msg in history(**kwargs):
+                messages.append(msg)
+        except Exception as exc:
+            logger.debug("[%s] Discord tracked thread %s history fetch failed: %s", self.name, thread_id, exc)
+            return []
+
+        messages.sort(key=self._discord_sortable_message_id)
+        if after_obj is None:
+            last_self_index = -1
+            last_self_id = None
+            for index, msg in enumerate(messages):
+                if self._discord_author_is_self(getattr(msg, "author", None)):
+                    last_self_index = index
+                    last_self_id = str(getattr(msg, "id", "") or "")
+            if last_self_id:
+                self._last_self_message_id[thread_id] = last_self_id
+            messages = messages[last_self_index + 1:]
+
+        return [msg for msg in messages if not self._discord_author_is_self(getattr(msg, "author", None))]
+
+    async def _should_replay_tracked_thread_message(self, message: Any, thread_id: str) -> bool:
+        message_id = str(getattr(message, "id", "") or "")
+        if not message_id:
+            return False
+        if not self._discord_message_within_missed_backfill_age(message):
+            return False
+
+        author = getattr(message, "author", None)
+        if self._discord_author_is_self(author) or getattr(author, "bot", False):
+            return False
+
+        message_type = getattr(message, "type", None)
+        discord_message_type = getattr(discord, "MessageType", None)
+        allowed_types = {
+            getattr(discord_message_type, "default", None),
+            getattr(discord_message_type, "reply", None),
+        }
+        allowed_types.discard(None)
+        if allowed_types and message_type not in allowed_types:
+            return False
+
+        hard_ignore_reason = self._discord_hard_ignore_reason(getattr(message, "channel", None))
+        if hard_ignore_reason:
+            logger.debug("[%s] Discord backfill skipping %s: %s", self.name, message_id, hard_ignore_reason)
+            return False
+
+        guild = getattr(message, "guild", None) or getattr(getattr(message, "channel", None), "guild", None)
+        if not self._is_allowed_user(
+            str(getattr(author, "id", "") or ""),
+            author,
+            guild=guild,
+            is_dm=False,
+        ):
+            return False
+
+        if self._message_mentions_self(message):
+            if self._discord_message_seen_in_session_history(message_id, thread_id=thread_id):
+                return False
+            self._ensure_self_mention_visible_to_handle_message(message)
+            return True
+        if await self._message_replies_to_self_for_replay(message):
+            return not self._discord_message_seen_in_session_history(message_id, thread_id=thread_id)
+        return False
+
+    async def _backfill_missed_tracked_thread_messages(self) -> None:
+        """Replay recent explicit bot triggers that Discord may have missed in tracked threads."""
+        if not self._discord_missed_thread_backfill_enabled() or not self._client:
+            return
+        thread_ids = self._tracked_discord_thread_ids()
+        if not thread_ids:
+            return
+
+        logger.info(
+            "[%s] Discord tracked-thread backfill inspecting up to %d tracked thread(s)",
+            self.name,
+            len(thread_ids),
+        )
+        replayed = 0
+        inspected = 0
+        for thread_id in thread_ids:
+            thread = await self._resolve_tracked_thread_for_backfill(thread_id)
+            if thread is None:
+                continue
+            messages = await self._recent_tracked_thread_messages_for_backfill(thread, thread_id)
+            for message in messages:
+                inspected += 1
+                if not await self._should_replay_tracked_thread_message(message, thread_id):
+                    continue
+                message_id = str(getattr(message, "id", "") or "")
+                if self._dedup.is_duplicate(message_id):
+                    continue
+                logger.info(
+                    "[%s] Replaying missed Discord thread message %s in thread %s",
+                    self.name,
+                    message_id,
+                    thread_id,
+                )
+                try:
+                    await self._handle_message(message)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Failed to replay Discord thread message %s in thread %s: %s",
+                        self.name,
+                        message_id,
+                        thread_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    continue
+                replayed += 1
+
+        logger.info(
+            "[%s] Discord tracked-thread backfill complete: replayed=%d inspected_messages=%d inspected_threads=%d",
+            self.name,
+            replayed,
+            inspected,
+            len(thread_ids),
+        )
+        if replayed:
+            logger.info(
+                "[%s] Replayed %d missed Discord thread message(s) after inspecting %d recent message(s)",
+                self.name,
+                replayed,
+                inspected,
+            )
 
     async def _fetch_goal_thread_context(
         self,
