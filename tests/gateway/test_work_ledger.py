@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -11,6 +12,13 @@ from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
 from gateway.work_ledger import GatewayWorkLedger
+
+
+DISCORD_EPOCH_SECONDS = 1_420_070_400.0
+
+
+def _discord_snowflake_at(timestamp: float) -> str:
+    return str(int((timestamp - DISCORD_EPOCH_SECONDS) * 1000) << 22)
 
 
 def _discord_event(message_id="m1", text="do the work"):
@@ -94,6 +102,19 @@ def test_ledger_skips_completed_and_expires_stale_items(tmp_path):
     ledger.mark_completed(fresh["id"], result_message_id="result-1")
     assert ledger.incomplete_items() == []
     assert ledger.get(fresh["id"])["result_message_id"] == "result-1"
+
+
+def test_ledger_expires_old_discord_message_ids(tmp_path):
+    now = time.time()
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: now)
+    old_message_id = _discord_snowflake_at(now - (8 * 24 * 60 * 60))
+    event = _discord_event(message_id=old_message_id)
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=3600)
+
+    assert item is not None
+    assert ledger.incomplete_items() == []
+    assert ledger.get(item["id"])["status"] == "expired"
 
 
 def test_ledger_keeps_finished_delivery_phases_incomplete_until_completed(tmp_path):

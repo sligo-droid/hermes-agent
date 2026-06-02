@@ -3,6 +3,7 @@
 import inspect
 import sys
 import types
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -72,6 +73,13 @@ _ensure_discord_mock()
 
 import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+
+
+DISCORD_EPOCH_SECONDS = 1_420_070_400.0
+
+
+def _discord_snowflake_at(timestamp: float) -> str:
+    return str(int((timestamp - DISCORD_EPOCH_SECONDS) * 1000) << 22)
 
 
 class FakeEmbed:
@@ -630,6 +638,24 @@ def test_load_feature_summary_keeps_existing_project_path(adapter):
 
     assert handle["project_context"] == existing_context
     adapter._write_project_summary_state.assert_not_called()
+
+
+def test_load_feature_summary_ignores_old_source_message(adapter):
+    old_id = _discord_snowflake_at(time.time() - (8 * 24 * 60 * 60))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=int(old_id), parent=parent)
+    adapter._persist_feature_summary_handle(
+        thread,
+        {
+            "thread_id": old_id,
+            "message_id": _discord_snowflake_at(time.time()),
+            "source_message_id": old_id,
+            "parent_channel_id": "100",
+            "initial_request": "/goal old work",
+        },
+    )
+
+    assert adapter._load_feature_summary_handle_for_thread(thread) is None
 
 
 def test_project_description_omits_unparseable_app_access(adapter):
