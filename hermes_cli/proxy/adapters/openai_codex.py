@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from types import SimpleNamespace
 from typing import Any, FrozenSet
@@ -31,6 +32,7 @@ from hermes_cli.auth import (
 )
 from hermes_cli.codex_models import get_codex_model_ids
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,8 @@ _SPEED_SERVICE_TIERS = {
     "normal": "default",
     "fast": "priority",
 }
+_MODEL_COOLDOWNS_ENV = "HERMES_CODEX_PROXY_MODEL_COOLDOWNS"
+_MODEL_COOLDOWNS_STATE = "codex-proxy-model-cooldowns.json"
 
 
 def _to_namespace(value: Any) -> Any:
@@ -71,6 +75,32 @@ def _chat_json_error(status: int, message: str, code: str = "proxy_error") -> we
         {"error": {"message": message, "type": code, "code": code}},
         status=status,
     )
+
+
+def _parse_model_cooldown_rules(raw: str | None = None) -> dict[str, tuple[str, int]]:
+    """Parse source:fallback:seconds cooldown rules from env.
+
+    Example:
+        HERMES_CODEX_PROXY_MODEL_COOLDOWNS=gpt-5.3-codex-spark:gpt-5.4-mini:3600
+
+    Rules are opt-in so generic proxy users do not inherit local Sligo Labs
+    routing policy.
+    """
+    value = os.getenv(_MODEL_COOLDOWNS_ENV, "") if raw is None else raw
+    rules: dict[str, tuple[str, int]] = {}
+    for item in value.split(","):
+        parts = [part.strip() for part in item.split(":")]
+        if len(parts) != 3 or not all(parts):
+            continue
+        source, fallback, seconds_raw = parts
+        try:
+            seconds = int(seconds_raw)
+        except ValueError:
+            continue
+        if seconds <= 0 or source == fallback:
+            continue
+        rules[source] = (fallback, seconds)
+    return rules
 
 
 def _resolve_codex_proxy_credentials(*, refresh_if_expiring: bool) -> dict[str, Any]:
@@ -139,6 +169,99 @@ class OpenAICodexAdapter(UpstreamAdapter):
             )
         return UpstreamCredential(bearer=token, base_url=base_url)
 
+    @staticmethod
+    def _model_cooldown_state_path():
+        return get_hermes_home() / "state" / _MODEL_COOLDOWNS_STATE
+
+    @classmethod
+    def _load_model_cooldown_state(cls) -> dict[str, Any]:
+        path = cls._model_cooldown_state_path()
+        try:
+            data = json.loads(path.read_text())
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            logger.debug("proxy: ignoring unreadable model cooldown state %s: %s", path, exc)
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @classmethod
+    def _write_model_cooldown_state(cls, state: dict[str, Any]) -> None:
+        path = cls._model_cooldown_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+        tmp.replace(path)
+
+    @classmethod
+    def _effective_model_for_cooldown(cls, requested_model: str) -> str:
+        rules = _parse_model_cooldown_rules()
+        rule = rules.get(requested_model)
+        if rule is None:
+            return requested_model
+
+        fallback_model, _seconds = rule
+        state = cls._load_model_cooldown_state()
+        models_obj = state.get("models")
+        models = models_obj if isinstance(models_obj, dict) else {}
+        entry = models.get(requested_model)
+        if not isinstance(entry, dict):
+            return requested_model
+
+        expires_at = float(entry.get("expires_at") or 0)
+        if expires_at <= time.time():
+            models.pop(requested_model, None)
+            state["models"] = models
+            try:
+                cls._write_model_cooldown_state(state)
+            except Exception as exc:
+                logger.debug("proxy: failed to prune expired model cooldown: %s", exc)
+            return requested_model
+
+        configured_fallback = str(entry.get("fallback_model") or "")
+        if configured_fallback and configured_fallback != fallback_model:
+            return requested_model
+
+        logger.warning(
+            "proxy: routing %s to %s because %s is cooling down for %.0fs",
+            requested_model,
+            fallback_model,
+            requested_model,
+            max(0.0, expires_at - time.time()),
+        )
+        return fallback_model
+
+    @classmethod
+    def _mark_model_cooldown(cls, failed_model: str, exc: Exception) -> None:
+        rules = _parse_model_cooldown_rules()
+        rule = rules.get(failed_model)
+        if rule is None:
+            return
+        fallback_model, seconds = rule
+        now = time.time()
+        state = cls._load_model_cooldown_state()
+        models = state.get("models") if isinstance(state.get("models"), dict) else {}
+        if not isinstance(models, dict):
+            models = {}
+        models[failed_model] = {
+            "fallback_model": fallback_model,
+            "cooldown_seconds": seconds,
+            "failed_at": now,
+            "expires_at": now + seconds,
+            "last_error": str(exc)[:500],
+        }
+        state["models"] = models
+        try:
+            cls._write_model_cooldown_state(state)
+            logger.warning(
+                "proxy: cooling down %s for %ss after upstream failure; routing future requests to %s",
+                failed_model,
+                seconds,
+                fallback_model,
+            )
+        except Exception as write_exc:
+            logger.warning("proxy: failed to write model cooldown state: %s", write_exc)
+
     async def handle_proxy_request(self, request: web.Request) -> web.StreamResponse:
         rel_path = "/" + request.match_info.get("tail", "").lstrip("/")
         if rel_path == "/models":
@@ -185,6 +308,8 @@ class OpenAICodexAdapter(UpstreamAdapter):
         model = str(payload.get("model") or "").strip()
         if not model:
             return _chat_json_error(400, "Missing required field: model.", code="invalid_request")
+        requested_model = model
+        model = self._effective_model_for_cooldown(requested_model)
 
         messages = payload.get("messages")
         if not isinstance(messages, list):
@@ -226,15 +351,18 @@ class OpenAICodexAdapter(UpstreamAdapter):
             response_json = response_obj.model_dump() if hasattr(response_obj, "model_dump") else {}
         except aiohttp.ClientError as exc:
             logger.warning("proxy: Codex upstream connection failed: %s", exc)
+            self._mark_model_cooldown(requested_model, exc)
             return _chat_json_error(502, f"upstream connection failed: {exc}", code="upstream_unreachable")
         except Exception as exc:
             logger.warning("proxy: Codex upstream response failed: %s", exc)
+            self._mark_model_cooldown(requested_model, exc)
             return _chat_json_error(502, f"upstream response failed: {exc}", code="upstream_invalid_response")
 
         try:
             msg, finish_reason = _normalize_codex_response(response_obj)
         except Exception as exc:
             logger.warning("proxy: Codex response normalization failed: %s", exc)
+            self._mark_model_cooldown(requested_model, exc)
             return _chat_json_error(502, f"upstream response normalization failed: {exc}", code="upstream_invalid_response")
 
         choice_message: dict[str, Any] = {
