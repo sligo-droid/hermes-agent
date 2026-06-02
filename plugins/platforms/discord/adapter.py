@@ -3222,11 +3222,13 @@ class DiscordAdapter(BasePlatformAdapter):
             sync_policy = self._get_discord_command_sync_policy()
             if sync_policy == "off":
                 logger.info("[%s] Skipping Discord slash command sync (policy=off)", self.name)
+                await self._recover_recent_missed_thread_mentions()
                 return
 
             if sync_policy == "bulk":
                 synced = await asyncio.wait_for(self._client.tree.sync(), timeout=30)
                 logger.info("[%s] Synced %d slash command(s) via bulk tree sync", self.name, len(synced))
+                await self._recover_recent_missed_thread_mentions()
                 return
 
             app_id = getattr(self._client, "application_id", None) or getattr(getattr(self._client, "user", None), "id", None)
@@ -3234,6 +3236,7 @@ class DiscordAdapter(BasePlatformAdapter):
             skip_reason = self._command_sync_skip_reason(app_id, fingerprint)
             if skip_reason:
                 logger.info("[%s] Skipping Discord slash command sync: %s", self.name, skip_reason)
+                await self._recover_recent_missed_thread_mentions()
                 return
             self._record_command_sync_attempt(app_id, fingerprint)
 
@@ -3263,6 +3266,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     self.name,
                     retry_after,
                 )
+                await self._recover_recent_missed_thread_mentions()
                 return
             finally:
                 if has_ratelimit_timeout:
@@ -3289,6 +3293,12 @@ class DiscordAdapter(BasePlatformAdapter):
             raise
         except Exception as e:  # pragma: no cover - defensive logging
             logger.warning("[%s] Slash command sync failed: %s", self.name, e, exc_info=True)
+        try:
+            await self._recover_recent_missed_thread_mentions()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # pragma: no cover - defensive logging
+            logger.warning("[%s] Discord missed-mention recovery failed: %s", self.name, e, exc_info=True)
 
     def _get_discord_command_sync_policy(self) -> str:
         raw = str(os.getenv("DISCORD_COMMAND_SYNC_POLICY", "safe") or "").strip().lower()
@@ -6596,6 +6606,101 @@ class DiscordAdapter(BasePlatformAdapter):
             return int(raw)
         except (ValueError, TypeError):
             return 50
+
+    def _discord_missed_mention_recovery(self) -> bool:
+        """Return whether startup should recover unprocessed thread mentions."""
+        configured = self.config.extra.get("missed_mention_recovery")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in {"false", "0", "no", "off"}
+            return bool(configured)
+        return os.getenv("DISCORD_MISSED_MENTION_RECOVERY", "true").lower() in {"true", "1", "yes", "on"}
+
+    def _discord_missed_mention_recovery_limit(self) -> int:
+        """Return the per-thread message scan cap for missed mention recovery."""
+        configured = self.config.extra.get("missed_mention_recovery_limit")
+        if configured is None:
+            configured = os.getenv("DISCORD_MISSED_MENTION_RECOVERY_LIMIT", "25")
+        try:
+            return max(1, min(int(configured), 100))
+        except (TypeError, ValueError):
+            return 25
+
+    def _discord_known_thread_ids(self) -> list[str]:
+        """Return recently tracked Discord thread ids without exposing tracker internals broadly."""
+        tracked = getattr(self._threads, "_threads", {})
+        if isinstance(tracked, dict):
+            return [str(thread_id) for thread_id in tracked.keys()]
+        return []
+
+    def _discord_message_already_worked(self, message_id: str) -> bool:
+        """Return True when a Discord message already has durable work state."""
+        if not message_id:
+            return True
+        try:
+            from gateway.work_ledger import GatewayWorkLedger
+
+            data = GatewayWorkLedger()._read()  # noqa: SLF001 - narrow recovery probe
+            for item in data.get("items", {}).values():
+                if isinstance(item, dict) and str(item.get("message_id") or "") == message_id:
+                    return True
+        except Exception:
+            logger.debug("[%s] Failed to inspect Discord work ledger", self.name, exc_info=True)
+        return False
+
+    async def _recover_recent_missed_thread_mentions(self) -> int:
+        """Replay recent direct mentions that Discord delivered but Hermes never accepted.
+
+        The normal gateway event stream is still authoritative. This is a bounded
+        startup safety net for known participated threads: if a direct mention is
+        visible in recent Discord history but absent from the work ledger, send it
+        through the ordinary Discord intake path so all existing allowlist,
+        mention, project, batching, and work-ledger gates still apply.
+        """
+        if not self._discord_missed_mention_recovery() or not self._client or not self._client.user:
+            return 0
+        limit = self._discord_missed_mention_recovery_limit()
+        recovered = 0
+        for thread_id in self._discord_known_thread_ids()[-200:]:
+            channel = None
+            try:
+                channel = self._client.get_channel(int(thread_id))
+            except Exception:
+                channel = None
+            if channel is None and hasattr(self._client, "fetch_channel"):
+                try:
+                    channel = await self._client.fetch_channel(int(thread_id))
+                except Exception:
+                    logger.debug("[%s] Could not fetch Discord thread %s for recovery", self.name, thread_id)
+                    continue
+            history = getattr(channel, "history", None)
+            if channel is None or history is None:
+                continue
+            try:
+                async for message in history(limit=limit):
+                    message_id = str(getattr(message, "id", "") or "")
+                    if not message_id or self._discord_message_already_worked(message_id):
+                        continue
+                    if getattr(message, "author", None) == self._client.user:
+                        continue
+                    if getattr(message, "type", None) not in {discord.MessageType.default, discord.MessageType.reply}:
+                        continue
+                    mentions_self = self._client.user in (getattr(message, "mentions", None) or [])
+                    if not mentions_self and not self._message_replies_to_self(message):
+                        continue
+                    logger.info(
+                        "[%s] Recovering missed Discord thread mention message_id=%s thread_id=%s",
+                        self.name,
+                        message_id,
+                        thread_id,
+                    )
+                    await self._handle_message(message)
+                    recovered += 1
+            except Exception:
+                logger.debug("[%s] Failed Discord missed-mention scan for thread %s", self.name, thread_id, exc_info=True)
+        if recovered:
+            logger.info("[%s] Recovered %d missed Discord thread mention(s)", self.name, recovered)
+        return recovered
 
     async def _fetch_goal_thread_context(
         self,
