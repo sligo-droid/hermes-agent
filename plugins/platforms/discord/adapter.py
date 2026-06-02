@@ -1837,7 +1837,29 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         return slug
 
+    def _feature_source_task_reaction_state(self, handle: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not isinstance(handle, dict):
+            return None
+        source_board = str(handle.get("source_board") or "").strip()
+        source_task_id = str(handle.get("source_task_id") or "").strip()
+        if not source_board or not source_task_id:
+            return None
+        try:
+            from hermes_cli.discord_worker_boards import source_task_reaction_state
+
+            return source_task_reaction_state(source_board, source_task_id)
+        except Exception as exc:
+            logger.debug(
+                "[%s] Failed to read Discord source Kanban task state: %s",
+                self.name,
+                exc,
+            )
+            return None
+
     def _feature_kanban_reaction_state(self, handle: Optional[Dict[str, Any]]) -> Optional[str]:
+        source_state = self._feature_source_task_reaction_state(handle)
+        if source_state:
+            return source_state
         slug = self._feature_kanban_board_slug(handle)
         if not slug:
             return None
@@ -3707,7 +3729,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def sync_kanban_thread_reaction(self, target: Dict[str, Any]) -> Optional[str]:
         """Synchronize a Discord worker thread's origin-message reaction."""
-        state = str(target.get("reaction_state") or target.get("state") or "").strip() or None
+        state = self._feature_source_task_reaction_state(target)
+        if state is None:
+            state = str(target.get("reaction_state") or target.get("state") or "").strip() or None
         if state is None:
             slug = str(target.get("board") or "").strip()
             if slug:
@@ -5261,22 +5285,28 @@ class DiscordAdapter(BasePlatformAdapter):
         """Start a persistent typing indicator for a channel.
 
         Discord's TYPING_START gateway event is unreliable in DMs for bots.
-        Instead, start a background loop that hits the typing endpoint every
-        8 seconds (typing indicator lasts ~10s).  The loop is cancelled when
-        stop_typing() is called (after the response is sent).
+        Send the first heartbeat before returning so the indicator appears at
+        turn start, then keep it alive with a background refresh loop.
         """
         if not self._client:
             return
         target_id = self._typing_target_id(chat_id, metadata=metadata)
-        # Don't start a duplicate loop
-        if target_id in self._typing_tasks:
-            return
         if target_id != str(chat_id):
             self._typing_aliases.setdefault(str(chat_id), set()).add(target_id)
+
+        # Don't start a duplicate loop
+        existing_task = self._typing_tasks.get(target_id)
+        if existing_task and not existing_task.done():
+            return
+        if existing_task:
+            self._typing_tasks.pop(target_id, None)
+
+        await self.send_typing_once(target_id)
 
         async def _typing_loop() -> None:
             try:
                 while True:
+                    await asyncio.sleep(8)
                     try:
                         await self.send_typing_once(target_id)
                     except asyncio.CancelledError:
@@ -5284,7 +5314,6 @@ class DiscordAdapter(BasePlatformAdapter):
                     except Exception as e:
                         logger.debug("Discord typing indicator failed for %s: %s", target_id, e)
                         return
-                    await asyncio.sleep(8)
             except asyncio.CancelledError:
                 pass
             finally:

@@ -558,6 +558,73 @@ async def test_kanban_thread_reaction_repairs_summary_embed_and_source_op(adapte
 
 
 @pytest.mark.asyncio
+async def test_kanban_thread_reaction_uses_source_task_state_over_done_target(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import kanban_db
+
+    conn = kanban_db.connect(board=kanban_db.DEFAULT_BOARD)
+    try:
+        source_task = kanban_db.create_task(conn, title="Default intake", assignee="default")
+        claimed = kanban_db.claim_task(conn, source_task)
+        assert claimed is not None
+    finally:
+        conn.close()
+
+    op_message = SimpleNamespace(
+        id=111,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="✅", me=True)],
+    )
+    summary_message = SimpleNamespace(
+        id=222,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="✅", me=True)],
+    )
+
+    async def fetch_parent_message(message_id):
+        if int(message_id) == op_message.id:
+            return op_message
+        if int(message_id) == summary_message.id:
+            return summary_message
+        raise LookupError(message_id)
+
+    parent = SimpleNamespace(fetch_message=AsyncMock(side_effect=fetch_parent_message))
+    thread = SimpleNamespace(
+        id=333,
+        parent=parent,
+        fetch_message=AsyncMock(side_effect=LookupError("not cached in thread")),
+    )
+    adapter._resolve_summary_channel = AsyncMock(return_value=thread)
+
+    synced = await adapter.sync_kanban_thread_reaction(
+        {
+            "board": "foreman-333",
+            "thread_id": "333",
+            "state": "done",
+            "reaction_state": "done",
+            "message_id": str(summary_message.id),
+            "source_message_id": str(op_message.id),
+            "source_board": kanban_db.DEFAULT_BOARD,
+            "source_task_id": source_task,
+        }
+    )
+
+    assert synced == "running"
+    assert [call.args for call in op_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="⏳",
+    )
+    op_message.add_reaction.assert_awaited_once_with("⏳")
+    assert [call.args for call in summary_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="⏳",
+    )
+    summary_message.add_reaction.assert_awaited_once_with("⏳")
+
+
+@pytest.mark.asyncio
 async def test_kanban_thread_reaction_clears_flag_after_syncing_reachable_target(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb

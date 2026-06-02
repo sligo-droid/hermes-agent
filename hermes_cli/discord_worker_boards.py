@@ -66,6 +66,7 @@ _DISCORD_MESSAGE_ID_RE = re.compile(
     r"\b(?:message|msg)\s+(?P<message>\d{16,24})\b",
     re.IGNORECASE,
 )
+_SOURCE_TASK_ERROR_OUTCOMES = frozenset({"spawn_failed", "crashed", "timed_out", "gave_up"})
 _DELETE_META = object()
 _POSIX_PATH_RE = re.compile(
     r"(?<![\w:/.-])/(?:home|Users|tmp|var|etc|opt|private|workspace|workspaces|mnt|srv|repo|root)"
@@ -2029,6 +2030,76 @@ def board_thread_reaction_state(board: str) -> str:
     return "active"
 
 
+def source_task_reaction_state(board: str, task_id: str) -> Optional[str]:
+    """Return Discord reaction/status state for a source Kanban task."""
+    board = str(board or "").strip() or kanban_db.DEFAULT_BOARD
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return None
+    conn = kanban_db.connect(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            return None
+        latest = kanban_db.latest_run(conn, task_id)
+    finally:
+        conn.close()
+
+    status = str(getattr(task, "status", "") or "").strip().lower()
+    latest_status = str(getattr(latest, "status", "") or "").strip().lower() if latest else ""
+    latest_outcome = str(getattr(latest, "outcome", "") or "").strip().lower() if latest else ""
+    latest_error_like = latest_status in _SOURCE_TASK_ERROR_OUTCOMES or latest_outcome in _SOURCE_TASK_ERROR_OUTCOMES
+
+    if status == "done":
+        return "done"
+    if latest_error_like:
+        return "errored"
+    if status == "blocked":
+        if str(getattr(task, "last_failure_error", "") or "").strip():
+            return "errored"
+        return "blocked"
+    if status == "running" or (latest_status == "running" and getattr(latest, "ended_at", None) is None):
+        return "running"
+    if status in {"triage", "todo", "scheduled", "ready", "review"}:
+        return "active"
+    if status == "archived":
+        return "blocked"
+    return "active"
+
+
+def _foreman_source_task_from_request(text: str) -> dict[str, str]:
+    source: dict[str, str] = {}
+    mapping = {
+        "board": "source_board",
+        "task": "source_task_id",
+    }
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip().lstrip("- ").strip()
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        target = mapping.get(key.strip().casefold())
+        if target and value.strip():
+            source[target] = value.strip()[:300]
+    return source
+
+
+def _worker_source_task_context(worker: dict[str, Any]) -> dict[str, str]:
+    context = {
+        "source_board": str(worker.get("source_board") or "").strip(),
+        "source_task_id": str(worker.get("source_task_id") or "").strip(),
+    }
+    request_text = str(worker.get("root_goal") or worker.get("initial_request") or "")
+    if (
+        (not context["source_board"] or not context["source_task_id"])
+        and _is_foreman_generated_request(request_text)
+    ):
+        parsed = _foreman_source_task_from_request(request_text)
+        context["source_board"] = context["source_board"] or parsed.get("source_board", "")
+        context["source_task_id"] = context["source_task_id"] or parsed.get("source_task_id", "")
+    return {key: value for key, value in context.items() if value}
+
+
 def _is_foreman_generated_worker(worker: dict[str, Any]) -> bool:
     request = str(
         worker.get("initial_request")
@@ -2628,6 +2699,14 @@ def thread_status_targets() -> list[dict[str, Any]]:
         except Exception:
             summary = {"state": board_thread_state(board)}
         state = summary.get("state") or board_thread_state(board)
+        source_context = _worker_source_task_context(worker)
+        source_state = None
+        if source_context.get("source_board") and source_context.get("source_task_id"):
+            source_state = source_task_reaction_state(
+                source_context["source_board"],
+                source_context["source_task_id"],
+            )
+        visible_state = source_state or state
         terminal_completion_message_pending = bool(worker.get("terminal_completion_message_pending"))
         terminal_sync_pending = bool(
             worker.get("terminal_reaction_sync_pending")
@@ -2635,12 +2714,13 @@ def thread_status_targets() -> list[dict[str, Any]]:
             or terminal_completion_message_pending
         )
         if (
-            state not in {"active", "running"}
+            visible_state not in {"active", "running"}
+            and not source_state
             and not (state in {"done", "blocked", "errored"} and terminal_sync_pending)
             and board not in active_foreman_sources
         ):
             continue
-        reaction_state = board_thread_reaction_state(board)
+        reaction_state = source_state or board_thread_reaction_state(board)
         target = {
             "board": board,
             "thread_id": thread_id,
@@ -2649,7 +2729,7 @@ def thread_status_targets() -> list[dict[str, Any]]:
             "source_message_id": summary.get("source_message_id") or str(worker.get("source_message_id") or ""),
             "guild_id": summary.get("guild_id") or str(worker.get("guild_id") or ""),
             "parent_channel_id": summary.get("parent_channel_id") or str(worker.get("parent_channel_id") or ""),
-            "state": state,
+            "state": visible_state,
             "title": summary.get("title") or "",
             "fallback_title": summary.get("fallback_title") or "",
             "outcome": summary.get("outcome") or "",
@@ -2662,9 +2742,13 @@ def thread_status_targets() -> list[dict[str, Any]]:
             "terminal_summary_sync_pending": bool(worker.get("terminal_summary_sync_pending")),
             "terminal_completion_message_pending": terminal_completion_message_pending,
         }
-        if reaction_state != state:
+        if source_context:
+            target.update(source_context)
+        if source_state:
+            target["source_state"] = source_state
+        if reaction_state != visible_state:
             target["reaction_state"] = reaction_state
-        if board in active_foreman_sources:
+        if board in active_foreman_sources and not source_state:
             target["reaction_state"] = "foreman"
         if _is_foreman_generated_worker(worker):
             target["hide_source_links"] = True

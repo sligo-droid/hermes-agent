@@ -6935,6 +6935,25 @@ class GatewayRunner:
                     initial_status="blocked",
                     board=_kb.DEFAULT_BOARD,
                 )
+                platform = getattr(source, "platform", None)
+                platform_str = (
+                    platform.value if hasattr(platform, "value") else str(platform or "")
+                ).lower()
+                notify_chat_id = chat_id or thread_id or parent_channel_id
+                user_id = str(getattr(source, "user_id", "") or "") or None
+                if platform_str and notify_chat_id:
+                    _kb.add_notify_sub(
+                        conn,
+                        task_id=task_id,
+                        platform=platform_str,
+                        chat_id=notify_chat_id,
+                        thread_id=thread_id or None,
+                        user_id=user_id,
+                        notifier_profile=(
+                            getattr(self, "_kanban_notifier_profile", None)
+                            or self._active_profile_name()
+                        ),
+                    )
             finally:
                 conn.close()
         except Exception as exc:
@@ -6987,6 +7006,9 @@ class GatewayRunner:
                 "branch": str(target.get("branch") or ""),
                 "pr_url": str(target.get("pr_url") or ""),
                 "public_url": str(target.get("public_url") or ""),
+                "source_board": str(target.get("source_board") or ""),
+                "source_task_id": str(target.get("source_task_id") or ""),
+                "source_state": str(target.get("source_state") or ""),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -6999,6 +7021,8 @@ class GatewayRunner:
                 "thread_id": str(target.get("thread_id") or ""),
                 "message_id": str(target.get("message_id") or ""),
                 "source_message_id": str(target.get("source_message_id") or ""),
+                "source_board": str(target.get("source_board") or ""),
+                "source_task_id": str(target.get("source_task_id") or ""),
                 "guild_id": str(target.get("guild_id") or ""),
                 "parent_channel_id": str(target.get("parent_channel_id") or ""),
             },

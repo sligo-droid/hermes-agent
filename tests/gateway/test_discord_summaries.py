@@ -1066,6 +1066,93 @@ async def test_foreman_goal_embed_posts_to_source_thread_and_hides_source_links(
     sent_message.add_reaction.assert_awaited_once_with("👀")
 
 
+@pytest.mark.asyncio
+async def test_foreman_feature_summary_uses_source_task_state_over_done_board(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=202, parent=parent)
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 202 else None
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    conn = kanban_db.connect(board=kanban_db.DEFAULT_BOARD)
+    try:
+        source_task = kanban_db.create_task(conn, title="Default intake", assignee="default")
+    finally:
+        conn.close()
+
+    foreman_board = dwb.start_direct_goal(
+        thread_id="202",
+        goal=(
+            "/goal Foreman escalation: resolve a Discord worker issue.\n\n"
+            "Problem:\n"
+            "- Board: default\n"
+            f"- Task: {source_task}\n"
+        ),
+        board_slug="foreman-source-summary",
+    )
+    dwb._update_worker_meta(foreman_board.slug, {"goal_status": "done", "phase": "complete"})
+
+    handle = await adapter.create_foreman_goal_thread(
+        "202",
+        name="Foreman: fix default intake",
+        initial_request="/goal Foreman escalation: resolve default intake",
+        source_board=kanban_db.DEFAULT_BOARD,
+        source_task_id=source_task,
+        kanban_board={"slug": foreman_board.slug, "public_url": "https://hermes.example/workers/foreman-source-summary"},
+    )
+    assert handle is not None
+    message = thread.sent[0][1]
+    message.add_reaction.reset_mock()
+
+    synced = await adapter.sync_kanban_feature_summary(
+        {
+            "board": foreman_board.slug,
+            "thread_id": "202",
+            "message_id": handle["message_id"],
+            "source_message_id": handle["source_message_id"],
+            "source_board": kanban_db.DEFAULT_BOARD,
+            "source_task_id": source_task,
+            "state": "done",
+            "sync_key": "source-active",
+        }
+    )
+
+    assert synced == "source-active"
+    active_fields = {field.name: field.value for field in message.edit.await_args.kwargs["embed"].fields}
+    assert active_fields["Status"] == "👀 In progress"
+    message.add_reaction.assert_awaited_once_with("👀")
+
+    conn = kanban_db.connect(board=kanban_db.DEFAULT_BOARD)
+    try:
+        claimed = kanban_db.claim_task(conn, source_task)
+        assert claimed is not None
+        kanban_db.complete_task(conn, source_task, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+
+    message.edit.reset_mock()
+    message.add_reaction.reset_mock()
+    done_synced = await adapter.sync_kanban_feature_summary(
+        {
+            "board": foreman_board.slug,
+            "thread_id": "202",
+            "message_id": handle["message_id"],
+            "source_message_id": handle["source_message_id"],
+            "source_board": kanban_db.DEFAULT_BOARD,
+            "source_task_id": source_task,
+            "state": "done",
+            "sync_key": "source-done",
+        }
+    )
+
+    assert done_synced == "source-done"
+    done_fields = {field.name: field.value for field in message.edit.await_args.kwargs["embed"].fields}
+    assert done_fields["Status"] == "✅ Done"
+    message.add_reaction.assert_awaited_once_with("✅")
+
+
 def test_feature_summary_kanban_status_labels(adapter):
     adapter._feature_kanban_reaction_state = MagicMock(return_value="active")
     active_embed = adapter._build_feature_summary_embed(

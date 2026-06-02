@@ -409,6 +409,95 @@ def test_board_thread_state_reflects_kanban_tasks(monkeypatch, tmp_path):
         conn.close()
 
 
+def test_source_task_reaction_state_maps_default_task_lifecycle(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    conn = kanban_db.connect(board=kanban_db.DEFAULT_BOARD)
+    try:
+        task_id = kanban_db.create_task(conn, title="Top-level intake", assignee="default")
+        assert dwb.source_task_reaction_state(kanban_db.DEFAULT_BOARD, task_id) == "active"
+
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+        assert dwb.source_task_reaction_state(kanban_db.DEFAULT_BOARD, task_id) == "running"
+
+        kanban_db.block_task(conn, task_id, reason="needs input", expected_run_id=claimed.current_run_id)
+        assert dwb.source_task_reaction_state(kanban_db.DEFAULT_BOARD, task_id) == "blocked"
+
+        kanban_db.unblock_task(conn, task_id)
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+        kanban_db.complete_task(conn, task_id, summary="done", expected_run_id=claimed.current_run_id)
+        assert dwb.source_task_reaction_state(kanban_db.DEFAULT_BOARD, task_id) == "done"
+
+        failed_id = kanban_db.create_task(conn, title="Failed intake", assignee="default")
+        conn.execute(
+            "UPDATE tasks SET status='blocked', last_failure_error='worker crashed' WHERE id=?",
+            (failed_id,),
+        )
+        conn.commit()
+        assert dwb.source_task_reaction_state(kanban_db.DEFAULT_BOARD, failed_id) == "errored"
+    finally:
+        conn.close()
+
+
+def test_thread_status_targets_use_source_task_state_for_foreman_board(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    conn = kanban_db.connect(board=kanban_db.DEFAULT_BOARD)
+    try:
+        source_task = kanban_db.create_task(conn, title="Default intake", assignee="default")
+    finally:
+        conn.close()
+
+    foreman_goal = (
+        "/goal Foreman escalation: resolve a Discord worker issue.\n\n"
+        "Problem:\n"
+        "- Board: default\n"
+        f"- Task: {source_task}\n"
+    )
+    board = dwb.start_direct_goal(
+        thread_id="7810",
+        goal=foreman_goal,
+        chat_id="7810",
+        guild_id="111",
+        parent_channel_id="222",
+        board_slug="foreman-source-sync",
+    )
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "summary_message_id": "333",
+            "source_message_id": "111",
+        },
+    )
+
+    target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
+    assert target["state"] == "active"
+    assert target["source_board"] == kanban_db.DEFAULT_BOARD
+    assert target["source_task_id"] == source_task
+    assert target["source_state"] == "active"
+
+    conn = kanban_db.connect(board=kanban_db.DEFAULT_BOARD)
+    try:
+        claimed = kanban_db.claim_task(conn, source_task)
+        assert claimed is not None
+        target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
+        assert target["state"] == "running"
+
+        kanban_db.complete_task(conn, source_task, summary="done", expected_run_id=claimed.current_run_id)
+        target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
+        assert target["state"] == "done"
+    finally:
+        conn.close()
+
+
 def test_terminal_to_terminal_meta_update_marks_discord_reaction_pending(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
