@@ -1771,6 +1771,34 @@ def _discord_source_channel_ids(source: Any) -> list[str]:
     return ids
 
 
+def _configured_id_set(raw: Any) -> set[str]:
+    """Normalize comma-separated/list config values containing platform ids."""
+    if raw is None:
+        return set()
+    if isinstance(raw, str):
+        values = re.split(r"[,\s]+", raw)
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        values = [raw]
+    return {str(v).strip() for v in values if str(v or "").strip()}
+
+
+def _discord_default_kanban_intake_channels(config: Optional[dict] = None) -> set[str]:
+    cfg = config or {}
+    raw = cfg_get(
+        cfg,
+        "kanban",
+        "discord_intake",
+        "default_board_channels",
+        default=None,
+    )
+    if not raw:
+        # Backward-compatible alias for early private configs.
+        raw = cfg_get(cfg, "discord", "default_kanban_intake_channels", default="")
+    return _configured_id_set(raw)
+
+
 def _resolve_gateway_session_cwd(
     source: Any,
     config: Optional[dict] = None,
@@ -6706,6 +6734,118 @@ class GatewayRunner:
             if self._running:
                 await self._sleep_until_kanban_dispatch_due(interval)
 
+    def _runtime_config_dict(self) -> dict:
+        config = getattr(self, "config", None)
+        if isinstance(config, dict):
+            return config
+        try:
+            return _load_gateway_runtime_config()
+        except Exception:
+            logger.debug("Failed to load gateway runtime config", exc_info=True)
+            return {}
+
+    def _maybe_route_discord_default_kanban_intake(self, event: MessageEvent) -> Optional[str]:
+        """Capture configured Discord channel messages as default-board intake.
+
+        This is for control-room channels such as #dev: accepted human input
+        becomes a top-level Kanban intake item instead of a per-thread worker
+        board or an immediate agent turn. Slash commands and bot/system events
+        continue through their existing paths.
+        """
+        source = getattr(event, "source", None)
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return None
+        if getattr(event, "internal", False) or getattr(source, "is_bot", False):
+            return None
+        if event.is_command():
+            return None
+        cfg = self._runtime_config_dict()
+        intake_channels = _discord_default_kanban_intake_channels(cfg)
+        if not intake_channels:
+            return None
+        source_channel_ids = _discord_source_channel_ids(source)
+        if not any(channel_id in intake_channels for channel_id in source_channel_ids):
+            return None
+
+        raw_text = str(getattr(event, "text", "") or "").strip()
+        if not raw_text and getattr(event, "media_urls", None):
+            raw_text = "[media attachment]"
+        if not raw_text:
+            return None
+        try:
+            from agent.redact import redact_sensitive_text
+
+            safe_text = redact_sensitive_text(raw_text)
+        except Exception:
+            safe_text = raw_text
+
+        title_text = re.sub(r"\s+", " ", safe_text).strip()
+        title_text = re.sub(r"^<@!?\d+>\s*", "", title_text).strip()
+        if not title_text:
+            title_text = "Discord intake"
+        if len(title_text) > 96:
+            title_text = title_text[:93].rstrip() + "..."
+        title = f"#dev intake: {title_text}"
+
+        guild_id = str(getattr(source, "guild_id", "") or "").strip()
+        thread_id = str(getattr(source, "thread_id", "") or "").strip()
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        parent_channel_id = str(getattr(source, "parent_chat_id", "") or "").strip()
+        message_id = str(getattr(event, "message_id", "") or getattr(source, "message_id", "") or "").strip()
+        url_channel_id = thread_id or chat_id or parent_channel_id
+        source_url = ""
+        if guild_id and url_channel_id and message_id:
+            source_url = f"https://discord.com/channels/{guild_id}/{url_channel_id}/{message_id}"
+
+        project_path = str(getattr(source, "project_path", "") or "").strip()
+        body_lines = [
+            "Discord default-board intake.",
+            "",
+            f"Source URL: {source_url or '(unavailable)'}",
+            f"Guild ID: {guild_id or '(unknown)'}",
+            f"Channel IDs: {', '.join(source_channel_ids) or '(unknown)'}",
+            f"Thread ID: {thread_id or '(none)'}",
+            f"Message ID: {message_id or '(none)'}",
+            f"User: {getattr(source, 'user_name', None) or getattr(source, 'user_id', None) or '(unknown)'}",
+        ]
+        if project_path:
+            body_lines.append(f"Workspace: {project_path}")
+        project_github = str(getattr(source, "project_github_url", "") or "").strip()
+        if project_github:
+            body_lines.append(f"GitHub: {project_github}")
+        body_lines.extend(["", "Message:", safe_text])
+        body = "\n".join(body_lines)
+
+        id_source = message_id or hashlib.sha256(
+            f"{guild_id}:{url_channel_id}:{safe_text}:{getattr(event, 'timestamp', '')}".encode("utf-8")
+        ).hexdigest()[:16]
+        idempotency_key = f"discord-default-intake:{guild_id}:{url_channel_id}:{id_source}"
+
+        try:
+            from hermes_cli import kanban_db as _kb
+
+            conn = _kb.connect(board=_kb.DEFAULT_BOARD)
+            try:
+                task_id = _kb.create_task(
+                    conn,
+                    title=title,
+                    body=body,
+                    created_by="discord-default-intake",
+                    workspace_kind="dir" if project_path else "scratch",
+                    workspace_path=project_path or None,
+                    tenant="discord-default-intake",
+                    idempotency_key=idempotency_key,
+                    initial_status="blocked",
+                    board=_kb.DEFAULT_BOARD,
+                )
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.exception("Discord default Kanban intake failed")
+            return f"⚠️ Failed to queue this on the top-level Kanban board: {exc}"
+
+        return f"Queued on top-level Kanban: `{task_id}`."
+
     def _fallback_discord_kanban_feature_title(self, target: Dict[str, Any]) -> str:
         text = str(target.get("fallback_title") or "").strip()
         text = re.sub(r"^/goal(?:\s+(.*))?$", r"\1", text, flags=re.IGNORECASE | re.DOTALL).strip()
@@ -9795,6 +9935,11 @@ class GatewayRunner:
             if self._should_send_telegram_lobby_reminder(source):
                 return self._telegram_topic_root_lobby_message()
             return None
+
+        if not command:
+            default_kanban_intake_response = self._maybe_route_discord_default_kanban_intake(event)
+            if default_kanban_intake_response is not None:
+                return default_kanban_intake_response
 
         _flow_admission_ts = time.time()
         _flow_route_type = _gateway_flow_route_type(event, command)
