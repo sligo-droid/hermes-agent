@@ -72,6 +72,7 @@ _DISCORD_GOAL_THREAD_CONTEXT_MAX_MESSAGE_CHARS = 1_500
 _DISCORD_MISSED_THREAD_BACKFILL_LIMIT = 20
 _DISCORD_MISSED_THREAD_BACKFILL_THREAD_LIMIT = 50
 _DISCORD_MISSED_THREAD_BACKFILL_MAX_AGE_SECONDS = 24 * 60 * 60
+_DISCORD_ALLOW_BOTS_MODES = {"none", "mentions", "all"}
 
 
 def _discord_live_voice_enabled() -> bool:
@@ -697,6 +698,17 @@ def _read_dm_role_auth_guild() -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return guild_id if guild_id > 0 else None
+
+
+def _normalize_discord_allow_bots(value: Any) -> Optional[str]:
+    mode = str(value).strip().lower()
+    if mode in _DISCORD_ALLOW_BOTS_MODES:
+        return mode
+    logger.warning(
+        "Ignoring invalid discord.allow_bots=%r; expected one of: all, mentions, none",
+        value,
+    )
+    return None
 
 
 class DiscordAdapter(BasePlatformAdapter):
@@ -10210,7 +10222,7 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     ``DISCORD_NO_THREAD_CHANNELS``, ``DISCORD_HISTORY_BACKFILL``,
     ``DISCORD_HISTORY_BACKFILL_LIMIT``, ``DISCORD_ALLOW_MENTION_*``,
     ``DISCORD_REPLY_TO_MODE``, ``DISCORD_THREAD_REQUIRE_MENTION``,
-    ``DISCORD_VOICE_AUTO_TAG``).
+    ``DISCORD_VOICE_AUTO_TAG``, ``DISCORD_ALLOW_BOTS``).
     Rather than rewrite ~50 call sites inside the adapter to read from
     ``PlatformConfig.extra`` instead, this hook keeps the existing
     env-driven model and merely owns the YAML→env translation here, next to
@@ -10243,6 +10255,14 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         if isinstance(allowed_users_cfg, list):
             allowed_users_cfg = ",".join(str(v) for v in allowed_users_cfg)
         os.environ["DISCORD_ALLOWED_USERS"] = str(allowed_users_cfg)
+    allow_bots_cfg = (
+        discord_cfg["allow_bots"] if "allow_bots" in discord_cfg
+        else platform_extra_cfg.get("allow_bots")
+    )
+    if allow_bots_cfg is not None and not os.getenv("DISCORD_ALLOW_BOTS"):
+        allow_bots_mode = _normalize_discord_allow_bots(allow_bots_cfg)
+        if allow_bots_mode is not None:
+            os.environ["DISCORD_ALLOW_BOTS"] = allow_bots_mode
     frc = discord_cfg.get("free_response_channels")
     if frc is not None and not os.getenv("DISCORD_FREE_RESPONSE_CHANNELS"):
         if isinstance(frc, list):
@@ -10340,7 +10360,7 @@ def register(ctx) -> None:
         # ``discord:`` keys (require_mention, free_response_channels,
         # auto_thread, reactions, ignored_channels, allowed_channels,
         # no_thread_channels, allow_mentions.*, reply_to_mode,
-        # thread_require_mention) into ``DISCORD_*`` env vars that the
+        # thread_require_mention, allow_bots) into ``DISCORD_*`` env vars that the
         # adapter reads via ``os.getenv()``.  Replaces the hardcoded block
         # that used to live in ``gateway/config.py``.  Hook contract: #24836.
         apply_yaml_config_fn=_apply_yaml_config,

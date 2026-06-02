@@ -431,6 +431,84 @@ class TestLoadGatewayConfig:
         ]
         assert os.environ.get("DISCORD_ALLOWED_USERS") == "123456789012345678"
 
+    def test_bridges_discord_allow_bots_from_config_yaml_to_env(self, tmp_path, monkeypatch):
+        """discord.allow_bots should populate DISCORD_ALLOW_BOTS for bot admission."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  allow_bots: mentions\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("DISCORD_ALLOW_BOTS", raising=False)
+
+        load_gateway_config()
+
+        assert os.environ.get("DISCORD_ALLOW_BOTS") == "mentions"
+
+    def test_bridges_discord_platform_extra_allow_bots_to_env(self, tmp_path, monkeypatch):
+        """platforms.discord.extra.allow_bots should reach DISCORD_ALLOW_BOTS."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "platforms:\n"
+            "  discord:\n"
+            "    extra:\n"
+            "      allow_bots: all\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("DISCORD_ALLOW_BOTS", raising=False)
+
+        load_gateway_config()
+
+        assert os.environ.get("DISCORD_ALLOW_BOTS") == "all"
+
+    def test_discord_allow_bots_yaml_does_not_overwrite_env(self, tmp_path, monkeypatch):
+        """Explicit DISCORD_ALLOW_BOTS should win over config.yaml."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  allow_bots: all\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("DISCORD_ALLOW_BOTS", "none")
+
+        load_gateway_config()
+
+        assert os.environ.get("DISCORD_ALLOW_BOTS") == "none"
+
+    def test_invalid_discord_allow_bots_yaml_is_ignored(self, tmp_path, monkeypatch, caplog):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  allow_bots: robots\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("DISCORD_ALLOW_BOTS", raising=False)
+        caplog.set_level("WARNING")
+
+        load_gateway_config()
+
+        assert os.environ.get("DISCORD_ALLOW_BOTS") is None
+        assert any(
+            "Ignoring invalid discord.allow_bots" in record.message
+            for record in caplog.records
+        )
+
     def test_bridges_quoted_false_platform_enabled_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

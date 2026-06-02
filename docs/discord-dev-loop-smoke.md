@@ -1,0 +1,1 @@
+Last smoke touch: never
