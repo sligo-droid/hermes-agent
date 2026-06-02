@@ -85,53 +85,6 @@ _DISCORD_FEATURE_REQUEST_FAST_PATH_PROMPT = (
     "when available."
 )
 
-_DISCORD_FAST_MAINLINE_DEFAULT_TOOLSETS = (
-    "web",
-    "browser",
-    "terminal",
-    "file",
-    "code_execution",
-    "vision",
-    "todo",
-    "session_search",
-    "clarify",
-    "delegation",
-    "discord",
-)
-
-
-def _coerce_bool(value: Any, *, default: bool) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on", "y"}
-    return bool(value)
-
-
-def _discord_fast_mainline_enabled(config: dict) -> bool:
-    return _coerce_bool(
-        cfg_get(config or {}, "discord", "fast_mainline_toolsets_enabled", default=True),
-        default=True,
-    )
-
-
-def _discord_fast_mainline_toolsets(config: dict) -> list[str]:
-    """Resolve the compact tool surface for ordinary Discord feature threads."""
-    raw = cfg_get(config or {}, "discord", "fast_mainline_toolsets", default=None)
-    if isinstance(raw, str):
-        names = [item.strip() for item in re.split(r"[,\s]+", raw) if item.strip()]
-    elif isinstance(raw, (list, tuple, set)):
-        names = [str(item).strip() for item in raw if str(item).strip()]
-    else:
-        names = list(_DISCORD_FAST_MAINLINE_DEFAULT_TOOLSETS)
-
-    disabled = cfg_get(config or {}, "agent", "disabled_toolsets", default=[]) or []
-    disabled_set = {str(item).strip() for item in disabled if str(item).strip()}
-    return sorted(dict.fromkeys(name for name in names if name not in disabled_set))
-
-
 def _kanban_dispatch_health_candidate(board_slug: str, discord_worker_boards: Any) -> bool:
     """Return whether a board should count toward dispatcher stuck health.
 
@@ -19155,15 +19108,7 @@ class GatewayRunner:
         default_discord_kanban_intake = bool(
             getattr(source, "default_kanban_intake", False)
         )
-        if standard_discord_feature_request and _discord_fast_mainline_enabled(user_config):
-            enabled_toolsets = _discord_fast_mainline_toolsets(user_config)
-            logger.info(
-                "Discord fast mainline toolsets enabled for session %s: %s",
-                session_key or session_id,
-                ",".join(enabled_toolsets),
-            )
-        else:
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         if default_discord_kanban_intake and "kanban" not in enabled_toolsets:
             enabled_toolsets = sorted([*enabled_toolsets, "kanban"])
         agent_cfg_local = user_config.get("agent") or {}
