@@ -150,14 +150,17 @@ def _schema_instructions(role: str) -> str:
     if role == ROLE_PLANNER:
         return (
             'Schema: {"status":"planned|blocked","summary":"...","acceptance_criteria":["..."],'
-            '"tasks":[{"title":"...","body":"...","priority":0,"parents":[]}],"blocker":null} '
+            '"requirements":[{"id":"REQ-1","text":"...","source_message_ids":[],"owner_task_indices":[0],"required":true}],'
+            '"tasks":[{"title":"...","body":"...","priority":0,"parents":[],"requirement_ids":["REQ-1"]}],"blocker":null} '
             'In each task, "parents" is a list of earlier task indices this task depends on. '
+            "Use requirements for distinct obligations from the request or Discord context; give each a stable ID and set task requirement_ids for the dev ticket that owns it. "
             "Break the job into the fewest coherent dev tickets that can be implemented and verified independently. "
             "Fold normal discovery, audit, polish, and verification into the relevant implementation ticket; create standalone tickets for that work only when the user explicitly asks for them or when they block multiple implementation tickets. "
             f"{DEV_TICKET_BODY_GUIDANCE} "
             "Write Success means as ticket-specific acceptance criteria for the slice owned by that dev ticket; include board-level criteria only when that ticket owns the whole outcome. "
             "Set Stop when to the concrete handoff point for that ticket, usually code changed and verification recorded or a blocker stated. "
             "Include enough surrounding context from the overall request for a fresh dev worker to execute the ticket without guessing, but keep the scope tight to the ticket. "
+            "Do not paste the full Discord thread context into dev tickets; use requirement IDs, context_pack paths, and concise relevant notes instead. "
             "The top-level acceptance_criteria must be one deduplicated canonical board-level list; if criteria already exist in the Kanban context, reuse them instead of paraphrasing or adding near-duplicates. "
             "Treat slash-looking text in the request as user prose unless the Kanban context explicitly says otherwise."
         )
@@ -165,6 +168,7 @@ def _schema_instructions(role: str) -> str:
         return (
             'Schema: {"status":"approved|changes_requested|blocked","summary":"...","findings":["..."],'
             '"new_tasks":[{"title":"...","body":"...","priority":0}],"criteria_assessment":{}, "blocker":null} '
+            "Assess any requirements included in the Kanban context for coverage gaps. "
             "When requesting changes, each new_tasks body must be a self-contained follow-up brief that opens with Goal, Success means, and Stop when."
         )
     return (
@@ -533,7 +537,9 @@ def _apply_role_output(
         criteria = _string_list(payload.get("acceptance_criteria"))
         tasks = payload.get("tasks") if isinstance(payload.get("tasks"), list) else []
         dev_round = active_dev_round_for_board(board)
+        requirements = _normalize_requirements(payload.get("requirements"))
         specs = _planner_dev_task_specs(tasks, dev_round=dev_round, workspace=workspace, board=board)
+        _add_context_headers(specs, board=board)
         created: list[str] = []
         try:
             created = _create_planned_dev_tasks(conn, specs, created_by=ROLE_PLANNER)
@@ -542,12 +548,19 @@ def _apply_role_output(
                 conn,
                 task_id,
                 summary=summary or f"Planned {len(created)} task(s).",
-                metadata={"created_tasks": created, "acceptance_criteria": criteria, "raw": payload},
+                metadata={
+                    "created_tasks": created,
+                    "acceptance_criteria": criteria,
+                    "requirements": requirements,
+                    "raw": payload,
+                },
                 created_cards=created,
                 expected_run_id=expected_run_id,
             )
             if not completed:
                 _cleanup_created_tasks(conn, created)
+            else:
+                _persist_requirements(board, requirements, specs, created)
         except Exception:
             _cleanup_created_tasks(conn, created)
             raise
@@ -555,11 +568,15 @@ def _apply_role_output(
 
     if role == ROLE_REVIEWER:
         if status == "approved":
+            metadata = {"raw": payload}
+            criteria_assessment = payload.get("criteria_assessment")
+            if isinstance(criteria_assessment, dict):
+                metadata["criteria_assessment"] = criteria_assessment
             completed = kanban_db.complete_task(
                 conn,
                 task_id,
                 summary=summary or "Reviewer approved.",
-                metadata={"raw": payload},
+                metadata=metadata,
                 expected_run_id=expected_run_id,
             )
             if not completed:
@@ -583,6 +600,7 @@ def _apply_role_output(
         new_tasks = payload.get("new_tasks") if isinstance(payload.get("new_tasks"), list) else []
         dev_round = active_dev_round_for_board(board)
         specs = _reviewer_dev_task_specs(new_tasks, dev_round=dev_round, workspace=workspace, board=board)
+        _add_context_headers(specs, board=board)
         created: list[str] = []
         try:
             created = _create_planned_dev_tasks(conn, specs, created_by=ROLE_REVIEWER)
@@ -662,6 +680,7 @@ def _planner_dev_task_specs(
                 "tenant": board,
                 "priority": _priority(spec.get("priority"), 50 - (raw_idx + 1)),
                 "parent_indices": _parent_indices(spec, len(tasks), raw_idx),
+                "requirement_ids": _string_list(spec.get("requirement_ids")),
             }
         )
     return specs
@@ -690,9 +709,100 @@ def _reviewer_dev_task_specs(
                 "tenant": board,
                 "priority": _priority(spec.get("priority"), 90 - (raw_idx + 1)),
                 "parent_indices": [],
+                "requirement_ids": _string_list(spec.get("requirement_ids")),
             }
         )
     return specs
+
+
+def _add_context_headers(specs: list[dict[str, Any]], *, board: Optional[str]) -> None:
+    if not board:
+        return
+    metadata = kanban_db.read_board_metadata(board)
+    from hermes_cli.discord_worker_boards import DISCORD_WORKER_META_KEY
+
+    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    context_path = str(worker.get("context_pack_markdown_path") or worker.get("context_pack_path") or "").strip()
+    if not context_path:
+        return
+    for spec in specs:
+        requirement_ids = _string_list(spec.get("requirement_ids"))
+        lines = ["Context pack:", f"- {context_path}"]
+        if worker.get("context_pack_path") and str(worker.get("context_pack_path")) != context_path:
+            lines.append(f"- JSON: {worker.get('context_pack_path')}")
+        if requirement_ids:
+            lines.append("Requirement IDs: " + ", ".join(requirement_ids))
+        header = "\n".join(lines).strip()
+        body = str(spec.get("body") or "").lstrip()
+        spec["body"] = f"{header}\n\n{body}" if body else header
+
+
+def _normalize_requirements(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    requirements: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for idx, raw in enumerate(value, start=1):
+        if not isinstance(raw, dict):
+            continue
+        req_id = re.sub(r"[^0-9A-Za-z_.:-]+", "-", str(raw.get("id") or f"REQ-{idx}").strip())[:80]
+        text = str(raw.get("text") or "").strip()
+        if not req_id or not text or req_id in seen:
+            continue
+        seen.add(req_id)
+        owner_indices: list[int] = []
+        for item in raw.get("owner_task_indices") if isinstance(raw.get("owner_task_indices"), list) else []:
+            try:
+                owner_indices.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        requirements.append(
+            {
+                "id": req_id,
+                "text": text,
+                "source_message_ids": _string_list(raw.get("source_message_ids")),
+                "owner_task_indices": owner_indices,
+                "owner_task_ids": [],
+                "required": bool(raw.get("required", True)),
+            }
+        )
+    return requirements
+
+
+def _persist_requirements(
+    board: Optional[str],
+    requirements: list[dict[str, Any]],
+    specs: list[dict[str, Any]],
+    created: list[str],
+) -> None:
+    if not board:
+        return
+    from hermes_cli.discord_worker_boards import DISCORD_WORKER_META_KEY
+    from utils import atomic_json_write
+
+    raw_to_task = {
+        int(spec["raw_index"]): created[idx]
+        for idx, spec in enumerate(specs)
+        if idx < len(created)
+    }
+    for req in requirements:
+        owner_ids = [raw_to_task[idx] for idx in req.get("owner_task_indices") or [] if idx in raw_to_task]
+        if not owner_ids:
+            owner_ids = [
+                raw_to_task[int(spec["raw_index"])]
+                for spec in specs
+                if req["id"] in _string_list(spec.get("requirement_ids"))
+                and int(spec["raw_index"]) in raw_to_task
+            ]
+        req["owner_task_ids"] = owner_ids
+    metadata = kanban_db.read_board_metadata(board)
+    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    # Planner output is authoritative for the current planning pass. Clear stale
+    # requirements when an older/auxiliary planner omits the optional field.
+    worker["requirements"] = requirements
+    metadata[DISCORD_WORKER_META_KEY] = worker
+    metadata.pop("db_path", None)
+    atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
 
 
 def _create_planned_dev_tasks(

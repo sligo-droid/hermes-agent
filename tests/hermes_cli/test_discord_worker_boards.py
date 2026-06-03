@@ -686,6 +686,55 @@ def test_set_goal_persists_thread_context_for_planner(monkeypatch, tmp_path):
     assert len(tasks) == 1
     payload = json.loads(tasks[0].body or "{}")
     assert payload["discord_thread_context"] == context
+    assert payload["context_pack"]["version"] == 1
+    assert payload["context_pack"]["markdown_path"].endswith("context-pack.md")
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["context_version"] == 1
+    pack = json.loads(Path(worker["context_pack_path"]).read_text(encoding="utf-8"))
+    assert pack["request"] == "Use the details above"
+    assert pack["discord_thread_context"] == context
+    assert pack["message_count"] == 2
+    assert pack["truncated"] is False
+    assert Path(worker["context_pack_markdown_path"]).read_text(encoding="utf-8").startswith(
+        "# Discord Goal Context Pack"
+    )
+
+
+def test_start_planner_request_context_pack_version_only_changes_on_material_context(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    context = "[Goal thread context truncated to recent messages]\n[Alice] keep message 123456789012345678"
+    board = dwb.start_planner_request(
+        thread_id="7793",
+        request="Ship context pack",
+        request_id="msg-7793",
+        thread_context=context,
+    )
+    first = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    repeated = dwb.start_planner_request(
+        thread_id="7793",
+        request="Ship context pack",
+        request_id="msg-7793",
+        thread_context=context,
+    )
+    second = kanban_db.read_board_metadata(repeated.slug)["discord_worker"]
+    changed = dwb.start_planner_request(
+        thread_id="7793",
+        request="Ship context pack",
+        request_id="msg-7793",
+        thread_context=context + "\n[Bob] new detail",
+    )
+    third = kanban_db.read_board_metadata(changed.slug)["discord_worker"]
+
+    assert first["context_version"] == 1
+    assert second["context_version"] == 1
+    assert third["context_version"] == 2
+    pack = json.loads(Path(third["context_pack_path"]).read_text(encoding="utf-8"))
+    assert pack["truncated"] is True
+    assert pack["source_message_ids"] == ["123456789012345678"]
+    assert pack["warnings"] == ["Discord thread context was truncated to recent messages."]
 
 
 def test_completed_goal_thread_new_request_gets_new_board(monkeypatch, tmp_path):
@@ -2354,6 +2403,53 @@ def test_reconcile_board_creates_round_prefixed_reviewer_ticket(monkeypatch, tmp
 
     assert len(reviewer_tasks) == 1
     assert reviewer_tasks[0].title == "R1: Review Discord implementation"
+
+
+def test_reconcile_board_reviewer_body_includes_context_pack_and_requirements(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_planner_request(
+        thread_id="review-context",
+        request="Ship from Discord context",
+        request_id="msg-review-context",
+        thread_context="[Goal thread context]\n[Alice] req 123456789012345678",
+    )
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "requirements": [
+                {
+                    "id": "REQ-1",
+                    "text": "Preserve context",
+                    "source_message_ids": ["123456789012345678"],
+                    "owner_task_ids": ["task-1"],
+                    "required": True,
+                }
+            ]
+        },
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        for task in kanban_db.list_tasks(conn, include_archived=False):
+            claimed = kanban_db.claim_task(conn, task.id)
+            assert claimed is not None
+            kanban_db.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+
+    assert dwb.reconcile_board(board.slug) == "reviewer_created"
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        reviewer = [task for task in kanban_db.list_tasks(conn, include_archived=False) if task.assignee == "reviewer"][0]
+    finally:
+        conn.close()
+
+    payload = json.loads(reviewer.body or "{}")
+    assert payload["context_pack"]["version"] == 1
+    assert payload["context_pack"]["markdown_path"].endswith("context-pack.md")
+    assert payload["requirements"][0]["id"] == "REQ-1"
 
 
 def test_dispatch_once_allows_explicit_role_lane_assignees(monkeypatch, tmp_path):

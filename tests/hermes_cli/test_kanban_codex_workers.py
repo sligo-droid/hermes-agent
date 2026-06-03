@@ -1219,6 +1219,69 @@ def test_planner_output_cleans_created_tasks_when_completion_fails(monkeypatch, 
     assert dev_tasks == []
 
 
+def test_planner_output_persists_requirements_and_adds_dev_context_header(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_PLANNER
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    metadata = kanban_db.read_board_metadata(board.slug)
+    board_worker = dict(metadata["discord_worker"])
+    board_worker.update(
+        {
+            "context_pack_path": str(tmp_path / "context-pack.json"),
+            "context_pack_markdown_path": str(tmp_path / "context-pack.md"),
+        }
+    )
+    from hermes_cli import discord_worker_boards as dwb
+
+    dwb._update_worker_meta(board.slug, board_worker)
+    payload = {
+        "status": "planned",
+        "summary": "Planned one step.",
+        "acceptance_criteria": ["done"],
+        "requirements": [
+            {
+                "id": "REQ-1",
+                "text": "Preserve Discord context",
+                "source_message_ids": ["123456789012345678"],
+                "owner_task_indices": [0],
+                "required": True,
+            }
+        ],
+        "tasks": [
+            {
+                "title": "Build context pack",
+                "body": "Goal: implement.\nSuccess means: done.\nStop when: verified.",
+                "priority": 20,
+                "requirement_ids": ["REQ-1"],
+            }
+        ],
+    }
+
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        worker._apply_role_output(
+            conn,
+            task.id,
+            ROLE_PLANNER,
+            payload,
+            board=board.slug,
+            workspace=str(tmp_path / "repo"),
+            expected_run_id=task.current_run_id,
+        )
+        dev_task = [item for item in kanban_db.list_tasks(conn, include_archived=False) if item.assignee == "dev"][0]
+    finally:
+        conn.close()
+
+    assert "Context pack:" in dev_task.body
+    assert str(tmp_path / "context-pack.md") in dev_task.body
+    assert "Requirement IDs: REQ-1" in dev_task.body
+    worker_meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker_meta["requirements"][0]["id"] == "REQ-1"
+    assert worker_meta["requirements"][0]["owner_task_ids"] == [dev_task.id]
+
+
 def test_reviewer_output_creates_next_round_dev_ticket(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
