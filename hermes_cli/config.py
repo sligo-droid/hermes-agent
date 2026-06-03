@@ -1965,6 +1965,40 @@ DEFAULT_CONFIG = {
         "dispatch_stale_timeout_seconds": 14400,
     },
 
+    # Self-improvement proposal intake. Cron prongs can emit strict structured
+    # proposal JSON that is stored separately from the Kanban execution DB.
+    "self_improvement": {
+        "enabled": False,
+        "storage_db": "self_improvement/proposals.db",
+        "projects": {
+            "sligo": {
+                "name": "Sligo",
+                "workspace_path": ".",
+                "board": "default",
+                "assignee": "dev",
+                "skills": [],
+                "prongs": {
+                    "airflow_doctor": {
+                        "name": "Airflow Doctor",
+                        "enabled": True,
+                    },
+                    "admin_dogfood": {
+                        "name": "Admin Dogfood",
+                        "enabled": True,
+                    },
+                    "invisible_technical_recommendations": {
+                        "name": "Invisible Technical Recommendations",
+                        "enabled": True,
+                    },
+                    "visible_ui_ux_recommendations": {
+                        "name": "Visible UI/UX Recommendations",
+                        "enabled": True,
+                    },
+                },
+            },
+        },
+    },
+
     # execute_code settings — controls the tool used for programmatic tool calls.
     "code_execution": {
         # Execution mode:
