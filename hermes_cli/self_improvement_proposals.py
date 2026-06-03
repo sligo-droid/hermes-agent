@@ -44,6 +44,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from hermes_cli import kanban_db
 from hermes_constants import get_hermes_home
 from hermes_cli.config import DEFAULT_CONFIG, load_config
 
@@ -412,6 +413,254 @@ def get_proposal_detail(
     return sanitize_proposal(dict(row)) if row else None
 
 
+def add_feedback(
+    card_id: str,
+    *,
+    feedback_type: str,
+    body: str,
+    author: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    db_path: str | Path | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    feedback_type = str(feedback_type or "comment").strip().lower()
+    if feedback_type not in {"comment", "reject", "approve", "edit"}:
+        raise ValueError("feedback_type must be comment, reject, approve, or edit")
+    body = str(body or "").strip()
+    if not body:
+        raise ValueError("feedback body is required")
+    now = int(time.time())
+    with connect(db_path, config) as conn:
+        if conn.execute("SELECT 1 FROM proposal_cards WHERE card_id = ?", (card_id,)).fetchone() is None:
+            raise KeyError(card_id)
+        cur = conn.execute(
+            """
+            INSERT INTO proposal_feedback (card_id, feedback_type, body, author, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (card_id, feedback_type, body, author, json.dumps(sanitize_payload(metadata or {}), sort_keys=True), now),
+        )
+        conn.commit()
+        return {
+            "id": cur.lastrowid,
+            "card_id": card_id,
+            "feedback_type": feedback_type,
+            "body": body,
+            "author": author,
+            "metadata": sanitize_payload(metadata or {}),
+            "created_at": now,
+        }
+
+
+def list_feedback(
+    card_id: str,
+    *,
+    db_path: str | Path | None = None,
+    config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    with connect(db_path, config) as conn:
+        rows = conn.execute(
+            "SELECT * FROM proposal_feedback WHERE card_id = ? ORDER BY id ASC",
+            (card_id,),
+        ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "card_id": row["card_id"],
+            "feedback_type": row["feedback_type"],
+            "body": row["body"],
+            "author": row["author"],
+            "metadata": sanitize_payload(_json_value(row["metadata_json"], {})),
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+
+
+def edit_proposal(
+    card_id: str,
+    *,
+    title: str | None = None,
+    summary: str | None = None,
+    body: str | None = None,
+    priority: str | None = None,
+    confidence: float | None = None,
+    effort: str | None = None,
+    acceptance_criteria: list[str] | None = None,
+    db_path: str | Path | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    updates: dict[str, Any] = {}
+    if title is not None:
+        updates["title"] = _non_empty_edit_str(title, "title")
+    if summary is not None:
+        updates["summary"] = _non_empty_edit_str(summary, "summary")
+    if body is not None:
+        updates["body"] = _non_empty_edit_str(body, "body")
+    if priority is not None:
+        value = str(priority).strip().lower()
+        if value not in {"low", "medium", "high", "urgent"}:
+            raise ValueError("priority must be low, medium, high, or urgent")
+        updates["priority"] = value
+    if confidence is not None:
+        if not isinstance(confidence, (int, float)) or confidence < 0 or confidence > 1:
+            raise ValueError("confidence must be a number between 0 and 1")
+        updates["confidence"] = float(confidence)
+    if effort is not None:
+        value = str(effort).strip().lower()
+        if value not in {"small", "medium", "large"}:
+            raise ValueError("effort must be small, medium, or large")
+        updates["effort"] = value
+    if acceptance_criteria is not None:
+        if not isinstance(acceptance_criteria, list) or not all(isinstance(v, str) and v.strip() for v in acceptance_criteria):
+            raise ValueError("acceptance_criteria must be a non-empty list of strings")
+        updates["acceptance_criteria_json"] = json.dumps([v.strip() for v in acceptance_criteria])
+    if not updates:
+        raise ValueError("no editable fields supplied")
+    updates["updated_at"] = int(time.time())
+    assignments = ", ".join(f"{name} = ?" for name in updates)
+    with connect(db_path, config) as conn:
+        cur = conn.execute(
+            f"UPDATE proposal_cards SET {assignments} WHERE card_id = ? AND status = 'proposed'",
+            [*updates.values(), card_id],
+        )
+        if cur.rowcount == 0:
+            exists = conn.execute("SELECT 1 FROM proposal_cards WHERE card_id = ?", (card_id,)).fetchone()
+            if exists is None:
+                raise KeyError(card_id)
+            raise ValueError("only proposed cards may be edited")
+        conn.commit()
+    detail = get_proposal_detail(card_id, db_path=db_path, config=config)
+    if detail is None:
+        raise KeyError(card_id)
+    return detail
+
+
+def approve_proposal(
+    card_id: str,
+    *,
+    actor: str | None = None,
+    config: dict[str, Any] | None = None,
+    db_path: str | Path | None = None,
+) -> dict[str, Any]:
+    now = int(time.time())
+    with connect(db_path, config) as conn:
+        row = conn.execute("SELECT * FROM proposal_cards WHERE card_id = ?", (card_id,)).fetchone()
+        if row is None:
+            raise KeyError(card_id)
+        card = sanitize_proposal(dict(row))
+        if card["status"] == "rejected":
+            raise ValueError("rejected cards cannot be approved")
+        validate_approval_project_workspace(card["project"], card["resolved_workspace_path"], config)
+        board = str(card["resolved_board"] or "default")
+        kanban_db.init_db(board=board)
+        with kanban_db.connect(board=board) as kb_conn:
+            task_id = kanban_db.create_task(
+                kb_conn,
+                title=card["title"],
+                body=build_kanban_task_body(card),
+                assignee=card["resolved_assignee"],
+                created_by="self-improvement",
+                workspace_kind="dir",
+                workspace_path=card["resolved_workspace_path"],
+                priority=_kanban_priority(card.get("priority")),
+                idempotency_key=f"self-improvement:{card_id}",
+                skills=card["resolved_skills"],
+                initial_status="running",
+                board=board,
+            )
+        conn.execute(
+            """
+            UPDATE proposal_cards
+            SET status = 'approved', lifecycle_status = 'worker_created', decision = 'approved',
+                decided_by = COALESCE(decided_by, ?), decided_at = COALESCE(decided_at, ?),
+                linked_kanban_task_id = ?, updated_at = ?
+            WHERE card_id = ?
+            """,
+            (actor, now, task_id, now, card_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO proposal_feedback (card_id, feedback_type, body, author, metadata_json, created_at)
+            VALUES (?, 'approve', ?, ?, ?, ?)
+            """,
+            (card_id, f"Approved into Kanban task {task_id}", actor, json.dumps({"board": board, "task_id": task_id}), now),
+        )
+        conn.commit()
+    detail = get_proposal_detail(card_id, db_path=db_path, config=config)
+    return _with_worker_link(detail, board=board, task_id=task_id)
+
+
+def reject_proposal(
+    card_id: str,
+    *,
+    reason: str | None = None,
+    strength: str | None = None,
+    actor: str | None = None,
+    db_path: str | Path | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    now = int(time.time())
+    reason_text = str(reason or "").strip()
+    metadata = {"strength": str(strength).strip()} if strength else {}
+    with connect(db_path, config) as conn:
+        row = conn.execute("SELECT * FROM proposal_cards WHERE card_id = ?", (card_id,)).fetchone()
+        if row is None:
+            raise KeyError(card_id)
+        if row["status"] == "approved":
+            raise ValueError("approved cards cannot be rejected")
+        conn.execute(
+            """
+            UPDATE proposal_cards
+            SET status = 'rejected', lifecycle_status = 'archived', decision = 'rejected',
+                decision_reason = ?, decided_by = COALESCE(decided_by, ?),
+                decided_at = COALESCE(decided_at, ?), updated_at = ?
+            WHERE card_id = ?
+            """,
+            (reason_text or None, actor, now, now, card_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO proposal_feedback (card_id, feedback_type, body, author, metadata_json, created_at)
+            VALUES (?, 'reject', ?, ?, ?, ?)
+            """,
+            (card_id, reason_text or "Rejected", actor, json.dumps(metadata, sort_keys=True), now),
+        )
+        conn.commit()
+    detail = get_proposal_detail(card_id, db_path=db_path, config=config)
+    if detail is None:
+        raise KeyError(card_id)
+    return detail
+
+
+def build_kanban_task_body(card: dict[str, Any]) -> str:
+    criteria = card.get("acceptance_criteria") or []
+    lines = [
+        "Self-Improvement proposal approved for implementation.",
+        "",
+        "Worker prompt:",
+        str(card.get("worker_prompt") or "").strip(),
+        "",
+        "Acceptance criteria:",
+    ]
+    lines.extend(f"- {str(item).strip()}" for item in criteria if str(item).strip())
+    lines.extend([
+        "",
+        "Proposal context:",
+        str(card.get("body") or card.get("summary") or "").strip(),
+    ])
+    return "\n".join(lines).strip()
+
+
+def _with_worker_link(detail: dict[str, Any] | None, *, board: str, task_id: str) -> dict[str, Any]:
+    if detail is None:
+        raise KeyError(task_id)
+    result = dict(detail)
+    result["linked_kanban_board"] = board
+    result["worker"] = {"board": board, "task_id": task_id, "url": _worker_url(board, task_id)}
+    return result
+
+
 def sanitize_run(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": row.get("id"),
@@ -651,6 +900,29 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def _non_empty_edit_str(value: str, field: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field} must be a non-empty string")
+    return text
+
+
+def _kanban_priority(priority: Any) -> int:
+    return {"low": -1, "medium": 0, "high": 1, "urgent": 2}.get(str(priority or "medium").lower(), 0)
+
+
+def _worker_url(board: str, task_id: str) -> str:
+    try:
+        from hermes_cli.discord_worker_boards import public_session_board_url
+
+        public_url = public_session_board_url(board)
+        if public_url:
+            return public_url
+    except Exception:
+        pass
+    return f"/workers/{board}?task={task_id}"
 
 
 def _metadata_str(metadata: dict[str, Any], *keys: str) -> str | None:
