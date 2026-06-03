@@ -150,6 +150,27 @@ def test_parent_guidance_keeps_post_worker_checks_minimal(monkeypatch, tmp_path)
     assert "comprehensive testing belongs to the worker" in guidance
 
 
+def test_parent_guidance_names_pr_boundary_workflow(monkeypatch, tmp_path):
+    hermes_root = tmp_path / "hermes"
+    hermes_root.mkdir()
+    monkeypatch.setattr(cws, "_known_hermes_roots", lambda: (hermes_root,))
+    monkeypatch.setattr(cws, "_git_common_dir", lambda cwd: None)
+
+    guidance = cws.build_worker_guidance(
+        "fix the Hermes gateway regression",
+        enabled=True,
+        tool_available=True,
+        api_mode="chat_completions",
+        cwd=str(hermes_root),
+    )
+
+    assert "github-pr-workflow" in guidance
+    assert "PR boundary" in guidance
+    assert "worker returned code changes or a committed repo fix" in guidance
+    assert "complete PR->CI->merge->pull" in guidance
+    assert "review-only or blocked" in guidance
+
+
 def test_hermes_context_detects_prompt_references_and_cwd(monkeypatch, tmp_path):
     hermes_root = tmp_path / "hermes"
     hermes_root.mkdir()
