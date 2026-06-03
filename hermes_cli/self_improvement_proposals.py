@@ -47,6 +47,7 @@ from typing import Any
 from hermes_cli import kanban_db
 from hermes_constants import get_hermes_home
 from hermes_cli.config import DEFAULT_CONFIG, load_config
+from agent.redact import redact_sensitive_text
 
 
 PARSER_VERSION = 1
@@ -60,6 +61,9 @@ _INIT_LOCK = threading.Lock()
 _SECRET_KEY_RE = re.compile(
     r"(api[_-]?key|token|secret|password|credential|private[_-]?key|auth)",
     re.IGNORECASE,
+)
+_EMBEDDED_SECRET_PREFIX_RE = re.compile(
+    r"(?i)(sk-(?:ant-)?[A-Za-z0-9_-]{10,}|ghp_[A-Za-z0-9_-]{10,}|github_pat_[A-Za-z0-9_]{10,}|gh[ousr]_[A-Za-z0-9_-]{10,})"
 )
 
 
@@ -931,7 +935,9 @@ def sanitize_payload(value: Any) -> Any:
         return clean
     if isinstance(value, list):
         return [sanitize_payload(item) for item in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    if isinstance(value, str):
+        return _sanitize_free_text(value)
+    if isinstance(value, (int, float, bool)) or value is None:
         return value
     return str(value)
 
@@ -959,10 +965,10 @@ def _normalize_proposal(item: Any, context: dict[str, Any]) -> dict[str, Any]:
     extra = sorted(set(item) - allowed)
     if extra:
         raise ProposalParseError(f"Unexpected proposal fields: {', '.join(extra)}")
-    title = _required_str(item, "title")
-    summary = _required_str(item, "summary")
-    body = _required_str(item, "body")
-    worker_prompt = _required_str(item, "worker_prompt")
+    title = _sanitize_free_text(_required_str(item, "title"))
+    summary = _sanitize_free_text(_required_str(item, "summary"))
+    body = _sanitize_free_text(_required_str(item, "body"))
+    worker_prompt = _sanitize_free_text(_required_str(item, "worker_prompt"))
     acceptance_criteria = item.get("acceptance_criteria")
     if not isinstance(acceptance_criteria, list) or not all(isinstance(v, str) and v.strip() for v in acceptance_criteria):
         raise ProposalParseError("acceptance_criteria must be a non-empty list of strings")
@@ -991,7 +997,7 @@ def _normalize_proposal(item: Any, context: dict[str, Any]) -> dict[str, Any]:
         "summary": summary,
         "body": body,
         "worker_prompt": worker_prompt,
-        "acceptance_criteria": acceptance_criteria,
+        "acceptance_criteria": [_sanitize_free_text(v.strip()) for v in acceptance_criteria],
         "evidence": sanitize_payload(evidence),
         "priority": priority,
         "confidence": float(confidence),
@@ -1004,6 +1010,9 @@ def _normalize_proposal(item: Any, context: dict[str, Any]) -> dict[str, Any]:
 
 def _insert_run(conn: sqlite3.Connection, **kwargs: Any) -> int:
     metadata = sanitize_payload(kwargs["metadata"])
+    for key in ("proposal_json", "proposal_block", "self_improvement_proposals", "structured_proposals"):
+        if key in metadata:
+            metadata[key] = "[REDACTED STRUCTURED PROPOSAL]"
     fields = {
         "run_key": kwargs["run_key"],
         "project": kwargs["project"],
@@ -1015,7 +1024,7 @@ def _insert_run(conn: sqlite3.Connection, **kwargs: Any) -> int:
         "cron_job_id": _metadata_str(metadata, "cron_job_id", "job_id"),
         "cron_job_name": _metadata_str(metadata, "cron_job_name", "job_name"),
         "cron_run_id": _metadata_str(metadata, "cron_run_id", "run_id"),
-        "cron_output_path": kwargs["output_path"],
+        "cron_output_path": _sanitize_free_text(kwargs["output_path"]),
         "cron_output_sha256": kwargs["output_hash"],
         "source_timestamp": kwargs["source_timestamp"],
         "model": _metadata_str(metadata, "model"),
@@ -1070,7 +1079,7 @@ def _insert_card(
         "resolved_skills_json": json.dumps(context["skills"]),
         "idempotency_key": card["idempotency_key"],
         "source_run_id": run_id,
-        "source_output_path": output_path,
+        "source_output_path": _sanitize_free_text(output_path),
         "source_output_sha256": output_hash,
         "source_timestamp": source_timestamp,
         "created_at": now,
@@ -1090,6 +1099,13 @@ def _required_str(data: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ProposalParseError(f"{key} must be a non-empty string")
     return value.strip()
+
+
+def _sanitize_free_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = redact_sensitive_text(str(value), force=True)
+    return _EMBEDDED_SECRET_PREFIX_RE.sub("***", text)
 
 
 def _string_list(value: Any) -> list[str]:

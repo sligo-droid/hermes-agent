@@ -2176,6 +2176,7 @@ class TestDashboardPluginManifestExtensions:
         plugins = web_server._get_dashboard_plugins(force_rescan=True)
         entry = next(p for p in plugins if p["name"] == "sligo")
 
+        assert entry["label"] == "Self-Improvement"
         assert entry["tab"]["path"] == "/self-improvement"
         assert entry["tab"]["position"] == "before:sessions"
         assert entry["entry"] == "dist/index.js"

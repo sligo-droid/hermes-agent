@@ -16,6 +16,19 @@ def test_workers_nav_link_appears_under_plugins_and_reload_document():
     assert "reloadDocument={item.reloadDocument}" in content
 
 
+def test_operator_default_surface_prioritizes_workers_without_removing_admin_routes():
+    app_tsx = Path(__file__).resolve().parents[2] / "web" / "src" / "App.tsx"
+
+    content = app_tsx.read_text(encoding="utf-8")
+
+    assert 'return <Navigate to="/workers" replace />;' in content
+    assert '"/sessions": SessionsPage' in content
+    assert '"/config": ConfigPage' in content
+    assert '"/env": EnvPage' in content
+    assert '"/plugins": PluginsPage' in content
+    assert 'pluginItems: [WORKERS_NAV_ITEM, ...nav.pluginItems]' in content
+
+
 def test_worker_console_uses_shared_dashboard_websocket_auth():
     page_tsx = (
         Path(__file__).resolve().parents[2]

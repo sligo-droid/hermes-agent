@@ -89,19 +89,35 @@ def test_connect_initializes_profile_scoped_db_and_tables(tmp_path, monkeypatch)
 
 def test_valid_ingestion_from_metadata_stores_run_card_source_and_sanitizes(tmp_path):
     cfg = _config(tmp_path)
-    source = tmp_path / "cron-output.txt"
+    source = tmp_path / "cron-output-sk-proj-sourceSecret1234567890.txt"
     source.write_text("cron output", encoding="utf-8")
+    payload = _payload()
+    payload["proposals"][0].update(
+        {
+            "title": "Add Airflow summary sk-proj-titleSecret1234567890",
+            "summary": "Expose failed DAGs using sk-proj-summarySecret1234567890 in neutral prose.",
+            "body": "Operators saw OPENAI_API_KEY=bodySecret1234567890 during triage.",
+            "worker_prompt": "Implement without leaking ghp_workerSecret1234567890.",
+            "evidence": [
+                {
+                    "label": "log sk-proj-labelSecret1234567890",
+                    "detail": "dag failed with token ghp_detailSecret1234567890",
+                    "api_token": "secret-token",
+                }
+            ],
+        }
+    )
     result = sip.ingest_proposal_output(
         metadata={
-            "proposal_json": json.dumps(_payload()),
+            "proposal_json": json.dumps(payload),
             "cron_output_path": str(source),
             "cron_job_id": "job-1",
-            "cron_job_name": "Sligo proposals",
+            "cron_job_name": "Sligo proposals sk-proj-jobSecret1234567890",
             "cron_run_id": "run-1",
-            "model": "test-model",
+            "model": "test-model sk-proj-modelSecret1234567890",
             "provider": "test-provider",
             "profile": "dev",
-            "workdir": str(tmp_path),
+            "workdir": f"{tmp_path}/sk-proj-workdirSecret1234567890",
         },
         config=cfg,
     )
@@ -110,22 +126,46 @@ def test_valid_ingestion_from_metadata_stores_run_card_source_and_sanitizes(tmp_
     assert len(result["card_ids"]) == 1
 
     runs = sip.list_runs(project="sligo", config=cfg)
-    assert runs[0]["cron_output_path"] == str(source)
+    assert "sk-proj-sourceSecret1234567890" not in runs[0]["cron_output_path"]
+    assert "sk-proj-jobSecret1234567890" not in runs[0]["cron_job_name"]
+    assert "sk-proj-modelSecret1234567890" not in runs[0]["model"]
+    assert "sk-proj-workdirSecret1234567890" not in runs[0]["workdir"]
     assert len(runs[0]["cron_output_sha256"]) == 64
     assert "metadata_json" not in runs[0]
 
     cards = sip.list_proposals(project="sligo", prong="airflow_doctor", config=cfg)
-    assert cards[0]["title"] == "Add Airflow DAG health summary"
+    assert "sk-proj-titleSecret1234567890" not in cards[0]["title"]
+    assert "sk-proj-summarySecret1234567890" not in cards[0]["summary"]
+    assert "bodySecret1234567890" not in cards[0]["body"]
+    assert "ghp_workerSecret1234567890" not in cards[0]["worker_prompt"]
     assert cards[0]["resolved_workspace_path"] == str(tmp_path / "sligo")
     assert cards[0]["resolved_board"] == "sligo-board"
     assert cards[0]["resolved_assignee"] == "dev"
     assert cards[0]["resolved_skills"] == ["python"]
     assert cards[0]["suggested_assignee"] == "somebody-else"
     assert cards[0]["evidence"][0]["api_token"] == "[REDACTED]"
+    assert "sk-proj-labelSecret1234567890" not in cards[0]["evidence"][0]["label"]
+    assert "ghp_detailSecret1234567890" not in cards[0]["evidence"][0]["detail"]
+    detail = sip.get_proposal_detail(cards[0]["card_id"], config=cfg)
+    assert "ghp_workerSecret1234567890" not in detail["worker_prompt"]
 
     with sqlite3.connect(str(tmp_path / "proposals.db")) as conn:
-        stored = conn.execute("SELECT evidence_json FROM proposal_cards").fetchone()[0]
+        stored_row = conn.execute(
+            "SELECT title, summary, body, worker_prompt, evidence_json, source_output_path FROM proposal_cards"
+        ).fetchone()
+        stored_run = conn.execute("SELECT cron_job_name, model, workdir, metadata_json FROM proposal_runs").fetchone()
+    stored = " ".join(str(value) for value in (*stored_row, *stored_run))
     assert "secret-token" not in stored
+    assert "sk-proj-titleSecret1234567890" not in stored
+    assert "sk-proj-summarySecret1234567890" not in stored
+    assert "bodySecret1234567890" not in stored
+    assert "ghp_workerSecret1234567890" not in stored
+    assert "sk-proj-labelSecret1234567890" not in stored
+    assert "ghp_detailSecret1234567890" not in stored
+    assert "sk-proj-sourceSecret1234567890" not in stored
+    assert "sk-proj-jobSecret1234567890" not in stored
+    assert "sk-proj-modelSecret1234567890" not in stored
+    assert "sk-proj-workdirSecret1234567890" not in stored
 
 
 def test_ingestion_from_marked_output_text(tmp_path):
