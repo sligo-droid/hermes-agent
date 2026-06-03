@@ -240,6 +240,7 @@ def test_malformed_json_creates_visible_parse_failure_run(tmp_path):
     runs = sip.list_runs(parse_status="parse_error", config=cfg)
     assert runs[0]["parse_status"] == "parse_error"
     assert "Malformed proposal JSON" in runs[0]["parse_error"]
+    assert sip.get_run_detail(runs[0]["id"], config=cfg)["parse_error"] == runs[0]["parse_error"]
     assert sip.list_proposals(config=cfg) == []
 
 

@@ -151,6 +151,38 @@ def test_reject_records_feedback_without_task(client):
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
 
 
+def test_parse_error_run_is_visible_without_proposal_cards(client):
+    r = client.post(
+        "/api/plugins/sligo/ingest",
+        headers={"X-Hermes-Session-Token": "test-token"},
+        json={
+            "metadata": {
+                "proposal_json": "{not json",
+                "cron_run_id": "bad-run",
+                "project": "sligo",
+                "prong": "airflow_doctor",
+                "cron_output_path": "/tmp/cron-output.txt",
+                "cron_output_sha256": "abc123",
+                "source_timestamp": 1700000000,
+            }
+        },
+    )
+
+    assert r.status_code == 200
+    assert r.json()["parse_status"] == "parse_error"
+    headers = {"X-Hermes-Session-Token": "test-token"}
+    runs = client.get("/api/plugins/sligo/runs?parse_status=parse_error", headers=headers).json()["runs"]
+    assert runs[0]["project"] == "sligo"
+    assert runs[0]["prong"] == "airflow_doctor"
+    assert runs[0]["cron_output_path"] == "/tmp/cron-output.txt"
+    assert runs[0]["cron_output_sha256"] == "abc123"
+    assert runs[0]["source_timestamp"] == 1700000000
+    assert "Malformed proposal JSON" in runs[0]["parse_error"]
+    detail = client.get(f"/api/plugins/sligo/runs/{runs[0]['id']}", headers=headers).json()["run"]
+    assert detail["parse_error"] == runs[0]["parse_error"]
+    assert client.get("/api/plugins/sligo/proposals", headers=headers).json()["proposals"] == []
+
+
 def test_limited_edit_validation_and_unsafe_override_rejection(client):
     card_id = _ingest_card(client)
     headers = {"X-Hermes-Session-Token": "test-token"}

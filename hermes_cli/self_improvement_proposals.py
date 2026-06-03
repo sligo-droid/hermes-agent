@@ -394,6 +394,17 @@ def list_runs(
     return [sanitize_run(dict(row)) for row in rows]
 
 
+def get_run_detail(
+    run_id: int,
+    *,
+    db_path: str | Path | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    with connect(db_path, config) as conn:
+        row = conn.execute("SELECT * FROM proposal_runs WHERE id = ?", (run_id,)).fetchone()
+    return sanitize_run(dict(row)) if row else None
+
+
 def list_proposals(
     *,
     project: str | None = None,

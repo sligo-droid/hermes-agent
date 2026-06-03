@@ -75,6 +75,14 @@ def list_runs(
     return {"runs": sip.list_runs(project=project, prong=prong, parse_status=parse_status, limit=limit)}
 
 
+@router.get("/runs/{run_id}")
+def get_run(run_id: int):
+    detail = sip.get_run_detail(run_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return {"run": detail}
+
+
 @router.get("/proposals")
 def list_proposals(
     project: Optional[str] = None,

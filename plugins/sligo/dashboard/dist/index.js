@@ -124,6 +124,14 @@
       }, {});
     }, [proposals]);
 
+    const parseFailures = useMemo(() => {
+      return runs.filter((run) => {
+        if (run.parse_status !== "parse_error") return false;
+        if (filters.project !== "all" && run.project !== filters.project) return false;
+        return true;
+      });
+    }, [filters.project, runs]);
+
     function setFilter(name, value) {
       setFilters((prev) => ({ ...prev, [name]: value }));
     }
@@ -194,6 +202,7 @@
           statPill("Proposed", stats.proposed || 0),
           statPill("Approved", stats.approved || 0),
           statPill("Rejected", stats.rejected || 0),
+          statPill("Parse failures", parseFailures.length),
           h(Button, { onClick: loadBoard, disabled: loading, className: "h-8" }, loading ? "Refreshing..." : "Refresh")
         )
       ),
@@ -205,6 +214,7 @@
       ),
       loading ? h("div", { className: "rounded-xl border border-current/10 p-6 text-sm text-text-secondary" }, "Loading self-improvement proposals...") : null,
       !loading && columns.length === 0 ? h("div", { className: "rounded-xl border border-current/10 p-6 text-sm text-text-secondary" }, "No proposals match these filters.") : null,
+      !loading && parseFailures.length ? h(ParseFailurePanel, { runs: parseFailures, prongLabels }) : null,
       h("div", { className: "grid items-start gap-4 xl:grid-cols-3 2xl:grid-cols-4" }, columns.map((column) => h("div", { key: column.key, className: "min-w-0 rounded-2xl border border-current/15 bg-black/25 p-3" },
         h("div", { className: "mb-3 flex items-center justify-between gap-2" },
           h("h2", { className: "truncate text-sm font-semibold text-midground" }, column.label),
@@ -236,6 +246,37 @@
         onReject: () => reject(detail.card_id),
         onSave: () => saveEdit(detail.card_id),
       }) : null
+    );
+  }
+
+  function ParseFailurePanel({ runs, prongLabels }) {
+    return h("section", { className: "rounded-2xl border border-red-400/30 bg-red-950/20 p-3", "data-testid": "parse-error-runs" },
+      h("div", { className: "mb-3 flex flex-wrap items-center justify-between gap-2" },
+        h("div", null,
+          h("h2", { className: "text-sm font-semibold text-red-100" }, "Cron proposal parse failures"),
+          h("p", { className: "text-xs text-red-100/70" }, "No proposal cards were created for these runs, but the run metadata is retained for inspection.")
+        ),
+        h("span", { className: "rounded-full border border-red-300/30 px-2 py-0.5 text-xs text-red-100" }, String(runs.length))
+      ),
+      h("div", { className: "grid gap-3 lg:grid-cols-2" }, runs.map((run) => h("article", { key: run.id, className: "rounded-xl border border-red-300/20 bg-background-base/70 p-3 text-sm" },
+        h("div", { className: "mb-2 flex flex-wrap items-start justify-between gap-2" },
+          h("div", null,
+            h("h3", { className: "font-semibold text-red-50" }, prongLabels.get(`${run.project}:${run.prong}`) || `${run.project || "project"} / ${run.prong || "prong"}`),
+            h("p", { className: "text-xs text-red-100/70" }, `Run ${run.id || "n/a"} · ${formatDate(run.source_timestamp || run.created_at)}`)
+          ),
+          statusBadge("parse_error")
+        ),
+        h("dl", { className: "mb-3 grid gap-2 text-[11px] text-red-100/70 sm:grid-cols-2" },
+          meta("Cron run", run.cron_run_id || run.cron_job_name || run.cron_job_id || "n/a"),
+          meta("Source path", run.cron_output_path || "n/a"),
+          meta("Source hash", run.cron_output_sha256 ? `sha256: ${run.cron_output_sha256}` : "n/a"),
+          meta("Model", [run.provider, run.model].filter(Boolean).join(" / ") || "n/a")
+        ),
+        h("div", { className: "rounded-lg border border-red-300/20 bg-black/20 p-2" },
+          h("p", { className: "mb-1 text-[11px] uppercase tracking-[0.12em] text-red-100/60" }, "Parse error"),
+          h("p", { className: "whitespace-pre-wrap break-words text-xs leading-5 text-red-50" }, run.parse_error || "Unknown parse error")
+        )
+      )))
     );
   }
 
