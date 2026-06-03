@@ -133,8 +133,8 @@
     const proposal = props.proposal;
     const run = props.run;
     const worker = proposal.worker || {};
-    const confidence = metadataValue(proposal, "confidence", "unscored");
-    const effort = metadataValue(proposal, "estimated_effort", metadataValue(proposal, "effort", "not estimated"));
+    const confidence = proposal.confidence || metadataValue(proposal, "confidence", "unscored");
+    const effort = proposal.estimated_effort || metadataValue(proposal, "estimated_effort", metadataValue(proposal, "effort", "not estimated"));
     return h("button", {
       className: "sligo-card" + (props.selected ? " sligo-card--selected" : ""),
       type: "button",
@@ -184,9 +184,9 @@
 
     if (!proposal) return null;
     const worker = proposal.worker || {};
-    const evidence = splitLines(proposal.evidence_bullets);
+    const evidence = splitLines(proposal.evidence || proposal.evidence_bullets);
     const acceptance = splitLines(proposal.acceptance_criteria);
-    const prompt = proposal.proposed_worker_prompt || "The backend will generate the worker prompt from stored proposal fields and project/prong configuration when approved.";
+    const prompt = proposal.worker_prompt || proposal.proposed_worker_prompt || "The backend will generate the worker prompt from stored proposal fields and project/prong configuration when approved.";
     const source = sourceHref(proposal, run);
     const outputUrl = sourceOutputUrl(proposal, run);
     const history = Array.isArray(proposal.audit_log) ? proposal.audit_log : [];
@@ -219,6 +219,15 @@
       h("section", null,
         h("h3", null, "Rationale"),
         h("p", null, proposal.rationale || proposal.body || "No generated rationale is available from this proposal."),
+      ),
+      h("section", null,
+        h("h3", null, "Recommendation"),
+        h("dl", { className: "sligo-dl" },
+          h("dt", null, "Action"), h("dd", null, proposal.recommended_action || "No recommended action was exposed by the API."),
+          h("dt", null, "Risk notes"), h("dd", null, proposal.risk_notes || "No risk notes were supplied."),
+          h("dt", null, "Confidence"), h("dd", null, proposal.confidence || "unscored"),
+          h("dt", null, "Estimated effort"), h("dd", null, proposal.estimated_effort || "not estimated"),
+        ),
       ),
       h("section", null,
         h("h3", null, "Evidence"),

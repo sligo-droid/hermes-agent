@@ -33,10 +33,14 @@ def test_db_path_uses_hermes_home_and_migrates_without_real_home_writes(tmp_path
             card_table = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'proposal_cards'"
             ).fetchone()
+            feedback_table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'proposal_feedback'"
+            ).fetchone()
 
     assert version == proposals.SCHEMA_VERSION
     assert run_table is not None
     assert card_table is not None
+    assert feedback_table is not None
     assert hermes_home / "self_improvement" / "proposals.db" == db_path
     assert (hermes_home / "self_improvement" / "proposals.db").exists()
     assert not (fake_home / ".hermes" / "self_improvement" / "proposals.db").exists()
@@ -48,12 +52,19 @@ def test_schema_includes_parse_metadata_fields(tmp_path):
     with proposals.connect(db_path) as conn:
         run_columns = {row[1] for row in conn.execute("PRAGMA table_info(proposal_runs)").fetchall()}
         card_columns = {row[1] for row in conn.execute("PRAGMA table_info(proposal_cards)").fetchall()}
+        feedback_columns = {row[1] for row in conn.execute("PRAGMA table_info(proposal_feedback)").fetchall()}
 
     assert "parse_status" in run_columns
     assert "parse_error" in run_columns
+    assert "recommended_action" in card_columns
     assert "evidence_bullets" in card_columns
     assert "acceptance_criteria" in card_columns
+    assert "worker_prompt" in card_columns
     assert "proposed_worker_prompt" in card_columns
+    assert "risk_notes" in card_columns
+    assert "confidence" in card_columns
+    assert "estimated_effort" in card_columns
+    assert {"proposal_id", "action", "actor", "reason", "feedback", "created_at"}.issubset(feedback_columns)
 
 
 def test_resolve_project_prong_supports_configured_aliases():
@@ -110,6 +121,12 @@ def test_ingest_run_and_card_are_idempotent_and_public_records_are_sanitized(tmp
                 "idempotency_key": "card-1",
                 "title": "Tighten proposal parser",
                 "summary": "Improve parser resilience.",
+                "recommended_action": "approve",
+                "evidence": ["Canonical evidence."],
+                "worker_prompt": "Canonical worker prompt.",
+                "risk_notes": "Low risk.",
+                "confidence": "high",
+                "estimated_effort": "small",
                 "tags": ["parser", "sligo"],
                 "metadata": {"private": "keep internal"},
             },
@@ -134,6 +151,14 @@ def test_ingest_run_and_card_are_idempotent_and_public_records_are_sanitized(tmp
     assert run_count == 1
     assert card_count == 1
     assert public_card["tags"] == ["parser", "sligo"]
+    assert public_card["recommended_action"] == "approve"
+    assert public_card["evidence"] == ["Canonical evidence."]
+    assert public_card["evidence_bullets"] == ["Canonical evidence."]
+    assert public_card["worker_prompt"] == "Canonical worker prompt."
+    assert public_card["proposed_worker_prompt"] == "Canonical worker prompt."
+    assert public_card["risk_notes"] == "Low risk."
+    assert public_card["confidence"] == "high"
+    assert public_card["estimated_effort"] == "small"
     assert "idempotency_key" not in public_card
     assert "metadata" not in public_card
     assert public_card["audit_log"][0]["action"] == "ingested"
@@ -166,6 +191,9 @@ def test_status_decision_outcome_and_worker_link_idempotency(tmp_path):
             feedback="Prefer small, reversible changes.",
             conn=conn,
         )
+        proposals.record_feedback_event(
+            card["id"], action="feedback", actor="operator", reason="Direction", feedback="More tests.", conn=conn
+        )
         linked = proposals.link_worker_task(
             card["id"], board="discord-board", task_id="t_123", status="ready", url="https://discord/app", conn=conn
         )
@@ -173,6 +201,7 @@ def test_status_decision_outcome_and_worker_link_idempotency(tmp_path):
             card["id"], board="discord-board", task_id="t_123", status="ready", url="https://discord/app", conn=conn
         )
         outcome = proposals.record_outcome(card["id"], status="landed", summary="Tests passed.", conn=conn)
+        feedback_rows = conn.execute("SELECT action, actor, reason, feedback FROM proposal_feedback ORDER BY id").fetchall()
 
     assert approved["status"] == "approved"
     assert approved["approved_by"] == "operator"
@@ -182,6 +211,8 @@ def test_status_decision_outcome_and_worker_link_idempotency(tmp_path):
     assert len(duplicate_link["audit_log"]) == len(linked["audit_log"])
     assert outcome["outcome_status"] == "landed"
     assert outcome["outcome_summary"] == "Tests passed."
+    assert [row["action"] for row in feedback_rows] == ["approved", "feedback"]
+    assert feedback_rows[0]["feedback"] == "Prefer small, reversible changes."
 
 
 def test_feedback_context_is_compact_project_prong_scoped_and_finds_recurring_preferences(tmp_path):
@@ -237,12 +268,15 @@ def test_feedback_context_is_compact_project_prong_scoped_and_finds_recurring_pr
                 feedback="Prefer small, reversible changes.",
                 conn=conn,
             )
+        proposals.record_feedback_event(
+            second["id"], action="feedback", reason="Direction", feedback="Prefer small, reversible changes.", conn=conn
+        )
         proposals.record_outcome(first["id"], status="landed", summary="Merged with tests.", conn=conn)
         proposals.record_decision(
             rejected["id"],
             "rejected",
             actor="operator",
-            reason="Too broad",
+            reason="Good scope",
             feedback="Prefer small, reversible changes.",
             conn=conn,
         )
@@ -259,6 +293,7 @@ def test_feedback_context_is_compact_project_prong_scoped_and_finds_recurring_pr
     assert approved_titles == {"Approved storage", "Approved context"}
     assert rejected_titles == {"Huge rewrite"}
     assert outcome_titles == {"Approved storage"}
+    assert context["feedback_only"][0]["title"] == "Approved context"
     assert "Other prong" not in approved_titles
     assert context["operator_preferences"] == ["Prefer small, reversible changes.", "Good scope"]
 
@@ -286,9 +321,13 @@ def test_cron_json_proposal_output_ingests_cards_and_is_idempotent(tmp_path):
                         "summary": "Parse structured proposal blocks.",
                         "body": "Wire cron output into storage.",
                         "rationale": "Keeps review queue current.",
-                        "evidence_bullets": ["Cron emitted a structured block.", "Parser reads it."],
+                        "recommended_action": "approve",
+                        "evidence": ["Cron emitted a structured block.", "Parser reads it."],
                         "acceptance_criteria": ["API exposes evidence.", "Drawer shows prompt."],
-                        "proposed_worker_prompt": "Implement the ingestion hook and test it.",
+                        "worker_prompt": "Implement the ingestion hook and test it.",
+                        "risk_notes": "Low risk.",
+                        "confidence": "high",
+                        "estimated_effort": "small",
                         "expected_outcome": "One card appears.",
                         "priority": "high",
                         "tags": ["cron"],
@@ -320,9 +359,15 @@ def test_cron_json_proposal_output_ingests_cards_and_is_idempotent(tmp_path):
     assert len(cards) == 1
     assert cards[0]["title"] == "Add ingestion hook"
     assert cards[0]["tags"] == ["cron"]
+    assert cards[0]["recommended_action"] == "approve"
+    assert cards[0]["evidence"] == ["Cron emitted a structured block.", "Parser reads it."]
     assert cards[0]["evidence_bullets"] == ["Cron emitted a structured block.", "Parser reads it."]
     assert cards[0]["acceptance_criteria"] == ["API exposes evidence.", "Drawer shows prompt."]
+    assert cards[0]["worker_prompt"] == "Implement the ingestion hook and test it."
     assert cards[0]["proposed_worker_prompt"] == "Implement the ingestion hook and test it."
+    assert cards[0]["risk_notes"] == "Low risk."
+    assert cards[0]["confidence"] == "high"
+    assert cards[0]["estimated_effort"] == "small"
     assert cards[0]["source_output_ref"] == run["source_output_ref"]
     assert cards[0]["audit_log"][0]["action"] == "ingested"
     assert "metadata" not in cards[0]
@@ -355,6 +400,48 @@ def test_cron_malformed_proposal_json_records_parse_failure(tmp_path):
     assert card_count == 0
 
 
+def test_cron_markdown_proposals_fail_without_explicit_legacy_parse(tmp_path):
+    hermes_home = tmp_path / "hermes-home"
+    config = {
+        "self_improvement": {
+            "proposals": {
+                "projects": {"sligo": {"default_prong": "r1", "prongs": {"r1": {}}}},
+                "cron_jobs": {"job-1": {"project": "sligo", "prong": "r1"}},
+            }
+        }
+    }
+
+    with patch.dict("os.environ", {"HERMES_HOME": str(hermes_home)}):
+        result = proposals.ingest_cron_proposal_output({"id": "job-1"}, "## Proposal: Legacy heading\n\nBody", config=config)
+        with proposals.connect() as conn:
+            card_count = conn.execute("SELECT COUNT(*) FROM proposal_cards").fetchone()[0]
+
+    assert result["parse_status"] == "failed"
+    assert result["parse_error"] == "missing required proposal JSON block"
+    assert card_count == 0
+
+
+def test_cron_markdown_proposals_can_use_explicit_legacy_parse(tmp_path):
+    hermes_home = tmp_path / "hermes-home"
+    config = {
+        "self_improvement": {
+            "proposals": {
+                "projects": {"sligo": {"default_prong": "r1", "prongs": {"r1": {}}}},
+                "cron_jobs": {"job-1": {"project": "sligo", "prong": "r1", "allow_legacy_parse": True}},
+            }
+        }
+    }
+
+    with patch.dict("os.environ", {"HERMES_HOME": str(hermes_home)}):
+        result = proposals.ingest_cron_proposal_output({"id": "job-1"}, "## Proposal: Legacy heading\n\nBody", config=config)
+        with proposals.connect() as conn:
+            card = proposals.sanitize_card(proposals.decode_row(conn.execute("SELECT * FROM proposal_cards").fetchone()))
+
+    assert result["parse_status"] == "partial"
+    assert result["parser_name"] == proposals.LEGACY_CRON_PARSER
+    assert card["title"] == "Legacy heading"
+
+
 def test_cron_feedback_prompt_section_is_configured_and_scoped(tmp_path):
     db_path = tmp_path / "proposals.db"
     config = {
@@ -382,9 +469,10 @@ def test_cron_feedback_prompt_section_is_configured_and_scoped(tmp_path):
     assert "Prefer scoped fixes." in section
     assert "Other prong" not in section
     assert proposals.PROPOSAL_BLOCK_KEY in section
-    assert "evidence_bullets" in section
+    assert "evidence" in section
     assert "acceptance_criteria" in section
-    assert "proposed_worker_prompt" in section
+    assert "worker_prompt" in section
+    assert "recommended_action" in section
 
 
 def test_invalid_status_and_json_are_rejected(tmp_path):

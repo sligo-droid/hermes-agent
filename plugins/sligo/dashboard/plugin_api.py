@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
@@ -50,9 +51,15 @@ class CardIngestBody(BaseModel):
     summary: str = ""
     body: str = ""
     rationale: str = ""
+    recommended_action: str = ""
+    evidence: list[str] = Field(default_factory=list)
     evidence_bullets: list[str] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(default_factory=list)
+    worker_prompt: str = ""
     proposed_worker_prompt: str = ""
+    risk_notes: str = ""
+    confidence: str = ""
+    estimated_effort: str = ""
     expected_outcome: str = ""
     status: str = "proposed"
     priority: str = ""
@@ -90,9 +97,15 @@ class PatchCardBody(BaseModel):
     summary: str | None = None
     body: str | None = None
     rationale: str | None = None
+    recommended_action: str | None = None
+    evidence: list[str] | None = None
     evidence_bullets: list[str] | None = None
     acceptance_criteria: list[str] | None = None
+    worker_prompt: str | None = None
     proposed_worker_prompt: str | None = None
+    risk_notes: str | None = None
+    confidence: str | None = None
+    estimated_effort: str | None = None
     expected_outcome: str | None = None
     priority: str | None = None
     tags: list[str] | None = None
@@ -196,7 +209,7 @@ def _card_response(card: dict[str, Any]) -> dict[str, Any]:
 
 
 def _worker_body(card: dict[str, Any], resolved: dict[str, Any], prong_cfg: dict[str, Any]) -> str:
-    prompt = card.get("proposed_worker_prompt") or prong_cfg.get("worker_prompt") or resolved["project"].get("worker_prompt")
+    prompt = card.get("worker_prompt") or card.get("proposed_worker_prompt") or prong_cfg.get("worker_prompt") or resolved["project"].get("worker_prompt")
     parts = [
         prompt or "Implement the approved Sligo proposal.",
         "",
@@ -239,6 +252,20 @@ def _worker_url(board: str, task_id: str, prong_cfg: dict[str, Any], project_cfg
     if template:
         return str(template).format(board=board, task_id=task_id)
     return f"/kanban?board={board}&task={task_id}"
+
+
+def _resolve_workspace_path(workspace_kind: str, workspace_path: Any) -> str | None:
+    if workspace_kind not in {"dir", "worktree"}:
+        return str(workspace_path) if workspace_path else None
+    if not workspace_path:
+        raise HTTPException(status_code=400, detail="configured workspace_path is required for persistent workspaces")
+    try:
+        resolved = Path(str(workspace_path)).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail="configured workspace_path must exist") from exc
+    if not resolved.is_dir():
+        raise HTTPException(status_code=400, detail="configured workspace_path must be a directory")
+    return str(resolved)
 
 
 @router.get("/projects")
@@ -369,9 +396,15 @@ def patch_proposal(proposal_id: int, body: PatchCardBody, request: Request) -> d
         "summary",
         "body",
         "rationale",
+        "recommended_action",
+        "evidence",
         "evidence_bullets",
         "acceptance_criteria",
+        "worker_prompt",
         "proposed_worker_prompt",
+        "risk_notes",
+        "confidence",
+        "estimated_effort",
         "expected_outcome",
         "priority",
         "tags",
@@ -385,6 +418,12 @@ def patch_proposal(proposal_id: int, body: PatchCardBody, request: Request) -> d
             now = proposals.utc_now()
             audit = card.get("audit_log", []) + [proposals.audit_event("patched", _operator(request), ",".join(sorted(updates)))]
             values = dict(updates)
+            if "evidence" in values:
+                values["evidence_bullets"] = values.pop("evidence")
+            if "worker_prompt" in values and "proposed_worker_prompt" not in values:
+                values["proposed_worker_prompt"] = values["worker_prompt"]
+            if "proposed_worker_prompt" in values and "worker_prompt" not in values:
+                values["worker_prompt"] = values["proposed_worker_prompt"]
             for field in ("tags", "evidence_bullets", "acceptance_criteria"):
                 if field in values:
                     values[field] = proposals.json_text(values[field], default=[])
@@ -412,8 +451,7 @@ def approve_proposal(proposal_id: int, body: ApproveBody, request: Request) -> d
             board = _validate_board(str(prong_cfg.get("kanban_board") or project_cfg.get("kanban_board") or ""))
             workspace_kind = str(prong_cfg.get("workspace_kind") or project_cfg.get("workspace_kind") or "dir")
             workspace_path = prong_cfg.get("workspace_path") or project_cfg.get("workspace_path")
-            if workspace_kind in {"dir", "worktree"} and not workspace_path:
-                raise HTTPException(status_code=400, detail="configured workspace_path is required for persistent workspaces")
+            resolved_workspace_path = _resolve_workspace_path(workspace_kind, workspace_path)
             if card.get("worker_task_id"):
                 task_id = card["worker_task_id"]
                 if card.get("status") == "approved":
@@ -429,11 +467,11 @@ def approve_proposal(proposal_id: int, body: ApproveBody, request: Request) -> d
                         assignee=prong_cfg.get("assignee") or project_cfg.get("assignee"),
                         created_by=actor,
                         workspace_kind=workspace_kind,
-                        workspace_path=str(workspace_path) if workspace_path else None,
+                        workspace_path=resolved_workspace_path,
                         branch_name=prong_cfg.get("branch_name") or project_cfg.get("branch_name"),
                         tenant=prong_cfg.get("tenant") or project_cfg.get("tenant"),
                         priority=_priority(card.get("priority", "")),
-                        idempotency_key=f"sligo:proposal:{proposal_id}",
+                        idempotency_key=f"self-improvement:{proposal_id}",
                         max_runtime_seconds=prong_cfg.get("max_runtime_seconds") or project_cfg.get("max_runtime_seconds"),
                         skills=prong_cfg.get("skills") or project_cfg.get("skills"),
                         initial_status=initial_status,
@@ -485,6 +523,14 @@ def record_feedback(proposal_id: int, body: FeedbackBody, request: Request) -> d
             card = proposals.get_card(proposal_id, conn=conn, public=False)
             now = proposals.utc_now()
             audit = card.get("audit_log", []) + [proposals.audit_event("feedback", _operator(request), body.reason or body.feedback)]
+            proposals.record_feedback_event(
+                proposal_id,
+                action="feedback",
+                actor=_operator(request),
+                reason=body.reason,
+                feedback=body.feedback,
+                conn=conn,
+            )
             conn.execute(
                 """
                 UPDATE proposal_cards

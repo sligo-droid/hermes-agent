@@ -1447,6 +1447,27 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         return _run_job_impl(job)
 
 
+def _save_job_profile_artifacts(job: dict, output: str) -> Path:
+    """Save cron output and proposal artifacts inside the job's profile context."""
+    job_id = job["id"]
+    with _job_profile_context(job_id, job.get("profile")):
+        output_file = save_job_output(job_id, output)
+        try:
+            from hermes_cli.self_improvement_proposals import ingest_cron_proposal_output
+
+            ingest_result = ingest_cron_proposal_output(job, output, source_output_path=output_file)
+            if ingest_result and ingest_result.get("parse_status") in {"failed", "partial"}:
+                logger.warning(
+                    "Job '%s': self-improvement proposal parse_status=%s parse_error=%s",
+                    job_id,
+                    ingest_result.get("parse_status"),
+                    ingest_result.get("parse_error"),
+                )
+        except Exception as ingest_exc:
+            logger.exception("Job '%s': self-improvement proposal ingestion failed: %s", job_id, ingest_exc)
+        return output_file
+
+
 def _resolve_cron_memory_mode(cfg: dict, job_id: str = "") -> tuple[bool, bool]:
     """Return (skip_memory, memory_read_only) for cron.memory_mode."""
     cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
@@ -2196,24 +2217,9 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             """Run one due job end-to-end: execute, save, deliver, mark."""
             try:
                 success, output, final_response, error = run_job(job)
-
-                output_file = save_job_output(job["id"], output)
+                output_file = _save_job_profile_artifacts(job, output)
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
-
-                try:
-                    from hermes_cli.self_improvement_proposals import ingest_cron_proposal_output
-
-                    ingest_result = ingest_cron_proposal_output(job, output, source_output_path=output_file)
-                    if ingest_result and ingest_result.get("parse_status") in {"failed", "partial"}:
-                        logger.warning(
-                            "Job '%s': self-improvement proposal parse_status=%s parse_error=%s",
-                            job["id"],
-                            ingest_result.get("parse_status"),
-                            ingest_result.get("parse_error"),
-                        )
-                except Exception as ingest_exc:
-                    logger.exception("Job '%s': self-improvement proposal ingestion failed: %s", job["id"], ingest_exc)
 
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but

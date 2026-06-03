@@ -15,7 +15,7 @@ from typing import Any, Iterable
 from hermes_constants import get_hermes_home
 from hermes_cli.config import load_config
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 PROPOSAL_BLOCK_KEY = "hermes_self_improvement_proposals"
 STRUCTURED_CRON_PARSER = "cron_json_block"
@@ -52,9 +52,14 @@ CARD_PUBLIC_FIELDS = {
     "summary",
     "body",
     "rationale",
+    "recommended_action",
     "evidence_bullets",
     "acceptance_criteria",
+    "worker_prompt",
     "proposed_worker_prompt",
+    "risk_notes",
+    "confidence",
+    "estimated_effort",
     "expected_outcome",
     "status",
     "priority",
@@ -162,9 +167,14 @@ def migrate(conn: sqlite3.Connection) -> None:
                 summary TEXT NOT NULL DEFAULT '',
                 body TEXT NOT NULL DEFAULT '',
                 rationale TEXT NOT NULL DEFAULT '',
+                recommended_action TEXT NOT NULL DEFAULT '',
                 evidence_bullets TEXT NOT NULL DEFAULT '[]',
                 acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+                worker_prompt TEXT NOT NULL DEFAULT '',
                 proposed_worker_prompt TEXT NOT NULL DEFAULT '',
+                risk_notes TEXT NOT NULL DEFAULT '',
+                confidence TEXT NOT NULL DEFAULT '',
+                estimated_effort TEXT NOT NULL DEFAULT '',
                 expected_outcome TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'proposed',
                 priority TEXT NOT NULL DEFAULT '',
@@ -220,6 +230,29 @@ def migrate(conn: sqlite3.Connection) -> None:
         if "proposed_worker_prompt" not in existing:
             conn.execute("ALTER TABLE proposal_cards ADD COLUMN proposed_worker_prompt TEXT NOT NULL DEFAULT ''")
         version = 3
+    if version < 4:
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(proposal_cards)").fetchall()}
+        for column in ("recommended_action", "worker_prompt", "risk_notes", "confidence", "estimated_effort"):
+            if column not in existing:
+                conn.execute(f"ALTER TABLE proposal_cards ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS proposal_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_id INTEGER NOT NULL REFERENCES proposal_cards(id) ON DELETE CASCADE,
+                action TEXT NOT NULL,
+                actor TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                feedback TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_proposal_feedback_proposal_created
+                ON proposal_feedback(proposal_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_proposal_feedback_action_created
+                ON proposal_feedback(action, created_at DESC);
+            """
+        )
+        version = 4
     current_version = conn.execute("PRAGMA user_version").fetchone()[0]
     if current_version != SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -275,9 +308,13 @@ def proposal_json_block_reference(project_key: str, prong_key: str) -> str:
                             "summary": "One sentence summary.",
                             "body": "Implementation notes and scope.",
                             "rationale": "Why this is worth doing.",
-                            "evidence_bullets": ["Concrete observation supporting the proposal."],
+                            "recommended_action": "approve",
+                            "evidence": ["Concrete observation supporting the proposal."],
                             "acceptance_criteria": ["Observable condition proving the worker finished."],
-                            "proposed_worker_prompt": "Prompt text to give the implementation worker.",
+                            "worker_prompt": "Prompt text to give the implementation worker.",
+                            "risk_notes": "Risks, rollback notes, or why this is safe.",
+                            "confidence": "medium",
+                            "estimated_effort": "small",
                             "expected_outcome": "How success is recognized.",
                             "priority": "medium",
                             "tags": ["self-improvement"],
@@ -403,9 +440,14 @@ def ingest_card(data: dict[str, Any], *, conn: sqlite3.Connection | None = None)
             "summary": text(data.get("summary")),
             "body": text(data.get("body")),
             "rationale": text(data.get("rationale")),
-            "evidence_bullets": json_text(data.get("evidence_bullets"), default=[]),
+            "recommended_action": text(data.get("recommended_action")),
+            "evidence_bullets": json_text(data.get("evidence") if data.get("evidence") else data.get("evidence_bullets"), default=[]),
             "acceptance_criteria": json_text(data.get("acceptance_criteria"), default=[]),
-            "proposed_worker_prompt": text(data.get("proposed_worker_prompt")),
+            "worker_prompt": text(data.get("worker_prompt") or data.get("proposed_worker_prompt")),
+            "proposed_worker_prompt": text(data.get("proposed_worker_prompt") or data.get("worker_prompt")),
+            "risk_notes": text(data.get("risk_notes")),
+            "confidence": text(data.get("confidence")),
+            "estimated_effort": text(data.get("estimated_effort")),
             "expected_outcome": text(data.get("expected_outcome")),
             "status": status,
             "priority": text(data.get("priority")),
@@ -470,6 +512,7 @@ def ingest_cron_proposal_output(
     parse_error = ""
     cards: list[dict[str, Any]] = []
 
+    allow_legacy_parse = bool(scope["mapping"].get("allow_legacy_parse"))
     try:
         block = _extract_proposal_block(raw_text)
         proposals_value = block.get("proposals")
@@ -478,7 +521,7 @@ def ingest_cron_proposal_output(
         parser_version = text(block.get("parser_version") or STRUCTURED_CRON_PARSER_VERSION)
         cards = _normalize_structured_cards(proposals_value)
     except ValueError as exc:
-        legacy_cards = _legacy_parse_markdown_cards(raw_text)
+        legacy_cards = _legacy_parse_markdown_cards(raw_text) if allow_legacy_parse else []
         if legacy_cards:
             parser_name = LEGACY_CRON_PARSER
             parser_version = LEGACY_CRON_PARSER_VERSION
@@ -622,6 +665,8 @@ def transition_card(
         updates["audit_log"] = json_text(card.get("audit_log", []) + [audit_event(status, actor, reason or feedback)])
         set_clause = ", ".join(f"{col} = ?" for col in updates)
         c.execute(f"UPDATE proposal_cards SET {set_clause} WHERE id = ?", (*updates.values(), card_id))
+        if status in {"approved", "rejected"}:
+            record_feedback_event(card_id, action=status, actor=actor, reason=reason, feedback=feedback, conn=c)
         return get_card(card_id, conn=c, public=False)
 
     if conn is not None:
@@ -642,6 +687,33 @@ def record_decision(
     if decision not in {"approved", "rejected"}:
         raise ValueError("decision must be 'approved' or 'rejected'")
     return transition_card(card_id, decision, actor=actor, reason=reason, feedback=feedback, conn=conn)
+
+
+def record_feedback_event(
+    card_id: int,
+    *,
+    action: str,
+    actor: str = "",
+    reason: str = "",
+    feedback: str = "",
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    def op(c: sqlite3.Connection) -> dict[str, Any]:
+        now = utc_now()
+        cur = c.execute(
+            """
+            INSERT INTO proposal_feedback (proposal_id, action, actor, reason, feedback, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (card_id, text(action), text(actor), text(reason), text(feedback), now),
+        )
+        row = c.execute("SELECT * FROM proposal_feedback WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return dict(row)
+
+    if conn is not None:
+        return op(conn)
+    with connect() as c:
+        return op(c)
 
 
 def link_worker_task(
@@ -725,13 +797,27 @@ def build_feedback_context(
         approved = [compact_card(card) for card in cards if card["status"] in {"approved", "completed", "failed"}]
         rejected = [compact_card(card) for card in cards if card["status"] == "rejected"]
         outcomes = [compact_outcome(card) for card in cards if card.get("outcome_status") or card.get("outcome_summary")]
-        preferences = recurring_preferences(cards)
+        feedback_rows = c.execute(
+            """
+            SELECT f.*, c.title, c.status
+            FROM proposal_feedback f
+            JOIN proposal_cards c ON c.id = f.proposal_id
+            WHERE c.project_key = ? AND c.prong_key = ?
+            ORDER BY f.created_at DESC, f.id DESC
+            LIMIT ?
+            """,
+            (project_key, prong_key, max_items),
+        ).fetchall()
+        feedback = [compact_feedback(decode_row(row)) for row in feedback_rows]
+        feedback_only = [item for item in feedback if item.get("action") == "feedback"]
+        preferences = recurring_preferences(cards, feedback)
         return {
             "project_key": project_key,
             "prong_key": prong_key,
             "approved": approved[:max_items],
             "rejected": rejected[:max_items],
             "outcomes": outcomes[:max_items],
+            "feedback_only": feedback_only[:max_items],
             "operator_preferences": preferences[:max_items],
         }
 
@@ -751,6 +837,9 @@ def sanitize_run(record: dict[str, Any]) -> dict[str, Any]:
 
 def sanitize_card(record: dict[str, Any]) -> dict[str, Any]:
     item = {key: record[key] for key in CARD_PUBLIC_FIELDS if key in record}
+    item["evidence"] = list(record.get("evidence_bullets") or [])
+    item["worker_prompt"] = text(record.get("worker_prompt") or record.get("proposed_worker_prompt"))
+    item["proposed_worker_prompt"] = text(record.get("proposed_worker_prompt") or record.get("worker_prompt"))
     item["audit_log"] = public_audit_log(record.get("audit_log", []))
     ref = safe_source_output_ref((record.get("source_metadata") or {}).get("source_output_path"))
     if ref:
@@ -783,10 +872,24 @@ def compact_outcome(card: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def recurring_preferences(cards: list[dict[str, Any]]) -> list[str]:
+def compact_feedback(row: dict[str, Any]) -> dict[str, str]:
+    return {
+        "title": truncate(row.get("title", "")),
+        "action": truncate(row.get("action", ""), 80),
+        "reason": truncate(row.get("reason", "")),
+        "feedback": truncate(row.get("feedback", "")),
+    }
+
+
+def recurring_preferences(cards: list[dict[str, Any]], feedback: list[dict[str, Any]] | None = None) -> list[str]:
     counts: dict[str, int] = {}
     for card in cards:
         for value in (card.get("operator_feedback"), card.get("decision_reason")):
+            item = truncate(value or "")
+            if item:
+                counts[item] = counts.get(item, 0) + 1
+    for row in feedback or []:
+        for value in (row.get("feedback"), row.get("reason")):
             item = truncate(value or "")
             if item:
                 counts[item] = counts.get(item, 0) + 1
@@ -859,9 +962,14 @@ def _normalize_structured_cards(items: list[Any]) -> list[dict[str, Any]]:
                 "summary": text(item.get("summary")),
                 "body": text(item.get("body")),
                 "rationale": text(item.get("rationale")),
-                "evidence_bullets": list_text(item.get("evidence_bullets") or item.get("evidence")),
+                "recommended_action": text(item.get("recommended_action")),
+                "evidence_bullets": list_text(item.get("evidence") if item.get("evidence") is not None else item.get("evidence_bullets")),
                 "acceptance_criteria": list_text(item.get("acceptance_criteria")),
+                "worker_prompt": text(item.get("worker_prompt") or item.get("proposed_worker_prompt")),
                 "proposed_worker_prompt": text(item.get("proposed_worker_prompt") or item.get("worker_prompt")),
+                "risk_notes": text(item.get("risk_notes")),
+                "confidence": text(item.get("confidence")),
+                "estimated_effort": text(item.get("estimated_effort")),
                 "expected_outcome": text(item.get("expected_outcome")),
                 "priority": text(item.get("priority")),
                 "tags": item.get("tags") if isinstance(item.get("tags"), list) else [],

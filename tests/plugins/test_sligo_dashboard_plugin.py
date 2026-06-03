@@ -84,9 +84,14 @@ def _ingest_card(client: TestClient, *, metadata: dict | None = None) -> int:
             "summary": "Add safe approval endpoints.",
             "body": "Use stored proposal content only.",
             "rationale": "Operators need the explicit parser detail.",
+            "recommended_action": "approve",
             "evidence_bullets": ["Evidence from cron output."],
             "acceptance_criteria": ["Detail drawer shows evidence."],
+            "worker_prompt": "Use the stored worker prompt.",
             "proposed_worker_prompt": "Use the stored worker prompt.",
+            "risk_notes": "Low risk.",
+            "confidence": "high",
+            "estimated_effort": "small",
             "priority": "high",
             "metadata": metadata or {},
         },
@@ -139,9 +144,15 @@ def test_read_routes_expose_projects_runs_and_proposals(client):
     detail = proposal_resp.json()["proposal"]
     assert detail["title"] == "Tighten dashboard API"
     assert detail["rationale"] == "Operators need the explicit parser detail."
+    assert detail["recommended_action"] == "approve"
+    assert detail["evidence"] == ["Evidence from cron output."]
     assert detail["evidence_bullets"] == ["Evidence from cron output."]
     assert detail["acceptance_criteria"] == ["Detail drawer shows evidence."]
+    assert detail["worker_prompt"] == "Use the stored worker prompt."
     assert detail["proposed_worker_prompt"] == "Use the stored worker prompt."
+    assert detail["risk_notes"] == "Low risk."
+    assert detail["confidence"] == "high"
+    assert detail["estimated_effort"] == "small"
     assert detail["audit_log"][0]["action"] == "ingested"
     assert "metadata" not in detail
     assert runs_resp.status_code == 200
@@ -199,6 +210,18 @@ def test_sligo_source_output_control_is_not_plain_api_anchor():
     assert 'href: source, target: "_blank"' not in bundle
 
 
+def test_sligo_bundle_uses_canonical_proposal_contract_fields():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = (repo_root / "plugins" / "sligo" / "dashboard" / "dist" / "index.js").read_text(encoding="utf-8")
+
+    assert "proposal.confidence || metadataValue" in bundle
+    assert "proposal.estimated_effort || metadataValue" in bundle
+    assert "proposal.evidence || proposal.evidence_bullets" in bundle
+    assert "proposal.worker_prompt || proposal.proposed_worker_prompt" in bundle
+    assert "proposal.recommended_action" in bundle
+    assert "proposal.risk_notes" in bundle
+
+
 def test_source_output_route_rejects_unsafe_and_missing_refs(client, sligo_home, tmp_path):
     outside = tmp_path / "outside.md"
     outside.write_text("outside", encoding="utf-8")
@@ -233,7 +256,7 @@ def test_approve_twice_is_idempotent_and_uses_configured_workspace(client, sligo
     assert second_proposal["approved_by"] == "operator-1"
 
     with kb.connect_closing(board="default") as conn:
-        count = conn.execute("SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?", (f"sligo:proposal:{proposal_id}",)).fetchone()[0]
+        count = conn.execute("SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?", (f"self-improvement:{proposal_id}",)).fetchone()[0]
         task = kb.get_task(conn, first_proposal["worker_task_id"])
 
     assert count == 1
@@ -245,6 +268,19 @@ def test_approve_twice_is_idempotent_and_uses_configured_workspace(client, sligo
     assert "Use the stored worker prompt." in task.body
     assert "Evidence from cron output." in task.body
     assert "Detail drawer shows evidence." in task.body
+
+
+def test_approve_rejects_missing_configured_workspace(client, sligo_home):
+    proposal_id = _ingest_card(client)
+    config_path = sligo_home / "config.yaml"
+    cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    cfg["self_improvement"]["proposals"]["projects"]["sligo"]["workspace_path"] = str(sligo_home / "missing")
+    config_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    resp = client.post(f"/api/plugins/sligo/proposals/{proposal_id}/approve", json={})
+
+    assert resp.status_code == 400
+    assert "workspace_path" in resp.json()["detail"]
 
 
 def test_reject_records_decision_and_default_list_excludes_it(client):
@@ -287,6 +323,11 @@ def test_patch_feedback_and_bulk_guard(client):
     assert patched.json()["proposal"]["tags"] == ["api"]
     assert feedback.status_code == 200, feedback.text
     assert feedback.json()["proposal"]["operator_feedback"] == "Prefer route-level tests."
+    with proposals.connect() as conn:
+        rows = conn.execute("SELECT action, reason, feedback FROM proposal_feedback ORDER BY id").fetchall()
+    assert [(row["action"], row["reason"], row["feedback"]) for row in rows] == [
+        ("feedback", "Direction", "Prefer route-level tests.")
+    ]
     assert bulk.status_code == 409
 
 
