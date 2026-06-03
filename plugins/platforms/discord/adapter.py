@@ -1936,6 +1936,45 @@ class DiscordAdapter(BasePlatformAdapter):
             "foreman": "🔨",
         }.get(str(state or ""))
 
+    def _aggregate_thread_reaction_state(
+        self,
+        states: Iterable[Optional[str]],
+        fallback: Optional[str],
+    ) -> Optional[str]:
+        normalized = [str(state or "").strip() for state in states if str(state or "").strip()]
+        if not normalized:
+            return fallback
+        for state in ("errored", "blocked", "foreman", "running", "active"):
+            if state in normalized:
+                return state
+        if "done" in normalized:
+            return "done"
+        return fallback
+
+    def _kanban_thread_origin_reaction_state(
+        self,
+        target: Dict[str, Any],
+        fallback: Optional[str],
+    ) -> Optional[str]:
+        thread_id = str(target.get("thread_id") or "").strip()
+        if not thread_id:
+            return fallback
+        try:
+            from hermes_cli.discord_worker_boards import thread_status_targets
+
+            states: List[Optional[str]] = []
+            for candidate in thread_status_targets():
+                if str(candidate.get("thread_id") or "").strip() != thread_id:
+                    continue
+                state = self._feature_source_task_reaction_state(candidate)
+                if state is None:
+                    state = str(candidate.get("reaction_state") or candidate.get("state") or "").strip() or None
+                states.append(state)
+            return self._aggregate_thread_reaction_state(states, fallback)
+        except Exception as exc:
+            logger.debug("[%s] Failed to aggregate Discord thread reaction state: %s", self.name, exc)
+            return fallback
+
     @staticmethod
     def _summary_status_reaction_emoji(status: str) -> Optional[str]:
         lower = str(status or "").strip().lower()
@@ -3763,9 +3802,7 @@ class DiscordAdapter(BasePlatformAdapter):
             seen.add(identity)
             messages.append(message)
 
-        source_message_id = str(target.get("source_message_id") or "").strip()
         fetched_by_id: Dict[str, Optional[Any]] = {}
-        source_message_fetched = False
         for field in ("message_id", "source_message_id"):
             candidate_id = str(target.get(field) or "").strip()
             if not candidate_id:
@@ -3777,11 +3814,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 targets_final = targets_final and final
                 fetched_by_id[candidate_id] = message
                 add_message(message)
-            if field == "source_message_id" and message is not None and hasattr(message, "add_reaction"):
-                source_message_fetched = True
 
-        if not source_message_id or not source_message_fetched:
-            add_message(await self._thread_origin_message(thread))
+        add_message(await self._thread_origin_message(thread))
         return messages, targets_final
 
     async def _kanban_reaction_target_message(self, thread: Any, target: Dict[str, Any]) -> Optional[Any]:
@@ -3812,9 +3846,14 @@ class DiscordAdapter(BasePlatformAdapter):
             if targets_final and self._clear_terminal_kanban_sync_flags(target, reaction=True):
                 return state
             return None
+        origin_message = await self._thread_origin_message(thread)
+        origin_identity = self._message_identity(origin_message) if origin_message is not None else None
+        origin_state = self._kanban_thread_origin_reaction_state(target, state)
+        origin_emoji = self._feature_kanban_reaction_emoji(origin_state) or emoji
         for message in messages:
             try:
-                await self._set_message_reaction_state(message, emoji)
+                message_emoji = origin_emoji if origin_identity == self._message_identity(message) else emoji
+                await self._set_message_reaction_state(message, message_emoji)
             except Exception as exc:
                 if self._is_permanent_feature_summary_error(exc):
                     continue
