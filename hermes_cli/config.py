@@ -789,6 +789,7 @@ DEFAULT_CONFIG = {
         "proposals": {
             "projects": {},
             "project_aliases": {},
+            "cron_jobs": {},
             "feedback_context_limit": 20,
         },
     },

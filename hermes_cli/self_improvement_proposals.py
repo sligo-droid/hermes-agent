@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -12,7 +14,13 @@ from typing import Any, Iterable
 from hermes_constants import get_hermes_home
 from hermes_cli.config import load_config
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+PROPOSAL_BLOCK_KEY = "hermes_self_improvement_proposals"
+STRUCTURED_CRON_PARSER = "cron_json_block"
+STRUCTURED_CRON_PARSER_VERSION = "1"
+LEGACY_CRON_PARSER = "legacy_parse"
+LEGACY_CRON_PARSER_VERSION = "1"
 
 RUN_PUBLIC_FIELDS = {
     "id",
@@ -25,6 +33,8 @@ RUN_PUBLIC_FIELDS = {
     "parser_name",
     "parser_version",
     "parser_metadata",
+    "parse_status",
+    "parse_error",
     "status",
     "started_at",
     "completed_at",
@@ -182,6 +192,16 @@ def migrate(conn: sqlite3.Connection) -> None:
                 ON proposal_cards(worker_board, worker_task_id);
             """
         )
+        version = 1
+    if version < 2:
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(proposal_runs)").fetchall()}
+        if "parse_status" not in existing:
+            conn.execute("ALTER TABLE proposal_runs ADD COLUMN parse_status TEXT NOT NULL DEFAULT ''")
+        if "parse_error" not in existing:
+            conn.execute("ALTER TABLE proposal_runs ADD COLUMN parse_error TEXT NOT NULL DEFAULT ''")
+        version = 2
+    current_version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if current_version != SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -216,6 +236,80 @@ def resolve_project_prong(
     }
 
 
+def proposal_json_block_reference(project_key: str, prong_key: str) -> str:
+    """Return compact cron prompt instructions for structured proposals."""
+    return (
+        "If you identify self-improvement work, include exactly one JSON block named "
+        f"{PROPOSAL_BLOCK_KEY!r}. Do not infer proposals outside this block. "
+        "Use this shape:\n"
+        "```json\n"
+        + json.dumps(
+            {
+                PROPOSAL_BLOCK_KEY: {
+                    "parser_version": STRUCTURED_CRON_PARSER_VERSION,
+                    "project": project_key,
+                    "prong": prong_key,
+                    "proposals": [
+                        {
+                            "title": "Small actionable change",
+                            "summary": "One sentence summary.",
+                            "body": "Implementation notes and scope.",
+                            "rationale": "Why this is worth doing.",
+                            "expected_outcome": "How success is recognized.",
+                            "priority": "medium",
+                            "tags": ["self-improvement"],
+                        }
+                    ],
+                }
+            },
+            indent=2,
+        )
+        + "\n```"
+    )
+
+
+def resolve_cron_project_prong(
+    job: dict[str, Any],
+    *,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Resolve self-improvement proposal scope for a cron job from config."""
+    cfg = config or load_config()
+    proposals = cfg.get("self_improvement", {}).get("proposals", {}) if isinstance(cfg, dict) else {}
+    cron_jobs = proposals.get("cron_jobs", {}) or {}
+    if not isinstance(cron_jobs, dict):
+        return None
+    mapping = None
+    for key in (text(job.get("id")).strip(), text(job.get("name")).strip()):
+        if key and isinstance(cron_jobs.get(key), dict):
+            mapping = cron_jobs[key]
+            break
+    if not mapping or mapping.get("enabled") is False:
+        return None
+    project = text(mapping.get("project") or mapping.get("project_key")).strip()
+    prong = text(mapping.get("prong") or mapping.get("prong_key")).strip() or None
+    if not project:
+        return None
+    resolved = resolve_project_prong(project, prong, config=cfg)
+    return {"project_key": resolved["project_key"], "prong_key": resolved["prong_key"], "mapping": mapping}
+
+
+def build_cron_feedback_prompt_section(job: dict[str, Any], *, config: dict[str, Any] | None = None) -> str:
+    """Build compact feedback context for a configured self-improvement cron job."""
+    scope = resolve_cron_project_prong(job, config=config)
+    if not scope:
+        return ""
+    feedback = build_feedback_context(scope["project_key"], scope["prong_key"])
+    return (
+        "## Self-Improvement Proposal Feedback Context\n"
+        "Use this operator feedback when deciding which future proposals are worth emitting. "
+        "Only emit proposals for this configured project/prong.\n\n"
+        f"```json\n{json.dumps(feedback, sort_keys=True, separators=(',', ':'))}\n```\n\n"
+        + proposal_json_block_reference(scope["project_key"], scope["prong_key"])
+        + "\n\n"
+    )
+
+
 def ingest_run(data: dict[str, Any], *, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     def op(c: sqlite3.Connection) -> dict[str, Any]:
         now = utc_now()
@@ -240,6 +334,8 @@ def ingest_run(data: dict[str, Any], *, conn: sqlite3.Connection | None = None) 
             "parser_name": text(data.get("parser_name")),
             "parser_version": text(data.get("parser_version")),
             "parser_metadata": json_text(data.get("parser_metadata"), default={}),
+            "parse_status": text(data.get("parse_status")),
+            "parse_error": text(data.get("parse_error")),
             "raw_input_ref": text(data.get("raw_input_ref")),
             "metadata": json_text(data.get("metadata"), default={}),
             "status": status,
@@ -313,6 +409,107 @@ def ingest_card(data: dict[str, Any], *, conn: sqlite3.Connection | None = None)
         return op(conn)
     with connect() as c:
         return op(c)
+
+
+def ingest_cron_proposal_output(
+    job: dict[str, Any],
+    output_text: str,
+    *,
+    source_output_path: str | Path | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Ingest a configured cron run's proposal JSON block without crashing cron."""
+    try:
+        scope = resolve_cron_project_prong(job, config=config)
+    except Exception as exc:
+        return {"ingested": False, "error": str(exc)}
+    if not scope:
+        return None
+
+    raw_text = text(output_text)
+    source_sha = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+    job_id = text(job.get("id"))
+    run_key = f"cron:{scope['project_key']}:{scope['prong_key']}:{job_id}:{source_sha}"
+    source_metadata = {
+        "job_id": job_id,
+        "job_name": text(job.get("name")),
+        "source_output_path": text(source_output_path),
+        "sha256": source_sha,
+    }
+
+    parser_name = STRUCTURED_CRON_PARSER
+    parser_version = STRUCTURED_CRON_PARSER_VERSION
+    parser_metadata: dict[str, Any] = {"block_key": PROPOSAL_BLOCK_KEY}
+    parse_status = "parsed"
+    parse_error = ""
+    cards: list[dict[str, Any]] = []
+
+    try:
+        block = _extract_proposal_block(raw_text)
+        proposals_value = block.get("proposals")
+        if not isinstance(proposals_value, list):
+            raise ValueError("proposal block field 'proposals' must be a list")
+        parser_version = text(block.get("parser_version") or STRUCTURED_CRON_PARSER_VERSION)
+        cards = _normalize_structured_cards(proposals_value)
+    except ValueError as exc:
+        legacy_cards = _legacy_parse_markdown_cards(raw_text)
+        if legacy_cards:
+            parser_name = LEGACY_CRON_PARSER
+            parser_version = LEGACY_CRON_PARSER_VERSION
+            parser_metadata.update({"confidence": "low", "legacy_parse_error": str(exc)})
+            parse_status = "partial"
+            parse_error = str(exc)
+            cards = legacy_cards
+        else:
+            parse_status = "failed"
+            parse_error = str(exc)
+
+    with connect() as conn:
+        run = ingest_run(
+            {
+                "project_key": scope["project_key"],
+                "prong_key": scope["prong_key"],
+                "idempotency_key": run_key,
+                "source_type": "cron",
+                "source_id": job_id,
+                "source_title": text(job.get("name")),
+                "source_metadata": source_metadata,
+                "parser_name": parser_name,
+                "parser_version": parser_version,
+                "parser_metadata": parser_metadata,
+                "parse_status": parse_status,
+                "parse_error": parse_error,
+                "raw_input_ref": text(source_output_path),
+                "status": "failed" if parse_status == "failed" else "parsed",
+                "metadata": {"card_count": len(cards)},
+            },
+            conn=conn,
+        )
+        ingested_cards = []
+        if parse_status != "failed":
+            for index, card in enumerate(cards):
+                card_key = text(card.get("idempotency_key")) or _card_idempotency_key(run_key, card, index)
+                ingested_cards.append(
+                    ingest_card(
+                        {
+                            **card,
+                            "run_id": run["id"],
+                            "idempotency_key": card_key,
+                            "source_metadata": source_metadata,
+                            "parser_metadata": parser_metadata,
+                            "metadata": {"parse_status": parse_status},
+                        },
+                        conn=conn,
+                    )
+                )
+        return {
+            "ingested": True,
+            "run_id": run["id"],
+            "card_count": len(ingested_cards),
+            "parse_status": run.get("parse_status") or parse_status,
+            "parse_error": run.get("parse_error") or parse_error,
+            "parser_name": run.get("parser_name") or parser_name,
+        }
 
 
 def get_run(run_id: int, *, conn: sqlite3.Connection | None = None, public: bool = True) -> dict[str, Any]:
@@ -559,6 +756,110 @@ def recurring_preferences(cards: list[dict[str, Any]]) -> list[str]:
             if item:
                 counts[item] = counts.get(item, 0) + 1
     return [item for item, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0])) if count > 1]
+
+
+def _extract_proposal_block(output_text: str) -> dict[str, Any]:
+    candidates: list[str] = []
+    for match in re.finditer(r"```(?:json)?\s*(.*?)```", output_text, flags=re.IGNORECASE | re.DOTALL):
+        body = match.group(1).strip()
+        if PROPOSAL_BLOCK_KEY in body:
+            candidates.append(body)
+    candidates.extend(_balanced_json_candidates(output_text))
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get(PROPOSAL_BLOCK_KEY), dict):
+            return parsed[PROPOSAL_BLOCK_KEY]
+    if PROPOSAL_BLOCK_KEY in output_text:
+        raise ValueError("proposal JSON block is malformed")
+    raise ValueError("missing required proposal JSON block")
+
+
+def _balanced_json_candidates(output_text: str) -> list[str]:
+    candidates: list[str] = []
+    key_index = output_text.find(PROPOSAL_BLOCK_KEY)
+    while key_index >= 0:
+        start = output_text.rfind("{", 0, key_index)
+        while start >= 0:
+            depth = 0
+            in_string = False
+            escape = False
+            for index in range(start, len(output_text)):
+                char = output_text[index]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif char == "\\":
+                        escape = True
+                    elif char == '"':
+                        in_string = False
+                    continue
+                if char == '"':
+                    in_string = True
+                elif char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidates.append(output_text[start : index + 1])
+                        break
+            start = output_text.rfind("{", 0, start)
+        key_index = output_text.find(PROPOSAL_BLOCK_KEY, key_index + 1)
+    return candidates
+
+
+def _normalize_structured_cards(items: list[Any]) -> list[dict[str, Any]]:
+    cards: list[dict[str, Any]] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(f"proposal at index {index} must be an object")
+        title = text(item.get("title")).strip()
+        if not title:
+            raise ValueError(f"proposal at index {index} is missing title")
+        cards.append(
+            {
+                "title": title,
+                "summary": text(item.get("summary")),
+                "body": text(item.get("body")),
+                "rationale": text(item.get("rationale")),
+                "expected_outcome": text(item.get("expected_outcome")),
+                "priority": text(item.get("priority")),
+                "tags": item.get("tags") if isinstance(item.get("tags"), list) else [],
+                "idempotency_key": text(item.get("idempotency_key")),
+            }
+        )
+    return cards
+
+
+def _legacy_parse_markdown_cards(output_text: str) -> list[dict[str, Any]]:
+    cards: list[dict[str, Any]] = []
+    for match in re.finditer(r"^#{2,4}\s+(?:Proposal\s*[:\-]\s*)?(.+?)\s*$", output_text, flags=re.MULTILINE):
+        title = match.group(1).strip()
+        if not title or title.lower().startswith(("prompt", "response", "cron job")):
+            continue
+        start = match.end()
+        next_match = re.search(r"^#{2,4}\s+", output_text[start:], flags=re.MULTILINE)
+        end = start + next_match.start() if next_match else len(output_text)
+        body = output_text[start:end].strip()
+        cards.append(
+            {
+                "title": title[:240],
+                "summary": truncate(body or title),
+                "body": body,
+                "priority": "",
+                "tags": ["legacy_parse"],
+            }
+        )
+    return cards
+
+
+def _card_idempotency_key(run_key: str, card: dict[str, Any], index: int) -> str:
+    digest = hashlib.sha256(
+        json.dumps({"index": index, "card": card}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"{run_key}:card:{digest}"
 
 
 def audit_event(action: str, actor: str | None, note: str | None) -> dict[str, str]:

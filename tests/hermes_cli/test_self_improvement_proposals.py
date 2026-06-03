@@ -1,4 +1,5 @@
 import sqlite3
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ def test_default_config_includes_self_improvement_proposal_defaults():
 
     assert cfg["projects"] == {}
     assert cfg["project_aliases"] == {}
+    assert cfg["cron_jobs"] == {}
     assert cfg["feedback_context_limit"] == 20
 
 
@@ -38,6 +40,16 @@ def test_db_path_uses_hermes_home_and_migrates_without_real_home_writes(tmp_path
     assert hermes_home / "self_improvement" / "proposals.db" == db_path
     assert (hermes_home / "self_improvement" / "proposals.db").exists()
     assert not (fake_home / ".hermes" / "self_improvement" / "proposals.db").exists()
+
+
+def test_schema_includes_parse_metadata_fields(tmp_path):
+    db_path = tmp_path / "proposals.db"
+
+    with proposals.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(proposal_runs)").fetchall()}
+
+    assert "parse_status" in columns
+    assert "parse_error" in columns
 
 
 def test_resolve_project_prong_supports_configured_aliases():
@@ -245,6 +257,114 @@ def test_feedback_context_is_compact_project_prong_scoped_and_finds_recurring_pr
     assert outcome_titles == {"Approved storage"}
     assert "Other prong" not in approved_titles
     assert context["operator_preferences"] == ["Prefer small, reversible changes.", "Good scope"]
+
+
+def test_cron_json_proposal_output_ingests_cards_and_is_idempotent(tmp_path):
+    hermes_home = tmp_path / "hermes-home"
+    config = {
+        "self_improvement": {
+            "proposals": {
+                "projects": {"sligo": {"default_prong": "r1", "prongs": {"r1": {}}}},
+                "cron_jobs": {"job-1": {"project": "sligo", "prong": "r1"}},
+            }
+        }
+    }
+    output = "Report\n```json\n" + json.dumps(
+        {
+            proposals.PROPOSAL_BLOCK_KEY: {
+                "parser_version": "1",
+                "project": "sligo",
+                "prong": "r1",
+                "proposals": [
+                    {
+                        "title": "Add ingestion hook",
+                        "summary": "Parse structured proposal blocks.",
+                        "body": "Wire cron output into storage.",
+                        "rationale": "Keeps review queue current.",
+                        "expected_outcome": "One card appears.",
+                        "priority": "high",
+                        "tags": ["cron"],
+                    }
+                ],
+            }
+        }
+    ) + "\n```"
+
+    with patch.dict("os.environ", {"HERMES_HOME": str(hermes_home)}):
+        first = proposals.ingest_cron_proposal_output(
+            {"id": "job-1", "name": "Daily proposals"}, output, source_output_path=tmp_path / "out.md", config=config
+        )
+        second = proposals.ingest_cron_proposal_output(
+            {"id": "job-1", "name": "Daily proposals"}, output, source_output_path=tmp_path / "out.md", config=config
+        )
+        with proposals.connect() as conn:
+            run = conn.execute("SELECT * FROM proposal_runs").fetchone()
+            cards = conn.execute("SELECT * FROM proposal_cards").fetchall()
+
+    assert first["parse_status"] == "parsed"
+    assert second["run_id"] == first["run_id"]
+    assert run["source_type"] == "cron"
+    assert run["parser_name"] == proposals.STRUCTURED_CRON_PARSER
+    assert run["parse_status"] == "parsed"
+    assert len(cards) == 1
+    assert cards[0]["title"] == "Add ingestion hook"
+    assert json.loads(cards[0]["tags"]) == ["cron"]
+
+
+def test_cron_malformed_proposal_json_records_parse_failure(tmp_path):
+    hermes_home = tmp_path / "hermes-home"
+    config = {
+        "self_improvement": {
+            "proposals": {
+                "projects": {"sligo": {"default_prong": "r1", "prongs": {"r1": {}}}},
+                "cron_jobs": {"job-1": {"project": "sligo", "prong": "r1"}},
+            }
+        }
+    }
+
+    with patch.dict("os.environ", {"HERMES_HOME": str(hermes_home)}):
+        result = proposals.ingest_cron_proposal_output(
+            {"id": "job-1"},
+            f"```json\n{{\"{proposals.PROPOSAL_BLOCK_KEY}\": {{\"proposals\": [}}\n```",
+            config=config,
+        )
+        with proposals.connect() as conn:
+            run = conn.execute("SELECT * FROM proposal_runs").fetchone()
+            card_count = conn.execute("SELECT COUNT(*) FROM proposal_cards").fetchone()[0]
+
+    assert result["parse_status"] == "failed"
+    assert run["status"] == "failed"
+    assert run["parse_error"] == "proposal JSON block is malformed"
+    assert card_count == 0
+
+
+def test_cron_feedback_prompt_section_is_configured_and_scoped(tmp_path):
+    db_path = tmp_path / "proposals.db"
+    config = {
+        "self_improvement": {
+            "proposals": {
+                "projects": {"sligo": {"default_prong": "r1", "prongs": {"r1": {}, "r2": {}}}},
+                "cron_jobs": {"Daily proposals": {"project": "sligo", "prong": "r1"}},
+                "feedback_context_limit": 10,
+            }
+        }
+    }
+    with proposals.connect(db_path) as conn:
+        run = proposals.ingest_run({"project_key": "sligo", "prong_key": "r1", "idempotency_key": "run-1"}, conn=conn)
+        other_run = proposals.ingest_run({"project_key": "sligo", "prong_key": "r2", "idempotency_key": "run-2"}, conn=conn)
+        approved = proposals.ingest_card({"run_id": run["id"], "idempotency_key": "card-1", "title": "Small fix"}, conn=conn)
+        other = proposals.ingest_card({"run_id": other_run["id"], "idempotency_key": "card-2", "title": "Other prong"}, conn=conn)
+        proposals.record_decision(approved["id"], "approved", feedback="Prefer scoped fixes.", conn=conn)
+        proposals.record_decision(other["id"], "rejected", feedback="Do not include.", conn=conn)
+
+    with patch.object(proposals, "get_db_path", return_value=db_path):
+        section = proposals.build_cron_feedback_prompt_section({"id": "job-9", "name": "Daily proposals"}, config=config)
+
+    assert "Self-Improvement Proposal Feedback Context" in section
+    assert "Small fix" in section
+    assert "Prefer scoped fixes." in section
+    assert "Other prong" not in section
+    assert proposals.PROPOSAL_BLOCK_KEY in section
 
 
 def test_invalid_status_and_json_are_rejected(tmp_path):
