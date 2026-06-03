@@ -8987,7 +8987,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # Only batch plain text messages — commands, media, etc. dispatch
         # immediately since they won't be split by the Discord client.
-        if msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
+        if msg_type == MessageType.TEXT and self._should_batch_text_event(event):
             self._log_discord_intake_timing(_intake_timing, source=source, batched=True)
             self._enqueue_text_event(event)
         else:
@@ -9006,6 +9006,32 @@ class DiscordAdapter(BasePlatformAdapter):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
+
+    def _fast_thread_text_batch_bypass_enabled(self) -> bool:
+        configured = self.config.extra.get("fast_thread_text_batch_bypass")
+        if configured is not None:
+            return is_truthy_value(configured, default=True)
+        return is_truthy_value(
+            os.getenv("HERMES_DISCORD_FAST_THREAD_TEXT_BATCH_BYPASS"),
+            default=True,
+        )
+
+    def _should_batch_text_event(self, event: MessageEvent) -> bool:
+        """Return whether this text event should wait for aggregation."""
+        if self._text_batch_delay_seconds <= 0:
+            return False
+
+        # Ordinary feature/mainline thread replies are usually short, single
+        # Discord messages. Dispatch them immediately and keep batching only
+        # for near-2k chunks where client-side splitting is likely.
+        if (
+            self._fast_thread_text_batch_bypass_enabled()
+            and getattr(event.source, "thread_id", None)
+            and len(event.text or "") < self._SPLIT_THRESHOLD
+        ):
+            return False
+
+        return True
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.

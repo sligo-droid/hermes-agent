@@ -875,10 +875,20 @@ class TestDeliverResultWrapping:
             {"thread_id": str(channel.id), "message_id": "embed-1"},
             {"thread_id": str(channel.id), "message_id": "embed-2"},
         ]
+        sent_order = []
+
+        async def fake_send(*args, **kwargs):
+            sent_order.append("text")
+            return MagicMock(success=True)
+
+        async def fake_initialize_feature_summary(*args, **kwargs):
+            sent_order.append("embed")
+            return handles[len(sent_order) - sent_order.count("text") - 1]
+
         adapter = MagicMock()
-        adapter.send = AsyncMock(return_value=MagicMock(success=True))
+        adapter.send = AsyncMock(side_effect=fake_send)
         adapter._resolve_channel_by_id = AsyncMock(return_value=channel)
-        adapter.initialize_feature_summary = AsyncMock(side_effect=handles)
+        adapter.initialize_feature_summary = AsyncMock(side_effect=fake_initialize_feature_summary)
         adapter.update_feature_summary = AsyncMock(return_value=True)
 
         pconfig = MagicMock()
@@ -917,6 +927,7 @@ class TestDeliverResultWrapping:
             )
 
         assert result is None
+        assert sent_order == ["embed", "embed", "text"]
         adapter.send.assert_called_once()
         assert adapter._resolve_channel_by_id.await_args.args == ("1505275259006484570",)
         assert adapter.initialize_feature_summary.await_count == 2

@@ -912,6 +912,42 @@ def _deliver_result(
             send_metadata = {"thread_id": thread_id} if thread_id else None
             cron_pr_urls = _extract_github_pr_urls(content) if cron_feature_summaries else []
             try:
+                # For Discord cron PR reports, create the Simple Feature Request
+                # / feature-summary embed first, then send the detailed text body.
+                # This keeps the channel visually anchored on the rich summary and
+                # makes the follow-up read like the post-embed evidence block.
+                if platform == Platform.DISCORD and cron_pr_urls:
+                    from agent.async_utils import safe_schedule_threadsafe
+
+                    future = safe_schedule_threadsafe(
+                        _send_discord_cron_feature_summaries(
+                            runtime_adapter,
+                            chat_id=str(chat_id),
+                            thread_id=str(thread_id) if thread_id else None,
+                            job=job,
+                            content=content,
+                            pr_urls=cron_pr_urls,
+                        ),
+                        loop,
+                    )
+                    if future is None:
+                        msg = "Discord cron feature-summary embed scheduling failed"
+                        logger.warning("Job '%s': %s", job["id"], msg)
+                        delivery_errors.append(msg)
+                    else:
+                        try:
+                            created = future.result(timeout=30)
+                        except TimeoutError:
+                            future.cancel()
+                            raise
+                        if created < len(cron_pr_urls):
+                            msg = (
+                                "Discord cron feature-summary embeds created "
+                                f"{created}/{len(cron_pr_urls)}"
+                            )
+                            logger.warning("Job '%s': %s", job["id"], msg)
+                            delivery_errors.append(msg)
+
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
                 text_to_send = cleaned_delivery_content.strip()
                 adapter_ok = True
@@ -963,37 +999,6 @@ def _deliver_result(
                     )
 
                 if adapter_ok:
-                    if platform == Platform.DISCORD and cron_pr_urls:
-                        from agent.async_utils import safe_schedule_threadsafe
-
-                        future = safe_schedule_threadsafe(
-                            _send_discord_cron_feature_summaries(
-                                runtime_adapter,
-                                chat_id=str(chat_id),
-                                thread_id=str(thread_id) if thread_id else None,
-                                job=job,
-                                content=content,
-                                pr_urls=cron_pr_urls,
-                            ),
-                            loop,
-                        )
-                        if future is None:
-                            msg = "Discord cron feature-summary embed scheduling failed"
-                            logger.warning("Job '%s': %s", job["id"], msg)
-                            delivery_errors.append(msg)
-                        else:
-                            try:
-                                created = future.result(timeout=30)
-                            except TimeoutError:
-                                future.cancel()
-                                raise
-                            if created < len(cron_pr_urls):
-                                msg = (
-                                    "Discord cron feature-summary embeds created "
-                                    f"{created}/{len(cron_pr_urls)}"
-                                )
-                                logger.warning("Job '%s': %s", job["id"], msg)
-                                delivery_errors.append(msg)
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
             except Exception as e:
