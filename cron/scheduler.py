@@ -11,6 +11,7 @@ runs at a time if multiple processes overlap.
 import asyncio
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -1445,6 +1446,53 @@ def _scan_assembled_cron_prompt(assembled: str, job: dict, *, has_skills: bool =
     return assembled
 
 
+def _ingest_self_improvement_proposals(
+    job: dict,
+    *,
+    success: bool,
+    output: str,
+    final_response: str,
+    output_file: Path | str | None,
+) -> None:
+    if not success:
+        return
+    try:
+        from hermes_cli.self_improvement_proposals import _self_improvement_target_for_job, ingest_proposal_output
+
+        config = load_config()
+        target = _self_improvement_target_for_job(job, config)
+        if target is None:
+            return
+
+        output_path = str(output_file) if output_file else None
+        output_hash = None
+        if output_file:
+            output_hash = hashlib.sha256(Path(output_file).read_bytes()).hexdigest()
+        elif output is not None:
+            output_hash = hashlib.sha256(str(output).encode("utf-8")).hexdigest()
+
+        metadata = {
+            "project": target["project"],
+            "prong": target["prong"],
+            "cron_job_id": job.get("id"),
+            "cron_job_name": job.get("name"),
+            "cron_run_id": f"{job.get('id')}:{output_hash}" if output_hash else job.get("id"),
+            "cron_output_path": output_path,
+            "cron_output_sha256": output_hash,
+            "model": job.get("model"),
+            "provider": job.get("provider"),
+            "profile": job.get("profile"),
+            "workdir": job.get("workdir"),
+        }
+        ingest_proposal_output(metadata=metadata, output_text=final_response or output, config=config)
+    except Exception as exc:
+        logger.warning(
+            "Cron job '%s': failed to ingest self-improvement proposals: %s",
+            job.get("name") or job.get("id"),
+            exc,
+        )
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """Execute a single cron job, applying any per-job profile override."""
     job_id = job["id"]
@@ -2205,6 +2253,14 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 output_file = save_job_output(job["id"], output)
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
+
+                _ingest_self_improvement_proposals(
+                    job,
+                    success=success,
+                    output=output,
+                    final_response=final_response,
+                    output_file=output_file,
+                )
 
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but

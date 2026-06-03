@@ -1971,8 +1971,8 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "storage_db": "self_improvement/proposals.db",
         "projects": {
-            "sligo": {
-                "name": "Sligo",
+            "pid": {
+                "name": "PID",
                 "workspace_path": ".",
                 "board": "default",
                 "assignee": "dev",
@@ -1982,25 +1982,25 @@ DEFAULT_CONFIG = {
                         "name": "Airflow Doctor",
                         "enabled": True,
                         "cron_prompt_context": True,
-                        "cron_job_names": ["Sligo Airflow Doctor"],
+                        "cron_job_names": ["Nightly PID Airflow scraper doctor"],
                     },
                     "admin_dogfood": {
                         "name": "Admin Dogfood",
                         "enabled": True,
                         "cron_prompt_context": True,
-                        "cron_job_names": ["Sligo Admin Dogfood"],
+                        "cron_job_names": ["Daily PID admin dogfood UX bugfix"],
                     },
                     "invisible_technical_recommendations": {
                         "name": "Invisible Technical Recommendations",
                         "enabled": True,
                         "cron_prompt_context": True,
-                        "cron_job_names": ["Sligo Invisible Technical Recommendations"],
+                        "cron_job_names": ["Daily PID invisible technical recommendations"],
                     },
                     "visible_ui_ux_recommendations": {
                         "name": "Visible UI/UX Recommendations",
                         "enabled": True,
                         "cron_prompt_context": True,
-                        "cron_job_names": ["Sligo Visible UI/UX Recommendations"],
+                        "cron_job_names": ["Daily PID visible UI/UX recommendations"],
                     },
                 },
             },

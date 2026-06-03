@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import sqlite3
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -2058,6 +2059,132 @@ class TestBuildJobPromptSilentHint:
 
         assert "SELF IMPROVEMENT CONTEXT" in result
         assert result.index("SELF IMPROVEMENT CONTEXT") < result.index("Generate proposals")
+
+
+class TestSelfImprovementCronIngestion:
+    def _payload(self) -> dict:
+        return {
+            "hermes_self_improvement_proposals_version": 1,
+            "project": "pid",
+            "prong": "airflow_doctor",
+            "proposals": [
+                {
+                    "title": "Fix PID DAG import alert",
+                    "summary": "Surface DAG import failures sooner.",
+                    "body": "The Airflow doctor found an import error without a card.",
+                    "evidence": [{"label": "cron", "detail": "dag import failed"}],
+                    "worker_prompt": "Add a focused DAG import health check.",
+                    "acceptance_criteria": ["Import failures are visible in the health report."],
+                    "priority": "high",
+                    "confidence": 0.8,
+                    "effort": "small",
+                }
+            ],
+        }
+
+    def _config(self, tmp_path):
+        return {
+            "self_improvement": {
+                "enabled": True,
+                "storage_db": str(tmp_path / "proposals.db"),
+                "projects": {
+                    "pid": {
+                        "name": "PID",
+                        "workspace_path": str(tmp_path / "PID"),
+                        "board": "pid-board",
+                        "assignee": "dev",
+                        "skills": [],
+                        "prongs": {
+                            "airflow_doctor": {
+                                "name": "Airflow Doctor",
+                                "enabled": True,
+                                "cron_prompt_context": True,
+                                "cron_job_names": ["Nightly PID Airflow scraper doctor"],
+                            }
+                        },
+                    }
+                },
+            }
+        }
+
+    def test_marked_pid_prong_output_creates_run_and_card(self, tmp_path):
+        from cron.scheduler import tick
+        from hermes_cli.self_improvement_proposals import START_MARKER, END_MARKER
+
+        cfg = self._config(tmp_path)
+        output_path = tmp_path / "output.md"
+
+        def save_output(_job_id, output):
+            output_path.write_text(output, encoding="utf-8")
+            return output_path
+
+        final = f"Report\n{START_MARKER}\n{json.dumps(self._payload())}\n{END_MARKER}"
+        job = {"id": "pid-airflow", "name": "Nightly PID Airflow scraper doctor"}
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.run_job", return_value=(True, "# full output\n" + final, final, None)), \
+             patch("cron.scheduler.save_job_output", side_effect=save_output), \
+             patch("cron.scheduler._deliver_result"), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler.load_config", return_value=cfg):
+            tick(verbose=False)
+
+        with sqlite3.connect(cfg["self_improvement"]["storage_db"]) as conn:
+            run = conn.execute("SELECT project, prong, parse_status, cron_job_name, cron_output_path, cron_output_sha256 FROM proposal_runs").fetchone()
+            card = conn.execute("SELECT project, prong, title, source_output_path FROM proposal_cards").fetchone()
+
+        assert run[0:4] == ("pid", "airflow_doctor", "parsed", "Nightly PID Airflow scraper doctor")
+        assert run[4] == str(output_path)
+        assert run[5]
+        assert card == ("pid", "airflow_doctor", "Fix PID DAG import alert", str(output_path))
+
+    def test_malformed_pid_prong_output_creates_parse_error_run(self, tmp_path):
+        from cron.scheduler import tick
+        from hermes_cli.self_improvement_proposals import START_MARKER, END_MARKER
+
+        cfg = self._config(tmp_path)
+        output_path = tmp_path / "bad.md"
+
+        def save_output(_job_id, output):
+            output_path.write_text(output, encoding="utf-8")
+            return output_path
+
+        final = f"{START_MARKER}\nnot json\n{END_MARKER}"
+        job = {"id": "pid-airflow", "name": "Nightly PID Airflow scraper doctor"}
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.run_job", return_value=(True, final, final, None)), \
+             patch("cron.scheduler.save_job_output", side_effect=save_output), \
+             patch("cron.scheduler._deliver_result"), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler.load_config", return_value=cfg):
+            tick(verbose=False)
+
+        with sqlite3.connect(cfg["self_improvement"]["storage_db"]) as conn:
+            run = conn.execute("SELECT project, prong, parse_status, parse_error FROM proposal_runs").fetchone()
+            cards = conn.execute("SELECT COUNT(*) FROM proposal_cards").fetchone()[0]
+
+        assert run[0:3] == ("pid", "airflow_doctor", "parse_error")
+        assert "Malformed proposal JSON" in run[3]
+        assert cards == 0
+
+    def test_non_self_improvement_job_does_not_ingest(self, tmp_path):
+        from cron.scheduler import tick
+        from hermes_cli.self_improvement_proposals import START_MARKER, END_MARKER
+
+        cfg = self._config(tmp_path)
+        final = f"{START_MARKER}\n{json.dumps(self._payload())}\n{END_MARKER}"
+        job = {"id": "regular", "name": "Regular cron"}
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.run_job", return_value=(True, final, final, None)), \
+             patch("cron.scheduler.save_job_output", return_value=tmp_path / "regular.md"), \
+             patch("cron.scheduler._deliver_result"), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler.load_config", return_value=cfg):
+            tick(verbose=False)
+
+        assert not (tmp_path / "proposals.db").exists()
 
 
 class TestParseWakeGate:

@@ -293,8 +293,8 @@ def ingest_proposal_output(
         parse_error = None
         contract_version = CONTRACT_VERSION
     except Exception as exc:
-        project_id = None
-        prong_id = None
+        project_id = _metadata_str(metadata, "project")
+        prong_id = _metadata_str(metadata, "prong")
         context = None
         cards = []
         parse_status = "parse_error"

@@ -57,20 +57,24 @@ def _payload() -> dict:
     }
 
 
-def test_default_config_contains_sligo_project_and_required_prongs(tmp_path, monkeypatch):
+def test_default_config_contains_pid_project_and_required_prongs(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     cfg = load_config()
     si = cfg["self_improvement"]
 
     assert si["enabled"] is False
-    assert list(si["projects"])[0] == "sligo"
-    assert set(si["projects"]["sligo"]["prongs"]) == {
+    assert list(si["projects"])[0] == "pid"
+    assert si["projects"]["pid"]["name"] == "PID"
+    assert set(si["projects"]["pid"]["prongs"]) == {
         "airflow_doctor",
         "admin_dogfood",
         "invisible_technical_recommendations",
         "visible_ui_ux_recommendations",
     }
+    assert si["projects"]["pid"]["prongs"]["airflow_doctor"]["cron_job_names"] == [
+        "Nightly PID Airflow scraper doctor"
+    ]
     assert DEFAULT_CONFIG["self_improvement"]["storage_db"] == "self_improvement/proposals.db"
 
 
