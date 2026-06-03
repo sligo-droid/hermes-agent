@@ -102,6 +102,7 @@ def test_valid_ingestion_from_metadata_stores_run_card_source_and_sanitizes(tmp_
             "summary": "Expose failed DAGs using sk-proj-summarySecret1234567890 in neutral prose.",
             "body": "Operators saw OPENAI_API_KEY=bodySecret1234567890 during triage.",
             "worker_prompt": "Implement without leaking ghp_workerSecret1234567890.",
+            "acceptance_criteria": ["No token sk-proj-acceptanceSecret1234567890 is visible."],
             "evidence": [
                 {
                     "label": "log sk-proj-labelSecret1234567890",
@@ -109,6 +110,8 @@ def test_valid_ingestion_from_metadata_stores_run_card_source_and_sanitizes(tmp_
                     "api_token": "secret-token",
                 }
             ],
+            "suggested_assignee": "dev sk-proj-assigneeSecret1234567890",
+            "suggested_skills": ["airflow", "secret skill ghp_skillSecret1234567890"],
         }
     )
     result = sip.ingest_proposal_output(
@@ -142,11 +145,13 @@ def test_valid_ingestion_from_metadata_stores_run_card_source_and_sanitizes(tmp_
     assert "sk-proj-summarySecret1234567890" not in cards[0]["summary"]
     assert "bodySecret1234567890" not in cards[0]["body"]
     assert "ghp_workerSecret1234567890" not in cards[0]["worker_prompt"]
+    assert "sk-proj-acceptanceSecret1234567890" not in cards[0]["acceptance_criteria"][0]
     assert cards[0]["resolved_workspace_path"] == str(tmp_path / "sligo")
     assert cards[0]["resolved_board"] == "sligo-board"
     assert cards[0]["resolved_assignee"] == "dev"
     assert cards[0]["resolved_skills"] == ["python"]
-    assert cards[0]["suggested_assignee"] == "somebody-else"
+    assert "sk-proj-assigneeSecret1234567890" not in cards[0]["suggested_assignee"]
+    assert "ghp_skillSecret1234567890" not in " ".join(cards[0]["suggested_skills"])
     assert cards[0]["evidence"][0]["api_token"] == "[REDACTED]"
     assert "sk-proj-labelSecret1234567890" not in cards[0]["evidence"][0]["label"]
     assert "ghp_detailSecret1234567890" not in cards[0]["evidence"][0]["detail"]
@@ -155,7 +160,7 @@ def test_valid_ingestion_from_metadata_stores_run_card_source_and_sanitizes(tmp_
 
     with sqlite3.connect(str(tmp_path / "proposals.db")) as conn:
         stored_row = conn.execute(
-            "SELECT title, summary, body, worker_prompt, evidence_json, source_output_path FROM proposal_cards"
+            "SELECT title, summary, body, worker_prompt, acceptance_criteria_json, evidence_json, suggested_assignee, suggested_skills_json, source_output_path FROM proposal_cards"
         ).fetchone()
         stored_run = conn.execute("SELECT cron_job_name, model, workdir, metadata_json FROM proposal_runs").fetchone()
     stored = " ".join(str(value) for value in (*stored_row, *stored_run))
@@ -164,12 +169,46 @@ def test_valid_ingestion_from_metadata_stores_run_card_source_and_sanitizes(tmp_
     assert "sk-proj-summarySecret1234567890" not in stored
     assert "bodySecret1234567890" not in stored
     assert "ghp_workerSecret1234567890" not in stored
+    assert "sk-proj-acceptanceSecret1234567890" not in stored
     assert "sk-proj-labelSecret1234567890" not in stored
     assert "ghp_detailSecret1234567890" not in stored
+    assert "sk-proj-assigneeSecret1234567890" not in stored
+    assert "ghp_skillSecret1234567890" not in stored
     assert "sk-proj-sourceSecret1234567890" not in stored
     assert "sk-proj-jobSecret1234567890" not in stored
     assert "sk-proj-modelSecret1234567890" not in stored
     assert "sk-proj-workdirSecret1234567890" not in stored
+
+
+def test_edit_proposal_sanitizes_dashboard_visible_fields_in_storage_and_response(tmp_path):
+    cfg = _config(tmp_path)
+    sip.ingest_proposal_output(metadata={"proposal_json": json.dumps(_payload()), "cron_run_id": "run-a"}, config=cfg)
+    card_id = sip.list_proposals(config=cfg)[0]["card_id"]
+
+    detail = sip.edit_proposal(
+        card_id,
+        title="Edited sk-proj-editTitleSecret1234567890",
+        summary="Edited OPENAI_API_KEY=editSummarySecret1234567890",
+        body="Edited body ghp_editBodySecret1234567890",
+        acceptance_criteria=["Hide token sk-proj-editCriteriaSecret1234567890"],
+        config=cfg,
+    )
+
+    returned = json.dumps(detail, sort_keys=True)
+    assert "sk-proj-editTitleSecret1234567890" not in returned
+    assert "editSummarySecret1234567890" not in returned
+    assert "ghp_editBodySecret1234567890" not in returned
+    assert "sk-proj-editCriteriaSecret1234567890" not in returned
+    with sqlite3.connect(str(tmp_path / "proposals.db")) as conn:
+        stored_row = conn.execute(
+            "SELECT title, summary, body, acceptance_criteria_json FROM proposal_cards WHERE card_id = ?",
+            (card_id,),
+        ).fetchone()
+    stored = " ".join(str(value) for value in stored_row)
+    assert "sk-proj-editTitleSecret1234567890" not in stored
+    assert "editSummarySecret1234567890" not in stored
+    assert "ghp_editBodySecret1234567890" not in stored
+    assert "sk-proj-editCriteriaSecret1234567890" not in stored
 
 
 def test_ingestion_from_marked_output_text(tmp_path):

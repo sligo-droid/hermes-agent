@@ -536,7 +536,7 @@ def edit_proposal(
     if acceptance_criteria is not None:
         if not isinstance(acceptance_criteria, list) or not all(isinstance(v, str) and v.strip() for v in acceptance_criteria):
             raise ValueError("acceptance_criteria must be a non-empty list of strings")
-        updates["acceptance_criteria_json"] = json.dumps([v.strip() for v in acceptance_criteria])
+        updates["acceptance_criteria_json"] = json.dumps([_sanitize_free_text(v.strip()) for v in acceptance_criteria])
     if not updates:
         raise ValueError("no editable fields supplied")
     updates["updated_at"] = int(time.time())
@@ -633,7 +633,7 @@ def reject_proposal(
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     now = int(time.time())
-    reason_text = str(reason or "").strip()
+    reason_text = _sanitize_free_text(str(reason or "").strip()) or ""
     metadata = {"strength": str(strength).strip()} if strength else {}
     with connect(db_path, config) as conn:
         row = conn.execute("SELECT * FROM proposal_cards WHERE card_id = ?", (card_id,)).fetchone()
@@ -929,32 +929,32 @@ def sanitize_proposal(row: dict[str, Any]) -> dict[str, Any]:
         "prong": row.get("prong"),
         "status": row.get("status"),
         "lifecycle_status": row.get("lifecycle_status"),
-        "title": row.get("title"),
-        "summary": row.get("summary"),
-        "body": row.get("body"),
-        "worker_prompt": row.get("worker_prompt"),
-        "acceptance_criteria": _json_value(row.get("acceptance_criteria_json"), []),
+        "title": _sanitize_free_text(row.get("title")),
+        "summary": _sanitize_free_text(row.get("summary")),
+        "body": _sanitize_free_text(row.get("body")),
+        "worker_prompt": _sanitize_free_text(row.get("worker_prompt")),
+        "acceptance_criteria": sanitize_payload(_json_value(row.get("acceptance_criteria_json"), [])),
         "evidence": sanitize_payload(_json_value(row.get("evidence_json"), [])),
         "priority": row.get("priority"),
         "confidence": row.get("confidence"),
         "effort": row.get("effort"),
-        "suggested_assignee": row.get("suggested_assignee"),
-        "suggested_skills": _json_value(row.get("suggested_skills_json"), []),
+        "suggested_assignee": _sanitize_free_text(row.get("suggested_assignee")),
+        "suggested_skills": sanitize_payload(_json_value(row.get("suggested_skills_json"), [])),
         "resolved_workspace_path": row.get("resolved_workspace_path"),
         "resolved_board": row.get("resolved_board"),
         "resolved_assignee": row.get("resolved_assignee"),
         "resolved_skills": _json_value(row.get("resolved_skills_json"), []),
         "idempotency_key": row.get("idempotency_key"),
         "decision": row.get("decision"),
-        "decision_reason": row.get("decision_reason"),
-        "decided_by": row.get("decided_by"),
+        "decision_reason": _sanitize_free_text(row.get("decision_reason")),
+        "decided_by": _sanitize_free_text(row.get("decided_by")),
         "decided_at": row.get("decided_at"),
         "linked_kanban_board": row.get("linked_kanban_board"),
         "linked_kanban_task_id": row.get("linked_kanban_task_id"),
         "linked_worker_run_id": row.get("linked_worker_run_id"),
         "linked_worker_url": row.get("linked_worker_url"),
         "linked_worker_session_id": row.get("linked_worker_session_id"),
-        "source_output_path": row.get("source_output_path"),
+        "source_output_path": _sanitize_free_text(row.get("source_output_path")),
         "source_output_sha256": row.get("source_output_sha256"),
         "source_timestamp": row.get("source_timestamp"),
         "created_at": row.get("created_at"),
@@ -1022,7 +1022,7 @@ def _normalize_proposal(item: Any, context: dict[str, Any]) -> dict[str, Any]:
     effort = str(item.get("effort") or "medium").lower()
     if effort not in {"small", "medium", "large"}:
         raise ProposalParseError("effort must be small, medium, or large")
-    suggested_skills = _string_list(item.get("suggested_skills"))
+    suggested_skills = [_sanitize_free_text(value) for value in _string_list(item.get("suggested_skills"))]
     idempotency_key = _stable_hash({
         "project": context["project"],
         "prong": context["prong"],
@@ -1040,7 +1040,7 @@ def _normalize_proposal(item: Any, context: dict[str, Any]) -> dict[str, Any]:
         "priority": priority,
         "confidence": float(confidence),
         "effort": effort,
-        "suggested_assignee": item.get("suggested_assignee") if isinstance(item.get("suggested_assignee"), str) else None,
+        "suggested_assignee": _sanitize_free_text(item.get("suggested_assignee")) if isinstance(item.get("suggested_assignee"), str) else None,
         "suggested_skills": suggested_skills,
         "idempotency_key": idempotency_key,
     }
@@ -1158,7 +1158,7 @@ def _non_empty_edit_str(value: str, field: str) -> str:
     text = str(value or "").strip()
     if not text:
         raise ValueError(f"{field} must be a non-empty string")
-    return text
+    return _sanitize_free_text(text) or ""
 
 
 def _kanban_priority(priority: Any) -> int:

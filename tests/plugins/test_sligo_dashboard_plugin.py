@@ -163,6 +163,39 @@ def test_limited_edit_validation_and_unsafe_override_rejection(client):
     assert bad.status_code == 422
 
 
+def test_dashboard_edit_sanitizes_visible_fields_in_response_and_storage(client, isolated):
+    card_id = _ingest_card(client)
+    headers = {"X-Hermes-Session-Token": "test-token"}
+
+    r = client.patch(
+        f"/api/plugins/sligo/proposals/{card_id}",
+        headers=headers,
+        json={
+            "title": "Edited sk-proj-dashboardTitleSecret1234567890",
+            "summary": "Edited OPENAI_API_KEY=dashboardSummarySecret1234567890",
+            "body": "Edited body ghp_dashboardBodySecret1234567890",
+            "acceptance_criteria": ["Hide sk-proj-dashboardCriteriaSecret1234567890"],
+        },
+    )
+
+    assert r.status_code == 200
+    returned = json.dumps(r.json()["proposal"], sort_keys=True)
+    assert "sk-proj-dashboardTitleSecret1234567890" not in returned
+    assert "dashboardSummarySecret1234567890" not in returned
+    assert "ghp_dashboardBodySecret1234567890" not in returned
+    assert "sk-proj-dashboardCriteriaSecret1234567890" not in returned
+    with sip.connect(config=isolated) as conn:
+        row = conn.execute(
+            "SELECT title, summary, body, acceptance_criteria_json FROM proposal_cards WHERE card_id = ?",
+            (card_id,),
+        ).fetchone()
+    stored = " ".join(str(value) for value in row)
+    assert "sk-proj-dashboardTitleSecret1234567890" not in stored
+    assert "dashboardSummarySecret1234567890" not in stored
+    assert "ghp_dashboardBodySecret1234567890" not in stored
+    assert "sk-proj-dashboardCriteriaSecret1234567890" not in stored
+
+
 def test_approve_rejects_unsafe_project_workspace(client, isolated):
     card_id = _ingest_card(client)
     with sip.connect(config=isolated) as conn:
