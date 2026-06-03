@@ -1245,6 +1245,15 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     prompt = str(job.get("prompt") or "")
     skills = job.get("skills")
 
+    try:
+        from hermes_cli.self_improvement_proposals import build_cron_feedback_prompt_section
+
+        feedback_section = build_cron_feedback_prompt_section(job)
+        if feedback_section:
+            prompt = feedback_section + prompt
+    except Exception as exc:
+        logger.warning("Job '%s': failed to build self-improvement feedback context: %s", job.get("id"), exc)
+
     # Run data-collection script if configured, inject output as context.
     script_path = job.get("script")
     if script_path:
@@ -2191,6 +2200,20 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 output_file = save_job_output(job["id"], output)
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
+
+                try:
+                    from hermes_cli.self_improvement_proposals import ingest_cron_proposal_output
+
+                    ingest_result = ingest_cron_proposal_output(job, output, source_output_path=output_file)
+                    if ingest_result and ingest_result.get("parse_status") in {"failed", "partial"}:
+                        logger.warning(
+                            "Job '%s': self-improvement proposal parse_status=%s parse_error=%s",
+                            job["id"],
+                            ingest_result.get("parse_status"),
+                            ingest_result.get("parse_error"),
+                        )
+                except Exception as ingest_exc:
+                    logger.exception("Job '%s': self-improvement proposal ingestion failed: %s", job["id"], ingest_exc)
 
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but
