@@ -811,6 +811,7 @@ async def test_goal_slash_routes_official_command_to_hermes_goal_loop(adapter):
     project_context = {"project_path": "/home/droid/hermes"}
     adapter._resolve_project_context_for_channel = MagicMock(return_value=project_context)
     adapter._fetch_goal_thread_context = AsyncMock(return_value="")
+    adapter._expand_discord_thread_refs_for_context = AsyncMock(return_value="")
     adapter._dispatch_thread_session = AsyncMock()
     scheduled = []
 
@@ -865,6 +866,7 @@ async def test_goal_slash_from_thread_uses_thread_parent_for_project_context(ada
     project_context = {"project_path": "/home/droid/hermes"}
     adapter._resolve_project_context_for_channel = MagicMock(return_value=project_context)
     adapter._fetch_goal_thread_context = AsyncMock(return_value="[Goal thread context]\n[Alice] prior detail")
+    adapter._expand_discord_thread_refs_for_context = AsyncMock(return_value="")
     adapter._dispatch_thread_session = AsyncMock()
     scheduled = []
 
@@ -937,6 +939,62 @@ async def test_text_goal_in_existing_thread_captures_planner_context(adapter, mo
     adapter._fetch_goal_thread_context.assert_awaited_once()
     assert len(captured_events) == 1
     assert captured_events[0].goal_thread_context == "[Goal thread context]\n[Alice] prior detail"
+
+
+@pytest.mark.asyncio
+async def test_goal_slash_expands_linked_thread_context(adapter):
+    parent = _FakeTextChannel(channel_id=123, name="features")
+    interaction = SimpleNamespace(
+        channel=parent,
+        channel_id=123,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+        guild=SimpleNamespace(name="TestGuild", id=1),
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+    adapter._create_thread = AsyncMock(
+        return_value={"success": True, "thread_id": "555", "thread_name": "Ship faster"}
+    )
+    thread = _FakeThreadChannel(channel_id=555, name="Ship faster", parent_id=123)
+    thread.parent = parent
+    adapter._resolve_channel_by_id = AsyncMock(return_value=thread)
+    adapter._fetch_goal_thread_context = AsyncMock(return_value="")
+    adapter._expand_discord_thread_refs_for_context = AsyncMock(
+        return_value="[Expanded Discord thread plan]\n## Plan\nUse linked plan."
+    )
+    adapter._dispatch_thread_session = AsyncMock()
+
+    def capture_background(coro, *, label):
+        coro.close()
+
+    adapter._schedule_discord_background = capture_background
+
+    await adapter._handle_goal_slash(interaction, "Ship https://discord.com/channels/1/2/3")
+
+    adapter._expand_discord_thread_refs_for_context.assert_awaited_once()
+    assert adapter._dispatch_thread_session.call_args.kwargs["goal_thread_context"] == (
+        "[Expanded Discord thread plan]\n## Plan\nUse linked plan."
+    )
+
+
+@pytest.mark.asyncio
+async def test_text_message_adds_expanded_thread_refs_to_channel_context(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    channel = _FakeTextChannel(channel_id=123, name="features")
+    adapter._expand_discord_thread_refs_for_context = AsyncMock(
+        return_value="[Expanded Discord thread plan]\n## Plan\nUse linked plan."
+    )
+    captured_events = []
+
+    async def capture_handle(event):
+        captured_events.append(event)
+
+    adapter.handle_message = capture_handle
+
+    await adapter._handle_message(_fake_message(channel, content="Please use 1511795999700680744"))
+
+    assert len(captured_events) == 1
+    assert "Use linked plan" in captured_events[0].channel_context
 
 
 def _fake_message(channel, *, content="Hello", author_id=42, display_name="Jezza"):
