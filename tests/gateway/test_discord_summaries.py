@@ -892,8 +892,22 @@ async def test_feature_summary_resumed_completion_updates_source_reaction(adapte
         remove_reaction=AsyncMock(),
         reactions=[],
     )
-    parent.fetch_message = AsyncMock(return_value=source_message)
-    thread = FakeThread(channel_id=200, parent=parent)
+    origin_message = SimpleNamespace(
+        id=200,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[],
+    )
+
+    async def fetch_parent_message(message_id):
+        messages = {
+            source_message.id: source_message,
+            origin_message.id: origin_message,
+        }
+        return messages[int(message_id)]
+
+    setattr(parent, "fetch_message", AsyncMock(side_effect=fetch_parent_message))
+    thread = FakeThread(channel_id=origin_message.id, parent=parent)
     handle = await adapter.initialize_feature_summary(
         thread,
         parent_channel=parent,
@@ -914,14 +928,18 @@ async def test_feature_summary_resumed_completion_updates_source_reaction(adapte
     assert failed_fields["Status"] == "❌ Failed"
     assert message.add_reaction.await_args_list[-1].args == ("❌",)
     assert source_message.add_reaction.await_args_list[-1].args == ("❌",)
+    assert origin_message.add_reaction.await_args_list[-1].args == ("❌",)
 
     message.reactions = [SimpleNamespace(emoji="❌", me=True)]
     source_message.reactions = [SimpleNamespace(emoji="❌", me=True)]
+    origin_message.reactions = [SimpleNamespace(emoji="❌", me=True)]
     message.edit.reset_mock()
     message.add_reaction.reset_mock()
     message.remove_reaction.reset_mock()
     source_message.add_reaction.reset_mock()
     source_message.remove_reaction.reset_mock()
+    origin_message.add_reaction.reset_mock()
+    origin_message.remove_reaction.reset_mock()
 
     assert await adapter.update_feature_summary(
         handle,
@@ -936,6 +954,8 @@ async def test_feature_summary_resumed_completion_updates_source_reaction(adapte
     message.add_reaction.assert_awaited_once_with("✅")
     source_message.remove_reaction.assert_any_await("❌", adapter._client.user)
     source_message.add_reaction.assert_awaited_once_with("✅")
+    origin_message.remove_reaction.assert_any_await("❌", adapter._client.user)
+    origin_message.add_reaction.assert_awaited_once_with("✅")
 
 
 @pytest.mark.asyncio
