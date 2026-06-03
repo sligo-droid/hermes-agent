@@ -294,6 +294,74 @@ def test_prepare_worker_home_adopts_worker_refreshed_shared_auth(tmp_path, monke
     assert entry.id_token == "new-id"
 
 
+def test_prepare_worker_home_adopts_shared_auth_without_changing_active_provider(tmp_path, monkeypatch):
+    from agent.codex_worker_auth import prepare_codex_worker_home
+    from agent.credential_pool import load_pool
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir(parents=True)
+    (hermes_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "active_provider": "nous",
+                "providers": {
+                    "nous": {"access_token": "nous-token"},
+                    "openai-codex": {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "access_token": "old-access",
+                            "refresh_token": "old-refresh",
+                            "id_token": "old-id",
+                        },
+                    },
+                },
+                "credential_pool": {
+                    "openai-codex": [
+                        {
+                            "id": "cred-1",
+                            "label": "primary",
+                            "auth_type": "oauth",
+                            "priority": 0,
+                            "source": "device_code",
+                            "access_token": "old-access",
+                            "refresh_token": "old-refresh",
+                            "id_token": "old-id",
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    first_home = tmp_path / "worker-one"
+    second_home = tmp_path / "worker-two"
+    prepare_codex_worker_home(first_home)
+    (first_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "new-access",
+                    "refresh_token": "new-refresh",
+                    "id_token": "new-id",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    prepare_codex_worker_home(second_home)
+
+    auth_store = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    entry = load_pool("openai-codex").entries()[0]
+    assert auth_store["active_provider"] == "nous"
+    assert auth_store["providers"]["openai-codex"]["tokens"]["access_token"] == "new-access"
+    assert entry.access_token == "new-access"
+
+
 def test_prepare_worker_home_falls_back_when_pool_auth_is_incomplete(tmp_path, monkeypatch):
     from agent import credential_pool
     from agent.codex_worker_auth import prepare_codex_worker_home

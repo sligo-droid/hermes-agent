@@ -299,13 +299,20 @@ def _rotate_codex_worker_credential_after_auth_failure(result: Any) -> bool:
     source_env = os.environ.copy()
     source_env.pop("CODEX_HOME", None)
     source_env.pop("HERMES_CODEX_WORKER_CREDENTIAL_ID", None)
+    next_codex_home = codex_home
+    use_shared_home_symlink = True
+    if os.environ.get("HERMES_CODEX_WORKER_CONTAINER_CODEX_HOME") == "1":
+        next_codex_home = str(Path(codex_home) / ".rotated-credential-home")
+        use_shared_home_symlink = False
     next_credential_id = prepare_codex_worker_home(
-        codex_home,
+        next_codex_home,
         source_env=source_env,
         allow_fallback=False,
+        use_shared_home_symlink=use_shared_home_symlink,
     )
     if not next_credential_id or next_credential_id == failed_credential_id:
         return False
+    os.environ["CODEX_HOME"] = next_codex_home
     os.environ["HERMES_CODEX_WORKER_CREDENTIAL_ID"] = next_credential_id
     return True
 
