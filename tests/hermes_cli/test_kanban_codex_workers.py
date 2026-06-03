@@ -652,6 +652,9 @@ def test_dev_runtime_auto_keeps_risky_and_retry_work_high(monkeypatch):
 def test_runtime_explicit_config_and_env_override_auto(monkeypatch):
     from hermes_cli import kanban_codex_workers as workers
 
+    monkeypatch.delenv("HERMES_CODEX_WORKER_REASONING", raising=False)
+    monkeypatch.delenv("HERMES_CODEX_WORKER_SERVICE_TIER", raising=False)
+
     task = SimpleNamespace(title="Fix typo", body="", consecutive_failures=0)
     cfg = {
         "roles": {"dev": {"reasoning": "low", "service_tier": "normal"}},
