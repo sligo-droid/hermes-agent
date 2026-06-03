@@ -21,6 +21,7 @@ def _ensure_discord_mock():
         discord_mod.Thread = type("Thread", (), {})
         discord_mod.ForumChannel = type("ForumChannel", (), {})
         discord_mod.Interaction = object
+        discord_mod.ChannelType = SimpleNamespace(public_thread="public_thread")
 
         # Lightweight mock for app_commands.Group and Command used by
         # _register_skill_group.
@@ -330,6 +331,7 @@ async def test_handle_thread_create_slash_reports_success(adapter):
         name="Planning",
         auto_archive_duration=1440,
         reason="Requested by Jezza via /thread",
+        type=_discord_mod.ChannelType.public_thread,
     )
     created_thread.send.assert_awaited_once_with("Kickoff")
     # Thread link shown to user
@@ -644,6 +646,34 @@ async def test_auto_create_thread_does_not_post_seed_message_when_message_thread
     assert result is None
     message.create_thread.assert_awaited_once()
     message.channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_thread_create_slash_without_message_creates_public_thread(adapter):
+    thread = SimpleNamespace(id=555, name="Planning")
+    channel = SimpleNamespace(
+        create_thread=AsyncMock(return_value=thread),
+        send=AsyncMock(),
+    )
+    interaction = SimpleNamespace(
+        channel=channel,
+        channel_id=123,
+        user=SimpleNamespace(display_name="Jezza", id=42),
+        guild=SimpleNamespace(name="TestGuild"),
+        followup=SimpleNamespace(send=AsyncMock()),
+        response=SimpleNamespace(defer=AsyncMock()),
+    )
+
+    await adapter._handle_thread_create_slash(interaction, "Planning", "", 1440)
+
+    channel.send.assert_not_awaited()
+    channel.create_thread.assert_awaited_once()
+    call_kwargs = channel.create_thread.await_args[1]
+    assert call_kwargs["name"] == "Planning"
+    assert call_kwargs["auto_archive_duration"] == 1440
+    assert call_kwargs["reason"] == "Requested by Jezza via /thread"
+    assert call_kwargs["type"] is _discord_mod.ChannelType.public_thread
+    interaction.followup.send.assert_awaited_once_with("Created thread <#555>", ephemeral=True)
 
 
 @pytest.mark.asyncio

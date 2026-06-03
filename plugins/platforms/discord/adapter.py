@@ -8026,12 +8026,17 @@ class DiscordAdapter(BasePlatformAdapter):
         reason = f"Requested by {display_name} via /thread"
         starter_message = (message or "").strip()
 
+        direct_thread_kwargs = {
+            "name": name,
+            "auto_archive_duration": auto_archive_duration,
+            "reason": reason,
+        }
+        public_thread_type = getattr(getattr(discord, "ChannelType", None), "public_thread", None)
+        if public_thread_type is not None:
+            direct_thread_kwargs["type"] = public_thread_type
+
         try:
-            thread = await parent_channel.create_thread(
-                name=name,
-                auto_archive_duration=auto_archive_duration,
-                reason=reason,
-            )
+            thread = await parent_channel.create_thread(**direct_thread_kwargs)
             if starter_message:
                 await thread.send(starter_message)
             return {
