@@ -362,8 +362,47 @@ class TestSchemaConversion:
 
 
 # ---------------------------------------------------------------------------
-# Check function
+# Check Functions
 # ---------------------------------------------------------------------------
+
+class TestMCPStatus:
+    def test_get_mcp_status_omits_disabled_servers(self):
+        """Startup/banner status should reflect runtime MCP surface, not disabled config inventory."""
+        from tools.mcp_tool import get_mcp_status, _servers
+
+        enabled_server = _make_mock_server("enabled", session=MagicMock())
+        enabled_server._registered_tool_names = ["mcp_enabled_one", "mcp_enabled_two"]
+        _servers["enabled"] = enabled_server
+
+        try:
+            with patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "mcp_servers": {
+                        "enabled": {"url": "http://example.test/mcp"},
+                        "enabled_failed": {"url": "http://failed.test/mcp"},
+                        "disabled": {"url": "http://disabled.test/mcp", "enabled": False},
+                    }
+                },
+            ):
+                status = get_mcp_status()
+
+            assert [entry["name"] for entry in status] == ["enabled", "enabled_failed"]
+            assert status[0] == {
+                "name": "enabled",
+                "transport": "http",
+                "tools": 2,
+                "connected": True,
+            }
+            assert status[1] == {
+                "name": "enabled_failed",
+                "transport": "http",
+                "tools": 0,
+                "connected": False,
+            }
+        finally:
+            _servers.pop("enabled", None)
+
 
 class TestCheckFunction:
     def test_disconnected_returns_false(self):

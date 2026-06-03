@@ -248,9 +248,13 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
   }
 
   // ── Collapsible MCP section ──
+  const mcpServers = info.mcp_servers ?? []
+  const mcpConnected = mcpServers.filter(s => s.connected).length
+  const mcpSuffix = mcpServers.length === 0 ? undefined : `${mcpConnected} connected`
+
   const mcpBody = () => (
     <>
-      {(info.mcp_servers ?? []).map(s => (
+      {mcpServers.map(s => (
         <Text key={s.name} wrap="truncate">
           <Text color={t.color.muted}>{`  ${s.name} `}</Text>
           <Text color={t.color.muted}>{`[${s.transport}]`}</Text>
@@ -375,13 +379,13 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
         )}
 
         {/* ── MCP Servers (collapsed by default) ── */}
-        {info.mcp_servers && info.mcp_servers.length > 0 && (
+        {mcpServers.length > 0 && (
           <Box flexDirection="column" marginTop={1}>
             <CollapseToggle
-              count={info.mcp_servers.length}
+              count={mcpServers.length}
               onToggle={() => setMcpOpen(v => !v)}
               open={mcpOpen}
-              suffix="connected"
+              suffix={mcpSuffix}
               t={t}
               title="MCP Servers"
             />
@@ -394,7 +398,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
         <Text color={t.color.text}>
           {toolsTotal} tools{' · '}
           {skillsTotal} skills
-          {info.mcp_servers?.length ? ` · ${info.mcp_servers.length} MCP` : ''}
+          {mcpServers.length ? ` · ${mcpServers.length} MCP` : ''}
           {' · '}
           <Text color={t.color.muted}>/help for commands</Text>
         </Text>
