@@ -12,6 +12,18 @@ from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
+@pytest.fixture(autouse=True)
+def _disable_runtime_footer(monkeypatch):
+    """Keep response assertions independent of the active profile footer config."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"display": {"runtime_footer": {"enabled": False}}},
+    )
+
+
 def _make_source(platform: Platform = Platform.TELEGRAM) -> SessionSource:
     return SessionSource(
         platform=platform,
@@ -283,6 +295,44 @@ async def test_handle_message_persists_agent_token_counts(monkeypatch):
         session_entry.session_key,
         last_prompt_tokens=80,
     )
+
+
+@pytest.mark.asyncio
+async def test_grill_me_message_rewrites_to_planning_prompt(monkeypatch):
+    import gateway.run as gateway_run
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100000,
+    )
+
+    result = await runner._handle_message(_make_event("please grill me about dashboard auth"))
+
+    assert isinstance(result, str)
+    assert result.startswith("ok")
+    message = runner._run_agent.await_args.kwargs["message"]
+    assert "Hermes grill-me planning mode is active" in message
+    assert "Do not implement code" in message
+    assert "please grill me about dashboard auth" in message
 
 
 @pytest.mark.asyncio

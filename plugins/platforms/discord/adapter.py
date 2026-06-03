@@ -148,6 +148,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     SUPPORTED_DOCUMENT_TYPES,
 )
+from hermes_cli.grill_me import detect_grill_me_trigger
 from tools.url_safety import is_safe_url
 
 
@@ -8485,6 +8486,7 @@ class DiscordAdapter(BasePlatformAdapter):
             self._slash_command_starts_threaded_work(normalized_content)
             or slash_goal_uses_attachment_body
         )
+        grill_me_trigger = detect_grill_me_trigger(normalized_content)
 
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
@@ -8572,7 +8574,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 auto_threaded_channel = thread
                 self._threads.mark(thread_id)
 
-        if not is_thread and not isinstance(message.channel, discord.DMChannel):
+        if grill_me_trigger and is_parent_channel_message:
+            _stage_started = time.perf_counter()
+            thread = await self._auto_create_thread(message)
+            self._mark_discord_stage(_intake_timing, "thread_create", _stage_started)
+            direct_question_prompt = True
+            if thread:
+                parent_channel_id = str(message.channel.id)
+                is_thread = True
+                thread_id = str(thread.id)
+                auto_threaded_channel = thread
+                auto_threaded_direct_question = True
+                self._threads.mark(thread_id)
+
+        if not grill_me_trigger and not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
             has_discord_message_link = self._contains_discord_message_link(normalized_content)
@@ -8634,6 +8649,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if (
             feature_request_intent is None
             and not is_meeting_command_message
+            and not grill_me_trigger
             and (
                 (is_parent_channel_message and mention_prefix)
                 or (is_thread and (mention_prefix or replies_to_self))
@@ -8654,6 +8670,7 @@ class DiscordAdapter(BasePlatformAdapter):
             is_parent_channel_message
             and mention_prefix
             and direct_question_prompt is False
+            and not grill_me_trigger
         ):
             project_summary_handle = await self.initialize_project_summary(
                 message.channel,

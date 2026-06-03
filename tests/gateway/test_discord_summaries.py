@@ -2001,6 +2001,34 @@ async def test_tagged_question_answers_in_thread_without_feature_summary(adapter
 
 
 @pytest.mark.asyncio
+async def test_tagged_grill_me_parent_message_threads_without_feature_summary(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+    adapter._classify_discord_feature_request = AsyncMock(return_value=True)
+
+    await adapter._handle_message(
+        _make_message(adapter, channel=parent, content="<@999> please grill me about dashboard auth")
+    )
+
+    parent.edit.assert_not_awaited()
+    adapter._auto_create_thread.assert_awaited_once()
+    adapter._classify_discord_feature_request.assert_not_awaited()
+    assert thread.sent == []
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "please grill me about dashboard auth"
+    assert event.feature_summary is None
+    assert event.project_summary is None
+    assert event.source.chat_id == "200"
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "200"
+    assert event.source.parent_chat_id == "100"
+    assert "classified as a direct question/request" in event.channel_prompt
+
+
+@pytest.mark.asyncio
 async def test_tagged_free_response_question_starts_thread_without_feature_summary(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "100")
