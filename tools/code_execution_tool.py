@@ -1111,6 +1111,25 @@ def execute_code(
             "duration_seconds": 0,
         }, ensure_ascii=False)
 
+    if env_type == "local":
+        try:
+            from tools.canonical_repo_guard import canonical_main_terminal_violation
+
+            _mode_for_guard = _get_execution_mode()
+            _cwd_for_guard = _resolve_child_cwd(_mode_for_guard, tempfile.gettempdir())
+            canonical_error = canonical_main_terminal_violation(
+                _cwd_for_guard, "execute_code Python script"
+            )
+        except Exception:
+            canonical_error = None
+        if canonical_error:
+            return json.dumps({
+                "status": "error",
+                "error": canonical_error,
+                "tool_calls_made": 0,
+                "duration_seconds": 0,
+            }, ensure_ascii=False)
+
     if env_type != "local":
         return _execute_remote(code, task_id, enabled_tools)
 

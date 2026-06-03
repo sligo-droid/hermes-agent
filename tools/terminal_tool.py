@@ -1815,6 +1815,41 @@ def terminal_tool(
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
+        # Validate workdir against shell injection before using it in any
+        # guard or process-spawn path.
+        if workdir:
+            workdir_error = _validate_workdir(workdir)
+            if workdir_error:
+                logger.warning("Blocked dangerous workdir: %s (command: %s)",
+                               workdir[:200], _safe_command_preview(command))
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": workdir_error,
+                    "status": "blocked"
+                }, ensure_ascii=False)
+
+        # Canonical project/main checkouts are inspection-only. Block broad
+        # terminal commands there because arbitrary shell commands can bypass
+        # the file-tool write guard.
+        effective_cwd_for_guard = workdir or cwd
+        if env_type == "local" and effective_cwd_for_guard:
+            try:
+                from tools.canonical_repo_guard import canonical_main_terminal_violation
+
+                canonical_error = canonical_main_terminal_violation(
+                    effective_cwd_for_guard, command
+                )
+            except Exception:
+                canonical_error = None
+            if canonical_error:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": canonical_error,
+                    "status": "blocked"
+                }, ensure_ascii=False)
+
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
         if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
@@ -1969,19 +2004,6 @@ def terminal_tool(
             elif approval.get("smart_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
-
-        # Validate workdir against shell injection
-        if workdir:
-            workdir_error = _validate_workdir(workdir)
-            if workdir_error:
-                logger.warning("Blocked dangerous workdir: %s (command: %s)",
-                               workdir[:200], _safe_command_preview(command))
-                return json.dumps({
-                    "output": "",
-                    "exit_code": -1,
-                    "error": workdir_error,
-                    "status": "blocked"
-                }, ensure_ascii=False)
 
         # Prepare command for execution
         pty_disabled_reason = None

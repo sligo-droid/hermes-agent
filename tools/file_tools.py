@@ -305,6 +305,21 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
     return get_cross_profile_warning(resolved)
 
 
+def _check_canonical_main_path(filepath: str, task_id: str = "default") -> str | None:
+    """Return a hard-block message for writes to protected canonical main."""
+    try:
+        from tools.canonical_repo_guard import canonical_main_write_violation
+    except Exception:
+        # Fail open on import errors so ordinary file tools keep working in
+        # minimal/test environments that do not have git installed.
+        return None
+    try:
+        resolved = _resolve_path_for_task(filepath, task_id)
+    except (OSError, ValueError):
+        resolved = Path(filepath).expanduser()
+    return canonical_main_write_violation(resolved)
+
+
 def _is_expected_write_exception(exc: Exception) -> bool:
     """Return True for expected write denials that should not hit error logs."""
     if isinstance(exc, PermissionError):
@@ -979,6 +994,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
             return tool_error(cross_warning)
+    canonical_warning = _check_canonical_main_path(path, task_id)
+    if canonical_warning:
+        return tool_error(canonical_warning)
     if _is_internal_file_status_text(content):
         return tool_error(
             "Refusing to write internal read_file status text as file content. "
@@ -1081,6 +1099,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             cross_warning = _check_cross_profile_path(_p, task_id)
             if cross_warning:
                 return tool_error(cross_warning)
+        canonical_warning = _check_canonical_main_path(_p, task_id)
+        if canonical_warning:
+            return tool_error(canonical_warning)
     try:
         # Resolve paths for locking.  Ordered + deduplicated so concurrent
         # callers lock in the same order — prevents deadlock on overlapping
