@@ -6,6 +6,7 @@ import json
 import hashlib
 import re
 import sqlite3
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -921,10 +922,28 @@ def safe_source_output_ref(value: Any) -> str:
     try:
         path = Path(raw).expanduser().resolve(strict=False)
         home = get_hermes_home().resolve(strict=False)
-        path.relative_to(home / "cron" / "output")
-        return str(path)
+        rel = path.relative_to(home / "cron" / "output")
+        return urlsafe_b64encode(rel.as_posix().encode("utf-8")).decode("ascii").rstrip("=")
     except Exception:
         return ""
+
+
+def resolve_source_output_ref(ref: Any) -> Path:
+    raw = text(ref).strip()
+    if not raw:
+        raise ValueError("source output ref is required")
+    try:
+        padded = raw + "=" * (-len(raw) % 4)
+        decoded = urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        base = (get_hermes_home() / "cron" / "output").resolve(strict=False)
+        rel = Path(decoded)
+        if rel.is_absolute():
+            raise ValueError("absolute source output refs are not allowed")
+        path = (base / rel).resolve(strict=False)
+        path.relative_to(base)
+    except Exception as exc:
+        raise ValueError("invalid source output ref") from exc
+    return path
 
 
 def required_str(data: dict[str, Any], key: str) -> str:

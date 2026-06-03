@@ -73,7 +73,7 @@
   }
 
   function sourceHref(proposal, run) {
-    return proposal.source_url || (run && run.source_url) || proposal.source_output_ref || (run && run.source_output_ref) || "";
+    return proposal.source_url || (run && run.source_url) || proposal.source_output_url || (run && run.source_output_url) || "";
   }
 
   function StatusPill(props) {

@@ -95,6 +95,32 @@ def _ingest_card(client: TestClient, *, metadata: dict | None = None) -> int:
     return card_resp.json()["proposal"]["id"]
 
 
+def _ingest_run_with_output(client: TestClient, output_path: Path) -> tuple[int, str]:
+    run_resp = client.post(
+        "/api/plugins/sligo/runs",
+        json={
+            "project_key": "sligo",
+            "prong_key": "r1",
+            "idempotency_key": "run-with-output",
+            "raw_input_ref": str(output_path),
+        },
+    )
+    assert run_resp.status_code == 200, run_resp.text
+    run = run_resp.json()["run"]
+    card_resp = client.post(
+        "/api/plugins/sligo/proposals",
+        json={
+            "run_id": run["id"],
+            "idempotency_key": "card-with-output",
+            "title": "Tighten dashboard API",
+            "summary": "Add safe approval endpoints.",
+            "source_metadata": {"source_output_path": str(output_path)},
+        },
+    )
+    assert card_resp.status_code == 200, card_resp.text
+    return card_resp.json()["proposal"]["id"], run["source_output_ref"]
+
+
 def test_read_routes_expose_projects_runs_and_proposals(client):
     proposal_id = _ingest_card(client)
 
@@ -121,6 +147,42 @@ def test_read_routes_expose_projects_runs_and_proposals(client):
     assert runs_resp.status_code == 200
     assert run_resp.status_code == 200
     assert run_resp.json()["proposals"][0]["id"] == proposal_id
+
+
+def test_source_output_ref_opens_saved_cron_markdown(client, sligo_home):
+    output_dir = sligo_home / "cron" / "output" / "2026-06-03"
+    output_dir.mkdir(parents=True)
+    output_path = output_dir / "proposal.md"
+    output_path.write_text("# Saved cron proposal\n\nCron output body.\n", encoding="utf-8")
+
+    proposal_id, ref = _ingest_run_with_output(client, output_path)
+    proposal_resp = client.get(f"/api/plugins/sligo/proposals/{proposal_id}")
+    opened = client.get(f"/api/plugins/sligo/source-output/{ref}")
+
+    assert proposal_resp.status_code == 200, proposal_resp.text
+    proposal = proposal_resp.json()["proposal"]
+    assert proposal["source_output_ref"] == ref
+    assert proposal["source_output_url"] == f"/api/plugins/sligo/source-output/{ref}"
+    assert str(output_path) not in proposal["source_output_url"]
+    assert opened.status_code == 200, opened.text
+    assert opened.headers["content-type"].startswith("text/markdown")
+    assert opened.text == "# Saved cron proposal\n\nCron output body.\n"
+
+
+def test_source_output_route_rejects_unsafe_and_missing_refs(client, sligo_home, tmp_path):
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside", encoding="utf-8")
+    missing = sligo_home / "cron" / "output" / "missing.md"
+
+    outside_ref = proposals.safe_source_output_ref(outside)
+    missing_ref = proposals.safe_source_output_ref(missing)
+
+    outside_resp = client.get("/api/plugins/sligo/source-output/not-a-valid-ref")
+    missing_resp = client.get(f"/api/plugins/sligo/source-output/{missing_ref}")
+
+    assert outside_ref == ""
+    assert outside_resp.status_code == 400
+    assert missing_resp.status_code == 404
 
 
 def test_approve_twice_is_idempotent_and_uses_configured_workspace(client, sligo_home):

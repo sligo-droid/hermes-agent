@@ -314,14 +314,16 @@ def test_cron_json_proposal_output_ingests_cards_and_is_idempotent(tmp_path):
     assert run["source_type"] == "cron"
     assert run["parser_name"] == proposals.STRUCTURED_CRON_PARSER
     assert run["parse_status"] == "parsed"
-    assert run["source_output_ref"] == str(output_path)
+    assert run["source_output_ref"] != str(output_path)
+    with patch.dict("os.environ", {"HERMES_HOME": str(hermes_home)}):
+        assert proposals.resolve_source_output_ref(run["source_output_ref"]) == output_path.resolve()
     assert len(cards) == 1
     assert cards[0]["title"] == "Add ingestion hook"
     assert cards[0]["tags"] == ["cron"]
     assert cards[0]["evidence_bullets"] == ["Cron emitted a structured block.", "Parser reads it."]
     assert cards[0]["acceptance_criteria"] == ["API exposes evidence.", "Drawer shows prompt."]
     assert cards[0]["proposed_worker_prompt"] == "Implement the ingestion hook and test it."
-    assert cards[0]["source_output_ref"] == str(output_path)
+    assert cards[0]["source_output_ref"] == run["source_output_ref"]
     assert cards[0]["audit_log"][0]["action"] == "ingested"
     assert "metadata" not in cards[0]
 

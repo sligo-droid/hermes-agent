@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
@@ -169,6 +169,8 @@ def _project_payload(key: str, cfg: dict[str, Any]) -> dict[str, Any]:
 
 def _card_with_links(card: dict[str, Any]) -> dict[str, Any]:
     item = dict(card)
+    if item.get("source_output_ref"):
+        item["source_output_url"] = f"/api/plugins/sligo/source-output/{item['source_output_ref']}"
     item["worker"] = {
         "board": card.get("worker_board") or "",
         "task_id": card.get("worker_task_id") or "",
@@ -179,7 +181,14 @@ def _card_with_links(card: dict[str, Any]) -> dict[str, Any]:
 
 
 def _run_response(run: dict[str, Any]) -> dict[str, Any]:
+    if run.get("source_output_ref"):
+        run = dict(run)
+        run["source_output_url"] = f"/api/plugins/sligo/source-output/{run['source_output_ref']}"
     return {"run": run}
+
+
+def _run_with_source_link(run: dict[str, Any]) -> dict[str, Any]:
+    return _run_response(run)["run"]
 
 
 def _card_response(card: dict[str, Any]) -> dict[str, Any]:
@@ -292,7 +301,7 @@ def list_runs(
             f"SELECT * FROM proposal_runs{where} ORDER BY created_at DESC, id DESC LIMIT ?",
             (*params, limit),
         ).fetchall()
-        runs = [proposals.sanitize_run(proposals.decode_row(row)) for row in rows]
+        runs = [_run_with_source_link(proposals.sanitize_run(proposals.decode_row(row))) for row in rows]
     return {"runs": runs}
 
 
@@ -303,7 +312,24 @@ def get_run(run_id: int) -> dict[str, Any]:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     cards = proposals.list_cards(project_key=run["project_key"], prong_key=run["prong_key"], limit=200)
-    return {"run": run, "proposals": [card for card in cards if card.get("run_id") == run_id]}
+    return {"run": _run_with_source_link(run), "proposals": [_card_with_links(card) for card in cards if card.get("run_id") == run_id]}
+
+
+@router.get("/source-output/{ref}")
+def get_source_output(ref: str) -> Response:
+    try:
+        path = proposals.resolve_source_output_ref(ref)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="source output file not found")
+    try:
+        content = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=415, detail="source output file is not UTF-8 markdown") from None
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="source output file not found") from exc
+    return Response(content, media_type="text/markdown; charset=utf-8")
 
 
 @router.post("/runs")
