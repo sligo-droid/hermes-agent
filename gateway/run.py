@@ -56,6 +56,7 @@ from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.grill_me import build_grill_me_prompt, detect_grill_me_trigger
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -10110,6 +10111,16 @@ class GatewayRunner:
         # Pending exec approvals are handled by /approve and /deny commands above.
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
+
+        if not command and detect_grill_me_trigger(event.text or ""):
+            event = dataclasses.replace(
+                event,
+                text=build_grill_me_prompt(
+                    event.text or "",
+                    runtime_note="Gateway natural-language grill-me trigger detected.",
+                ),
+            )
+            source = event.source
 
         if self._is_telegram_topic_root_lobby(source):
             # Debounce the lobby reminder so a user who forgets about
