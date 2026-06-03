@@ -1,0 +1,311 @@
+.sligo {
+  width: 100%;
+  color: var(--color-foreground);
+}
+
+.sligo-hero {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg, 0.75rem);
+  background: linear-gradient(135deg, color-mix(in srgb, var(--color-card) 94%, transparent), color-mix(in srgb, var(--color-ring) 13%, var(--color-card)));
+}
+
+.sligo-eyebrow {
+  margin: 0 0 0.25rem;
+  color: var(--color-muted-foreground);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.sligo-hero h1,
+.sligo-drawer h2,
+.sligo-card h3 {
+  margin: 0;
+}
+
+.sligo-hero p:not(.sligo-eyebrow) {
+  max-width: 56rem;
+  margin: 0.4rem 0 0;
+  color: var(--color-muted-foreground);
+}
+
+.sligo-hero__stats {
+  min-width: 8rem;
+  align-self: stretch;
+  display: grid;
+  place-content: center;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius, 0.5rem);
+  background: color-mix(in srgb, var(--color-background) 64%, transparent);
+  text-align: center;
+}
+
+.sligo-hero__stats span {
+  font-size: 2.25rem;
+  line-height: 1;
+  font-weight: 800;
+}
+
+.sligo-hero__stats small,
+.sligo-muted {
+  color: var(--color-muted-foreground);
+}
+
+.sligo-filters {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(9rem, 1fr)) auto;
+  gap: 0.75rem;
+  align-items: end;
+  margin: 1rem 0;
+  padding: 0.75rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius, 0.5rem);
+  background: color-mix(in srgb, var(--color-card) 82%, transparent);
+}
+
+.sligo-field {
+  display: grid;
+  gap: 0.35rem;
+  color: var(--color-muted-foreground);
+  font-size: 0.75rem;
+  font-weight: 650;
+}
+
+.sligo-field input,
+.sligo-field select,
+.sligo-field textarea,
+.sligo-actions textarea,
+.sligo-actions input {
+  width: 100%;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.35rem);
+  background: var(--color-background);
+  color: var(--color-foreground);
+  padding: 0.5rem 0.6rem;
+  font: inherit;
+}
+
+.sligo-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(22rem, 32rem);
+  gap: 1rem;
+  align-items: start;
+}
+
+.sligo-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr));
+  gap: 0.75rem;
+}
+
+.sligo-card {
+  appearance: none;
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.85rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg, 0.75rem);
+  background: var(--color-card);
+  color: var(--color-foreground);
+  text-align: left;
+  cursor: pointer;
+}
+
+.sligo-card:hover,
+.sligo-card--selected {
+  border-color: var(--color-ring);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-ring) 30%, transparent);
+}
+
+.sligo-card__top,
+.sligo-card__footer,
+.sligo-action-row,
+.sligo-drawer__header,
+.sligo-two {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.sligo-card__top,
+.sligo-card__footer,
+.sligo-drawer__header {
+  justify-content: space-between;
+}
+
+.sligo-card p {
+  margin: 0;
+  color: var(--color-muted-foreground);
+}
+
+.sligo-card__date,
+.sligo-card__footer {
+  color: var(--color-muted-foreground);
+  font-size: 0.75rem;
+}
+
+.sligo-card__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.sligo-card__meta span,
+.sligo-pill {
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  padding: 0.15rem 0.45rem;
+  color: var(--color-muted-foreground);
+  font-size: 0.72rem;
+}
+
+.sligo-pill--approved,
+.sligo-pill--completed {
+  border-color: color-mix(in srgb, #22c55e 50%, var(--color-border));
+  color: color-mix(in srgb, #22c55e 80%, var(--color-foreground));
+}
+
+.sligo-pill--rejected,
+.sligo-pill--failed {
+  border-color: color-mix(in srgb, #ef4444 50%, var(--color-border));
+  color: color-mix(in srgb, #ef4444 80%, var(--color-foreground));
+}
+
+.sligo-drawer {
+  position: sticky;
+  top: 1rem;
+  max-height: calc(100vh - 2rem);
+  overflow: auto;
+  display: grid;
+  gap: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg, 0.75rem);
+  background: color-mix(in srgb, var(--color-card) 97%, var(--color-background));
+}
+
+.sligo-drawer:empty {
+  display: none;
+}
+
+.sligo-drawer section {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.sligo-drawer h3 {
+  margin: 0;
+  font-size: 0.85rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.sligo-drawer p,
+.sligo-drawer ul,
+.sligo-dl {
+  margin: 0;
+}
+
+.sligo-drawer pre {
+  white-space: pre-wrap;
+  overflow: auto;
+  margin: 0;
+  padding: 0.75rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.35rem);
+  background: var(--color-background);
+  color: var(--color-muted-foreground);
+}
+
+.sligo-dl {
+  display: grid;
+  grid-template-columns: 7rem 1fr;
+  gap: 0.35rem 0.75rem;
+}
+
+.sligo-dl dt {
+  color: var(--color-muted-foreground);
+}
+
+.sligo-actions {
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--color-border);
+}
+
+.sligo-actions textarea {
+  min-height: 5rem;
+  resize: vertical;
+}
+
+.sligo-icon-button {
+  width: 2rem;
+  height: 2rem;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: var(--color-background);
+  color: var(--color-foreground);
+}
+
+.sligo-error,
+.sligo-empty,
+.sligo-loading {
+  margin: 1rem 0;
+  padding: 0.85rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius, 0.5rem);
+  background: color-mix(in srgb, var(--color-destructive, #ef4444) 9%, var(--color-card));
+}
+
+.sligo-empty,
+.sligo-loading {
+  background: color-mix(in srgb, var(--color-card) 88%, transparent);
+}
+
+.sligo-empty h3 {
+  margin: 0 0 0.35rem;
+}
+
+.sligo-default-note {
+  margin: -0.25rem 0 0.75rem;
+}
+
+.sligo a {
+  color: var(--color-primary, var(--color-ring));
+}
+
+@media (max-width: 980px) {
+  .sligo-hero,
+  .sligo-layout,
+  .sligo-card__footer,
+  .sligo-two {
+    display: grid;
+  }
+
+  .sligo-filters {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .sligo-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .sligo-drawer {
+    position: static;
+    max-height: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .sligo-filters {
+    grid-template-columns: 1fr;
+  }
+
+  .sligo-list {
+    grid-template-columns: 1fr;
+  }
+}
