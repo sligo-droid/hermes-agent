@@ -369,6 +369,7 @@ def test_codex_role_worker_inherits_available_pool_credential(monkeypatch, tmp_p
     payload = json.loads((codex_home / "auth.json").read_text())
     assert captured["env"]["HERMES_CODEX_WORKER_CREDENTIAL_ID"] == "cred-2"
     assert captured["env"]["CODEX_HOME"] != str(tmp_path / "parent-codex-home")
+    assert codex_home.is_symlink()
     assert payload["tokens"]["access_token"] == "access-2"
     assert payload["tokens"]["refresh_token"] == "refresh-2"
 
@@ -474,7 +475,7 @@ def test_codex_role_worker_does_not_copy_inherited_worker_codex_home(monkeypatch
     assert not (codex_home / "auth.json").exists()
 
 
-def test_codex_role_worker_copies_intentional_non_worker_codex_home(monkeypatch, tmp_path):
+def test_codex_role_worker_does_not_copy_external_codex_home(monkeypatch, tmp_path):
     from agent import credential_pool
     from hermes_cli import kanban_codex_workers as workers
 
@@ -508,11 +509,9 @@ def test_codex_role_worker_copies_intentional_non_worker_codex_home(monkeypatch,
     workers.spawn_codex_worker(task, str(tmp_path / "repo"), board=board.slug)
 
     codex_home = Path(captured["env"]["CODEX_HOME"])
-    payload = json.loads((codex_home / "auth.json").read_text(encoding="utf-8"))
     assert captured["env"].get("HERMES_CODEX_WORKER_CREDENTIAL_ID") is None
     assert captured["env"]["CODEX_HOME"] != str(source_codex_home)
-    assert payload["tokens"]["access_token"] == "source-access"
-    assert payload["tokens"]["refresh_token"] == "source-refresh"
+    assert not (codex_home / "auth.json").exists()
 
 
 def test_codex_role_worker_logs_scheduled_runtime_settings(monkeypatch, tmp_path):
