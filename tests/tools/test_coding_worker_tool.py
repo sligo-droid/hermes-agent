@@ -233,6 +233,12 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
 
     (tmp_path / "AGENTS.md").write_text("OpenCode should see repo rules.")
     monkeypatch.setattr(ow, "load_coding_worker_backend", lambda: ow.BACKEND_OPENCODE)
+    activity_messages = []
+    parent = SimpleNamespace(
+        api_mode="chat_completions",
+        session_cwd=str(tmp_path),
+        _touch_activity=activity_messages.append,
+    )
 
     def fake_run(prompt, workspace, **kwargs):
         assert "fix the parser" in prompt
@@ -240,6 +246,9 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
         assert "OpenClaw autoreview skill" in prompt
         assert workspace == str(tmp_path)
         assert kwargs["context_for_classification"]
+        assert callable(kwargs["on_event"])
+        kwargs["on_event"]({"type": "message", "agent": "build"})
+        kwargs["on_event"](["unexpected event shape"])
         return SimpleNamespace(
             final_text="Changed src/parser.py and ran pytest.",
             error=None,
@@ -257,7 +266,7 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
         cwt.delegate_coding_task(
             task="fix the parser",
             context="focus on src/parser.py",
-            parent_agent=_parent(tmp_path),
+            parent_agent=parent,
         )
     )
 
@@ -265,6 +274,7 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
     assert result["backend"] == "opencode"
     assert result["agents"] == ["build"]
     assert result["summary"] == "Changed src/parser.py and ran pytest."
+    assert activity_messages == ["OpenCode coding worker event: message: build"]
 
 
 def test_delegate_includes_repo_state_preflight(monkeypatch, tmp_path):
