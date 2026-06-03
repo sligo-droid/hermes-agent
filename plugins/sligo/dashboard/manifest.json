@@ -1,0 +1,14 @@
+{
+  "name": "sligo",
+  "label": "Sligo",
+  "description": "Self-improvement proposal review and execution workflows",
+  "icon": "Sparkles",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/sligo",
+    "position": "after:kanban"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

@@ -1245,6 +1245,15 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     prompt = str(job.get("prompt") or "")
     skills = job.get("skills")
 
+    try:
+        from hermes_cli.self_improvement_proposals import build_cron_feedback_prompt_section
+
+        feedback_section = build_cron_feedback_prompt_section(job)
+        if feedback_section:
+            prompt = feedback_section + prompt
+    except Exception as exc:
+        logger.warning("Job '%s': failed to build self-improvement feedback context: %s", job.get("id"), exc)
+
     # Run data-collection script if configured, inject output as context.
     script_path = job.get("script")
     if script_path:
@@ -1436,6 +1445,27 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     job_id = job["id"]
     with _job_profile_context(job_id, job.get("profile")):
         return _run_job_impl(job)
+
+
+def _save_job_profile_artifacts(job: dict, output: str) -> Path:
+    """Save cron output and proposal artifacts inside the job's profile context."""
+    job_id = job["id"]
+    with _job_profile_context(job_id, job.get("profile")):
+        output_file = save_job_output(job_id, output)
+        try:
+            from hermes_cli.self_improvement_proposals import ingest_cron_proposal_output
+
+            ingest_result = ingest_cron_proposal_output(job, output, source_output_path=output_file)
+            if ingest_result and ingest_result.get("parse_status") in {"failed", "partial"}:
+                logger.warning(
+                    "Job '%s': self-improvement proposal parse_status=%s parse_error=%s",
+                    job_id,
+                    ingest_result.get("parse_status"),
+                    ingest_result.get("parse_error"),
+                )
+        except Exception as ingest_exc:
+            logger.exception("Job '%s': self-improvement proposal ingestion failed: %s", job_id, ingest_exc)
+        return output_file
 
 
 def _resolve_cron_memory_mode(cfg: dict, job_id: str = "") -> tuple[bool, bool]:
@@ -2187,8 +2217,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             """Run one due job end-to-end: execute, save, deliver, mark."""
             try:
                 success, output, final_response, error = run_job(job)
-
-                output_file = save_job_output(job["id"], output)
+                output_file = _save_job_profile_artifacts(job, output)
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
 
