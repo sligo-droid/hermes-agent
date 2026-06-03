@@ -483,8 +483,6 @@ def _spawn_docker_worker(
             "HERMES_CODEX_WORKER_SERVICE_TIER_SOURCE": settings["service_tier_source"],
             "HERMES_CODING_WORKER_BACKEND": backend,
             "CODEX_HOME": "/codex-home",
-            "HERMES_CODEX_WORKER_CLEANUP_HOME": "1",
-            "HERMES_CODEX_WORKER_CLEANUP_ROOT": "/codex-home",
             "PYTHONPATH": "/hermes",
         }
     )
@@ -494,6 +492,9 @@ def _spawn_docker_worker(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if inherited_credential_id:
         env["HERMES_CODEX_WORKER_CREDENTIAL_ID"] = inherited_credential_id
+    else:
+        env["HERMES_CODEX_WORKER_CLEANUP_HOME"] = "1"
+        env["HERMES_CODEX_WORKER_CLEANUP_ROOT"] = "/codex-home"
     host_gh_config_dir = _github_cli_config_dir(env)
 
     from hermes_cli import kanban_db

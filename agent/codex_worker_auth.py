@@ -15,15 +15,18 @@ logger = logging.getLogger(__name__)
 
 
 class CodexWorkerHomeLease:
-    """Temporary Codex home containing short-lived worker credentials."""
+    """Leased worker Codex home path.
 
-    def __init__(self, tmp_dir: tempfile.TemporaryDirectory[str], credential_id: Optional[str]):
-        self._tmp_dir = tmp_dir
-        self.path = Path(tmp_dir.name)
+    The path may be a real temporary directory or a symlink to a shared
+    Hermes-owned credential home. Cleanup removes only the leased path.
+    """
+
+    def __init__(self, path: Path, credential_id: Optional[str]):
+        self.path = path
         self.credential_id = credential_id
 
     def cleanup(self) -> None:
-        self._tmp_dir.cleanup()
+        cleanup_codex_worker_home(self.path)
 
     def __enter__(self) -> "CodexWorkerHomeLease":
         return self
@@ -36,6 +39,22 @@ def _codex_worker_home_root() -> Path:
     from hermes_constants import get_hermes_home
 
     return (get_hermes_home() / "tmp" / "codex-worker-homes").resolve()
+
+
+def _codex_worker_auth_root() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return (get_hermes_home() / "tmp" / "codex-worker-auth").resolve()
+
+
+def _safe_credential_path_segment(credential_id: str) -> str:
+    raw = str(credential_id or "").strip()
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in raw)
+    return safe or "unknown"
+
+
+def _shared_codex_home_for_credential(credential_id: str) -> Path:
+    return _codex_worker_auth_root() / _safe_credential_path_segment(credential_id)
 
 
 def _string_attr(entry: Any, name: str) -> str:
@@ -68,6 +87,24 @@ def _entry_is_usable(entry: Any) -> bool:
     return _entry_tokens(entry) is not None
 
 
+def _entry_needs_refresh(entry: Any) -> bool:
+    access_token = _string_attr(entry, "access_token")
+    if not access_token:
+        return False
+    try:
+        from hermes_cli.auth import (
+            CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+            _codex_access_token_is_expiring,
+        )
+
+        return _codex_access_token_is_expiring(
+            access_token,
+            CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+        )
+    except Exception:
+        return False
+
+
 def _refresh_worker_entry(pool: Any, entry: Any) -> Any:
     """Refresh a Codex pool entry when worker auth needs an id_token."""
     if entry is None:
@@ -97,7 +134,7 @@ def _refresh_worker_entry(pool: Any, entry: Any) -> Any:
 
 
 def _usable_worker_entry(pool: Any, entry: Any) -> Any:
-    if _entry_is_usable(entry):
+    if _entry_is_usable(entry) and not _entry_needs_refresh(entry):
         return entry
     return _refresh_worker_entry(pool, entry)
 
@@ -245,36 +282,109 @@ def _write_codex_auth(codex_home: Path, entry: Any) -> bool:
     return True
 
 
+def _entry_by_id(pool: Any, credential_id: str) -> Any:
+    try:
+        entries = pool.entries()
+    except Exception:
+        entries = []
+    for entry in entries:
+        if str(getattr(entry, "id", "") or "") == credential_id:
+            return entry
+    return None
+
+
+def _replace_path_with_directory_symlink(path: Path, target: Path) -> None:
+    target = target.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        path.unlink()
+    elif path.exists():
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    path.symlink_to(target, target_is_directory=True)
+
+
+def _prepare_shared_codex_home(
+    path: Path,
+    *,
+    entry: Any,
+    credential_id: str,
+) -> bool:
+    """Prepare shared auth for a pool credential and point ``path`` at it.
+
+    Codex refresh tokens rotate. A per-worker auth copy can therefore become
+    stale the moment any sibling worker refreshes. The durable shape is one
+    Hermes-owned Codex home per credential, with task-specific CODEX_HOME paths
+    as directory symlinks to that shared home.
+    """
+    shared_home = _shared_codex_home_for_credential(credential_id)
+    shared_home.mkdir(parents=True, exist_ok=True)
+    try:
+        shared_home.chmod(0o700)
+        shared_home.parent.chmod(0o700)
+    except OSError:
+        pass
+
+    # A previous worker may have refreshed the shared auth file and then died
+    # before syncing back to auth.json. Adopt it before writing, otherwise a
+    # new worker can resurrect a consumed refresh token from the pool.
+    if (shared_home / "auth.json").is_file():
+        sync_codex_worker_home(shared_home, credential_id)
+        try:
+            refreshed_pool = _load_codex_pool()
+            if refreshed_pool is not None:
+                synced_entry = _entry_by_id(refreshed_pool, credential_id)
+                if synced_entry is not None:
+                    entry = synced_entry
+        except Exception:
+            pass
+
+    if not _write_codex_auth(shared_home, entry):
+        return False
+    _write_minimal_config(shared_home)
+    _replace_path_with_directory_symlink(path, shared_home)
+    return True
+
+
 def prepare_codex_worker_home(
     codex_home: Path | str,
     *,
     parent_agent: Any = None,
     source_env: dict[str, str] | None = None,
-    allow_fallback: bool = True,
+    allow_fallback: bool = False,
 ) -> Optional[str]:
     """Prepare an isolated Codex home and return inherited credential id.
 
-    The active Hermes ``openai-codex`` credential wins. If no pool credential is
-    available and ``allow_fallback`` is true, this preserves the previous
-    behavior of copying the user's existing Codex auth files when present.
-    Pool credentials without ``id_token`` are refreshed once before falling
-    back, because Codex CLI rejects those auth files before it can refresh them.
-    ``source_env`` lets callers choose the environment used for that fallback
-    without mutating global state.
+    The active Hermes ``openai-codex`` credential wins. Pool-backed workers do
+    not receive one-off auth snapshots: ``codex_home`` becomes a directory
+    symlink to a shared Hermes-owned Codex home for that credential. That keeps
+    refresh-token rotation visible across Codex worker processes.
+
+    If no pool credential is available and ``allow_fallback`` is true, copy the
+    user's existing Codex auth file as an explicit compatibility fallback.
+    Worker launchers should keep this disabled so stale external OAuth state
+    fails loudly instead of being cloned into another refresh owner.
     """
     path = Path(codex_home).expanduser()
-    path.mkdir(parents=True, exist_ok=True)
 
     pool, entry = select_codex_worker_credential(parent_agent)
     credential_id = None
     copied_fallback_auth = False
-    if entry is not None and _write_codex_auth(path, entry):
+    if entry is not None:
         credential_id = str(getattr(entry, "id", "") or "").strip() or None
+    if entry is not None and credential_id and _prepare_shared_codex_home(
+        path,
+        entry=entry,
+        credential_id=credential_id,
+    ):
         logger.info(
-            "Codex worker inheriting openai-codex pool credential %s",
+            "Codex worker using shared openai-codex pool credential %s",
             credential_id or "<unknown>",
         )
     elif allow_fallback:
+        path.mkdir(parents=True, exist_ok=True)
         _copy_codex_file(
             path,
             "auth.json",
@@ -282,9 +392,14 @@ def prepare_codex_worker_home(
             overwrite=not _codex_auth_has_id_token(path),
         )
         copied_fallback_auth = True
+    else:
+        path.mkdir(parents=True, exist_ok=True)
 
     if copied_fallback_auth:
-        _copy_codex_file(path, "credentials.json", source_env=source_env)
+        logger.warning(
+            "Codex worker copied fallback auth from CODEX_HOME; configure "
+            "Hermes openai-codex auth to avoid independent refresh-token owners."
+        )
     _write_minimal_config(path)
     return credential_id
 
@@ -293,7 +408,7 @@ def create_codex_worker_home(
     *,
     parent_agent: Any = None,
     source_env: dict[str, str] | None = None,
-    allow_fallback: bool = True,
+    allow_fallback: bool = False,
     prefix: str = "codex-worker-",
 ) -> CodexWorkerHomeLease:
     """Create a temporary Codex home lease populated with worker auth."""
@@ -303,18 +418,18 @@ def create_codex_worker_home(
         root.chmod(0o700)
     except OSError:
         pass
-    tmp_dir = tempfile.TemporaryDirectory(prefix=prefix, dir=str(root))
+    path = Path(tempfile.mkdtemp(prefix=prefix, dir=str(root)))
     try:
         credential_id = prepare_codex_worker_home(
-            Path(tmp_dir.name),
+            path,
             parent_agent=parent_agent,
             source_env=source_env,
             allow_fallback=allow_fallback,
         )
     except Exception:
-        tmp_dir.cleanup()
+        cleanup_codex_worker_home(path)
         raise
-    return CodexWorkerHomeLease(tmp_dir, credential_id)
+    return CodexWorkerHomeLease(path, credential_id)
 
 
 def cleanup_codex_worker_home(codex_home: Path | str | None) -> None:
@@ -323,13 +438,20 @@ def cleanup_codex_worker_home(codex_home: Path | str | None) -> None:
         return
     cleanup_root = os.environ.get("HERMES_CODEX_WORKER_CLEANUP_ROOT", "").strip()
     root = Path(cleanup_root).expanduser().resolve() if cleanup_root else _codex_worker_home_root()
-    path = Path(codex_home).expanduser().resolve()
+    path = Path(codex_home).expanduser()
+    lease_path = path.absolute() if path.is_symlink() else path.resolve()
     if cleanup_root:
-        allowed = path == root or root in path.parents
+        allowed = lease_path == root or root in lease_path.parents
     else:
-        allowed = path != root and root in path.parents
+        allowed = lease_path != root and root in lease_path.parents
     if not allowed:
-        logger.warning("Refusing to clean non-worker Codex home: %s", path)
+        logger.warning("Refusing to clean non-worker Codex home: %s", lease_path)
+        return
+    if path.is_symlink():
+        try:
+            path.unlink()
+        except OSError:
+            pass
         return
     try:
         shutil.rmtree(path)

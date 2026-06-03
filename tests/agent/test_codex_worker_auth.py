@@ -69,10 +69,12 @@ def test_prepare_worker_home_writes_complete_pool_auth(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(credential_pool, "load_pool", lambda provider: FakePool(entry))
 
-    credential_id = prepare_codex_worker_home(tmp_path / "worker-codex")
+    worker_home = tmp_path / "worker-codex"
+    credential_id = prepare_codex_worker_home(worker_home)
 
-    payload = json.loads((tmp_path / "worker-codex" / "auth.json").read_text(encoding="utf-8"))
+    payload = json.loads((worker_home / "auth.json").read_text(encoding="utf-8"))
     assert credential_id == "pool-1"
+    assert worker_home.is_symlink()
     assert payload["tokens"]["access_token"] == "pool-access"
     assert payload["tokens"]["refresh_token"] == "pool-refresh"
     assert payload["tokens"]["id_token"] == "pool-id"
@@ -99,9 +101,12 @@ def test_create_worker_home_lease_cleans_up_auth_material(tmp_path, monkeypatch)
     auth_path = lease.path / "auth.json"
 
     assert auth_path.exists()
+    assert lease.path.is_symlink()
     assert str(lease.path).startswith(str(hermes_home / "tmp" / "codex-worker-homes"))
+    shared_auth = auth_path.resolve()
     lease.cleanup()
     assert not lease.path.exists()
+    assert shared_auth.exists()
 
 
 def test_cleanup_worker_home_only_removes_allowed_temp_homes(tmp_path, monkeypatch):
@@ -144,7 +149,10 @@ def test_prepare_worker_home_skips_pool_auth_without_id_token(tmp_path, monkeypa
     )
     monkeypatch.setattr(credential_pool, "load_pool", lambda provider: FakePool(entry))
 
-    credential_id = prepare_codex_worker_home(tmp_path / "worker-codex")
+    credential_id = prepare_codex_worker_home(
+        tmp_path / "worker-codex",
+        allow_fallback=True,
+    )
 
     payload = json.loads((tmp_path / "worker-codex" / "auth.json").read_text(encoding="utf-8"))
     assert credential_id is None
@@ -194,9 +202,96 @@ def test_prepare_worker_home_skips_to_pool_auth_with_id_token(tmp_path, monkeypa
 
     payload = json.loads((tmp_path / "worker-codex" / "auth.json").read_text(encoding="utf-8"))
     assert credential_id == "pool-2"
+    assert (tmp_path / "worker-codex").is_symlink()
     assert payload["tokens"]["access_token"] == "pool-access-2"
     assert payload["tokens"]["refresh_token"] == "pool-refresh-2"
     assert payload["tokens"]["id_token"] == "pool-id-2"
+
+
+def test_prepare_worker_home_reuses_shared_auth_for_same_credential(tmp_path, monkeypatch):
+    from agent.codex_worker_auth import prepare_codex_worker_home
+
+    hermes_home = tmp_path / "hermes-home"
+    _write_pool_auth(
+        hermes_home,
+        [
+            {
+                "id": "cred-1",
+                "label": "primary",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "manual:device_code",
+                "access_token": "access-1",
+                "refresh_token": "refresh-1",
+                "id_token": "id-1",
+            },
+        ],
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    first_home = tmp_path / "worker-one"
+    second_home = tmp_path / "worker-two"
+
+    assert prepare_codex_worker_home(first_home) == "cred-1"
+    assert prepare_codex_worker_home(second_home) == "cred-1"
+    assert first_home.is_symlink()
+    assert second_home.is_symlink()
+    assert first_home.resolve() == second_home.resolve()
+
+    payload = json.loads((first_home / "auth.json").read_text(encoding="utf-8"))
+    assert payload["tokens"]["refresh_token"] == "refresh-1"
+
+
+def test_prepare_worker_home_adopts_worker_refreshed_shared_auth(tmp_path, monkeypatch):
+    from agent.codex_worker_auth import prepare_codex_worker_home
+    from agent.credential_pool import load_pool
+
+    hermes_home = tmp_path / "hermes-home"
+    _write_pool_auth(
+        hermes_home,
+        [
+            {
+                "id": "cred-1",
+                "label": "primary",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "manual:device_code",
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+                "id_token": "old-id",
+            },
+        ],
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    first_home = tmp_path / "worker-one"
+    second_home = tmp_path / "worker-two"
+    prepare_codex_worker_home(first_home)
+
+    (first_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "new-access",
+                    "refresh_token": "new-refresh",
+                    "id_token": "new-id",
+                    "account_id": "acct-new",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    prepare_codex_worker_home(second_home)
+
+    payload = json.loads((second_home / "auth.json").read_text(encoding="utf-8"))
+    entry = load_pool("openai-codex").entries()[0]
+    assert payload["tokens"]["access_token"] == "new-access"
+    assert payload["tokens"]["refresh_token"] == "new-refresh"
+    assert entry.access_token == "new-access"
+    assert entry.refresh_token == "new-refresh"
+    assert entry.id_token == "new-id"
 
 
 def test_prepare_worker_home_falls_back_when_pool_auth_is_incomplete(tmp_path, monkeypatch):
@@ -217,7 +312,7 @@ def test_prepare_worker_home_falls_back_when_pool_auth_is_incomplete(tmp_path, m
     worker_home = tmp_path / "worker-codex"
     _write_codex_auth(worker_home, access="stale-access", refresh="stale-refresh", id_token="")
 
-    credential_id = prepare_codex_worker_home(worker_home)
+    credential_id = prepare_codex_worker_home(worker_home, allow_fallback=True)
 
     payload = json.loads((worker_home / "auth.json").read_text(encoding="utf-8"))
     assert credential_id is None
