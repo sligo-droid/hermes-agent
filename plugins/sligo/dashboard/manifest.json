@@ -1,0 +1,11 @@
+{
+  "name": "sligo",
+  "label": "Self-Improvement",
+  "description": "Operator steering board for cron-generated improvement proposals.",
+  "icon": "Sparkles",
+  "version": "0.1.0",
+  "tab": { "path": "/self-improvement", "position": "after:workers" },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}
