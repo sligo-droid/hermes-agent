@@ -267,6 +267,14 @@ def delegate_coding_task(
     workdir = _resolve_cwd(cwd, parent_agent)
     if not Path(workdir).exists():
         return tool_error(f"cwd does not exist: {workdir}")
+    try:
+        from tools.canonical_repo_guard import canonical_main_worker_violation
+
+        canonical_error = canonical_main_worker_violation(workdir)
+    except Exception:
+        canonical_error = None
+    if canonical_error:
+        return tool_error(canonical_error)
     project_context = _worker_project_context(workdir)
     repo_state_notes = _repo_state_guard_notes(workdir)
     dependency_notes = _prepare_pnpm_dependency_links(workdir)
