@@ -39,6 +39,9 @@ def test_self_improvement_bundle_has_drawer_actions_loading_errors_and_links():
     assert "View worker" in src
     assert "Generated worker prompt" in src
     assert "Feedback and action history" in src
+    assert "proposal.linked_worker_url" in src
+    assert "`/kanban?board=${encodeURIComponent(board)}&task=${encodeURIComponent(task)}`" in src
+    assert "/workers?board=" not in src
 
 
 def test_self_improvement_bundle_calls_proposal_mutation_endpoints():

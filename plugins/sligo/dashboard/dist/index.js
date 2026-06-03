@@ -425,11 +425,17 @@
 
   function workerLink(proposal) {
     if (proposal.worker && proposal.worker.url) return proposal.worker;
+    if (proposal.linked_worker_url) {
+      return {
+        board: proposal.linked_kanban_board || proposal.resolved_board || "default",
+        task_id: proposal.linked_kanban_task_id || "",
+        url: proposal.linked_worker_url,
+      };
+    }
     if (!proposal.linked_kanban_task_id) return null;
     const board = proposal.linked_kanban_board || proposal.resolved_board || "default";
     const task = proposal.linked_kanban_task_id;
-    const session = proposal.linked_worker_run_id;
-    return { board, task_id: task, url: session ? `/workers/${encodeURIComponent(session)}/tickets/${encodeURIComponent(task)}` : `/workers?board=${encodeURIComponent(board)}&task=${encodeURIComponent(task)}` };
+    return { board, task_id: task, url: `/kanban?board=${encodeURIComponent(board)}&task=${encodeURIComponent(task)}` };
   }
 
   function oneSentence(text) {

@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi import FastAPI
@@ -125,6 +126,11 @@ def test_approve_creates_one_idempotent_kanban_task(client, isolated):
     first_task = first.json()["proposal"]["linked_kanban_task_id"]
     assert second.json()["proposal"]["linked_kanban_task_id"] == first_task
     assert second.json()["proposal"]["worker"]["url"]
+    worker_url = second.json()["proposal"]["linked_worker_url"]
+    parsed = urlsplit(worker_url)
+    assert parsed.path == "/kanban"
+    assert parse_qs(parsed.query) == {"board": ["sligo-board"], "task": [first_task]}
+    assert second.json()["proposal"]["worker"]["url"] == worker_url
     with kb.connect(board="sligo-board") as conn:
         rows = conn.execute("SELECT * FROM tasks WHERE idempotency_key = ?", (f"self-improvement:{card_id}",)).fetchall()
     assert len(rows) == 1

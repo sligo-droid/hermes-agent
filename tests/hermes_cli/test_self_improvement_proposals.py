@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -55,6 +56,40 @@ def _payload() -> dict:
             }
         ],
     }
+
+
+def _pid_payload() -> dict:
+    payload = _payload()
+    payload["project"] = "pid"
+    payload["prong"] = "airflow_doctor"
+    return payload
+
+
+def _pid_config(tmp_path: Path) -> dict:
+    cfg = _config(tmp_path)
+    cfg["self_improvement"]["projects"] = {
+        "pid": {
+            "name": "PID",
+            "workspace_path": str(tmp_path / "pid"),
+            "assignee": "dev",
+            "skills": [],
+            "prongs": {"airflow_doctor": {"name": "Airflow Doctor", "enabled": True}},
+        }
+    }
+    return cfg
+
+
+def _assert_worker_link_resolves(detail: dict, *, board: str):
+    task_id = detail["linked_kanban_task_id"]
+    worker_url = detail["linked_worker_url"]
+    parsed = urlsplit(worker_url)
+    params = parse_qs(parsed.query)
+
+    assert parsed.path == "/kanban"
+    assert params == {"board": [board], "task": [task_id]}
+    assert detail["worker"]["url"] == worker_url
+    with sip.kanban_db.connect(board=board) as conn:
+        assert sip.kanban_db.get_task(conn, task_id) is not None
 
 
 def test_default_config_contains_pid_project_and_required_prongs(tmp_path, monkeypatch):
@@ -326,9 +361,27 @@ def test_approve_is_idempotent_and_records_one_audit_event(tmp_path):
     assert second["linked_kanban_board"] == "sligo-board"
     assert second["linked_worker_url"]
     assert second["worker"]["url"] == first["worker"]["url"]
+    _assert_worker_link_resolves(second, board="sligo-board")
     feedback = sip.list_feedback(card_id, config=cfg)
     assert [item["feedback_type"] for item in feedback] == ["approve"]
     with sip.kanban_db.connect(board="sligo-board") as conn:
+        rows = conn.execute("SELECT * FROM tasks WHERE idempotency_key = ?", (f"self-improvement:{card_id}",)).fetchall()
+    assert len(rows) == 1
+
+
+def test_approve_pid_default_board_persists_resolvable_worker_link(tmp_path):
+    cfg = _pid_config(tmp_path)
+    Path(cfg["self_improvement"]["projects"]["pid"]["workspace_path"]).mkdir()
+    sip.ingest_proposal_output(metadata={"proposal_json": json.dumps(_pid_payload()), "cron_run_id": "run-pid"}, config=cfg)
+    card_id = sip.list_proposals(config=cfg)[0]["card_id"]
+
+    approved = sip.approve_proposal(card_id, actor="operator", config=cfg)
+    reloaded = sip.get_proposal_detail(card_id, config=cfg)
+
+    assert approved["linked_kanban_board"] == "default"
+    assert reloaded["linked_worker_url"] == approved["linked_worker_url"]
+    _assert_worker_link_resolves(approved, board="default")
+    with sip.kanban_db.connect(board="default") as conn:
         rows = conn.execute("SELECT * FROM tasks WHERE idempotency_key = ?", (f"self-improvement:{card_id}",)).fetchall()
     assert len(rows) == 1
 

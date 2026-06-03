@@ -43,6 +43,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from hermes_cli import kanban_db
 from hermes_constants import get_hermes_home
@@ -1251,15 +1252,7 @@ def _self_improvement_target_for_job(job: dict[str, Any], config: dict[str, Any]
 
 
 def _worker_url(board: str, task_id: str) -> str:
-    try:
-        from hermes_cli.discord_worker_boards import public_session_board_url
-
-        public_url = public_session_board_url(board)
-        if public_url:
-            return public_url
-    except Exception:
-        pass
-    return f"/workers/{board}?task={task_id}"
+    return f"/kanban?board={quote(str(board or 'default'), safe='')}&task={quote(str(task_id or ''), safe='')}"
 
 
 def _metadata_str(metadata: dict[str, Any], *keys: str) -> str | None:

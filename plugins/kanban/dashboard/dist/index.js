@@ -197,6 +197,12 @@
     } catch (_e) { return null; }
   }
 
+  function queryParam(name) {
+    try {
+      return (new URLSearchParams(window.location.search).get(name) || "").trim() || null;
+    } catch (_e) { return null; }
+  }
+
   function writeSelectedBoard(slug) {
     try {
       // Persist the user's dashboard-side board pin even for "default".
@@ -447,7 +453,8 @@
 
   function KanbanPage() {
     const { t } = useI18n();
-    const [board, setBoard] = useState(() => readSelectedBoard() || null);
+    const initialTaskId = useMemo(() => queryParam("task"), []);
+    const [board, setBoard] = useState(() => queryParam("board") || readSelectedBoard() || null);
     const [boardList, setBoardList] = useState([]);      // [{slug, name, counts, ...}]
     const [showNewBoard, setShowNewBoard] = useState(false);
 
@@ -471,7 +478,7 @@
     const [laneByProfile, setLaneByProfile] = useState(true);
     const [configApplied, setConfigApplied] = useState(false);
 
-    const [selectedTaskId, setSelectedTaskId] = useState(null);
+    const [selectedTaskId, setSelectedTaskId] = useState(initialTaskId || null);
     const [selectedIds, setSelectedIds] = useState(() => new Set());
     const [lastSelectedId, setLastSelectedId] = useState(null);
     const [failedIds, setFailedIds] = useState(() => new Set());
