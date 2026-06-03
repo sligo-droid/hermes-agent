@@ -376,6 +376,18 @@ def looks_complex_or_risky(task: str, context: str = "") -> bool:
     return any(_contains_signal(lower, signal) for signal in risky_signals)
 
 
+def _prompt_with_repo_state_preflight(prompt: str, workspace: str) -> str:
+    try:
+        from agent.repo_state_guard import format_repo_state_preflight, repo_state_preflight
+
+        notes = format_repo_state_preflight(repo_state_preflight(workspace)).strip()
+    except Exception:
+        notes = ""
+    if not notes or "Repository state preflight:" in prompt:
+        return prompt
+    return f"{notes}\n\n{prompt}"
+
+
 def run_opencode_task(
     prompt: str,
     workspace: str,
@@ -398,6 +410,7 @@ def run_opencode_task(
     events: list[dict[str, Any]] = []
     agents: list[str] = []
     run_profile = _task_run_profile(cfg, needs_plan)
+    worker_prompt = _prompt_with_repo_state_preflight(prompt, workspace)
 
     def _capture(event: dict[str, Any]) -> None:
         events.append(event)
@@ -408,7 +421,7 @@ def run_opencode_task(
     if needs_plan:
         agents.append(cfg["plan_agent"])
         plan = _run_opencode_once(
-            prompt=_plan_prompt(prompt),
+            prompt=_plan_prompt(worker_prompt),
             workspace=workspace,
             timeout=max(30.0, timeout),
             cfg=cfg,
@@ -428,10 +441,10 @@ def run_opencode_task(
         plan_text = plan.final_text.strip()
 
     agents.append(cfg["build_agent"])
-    build_prompt = prompt
+    build_prompt = worker_prompt
     if plan_text:
         build_prompt = (
-            f"{prompt.rstrip()}\n\n"
+            f"{worker_prompt.rstrip()}\n\n"
             "OpenCode plan to follow:\n"
             f"{plan_text}\n"
         )
@@ -493,7 +506,7 @@ def run_opencode_single_pass(
             on_event(event)
 
     result = _run_opencode_once(
-        prompt=prompt,
+        prompt=_prompt_with_repo_state_preflight(prompt, workspace),
         workspace=workspace,
         timeout=max(30.0, timeout),
         cfg=cfg,

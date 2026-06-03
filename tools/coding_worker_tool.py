@@ -74,6 +74,16 @@ def _worker_project_context(workdir: str) -> str:
         return ""
 
 
+def _repo_state_guard_notes(workdir: str) -> str:
+    """Return a compact git-state warning block for worker prompts."""
+    try:
+        from agent.repo_state_guard import format_repo_state_preflight, repo_state_preflight
+
+        return format_repo_state_preflight(repo_state_preflight(workdir)).strip()
+    except Exception:
+        return ""
+
+
 _PNPM_SCAN_SKIP_DIRS = {
     ".git",
     ".hermes",
@@ -258,6 +268,7 @@ def delegate_coding_task(
     if not Path(workdir).exists():
         return tool_error(f"cwd does not exist: {workdir}")
     project_context = _worker_project_context(workdir)
+    repo_state_notes = _repo_state_guard_notes(workdir)
     dependency_notes = _prepare_pnpm_dependency_links(workdir)
 
     timeout = (
@@ -304,6 +315,8 @@ def delegate_coding_task(
                 "all git and PR lifecycle steps after the worker returns.",
             ]
         )
+    if repo_state_notes:
+        worker_prompt_parts.extend(["", repo_state_notes])
     worker_prompt_parts.extend(["", "Task:", task_text])
     if context and str(context).strip():
         worker_prompt_parts.extend(["", "Context from Hermes:", str(context).strip()])
