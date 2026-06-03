@@ -1,0 +1,413 @@
+/* Sligo Self-Improvement dashboard plugin. */
+.sligo-self-improvement {
+  width: 100%;
+  min-height: 100%;
+  padding: 1.25rem;
+  color: var(--color-foreground);
+}
+
+.si-hero,
+.si-controls,
+.si-project-note,
+.si-layout,
+.si-drawer {
+  border: 1px solid var(--color-border);
+  background: color-mix(in srgb, var(--color-card) 88%, transparent);
+  border-radius: var(--radius);
+}
+
+.si-hero {
+  display: flex;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem;
+  margin-bottom: 1rem;
+}
+
+.si-kicker {
+  margin: 0 0 0.35rem;
+  color: var(--color-muted-foreground);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 0.72rem;
+}
+
+.si-hero h1,
+.si-drawer h2,
+.si-sidebar-panel h2,
+.si-column-header h2 {
+  margin: 0;
+}
+
+.si-hero h1 {
+  font-size: clamp(1.75rem, 3vw, 2.8rem);
+  line-height: 1;
+}
+
+.si-hero-copy {
+  max-width: 760px;
+  margin: 0.7rem 0 0;
+  color: var(--color-muted-foreground);
+}
+
+.si-hero-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(90px, 1fr));
+  gap: 0.75rem;
+  min-width: 320px;
+}
+
+.si-hero-stats > div {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 0.85rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--color-background) 75%, transparent);
+}
+
+.si-hero-stats strong {
+  font-size: 1.7rem;
+}
+
+.si-hero-stats span,
+.si-muted,
+.si-summary,
+.si-meta-row,
+.si-effort,
+.si-run span,
+.si-project-note span {
+  color: var(--color-muted-foreground);
+}
+
+.si-controls {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  padding: 0.9rem;
+  margin-bottom: 0.75rem;
+}
+
+.si-controls > div {
+  min-width: 190px;
+}
+
+.si-check {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 2.4rem;
+  color: var(--color-muted-foreground);
+}
+
+.si-check input {
+  width: 1rem;
+  height: 1rem;
+}
+
+.si-project-note {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding: 0.7rem 0.9rem;
+  margin-bottom: 0.75rem;
+  font-size: 0.9rem;
+}
+
+.si-layout {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  min-height: 520px;
+  overflow: hidden;
+}
+
+.si-sidebar-panel {
+  padding: 0.9rem;
+  border-right: 1px solid var(--color-border);
+  background: color-mix(in srgb, var(--color-background) 48%, transparent);
+}
+
+.si-sidebar-panel h2 {
+  font-size: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.si-runs {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.si-run {
+  width: 100%;
+  text-align: left;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 0.65rem;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.si-run:hover,
+.si-run-active {
+  background: color-mix(in srgb, var(--color-primary) 12%, transparent);
+  border-color: color-mix(in srgb, var(--color-primary) 45%, var(--color-border));
+}
+
+.si-run strong,
+.si-run span {
+  display: block;
+  line-height: 1.25;
+}
+
+.si-run span {
+  font-size: 0.78rem;
+  margin-top: 0.25rem;
+}
+
+.si-board {
+  min-width: 0;
+  padding: 0.9rem;
+  overflow-x: auto;
+}
+
+.si-columns {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.8rem;
+  min-width: min-content;
+}
+
+.si-column {
+  width: 300px;
+  flex: 0 0 300px;
+  min-height: 440px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 0.65rem;
+  background: color-mix(in srgb, var(--color-background) 56%, transparent);
+}
+
+.si-column-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.65rem;
+}
+
+.si-column-header h2 {
+  font-size: 0.95rem;
+}
+
+.si-column-header span {
+  display: inline-flex;
+  min-width: 1.6rem;
+  justify-content: center;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-primary) 12%, transparent);
+  color: var(--color-muted-foreground);
+  font-size: 0.78rem;
+}
+
+.si-card {
+  margin-bottom: 0.65rem;
+  border-color: var(--color-border);
+}
+
+.si-card-content {
+  padding: 0.8rem !important;
+}
+
+.si-card-top,
+.si-meta-row,
+.si-actions,
+.si-drawer-status,
+.si-drawer-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.si-card-top {
+  justify-content: space-between;
+  margin-bottom: 0.55rem;
+}
+
+.si-card-title {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  font-weight: 700;
+  line-height: 1.2;
+  cursor: pointer;
+}
+
+.si-card-title:hover {
+  color: var(--color-primary);
+}
+
+.si-summary {
+  margin: 0.5rem 0;
+  font-size: 0.88rem;
+  line-height: 1.35;
+}
+
+.si-meta-row {
+  font-size: 0.75rem;
+  margin-bottom: 0.65rem;
+}
+
+.si-actions {
+  justify-content: flex-start;
+}
+
+.si-worker-link,
+.si-primary-link {
+  color: var(--color-primary);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.si-badge {
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-size: 0.68rem;
+}
+.si-badge-proposed { background: color-mix(in srgb, #facc15 18%, transparent) !important; }
+.si-badge-active { background: color-mix(in srgb, #60a5fa 18%, transparent) !important; }
+.si-badge-done { background: color-mix(in srgb, #34d399 18%, transparent) !important; }
+.si-badge-risk { background: color-mix(in srgb, #fb7185 20%, transparent) !important; }
+.si-badge-rejected { background: color-mix(in srgb, currentColor 10%, transparent) !important; }
+
+.si-error,
+.si-empty,
+.si-loading {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.si-error {
+  border-color: color-mix(in srgb, #ef4444 55%, var(--color-border));
+  background: color-mix(in srgb, #ef4444 12%, transparent);
+}
+
+.si-empty,
+.si-loading {
+  color: var(--color-muted-foreground);
+  background: color-mix(in srgb, var(--color-background) 70%, transparent);
+}
+
+.si-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  background: rgba(0, 0, 0, 0.42);
+  display: flex;
+  justify-content: flex-end;
+}
+
+.si-drawer {
+  width: min(720px, 100vw);
+  height: 100vh;
+  overflow: auto;
+  padding: 1rem;
+  border-radius: 0;
+  border-top: 0;
+  border-right: 0;
+  border-bottom: 0;
+  box-shadow: -18px 0 40px rgba(0, 0, 0, 0.24);
+}
+
+.si-drawer-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: start;
+  margin-bottom: 0.75rem;
+}
+
+.si-drawer h2 {
+  font-size: 1.45rem;
+}
+
+.si-drawer section {
+  border-top: 1px solid var(--color-border);
+  padding-top: 0.9rem;
+  margin-top: 0.9rem;
+}
+
+.si-drawer h3 {
+  margin: 0 0 0.45rem;
+  font-size: 0.95rem;
+}
+
+.si-list {
+  margin: 0;
+  padding-left: 1.2rem;
+}
+
+.si-list li {
+  margin-bottom: 0.35rem;
+}
+
+.si-pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--color-background) 80%, transparent) !important;
+  padding: 0.75rem;
+  color: inherit;
+}
+
+.si-definition {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  gap: 0.35rem 0.7rem;
+}
+
+.si-definition dt {
+  color: var(--color-muted-foreground);
+}
+
+.si-definition dd {
+  margin: 0;
+  word-break: break-word;
+}
+
+.si-source-details {
+  margin-top: 0.75rem;
+}
+
+.si-source-details summary {
+  cursor: pointer;
+  color: var(--color-primary);
+  font-weight: 600;
+}
+
+@media (max-width: 900px) {
+  .si-hero,
+  .si-layout {
+    display: block;
+  }
+  .si-hero-stats {
+    min-width: 0;
+    margin-top: 1rem;
+  }
+  .si-sidebar-panel {
+    border-right: 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+}
