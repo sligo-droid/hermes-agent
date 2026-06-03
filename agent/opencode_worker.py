@@ -91,9 +91,63 @@ def _bool_config(value: Any, default: bool) -> bool:
 
 def _direct_opencode_model(value: Any) -> str:
     model = str(value or "").strip()
-    if not model or model == "hermes-codex/gpt-5.5":
+    if not model:
         return _DEFAULT_OPENCODE_MODEL
     return model
+
+
+def _inline_worker_brief(model: Any) -> bool:
+    """Return True when the selected OpenCode provider rejects file parts.
+
+    The local ``hermes-codex`` OpenCode provider proxies Codex-style text
+    turns. Sending the worker brief through ``opencode run --file`` produces a
+    server-side ``UnknownError`` before inference, while the same brief in the
+    text message succeeds. Keep file attachments for providers that support
+    them, but inline for this provider so the coding worker smoke is a real
+    inference check instead of a file-upload compatibility check.
+    """
+    return str(model or "").strip().startswith("hermes-codex/")
+
+
+def _worker_brief_message(prompt: str) -> str:
+    return (
+        "Follow this Hermes worker brief exactly. Return only your final "
+        "answer unless the brief asks for a structured response.\n\n"
+        "Hermes worker brief:\n"
+        f"{prompt.rstrip()}"
+    )
+
+
+def _opencode_provider_id(model: Any) -> str:
+    raw = str(model or "").strip()
+    return raw.split("/", 1)[0] if "/" in raw else ""
+
+
+def _read_opencode_user_config() -> dict[str, Any]:
+    config_base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    config_dir = config_base / "opencode"
+    for name in ("opencode.json", "opencode.jsonc"):
+        path = config_dir / name
+        if not path.is_file():
+            continue
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _opencode_provider_config_for_model(model: Any) -> dict[str, Any]:
+    provider_id = _opencode_provider_id(model)
+    if not provider_id:
+        return {}
+    providers = _read_opencode_user_config().get("provider")
+    if not isinstance(providers, dict):
+        return {}
+    provider = providers.get(provider_id)
+    return provider if isinstance(provider, dict) else {}
 
 
 def load_coding_worker_backend(
@@ -529,7 +583,8 @@ def _run_opencode_once(
 
     workdir_path = Path(workspace).expanduser().resolve()
     workdir = str(workdir_path)
-    brief_path = _write_brief(prompt, workspace=workdir_path)
+    inline_brief = _inline_worker_brief(cfg.get("model"))
+    brief_path = None if inline_brief else _write_brief(prompt, workspace=workdir_path)
     config_home = (
         _write_worker_config(str(cfg.get("model") or _DEFAULT_OPENCODE_MODEL))
         if cfg.get("isolated_config")
@@ -539,7 +594,9 @@ def _run_opencode_once(
         binary_or_error,
         "run",
         "--pure",
-        "Read the attached Hermes worker brief and follow it exactly.",
+        _worker_brief_message(prompt)
+        if inline_brief
+        else "Read the attached Hermes worker brief and follow it exactly.",
         "--format",
         "json",
         "--agent",
@@ -555,7 +612,8 @@ def _run_opencode_once(
         cmd.extend(["--title", title])
     if cfg.get("dangerously_skip_permissions"):
         cmd.append("--dangerously-skip-permissions")
-    cmd.extend(["--file", str(brief_path)])
+    if brief_path is not None:
+        cmd.extend(["--file", str(brief_path)])
 
     try:
         configured_startup_timeout = float(
@@ -578,10 +636,11 @@ def _run_opencode_once(
     except Exception as exc:
         return OpenCodeRunResult(error=f"OpenCode {agent} run failed to start: {exc}")
     finally:
-        try:
-            brief_path.unlink()
-        except OSError:
-            pass
+        if brief_path is not None:
+            try:
+                brief_path.unlink()
+            except OSError:
+                pass
         if config_home is not None:
             shutil.rmtree(config_home, ignore_errors=True)
 
@@ -876,6 +935,8 @@ def _write_worker_config(model: str) -> Path:
     root = Path(tempfile.mkdtemp(prefix="hermes-opencode-config-"))
     config_dir = root / "opencode"
     config_dir.mkdir(parents=True, exist_ok=True)
+    provider_id = _opencode_provider_id(model)
+    provider_cfg = _opencode_provider_config_for_model(model)
     payload = {
         "$schema": "https://opencode.ai/config.json",
         "plugin": [],
@@ -883,6 +944,8 @@ def _write_worker_config(model: str) -> Path:
         "mcp": {},
         "model": model or _DEFAULT_OPENCODE_MODEL,
     }
+    if provider_id and provider_cfg:
+        payload["provider"] = {provider_id: provider_cfg}
     (config_dir / "opencode.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

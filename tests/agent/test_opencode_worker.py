@@ -118,10 +118,70 @@ def test_isolated_config_contains_direct_openai_model_without_mcps(monkeypatch, 
     assert not seen_config_home.exists()
 
 
-def test_legacy_proxy_model_is_mapped_to_direct_openai():
+def test_configured_hermes_codex_model_is_preserved():
     cfg = ow.load_opencode_config(_cfg(opencode={"model": "hermes-codex/gpt-5.5"}))
 
-    assert cfg["model"] == "openai/gpt-5.5"
+    assert cfg["model"] == "hermes-codex/gpt-5.5"
+
+
+def test_hermes_codex_model_inlines_worker_brief(monkeypatch, tmp_path):
+    calls = []
+    seen_payload = None
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    config_dir = home / ".config" / "opencode"
+    config_dir.mkdir(parents=True)
+    (config_dir / "opencode.json").write_text(
+        json.dumps(
+            {
+                "provider": {
+                    "hermes-codex": {
+                        "npm": "@ai-sdk/openai-compatible",
+                        "name": "Hermes Codex Proxy",
+                        "options": {"baseURL": "http://127.0.0.1:9999/v1"},
+                        "models": {"gpt-5.5": {}},
+                    }
+                },
+                "model": "hermes-codex/gpt-5.5",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+
+    def fake_run(cmd, **kwargs):
+        nonlocal seen_payload
+        calls.append(cmd)
+        config_path = ow.Path(kwargs["env"]["XDG_CONFIG_HOME"]) / "opencode" / "opencode.json"
+        seen_payload = json.loads(config_path.read_text(encoding="utf-8"))
+        return _process_result(
+            stdout=json.dumps(
+                {"type": "message", "sessionID": "ses-build", "message": "done"}
+            )
+            + "\n",
+        )
+
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
+
+    result = ow.run_opencode_task(
+        "fix typo in README",
+        str(workspace),
+        timeout=60,
+        config=_cfg(opencode={"model": "hermes-codex/gpt-5.5"}),
+    )
+
+    assert result.error is None
+    assert _option(calls[0], "--model") == "hermes-codex/gpt-5.5"
+    assert "--file" not in calls[0]
+    assert "Hermes worker brief:\nfix typo in README" in calls[0][3]
+    assert seen_payload["provider"]["hermes-codex"]["options"] == {
+        "baseURL": "http://127.0.0.1:9999/v1"
+    }
+    assert seen_payload["mcp"] == {}
+    assert not (workspace / ".hermes-opencode").exists()
 
 
 def test_isolated_config_can_be_disabled(monkeypatch, tmp_path):
