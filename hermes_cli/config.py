@@ -784,6 +784,14 @@ DEFAULT_CONFIG = {
         "image_input_mode": "auto",
         "disabled_toolsets": [],
     },
+
+    "self_improvement": {
+        "proposals": {
+            "projects": {},
+            "project_aliases": {},
+            "feedback_context_limit": 20,
+        },
+    },
     
     "terminal": {
         "backend": "local",
