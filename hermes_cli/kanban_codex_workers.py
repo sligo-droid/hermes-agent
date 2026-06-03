@@ -18,6 +18,7 @@ _CODEX_WORKER_ENV_KEYS = (
     "HERMES_CODEX_WORKER_CREDENTIAL_ID",
     "HERMES_CODEX_WORKER_CLEANUP_HOME",
     "HERMES_CODEX_WORKER_CLEANUP_ROOT",
+    "HERMES_CODEX_WORKER_CONTAINER_CODEX_HOME",
 )
 _WORKER_CONTAINER_ENV_PREFIXES = (
     "HERMES_",
@@ -483,6 +484,7 @@ def _spawn_docker_worker(
             "HERMES_CODEX_WORKER_SERVICE_TIER_SOURCE": settings["service_tier_source"],
             "HERMES_CODING_WORKER_BACKEND": backend,
             "CODEX_HOME": "/codex-home",
+            "HERMES_CODEX_WORKER_CONTAINER_CODEX_HOME": "1",
             "PYTHONPATH": "/hermes",
         }
     )

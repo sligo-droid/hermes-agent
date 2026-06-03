@@ -1558,6 +1558,58 @@ def test_run_codex_retries_auth_failure_with_next_pool_credential(monkeypatch, t
     assert pool_entries["cred-1"].last_error_code == 401
 
 
+def test_rotate_codex_worker_credential_uses_child_home_for_container_mount(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+
+    hermes_home = tmp_path / "hermes-home"
+    _write_pool_auth(
+        hermes_home,
+        [
+            {
+                "id": "cred-1",
+                "label": "primary",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "manual:device_code",
+                "access_token": "access-1",
+                "refresh_token": "refresh-1",
+                "id_token": "id-1",
+            },
+            {
+                "id": "cred-2",
+                "label": "secondary",
+                "auth_type": "oauth",
+                "priority": 1,
+                "source": "manual:device_code",
+                "access_token": "access-2",
+                "refresh_token": "refresh-2",
+                "id_token": "id-2",
+            },
+        ],
+    )
+    codex_mount = tmp_path / "codex-mount"
+    _write_codex_auth(codex_mount, access="access-1", refresh="refresh-1", id_token="id-1")
+    (codex_mount / "sentinel.txt").write_text("keep", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_mount))
+    monkeypatch.setenv("HERMES_CODEX_WORKER_CREDENTIAL_ID", "cred-1")
+    monkeypatch.setenv("HERMES_CODEX_WORKER_CONTAINER_CODEX_HOME", "1")
+
+    rotated = worker._rotate_codex_worker_credential_after_auth_failure(
+        SimpleNamespace(error="Codex authentication failed")
+    )
+
+    next_home = codex_mount / ".rotated-credential-home"
+    original_payload = json.loads((codex_mount / "auth.json").read_text(encoding="utf-8"))
+    next_payload = json.loads((next_home / "auth.json").read_text(encoding="utf-8"))
+    assert rotated is True
+    assert os.environ["CODEX_HOME"] == str(next_home)
+    assert (codex_mount / "sentinel.txt").read_text(encoding="utf-8") == "keep"
+    assert original_payload["tokens"]["access_token"] == "access-1"
+    assert next_payload["tokens"]["access_token"] == "access-2"
+    assert not next_home.is_symlink()
+
+
 def test_rotate_codex_worker_credential_disables_fallback_auth_copy(monkeypatch, tmp_path):
     from agent import codex_worker_auth
     from hermes_cli import kanban_codex_worker as worker

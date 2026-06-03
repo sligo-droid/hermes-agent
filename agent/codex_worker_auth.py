@@ -82,7 +82,7 @@ def _entry_tokens(entry: Any) -> Optional[dict[str, str]]:
 def _entry_is_usable(entry: Any) -> bool:
     if entry is None:
         return False
-    if str(getattr(entry, "last_status", "") or "").strip().lower() == "exhausted":
+    if str(getattr(entry, "last_status", "") or "").strip().lower() in {"exhausted", "dead"}:
         return False
     return _entry_tokens(entry) is not None
 
@@ -111,7 +111,7 @@ def _refresh_worker_entry(pool: Any, entry: Any) -> Any:
         return None
     if str(getattr(entry, "provider", "") or "").strip().lower() != "openai-codex":
         return None
-    if str(getattr(entry, "last_status", "") or "").strip().lower() == "exhausted":
+    if str(getattr(entry, "last_status", "") or "").strip().lower() in {"exhausted", "dead"}:
         return None
     if not _string_attr(entry, "access_token") or not _string_attr(entry, "refresh_token"):
         return None
@@ -311,6 +311,7 @@ def _prepare_shared_codex_home(
     *,
     entry: Any,
     credential_id: str,
+    use_shared_home_symlink: bool,
 ) -> bool:
     """Prepare shared auth for a pool credential and point ``path`` at it.
 
@@ -320,12 +321,13 @@ def _prepare_shared_codex_home(
     as directory symlinks to that shared home.
     """
     shared_home = _shared_codex_home_for_credential(credential_id)
-    shared_home.mkdir(parents=True, exist_ok=True)
-    try:
-        shared_home.chmod(0o700)
-        shared_home.parent.chmod(0o700)
-    except OSError:
-        pass
+    if use_shared_home_symlink:
+        shared_home.mkdir(parents=True, exist_ok=True)
+        try:
+            shared_home.chmod(0o700)
+            shared_home.parent.chmod(0o700)
+        except OSError:
+            pass
 
     # A previous worker may have refreshed the shared auth file and then died
     # before syncing back to auth.json. Adopt it before writing, otherwise a
@@ -341,10 +343,16 @@ def _prepare_shared_codex_home(
         except Exception:
             pass
 
-    if not _write_codex_auth(shared_home, entry):
-        return False
-    _write_minimal_config(shared_home)
-    _replace_path_with_directory_symlink(path, shared_home)
+    if use_shared_home_symlink:
+        if not _write_codex_auth(shared_home, entry):
+            return False
+        _write_minimal_config(shared_home)
+        _replace_path_with_directory_symlink(path, shared_home)
+    else:
+        path.mkdir(parents=True, exist_ok=True)
+        if not _write_codex_auth(path, entry):
+            return False
+        _write_minimal_config(path)
     return True
 
 
@@ -354,6 +362,7 @@ def prepare_codex_worker_home(
     parent_agent: Any = None,
     source_env: dict[str, str] | None = None,
     allow_fallback: bool = False,
+    use_shared_home_symlink: bool = True,
 ) -> Optional[str]:
     """Prepare an isolated Codex home and return inherited credential id.
 
@@ -378,6 +387,7 @@ def prepare_codex_worker_home(
         path,
         entry=entry,
         credential_id=credential_id,
+        use_shared_home_symlink=use_shared_home_symlink,
     ):
         logger.info(
             "Codex worker using shared openai-codex pool credential %s",
@@ -576,6 +586,6 @@ def sync_codex_worker_home(
         try:
             from hermes_cli.auth import _save_codex_tokens
 
-            _save_codex_tokens(dict(tokens))
+            _save_codex_tokens(dict(tokens), set_active=False)
         except Exception as exc:
             logger.debug("Could not sync Codex singleton credentials: %s", exc)
