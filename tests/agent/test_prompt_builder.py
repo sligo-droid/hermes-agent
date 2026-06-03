@@ -8,6 +8,7 @@ import sys
 import pytest
 
 from agent.prompt_builder import (
+    CLARIFYING_QUESTION_GUIDANCE,
     _scan_context_content,
     _truncate_content,
     _parse_skill_file,
@@ -54,6 +55,13 @@ class TestGuidanceConstants:
         assert "first-pass retrieval layer" in QMD_MCP_GUIDANCE
         assert "before using read_file on local docs" in QMD_MCP_GUIDANCE
         assert "source/code inspection" in QMD_MCP_GUIDANCE
+
+    def test_clarifying_question_guidance_is_balanced(self):
+        text = CLARIFYING_QUESTION_GUIDANCE.lower()
+        assert "sparingly" in text
+        assert "low-stakes" in text
+        assert "recommended default" in text
+        assert "user-visible behavior" in text
 
 
 # =========================================================================
@@ -1292,6 +1300,12 @@ class TestOpenAIModelExecutionGuidance:
         text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
         assert "missing_context" in text or "missing context" in text
         assert "hallucinate" in text or "guess" in text
+
+    def test_guidance_allows_material_clarifying_questions(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "clarification sparingly" in text
+        assert "user-visible behavior" in text
+        assert "human product/tradeoff decision" in text
 
     def test_guidance_uses_xml_tags(self):
         assert "<tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
