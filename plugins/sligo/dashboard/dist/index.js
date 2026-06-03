@@ -76,6 +76,40 @@
     return proposal.source_url || (run && run.source_url) || proposal.source_output_url || (run && run.source_output_url) || "";
   }
 
+  function sourceOutputUrl(proposal, run) {
+    return proposal.source_output_url || (run && run.source_output_url) || "";
+  }
+
+  function sameOriginUrl(path) {
+    if (!path) return "";
+    if (/^[a-z][a-z0-9+.-]*:/i.test(path)) return path;
+    const rawBase = window.__HERMES_BASE_PATH__ || "";
+    const base = rawBase ? (rawBase.charAt(0) === "/" ? rawBase : "/" + rawBase).replace(/\/+$/, "") : "";
+    const suffix = path.charAt(0) === "/" ? path : "/" + path;
+    return new URL(base + suffix, window.location.origin).toString();
+  }
+
+  function authenticatedFetch(path) {
+    const headers = new Headers({ "Accept": "text/markdown" });
+    if (window.__HERMES_SESSION_TOKEN__) headers.set("X-Hermes-Session-Token", window.__HERMES_SESSION_TOKEN__);
+    return fetch(sameOriginUrl(path), { headers: headers, credentials: "include" });
+  }
+
+  function openMarkdownBlob(text, filename) {
+    const blob = new Blob([text], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const opened = window.open(url, "_blank", "noopener,noreferrer");
+    if (!opened) {
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename || "sligo-source-output.md";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    }
+    window.setTimeout(function () { URL.revokeObjectURL(url); }, 60000);
+  }
+
   function StatusPill(props) {
     return h("span", { className: "sligo-pill sligo-pill--" + String(props.status || "unknown").replace(/[^a-z0-9_-]/gi, "-") }, props.children || props.status || "unknown");
   }
@@ -154,10 +188,22 @@
     const acceptance = splitLines(proposal.acceptance_criteria);
     const prompt = proposal.proposed_worker_prompt || "The backend will generate the worker prompt from stored proposal fields and project/prong configuration when approved.";
     const source = sourceHref(proposal, run);
+    const outputUrl = sourceOutputUrl(proposal, run);
     const history = Array.isArray(proposal.audit_log) ? proposal.audit_log : [];
 
     function mutate(action, payload) {
       props.onAction(proposal.id, action, payload || {});
+    }
+
+    function openSourceOutput() {
+      props.onSourceError("");
+      authenticatedFetch(outputUrl)
+        .then(function (response) {
+          if (!response.ok) throw new Error("HTTP " + response.status);
+          return response.text();
+        })
+        .then(function (text) { openMarkdownBlob(text, "sligo-source-output-" + proposal.id + ".md"); })
+        .catch(function (err) { props.onSourceError("Could not open source output: " + errorText(err)); });
     }
 
     return h("aside", { className: "sligo-drawer", "aria-label": "Proposal detail" },
@@ -169,6 +215,7 @@
         h("button", { className: "sligo-icon-button", type: "button", onClick: props.onClose, "aria-label": "Close proposal detail" }, "x"),
       ),
       props.actionError ? h("div", { className: "sligo-error", role: "alert" }, props.actionError) : null,
+      props.sourceError ? h("div", { className: "sligo-error", role: "alert" }, props.sourceError) : null,
       h("section", null,
         h("h3", null, "Rationale"),
         h("p", null, proposal.rationale || proposal.body || "No generated rationale is available from this proposal."),
@@ -193,7 +240,7 @@
           h("dt", null, "Parser"), h("dd", null, proposal.parser_name || (run && run.parser_name) || "unknown"),
           h("dt", null, "Parse status"), h("dd", null, (run && (run.parse_status || run.status)) || "unknown"),
         ),
-        source ? h("a", { href: source, target: "_blank", rel: "noreferrer" }, "Open source output") : h("p", { className: "sligo-muted" }, "No source output link is present on this proposal."),
+        outputUrl ? h(Button, { type: "button", onClick: openSourceOutput }, "Open source output") : source ? h("p", { className: "sligo-muted" }, "Source URL: ", h("code", null, source)) : h("p", { className: "sligo-muted" }, "No source output link is present on this proposal."),
       ),
       h("section", null,
         h("h3", null, "Feedback & Action History"),
@@ -243,6 +290,9 @@
     const actionState = hooks.useState({ busy: "", error: "" });
     const action = actionState[0];
     const setAction = actionState[1];
+    const sourceErrorState = hooks.useState("");
+    const sourceError = sourceErrorState[0];
+    const setSourceError = sourceErrorState[1];
 
     const runsById = hooks.useMemo(function () {
       const out = {};
@@ -386,7 +436,9 @@
           run: selectedProposal ? runForProposal(runsById, selectedProposal) : null,
           busy: action.busy,
           actionError: action.error,
+          sourceError: sourceError,
           onAction: onAction,
+          onSourceError: setSourceError,
           onClose: function () { setSelectedId(null); },
         }),
       ),

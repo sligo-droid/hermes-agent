@@ -169,6 +169,36 @@ def test_source_output_ref_opens_saved_cron_markdown(client, sligo_home):
     assert opened.text == "# Saved cron proposal\n\nCron output body.\n"
 
 
+def test_source_output_uses_authenticated_dashboard_fetch(sligo_home):
+    from hermes_cli import web_server
+
+    output_dir = sligo_home / "cron" / "output" / "2026-06-03"
+    output_dir.mkdir(parents=True)
+    output_path = output_dir / "proposal.md"
+    output_path.write_text("# Saved cron proposal\n\nAuthenticated body.\n", encoding="utf-8")
+    ref = proposals.safe_source_output_ref(output_path)
+
+    web_client = TestClient(web_server.app)
+    raw = web_client.get(f"/api/plugins/sligo/source-output/{ref}")
+    authed = web_client.get(
+        f"/api/plugins/sligo/source-output/{ref}",
+        headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
+    )
+
+    assert raw.status_code == 401
+    assert authed.status_code == 200, authed.text
+    assert authed.headers["content-type"].startswith("text/markdown")
+    assert authed.text == "# Saved cron proposal\n\nAuthenticated body.\n"
+
+
+def test_sligo_source_output_control_is_not_plain_api_anchor():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = (repo_root / "plugins" / "sligo" / "dashboard" / "dist" / "index.js").read_text(encoding="utf-8")
+
+    assert "authenticatedFetch(outputUrl)" in bundle
+    assert 'href: source, target: "_blank"' not in bundle
+
+
 def test_source_output_route_rejects_unsafe_and_missing_refs(client, sligo_home, tmp_path):
     outside = tmp_path / "outside.md"
     outside.write_text("outside", encoding="utf-8")
