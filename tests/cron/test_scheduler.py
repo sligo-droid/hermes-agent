@@ -2045,6 +2045,20 @@ class TestBuildJobPromptSilentHint:
         prompt_pos = result.index("My custom prompt")
         assert system_pos < prompt_pos
 
+    def test_self_improvement_context_precedes_prompt(self, monkeypatch):
+        from hermes_cli import self_improvement_proposals as sip
+
+        monkeypatch.setattr(
+            sip,
+            "build_cron_job_prompt_context",
+            lambda job, config=None: "SELF IMPROVEMENT CONTEXT" if job.get("self_improvement") else "",
+        )
+
+        result = _build_job_prompt({"prompt": "Generate proposals", "self_improvement": {"project": "sligo", "prong": "airflow_doctor"}})
+
+        assert "SELF IMPROVEMENT CONTEXT" in result
+        assert result.index("SELF IMPROVEMENT CONTEXT") < result.index("Generate proposals")
+
 
 class TestParseWakeGate:
     """Unit tests for _parse_wake_gate — pure function, no side effects."""

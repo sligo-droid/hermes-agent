@@ -204,3 +204,100 @@ def test_project_validation_helpers_resolve_only_trusted_config(tmp_path):
         sip.resolve_execution_context("sligo", "missing", cfg)
     with pytest.raises(ValueError, match="Workspace does not match"):
         sip.validate_approval_project_workspace("sligo", str(tmp_path), cfg)
+
+
+def test_feedback_context_summarizes_approved_rejected_preferences_and_edges(tmp_path):
+    cfg = _config(tmp_path)
+    sip.ingest_proposal_output(metadata={"proposal_json": json.dumps(_payload()), "cron_run_id": "run-a"}, config=cfg)
+    approved_id = sip.list_proposals(config=cfg)[0]["card_id"]
+    sip.approve_proposal(approved_id, actor="operator", config=cfg)
+    sip.add_feedback(approved_id, feedback_type="comment", body="Prefer read-only observability with tiny worker prompts.", author="operator", config=cfg)
+
+    payload = _payload()
+    payload["proposals"][0]["title"] = "Rewrite the admin shell"
+    payload["proposals"][0]["summary"] = "Large shell replacement."
+    payload["proposals"][0]["worker_prompt"] = "Replace all admin shell code."
+    sip.ingest_proposal_output(metadata={"proposal_json": json.dumps(payload), "cron_run_id": "run-b"}, config=cfg)
+    rejected_id = [p for p in sip.list_proposals(config=cfg) if p["card_id"] != approved_id][0]["card_id"]
+    sip.reject_proposal(rejected_id, reason="Too broad; split into smaller read-only slices.", actor="operator", config=cfg)
+
+    context = sip.build_feedback_context("sligo", "airflow_doctor", config=cfg)
+
+    assert context["project"] == "sligo"
+    assert context["recent_approved_proposals"][0]["title"] == "Add Airflow DAG health summary"
+    assert context["recent_rejected_proposals"][0]["reason"] == "Too broad; split into smaller read-only slices."
+    preference_bodies = [item["body"] for item in context["operator_preferences_and_patterns"]]
+    assert "Prefer read-only observability with tiny worker prompts." in preference_bodies
+
+
+def test_feedback_context_handles_missing_feedback_and_malformed_metadata(tmp_path):
+    cfg = _config(tmp_path)
+    sip.ingest_proposal_output(metadata={"proposal_json": json.dumps(_payload()), "cron_run_id": "run-a"}, config=cfg)
+    card_id = sip.list_proposals(config=cfg)[0]["card_id"]
+    with sqlite3.connect(str(tmp_path / "proposals.db")) as conn:
+        conn.execute(
+            "INSERT INTO proposal_feedback (card_id, feedback_type, body, author, metadata_json, created_at) VALUES (?, 'comment', '', 'op', '{bad', 1)",
+            (card_id,),
+        )
+
+    context = sip.build_feedback_context("sligo", "airflow_doctor", config=cfg)
+
+    assert context["recent_approved_proposals"] == []
+    assert context["recent_rejected_proposals"] == []
+    assert context["operator_preferences_and_patterns"] == []
+
+
+def test_correlate_linked_kanban_status_updates_lifecycle_and_feedback(tmp_path):
+    cfg = _config(tmp_path)
+    sip.ingest_proposal_output(metadata={"proposal_json": json.dumps(_payload()), "cron_run_id": "run-a"}, config=cfg)
+    card_id = sip.list_proposals(config=cfg)[0]["card_id"]
+    approved = sip.approve_proposal(card_id, actor="operator", config=cfg)
+
+    from hermes_cli import kanban_db
+
+    board = approved["linked_kanban_board"]
+    task_id = approved["linked_kanban_task_id"]
+    with kanban_db.connect(board=board) as conn:
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+
+    result = sip.correlate_linked_kanban_outcomes(project="sligo", prong="airflow_doctor", config=cfg)
+
+    detail = sip.get_proposal_detail(card_id, config=cfg)
+    feedback = sip.list_feedback(card_id, config=cfg)
+    assert result["updated"] == 1
+    assert detail["lifecycle_status"] == "completed"
+    assert any(item["feedback_type"] == "kanban_status" and " is done" in item["body"] for item in feedback)
+
+
+def test_build_proposal_prompt_context_contains_contract_and_feedback(tmp_path):
+    cfg = _config(tmp_path)
+    sip.ingest_proposal_output(metadata={"proposal_json": json.dumps(_payload()), "cron_run_id": "run-a"}, config=cfg)
+    card_id = sip.list_proposals(config=cfg)[0]["card_id"]
+    sip.reject_proposal(card_id, reason="Needs stronger evidence.", config=cfg)
+
+    block = sip.build_proposal_prompt_context("sligo", "airflow_doctor", config=cfg)
+
+    assert sip.PROMPT_CONTEXT_MARKER in block
+    assert sip.START_MARKER in block
+    assert sip.END_MARKER in block
+    assert '"hermes_self_improvement_proposals_version": 1' in block
+    assert '"project": "sligo"' in block
+    assert '"prong": "airflow_doctor"' in block
+    assert "Needs stronger evidence." in block
+
+
+def test_cron_job_prompt_context_uses_job_opt_in_and_config_names(tmp_path):
+    cfg = _config(tmp_path)
+    cfg["self_improvement"]["projects"]["sligo"]["prongs"]["airflow_doctor"].update(
+        {"cron_prompt_context": True, "cron_job_names": ["Sligo Airflow Doctor"]}
+    )
+
+    by_job = sip.build_cron_job_prompt_context(
+        {"self_improvement": {"project": "sligo", "prong": "airflow_doctor"}},
+        config=cfg,
+    )
+    by_name = sip.build_cron_job_prompt_context({"name": "Sligo Airflow Doctor"}, config=cfg)
+
+    assert sip.PROMPT_CONTEXT_MARKER in by_job
+    assert sip.PROMPT_CONTEXT_MARKER in by_name
+    assert sip.build_cron_job_prompt_context({"name": "Unrelated"}, config=cfg) == ""

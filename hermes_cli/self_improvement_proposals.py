@@ -53,6 +53,8 @@ PARSER_VERSION = 1
 CONTRACT_VERSION = 1
 START_MARKER = "HERMES_SELF_IMPROVEMENT_PROPOSALS_JSON_START"
 END_MARKER = "HERMES_SELF_IMPROVEMENT_PROPOSALS_JSON_END"
+PROMPT_CONTEXT_MARKER = "HERMES_SELF_IMPROVEMENT_PROPOSAL_CONTEXT"
+_OUTCOME_FEEDBACK_TYPES = {"outcome", "kanban_status"}
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.Lock()
 _SECRET_KEY_RE = re.compile(
@@ -424,8 +426,8 @@ def add_feedback(
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     feedback_type = str(feedback_type or "comment").strip().lower()
-    if feedback_type not in {"comment", "reject", "approve", "edit"}:
-        raise ValueError("feedback_type must be comment, reject, approve, or edit")
+    if feedback_type not in {"comment", "reject", "approve", "edit", *_OUTCOME_FEEDBACK_TYPES}:
+        raise ValueError("feedback_type must be comment, reject, approve, edit, outcome, or kanban_status")
     body = str(body or "").strip()
     if not body:
         raise ValueError("feedback body is required")
@@ -631,6 +633,202 @@ def reject_proposal(
     if detail is None:
         raise KeyError(card_id)
     return detail
+
+
+def correlate_linked_kanban_outcomes(
+    *,
+    project: str | None = None,
+    prong: str | None = None,
+    db_path: str | Path | None = None,
+    config: dict[str, Any] | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Mirror linked Kanban task status into compact proposal card state.
+
+    Kanban remains the source of truth for execution. This helper only stores a
+    small derived lifecycle/status feedback note so future proposal cron prongs
+    can learn from outcomes without rereading worker boards or Discord history.
+    """
+    clauses = ["linked_kanban_task_id IS NOT NULL", "status = 'approved'"]
+    params: list[Any] = []
+    if project:
+        clauses.append("project = ?")
+        params.append(project)
+    if prong:
+        clauses.append("prong = ?")
+        params.append(prong)
+    params.append(max(1, min(int(limit), 500)))
+    now = int(time.time())
+    checked = updated = missing = 0
+    with connect(db_path, config) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM proposal_cards WHERE {' AND '.join(clauses)} ORDER BY updated_at DESC LIMIT ?",
+            params,
+        ).fetchall()
+        for row in rows:
+            checked += 1
+            board = str(row["resolved_board"] or "default")
+            task_id = str(row["linked_kanban_task_id"] or "")
+            try:
+                kanban_db.init_db(board=board)
+                with kanban_db.connect(board=board) as kb_conn:
+                    task = kanban_db.get_task(kb_conn, task_id)
+            except Exception:
+                task = None
+            if task is None:
+                missing += 1
+                continue
+            lifecycle = _lifecycle_for_kanban_status(task.status)
+            if lifecycle == row["lifecycle_status"]:
+                continue
+            conn.execute(
+                "UPDATE proposal_cards SET lifecycle_status = ?, updated_at = ? WHERE card_id = ?",
+                (lifecycle, now, row["card_id"]),
+            )
+            conn.execute(
+                """
+                INSERT INTO proposal_feedback (card_id, feedback_type, body, author, metadata_json, created_at)
+                VALUES (?, 'kanban_status', ?, 'kanban', ?, ?)
+                """,
+                (
+                    row["card_id"],
+                    f"Linked Kanban task {task_id} is {task.status}",
+                    json.dumps({"board": board, "task_id": task_id, "task_status": task.status}, sort_keys=True),
+                    now,
+                ),
+            )
+            updated += 1
+        conn.commit()
+    return {"checked": checked, "updated": updated, "missing": missing}
+
+
+def build_feedback_context(
+    project: str,
+    prong: str,
+    *,
+    db_path: str | Path | None = None,
+    config: dict[str, Any] | None = None,
+    limit: int = 8,
+) -> dict[str, Any]:
+    """Return compact project/prong feedback for future proposal generation."""
+    validate_project_prong(project, prong, config)
+    correlate_linked_kanban_outcomes(project=project, prong=prong, db_path=db_path, config=config)
+    cap = max(1, min(int(limit), 25))
+    with connect(db_path, config) as conn:
+        approved = conn.execute(
+            """
+            SELECT * FROM proposal_cards
+            WHERE project = ? AND prong = ? AND status = 'approved'
+            ORDER BY decided_at DESC, updated_at DESC LIMIT ?
+            """,
+            (project, prong, cap),
+        ).fetchall()
+        rejected = conn.execute(
+            """
+            SELECT * FROM proposal_cards
+            WHERE project = ? AND prong = ? AND status = 'rejected'
+            ORDER BY decided_at DESC, updated_at DESC LIMIT ?
+            """,
+            (project, prong, cap),
+        ).fetchall()
+        outcomes = conn.execute(
+            """
+            SELECT * FROM proposal_cards
+            WHERE project = ? AND prong = ? AND status = 'approved'
+              AND lifecycle_status IN ('completed', 'blocked', 'failed')
+            ORDER BY updated_at DESC LIMIT ?
+            """,
+            (project, prong, cap * 2),
+        ).fetchall()
+        feedback_rows = conn.execute(
+            """
+            SELECT f.* FROM proposal_feedback f
+            JOIN proposal_cards c ON c.card_id = f.card_id
+            WHERE c.project = ? AND c.prong = ?
+            ORDER BY f.id DESC LIMIT ?
+            """,
+            (project, prong, cap * 4),
+        ).fetchall()
+    completed = []
+    failed_or_blocked = []
+    for row in outcomes:
+        item = _feedback_card_summary(dict(row))
+        if row["lifecycle_status"] == "completed":
+            completed.append(item)
+        else:
+            failed_or_blocked.append(item)
+    preferences = _operator_preferences(feedback_rows, cap)
+    return {
+        "project": project,
+        "prong": prong,
+        "recent_approved_proposals": [_feedback_card_summary(dict(row)) for row in approved],
+        "recent_rejected_proposals": [_feedback_card_summary(dict(row), include_reason=True) for row in rejected],
+        "operator_preferences_and_patterns": preferences,
+        "approved_then_failed_or_blocked_outcomes": failed_or_blocked[:cap],
+        "completed_approved_outcomes": completed[:cap],
+    }
+
+
+def build_proposal_prompt_context(
+    project: str,
+    prong: str,
+    *,
+    db_path: str | Path | None = None,
+    config: dict[str, Any] | None = None,
+) -> str:
+    """Build a concise cron prompt block for structured proposal prongs."""
+    feedback = build_feedback_context(project, prong, db_path=db_path, config=config)
+    contract = {
+        "hermes_self_improvement_proposals_version": CONTRACT_VERSION,
+        "project": project,
+        "prong": prong,
+        "proposals": [
+            {
+                "title": "Short implementation title",
+                "summary": "One paragraph summary",
+                "body": "Detailed rationale and implementation notes",
+                "evidence": [{"label": "source", "detail": "compact evidence"}],
+                "worker_prompt": "Self-contained worker prompt for a later Kanban task",
+                "acceptance_criteria": ["Observable completion criterion"],
+                "priority": "medium",
+                "confidence": 0.8,
+                "effort": "small",
+                "suggested_assignee": "dev",
+                "suggested_skills": [],
+            }
+        ],
+    }
+    lines = [
+        f"## {PROMPT_CONTEXT_MARKER}",
+        "Use this compact feedback context instead of raw Discord or worker-board history.",
+        "Avoid repeating recently rejected ideas unless the rejection reason is directly addressed.",
+        "Prefer proposals similar to completed approved outcomes and avoid patterns from blocked/failed outcomes.",
+        "Return only strict JSON between the required markers; do not include Markdown prose outside the markers.",
+        START_MARKER,
+        json.dumps(contract, indent=2, sort_keys=True),
+        END_MARKER,
+        "## Feedback Context JSON",
+        json.dumps(feedback, indent=2, sort_keys=True),
+    ]
+    return "\n".join(lines)
+
+
+def build_cron_job_prompt_context(
+    job: dict[str, Any],
+    *,
+    config: dict[str, Any] | None = None,
+    db_path: str | Path | None = None,
+) -> str:
+    """Return self-improvement context for an opted-in cron job, else empty."""
+    target = _self_improvement_target_for_job(job, config)
+    if target is None:
+        return ""
+    return build_proposal_prompt_context(
+        target["project"],
+        target["prong"],
+        db_path=db_path,
+        config=config,
+    )
 
 
 def build_kanban_task_body(card: dict[str, Any]) -> str:
@@ -911,6 +1109,80 @@ def _non_empty_edit_str(value: str, field: str) -> str:
 
 def _kanban_priority(priority: Any) -> int:
     return {"low": -1, "medium": 0, "high": 1, "urgent": 2}.get(str(priority or "medium").lower(), 0)
+
+
+def _lifecycle_for_kanban_status(status: str) -> str:
+    value = str(status or "").strip().lower()
+    if value == "done":
+        return "completed"
+    if value == "blocked":
+        return "blocked"
+    if value == "archived":
+        return "archived"
+    if value in {"running", "review"}:
+        return "in_progress"
+    return "worker_created"
+
+
+def _feedback_card_summary(row: dict[str, Any], *, include_reason: bool = False) -> dict[str, Any]:
+    item = {
+        "card_id": row.get("card_id"),
+        "title": row.get("title"),
+        "summary": row.get("summary"),
+        "priority": row.get("priority"),
+        "confidence": row.get("confidence"),
+        "effort": row.get("effort"),
+        "status": row.get("status"),
+        "lifecycle_status": row.get("lifecycle_status"),
+    }
+    if include_reason and row.get("decision_reason"):
+        item["reason"] = row.get("decision_reason")
+    return item
+
+
+def _operator_preferences(rows: list[sqlite3.Row], limit: int) -> list[dict[str, Any]]:
+    prefs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        ftype = str(row["feedback_type"] or "")
+        if ftype not in {"comment", "reject", "edit", "outcome", "kanban_status"}:
+            continue
+        body = str(row["body"] or "").strip()
+        if not body:
+            continue
+        compact = body[:300]
+        key = f"{ftype}:{compact.lower()}"
+        if key in seen:
+            continue
+        seen.add(key)
+        prefs.append({"type": ftype, "body": compact, "author": row["author"]})
+        if len(prefs) >= limit:
+            break
+    return prefs
+
+
+def _self_improvement_target_for_job(job: dict[str, Any], config: dict[str, Any] | None) -> dict[str, str] | None:
+    raw = job.get("self_improvement")
+    if isinstance(raw, dict) and raw.get("enabled", True):
+        project = str(raw.get("project") or "").strip()
+        prong = str(raw.get("prong") or "").strip()
+        if project and prong:
+            return {"project": project, "prong": prong}
+
+    job_id = str(job.get("id") or "").strip()
+    job_name = str(job.get("name") or "").strip()
+    projects = load_self_improvement_config(config).get("projects") or {}
+    for project_id, project in projects.items():
+        if not isinstance(project, dict):
+            continue
+        for prong_id, prong in (project.get("prongs") or {}).items():
+            if not isinstance(prong, dict) or not prong.get("cron_prompt_context", False):
+                continue
+            ids = {str(v).strip() for v in _string_list(prong.get("cron_job_ids"))}
+            names = {str(v).strip() for v in _string_list(prong.get("cron_job_names"))}
+            if (job_id and job_id in ids) or (job_name and job_name in names):
+                return {"project": str(project_id), "prong": str(prong_id)}
+    return None
 
 
 def _worker_url(board: str, task_id: str) -> str:

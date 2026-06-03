@@ -685,6 +685,8 @@ def create_job(
         "workdir": normalized_workdir,
         "profile": normalized_profile,
     }
+    if isinstance(origin, dict) and isinstance(origin.get("self_improvement"), dict):
+        job["self_improvement"] = origin["self_improvement"]
 
     jobs = load_jobs()
     jobs.append(job)

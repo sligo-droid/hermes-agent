@@ -1981,18 +1981,26 @@ DEFAULT_CONFIG = {
                     "airflow_doctor": {
                         "name": "Airflow Doctor",
                         "enabled": True,
+                        "cron_prompt_context": True,
+                        "cron_job_names": ["Sligo Airflow Doctor"],
                     },
                     "admin_dogfood": {
                         "name": "Admin Dogfood",
                         "enabled": True,
+                        "cron_prompt_context": True,
+                        "cron_job_names": ["Sligo Admin Dogfood"],
                     },
                     "invisible_technical_recommendations": {
                         "name": "Invisible Technical Recommendations",
                         "enabled": True,
+                        "cron_prompt_context": True,
+                        "cron_job_names": ["Sligo Invisible Technical Recommendations"],
                     },
                     "visible_ui_ux_recommendations": {
                         "name": "Visible UI/UX Recommendations",
                         "enabled": True,
+                        "cron_prompt_context": True,
+                        "cron_job_names": ["Sligo Visible UI/UX Recommendations"],
                     },
                 },
             },

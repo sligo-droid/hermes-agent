@@ -1319,6 +1319,20 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 logger.warning("context_from: failed to read output for job %r: %s", source_job_id, e)
                 # silent skip — do not pollute the prompt with error messages
 
+    try:
+        from hermes_cli.self_improvement_proposals import build_cron_job_prompt_context
+
+        proposal_context = build_cron_job_prompt_context(job, config=load_config())
+    except Exception as exc:
+        logger.warning(
+            "Cron job '%s': failed to build self-improvement proposal context: %s",
+            job.get("name") or job.get("id"),
+            exc,
+        )
+        proposal_context = ""
+    if proposal_context:
+        prompt = f"{proposal_context}\n\n{prompt}"
+
     # Always prepend cron execution guidance so the agent knows how
     # delivery works and can suppress delivery when appropriate.
     cron_hint = (
