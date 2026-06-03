@@ -56,6 +56,7 @@ from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.grill_me import build_grill_me_prompt, detect_grill_me_trigger
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -82,7 +83,11 @@ _DISCORD_FEATURE_REQUEST_FAST_PATH_PROMPT = (
     "implementation and verification. For straightforward code/deploy asks, "
     "avoid lengthy planning/status narration, make the smallest correct change, "
     "run focused checks, and report the result concisely with PR/deploy evidence "
-    "when available."
+    "when available. Do not suppress a necessary clarifying question: ask at "
+    "most one concise question with a recommended default when the answer "
+    "materially changes user-visible behavior, scope, irreversible/public/cost/"
+    "security effects, or the definition of done. For low-stakes ambiguity, "
+    "state the assumption and continue."
 )
 
 def _kanban_dispatch_health_candidate(board_slug: str, discord_worker_boards: Any) -> bool:
@@ -10106,6 +10111,16 @@ class GatewayRunner:
         # Pending exec approvals are handled by /approve and /deny commands above.
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
+
+        if not command and detect_grill_me_trigger(event.text or ""):
+            event = dataclasses.replace(
+                event,
+                text=build_grill_me_prompt(
+                    event.text or "",
+                    runtime_note="Gateway natural-language grill-me trigger detected.",
+                ),
+            )
+            source = event.source
 
         if self._is_telegram_topic_root_lobby(source):
             # Debounce the lobby reminder so a user who forgets about

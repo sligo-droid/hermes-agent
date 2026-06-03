@@ -1168,12 +1168,14 @@ class TestBuildSystemPrompt:
 class TestToolUseEnforcementConfig:
     """Tests for the agent.tool_use_enforcement config option."""
 
-    def _make_agent(self, model="openai/gpt-4.1", tool_use_enforcement="auto"):
+    def _make_agent(self, model="openai/gpt-4.1", tool_use_enforcement="auto", tool_names=None):
         """Create an agent with tools and a specific enforcement config."""
+        if tool_names is None:
+            tool_names = ("terminal", "web_search")
         with (
             patch(
                 "run_agent.get_tool_definitions",
-                return_value=_make_tool_defs("terminal", "web_search"),
+                return_value=_make_tool_defs(*tool_names),
             ),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
@@ -1198,6 +1200,22 @@ class TestToolUseEnforcementConfig:
         agent = self._make_agent(model="openai/gpt-4.1", tool_use_enforcement="auto")
         prompt = agent._build_system_prompt()
         assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
+
+    def test_injects_clarifying_guidance_when_clarify_tool_loaded(self):
+        from agent.prompt_builder import CLARIFYING_QUESTION_GUIDANCE
+        agent = self._make_agent(
+            model="openai/gpt-4.1",
+            tool_use_enforcement="auto",
+            tool_names=("terminal", "web_search", "clarify"),
+        )
+        prompt = agent._build_system_prompt()
+        assert CLARIFYING_QUESTION_GUIDANCE in prompt
+
+    def test_skips_clarifying_guidance_without_clarify_tool(self):
+        from agent.prompt_builder import CLARIFYING_QUESTION_GUIDANCE
+        agent = self._make_agent(model="openai/gpt-4.1", tool_use_enforcement="auto")
+        prompt = agent._build_system_prompt()
+        assert CLARIFYING_QUESTION_GUIDANCE not in prompt
 
     def test_auto_injects_for_codex(self):
         from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE

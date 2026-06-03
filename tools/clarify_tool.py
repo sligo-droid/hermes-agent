@@ -87,8 +87,9 @@ def check_clarify_requirements() -> bool:
 CLARIFY_SCHEMA = {
     "name": "clarify",
     "description": (
-        "Ask the user a question when you need clarification, feedback, or a "
-        "decision before proceeding. Supports two modes:\n\n"
+        "Ask the user a question sparingly when you need clarification, "
+        "feedback, or a decision before proceeding. Prefer one concise "
+        "multiple-choice question when possible. Supports two modes:\n\n"
         "1. **Multiple choice** — provide up to 4 choices. The user picks one "
         "or types their own answer via a 5th 'Other' option.\n"
         "2. **Open-ended** — omit choices entirely. The user types a free-form "

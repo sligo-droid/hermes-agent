@@ -146,6 +146,7 @@ from hermes_cli.browser_connect import (
     try_launch_chrome_debug,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.grill_me import build_grill_me_prompt, detect_grill_me_trigger
 from hermes_cli.terminal_notifications import emit_completion_notification
 from utils import base_url_host_matches, is_truthy_value
 
@@ -11995,6 +11996,12 @@ class HermesCLI:
         if isinstance(message, str):
             from run_agent import _sanitize_surrogates
             message = _sanitize_surrogates(message)
+
+        if isinstance(message, str) and detect_grill_me_trigger(message):
+            message = build_grill_me_prompt(
+                message,
+                runtime_note="Classic CLI natural-language grill-me trigger detected.",
+            )
 
         # Add user message to history
         self.conversation_history.append({"role": "user", "content": message})
