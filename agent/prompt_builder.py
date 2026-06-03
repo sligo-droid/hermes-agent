@@ -307,6 +307,17 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
+CLARIFYING_QUESTION_GUIDANCE = (
+    "# Clarifying questions\n"
+    "Ask clarifying questions sparingly. Do not use them for low-stakes "
+    "ambiguity or information you can retrieve yourself; state the assumption "
+    "and proceed. Ask one concise question, preferably multiple-choice with a "
+    "recommended default, when the answer would materially change user-visible "
+    "behavior, implementation scope, tradeoffs, irreversible/public/cost/security "
+    "effects, or the definition of done. If you can make safe partial progress "
+    "while waiting, do that instead of blocking."
+)
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.
@@ -346,8 +357,9 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- 'Is port 443 open?' → check THIS machine (don't ask 'open where?')\n"
     "- 'What OS am I running?' → check the live system (don't use user profile)\n"
     "- 'What time is it?' → run `date` (don't guess)\n"
-    "Only ask for clarification when the ambiguity genuinely changes what tool "
-    "you would call.\n"
+    "Ask for clarification sparingly, only when the ambiguity would materially "
+    "change the outcome, scope, user-visible behavior, risk profile, tool choice, "
+    "or implementation approach.\n"
     "</act_dont_ask>\n"
     "\n"
     "<prerequisite_checks>\n"
@@ -370,7 +382,8 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- If required context is missing, do NOT guess or hallucinate an answer.\n"
     "- Use the appropriate lookup tool when missing information is retrievable "
     "(search_files, web_search, read_file, etc.).\n"
-    "- Ask a clarifying question only when the information cannot be retrieved by tools.\n"
+    "- Ask a clarifying question only when missing information cannot be retrieved "
+    "by tools or requires a human product/tradeoff decision.\n"
     "- If you must proceed with incomplete information, label assumptions explicitly.\n"
     "</missing_context>"
 )
