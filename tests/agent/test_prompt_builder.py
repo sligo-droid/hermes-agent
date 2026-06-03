@@ -24,6 +24,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     MEMORY_GUIDANCE,
+    QMD_MCP_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
@@ -47,6 +48,12 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_qmd_mcp_guidance_prefers_index_for_project_docs(self):
+        assert "qmd-*" in QMD_MCP_GUIDANCE
+        assert "first-pass retrieval layer" in QMD_MCP_GUIDANCE
+        assert "before using read_file on local docs" in QMD_MCP_GUIDANCE
+        assert "source/code inspection" in QMD_MCP_GUIDANCE
 
 
 # =========================================================================
