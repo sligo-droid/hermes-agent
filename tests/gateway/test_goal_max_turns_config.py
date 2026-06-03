@@ -167,6 +167,55 @@ async def test_gateway_goal_kickoff_wraps_nested_slash_body(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_native_goal_kickoff_includes_thread_context_without_changing_goal(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        "hermes_cli.discord_worker_boards.board_for_gateway_event",
+        lambda *args, **kwargs: None,
+    )
+    goals._DB_CACHE.clear()
+
+    adapter = _FakeAdapter()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.session_store = _FakeSessionStore()
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._queued_events = {}
+
+    event = MessageEvent(
+        text="/goal Ship the dashboard",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="chat-goal-config",
+            chat_type="channel",
+            user_id="user-goal-config",
+        ),
+        message_id="msg-goal-config",
+    )
+    event.native_slash_command = True
+    event.goal_thread_context = "[Expanded Discord thread plan]\n## Plan\nUse the linked plan."
+
+    response = await GatewayRunner._handle_goal_command(runner, event)
+
+    try:
+        assert "⊙ Goal set" in response
+        state = goals.GoalManager(_session_id()).state
+        assert state is not None
+        assert state.goal == "Ship the dashboard"
+        queued = next(iter(adapter._pending_messages.values()))
+        assert "[Discord goal thread context]" in queued.text
+        assert "Use the linked plan" in queued.text
+        assert "Use the linked plan" not in state.goal
+    finally:
+        goals._DB_CACHE.clear()
+
+
+@pytest.mark.asyncio
 async def test_discord_subgoal_without_board_creates_dev_ticket(tmp_path, monkeypatch):
     kanban_home = tmp_path / "kanban-home"
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))

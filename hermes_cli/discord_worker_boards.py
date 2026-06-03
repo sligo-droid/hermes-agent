@@ -24,6 +24,11 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 from hermes_cli import kanban_db
 from hermes_cli.discord_time import discord_message_exceeds_age_limit
+from hermes_cli.discord_thread_context import (
+    expand_discord_thread_references,
+    format_discord_thread_expansions,
+    has_discord_thread_reference,
+)
 from hermes_cli.discord_worker_roles import (
     BOARD_RUN_SUMMARY_FILENAME,
     DEV_TICKET_BODY_GUIDANCE,
@@ -4006,7 +4011,10 @@ def start_planner_request(
         request_id=request_id,
         include_request_id=starts_new_goal_run,
     )
-    thread_context_text = str(thread_context or "").strip()
+    thread_context_text = _merge_expanded_discord_thread_context(
+        raw_request,
+        str(thread_context or ""),
+    )
     if request_changed:
         _clear_generated_summary_title(worker)
     if starts_new_goal_run:
@@ -4065,6 +4073,20 @@ def _canonical_planner_request_text(request: str) -> str:
     if args.lower() in GOAL_CONTROL_COMMANDS:
         return text
     return args
+
+
+def _merge_expanded_discord_thread_context(request: str, thread_context: str) -> str:
+    base = str(thread_context or "").strip()
+    if not has_discord_thread_reference(request):
+        return base
+    expanded = format_discord_thread_expansions(expand_discord_thread_references(request))
+    if not expanded:
+        return base
+    if expanded in base:
+        return base
+    if base:
+        return f"{base}\n\n{expanded}"
+    return expanded
 
 
 def _planner_request_fingerprint(request: str) -> str:

@@ -13865,7 +13865,11 @@ class GatewayRunner:
         try:
             self._enqueue_goal_work(
                 event,
-                mgr.initial_work_prompt() or self._goal_kickoff_prompt(state.goal),
+                self._goal_initial_work_prompt(
+                    mgr,
+                    state.goal,
+                    str(getattr(event, "goal_thread_context", "") or ""),
+                ),
             )
             self._log_gateway_flow_telemetry(
                 route_type="slash_goal",
@@ -13879,6 +13883,14 @@ class GatewayRunner:
             logger.debug("goal kickoff enqueue failed: %s", exc)
 
         return t("gateway.goal.set", budget=state.max_turns, goal=state.goal)
+
+    @staticmethod
+    def _goal_initial_work_prompt(mgr: Any, goal: str, context: str) -> str:
+        base = mgr.initial_work_prompt() or GatewayRunner._goal_kickoff_prompt(goal)
+        context = str(context or "").strip()
+        if not context:
+            return base
+        return f"{base}\n\n[Discord goal thread context]\n{context}"
 
     async def _handle_subgoal_command(self, event: "MessageEvent") -> str:
         """Handle /subgoal for gateway platforms (mirror of CLI handler).

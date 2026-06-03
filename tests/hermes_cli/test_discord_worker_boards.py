@@ -700,6 +700,44 @@ def test_set_goal_persists_thread_context_for_planner(monkeypatch, tmp_path):
     )
 
 
+def test_set_goal_expands_discord_thread_reference_for_planner(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_thread_context import DiscordThreadPlanExpansion
+
+    def fake_expand(text):
+        assert "1511795999700680744" in text
+        return [
+            DiscordThreadPlanExpansion(
+                source="1511795999700680744",
+                thread_id="1511795999700680744",
+                thread_name="plan-thread",
+                selected_message_ids=("1511799412559708283",),
+                content="[Sligo Labs [bot] msg:1511799412559708283]\n## Plan\nImplement expansion.",
+            )
+        ]
+
+    monkeypatch.setattr(dwb, "expand_discord_thread_references", fake_expand)
+    board = dwb.set_goal(
+        thread_id="7792",
+        goal="Use plan from 1511795999700680744",
+        request_id="msg-7792",
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+
+    payload = json.loads(tasks[0].body or "{}")
+    assert "[Expanded Discord thread plan]" in payload["discord_thread_context"]
+    assert "Implement expansion" in payload["discord_thread_context"]
+    pack = json.loads(Path(payload["context_pack"]["json_path"]).read_text(encoding="utf-8"))
+    assert "Implement expansion" in pack["discord_thread_context"]
+    assert "1511799412559708283" in pack["source_message_ids"]
+
+
 def test_start_planner_request_context_pack_version_only_changes_on_material_context(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

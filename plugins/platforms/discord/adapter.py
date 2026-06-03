@@ -27,6 +27,11 @@ from typing import Callable, Dict, Iterable, List, Optional, Any, Tuple, cast
 from urllib.parse import quote, urlparse
 
 from hermes_cli.discord_time import discord_message_exceeds_age_limit
+from hermes_cli.discord_thread_context import (
+    expand_discord_thread_references,
+    format_discord_thread_expansions,
+    has_discord_thread_reference,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -6587,6 +6592,10 @@ class DiscordAdapter(BasePlatformAdapter):
         goal_thread_context = ""
         if thread_channel is not None:
             goal_thread_context = await self._fetch_goal_thread_context(thread_channel)
+        goal_thread_context = self._merge_thread_context_blocks(
+            goal_thread_context,
+            await self._expand_discord_thread_refs_for_context(args),
+        )
 
         try:
             await interaction.edit_original_response(content=f"Goal started in <#{thread_id}>.")
@@ -6605,6 +6614,28 @@ class DiscordAdapter(BasePlatformAdapter):
             ),
             label=f"/goal {thread_id}",
         )
+
+    async def _expand_discord_thread_refs_for_context(self, text: str) -> str:
+        if not has_discord_thread_reference(text):
+            return ""
+        try:
+            expansions = await asyncio.to_thread(expand_discord_thread_references, text)
+        except Exception as exc:
+            logger.debug("[%s] Discord thread reference expansion failed: %s", self.name, exc)
+            return ""
+        return format_discord_thread_expansions(expansions)
+
+    @staticmethod
+    def _merge_thread_context_blocks(base: Optional[str], extra: Optional[str]) -> str:
+        base_text = str(base or "").strip()
+        extra_text = str(extra or "").strip()
+        if not extra_text:
+            return base_text
+        if extra_text in base_text:
+            return base_text
+        if base_text:
+            return f"{base_text}\n\n{extra_text}"
+        return extra_text
 
     def _resolve_channel_skills(self, channel_id: str, parent_id: str | None = None) -> list[str] | None:
         """Look up auto-skill bindings for a Discord channel/forum thread.
@@ -9524,6 +9555,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._mark_discord_stage(_intake_timing, "history_backfill", _stage_started)
                 if _backfill_text:
                     _channel_context = _backfill_text
+        _expanded_thread_refs = await self._expand_discord_thread_refs_for_context(event_text)
+        if _expanded_thread_refs:
+            _channel_context = self._merge_thread_context_blocks(
+                _channel_context,
+                _expanded_thread_refs,
+            )
 
         # Defense-in-depth: prevent empty user messages from entering session
         # (can happen when user sends @mention-only with no other text).
@@ -9536,6 +9573,11 @@ class DiscordAdapter(BasePlatformAdapter):
         if is_thread and slash_command_starts_threaded_work:
             context_channel = effective_channel if auto_threaded_channel is not None else message.channel
             _goal_thread_context = await self._fetch_goal_thread_context(context_channel, before=message)
+        if slash_command_starts_threaded_work and _expanded_thread_refs:
+            _goal_thread_context = self._merge_thread_context_blocks(
+                _goal_thread_context,
+                _expanded_thread_refs,
+            )
 
         _chan = message.channel
         _parent_id = str(getattr(_chan, "parent_id", "") or "")
