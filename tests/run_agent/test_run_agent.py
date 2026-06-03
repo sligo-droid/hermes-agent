@@ -1137,6 +1137,33 @@ class TestBuildSystemPrompt:
         assert mock_skills.call_args.kwargs["available_tools"] == set(toolset_map)
         assert mock_skills.call_args.kwargs["available_toolsets"] == {"web", "skills"}
 
+    def test_qmd_mcp_guidance_when_qmd_mcp_tool_loaded(self):
+        from agent.prompt_builder import QMD_MCP_GUIDANCE
+
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("mcp_qmd_pid_query", "read_file")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+            prompt = agent._build_system_prompt()
+
+        assert QMD_MCP_GUIDANCE in prompt
+
+    def test_no_qmd_mcp_guidance_without_qmd_mcp_tool(self, agent):
+        from agent.prompt_builder import QMD_MCP_GUIDANCE
+
+        prompt = agent._build_system_prompt()
+
+        assert QMD_MCP_GUIDANCE not in prompt
+
 
 class TestToolUseEnforcementConfig:
     """Tests for the agent.tool_use_enforcement config option."""

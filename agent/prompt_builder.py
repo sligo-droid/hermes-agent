@@ -162,6 +162,16 @@ SESSION_SEARCH_GUIDANCE = (
     "asking them to repeat themselves."
 )
 
+QMD_MCP_GUIDANCE = (
+    "When an MCP server named qmd-* is available, treat its tools as the first-pass "
+    "retrieval layer for that project's documentation and knowledge index. For "
+    "documentation or project-knowledge discovery, query/get through the qmd-* MCP "
+    "tools before using read_file on local docs. Direct file reads remain appropriate "
+    "for exact paths, source/code inspection, verification, edits, or when QMD has no "
+    "useful result."
+)
+
+
 SKILLS_GUIDANCE = (
     "After completing a complex task (5+ tool calls), fixing a tricky error, "
     "or discovering a non-trivial workflow, save the approach as a "
