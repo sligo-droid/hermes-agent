@@ -3538,10 +3538,12 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
 
 
 def get_mcp_status() -> List[dict]:
-    """Return status of all configured MCP servers for banner display.
+    """Return status of enabled MCP servers for banner display.
 
     Returns a list of dicts with keys: name, transport, tools, connected.
-    Includes both successfully connected servers and configured-but-failed ones.
+    Includes both successfully connected servers and enabled-but-failed ones.
+    Servers explicitly marked ``enabled: false`` are omitted; they are
+    configuration inventory, not part of the runtime MCP tool surface.
     """
     result: List[dict] = []
 
@@ -3554,6 +3556,8 @@ def get_mcp_status() -> List[dict]:
         active_servers = dict(_servers)
 
     for name, cfg in configured.items():
+        if not _parse_boolish(cfg.get("enabled", True), default=True):
+            continue
         transport = cfg.get("transport", "http") if "url" in cfg else "stdio"
         server = active_servers.get(name)
         if server and server.session is not None:

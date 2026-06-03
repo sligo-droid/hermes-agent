@@ -85,7 +85,6 @@ _DISCORD_FEATURE_REQUEST_FAST_PATH_PROMPT = (
     "when available."
 )
 
-
 def _kanban_dispatch_health_candidate(board_slug: str, discord_worker_boards: Any) -> bool:
     """Return whether a board should count toward dispatcher stuck health.
 
@@ -19106,10 +19105,10 @@ class GatewayRunner:
         )
 
         from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         default_discord_kanban_intake = bool(
             getattr(source, "default_kanban_intake", False)
         )
+        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         if default_discord_kanban_intake and "kanban" not in enabled_toolsets:
             enabled_toolsets = sorted([*enabled_toolsets, "kanban"])
         agent_cfg_local = user_config.get("agent") or {}

@@ -390,8 +390,20 @@ class HonchoMemoryProvider(MemoryProvider):
             if not session.messages and cfg.session_strategy != "per-session":
                 from hermes_constants import get_hermes_home
                 mem_dir = str(get_hermes_home() / "memories")
-                self._manager.migrate_memory_files(self._session_key, mem_dir)
-                logger.debug("Honcho memory file migration attempted for new session: %s", self._session_key)
+                migration_mode = self._memory_file_migration_mode(cfg, kwargs.get("platform"))
+                if migration_mode == "off":
+                    logger.debug(
+                        "Honcho memory file migration skipped by config for %s",
+                        self._session_key,
+                    )
+                elif migration_mode == "async":
+                    self._start_memory_file_migration_thread(mem_dir)
+                else:
+                    self._manager.migrate_memory_files(self._session_key, mem_dir)
+                    logger.debug(
+                        "Honcho memory file migration attempted for new session: %s",
+                        self._session_key,
+                    )
             elif cfg.session_strategy == "per-session":
                 logger.debug(
                     "Honcho memory file migration skipped: per-session strategy creates a fresh session per run (%s)",
@@ -439,6 +451,71 @@ class HonchoMemoryProvider(MemoryProvider):
             )
             self._prefetch_thread.start()
             logger.debug("Honcho pre-warm started for session: %s", self._session_key)
+
+    @staticmethod
+    def _memory_file_migration_mode(cfg, platform: str | None) -> str:
+        """Return sync/async/off for local MEMORY.md/USER.md Honcho migration."""
+        raw = getattr(cfg, "raw", None) or {}
+        configured_mode = raw.get("memoryFileMigration")
+        mode = str(configured_mode or "sync").strip().lower()
+        if mode in {"off", "disabled", "false", "0", "none"}:
+            return "off"
+        if mode in {"async", "background", "defer", "deferred"}:
+            return "async"
+        if configured_mode is not None and mode in {
+            "sync",
+            "inline",
+            "blocking",
+            "true",
+            "1",
+        }:
+            return "sync"
+
+        defer_platforms = raw.get("deferMemoryFileMigrationPlatforms")
+        if defer_platforms is None:
+            # Discord gateway first turns should not block on uploading old
+            # local memory files; those uploads are migration hygiene, not
+            # user-visible work. Keep CLI/default behaviour sync for backwards
+            # compatibility, but move Discord's migration off the hot path.
+            defer_platforms = ["discord"]
+        if isinstance(defer_platforms, str):
+            defer_set = {
+                item.strip().lower()
+                for item in re.split(r"[,\s]+", defer_platforms)
+                if item.strip()
+            }
+        elif isinstance(defer_platforms, (list, tuple, set)):
+            defer_set = {str(item).strip().lower() for item in defer_platforms if str(item).strip()}
+        else:
+            defer_set = set()
+
+        if str(platform or "").strip().lower() in defer_set:
+            return "async"
+        return "sync"
+
+    def _start_memory_file_migration_thread(self, memory_dir: str) -> None:
+        """Run local memory-file migration without blocking session init."""
+        manager = self._manager
+        session_key = self._session_key
+        if manager is None or not session_key:
+            return
+
+        def _run() -> None:
+            try:
+                manager.migrate_memory_files(session_key, memory_dir)
+                logger.debug(
+                    "Honcho async memory file migration attempted for new session: %s",
+                    session_key,
+                )
+            except Exception as exc:
+                logger.debug("Honcho async memory file migration skipped: %s", exc)
+
+        thread = threading.Thread(
+            target=_run,
+            daemon=True,
+            name="honcho-memory-file-migration",
+        )
+        thread.start()
 
     def _ensure_session(self) -> bool:
         """Lazily initialize the Honcho session (for tools-only mode).

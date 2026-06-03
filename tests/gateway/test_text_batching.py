@@ -26,11 +26,17 @@ def _make_event(
     platform: Platform,
     chat_id: str = "12345",
     msg_type: MessageType = MessageType.TEXT,
+    thread_id: str | None = None,
 ) -> MessageEvent:
     return MessageEvent(
         text=text,
         message_type=msg_type,
-        source=SessionSource(platform=platform, chat_id=chat_id, chat_type="dm"),
+        source=SessionSource(
+            platform=platform,
+            chat_id=chat_id,
+            chat_type="thread" if thread_id else "dm",
+            thread_id=thread_id,
+        ),
     )
 
 
@@ -58,6 +64,25 @@ def _make_discord_adapter():
 
 
 class TestDiscordTextBatching:
+    def test_short_thread_text_bypasses_batch_delay(self):
+        adapter = _make_discord_adapter()
+        event = _make_event("quick follow-up", Platform.DISCORD, thread_id="thread-1")
+
+        assert adapter._should_batch_text_event(event) is False
+
+    def test_near_split_thread_text_still_batches(self):
+        adapter = _make_discord_adapter()
+        event = _make_event("x" * adapter._SPLIT_THRESHOLD, Platform.DISCORD, thread_id="thread-1")
+
+        assert adapter._should_batch_text_event(event) is True
+
+    def test_thread_text_batch_bypass_can_be_disabled(self):
+        adapter = _make_discord_adapter()
+        adapter.config.extra["fast_thread_text_batch_bypass"] = False
+        event = _make_event("quick follow-up", Platform.DISCORD, thread_id="thread-1")
+
+        assert adapter._should_batch_text_event(event) is True
+
     @pytest.mark.asyncio
     async def test_single_message_dispatched_after_delay(self):
         adapter = _make_discord_adapter()

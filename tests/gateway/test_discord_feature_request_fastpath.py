@@ -133,7 +133,7 @@ def test_standard_discord_feature_request_helper_excludes_goal():
 
 
 @pytest.mark.asyncio
-async def test_discord_feature_request_fast_path_adds_guidance_and_zero_tool_delay(monkeypatch):
+async def test_discord_feature_request_keeps_full_platform_tool_surface(monkeypatch):
     _patch_agent_runtime(monkeypatch)
     runner = _make_runner()
     _CapturingAgent.last_init = None
@@ -147,6 +147,7 @@ async def test_discord_feature_request_fast_path_adds_guidance_and_zero_tool_del
     init = _CapturingAgent.last_init
     assert init is not None
     assert init["tool_delay"] == 0.0
+    assert init["enabled_toolsets"] == ["core"]
     assert init["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
     assert init.get("skip_memory", False) is False
     assert "Discord feature-request thread guidance" in init["ephemeral_system_prompt"]
