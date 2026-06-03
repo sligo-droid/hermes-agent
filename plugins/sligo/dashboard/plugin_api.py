@@ -87,11 +87,7 @@ def _project_payload(key: str, cfg: dict[str, Any]) -> dict[str, Any]:
                 "key": prong_key,
                 "name": prong_cfg.get("name") or prong_key,
                 "description": prong_cfg.get("description") or "",
-                "kanban_board": prong_cfg.get("kanban_board") or cfg.get("kanban_board") or "",
-                "workspace_kind": prong_cfg.get("workspace_kind") or cfg.get("workspace_kind") or "dir",
-                "workspace_path": prong_cfg.get("workspace_path") or cfg.get("workspace_path") or "",
-                "assignee": prong_cfg.get("assignee") or cfg.get("assignee") or "",
-                "skills": prong_cfg.get("skills") or cfg.get("skills") or [],
+                "cron_job_ids": prong_cfg.get("cron_job_ids") or [],
             }
             for prong_key, prong_cfg in prongs.items()
             if isinstance(prong_cfg, dict)
@@ -282,92 +278,16 @@ def get_source_output(ref: str) -> Response:
     return Response(content, media_type="text/markdown; charset=utf-8")
 
 
-@router.post("/runs")
-def ingest_run(body: RunIngestBody) -> dict[str, Any]:
-    config = _config()
-    resolved = _resolve(body.project_key, body.prong_key, config)
-    data = _model_data(body)
-    data["project_key"] = resolved["project_key"]
-    data["prong_key"] = resolved["prong_key"]
-    try:
-        run = proposals.ingest_run(data)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _run_response(proposals.sanitize_run(run))
-
-
-@router.post("/proposals")
-def ingest_proposal(body: CardIngestBody) -> dict[str, Any]:
-    data = _model_data(body)
-    try:
-        with proposals.connect() as conn:
-            if data.get("project_key"):
-                resolved = _resolve(data["project_key"], data.get("prong_key"), _config())
-                data["project_key"] = resolved["project_key"]
-                data["prong_key"] = resolved["prong_key"]
-            card = proposals.ingest_card(data, conn=conn)
-            return _card_response(proposals.sanitize_card(card))
-    except (KeyError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.patch("/proposals/{proposal_id}")
-def patch_proposal(proposal_id: int, body: PatchCardBody, request: Request) -> dict[str, Any]:
-    updates = {key: value for key, value in _model_data(body).items() if value is not None}
-    allowed = {
-        "title",
-        "summary",
-        "body",
-        "rationale",
-        "recommended_action",
-        "evidence",
-        "evidence_bullets",
-        "acceptance_criteria",
-        "worker_prompt",
-        "proposed_worker_prompt",
-        "risk_notes",
-        "confidence",
-        "estimated_effort",
-        "expected_outcome",
-        "priority",
-        "tags",
-    }
-    updates = {key: value for key, value in updates.items() if key in allowed}
-    if not updates:
-        return get_proposal(proposal_id)
-    try:
-        with proposals.connect() as conn:
-            card = proposals.get_card(proposal_id, conn=conn, public=False)
-            now = proposals.utc_now()
-            audit = card.get("audit_log", []) + [proposals.audit_event("patched", _operator(request), ",".join(sorted(updates)))]
-            values = dict(updates)
-            if "evidence" in values:
-                values["evidence_bullets"] = values.pop("evidence")
-            if "worker_prompt" in values and "proposed_worker_prompt" not in values:
-                values["proposed_worker_prompt"] = values["worker_prompt"]
-            if "proposed_worker_prompt" in values and "worker_prompt" not in values:
-                values["worker_prompt"] = values["proposed_worker_prompt"]
-            for field in ("tags", "evidence_bullets", "acceptance_criteria"):
-                if field in values:
-                    values[field] = proposals.json_text(values[field], default=[])
-            values["audit_log"] = proposals.json_text(audit)
-            values["updated_at"] = now
-            set_clause = ", ".join(f"{col} = ?" for col in values)
-            conn.execute(f"UPDATE proposal_cards SET {set_clause} WHERE id = ?", (*values.values(), proposal_id))
-            return _card_response(proposals.get_card(proposal_id, conn=conn))
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
 @router.post("/proposals/{proposal_id}/approve")
 def approve_proposal(proposal_id: int, body: ApproveBody, request: Request) -> dict[str, Any]:
     actor = _operator(request)
-    config = _config()
     try:
         with proposals.connect() as conn:
             card = proposals.get_card(proposal_id, conn=conn, public=False)
+            if card.get("status") == "approved" and card.get("worker_task_id"):
+                return _card_response(proposals.sanitize_card(card))
+
+            config = _config()
             resolved = _resolve(card["project_key"], card["prong_key"], config)
             project_cfg = resolved["project"]
             prong_cfg = resolved["prong"]
@@ -377,8 +297,6 @@ def approve_proposal(proposal_id: int, body: ApproveBody, request: Request) -> d
             resolved_workspace_path = _resolve_workspace_path(workspace_kind, workspace_path)
             if card.get("worker_task_id"):
                 task_id = card["worker_task_id"]
-                if card.get("status") == "approved":
-                    return _card_response(proposals.sanitize_card(card))
             else:
                 initial_status = str(prong_cfg.get("initial_status") or project_cfg.get("initial_status") or "blocked")
                 target_status = str(prong_cfg.get("target_status") or project_cfg.get("target_status") or "ready")

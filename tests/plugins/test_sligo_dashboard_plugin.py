@@ -5,7 +5,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from contextlib import AbstractContextManager
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from fastapi import FastAPI
@@ -13,6 +15,10 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import self_improvement_proposals as proposals
+
+
+def _connect() -> AbstractContextManager[Any]:
+    return cast(AbstractContextManager[Any], proposals.connect())
 
 
 def _load_plugin_module():
@@ -68,62 +74,60 @@ def client(sligo_home):
     return TestClient(app)
 
 
-def _ingest_card(client: TestClient, *, metadata: dict | None = None) -> int:
-    run_resp = client.post(
-        "/api/plugins/sligo/runs",
-        json={"project_key": "sligo", "prong_key": "r1", "idempotency_key": "run-1"},
-    )
-    assert run_resp.status_code == 200, run_resp.text
-    run_id = run_resp.json()["run"]["id"]
-    card_resp = client.post(
-        "/api/plugins/sligo/proposals",
-        json={
-            "run_id": run_id,
-            "idempotency_key": "card-1",
-            "title": "Tighten dashboard API",
-            "summary": "Add safe approval endpoints.",
-            "body": "Use stored proposal content only.",
-            "rationale": "Operators need the explicit parser detail.",
-            "recommended_action": "approve",
-            "evidence_bullets": ["Evidence from cron output."],
-            "acceptance_criteria": ["Detail drawer shows evidence."],
-            "worker_prompt": "Use the stored worker prompt.",
-            "proposed_worker_prompt": "Use the stored worker prompt.",
-            "risk_notes": "Low risk.",
-            "confidence": "high",
-            "estimated_effort": "small",
-            "priority": "high",
-            "metadata": metadata or {},
-        },
-    )
-    assert card_resp.status_code == 200, card_resp.text
-    return card_resp.json()["proposal"]["id"]
+def _ingest_card(client: TestClient | None = None, *, metadata: dict | None = None) -> int:
+    del client
+    with _connect() as conn:
+        run = proposals.ingest_run(
+            {"project_key": "sligo", "prong_key": "r1", "idempotency_key": "run-1"},
+            conn=conn,
+        )
+        card = proposals.ingest_card(
+            {
+                "run_id": run["id"],
+                "idempotency_key": "card-1",
+                "title": "Tighten dashboard API",
+                "summary": "Add safe approval endpoints.",
+                "body": "Use stored proposal content only.",
+                "rationale": "Operators need the explicit parser detail.",
+                "recommended_action": "approve",
+                "evidence_bullets": ["Evidence from cron output."],
+                "acceptance_criteria": ["Detail drawer shows evidence."],
+                "worker_prompt": "Use the stored worker prompt.",
+                "proposed_worker_prompt": "Use the stored worker prompt.",
+                "risk_notes": "Low risk.",
+                "confidence": "high",
+                "estimated_effort": "small",
+                "priority": "high",
+                "metadata": metadata or {},
+            },
+            conn=conn,
+        )
+    return card["id"]
 
 
-def _ingest_run_with_output(client: TestClient, output_path: Path) -> tuple[int, str]:
-    run_resp = client.post(
-        "/api/plugins/sligo/runs",
-        json={
-            "project_key": "sligo",
-            "prong_key": "r1",
-            "idempotency_key": "run-with-output",
-            "raw_input_ref": str(output_path),
-        },
-    )
-    assert run_resp.status_code == 200, run_resp.text
-    run = run_resp.json()["run"]
-    card_resp = client.post(
-        "/api/plugins/sligo/proposals",
-        json={
-            "run_id": run["id"],
-            "idempotency_key": "card-with-output",
-            "title": "Tighten dashboard API",
-            "summary": "Add safe approval endpoints.",
-            "source_metadata": {"source_output_path": str(output_path)},
-        },
-    )
-    assert card_resp.status_code == 200, card_resp.text
-    return card_resp.json()["proposal"]["id"], run["source_output_ref"]
+def _ingest_run_with_output(client: TestClient | None, output_path: Path) -> tuple[int, str]:
+    del client
+    with _connect() as conn:
+        run = proposals.ingest_run(
+            {
+                "project_key": "sligo",
+                "prong_key": "r1",
+                "idempotency_key": "run-with-output",
+                "raw_input_ref": str(output_path),
+            },
+            conn=conn,
+        )
+        card = proposals.ingest_card(
+            {
+                "run_id": run["id"],
+                "idempotency_key": "card-with-output",
+                "title": "Tighten dashboard API",
+                "summary": "Add safe approval endpoints.",
+                "source_metadata": {"source_output_path": str(output_path)},
+            },
+            conn=conn,
+        )
+    return card["id"], proposals.sanitize_run(run)["source_output_ref"]
 
 
 def test_read_routes_expose_projects_runs_and_proposals(client):
@@ -137,7 +141,14 @@ def test_read_routes_expose_projects_runs_and_proposals(client):
     run_resp = client.get(f"/api/plugins/sligo/runs/{run_id}")
 
     assert projects.status_code == 200
-    assert projects.json()["projects"][0]["key"] == "sligo"
+    project = projects.json()["projects"][0]
+    assert project["key"] == "sligo"
+    assert "workspace_path" not in project
+    assert "kanban_board" not in project["prongs"][0]
+    assert "workspace_kind" not in project["prongs"][0]
+    assert "workspace_path" not in project["prongs"][0]
+    assert "assignee" not in project["prongs"][0]
+    assert "skills" not in project["prongs"][0]
     assert proposals_resp.status_code == 200
     assert [p["id"] for p in proposals_resp.json()["proposals"]] == [proposal_id]
     assert proposal_resp.status_code == 200
@@ -161,34 +172,31 @@ def test_read_routes_expose_projects_runs_and_proposals(client):
 
 
 def test_run_detail_filters_cards_by_run_id_before_limit(client):
-    target_run = client.post(
-        "/api/plugins/sligo/runs",
-        json={"project_key": "sligo", "prong_key": "r1", "idempotency_key": "target-run"},
-    )
-    assert target_run.status_code == 200, target_run.text
-    target_run_id = target_run.json()["run"]["id"]
-    target_card = client.post(
-        "/api/plugins/sligo/proposals",
-        json={"run_id": target_run_id, "idempotency_key": "target-card", "title": "Target proposal"},
-    )
-    assert target_card.status_code == 200, target_card.text
-    target_card_id = target_card.json()["proposal"]["id"]
+    with _connect() as conn:
+        target_run = proposals.ingest_run(
+            {"project_key": "sligo", "prong_key": "r1", "idempotency_key": "target-run"},
+            conn=conn,
+        )
+        target_card = proposals.ingest_card(
+            {"run_id": target_run["id"], "idempotency_key": "target-card", "title": "Target proposal"},
+            conn=conn,
+        )
+        target_run_id = target_run["id"]
+        target_card_id = target_card["id"]
 
-    for index in range(205):
-        run_resp = client.post(
-            "/api/plugins/sligo/runs",
-            json={"project_key": "sligo", "prong_key": "r1", "idempotency_key": f"newer-run-{index}"},
-        )
-        assert run_resp.status_code == 200, run_resp.text
-        card_resp = client.post(
-            "/api/plugins/sligo/proposals",
-            json={
-                "run_id": run_resp.json()["run"]["id"],
-                "idempotency_key": f"newer-card-{index}",
-                "title": f"Newer proposal {index}",
-            },
-        )
-        assert card_resp.status_code == 200, card_resp.text
+        for index in range(205):
+            run = proposals.ingest_run(
+                {"project_key": "sligo", "prong_key": "r1", "idempotency_key": f"newer-run-{index}"},
+                conn=conn,
+            )
+            proposals.ingest_card(
+                {
+                    "run_id": run["id"],
+                    "idempotency_key": f"newer-card-{index}",
+                    "title": f"Newer proposal {index}",
+                },
+                conn=conn,
+            )
 
     detail = client.get(f"/api/plugins/sligo/runs/{target_run_id}")
 
@@ -244,6 +252,16 @@ def test_sligo_source_output_control_is_not_plain_api_anchor():
 
     assert "authenticatedFetch(outputUrl)" in bundle
     assert 'href: source, target: "_blank"' not in bundle
+
+
+def test_sligo_bundle_does_not_expose_metadata_patch_ui():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = (repo_root / "plugins" / "sligo" / "dashboard" / "dist" / "index.js").read_text(encoding="utf-8")
+
+    assert "Metadata Patch" not in bundle
+    assert "patchState" not in bundle
+    assert 'mutate("patch"' not in bundle
+    assert 'method: "PATCH"' not in bundle
 
 
 def test_sligo_bundle_uses_canonical_proposal_contract_fields():
@@ -340,10 +358,10 @@ def test_reject_records_decision_and_default_list_excludes_it(client):
     assert [p["id"] for p in inactive_list.json()["proposals"]] == [proposal_id]
 
 
-def test_patch_feedback_and_bulk_guard(client):
+def test_feedback_bulk_guard_and_removed_mutation_routes(client):
     proposal_id = _ingest_card(client)
 
-    patched = client.patch(
+    removed_patch = client.patch(
         f"/api/plugins/sligo/proposals/{proposal_id}",
         json={"title": "Updated title", "tags": ["api"], "status": "approved"},
     )
@@ -353,13 +371,10 @@ def test_patch_feedback_and_bulk_guard(client):
     )
     bulk = client.post("/api/plugins/sligo/proposals/bulk-approve", json={"proposal_ids": [proposal_id]})
 
-    assert patched.status_code == 200, patched.text
-    assert patched.json()["proposal"]["title"] == "Updated title"
-    assert patched.json()["proposal"]["status"] == "proposed"
-    assert patched.json()["proposal"]["tags"] == ["api"]
+    assert removed_patch.status_code == 405
     assert feedback.status_code == 200, feedback.text
     assert feedback.json()["proposal"]["operator_feedback"] == "Prefer route-level tests."
-    with proposals.connect() as conn:
+    with _connect() as conn:
         rows = conn.execute("SELECT action, reason, feedback FROM proposal_feedback ORDER BY id").fetchall()
     assert [(row["action"], row["reason"], row["feedback"]) for row in rows] == [
         ("feedback", "Direction", "Prefer route-level tests.")
@@ -367,27 +382,33 @@ def test_patch_feedback_and_bulk_guard(client):
     assert bulk.status_code == 409
 
 
-def test_unknown_project_ingest_is_rejected(client):
-    resp = client.post(
+def test_dashboard_does_not_expose_ingest_endpoints(client):
+    post_run = client.post(
         "/api/plugins/sligo/runs",
-        json={"project_key": "missing", "prong_key": "r1", "idempotency_key": "run-unknown"},
+        json={"project_key": "sligo", "prong_key": "r1", "idempotency_key": "run-blocked"},
+    )
+    post_card = client.post(
+        "/api/plugins/sligo/proposals",
+        json={"run_id": 1, "idempotency_key": "card-blocked", "title": "Blocked"},
     )
 
-    assert resp.status_code == 404
+    assert post_run.status_code == 405
+    assert post_card.status_code == 405
 
 
 def test_mutations_are_protected_by_dashboard_auth(sligo_home):
     from hermes_cli import web_server
 
+    proposal_id = _ingest_card()
     web_client = TestClient(web_server.app)
     resp = web_client.post(
-        "/api/plugins/sligo/runs",
-        json={"project_key": "sligo", "prong_key": "r1", "idempotency_key": "run-auth"},
+        f"/api/plugins/sligo/proposals/{proposal_id}/approve",
+        json={"reason": "Authenticated only"},
     )
 
     authed = web_client.post(
-        "/api/plugins/sligo/runs",
-        json={"project_key": "sligo", "prong_key": "r1", "idempotency_key": "run-auth"},
+        f"/api/plugins/sligo/proposals/{proposal_id}/approve",
+        json={"reason": "Authenticated only"},
         headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
     )
 

@@ -10,7 +10,7 @@ from base64 import urlsafe_b64decode, urlsafe_b64encode
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterator
 
 from hermes_constants import get_hermes_home
 from hermes_cli.config import load_config
@@ -112,7 +112,7 @@ def get_db_path() -> Path:
 
 
 @contextmanager
-def connect(db_path: Path | None = None) -> Iterable[sqlite3.Connection]:
+def connect(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
     path = db_path or get_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)

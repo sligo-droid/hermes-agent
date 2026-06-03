@@ -167,19 +167,9 @@
     const state = hooks.useState("");
     const note = state[0];
     const setNote = state[1];
-    const patchState = hooks.useState({ title: "", summary: "", priority: "", tags: "" });
-    const patch = patchState[0];
-    const setPatch = patchState[1];
-
     hooks.useEffect(function () {
       if (!proposal) return;
       setNote("");
-      setPatch({
-        title: proposal.title || "",
-        summary: proposal.summary || "",
-        priority: proposal.priority || "",
-        tags: Array.isArray(proposal.tags) ? proposal.tags.join(", ") : "",
-      });
     }, [proposal && proposal.id]);
 
     if (!proposal) return null;
@@ -272,16 +262,6 @@
           h(Button, { disabled: props.busy, onClick: function () { mutate("reject", { reason: note || "Rejected from dashboard", feedback: note }); } }, props.busy === "reject" ? "Rejecting..." : "Reject"),
           h(Button, { disabled: props.busy || !note.trim(), onClick: function () { mutate("feedback", { reason: "operator feedback", feedback: note }); } }, props.busy === "feedback" ? "Saving..." : "Send Feedback"),
         ),
-      ),
-      h("section", { className: "sligo-actions" },
-        h("h3", null, "Metadata Patch"),
-        h(Field, { label: "Title" }, h("input", { value: patch.title, onChange: function (event) { setPatch(Object.assign({}, patch, { title: event.target.value })); } })),
-        h(Field, { label: "Summary" }, h("textarea", { value: patch.summary, onChange: function (event) { setPatch(Object.assign({}, patch, { summary: event.target.value })); } })),
-        h("div", { className: "sligo-two" },
-          h(Field, { label: "Priority" }, h("input", { value: patch.priority, onChange: function (event) { setPatch(Object.assign({}, patch, { priority: event.target.value })); } })),
-          h(Field, { label: "Tags" }, h("input", { value: patch.tags, placeholder: "comma, separated", onChange: function (event) { setPatch(Object.assign({}, patch, { tags: event.target.value })); } })),
-        ),
-        h(Button, { disabled: props.busy, onClick: function () { mutate("patch", { title: patch.title, summary: patch.summary, priority: patch.priority, tags: patch.tags.split(",").map(function (tag) { return tag.trim(); }).filter(Boolean) }); } }, props.busy === "patch" ? "Saving..." : "Save Metadata"),
       ),
     );
   }
@@ -380,10 +360,8 @@
 
     function onAction(id, name, payload) {
       setAction({ busy: name, error: "" });
-      const route = name === "patch" ? "/proposals/" + id : "/proposals/" + id + "/" + name;
-      const method = name === "patch" ? "PATCH" : "POST";
-      return api(route, {
-        method: method,
+      return api("/proposals/" + id + "/" + name, {
+        method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload || {}),
       })
