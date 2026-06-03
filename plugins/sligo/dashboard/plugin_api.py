@@ -1,0 +1,465 @@
+"""Sligo dashboard plugin backend API routes."""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Query, Request, status
+from pydantic import BaseModel, Field
+
+from hermes_cli import kanban_db
+from hermes_cli import self_improvement_proposals as proposals
+from hermes_cli.config import load_config
+
+router = APIRouter()
+
+
+def _model_data(model: BaseModel) -> dict[str, Any]:
+    dump = getattr(model, "model_dump", None)
+    if callable(dump):
+        return dump()
+    return model.dict()
+
+
+class RunIngestBody(BaseModel):
+    project_key: str
+    prong_key: str | None = None
+    idempotency_key: str
+    source_type: str = ""
+    source_id: str = ""
+    source_url: str = ""
+    source_title: str = ""
+    source_metadata: dict[str, Any] = Field(default_factory=dict)
+    parser_name: str = ""
+    parser_version: str = ""
+    parser_metadata: dict[str, Any] = Field(default_factory=dict)
+    raw_input_ref: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    status: str = "ingested"
+    started_at: str | None = None
+    completed_at: str | None = None
+
+
+class CardIngestBody(BaseModel):
+    run_id: int
+    idempotency_key: str
+    title: str
+    project_key: str | None = None
+    prong_key: str | None = None
+    summary: str = ""
+    body: str = ""
+    rationale: str = ""
+    expected_outcome: str = ""
+    status: str = "proposed"
+    priority: str = ""
+    tags: list[str] = Field(default_factory=list)
+    source_type: str = ""
+    source_id: str = ""
+    source_url: str = ""
+    source_title: str = ""
+    source_metadata: dict[str, Any] = Field(default_factory=dict)
+    parser_name: str = ""
+    parser_version: str = ""
+    parser_metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_by: str = ""
+
+
+class ApproveBody(BaseModel):
+    reason: str = ""
+    feedback: str = ""
+
+
+class RejectBody(BaseModel):
+    reason: str = ""
+    strength: str = ""
+    feedback: str = ""
+
+
+class FeedbackBody(BaseModel):
+    feedback: str
+    reason: str = ""
+
+
+class PatchCardBody(BaseModel):
+    title: str | None = None
+    summary: str | None = None
+    body: str | None = None
+    rationale: str | None = None
+    expected_outcome: str | None = None
+    priority: str | None = None
+    tags: list[str] | None = None
+
+
+class BulkApproveBody(BaseModel):
+    proposal_ids: list[int] = Field(default_factory=list)
+    confirm: str = ""
+
+
+def _config() -> dict[str, Any]:
+    return load_config()
+
+
+def _proposal_config(config: dict[str, Any]) -> dict[str, Any]:
+    value = config.get("self_improvement", {}).get("proposals", {})
+    return value if isinstance(value, dict) else {}
+
+
+def _operator(request: Request) -> str:
+    operator = request.headers.get("X-Hermes-Operator", "")
+    if operator and operator.strip():
+        return operator.strip()
+    session = getattr(request.state, "session", None)
+    user = getattr(session, "user", None)
+    if user:
+        return str(user)
+    return "dashboard"
+
+
+def _resolve(project: str, prong: str | None, config: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return proposals.resolve_project_prong(project, prong, config=config)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def _validate_board(board: str) -> str:
+    try:
+        normed = kanban_db._normalize_board_slug(board)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not normed:
+        raise HTTPException(status_code=400, detail="kanban_board is required")
+    if normed != kanban_db.DEFAULT_BOARD and not kanban_db.board_exists(normed):
+        raise HTTPException(status_code=404, detail=f"board {normed!r} does not exist")
+    return normed
+
+
+def _project_payload(key: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    prongs = cfg.get("prongs", {}) or {}
+    return {
+        "key": key,
+        "name": cfg.get("name") or key,
+        "description": cfg.get("description") or "",
+        "default_prong": cfg.get("default_prong") or "",
+        "prong_aliases": cfg.get("prong_aliases") or {},
+        "prongs": [
+            {
+                "key": prong_key,
+                "name": prong_cfg.get("name") or prong_key,
+                "description": prong_cfg.get("description") or "",
+                "kanban_board": prong_cfg.get("kanban_board") or cfg.get("kanban_board") or "",
+                "workspace_kind": prong_cfg.get("workspace_kind") or cfg.get("workspace_kind") or "dir",
+                "workspace_path": prong_cfg.get("workspace_path") or cfg.get("workspace_path") or "",
+                "assignee": prong_cfg.get("assignee") or cfg.get("assignee") or "",
+                "skills": prong_cfg.get("skills") or cfg.get("skills") or [],
+            }
+            for prong_key, prong_cfg in prongs.items()
+            if isinstance(prong_cfg, dict)
+        ],
+    }
+
+
+def _card_with_links(card: dict[str, Any]) -> dict[str, Any]:
+    item = dict(card)
+    item["worker"] = {
+        "board": card.get("worker_board") or "",
+        "task_id": card.get("worker_task_id") or "",
+        "status": card.get("worker_status") or "",
+        "url": card.get("worker_url") or "",
+    }
+    return item
+
+
+def _run_response(run: dict[str, Any]) -> dict[str, Any]:
+    return {"run": run}
+
+
+def _card_response(card: dict[str, Any]) -> dict[str, Any]:
+    return {"proposal": _card_with_links(card)}
+
+
+def _worker_body(card: dict[str, Any], resolved: dict[str, Any], prong_cfg: dict[str, Any]) -> str:
+    parts = [
+        prong_cfg.get("worker_prompt") or resolved["project"].get("worker_prompt") or "Implement the approved Sligo proposal.",
+        "",
+        f"Proposal: {card['title']}",
+    ]
+    for label, field in (
+        ("Summary", "summary"),
+        ("Body", "body"),
+        ("Rationale", "rationale"),
+        ("Expected outcome", "expected_outcome"),
+    ):
+        if card.get(field):
+            parts.extend(["", f"{label}:\n{card[field]}"])
+    acceptance = prong_cfg.get("acceptance_criteria") or resolved["project"].get("acceptance_criteria") or []
+    if isinstance(acceptance, str):
+        acceptance = [acceptance]
+    if acceptance:
+        parts.extend(["", "Acceptance criteria:"])
+        parts.extend(f"- {item}" for item in acceptance if item)
+    if card.get("source_url"):
+        parts.extend(["", f"Source: {card['source_url']}"])
+    return "\n".join(parts).strip()
+
+
+def _priority(value: str) -> int:
+    lookup = {"low": -1, "normal": 0, "medium": 0, "high": 1, "urgent": 2}
+    return lookup.get((value or "").strip().lower(), 0)
+
+
+def _worker_url(board: str, task_id: str, prong_cfg: dict[str, Any], project_cfg: dict[str, Any]) -> str:
+    template = prong_cfg.get("worker_url_template") or project_cfg.get("worker_url_template") or ""
+    if template:
+        return str(template).format(board=board, task_id=task_id)
+    return f"/kanban?board={board}&task={task_id}"
+
+
+@router.get("/projects")
+def list_projects() -> dict[str, Any]:
+    proposal_cfg = _proposal_config(_config())
+    projects = proposal_cfg.get("projects", {}) or {}
+    return {
+        "projects": [_project_payload(key, cfg) for key, cfg in projects.items() if isinstance(cfg, dict)],
+        "project_aliases": proposal_cfg.get("project_aliases", {}) or {},
+    }
+
+
+@router.get("/proposals")
+def list_proposals(
+    project: str | None = None,
+    prong: str | None = None,
+    status_filter: str | None = Query(default="proposed", alias="status"),
+    include_inactive: bool = False,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    if project:
+        resolved = _resolve(project, prong, _config())
+        project_key = resolved["project_key"]
+        prong_key = resolved["prong_key"] if prong else None
+    else:
+        project_key = None
+        prong_key = None
+    status_value = None if include_inactive else status_filter
+    cards = proposals.list_cards(project_key=project_key, prong_key=prong_key, status=status_value, limit=limit)
+    return {"proposals": [_card_with_links(card) for card in cards]}
+
+
+@router.get("/proposals/{proposal_id}")
+def get_proposal(proposal_id: int) -> dict[str, Any]:
+    try:
+        card = proposals.get_card(proposal_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return _card_response(card)
+
+
+@router.get("/runs")
+def list_runs(
+    project: str | None = None,
+    prong: str | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    with proposals.connect() as conn:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project:
+            resolved = _resolve(project, prong, _config())
+            clauses.append("project_key = ?")
+            params.append(resolved["project_key"])
+            if prong:
+                clauses.append("prong_key = ?")
+                params.append(resolved["prong_key"])
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = conn.execute(
+            f"SELECT * FROM proposal_runs{where} ORDER BY created_at DESC, id DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        runs = [proposals.sanitize_run(proposals.decode_row(row)) for row in rows]
+    return {"runs": runs}
+
+
+@router.get("/runs/{run_id}")
+def get_run(run_id: int) -> dict[str, Any]:
+    try:
+        run = proposals.get_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    cards = proposals.list_cards(project_key=run["project_key"], prong_key=run["prong_key"], limit=200)
+    return {"run": run, "proposals": [card for card in cards if card.get("run_id") == run_id]}
+
+
+@router.post("/runs")
+def ingest_run(body: RunIngestBody) -> dict[str, Any]:
+    config = _config()
+    resolved = _resolve(body.project_key, body.prong_key, config)
+    data = _model_data(body)
+    data["project_key"] = resolved["project_key"]
+    data["prong_key"] = resolved["prong_key"]
+    try:
+        run = proposals.ingest_run(data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _run_response(proposals.sanitize_run(run))
+
+
+@router.post("/proposals")
+def ingest_proposal(body: CardIngestBody) -> dict[str, Any]:
+    data = _model_data(body)
+    try:
+        with proposals.connect() as conn:
+            if data.get("project_key"):
+                resolved = _resolve(data["project_key"], data.get("prong_key"), _config())
+                data["project_key"] = resolved["project_key"]
+                data["prong_key"] = resolved["prong_key"]
+            card = proposals.ingest_card(data, conn=conn)
+            return _card_response(proposals.sanitize_card(card))
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.patch("/proposals/{proposal_id}")
+def patch_proposal(proposal_id: int, body: PatchCardBody, request: Request) -> dict[str, Any]:
+    updates = {key: value for key, value in _model_data(body).items() if value is not None}
+    allowed = {"title", "summary", "body", "rationale", "expected_outcome", "priority", "tags"}
+    updates = {key: value for key, value in updates.items() if key in allowed}
+    if not updates:
+        return get_proposal(proposal_id)
+    try:
+        with proposals.connect() as conn:
+            card = proposals.get_card(proposal_id, conn=conn, public=False)
+            now = proposals.utc_now()
+            audit = card.get("audit_log", []) + [proposals.audit_event("patched", _operator(request), ",".join(sorted(updates)))]
+            values = dict(updates)
+            if "tags" in values:
+                values["tags"] = proposals.json_text(values["tags"], default=[])
+            values["audit_log"] = proposals.json_text(audit)
+            values["updated_at"] = now
+            set_clause = ", ".join(f"{col} = ?" for col in values)
+            conn.execute(f"UPDATE proposal_cards SET {set_clause} WHERE id = ?", (*values.values(), proposal_id))
+            return _card_response(proposals.get_card(proposal_id, conn=conn))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/proposals/{proposal_id}/approve")
+def approve_proposal(proposal_id: int, body: ApproveBody, request: Request) -> dict[str, Any]:
+    actor = _operator(request)
+    config = _config()
+    try:
+        with proposals.connect() as conn:
+            card = proposals.get_card(proposal_id, conn=conn, public=False)
+            resolved = _resolve(card["project_key"], card["prong_key"], config)
+            project_cfg = resolved["project"]
+            prong_cfg = resolved["prong"]
+            board = _validate_board(str(prong_cfg.get("kanban_board") or project_cfg.get("kanban_board") or ""))
+            workspace_kind = str(prong_cfg.get("workspace_kind") or project_cfg.get("workspace_kind") or "dir")
+            workspace_path = prong_cfg.get("workspace_path") or project_cfg.get("workspace_path")
+            if workspace_kind in {"dir", "worktree"} and not workspace_path:
+                raise HTTPException(status_code=400, detail="configured workspace_path is required for persistent workspaces")
+            if card.get("worker_task_id"):
+                task_id = card["worker_task_id"]
+                if card.get("status") == "approved":
+                    return _card_response(proposals.sanitize_card(card))
+            else:
+                initial_status = str(prong_cfg.get("initial_status") or project_cfg.get("initial_status") or "blocked")
+                target_status = str(prong_cfg.get("target_status") or project_cfg.get("target_status") or "ready")
+                with kanban_db.connect_closing(board=board) as kb_conn:
+                    task_id = kanban_db.create_task(
+                        kb_conn,
+                        title=card["title"],
+                        body=_worker_body(card, resolved, prong_cfg),
+                        assignee=prong_cfg.get("assignee") or project_cfg.get("assignee"),
+                        created_by=actor,
+                        workspace_kind=workspace_kind,
+                        workspace_path=str(workspace_path) if workspace_path else None,
+                        branch_name=prong_cfg.get("branch_name") or project_cfg.get("branch_name"),
+                        tenant=prong_cfg.get("tenant") or project_cfg.get("tenant"),
+                        priority=_priority(card.get("priority", "")),
+                        idempotency_key=f"sligo:proposal:{proposal_id}",
+                        max_runtime_seconds=prong_cfg.get("max_runtime_seconds") or project_cfg.get("max_runtime_seconds"),
+                        skills=prong_cfg.get("skills") or project_cfg.get("skills"),
+                        initial_status=initial_status,
+                        board=board,
+                    )
+                    if target_status and target_status != initial_status:
+                        kanban_db.move_task_status(kb_conn, task_id, target_status, source="sligo/approve")
+            worker_status = locals().get("target_status") or card.get("worker_status") or "ready"
+            url = card.get("worker_url") or _worker_url(board, task_id, prong_cfg, project_cfg)
+            linked = proposals.link_worker_task(proposal_id, board=board, task_id=task_id, status=worker_status, url=url, conn=conn)
+            decided = proposals.record_decision(
+                proposal_id,
+                "approved",
+                actor=actor,
+                reason=body.reason,
+                feedback=body.feedback,
+                conn=conn,
+            )
+            decided.update({k: linked[k] for k in ("worker_board", "worker_task_id", "worker_status", "worker_url")})
+            return _card_response(proposals.sanitize_card(decided))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/proposals/{proposal_id}/reject")
+def reject_proposal(proposal_id: int, body: RejectBody, request: Request) -> dict[str, Any]:
+    note = body.reason
+    if body.strength:
+        note = f"{note} [strength={body.strength}]" if note else f"strength={body.strength}"
+    try:
+        card = proposals.record_decision(
+            proposal_id,
+            "rejected",
+            actor=_operator(request),
+            reason=note,
+            feedback=body.feedback,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return _card_response(proposals.sanitize_card(card))
+
+
+@router.post("/proposals/{proposal_id}/feedback")
+def record_feedback(proposal_id: int, body: FeedbackBody, request: Request) -> dict[str, Any]:
+    try:
+        with proposals.connect() as conn:
+            card = proposals.get_card(proposal_id, conn=conn, public=False)
+            now = proposals.utc_now()
+            audit = card.get("audit_log", []) + [proposals.audit_event("feedback", _operator(request), body.reason or body.feedback)]
+            conn.execute(
+                """
+                UPDATE proposal_cards
+                SET operator_feedback = ?, decision_reason = COALESCE(NULLIF(?, ''), decision_reason), audit_log = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (body.feedback, body.reason, proposals.json_text(audit), now, proposal_id),
+            )
+            return _card_response(proposals.get_card(proposal_id, conn=conn))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/proposals/bulk-approve")
+def bulk_approve(body: BulkApproveBody) -> dict[str, Any]:
+    if body.confirm != "APPROVE":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="bulk approval requires confirm='APPROVE' and is not implemented by this endpoint yet",
+        )
+    raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="bulk approval is not implemented")
+
+
+@router.get("/worker-tasks/{board}/{task_id}")
+def get_worker_task(board: str, task_id: str) -> dict[str, Any]:
+    board_slug = _validate_board(board)
+    with kanban_db.connect_closing(board=board_slug) as conn:
+        task = kanban_db.get_task(conn, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Unknown worker task: {task_id}")
+    return {"board": board_slug, "task": asdict(task)}
