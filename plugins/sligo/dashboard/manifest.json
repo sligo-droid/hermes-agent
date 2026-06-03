@@ -4,5 +4,10 @@
   "description": "Self-improvement proposal review and approval APIs",
   "icon": "Sparkles",
   "version": "1.0.0",
+  "tab": {
+    "path": "/self-improvement",
+    "position": "before:sessions"
+  },
+  "entry": "dist/index.js",
   "api": "plugin_api.py"
 }

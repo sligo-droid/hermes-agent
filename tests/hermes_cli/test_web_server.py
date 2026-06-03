@@ -2169,6 +2169,19 @@ class TestDashboardPluginManifestExtensions:
             "chat:top",
         ]
 
+    def test_bundled_sligo_self_improvement_tab_manifest(self):
+        from hermes_cli import web_server
+
+        web_server._dashboard_plugins_cache = None
+        plugins = web_server._get_dashboard_plugins(force_rescan=True)
+        entry = next(p for p in plugins if p["name"] == "sligo")
+
+        assert entry["tab"]["path"] == "/self-improvement"
+        assert entry["tab"]["position"] == "before:sessions"
+        assert entry["entry"] == "dist/index.js"
+        assert entry["has_api"] is True
+        assert entry["source"] == "bundled"
+
 
 # ---------------------------------------------------------------------------
 # /api/pty WebSocket — terminal bridge for the dashboard "Chat" tab.
