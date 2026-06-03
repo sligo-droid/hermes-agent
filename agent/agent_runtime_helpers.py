@@ -1666,28 +1666,31 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         ))
     elif function_name == "memory":
         target = function_args.get("target", "memory")
-        from tools.memory_tool import memory_tool as _memory_tool
-        result = _memory_tool(
-            action=function_args.get("action"),
-            target=target,
-            content=function_args.get("content"),
-            old_text=function_args.get("old_text"),
-            store=agent._memory_store,
-        )
-        # Bridge: notify external memory provider of built-in memory writes
-        if agent._memory_manager and function_args.get("action") in {"add", "replace"}:
-            try:
-                agent._memory_manager.on_memory_write(
-                    function_args.get("action", ""),
-                    target,
-                    function_args.get("content", ""),
-                    metadata=agent._build_memory_write_metadata(
-                        task_id=effective_task_id,
-                        tool_call_id=tool_call_id,
-                    ),
-                )
-            except Exception:
-                pass
+        if getattr(agent, "memory_read_only", False):
+            result = json.dumps({"error": "The memory tool is disabled in read-only memory mode"})
+        else:
+            from tools.memory_tool import memory_tool as _memory_tool
+            result = _memory_tool(
+                action=function_args.get("action"),
+                target=target,
+                content=function_args.get("content"),
+                old_text=function_args.get("old_text"),
+                store=agent._memory_store,
+            )
+            # Bridge: notify external memory provider of built-in memory writes
+            if agent._memory_manager and function_args.get("action") in {"add", "replace"}:
+                try:
+                    agent._memory_manager.on_memory_write(
+                        function_args.get("action", ""),
+                        target,
+                        function_args.get("content", ""),
+                        metadata=agent._build_memory_write_metadata(
+                            task_id=effective_task_id,
+                            tool_call_id=tool_call_id,
+                        ),
+                    )
+                except Exception:
+                    pass
         return _finish(result)
     elif agent._context_engine_tool_names and function_name in agent._context_engine_tool_names:
         try:

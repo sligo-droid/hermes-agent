@@ -265,6 +265,23 @@ class TestMemoryManager:
 
         assert p.synced_turns == [("user msg", "assistant msg")]
 
+    def test_read_only_blocks_write_lifecycle_hooks(self):
+        mgr = MemoryManager(read_only=True)
+        p = FakeMemoryProvider("external")
+        mgr.add_provider(p)
+
+        mgr.sync_all("user msg", "assistant msg")
+        mgr.on_session_end([{"role": "user", "content": "hi"}])
+        result = mgr.on_pre_compress([{"role": "user", "content": "old"}])
+        mgr.on_memory_write("add", "memory", "new fact")
+        mgr.on_delegation("task", "result")
+
+        assert p.synced_turns == []
+        assert p.session_end_called is False
+        assert p.pre_compress_called is False
+        assert result == ""
+        assert p.memory_writes == []
+
     def test_sync_failure_doesnt_block_others(self):
         """If one provider's sync fails, others still run."""
         mgr = MemoryManager()
@@ -331,6 +348,47 @@ class TestMemoryManager:
         assert r1["handled"] == "builtin_tool"
         r2 = json.loads(mgr.handle_tool_call("ext_tool", {"b": 2}))
         assert r2["handled"] == "ext_tool"
+
+    def test_read_only_filters_write_like_tools_but_keeps_read_tools(self):
+        mgr = MemoryManager(read_only=True)
+        p = FakeMemoryProvider("external", tools=[
+            {"name": "honcho_search", "description": "Search memory", "parameters": {}},
+            {"name": "hindsight_retain", "description": "Retain a fact", "parameters": {}},
+            {"name": "profile", "description": "Read profile context", "parameters": {}},
+            {"name": "memory_delete", "description": "Delete memory", "parameters": {}},
+        ])
+        mgr.add_provider(p)
+
+        schemas = mgr.get_all_tool_schemas()
+        names = {s["name"] for s in schemas}
+
+        assert names == {"honcho_search", "profile"}
+        assert mgr.has_tool("honcho_search")
+        assert not mgr.has_tool("hindsight_retain")
+        assert json.loads(mgr.handle_tool_call("honcho_search", {"q": "x"}))["handled"] == "honcho_search"
+        blocked = json.loads(mgr.handle_tool_call("hindsight_retain", {"fact": "x"}))
+        assert "blocked" in blocked["error"]
+        assert "read-only memory mode" in blocked["error"]
+
+    def test_read_only_unknown_write_like_tool_returns_blocked_error(self):
+        mgr = MemoryManager(read_only=True)
+
+        blocked = json.loads(mgr.handle_tool_call("memory_upload", {"fact": "x"}))
+
+        assert "blocked" in blocked["error"]
+        assert "read-only memory mode" in blocked["error"]
+
+    def test_read_only_blocks_write_like_tool_if_called_after_registration(self):
+        mgr = MemoryManager(read_only=True)
+        p = FakeMemoryProvider("external", tools=[
+            {"name": "honcho_search", "description": "Search memory", "parameters": {}},
+        ])
+        mgr.add_provider(p)
+        p._tools = [{"name": "honcho_search", "description": "Update memory", "parameters": {}}]
+
+        blocked = json.loads(mgr.handle_tool_call("honcho_search", {"q": "x"}))
+
+        assert "read-only memory mode" in blocked["error"]
 
     # -- Lifecycle hooks -----------------------------------------------------
 

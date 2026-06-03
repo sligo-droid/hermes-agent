@@ -36,6 +36,12 @@ from tools.registry import tool_error
 logger = logging.getLogger(__name__)
 
 
+_WRITE_TOOL_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9])(?:retain|remember|conclude|add|create|update|delete|remove|forget|write|ingest|upload)(?:$|[^A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
+
 # ---------------------------------------------------------------------------
 # Context fencing helpers
 # ---------------------------------------------------------------------------
@@ -248,10 +254,18 @@ class MemoryManager:
     provider is allowed.  Failures in one provider never block the other.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, read_only: bool = False) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
+        self.read_only = bool(read_only)
+
+    @staticmethod
+    def is_write_like_tool_schema(schema: Dict[str, Any]) -> bool:
+        """Best-effort filter for provider tools that appear to write memory."""
+        name = str(schema.get("name") or "")
+        description = str(schema.get("description") or "")
+        return bool(_WRITE_TOOL_RE.search(f"{name} {description}"))
 
     # -- Registration --------------------------------------------------------
 
@@ -283,6 +297,8 @@ class MemoryManager:
 
         # Index tool names → provider for routing
         for schema in provider.get_tool_schemas():
+            if self.read_only and self.is_write_like_tool_schema(schema):
+                continue
             tool_name = schema.get("name", "")
             if tool_name and tool_name not in self._tool_to_provider:
                 self._tool_to_provider[tool_name] = provider
@@ -389,6 +405,8 @@ class MemoryManager:
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Sync a completed turn to all providers."""
+        if self.read_only:
+            return
         for provider in self._providers:
             try:
                 if messages is not None and self._provider_sync_accepts_messages(provider):
@@ -419,6 +437,8 @@ class MemoryManager:
         for provider in self._providers:
             try:
                 for schema in provider.get_tool_schemas():
+                    if self.read_only and self.is_write_like_tool_schema(schema):
+                        continue
                     name = schema.get("name", "")
                     if name and name not in seen:
                         schemas.append(schema)
@@ -448,7 +468,27 @@ class MemoryManager:
         """
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
+            if self.read_only:
+                if _WRITE_TOOL_RE.search(tool_name):
+                    return tool_error(
+                        f"Memory tool '{tool_name}' is blocked in read-only memory mode"
+                    )
+                return tool_error(
+                    f"Memory tool '{tool_name}' is not available in read-only memory mode"
+                )
             return tool_error(f"No memory provider handles tool '{tool_name}'")
+        if self.read_only:
+            try:
+                for schema in provider.get_tool_schemas():
+                    if schema.get("name") == tool_name and self.is_write_like_tool_schema(schema):
+                        return tool_error(
+                            f"Memory tool '{tool_name}' is blocked in read-only memory mode"
+                        )
+            except Exception:
+                if _WRITE_TOOL_RE.search(tool_name):
+                    return tool_error(
+                        f"Memory tool '{tool_name}' is blocked in read-only memory mode"
+                    )
         try:
             return provider.handle_tool_call(tool_name, args, **kwargs)
         except Exception as e:
@@ -476,6 +516,8 @@ class MemoryManager:
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Notify all providers of session end."""
+        if self.read_only:
+            return
         for provider in self._providers:
             try:
                 provider.on_session_end(messages)
@@ -526,6 +568,8 @@ class MemoryManager:
         Returns combined text from providers to include in the compression
         summary prompt. Empty string if no provider contributes.
         """
+        if self.read_only:
+            return ""
         parts = []
         for provider in self._providers:
             try:
@@ -576,6 +620,8 @@ class MemoryManager:
 
         Skips the builtin provider itself (it's the source of the write).
         """
+        if self.read_only:
+            return
         for provider in self._providers:
             if provider.name == "builtin":
                 continue
@@ -598,6 +644,8 @@ class MemoryManager:
     def on_delegation(self, task: str, result: str, *,
                       child_session_id: str = "", **kwargs) -> None:
         """Notify all providers that a subagent completed."""
+        if self.read_only:
+            return
         for provider in self._providers:
             try:
                 provider.on_delegation(

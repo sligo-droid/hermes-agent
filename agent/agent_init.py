@@ -125,6 +125,7 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    memory_read_only: bool = False,
     session_db=None,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
@@ -213,6 +214,7 @@ def init_agent(
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
+    agent.memory_read_only = bool(memory_read_only)
     agent.pass_session_id = pass_session_id
     agent._credential_pool = credential_pool
     agent.log_prefix_chars = log_prefix_chars
@@ -1018,7 +1020,7 @@ def init_agent(
             if _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                agent._memory_manager = _MemoryManager(read_only=agent.memory_read_only)
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
@@ -1027,7 +1029,8 @@ def init_agent(
                         "session_id": agent.session_id,
                         "platform": platform or "cli",
                         "hermes_home": str(get_hermes_home()),
-                        "agent_context": "primary",
+                        "agent_context": "cron_read_only" if agent.memory_read_only else "primary",
+                        "memory_read_only": agent.memory_read_only,
                     }
                     # Thread session title for memory provider scoping
                     # (e.g. honcho uses this to derive chat-scoped session keys)
@@ -1088,9 +1091,31 @@ def init_agent(
     # Without this gate, `platform_toolsets: telegram: []` still leaks memory
     # provider tools (fact_store, etc.) into the tool surface — a 10x latency
     # penalty on local models and a frequent trigger of tool-call loops.
+    if agent.memory_read_only and agent.tools is not None:
+        agent.tools = [
+            _tool for _tool in agent.tools
+            if _tool.get("function", {}).get("name") != "memory"
+        ]
+        agent.valid_tool_names.discard("memory")
+
     if agent._memory_manager and agent.tools is not None and (
         agent.enabled_toolsets is None or "memory" in agent.enabled_toolsets
     ):
+        if agent.memory_read_only:
+            _blocked_memory_tool_names = {"memory"}
+            for _provider in agent._memory_manager.providers:
+                try:
+                    for _schema in _provider.get_tool_schemas():
+                        if agent._memory_manager.is_write_like_tool_schema(_schema):
+                            _blocked_memory_tool_names.add(_schema.get("name", ""))
+                except Exception:
+                    pass
+            agent.tools = [
+                _tool for _tool in agent.tools
+                if _tool.get("function", {}).get("name") not in _blocked_memory_tool_names
+            ]
+            agent.valid_tool_names.difference_update(_blocked_memory_tool_names)
+
         _existing_tool_names = {
             t.get("function", {}).get("name")
             for t in agent.tools

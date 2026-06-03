@@ -2,6 +2,7 @@ import asyncio
 import sys
 import types
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 
 sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
@@ -122,6 +123,82 @@ def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch):
     assert _Codex401ThenSuccessAgent.refresh_attempts == 1
     assert _Codex401ThenSuccessAgent.last_init["provider"] == "openai-codex"
     assert _Codex401ThenSuccessAgent.last_init["api_mode"] == "codex_responses"
+
+
+def _patch_cron_agent_capture(monkeypatch, tmp_path, memory_mode_marker):
+    class DummyAgent:
+        last_init = {}
+
+        def __init__(self, **kwargs):
+            type(self).last_init = dict(kwargs)
+
+        def run_conversation(self, user_message):
+            return {"final_response": "ok"}
+
+        def close(self):
+            return None
+
+        def get_activity_summary(self):
+            return {"seconds_since_activity": 0.0}
+
+    monkeypatch.setattr(cron_scheduler, "_hermes_home", tmp_path)
+    monkeypatch.setattr(cron_scheduler, "_resolve_origin", lambda job: None)
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_state.SessionDB", lambda: MagicMock())
+    monkeypatch.setattr("run_agent.AIAgent", DummyAgent)
+    monkeypatch.setattr("tools.mcp_tool.discover_mcp_tools", lambda: [])
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda requested=None: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://example.invalid/v1",
+            "api_key": "test-key",
+        },
+    )
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+    if memory_mode_marker is not None:
+        (tmp_path / "config.yaml").write_text(f"cron:\n  memory_mode: {memory_mode_marker}\n", encoding="utf-8")
+    return DummyAgent
+
+
+def test_cron_memory_mode_omitted_keeps_memory_skipped(monkeypatch, tmp_path):
+    DummyAgent = _patch_cron_agent_capture(monkeypatch, tmp_path, None)
+
+    success, _output, _final_response, error = cron_scheduler.run_job(
+        {"id": "memory-default", "name": "Memory Default", "prompt": "ping"}
+    )
+
+    assert success is True
+    assert error is None
+    assert DummyAgent.last_init["skip_memory"] is True
+    assert DummyAgent.last_init["memory_read_only"] is False
+
+
+def test_cron_memory_mode_read_only_enables_read_only_memory(monkeypatch, tmp_path):
+    DummyAgent = _patch_cron_agent_capture(monkeypatch, tmp_path, "read_only")
+
+    success, _output, _final_response, error = cron_scheduler.run_job(
+        {"id": "memory-read-only", "name": "Memory Read Only", "prompt": "ping"}
+    )
+
+    assert success is True
+    assert error is None
+    assert DummyAgent.last_init["skip_memory"] is False
+    assert DummyAgent.last_init["memory_read_only"] is True
+
+
+def test_cron_memory_mode_read_write_enables_writes_explicitly(monkeypatch, tmp_path):
+    DummyAgent = _patch_cron_agent_capture(monkeypatch, tmp_path, "read_write")
+
+    success, _output, _final_response, error = cron_scheduler.run_job(
+        {"id": "memory-read-write", "name": "Memory Read Write", "prompt": "ping"}
+    )
+
+    assert success is True
+    assert error is None
+    assert DummyAgent.last_init["skip_memory"] is False
+    assert DummyAgent.last_init["memory_read_only"] is False
 
 
 def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):

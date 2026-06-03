@@ -1438,6 +1438,28 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         return _run_job_impl(job)
 
 
+def _resolve_cron_memory_mode(cfg: dict, job_id: str = "") -> tuple[bool, bool]:
+    """Return (skip_memory, memory_read_only) for cron.memory_mode."""
+    cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+    raw = cron_cfg.get("memory_mode") if isinstance(cron_cfg, dict) else None
+    if raw is None:
+        return True, False
+    if isinstance(raw, bool):
+        return (False, False) if raw else (True, False)
+
+    value = str(raw).strip().lower().replace("_", "-")
+    if value in {"", "off", "disabled", "none", "false"}:
+        return True, False
+    if value in {"read-only", "readonly"}:
+        return False, True
+    if value in {"read-write", "readwrite", "write", "true"}:
+        return False, False
+
+    label = f" for job '{job_id}'" if job_id else ""
+    logger.warning("Invalid cron.memory_mode=%r%s; using off", raw, label)
+    return True, False
+
+
 def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -1852,6 +1874,8 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 job_id, _mcp_exc,
             )
 
+        _skip_memory, _memory_read_only = _resolve_cron_memory_mode(_cfg, job_id)
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -1879,7 +1903,8 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            skip_memory=True,  # Cron system prompts would corrupt user representations
+            skip_memory=_skip_memory,
+            memory_read_only=_memory_read_only,
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
