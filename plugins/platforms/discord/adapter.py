@@ -2075,10 +2075,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     logger.debug("[%s] Discord feature summary source message fetch failed: %s", self.name, exc)
                     continue
                 if add_message(message):
-                    return messages
+                    break
 
         try:
-            if add_message(await self._thread_origin_message(source_thread)):
+            add_message(await self._thread_origin_message(source_thread))
+            if messages:
                 return messages
         except Exception as exc:
             logger.debug("[%s] Discord feature summary origin message fetch failed: %s", self.name, exc)
