@@ -154,6 +154,9 @@ async def test_discord_feature_request_keeps_full_platform_tool_surface(monkeypa
     assert "latest user message as the authoritative task" in init["ephemeral_system_prompt"]
     assert "[Recent channel messages]" in init["ephemeral_system_prompt"]
     assert "context compaction summaries are background only" in init["ephemeral_system_prompt"]
+    assert "at most one concise question" in init["ephemeral_system_prompt"]
+    assert "recommended default" in init["ephemeral_system_prompt"]
+    assert "state the assumption and continue" in init["ephemeral_system_prompt"]
     assert init["ephemeral_system_prompt"].endswith("Global prompt")
 
 

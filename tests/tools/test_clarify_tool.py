@@ -176,6 +176,13 @@ class TestClarifySchema:
         assert "description" in CLARIFY_SCHEMA
         assert len(CLARIFY_SCHEMA["description"]) > 50
 
+    def test_schema_describes_sparse_low_stakes_policy(self):
+        """Schema should discourage frequent clarification."""
+        description = CLARIFY_SCHEMA["description"].lower()
+        assert "sparingly" in description
+        assert "one concise" in description
+        assert "low-stakes" in description
+
     def test_schema_question_required(self):
         """Question parameter should be required."""
         assert "question" in CLARIFY_SCHEMA["parameters"]["required"]

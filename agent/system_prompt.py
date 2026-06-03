@@ -28,6 +28,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
+    CLARIFYING_QUESTION_GUIDANCE,
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
@@ -119,6 +120,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
+    if "clarify" in agent.valid_tool_names:
+        tool_guidance.append(CLARIFYING_QUESTION_GUIDANCE)
     if any(name.startswith("mcp_qmd_") for name in agent.valid_tool_names):
         tool_guidance.append(QMD_MCP_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the

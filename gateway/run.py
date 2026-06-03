@@ -82,7 +82,11 @@ _DISCORD_FEATURE_REQUEST_FAST_PATH_PROMPT = (
     "implementation and verification. For straightforward code/deploy asks, "
     "avoid lengthy planning/status narration, make the smallest correct change, "
     "run focused checks, and report the result concisely with PR/deploy evidence "
-    "when available."
+    "when available. Do not suppress a necessary clarifying question: ask at "
+    "most one concise question with a recommended default when the answer "
+    "materially changes user-visible behavior, scope, irreversible/public/cost/"
+    "security effects, or the definition of done. For low-stakes ambiguity, "
+    "state the assumption and continue."
 )
 
 def _kanban_dispatch_health_candidate(board_slug: str, discord_worker_boards: Any) -> bool:
