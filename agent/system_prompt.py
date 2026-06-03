@@ -321,6 +321,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # External memory provider system prompt block (additive to built-in)
     if agent._memory_manager:
+        if getattr(agent, "memory_read_only", False):
+            volatile_parts.append(
+                "Memory mode: read-only. Use injected memory and read-only memory recall tools as context only. "
+                "Do not attempt to save, update, delete, conclude, retain, or otherwise write memory from this session."
+            )
         try:
             _ext_mem_block = agent._memory_manager.build_system_prompt()
             if _ext_mem_block:
