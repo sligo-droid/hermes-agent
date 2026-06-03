@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -247,6 +248,42 @@ def test_worker_brief_is_workspace_scoped_and_cleaned(monkeypatch, tmp_path):
     assert not brief_paths[0].exists()
 
 
+def test_worker_prompt_includes_dirty_repo_preflight(monkeypatch, tmp_path):
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=subprocess.DEVNULL)
+    (tmp_path / "src.py").write_text("dirty = True\n", encoding="utf-8")
+    seen_brief = ""
+
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+
+    def fake_run(cmd, **_kwargs):
+        nonlocal seen_brief
+        brief_arg = _option(cmd, "--file")
+        assert brief_arg is not None
+        seen_brief = Path(brief_arg).read_text(encoding="utf-8")
+        return _process_result(
+            stdout=json.dumps(
+                {"type": "message", "sessionID": "ses-build", "message": "done"}
+            )
+            + "\n",
+        )
+
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_run)
+
+    result = ow.run_opencode_task(
+        "fix typo in README",
+        str(tmp_path),
+        timeout=60,
+        config=_cfg(),
+    )
+
+    assert result.error is None
+    assert "Repository state preflight:" in seen_brief
+    assert "dirty worktree" in seen_brief
+    assert "?? src.py" in seen_brief
+    assert "preserve unrelated changes" in seen_brief
+    assert "fix typo in README" in seen_brief
+
+
 def test_complex_task_runs_plan_then_build(monkeypatch, tmp_path):
     calls = []
     briefs = []
@@ -384,7 +421,8 @@ def test_sparse_json_output_recovers_final_text_from_export(monkeypatch, tmp_pat
     assert result.error is None
     assert result.final_text == "exported final"
     assert result.thread_id == "ses-export"
-    assert calls[1] == ["/bin/opencode", "export", "ses-export"]
+    export_calls = [cmd for cmd in calls if len(cmd) > 1 and cmd[1] == "export"]
+    assert export_calls == [["/bin/opencode", "export", "ses-export"]]
 
 
 def test_reasoning_levels_are_configurable_by_mode(monkeypatch, tmp_path):

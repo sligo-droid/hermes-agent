@@ -267,6 +267,43 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
     assert result["summary"] == "Changed src/parser.py and ran pytest."
 
 
+def test_delegate_includes_repo_state_preflight(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    monkeypatch.setattr(ow, "load_coding_worker_backend", lambda: ow.BACKEND_OPENCODE)
+    monkeypatch.setattr(
+        cwt,
+        "_repo_state_guard_notes",
+        lambda workdir: "Repository state preflight:\n- concerns: dirty worktree",
+    )
+
+    def fake_run(prompt, workspace, **kwargs):
+        assert "Repository state preflight:" in prompt
+        assert "dirty worktree" in prompt
+        assert "fix the parser" in prompt
+        return SimpleNamespace(
+            final_text="done",
+            error=None,
+            interrupted=False,
+            agents=["build"],
+            plan_text="",
+            thread_id="ses-build",
+            turn_id="ses-build",
+            tool_iterations=1,
+        )
+
+    monkeypatch.setattr(ow, "run_opencode_task", fake_run)
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the parser",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+
+
 def test_prepare_pnpm_dependency_links_reuses_matching_worktree(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     worktree = tmp_path / "worktree"
