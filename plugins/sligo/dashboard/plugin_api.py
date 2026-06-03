@@ -50,6 +50,9 @@ class CardIngestBody(BaseModel):
     summary: str = ""
     body: str = ""
     rationale: str = ""
+    evidence_bullets: list[str] = Field(default_factory=list)
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    proposed_worker_prompt: str = ""
     expected_outcome: str = ""
     status: str = "proposed"
     priority: str = ""
@@ -87,6 +90,9 @@ class PatchCardBody(BaseModel):
     summary: str | None = None
     body: str | None = None
     rationale: str | None = None
+    evidence_bullets: list[str] | None = None
+    acceptance_criteria: list[str] | None = None
+    proposed_worker_prompt: str | None = None
     expected_outcome: str | None = None
     priority: str | None = None
     tags: list[str] | None = None
@@ -181,8 +187,9 @@ def _card_response(card: dict[str, Any]) -> dict[str, Any]:
 
 
 def _worker_body(card: dict[str, Any], resolved: dict[str, Any], prong_cfg: dict[str, Any]) -> str:
+    prompt = card.get("proposed_worker_prompt") or prong_cfg.get("worker_prompt") or resolved["project"].get("worker_prompt")
     parts = [
-        prong_cfg.get("worker_prompt") or resolved["project"].get("worker_prompt") or "Implement the approved Sligo proposal.",
+        prompt or "Implement the approved Sligo proposal.",
         "",
         f"Proposal: {card['title']}",
     ]
@@ -194,6 +201,14 @@ def _worker_body(card: dict[str, Any], resolved: dict[str, Any], prong_cfg: dict
     ):
         if card.get(field):
             parts.extend(["", f"{label}:\n{card[field]}"])
+    evidence = card.get("evidence_bullets") or []
+    if evidence:
+        parts.extend(["", "Evidence:"])
+        parts.extend(f"- {item}" for item in evidence if item)
+    card_acceptance = card.get("acceptance_criteria") or []
+    if card_acceptance:
+        parts.extend(["", "Proposal acceptance criteria:"])
+        parts.extend(f"- {item}" for item in card_acceptance if item)
     acceptance = prong_cfg.get("acceptance_criteria") or resolved["project"].get("acceptance_criteria") or []
     if isinstance(acceptance, str):
         acceptance = [acceptance]
@@ -323,7 +338,18 @@ def ingest_proposal(body: CardIngestBody) -> dict[str, Any]:
 @router.patch("/proposals/{proposal_id}")
 def patch_proposal(proposal_id: int, body: PatchCardBody, request: Request) -> dict[str, Any]:
     updates = {key: value for key, value in _model_data(body).items() if value is not None}
-    allowed = {"title", "summary", "body", "rationale", "expected_outcome", "priority", "tags"}
+    allowed = {
+        "title",
+        "summary",
+        "body",
+        "rationale",
+        "evidence_bullets",
+        "acceptance_criteria",
+        "proposed_worker_prompt",
+        "expected_outcome",
+        "priority",
+        "tags",
+    }
     updates = {key: value for key, value in updates.items() if key in allowed}
     if not updates:
         return get_proposal(proposal_id)
@@ -333,8 +359,9 @@ def patch_proposal(proposal_id: int, body: PatchCardBody, request: Request) -> d
             now = proposals.utc_now()
             audit = card.get("audit_log", []) + [proposals.audit_event("patched", _operator(request), ",".join(sorted(updates)))]
             values = dict(updates)
-            if "tags" in values:
-                values["tags"] = proposals.json_text(values["tags"], default=[])
+            for field in ("tags", "evidence_bullets", "acceptance_criteria"):
+                if field in values:
+                    values[field] = proposals.json_text(values[field], default=[])
             values["audit_log"] = proposals.json_text(audit)
             values["updated_at"] = now
             set_clause = ", ".join(f"{col} = ?" for col in values)

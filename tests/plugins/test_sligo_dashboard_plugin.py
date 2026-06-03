@@ -83,6 +83,10 @@ def _ingest_card(client: TestClient, *, metadata: dict | None = None) -> int:
             "title": "Tighten dashboard API",
             "summary": "Add safe approval endpoints.",
             "body": "Use stored proposal content only.",
+            "rationale": "Operators need the explicit parser detail.",
+            "evidence_bullets": ["Evidence from cron output."],
+            "acceptance_criteria": ["Detail drawer shows evidence."],
+            "proposed_worker_prompt": "Use the stored worker prompt.",
             "priority": "high",
             "metadata": metadata or {},
         },
@@ -106,7 +110,14 @@ def test_read_routes_expose_projects_runs_and_proposals(client):
     assert proposals_resp.status_code == 200
     assert [p["id"] for p in proposals_resp.json()["proposals"]] == [proposal_id]
     assert proposal_resp.status_code == 200
-    assert proposal_resp.json()["proposal"]["title"] == "Tighten dashboard API"
+    detail = proposal_resp.json()["proposal"]
+    assert detail["title"] == "Tighten dashboard API"
+    assert detail["rationale"] == "Operators need the explicit parser detail."
+    assert detail["evidence_bullets"] == ["Evidence from cron output."]
+    assert detail["acceptance_criteria"] == ["Detail drawer shows evidence."]
+    assert detail["proposed_worker_prompt"] == "Use the stored worker prompt."
+    assert detail["audit_log"][0]["action"] == "ingested"
+    assert "metadata" not in detail
     assert runs_resp.status_code == 200
     assert run_resp.status_code == 200
     assert run_resp.json()["proposals"][0]["id"] == proposal_id
@@ -139,6 +150,9 @@ def test_approve_twice_is_idempotent_and_uses_configured_workspace(client, sligo
     assert task.workspace_path != "/attacker/override"
     assert task.assignee == "dev"
     assert task.status == "ready"
+    assert "Use the stored worker prompt." in task.body
+    assert "Evidence from cron output." in task.body
+    assert "Detail drawer shows evidence." in task.body
 
 
 def test_reject_records_decision_and_default_list_excludes_it(client):

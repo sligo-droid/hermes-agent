@@ -14,7 +14,7 @@ from typing import Any, Iterable
 from hermes_constants import get_hermes_home
 from hermes_cli.config import load_config
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 PROPOSAL_BLOCK_KEY = "hermes_self_improvement_proposals"
 STRUCTURED_CRON_PARSER = "cron_json_block"
@@ -51,6 +51,9 @@ CARD_PUBLIC_FIELDS = {
     "summary",
     "body",
     "rationale",
+    "evidence_bullets",
+    "acceptance_criteria",
+    "proposed_worker_prompt",
     "expected_outcome",
     "status",
     "priority",
@@ -58,6 +61,7 @@ CARD_PUBLIC_FIELDS = {
     "source_type",
     "source_id",
     "source_url",
+    "source_output_ref",
     "source_title",
     "parser_name",
     "parser_version",
@@ -72,6 +76,7 @@ CARD_PUBLIC_FIELDS = {
     "rejected_at",
     "decision_reason",
     "operator_feedback",
+    "audit_log",
     "outcome_status",
     "outcome_summary",
     "created_at",
@@ -84,6 +89,8 @@ JSON_FIELDS = {
     "source_metadata",
     "audit_log",
     "tags",
+    "evidence_bullets",
+    "acceptance_criteria",
 }
 
 VALID_RUN_STATUSES = {"ingested", "parsed", "failed", "complete"}
@@ -154,6 +161,9 @@ def migrate(conn: sqlite3.Connection) -> None:
                 summary TEXT NOT NULL DEFAULT '',
                 body TEXT NOT NULL DEFAULT '',
                 rationale TEXT NOT NULL DEFAULT '',
+                evidence_bullets TEXT NOT NULL DEFAULT '[]',
+                acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+                proposed_worker_prompt TEXT NOT NULL DEFAULT '',
                 expected_outcome TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'proposed',
                 priority TEXT NOT NULL DEFAULT '',
@@ -200,6 +210,15 @@ def migrate(conn: sqlite3.Connection) -> None:
         if "parse_error" not in existing:
             conn.execute("ALTER TABLE proposal_runs ADD COLUMN parse_error TEXT NOT NULL DEFAULT ''")
         version = 2
+    if version < 3:
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(proposal_cards)").fetchall()}
+        if "evidence_bullets" not in existing:
+            conn.execute("ALTER TABLE proposal_cards ADD COLUMN evidence_bullets TEXT NOT NULL DEFAULT '[]'")
+        if "acceptance_criteria" not in existing:
+            conn.execute("ALTER TABLE proposal_cards ADD COLUMN acceptance_criteria TEXT NOT NULL DEFAULT '[]'")
+        if "proposed_worker_prompt" not in existing:
+            conn.execute("ALTER TABLE proposal_cards ADD COLUMN proposed_worker_prompt TEXT NOT NULL DEFAULT ''")
+        version = 3
     current_version = conn.execute("PRAGMA user_version").fetchone()[0]
     if current_version != SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -255,6 +274,9 @@ def proposal_json_block_reference(project_key: str, prong_key: str) -> str:
                             "summary": "One sentence summary.",
                             "body": "Implementation notes and scope.",
                             "rationale": "Why this is worth doing.",
+                            "evidence_bullets": ["Concrete observation supporting the proposal."],
+                            "acceptance_criteria": ["Observable condition proving the worker finished."],
+                            "proposed_worker_prompt": "Prompt text to give the implementation worker.",
                             "expected_outcome": "How success is recognized.",
                             "priority": "medium",
                             "tags": ["self-improvement"],
@@ -380,6 +402,9 @@ def ingest_card(data: dict[str, Any], *, conn: sqlite3.Connection | None = None)
             "summary": text(data.get("summary")),
             "body": text(data.get("body")),
             "rationale": text(data.get("rationale")),
+            "evidence_bullets": json_text(data.get("evidence_bullets"), default=[]),
+            "acceptance_criteria": json_text(data.get("acceptance_criteria"), default=[]),
+            "proposed_worker_prompt": text(data.get("proposed_worker_prompt")),
             "expected_outcome": text(data.get("expected_outcome")),
             "status": status,
             "priority": text(data.get("priority")),
@@ -716,11 +741,20 @@ def build_feedback_context(
 
 
 def sanitize_run(record: dict[str, Any]) -> dict[str, Any]:
-    return {key: record[key] for key in RUN_PUBLIC_FIELDS if key in record}
+    item = {key: record[key] for key in RUN_PUBLIC_FIELDS if key in record}
+    ref = safe_source_output_ref(record.get("raw_input_ref"))
+    if ref:
+        item["source_output_ref"] = ref
+    return item
 
 
 def sanitize_card(record: dict[str, Any]) -> dict[str, Any]:
-    return {key: record[key] for key in CARD_PUBLIC_FIELDS if key in record}
+    item = {key: record[key] for key in CARD_PUBLIC_FIELDS if key in record}
+    item["audit_log"] = public_audit_log(record.get("audit_log", []))
+    ref = safe_source_output_ref((record.get("source_metadata") or {}).get("source_output_path"))
+    if ref:
+        item["source_output_ref"] = ref
+    return item
 
 
 def decode_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -824,6 +858,9 @@ def _normalize_structured_cards(items: list[Any]) -> list[dict[str, Any]]:
                 "summary": text(item.get("summary")),
                 "body": text(item.get("body")),
                 "rationale": text(item.get("rationale")),
+                "evidence_bullets": list_text(item.get("evidence_bullets") or item.get("evidence")),
+                "acceptance_criteria": list_text(item.get("acceptance_criteria")),
+                "proposed_worker_prompt": text(item.get("proposed_worker_prompt") or item.get("worker_prompt")),
                 "expected_outcome": text(item.get("expected_outcome")),
                 "priority": text(item.get("priority")),
                 "tags": item.get("tags") if isinstance(item.get("tags"), list) else [],
@@ -866,6 +903,30 @@ def audit_event(action: str, actor: str | None, note: str | None) -> dict[str, s
     return {"at": utc_now(), "action": action, "actor": text(actor), "note": text(note)}
 
 
+def public_audit_log(events: Any) -> list[dict[str, str]]:
+    if not isinstance(events, list):
+        return []
+    public: list[dict[str, str]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        public.append({key: text(event.get(key)) for key in ("at", "action", "actor", "note")})
+    return public
+
+
+def safe_source_output_ref(value: Any) -> str:
+    raw = text(value).strip()
+    if not raw:
+        return ""
+    try:
+        path = Path(raw).expanduser().resolve(strict=False)
+        home = get_hermes_home().resolve(strict=False)
+        path.relative_to(home / "cron" / "output")
+        return str(path)
+    except Exception:
+        return ""
+
+
 def required_str(data: dict[str, Any], key: str) -> str:
     value = text(data.get(key))
     if not value:
@@ -875,6 +936,14 @@ def required_str(data: dict[str, Any], key: str) -> str:
 
 def text(value: Any) -> str:
     return "" if value is None else str(value)
+
+
+def list_text(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [text(item).strip() for item in value if text(item).strip()]
+    if not value:
+        return []
+    return [line for line in (text(value).replace("\r", "\n").split("\n")) if line.strip()]
 
 
 def json_text(value: Any, *, default: Any = None) -> str:

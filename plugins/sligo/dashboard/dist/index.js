@@ -72,6 +72,10 @@
     return String(value).split(/\n+/).map(function (line) { return line.replace(/^[-*]\s*/, "").trim(); }).filter(Boolean);
   }
 
+  function sourceHref(proposal, run) {
+    return proposal.source_url || (run && run.source_url) || proposal.source_output_ref || (run && run.source_output_ref) || "";
+  }
+
   function StatusPill(props) {
     return h("span", { className: "sligo-pill sligo-pill--" + String(props.status || "unknown").replace(/[^a-z0-9_-]/gi, "-") }, props.children || props.status || "unknown");
   }
@@ -146,15 +150,11 @@
 
     if (!proposal) return null;
     const worker = proposal.worker || {};
-    const parserMeta = proposal.parser_metadata || {};
-    const evidence = splitLines(parserMeta.evidence || parserMeta.evidence_bullets || proposal.body);
-    const acceptance = splitLines(parserMeta.acceptance_criteria || proposal.expected_outcome);
-    const prompt = parserMeta.worker_prompt || proposal.body || "The backend will generate the worker prompt from stored proposal fields and project/prong configuration when approved.";
-    const history = [];
-    if (proposal.approved_at) history.push("Approved by " + (proposal.approved_by || "operator") + " at " + formatDate(proposal.approved_at));
-    if (proposal.rejected_at) history.push("Rejected by " + (proposal.rejected_by || "operator") + " at " + formatDate(proposal.rejected_at));
-    if (proposal.decision_reason) history.push("Decision reason: " + proposal.decision_reason);
-    if (proposal.operator_feedback) history.push("Feedback: " + proposal.operator_feedback);
+    const evidence = splitLines(proposal.evidence_bullets);
+    const acceptance = splitLines(proposal.acceptance_criteria);
+    const prompt = proposal.proposed_worker_prompt || "The backend will generate the worker prompt from stored proposal fields and project/prong configuration when approved.";
+    const source = sourceHref(proposal, run);
+    const history = Array.isArray(proposal.audit_log) ? proposal.audit_log : [];
 
     function mutate(action, payload) {
       props.onAction(proposal.id, action, payload || {});
@@ -193,11 +193,11 @@
           h("dt", null, "Parser"), h("dd", null, proposal.parser_name || (run && run.parser_name) || "unknown"),
           h("dt", null, "Parse status"), h("dd", null, (run && (run.parse_status || run.status)) || "unknown"),
         ),
-        proposal.source_url ? h("a", { href: proposal.source_url, target: "_blank", rel: "noreferrer" }, "Open source output") : h("p", { className: "sligo-muted" }, "No source output link is present on this proposal."),
+        source ? h("a", { href: source, target: "_blank", rel: "noreferrer" }, "Open source output") : h("p", { className: "sligo-muted" }, "No source output link is present on this proposal."),
       ),
       h("section", null,
         h("h3", null, "Feedback & Action History"),
-        history.length ? h("ul", null, history.map(function (item, index) { return h("li", { key: index }, item); })) : h("p", { className: "sligo-muted" }, "No operator actions have been recorded yet. Full audit log exposure is a backend contract gap."),
+        history.length ? h("ul", null, history.map(function (item, index) { return h("li", { key: index }, [formatDate(item.at), item.action, item.actor ? "by " + item.actor : "", item.note].filter(Boolean).join(" - ")); })) : h("p", { className: "sligo-muted" }, "No operator actions have been recorded yet."),
       ),
       h("section", null,
         h("h3", null, "Linked Worker"),

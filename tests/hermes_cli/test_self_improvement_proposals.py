@@ -46,10 +46,14 @@ def test_schema_includes_parse_metadata_fields(tmp_path):
     db_path = tmp_path / "proposals.db"
 
     with proposals.connect(db_path) as conn:
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(proposal_runs)").fetchall()}
+        run_columns = {row[1] for row in conn.execute("PRAGMA table_info(proposal_runs)").fetchall()}
+        card_columns = {row[1] for row in conn.execute("PRAGMA table_info(proposal_cards)").fetchall()}
 
-    assert "parse_status" in columns
-    assert "parse_error" in columns
+    assert "parse_status" in run_columns
+    assert "parse_error" in run_columns
+    assert "evidence_bullets" in card_columns
+    assert "acceptance_criteria" in card_columns
+    assert "proposed_worker_prompt" in card_columns
 
 
 def test_resolve_project_prong_supports_configured_aliases():
@@ -132,7 +136,7 @@ def test_ingest_run_and_card_are_idempotent_and_public_records_are_sanitized(tmp
     assert public_card["tags"] == ["parser", "sligo"]
     assert "idempotency_key" not in public_card
     assert "metadata" not in public_card
-    assert "audit_log" not in public_card
+    assert public_card["audit_log"][0]["action"] == "ingested"
     assert "raw_input_ref" not in public_run
     assert "metadata" not in public_run
 
@@ -261,6 +265,7 @@ def test_feedback_context_is_compact_project_prong_scoped_and_finds_recurring_pr
 
 def test_cron_json_proposal_output_ingests_cards_and_is_idempotent(tmp_path):
     hermes_home = tmp_path / "hermes-home"
+    output_path = hermes_home / "cron" / "output" / "job-1" / "run.md"
     config = {
         "self_improvement": {
             "proposals": {
@@ -281,6 +286,9 @@ def test_cron_json_proposal_output_ingests_cards_and_is_idempotent(tmp_path):
                         "summary": "Parse structured proposal blocks.",
                         "body": "Wire cron output into storage.",
                         "rationale": "Keeps review queue current.",
+                        "evidence_bullets": ["Cron emitted a structured block.", "Parser reads it."],
+                        "acceptance_criteria": ["API exposes evidence.", "Drawer shows prompt."],
+                        "proposed_worker_prompt": "Implement the ingestion hook and test it.",
                         "expected_outcome": "One card appears.",
                         "priority": "high",
                         "tags": ["cron"],
@@ -292,23 +300,30 @@ def test_cron_json_proposal_output_ingests_cards_and_is_idempotent(tmp_path):
 
     with patch.dict("os.environ", {"HERMES_HOME": str(hermes_home)}):
         first = proposals.ingest_cron_proposal_output(
-            {"id": "job-1", "name": "Daily proposals"}, output, source_output_path=tmp_path / "out.md", config=config
+            {"id": "job-1", "name": "Daily proposals"}, output, source_output_path=output_path, config=config
         )
         second = proposals.ingest_cron_proposal_output(
-            {"id": "job-1", "name": "Daily proposals"}, output, source_output_path=tmp_path / "out.md", config=config
+            {"id": "job-1", "name": "Daily proposals"}, output, source_output_path=output_path, config=config
         )
         with proposals.connect() as conn:
-            run = conn.execute("SELECT * FROM proposal_runs").fetchone()
-            cards = conn.execute("SELECT * FROM proposal_cards").fetchall()
+            run = proposals.sanitize_run(proposals.decode_row(conn.execute("SELECT * FROM proposal_runs").fetchone()))
+            cards = [proposals.sanitize_card(proposals.decode_row(row)) for row in conn.execute("SELECT * FROM proposal_cards").fetchall()]
 
     assert first["parse_status"] == "parsed"
     assert second["run_id"] == first["run_id"]
     assert run["source_type"] == "cron"
     assert run["parser_name"] == proposals.STRUCTURED_CRON_PARSER
     assert run["parse_status"] == "parsed"
+    assert run["source_output_ref"] == str(output_path)
     assert len(cards) == 1
     assert cards[0]["title"] == "Add ingestion hook"
-    assert json.loads(cards[0]["tags"]) == ["cron"]
+    assert cards[0]["tags"] == ["cron"]
+    assert cards[0]["evidence_bullets"] == ["Cron emitted a structured block.", "Parser reads it."]
+    assert cards[0]["acceptance_criteria"] == ["API exposes evidence.", "Drawer shows prompt."]
+    assert cards[0]["proposed_worker_prompt"] == "Implement the ingestion hook and test it."
+    assert cards[0]["source_output_ref"] == str(output_path)
+    assert cards[0]["audit_log"][0]["action"] == "ingested"
+    assert "metadata" not in cards[0]
 
 
 def test_cron_malformed_proposal_json_records_parse_failure(tmp_path):
@@ -365,6 +380,9 @@ def test_cron_feedback_prompt_section_is_configured_and_scoped(tmp_path):
     assert "Prefer scoped fixes." in section
     assert "Other prong" not in section
     assert proposals.PROPOSAL_BLOCK_KEY in section
+    assert "evidence_bullets" in section
+    assert "acceptance_criteria" in section
+    assert "proposed_worker_prompt" in section
 
 
 def test_invalid_status_and_json_are_rejected(tmp_path):
