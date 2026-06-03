@@ -121,8 +121,11 @@ CREATE TABLE IF NOT EXISTS proposal_cards (
     decision_reason TEXT,
     decided_by TEXT,
     decided_at INTEGER,
+    linked_kanban_board TEXT,
     linked_kanban_task_id TEXT,
     linked_worker_run_id TEXT,
+    linked_worker_url TEXT,
+    linked_worker_session_id TEXT,
     source_run_id INTEGER NOT NULL,
     source_output_path TEXT,
     source_output_sha256 TEXT,
@@ -173,6 +176,7 @@ def connect(db_path: str | Path | None = None, config: dict[str, Any] | None = N
                 try:
                     conn.row_factory = sqlite3.Row
                     conn.executescript(SCHEMA_SQL)
+                    _migrate_schema(conn)
                     conn.commit()
                 finally:
                     conn.close()
@@ -186,6 +190,18 @@ def connect(db_path: str | Path | None = None, config: dict[str, Any] | None = N
 def load_self_improvement_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
     cfg = config or load_config()
     return cfg.get("self_improvement") or DEFAULT_CONFIG["self_improvement"]
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(proposal_cards)").fetchall()}
+    additions = {
+        "linked_kanban_board": "linked_kanban_board TEXT",
+        "linked_worker_url": "linked_worker_url TEXT",
+        "linked_worker_session_id": "linked_worker_session_id TEXT",
+    }
+    for name, ddl in additions.items():
+        if name not in cols:
+            conn.execute(f"ALTER TABLE proposal_cards ADD COLUMN {ddl}")
 
 
 def list_projects(config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -555,8 +571,14 @@ def approve_proposal(
         if row is None:
             raise KeyError(card_id)
         card = sanitize_proposal(dict(row))
+        if card["status"] == "approved":
+            board = str(card.get("linked_kanban_board") or card["resolved_board"] or "default")
+            task_id = str(card.get("linked_kanban_task_id") or "")
+            return _with_worker_link(card, board=board, task_id=task_id)
         if card["status"] == "rejected":
             raise ValueError("rejected cards cannot be approved")
+        if card["status"] != "proposed":
+            raise ValueError("only proposed cards may be approved")
         validate_approval_project_workspace(card["project"], card["resolved_workspace_path"], config)
         board = str(card["resolved_board"] or "default")
         kanban_db.init_db(board=board)
@@ -575,15 +597,19 @@ def approve_proposal(
                 initial_status="running",
                 board=board,
             )
+            task = kanban_db.get_task(kb_conn, task_id)
+        worker_url = _worker_url(board, task_id)
+        worker_session_id = getattr(task, "session_id", None) if task is not None else None
         conn.execute(
             """
             UPDATE proposal_cards
             SET status = 'approved', lifecycle_status = 'worker_created', decision = 'approved',
                 decided_by = COALESCE(decided_by, ?), decided_at = COALESCE(decided_at, ?),
-                linked_kanban_task_id = ?, updated_at = ?
+                linked_kanban_board = ?, linked_kanban_task_id = ?, linked_worker_url = ?,
+                linked_worker_session_id = ?, updated_at = ?
             WHERE card_id = ?
             """,
-            (actor, now, task_id, now, card_id),
+            (actor, now, board, task_id, worker_url, worker_session_id, now, card_id),
         )
         conn.execute(
             """
@@ -613,8 +639,12 @@ def reject_proposal(
         row = conn.execute("SELECT * FROM proposal_cards WHERE card_id = ?", (card_id,)).fetchone()
         if row is None:
             raise KeyError(card_id)
+        if row["status"] == "rejected":
+            return sanitize_proposal(dict(row))
         if row["status"] == "approved":
             raise ValueError("approved cards cannot be rejected")
+        if row["status"] != "proposed":
+            raise ValueError("only proposed cards may be rejected")
         conn.execute(
             """
             UPDATE proposal_cards
@@ -859,7 +889,12 @@ def _with_worker_link(detail: dict[str, Any] | None, *, board: str, task_id: str
         raise KeyError(task_id)
     result = dict(detail)
     result["linked_kanban_board"] = board
-    result["worker"] = {"board": board, "task_id": task_id, "url": _worker_url(board, task_id)}
+    result["worker"] = {
+        "board": board,
+        "task_id": task_id,
+        "url": result.get("linked_worker_url") or _worker_url(board, task_id),
+        "session_id": result.get("linked_worker_session_id"),
+    }
     return result
 
 
@@ -914,8 +949,11 @@ def sanitize_proposal(row: dict[str, Any]) -> dict[str, Any]:
         "decision_reason": row.get("decision_reason"),
         "decided_by": row.get("decided_by"),
         "decided_at": row.get("decided_at"),
+        "linked_kanban_board": row.get("linked_kanban_board"),
         "linked_kanban_task_id": row.get("linked_kanban_task_id"),
         "linked_worker_run_id": row.get("linked_worker_run_id"),
+        "linked_worker_url": row.get("linked_worker_url"),
+        "linked_worker_session_id": row.get("linked_worker_session_id"),
         "source_output_path": row.get("source_output_path"),
         "source_output_sha256": row.get("source_output_sha256"),
         "source_timestamp": row.get("source_timestamp"),

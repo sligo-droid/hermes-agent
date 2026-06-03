@@ -274,6 +274,61 @@ def test_feedback_context_summarizes_approved_rejected_preferences_and_edges(tmp
     assert "Prefer read-only observability with tiny worker prompts." in preference_bodies
 
 
+def test_approve_is_idempotent_and_records_one_audit_event(tmp_path):
+    cfg = _config(tmp_path)
+    sip.ingest_proposal_output(metadata={"proposal_json": json.dumps(_payload()), "cron_run_id": "run-a"}, config=cfg)
+    card_id = sip.list_proposals(config=cfg)[0]["card_id"]
+
+    first = sip.approve_proposal(card_id, actor="operator", config=cfg)
+    second = sip.approve_proposal(card_id, actor="operator", config=cfg)
+
+    assert second["linked_kanban_task_id"] == first["linked_kanban_task_id"]
+    assert second["linked_kanban_board"] == "sligo-board"
+    assert second["linked_worker_url"]
+    assert second["worker"]["url"] == first["worker"]["url"]
+    feedback = sip.list_feedback(card_id, config=cfg)
+    assert [item["feedback_type"] for item in feedback] == ["approve"]
+    with sip.kanban_db.connect(board="sligo-board") as conn:
+        rows = conn.execute("SELECT * FROM tasks WHERE idempotency_key = ?", (f"self-improvement:{card_id}",)).fetchall()
+    assert len(rows) == 1
+
+
+def test_approve_after_linked_task_archived_returns_existing_link_without_new_task(tmp_path):
+    cfg = _config(tmp_path)
+    sip.ingest_proposal_output(metadata={"proposal_json": json.dumps(_payload()), "cron_run_id": "run-a"}, config=cfg)
+    card_id = sip.list_proposals(config=cfg)[0]["card_id"]
+    approved = sip.approve_proposal(card_id, actor="operator", config=cfg)
+    task_id = approved["linked_kanban_task_id"]
+
+    with sip.kanban_db.connect(board="sligo-board") as conn:
+        conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (task_id,))
+
+    repeated = sip.approve_proposal(card_id, actor="operator", config=cfg)
+
+    assert repeated["linked_kanban_task_id"] == task_id
+    assert repeated["worker"]["task_id"] == task_id
+    feedback = sip.list_feedback(card_id, config=cfg)
+    assert [item["feedback_type"] for item in feedback] == ["approve"]
+    with sip.kanban_db.connect(board="sligo-board") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?", (f"self-improvement:{card_id}",)).fetchone()[0] == 1
+
+
+def test_repeated_reject_is_idempotent_and_records_one_audit_event(tmp_path):
+    cfg = _config(tmp_path)
+    sip.ingest_proposal_output(metadata={"proposal_json": json.dumps(_payload()), "cron_run_id": "run-a"}, config=cfg)
+    card_id = sip.list_proposals(config=cfg)[0]["card_id"]
+
+    first = sip.reject_proposal(card_id, reason="Too broad", strength="strong", actor="operator", config=cfg)
+    second = sip.reject_proposal(card_id, reason="Different reason", strength="weak", actor="other", config=cfg)
+
+    assert second["status"] == "rejected"
+    assert second["decision_reason"] == first["decision_reason"] == "Too broad"
+    feedback = sip.list_feedback(card_id, config=cfg)
+    assert len(feedback) == 1
+    assert feedback[0]["feedback_type"] == "reject"
+    assert feedback[0]["body"] == "Too broad"
+
+
 def test_feedback_context_handles_missing_feedback_and_malformed_metadata(tmp_path):
     cfg = _config(tmp_path)
     sip.ingest_proposal_output(metadata={"proposal_json": json.dumps(_payload()), "cron_run_id": "run-a"}, config=cfg)
