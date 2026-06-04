@@ -337,6 +337,23 @@ class TestGoalManager:
         assert mgr.state.status == "active"
         assert mgr.state.turns_used == 1
 
+    def test_evaluate_after_turn_accumulates_runtime(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="eval-runtime", default_max_turns=5)
+        mgr.set("a long goal")
+
+        with patch.object(goals, "judge_goal", return_value=("continue", "more work", False)):
+            decision = mgr.evaluate_after_turn(
+                "made some progress",
+                runtime_breakdown={"wall_s": 5, "model_s": 3, "tools_s": 1, "overhead_s": 1},
+            )
+
+        assert decision["runtime_breakdown"]["scope"] == "goal"
+        assert decision["runtime_breakdown"]["wall_s"] == 5
+        assert mgr.state.runtime_breakdown["model_s"] == 3
+
     def test_evaluate_after_turn_blocked_pauses(self, hermes_home):
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager

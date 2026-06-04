@@ -1152,6 +1152,8 @@ def test_persisted_board_run_summary_drives_terminal_surfaces(monkeypatch, tmp_p
     assert summary["review"]["final_verdict"]["status"] == "approved"
     assert summary["pr"]["checks_status"] == "passed"
     assert summary["verification_commands"][0]["command"].startswith("scripts/run_tests.sh")
+    assert summary["runtime_breakdown"]["scope"] == "discord_worker_board"
+    assert {phase["name"] for phase in summary["runtime_breakdown"]["phases"]} >= {"Build", "Review"}
     assert dwb.board_run_summary_path(board.slug).exists()
 
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]

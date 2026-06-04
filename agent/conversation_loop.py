@@ -57,6 +57,7 @@ from agent.model_metadata import (
 )
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
+from agent.runtime_breakdown import build_turn_runtime_breakdown
 from agent.retry_utils import jittered_backoff
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
@@ -174,6 +175,25 @@ def _log_turn_runtime_summary(
         logger.info("turn_runtime_summary %s", json.dumps(payload, sort_keys=True))
     except Exception:
         logger.debug("turn runtime summary log failed", exc_info=True)
+
+
+def _current_turn_runtime_breakdown(agent: Any, total_elapsed_s: float, scope: str = "agent_turn") -> dict[str, Any]:
+    stats = getattr(agent, "_turn_runtime_stats", None)
+    if not isinstance(stats, dict):
+        return {}
+    try:
+        return build_turn_runtime_breakdown(stats, total_elapsed_s=total_elapsed_s, scope=scope)
+    except Exception:
+        logger.debug("turn runtime breakdown build failed", exc_info=True)
+        return {}
+
+
+def _attach_runtime_breakdown(result: dict[str, Any], agent: Any, total_elapsed_s: float, scope: str = "agent_turn") -> dict[str, Any]:
+    if isinstance(result, dict) and "runtime_breakdown" not in result:
+        breakdown = _current_turn_runtime_breakdown(agent, total_elapsed_s, scope=scope)
+        if breakdown:
+            result["runtime_breakdown"] = breakdown
+    return result
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -965,6 +985,12 @@ def run_conversation(
             ),
             interrupted=bool(_codex_result.get("interrupted")),
             response_len=len(_codex_result.get("final_response") or ""),
+        )
+        _attach_runtime_breakdown(
+            _codex_result,
+            agent,
+            time.perf_counter() - _turn_runtime_started_at,
+            scope="agent_turn",
         )
         return _codex_result
 
@@ -4815,6 +4841,12 @@ def run_conversation(
         "cost_source": agent.session_cost_source,
         "session_id": agent.session_id,
     }
+    _attach_runtime_breakdown(
+        result,
+        agent,
+        time.perf_counter() - _turn_runtime_started_at,
+        scope="agent_turn",
+    )
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # If a /steer landed after the final assistant turn (no more tool

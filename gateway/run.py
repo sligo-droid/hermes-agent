@@ -3224,6 +3224,10 @@ class GatewayRunner:
             message_id=event.message_id,
             channel_prompt=event.channel_prompt,
         )
+        if isinstance(getattr(event, "feature_summary", None), dict):
+            goal_event.feature_summary = event.feature_summary
+        if isinstance(getattr(event, "project_summary", None), dict):
+            goal_event.project_summary = event.project_summary
         self._enqueue_fifo(session_key, goal_event, adapter)
 
     def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
@@ -4604,6 +4608,7 @@ class GatewayRunner:
             status=str(item.get("summary_status") or "Complete"),
             session_id=item.get("session_id"),
             title=item.get("title"),
+            runtime_breakdown=item.get("runtime_breakdown") if isinstance(item.get("runtime_breakdown"), dict) else None,
         )
         if summary_ok:
             ledger.mark_summary_updated(work_id)
@@ -10182,6 +10187,7 @@ class GatewayRunner:
                             session_entry=session_entry,
                             source=source,
                             final_response=_final_text,
+                            runtime_breakdown=_agent_result.get("runtime_breakdown") if isinstance(_agent_result, dict) else None,
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
@@ -11391,6 +11397,7 @@ class GatewayRunner:
                         title=title,
                         feature_summary=getattr(event, "feature_summary", None),
                         project_summary=getattr(event, "project_summary", None),
+                        runtime_breakdown=agent_result.get("runtime_breakdown") if isinstance(agent_result, dict) else None,
                         already_delivered=bool(agent_result.get("already_sent"))
                         and not agent_result.get("failed"),
                     )
@@ -11623,6 +11630,7 @@ class GatewayRunner:
                     final_response=response,
                     status=summary_status,
                     session_id=session_entry.session_id,
+                    runtime_breakdown=agent_result.get("runtime_breakdown") if isinstance(agent_result, dict) else None,
                 )
                 if work_item_id and source.platform == Platform.DISCORD and summary_ok:
                     try:
@@ -13865,6 +13873,8 @@ class GatewayRunner:
         try:
             dispatch_start_ts = time.time()
             state = mgr.set(args)
+            if isinstance(getattr(event, "feature_summary", None), dict):
+                event.feature_summary["title"] = self._fallback_discord_feature_title(event.feature_summary)
         except ValueError as exc:
             return t("gateway.goal.invalid", error=str(exc))
 
@@ -14137,6 +14147,7 @@ class GatewayRunner:
         status: str = "Complete",
         session_id: Optional[str] = None,
         title: Optional[str] = None,
+        runtime_breakdown: Optional[Dict[str, Any]] = None,
     ) -> bool:
         if source.platform != Platform.DISCORD:
             return True
@@ -14157,17 +14168,34 @@ class GatewayRunner:
         )
         if feature_summary and not title and not has_feature_kanban:
             title = self._fallback_discord_feature_title(feature_summary)
+        if feature_summary and not has_feature_kanban and session_id:
+            initial_request = str(feature_summary.get("initial_request") or "").strip()
+            if re.match(r"^/goal(?:\s|$)", initial_request, flags=re.IGNORECASE):
+                try:
+                    from hermes_cli.goals import GoalManager
+
+                    state = GoalManager(session_id=session_id).state
+                    accumulated = getattr(state, "runtime_breakdown", None) if state is not None else None
+                    if isinstance(accumulated, dict) and accumulated:
+                        runtime_breakdown = accumulated
+                except Exception:
+                    logger.debug("Discord goal runtime summary lookup failed", exc_info=True)
         if feature_summary and hasattr(adapter, "update_feature_summary"):
             try:
                 concise_response = await asyncio.to_thread(
                     self._summarize_discord_feature_outcome,
                     final_response,
                 )
+                update_kwargs = {
+                    "final_response": concise_response,
+                    "status": status,
+                    "title": title,
+                }
+                if runtime_breakdown is not None:
+                    update_kwargs["runtime_breakdown"] = runtime_breakdown
                 result = await adapter.update_feature_summary(
                     feature_summary,
-                    final_response=concise_response,
-                    status=status,
-                    title=title,
+                    **update_kwargs,
                 )
                 return bool(result) if result is not None else True
             except Exception:
@@ -14205,6 +14233,7 @@ class GatewayRunner:
                 final_response=final_response,
                 status=status,
                 session_id=session_id,
+                runtime_breakdown=(agent_result or {}).get("runtime_breakdown") if isinstance(agent_result, dict) else None,
             )
             if summary_ok and work_item_id:
                 try:
@@ -14229,6 +14258,7 @@ class GatewayRunner:
         session_entry: Any,
         source: Any,
         final_response: str,
+        runtime_breakdown: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -14270,7 +14300,11 @@ class GatewayRunner:
         if not mgr.is_active():
             return
 
-        decision = mgr.evaluate_after_turn(final_response or "", user_initiated=True)
+        decision = mgr.evaluate_after_turn(
+            final_response or "",
+            user_initiated=True,
+            runtime_breakdown=runtime_breakdown,
+        )
         msg = decision.get("message") or ""
 
         # Defer the status line until after the adapter has delivered the
@@ -20512,6 +20546,7 @@ class GatewayRunner:
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
                     "context_length": _context_length,
+                    "runtime_breakdown": result.get("runtime_breakdown") if isinstance(result.get("runtime_breakdown"), dict) else None,
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -20679,6 +20714,7 @@ class GatewayRunner:
                                         status="Complete",
                                         session_id=effective_session_id,
                                         title=title,
+                                        runtime_breakdown=result.get("runtime_breakdown") if isinstance(result.get("runtime_breakdown"), dict) else None,
                                     ),
                                     _loop_for_step,
                                 )
@@ -20729,6 +20765,7 @@ class GatewayRunner:
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
+                "runtime_breakdown": result.get("runtime_breakdown") if isinstance(result.get("runtime_breakdown"), dict) else None,
             }
         
         # Start progress message sender if enabled
