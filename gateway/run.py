@@ -2179,6 +2179,8 @@ class GatewayRunner:
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
         self._kanban_dispatch_dirty_event = asyncio.Event()
+        self._kanban_dispatch_dirty_marker_ns = 0
+        self._kanban_foreman_dirty_marker_ns = 0
         self._exit_cleanly = False
         self._exit_with_failure = False
         self._exit_reason: Optional[str] = None
@@ -6075,19 +6077,51 @@ class GatewayRunner:
             logger.debug("kanban dispatcher: dirty signal failed", exc_info=True)
             return False
 
-    def _discord_worker_dispatch_marker_changed(self) -> bool:
-        """Return True when a Discord role subprocess requested dispatch."""
+    def _discord_worker_dirty_marker_changed(self, marker_state_attr: str) -> bool:
+        """Return True when a Discord worker subprocess updated the dirty marker."""
         try:
             from hermes_cli import discord_worker_boards as _dwb
 
             marker = _dwb.dispatch_dirty_marker_mtime_ns()
         except Exception:
             return False
-        last = int(getattr(self, "_kanban_dispatch_dirty_marker_ns", 0) or 0)
+        last = int(getattr(self, marker_state_attr, 0) or 0)
         if marker <= 0 or marker <= last:
             return False
-        self._kanban_dispatch_dirty_marker_ns = marker
+        setattr(self, marker_state_attr, marker)
         return True
+
+    def _discord_worker_dispatch_marker_changed(self) -> bool:
+        """Return True when a Discord role subprocess requested dispatch."""
+        return self._discord_worker_dirty_marker_changed("_kanban_dispatch_dirty_marker_ns")
+
+    async def _sleep_until_discord_worker_dirty_or_timeout(
+        self,
+        interval: float,
+        *,
+        marker_state_attr: str,
+        event: Optional[asyncio.Event] = None,
+    ) -> bool:
+        """Sleep until a dirty marker/event wakes this watcher or timeout expires."""
+        remaining = max(float(interval or 0), 0.0)
+        while getattr(self, "_running", True) and remaining > 0:
+            if self._discord_worker_dirty_marker_changed(marker_state_attr):
+                return True
+            step = min(1.0, remaining)
+            if event is None:
+                await asyncio.sleep(step)
+            else:
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=step)
+                except asyncio.TimeoutError:
+                    remaining -= step
+                    continue
+                event.clear()
+                return True
+            remaining -= step
+        if self._discord_worker_dirty_marker_changed(marker_state_attr):
+            return True
+        return False
 
     async def _sleep_until_kanban_dispatch_due(self, interval: float) -> bool:
         """Sleep until the next dispatcher tick or an explicit dirty signal.
@@ -6095,21 +6129,11 @@ class GatewayRunner:
         Returns True when a dirty signal woke the sleep early, False on timeout.
         """
         event = self._ensure_kanban_dispatch_dirty_event()
-        remaining = max(float(interval or 0), 0.0)
-        while getattr(self, "_running", True) and remaining > 0:
-            if self._discord_worker_dispatch_marker_changed():
-                return True
-            step = min(1.0, remaining)
-            try:
-                await asyncio.wait_for(event.wait(), timeout=step)
-            except asyncio.TimeoutError:
-                remaining -= step
-                continue
-            event.clear()
-            return True
-        if self._discord_worker_dispatch_marker_changed():
-            return True
-        return False
+        return await self._sleep_until_discord_worker_dirty_or_timeout(
+            interval,
+            marker_state_attr="_kanban_dispatch_dirty_marker_ns",
+            event=event,
+        )
 
     def _log_gateway_flow_telemetry(
         self,
@@ -7790,7 +7814,10 @@ class GatewayRunner:
                     logger.exception("discord foreman: unexpected watcher error")
 
                 if self._running:
-                    await asyncio.sleep(interval)
+                    await self._sleep_until_discord_worker_dirty_or_timeout(
+                        interval,
+                        marker_state_attr="_kanban_foreman_dirty_marker_ns",
+                    )
         finally:
             self._discord_worker_foreman_watcher_active = False
             if lock_acquired:

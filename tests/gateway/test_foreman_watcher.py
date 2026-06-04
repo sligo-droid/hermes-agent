@@ -1,4 +1,5 @@
 import asyncio
+import time
 from types import SimpleNamespace
 
 from gateway.config import Platform
@@ -597,3 +598,54 @@ def test_foreman_watcher_active_guard_prevents_duplicate_runner_loop(monkeypatch
     asyncio.run(runner._discord_worker_foreman_watcher())
 
     assert runner.adapters[Platform.DISCORD].sent == []
+
+
+def test_foreman_dirty_marker_wakes_sleep_before_full_interval(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+
+    async def run():
+        from hermes_cli import discord_worker_boards as dwb
+
+        runner = _runner(ForemanAdapter())
+        runner._kanban_foreman_dirty_marker_ns = dwb.dispatch_dirty_marker_mtime_ns()
+
+        async def mark_soon():
+            await asyncio.sleep(0.05)
+            dwb.mark_dispatch_dirty(board="discord-1", reason="self-improvement-approved")
+
+        marker_task = asyncio.create_task(mark_soon())
+        started = time.monotonic()
+        woke = await runner._sleep_until_discord_worker_dirty_or_timeout(
+            5.0,
+            marker_state_attr="_kanban_foreman_dirty_marker_ns",
+        )
+        elapsed = time.monotonic() - started
+        await marker_task
+
+        assert woke is True
+        assert elapsed < 2.0
+
+    asyncio.run(run())
+
+
+def test_dispatcher_and_foreman_dirty_marker_state_do_not_interfere(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+
+    async def run():
+        from hermes_cli import discord_worker_boards as dwb
+
+        runner = _runner(ForemanAdapter())
+        current_marker = dwb.dispatch_dirty_marker_mtime_ns()
+        runner._kanban_dispatch_dirty_marker_ns = current_marker
+        runner._kanban_foreman_dirty_marker_ns = current_marker
+
+        dwb.mark_dispatch_dirty(board="discord-1", reason="self-improvement-approved")
+
+        assert await runner._sleep_until_kanban_dispatch_due(0) is True
+        assert await runner._sleep_until_discord_worker_dirty_or_timeout(
+            0,
+            marker_state_attr="_kanban_foreman_dirty_marker_ns",
+        ) is True
+        assert runner._kanban_dispatch_dirty_marker_ns == runner._kanban_foreman_dirty_marker_ns
+
+    asyncio.run(run())
