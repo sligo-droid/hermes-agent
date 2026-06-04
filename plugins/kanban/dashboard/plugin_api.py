@@ -52,6 +52,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from self_improvement import proposal_storage
 
 log = logging.getLogger(__name__)
 
@@ -1247,6 +1248,39 @@ def list_active_workers(
         return {"workers": workers, "count": len(workers), "checked_at": int(time.time())}
     finally:
         conn.close()
+
+
+@router.get("/self-improvement/proposals")
+def self_improvement_proposals_endpoint():
+    """Grouped self-improvement proposal cards for the dashboard.
+
+    Response shape: ``{projects:[{project, prongs:[{prong, cards:[...]}]}]}``.
+    Cards include source cron identifiers and the embedded future Kanban task
+    payload, but this endpoint is read-only and never creates Kanban tasks.
+    """
+
+    return proposal_storage.grouped_cards()
+
+
+@router.get("/self-improvement/proposals/{proposal_id}")
+def self_improvement_proposal_detail_endpoint(proposal_id: str):
+    card = proposal_storage.get_card(proposal_id)
+    if card is None:
+        raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")
+    return {"card": card}
+
+
+@router.get("/self-improvement/runs/{run_id}")
+def self_improvement_run_detail_endpoint(run_id: str):
+    run = proposal_storage.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"proposal run {run_id!r} not found")
+    return {"run": run}
+
+
+@router.get("/self-improvement/parse-failures")
+def self_improvement_parse_failures_endpoint():
+    return proposal_storage.list_parse_failures()
 
 
 @router.get("/runs/{run_id}")
