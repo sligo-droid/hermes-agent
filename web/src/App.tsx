@@ -44,6 +44,7 @@ import {
   Star,
   Terminal,
   Users,
+  Workflow,
   Wrench,
   X,
   Zap,
@@ -75,8 +76,7 @@ import SkillsPage from "@/pages/SkillsPage";
 import PluginsPage from "@/pages/PluginsPage";
 import ChatPage from "@/pages/ChatPage";
 import WorkerConsolePage from "@/pages/WorkerConsolePage";
-import SelfImprovementBoardPage from "@/pages/SelfImprovementBoardPage";
-import SligoOperatorPage from "@/pages/SligoOperatorPage";
+import CommandCenterPage from "@/pages/CommandCenterPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -129,15 +129,15 @@ const WORKERS_NAV_ITEM: NavItem = {
   reloadDocument: true,
 };
 
-const SLIGO_NAV_ITEM: NavItem = {
+const COMMAND_CENTER_NAV_ITEM: NavItem = {
   path: "/sligo",
-  label: "Sligo Home",
-  icon: Home,
+  label: "Command Center",
+  icon: Workflow,
 };
 
-const SELF_IMPROVEMENT_NAV_ITEM: NavItem = {
-  path: "/self-improvement",
-  label: "Self-Improvement",
+const COMMAND_CENTER_RECOMMENDATIONS_NAV_ITEM: NavItem = {
+  path: "/sligo/recommendations",
+  label: "Recommendations",
   icon: Sparkles,
 };
 
@@ -163,21 +163,39 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/config": ConfigPage,
   "/env": EnvPage,
   "/docs": DocsPage,
-  "/sligo": SligoOperatorPage,
-  "/self-improvement": SelfImprovementBoardPage,
+  "/sligo": CommandCenterPage,
+  "/sligo/inbox": CommandCenterPage,
+  "/sligo/work": CommandCenterPage,
+  "/sligo/runs": CommandCenterPage,
+  "/sligo/recommendations": CommandCenterPage,
+  "/sligo/sources": CommandCenterPage,
+  "/command-center": CommandCenterPage,
+  "/self-improvement": CommandCenterPage,
   "/workers/:sessionId/tickets/:taskId/console": WorkerConsolePage,
 };
 
 const HERMES_HOST_REDIRECT_ROUTES: Record<string, ComponentType> = {
   "/sligo": HermesToSligoRedirect,
+  "/sligo/inbox": HermesToSligoRedirect,
+  "/sligo/work": HermesToSligoRedirect,
+  "/sligo/runs": HermesToSligoRedirect,
+  "/sligo/recommendations": HermesToSligoRedirect,
+  "/sligo/sources": HermesToSligoRedirect,
+  "/command-center": HermesToSligoRedirect,
   "/self-improvement": HermesToSligoRedirect,
   "/workers/:sessionId/tickets/:taskId/console": HermesToSligoRedirect,
 };
 
 const SLIGO_ROUTES: Record<string, ComponentType> = {
-  "/": SligoOperatorPage,
-  "/sligo": SligoOperatorPage,
-  "/self-improvement": SelfImprovementBoardPage,
+  "/": CommandCenterPage,
+  "/sligo": CommandCenterPage,
+  "/sligo/inbox": CommandCenterPage,
+  "/sligo/work": CommandCenterPage,
+  "/sligo/runs": CommandCenterPage,
+  "/sligo/recommendations": CommandCenterPage,
+  "/sligo/sources": CommandCenterPage,
+  "/command-center": CommandCenterPage,
+  "/self-improvement": CommandCenterPage,
   "/workers/:sessionId/tickets/:taskId/console": WorkerConsolePage,
 };
 
@@ -367,7 +385,7 @@ function buildRoutes(
 
 const SIDEBAR_COLLAPSED_KEY = "hermes-sidebar-collapsed";
 
-function SligoNavLink({ children, to }: { children: ReactNode; to: string }) {
+function SligoNavLink({ children, to, end = to === "/sligo" }: { children: ReactNode; to: string; end?: boolean }) {
   return (
     <NavLink
       className={({ isActive }) =>
@@ -377,6 +395,7 @@ function SligoNavLink({ children, to }: { children: ReactNode; to: string }) {
           isActive && "bg-cyan-200/12 text-cyan-50 ring-1 ring-cyan-200/25",
         )
       }
+      end={end}
       to={to}
     >
       {children}
@@ -407,8 +426,12 @@ function SligoSurfaceShell({ routes }: { routes: DashboardRoute[] }) {
 
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
             <nav aria-label="Sligo operator navigation" className="flex flex-wrap gap-1 rounded-full border border-white/10 bg-white/[0.035] p-1">
-              <SligoNavLink to="/sligo">Home</SligoNavLink>
-              <SligoNavLink to="/self-improvement">Proposal tickets</SligoNavLink>
+              <SligoNavLink to="/sligo">Command Center</SligoNavLink>
+              <SligoNavLink to="/sligo/inbox">Inbox</SligoNavLink>
+              <SligoNavLink to="/sligo/work">Work</SligoNavLink>
+              <SligoNavLink to="/sligo/runs">Runs</SligoNavLink>
+              <SligoNavLink to="/sligo/recommendations">Recommendations</SligoNavLink>
+              <SligoNavLink to="/sligo/sources">Sources</SligoNavLink>
               <a
                 className="rounded-full px-3 py-2 text-sm font-medium text-slate-300 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-200/70"
                 href="/workers"
@@ -524,7 +547,7 @@ export default function App() {
 
   const builtinNav = useMemo(() => {
     if (dashboardSurface === "sligo") {
-      return [SLIGO_NAV_ITEM, SELF_IMPROVEMENT_NAV_ITEM, WORKERS_NAV_ITEM];
+      return [COMMAND_CENTER_NAV_ITEM, COMMAND_CENTER_RECOMMENDATIONS_NAV_ITEM, WORKERS_NAV_ITEM];
     }
     const base = embeddedChat
       ? [CHAT_NAV_ITEM, ...BUILTIN_NAV_REST]
@@ -541,7 +564,7 @@ export default function App() {
       if (dashboardSurface !== "combined") return nav;
       return {
         ...nav,
-        pluginItems: [SLIGO_NAV_ITEM, SELF_IMPROVEMENT_NAV_ITEM, WORKERS_NAV_ITEM, ...nav.pluginItems],
+        pluginItems: [COMMAND_CENTER_NAV_ITEM, COMMAND_CENTER_RECOMMENDATIONS_NAV_ITEM, WORKERS_NAV_ITEM, ...nav.pluginItems],
       };
     },
     [builtinNav, dashboardSurface, manifests],
@@ -552,20 +575,29 @@ export default function App() {
   );
   const pluginTabMeta = useMemo(
     () => {
+      const commandCenterTabs = [
+        { path: "/sligo", label: "Command Center" },
+        { path: "/sligo/inbox", label: "Inbox" },
+        { path: "/sligo/work", label: "Work" },
+        { path: "/sligo/runs", label: "Runs" },
+        { path: "/sligo/recommendations", label: "Recommendations" },
+        { path: "/sligo/sources", label: "Sources" },
+        { path: "/command-center", label: "Command Center" },
+        { path: "/self-improvement", label: "Recommendations" },
+        { path: "/workers", label: "Workers" },
+      ];
       if (dashboardSurface === "sligo") {
-        return [
-          { path: "/", label: "Sligo Home" },
-          { path: "/sligo", label: "Sligo Home" },
-          { path: "/self-improvement", label: "Self-Improvement" },
-          { path: "/workers", label: "Workers" },
-        ];
+        return [{ path: "/", label: "Command Center" }, ...commandCenterTabs];
       }
-      return manifests
+      return [
+        ...commandCenterTabs,
+        ...manifests
         .filter((m) => !m.tab.hidden)
         .map((m) => ({
           path: m.tab.override ?? m.tab.path,
           label: m.label,
-        }));
+        })),
+      ];
     },
     [dashboardSurface, manifests],
   );
@@ -925,7 +957,7 @@ function SidebarNavLink({
     >
       <NavLink
         to={path}
-        end={path === "/sessions"}
+        end={path === "/sessions" || path === "/sligo"}
         reloadDocument={item.reloadDocument}
         onClick={closeMobile}
         aria-label={collapsed ? navLabel : undefined}

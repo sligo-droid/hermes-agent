@@ -395,8 +395,9 @@ async def auth_middleware(request: Request, call_next):
 
 def _is_sligo_operator_path(path: str) -> bool:
     return (
-        path in {"/sligo", "/self-improvement", "/workers"}
+        path in {"/sligo", "/command-center", "/self-improvement", "/workers"}
         or path.startswith("/sligo/")
+        or path.startswith("/command-center/")
         or path.startswith("/self-improvement/")
         or path.startswith("/workers/")
         # Legacy/public worker board URLs should move with the Workers surface.

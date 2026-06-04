@@ -549,24 +549,41 @@ def format_feedback_history_context(summary: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def grouped_cards(*, db_path: Path | None = None) -> dict[str, Any]:
+def list_cards(
+    *,
+    include_rejected: bool = False,
+    include_archived: bool = False,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    """Return proposal cards as a flat list for aggregate dashboards."""
+
     init_db(db_path)
     conn = connect(db_path)
     try:
+        where: list[str] = []
+        if not include_rejected:
+            where.append("c.status != 'rejected'")
+        if not include_archived:
+            where.append("c.archived_at IS NULL")
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
         rows = conn.execute(
-            """
+            f"""
             SELECT c.*, r.source_key, r.run_id, r.cron_job_id, r.cron_output_path
             FROM proposal_cards c
             JOIN proposal_runs r ON r.id = c.run_db_id
-            WHERE c.status != 'rejected' AND c.archived_at IS NULL
+            {where_sql}
             ORDER BY c.project, c.prong, c.created_at DESC, c.proposal_id
             """
         ).fetchall()
+        return {"cards": [_row_to_card(row) for row in rows]}
     finally:
         conn.close()
+
+
+def grouped_cards(*, db_path: Path | None = None) -> dict[str, Any]:
+    cards = list_cards(db_path=db_path).get("cards", [])
     projects: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        card = _row_to_card(row)
+    for card in cards:
         project = projects.setdefault(card["project"], {"project": card["project"], "prongs": {}})
         prong = project["prongs"].setdefault(card["prong"], {"prong": card["prong"], "cards": []})
         prong["cards"].append(card)

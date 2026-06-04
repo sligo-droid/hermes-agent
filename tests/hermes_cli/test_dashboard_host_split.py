@@ -14,11 +14,22 @@ def test_hermes_host_sligo_paths_redirect_before_dashboard_auth():
     assert response.status_code == 307
     assert response.headers["location"] == "https://sligo.sligolabs.com/sligo?proposal=1"
 
+    alias_response = client.get(
+        "/command-center",
+        headers={"host": "hermes.sligolabs.com"},
+        follow_redirects=False,
+    )
+    assert alias_response.status_code == 307
+    assert alias_response.headers["location"] == "https://sligo.sligolabs.com/command-center"
+
 
 def test_sligo_operator_path_matches_sections_and_legacy_worker_urls():
     for path in (
         "/sligo",
         "/sligo/",
+        "/sligo/work",
+        "/command-center",
+        "/command-center/",
         "/self-improvement",
         "/self-improvement/",
         "/workers",
