@@ -64,6 +64,11 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 DEFAULT_REVIEW_LOOP_LIMIT = 5
 FOREMAN_REVIEW_LOOP_LIMIT = 3
+PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL = "after_review_approval"
+MERGE_POLICY_AUTO = "auto"
+MERGE_POLICY_MANUAL = "manual"
+MERGE_POLICY_NEVER = "never"
+VALID_MERGE_POLICIES = frozenset({MERGE_POLICY_AUTO, MERGE_POLICY_MANUAL, MERGE_POLICY_NEVER})
 _DISCORD_MESSAGE_URL_RE = re.compile(
     r"https?://(?:canary\.|ptb\.)?discord(?:app)?\.com/channels/"
     r"(?P<guild>\d+)/(?P<channel>\d+)/(?P<message>\d+)"
@@ -94,6 +99,58 @@ def _now() -> int:
 def _is_foreman_generated_request(request: object) -> bool:
     text = str(request or "").lstrip()
     return text.startswith("Foreman escalation:") or text.startswith("/goal Foreman escalation:")
+
+
+def pr_policy_for_request(request: object) -> dict[str, str]:
+    """Infer board-level PR policy from the user's request.
+
+    Ambiguous implementation requests should take the normal Sligo path:
+    open a PR after reviewer approval, wait for checks, then merge. Explicit
+    review-only / do-not-merge wording overrides that default.
+    """
+    text = re.sub(r"\s+", " ", str(request or "")).strip().casefold()
+    merge_policy = MERGE_POLICY_AUTO
+    if _request_forbids_merge(text):
+        merge_policy = MERGE_POLICY_NEVER
+    elif _request_requires_manual_merge(text):
+        merge_policy = MERGE_POLICY_MANUAL
+    return {
+        "pr_open_policy": PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL,
+        "merge_policy": merge_policy,
+    }
+
+
+def _request_forbids_merge(text: str) -> bool:
+    if not text:
+        return False
+    patterns = (
+        r"\bdo\s+not\s+merge\b",
+        r"\bdon['’]?t\s+merge\b",
+        r"\bdont\s+merge\b",
+        r"\bwithout\s+merging\b",
+        r"\bunmerged\b",
+        r"\bopen\s+(?:a\s+)?(?:pull\s+request|pr)\s+only\b",
+        r"\b(?:pull\s+request|pr)\s+only\b",
+        r"\bleave\s+(?:the\s+)?(?:pull\s+request|pr)\s+open\b",
+        r"\bkeep\s+(?:the\s+)?(?:pull\s+request|pr)\s+open\b",
+        r"\bopen\s+(?:a\s+)?(?:pull\s+request|pr)\b.{0,80}\b(?:do\s+not|don['’]?t|dont)\s+merge\b",
+        r"\b(?:do\s+not|don['’]?t|dont)\s+land\b",
+        r"\breview[-\s]?only\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _request_requires_manual_merge(text: str) -> bool:
+    if not text:
+        return False
+    patterns = (
+        r"\bmanual\s+merge\b",
+        r"\bmerge\s+manually\b",
+        r"\bdo\s+not\s+auto[-\s]?merge\b",
+        r"\bno\s+auto[-\s]?merge\b",
+        r"\bwait\s+for\s+(?:human\s+)?(?:approval|review)\s+before\s+merg",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
 
 
 def active_dev_round_for_board(board: Optional[str]) -> int:
@@ -636,6 +693,7 @@ def ensure_discord_thread_board(
     if not worktree_path or (project_path_changed and not worker.get("code_island_ready")):
         worktree_path = _default_worktree_path(project_path, request_suffix or str(thread_id))
     request_text = str(initial_request or worker.get("initial_request") or "")
+    pr_policy = pr_policy_for_request(request_text)
     worker.update(
         {
             "kind": "discord_worker_board",
@@ -658,6 +716,8 @@ def ensure_discord_thread_board(
             "criteria": worker.get("criteria") or [],
             "review_loop_count": int(worker.get("review_loop_count") or 0),
             "review_loop_limit": int(worker.get("review_loop_limit") or _review_loop_limit_for_request(request_text)),
+            "pr_open_policy": pr_policy["pr_open_policy"],
+            "merge_policy": pr_policy["merge_policy"],
             "share_token": token,
             "public_url": public_session_board_url(route_id),
             "created_at": worker.get("created_at") or _now(),
@@ -4052,6 +4112,7 @@ def start_direct_goal(
             "goal_status": "active",
             "phase": "dev",
             "execution_mode": "kanban_pipeline",
+            **pr_policy_for_request(raw_goal),
             "paused": False,
             "cancelled": False,
         }
@@ -4117,6 +4178,7 @@ def start_planner_request(
             "goal_status": "active",
             "phase": "planning",
             "execution_mode": "kanban_pipeline",
+            **pr_policy_for_request(raw_request),
             "paused": False,
             "cancelled": False,
         }
