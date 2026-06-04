@@ -619,6 +619,21 @@ def get_run(run_id: int | str, *, db_path: Path | None = None, include_source: b
         conn.close()
 
 
+def list_runs(*, db_path: Path | None = None) -> dict[str, Any]:
+    init_db(db_path)
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM proposal_runs
+            ORDER BY updated_at DESC, id DESC
+            """
+        ).fetchall()
+        return {"runs": [_row_to_run(row, include_source=False) for row in rows]}
+    finally:
+        conn.close()
+
+
 def list_parse_failures(*, db_path: Path | None = None) -> dict[str, Any]:
     init_db(db_path)
     conn = connect(db_path)

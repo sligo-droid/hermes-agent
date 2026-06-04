@@ -191,6 +191,22 @@ def test_self_improvement_reject_validation_failure(client):
     assert response.status_code == 422
 
 
+def test_self_improvement_runs_endpoint_includes_empty_and_malformed_runs(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture("proposal_run_pid_empty.json"), source={"source_key": "empty-run"})
+    proposal_storage.ingest_proposal_output("not proposal json", source={"source_key": "malformed-run"})
+
+    runs = client.get("/api/plugins/kanban/self-improvement/runs")
+    assert runs.status_code == 200
+    statuses = {run["source_key"]: run["status"] for run in runs.json()["runs"]}
+    assert statuses["empty-run"] == "empty"
+    assert statuses["malformed-run"] == "malformed"
+
+    failures = client.get("/api/plugins/kanban/self-improvement/parse-failures")
+    assert failures.status_code == 200
+    failure_keys = {failure["source_key"] for failure in failures.json()["failures"]}
+    assert "malformed-run" in failure_keys
+
+
 def test_scheduled_tasks_have_their_own_column_not_todo(client):
     """Scheduled/time-delay tasks must not be silently bucketed into todo."""
 

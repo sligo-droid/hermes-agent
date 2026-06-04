@@ -1315,6 +1315,13 @@ def self_improvement_proposals_endpoint():
     return proposal_storage.grouped_cards()
 
 
+@router.get("/self-improvement/runs")
+def self_improvement_runs_endpoint():
+    """All self-improvement proposal runs, including empty and malformed runs."""
+
+    return proposal_storage.list_runs()
+
+
 @router.get("/self-improvement/proposals/{proposal_id}")
 def self_improvement_proposal_detail_endpoint(proposal_id: str):
     card = proposal_storage.get_card(proposal_id)
