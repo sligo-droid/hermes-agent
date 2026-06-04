@@ -65,6 +65,7 @@ def test_fetch_message_uses_read_broker_without_bot_token(monkeypatch, capsys):
     base_url, bearer = reader.start_read_broker("bot-token")
     monkeypatch.setenv("HERMES_DISCORD_WORKER_READ_URL", base_url)
     monkeypatch.setenv("HERMES_DISCORD_WORKER_READ_TOKEN", bearer)
+    monkeypatch.setenv("HERMES_DISCORD_WORKER_READ_ONLY", "1")
     try:
         code = reader.main(
             [
@@ -81,6 +82,22 @@ def test_fetch_message_uses_read_broker_without_bot_token(monkeypatch, capsys):
     assert code == 0
     assert calls == [("GET", "/channels/123/messages/456", "bot-token", None, None, 15)]
     assert json.loads(capsys.readouterr().out) == {"id": "456", "content": "from broker"}
+
+
+def test_read_only_worker_blocks_control_mutations(monkeypatch):
+    from hermes_cli import discord_worker_read as reader
+
+    monkeypatch.setenv("HERMES_DISCORD_WORKER_READ_ONLY", "1")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "bot-token")
+
+    with pytest.raises(RuntimeError, match="read-only"):
+        reader.discord_request("PATCH", "/channels/123/messages/456", body={"content": "no"})
+    with pytest.raises(RuntimeError, match="read-only"):
+        reader.update_board("board-a", goal_status="done")
+    with pytest.raises(RuntimeError, match="read-only"):
+        reader.update_task_status("board-a", "task-a", "done")
+    with pytest.raises(RuntimeError, match="read-only"):
+        reader.sync_summary_message("board-a")
 
 
 def test_worker_broker_rejects_invalid_discord_endpoint(monkeypatch):

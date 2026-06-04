@@ -1123,19 +1123,26 @@ def test_docker_runner_uses_read_broker_without_discord_credentials(monkeypatch,
     assert "parent-cred" not in log
 
 
-def test_worker_prompt_mentions_discord_control_helper(monkeypatch):
+def test_worker_prompt_is_read_only_for_normal_roles(monkeypatch):
     from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_DEV, ROLE_PLANNER, ROLE_REVIEWER
 
     monkeypatch.setattr(worker.kanban_db, "build_worker_context", lambda _conn, _task_id: "{}")
+    monkeypatch.setattr(worker, "_build_reviewer_context", lambda _conn, _task_id: "reviewer compact")
     monkeypatch.setattr(worker, "_git_summary", lambda _workspace: "clean")
 
-    prompt = worker._build_prompt(object(), "task-1", "planner")
-
-    assert "python -m hermes_cli.discord_worker_read fetch-message" in prompt
-    assert "python -m hermes_cli.discord_worker_read discord-request" in prompt
-    assert "python -m hermes_cli.discord_worker_read update-board" in prompt
-    assert "python -m hermes_cli.discord_worker_read sync-summary" in prompt
-    assert "read-only" not in prompt.lower()
+    for role in (ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER):
+        prompt = worker._build_prompt(object(), "task-1", role)
+        assert "python -m hermes_cli.discord_worker_read fetch-message" in prompt
+        assert "python -m hermes_cli.discord_worker_read fetch-messages" in prompt
+        assert "read-only" in prompt.lower()
+        assert "finalizer/operator owns board and Discord mutation" in prompt
+        assert "python -m hermes_cli.discord_worker_read discord-request" not in prompt
+        assert "python -m hermes_cli.discord_worker_read update-board" not in prompt
+        assert "python -m hermes_cli.discord_worker_read task-status" not in prompt
+        assert "python -m hermes_cli.discord_worker_read sync-summary" not in prompt
+        assert "exact host:port" in prompt
+        assert "worker_frontend_smoke" in prompt
 
 
 def test_planner_output_links_parent_dependencies(monkeypatch, tmp_path):
@@ -1509,6 +1516,107 @@ def test_dev_blocked_output_marks_discord_board_blocked(monkeypatch, tmp_path):
     assert worker_meta["phase"] == "blocked"
 
 
+def test_dev_output_persists_handoff_manifest(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+
+    board = dwb.start_direct_goal(thread_id="dev-handoff", goal="Ship it")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(conn, title="Implement", assignee=ROLE_DEV, tenant=board.slug)
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+        handoff = {
+            "changed_files": ["app/page.tsx"],
+            "tests": [{"command": "pnpm test", "result": "passed", "output": "ok"}],
+            "verification": ["inspected UI"],
+            "preview": {"url": "http://127.0.0.1:4173", "command": "pnpm preview --port 4173", "status": "passed"},
+            "smoke_routes": ["/"],
+            "known_warnings": ["none"],
+            "notes": "ready for review",
+        }
+        worker._apply_role_output(
+            conn,
+            claimed.id,
+            ROLE_DEV,
+            {
+                "status": "completed",
+                "summary": "Done.",
+                "changed_files": ["app/page.tsx"],
+                "tests": [],
+                "handoff": handoff,
+            },
+            board=board.slug,
+            workspace=str(tmp_path / "repo"),
+            expected_run_id=claimed.current_run_id,
+        )
+        run = kanban_db.list_runs(conn, task_id)[-1]
+    finally:
+        conn.close()
+
+    assert run.metadata["handoff"] == handoff
+
+
+def test_reviewer_prompt_uses_compact_context_and_parent_handoff(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_DEV, ROLE_REVIEWER
+
+    board = dwb.start_direct_goal(
+        thread_id="reviewer-compact",
+        goal="Root goal with SECRET_FULL_BODY_SHOULD_NOT_APPEAR",
+    )
+    metadata = kanban_db.read_board_metadata(board.slug)
+    board_worker = dict(metadata["discord_worker"])
+    board_worker["criteria"] = ["Smoke exact preview port"]
+    board_worker["requirements"] = [{"id": "REQ-1", "text": "Use handoff manifests"}]
+    board_worker["context_pack_markdown_path"] = str(tmp_path / "context-pack.md")
+    board_worker["context_pack_path"] = str(tmp_path / "context-pack.json")
+    dwb._update_worker_meta(board.slug, board_worker)
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        dev_id = kanban_db.create_task(
+            conn,
+            title="Dev",
+            body="FULL DEV BODY SHOULD NOT APPEAR " * 100,
+            assignee=ROLE_DEV,
+            tenant=board.slug,
+        )
+        dev = kanban_db.claim_task(conn, dev_id)
+        assert dev is not None
+        kanban_db.complete_task(
+            conn,
+            dev_id,
+            summary="Dev complete.",
+            metadata={"handoff": {"changed_files": ["src/app.ts"], "smoke_routes": ["/"]}},
+            expected_run_id=dev.current_run_id,
+        )
+        reviewer_id = kanban_db.create_task(
+            conn,
+            title="Review",
+            body="FULL REVIEW TASK BODY SHOULD NOT APPEAR " * 100,
+            assignee=ROLE_REVIEWER,
+            parents=[dev_id],
+            tenant=board.slug,
+        )
+        prompt = worker._build_prompt(conn, reviewer_id, ROLE_REVIEWER)
+    finally:
+        conn.close()
+
+    assert "Parent task handoff manifests" in prompt
+    assert "src/app.ts" in prompt
+    assert "Smoke exact preview port" in prompt
+    assert "context-pack.md" in prompt
+    assert "FULL DEV BODY SHOULD NOT APPEAR" not in prompt
+    assert "FULL REVIEW TASK BODY SHOULD NOT APPEAR" not in prompt
+    assert "Use parent task handoff manifests" in prompt
+
+
 def test_planner_schema_uses_parents_not_depends_on():
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli.discord_worker_boards import ROLE_PLANNER
@@ -1590,15 +1698,15 @@ def test_worker_prompt_mentions_discord_read_helper(monkeypatch, tmp_path):
     finally:
         conn.close()
 
-    assert "mutate Hermes/Discord state when that is the correct outcome" in prompt
+    assert "finalizer/operator owns board and Discord mutation" in prompt
     assert "Outcome frame:" in prompt
     assert "Goal: Convert the Kanban context into the smallest coherent implementation plan" in prompt
     assert "Success means:" in prompt
     assert "Stop when: Return the JSON plan or a concise blocker." in prompt
     assert "python -m hermes_cli.discord_worker_read fetch-message" in prompt
     assert "python -m hermes_cli.discord_worker_read fetch-messages" in prompt
-    assert "python -m hermes_cli.discord_worker_read update-board" in prompt
-    assert "Do not attempt Discord mutation or admin actions" not in prompt
+    assert "python -m hermes_cli.discord_worker_read update-board" not in prompt
+    assert "python -m hermes_cli.discord_worker_read discord-request" not in prompt
 
 
 def test_run_codex_records_app_server_state(monkeypatch, tmp_path):
@@ -1610,8 +1718,11 @@ def test_run_codex_records_app_server_state(monkeypatch, tmp_path):
     workspace = tmp_path / "repo"
     workspace.mkdir()
 
+    session_envs = []
+
     class FakeSession:
         def __init__(self, **kwargs):
+            session_envs.append(dict(kwargs["env"]))
             self.on_event = kwargs["on_event"]
 
         def run_turn(self, prompt, turn_timeout):
@@ -1652,6 +1763,9 @@ def test_run_codex_records_app_server_state(monkeypatch, tmp_path):
     )
 
     assert result.turn_id == "turn-1"
+    assert session_envs[0]["HERMES_DISCORD_WORKER_READ_ONLY"] == "1"
+    assert session_envs[0]["HERMES_DISCORD_WORKER_CONTROL_URL"] == ""
+    assert session_envs[0]["HERMES_DISCORD_WORKER_CONTROL_TOKEN"] == ""
     state = dwb.ticket_state_for_session("9001", task.id)["codex_state"]
     rendered = str(state)
     assert state["result"]["thread_id"] == "thread-1"

@@ -11,7 +11,9 @@ from hermes_cli import kanban_db
 from utils import atomic_json_write
 
 CODEX_STATE_MAX_EVENTS = 200
+CODEX_STATE_MAX_TOOL_TRACE = 80
 CODEX_STATE_MAX_TEXT_BYTES = 24_000
+CODEX_STATE_MAX_TRACE_TEXT_BYTES = 2_000
 CODEX_STATE_LOG_TAIL_BYTES = 64_000
 
 
@@ -80,6 +82,12 @@ def record_codex_worker_event(
     current = read_codex_worker_state(task_id, board=board)
     events = current.get("events") if isinstance(current.get("events"), list) else []
     item = ((event.get("params") or {}).get("item") or {}) if isinstance(event, dict) else {}
+    trace = current.get("tool_trace") if isinstance(current.get("tool_trace"), list) else []
+    trace_item = _tool_trace_from_event(event, ts=_now())
+    if trace_item:
+        trace.append(trace_item)
+        if len(trace) > CODEX_STATE_MAX_TOOL_TRACE:
+            trace = trace[-CODEX_STATE_MAX_TOOL_TRACE:]
     events.append(
         {
             "ts": _now(),
@@ -95,8 +103,84 @@ def record_codex_worker_event(
     write_codex_worker_state(
         task_id,
         board=board,
-        update={"events": events, "truncated_events": truncated},
+        update={"events": events, "truncated_events": truncated, "tool_trace": trace},
     )
+
+
+def _short_text(value: Any) -> str:
+    return str(cap_state_value(str(value or ""), max_text=CODEX_STATE_MAX_TRACE_TEXT_BYTES) or "")
+
+
+def _tool_trace_from_event(event: dict[str, Any], *, ts: int) -> Optional[dict[str, Any]]:
+    if not isinstance(event, dict):
+        return None
+    method = str(event.get("method") or "")
+    params = event.get("params") if isinstance(event.get("params"), dict) else {}
+    item = params.get("item") if isinstance(params.get("item"), dict) else {}
+    if method.startswith("opencode/"):
+        return _opencode_tool_trace(method, item, ts=ts)
+    return _codex_tool_trace(method, item, params, ts=ts)
+
+
+def _codex_tool_trace(method: str, item: dict[str, Any], params: dict[str, Any], *, ts: int) -> Optional[dict[str, Any]]:
+    if method != "item/completed":
+        return None
+    item_type = str(item.get("type") or "")
+    if item_type == "commandExecution":
+        out = item.get("aggregatedOutput") or item.get("output") or item.get("stderr") or item.get("stdout")
+        entry = {
+            "ts": ts,
+            "source": "codex",
+            "tool": "commandExecution",
+            "command": _short_text(item.get("command") or item.get("cmd")),
+            "status": _short_text(item.get("status") or ("completed" if method.endswith("completed") else "started")),
+        }
+        if item.get("exitCode") is not None:
+            entry["exit_code"] = item.get("exitCode")
+        if item.get("durationMs") is not None:
+            entry["duration_ms"] = item.get("durationMs")
+        if out:
+            entry["output"] = _short_text(out)
+        return entry
+    tool_name = item.get("tool") or item.get("name") or item.get("toolName")
+    if item_type and ("tool" in item_type.lower() or tool_name):
+        entry = {
+            "ts": ts,
+            "source": "codex",
+            "tool": _short_text(tool_name or item_type),
+            "status": _short_text(item.get("status") or ("completed" if method.endswith("completed") else "started")),
+        }
+        if item.get("command") or item.get("summary"):
+            entry["summary"] = _short_text(item.get("command") or item.get("summary"))
+        if item.get("output") or item.get("error"):
+            entry["output"] = _short_text(item.get("output") or item.get("error"))
+        return entry
+    return None
+
+
+def _opencode_tool_trace(method: str, item: dict[str, Any], *, ts: int) -> Optional[dict[str, Any]]:
+    event_type = str(item.get("type") or method.removeprefix("opencode/"))
+    lower_type = event_type.lower()
+    name = item.get("tool") or item.get("name") or item.get("tool_name")
+    if not name and ("tool_use" in lower_type or lower_type in {"bash", "tool"}):
+        name = item.get("command") and "bash" or event_type
+    if not name:
+        return None
+    entry = {
+        "ts": ts,
+        "source": "opencode",
+        "tool": _short_text(name),
+        "status": _short_text(item.get("status") or item.get("state") or ("completed" if "complete" in lower_type else "started")),
+    }
+    command = item.get("command") or item.get("cmd")
+    if isinstance(item.get("input"), dict):
+        command = command or item["input"].get("command") or item["input"].get("cmd")
+    if command:
+        entry["command"] = _short_text(command)
+    output = item.get("output") or item.get("result") or item.get("error")
+    if output:
+        entry["output"] = _short_text(output)
+    return entry
 
 
 def record_codex_worker_result(
