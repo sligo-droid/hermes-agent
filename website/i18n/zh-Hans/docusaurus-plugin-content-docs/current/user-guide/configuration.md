@@ -552,9 +552,13 @@ Hermes 自动压缩长对话以保持在模型的上下文窗口内。压缩摘�
 ```yaml
 compression:
   enabled: true                                     # 开启/关闭压缩
-  threshold: 0.50                                   # 在上下文限制的此百分比时压缩
-  target_ratio: 0.20                                # 保留为最近尾部的阈值分数
-  protect_last_n: 20                                # 保持未压缩的最少最近消息数
+  threshold: 0.70                                   # 在上下文限制的此百分比时压缩
+  target_ratio: 0.35                                # 保留为最近尾部的阈值分数
+  protect_last_n: 50                                # 保持未压缩的最少最近消息数
+  protect_first_n: 3                                # 跨压缩固定保留的非 system 头部消息（0 = 不固定）
+  summary_ratio: 0.25                               # 分配给摘要的被压缩内容比例
+  max_summary_tokens: 32000                         # 摘要 token 上限
+  abort_on_summary_failure: true                    # 摘要失败时原样保留消息
   hygiene_hard_message_limit: 400                   # Gateway 安全阀 —— 见下文
 
 # 摘要模型/provider 在 auxiliary: 下配置：
@@ -571,6 +575,8 @@ auxiliary:
 
 `hygiene_hard_message_limit` 是仅限 gateway 的**预压缩安全阀**。拥有数千条消息的失控会话可能在正常的上下文百分比阈值触发之前就达到模型上下文限制；当消息数超过此上限时，Hermes 强制压缩，无论 token 使用情况如何。默认 `400` —— 对于非常长的会话正常的平台，请调高；要强制更积极的压缩，请降低。在运行中的 gateway 上编辑此值将在下一条消息时生效（见下文）。
 
+`abort_on_summary_failure` 默认为 `true`：摘要器失败时，Hermes 会原样保留消息，而不是丢弃中间窗口。仅当你明确希望使用历史确定性回退摘要和降级压缩行为时，才将其设为 `false`。
+
 :::tip Gateway 热重载压缩和上下文长度
 从最近的版本开始，在运行中的 gateway 上编辑 `config.yaml` 中的 `model.context_length` 或任何 `compression.*` 键将在下一条消息时生效 —— 无需 gateway 重启、`/reset` 或会话轮换。缓存的 agent 签名包含这些键，因此 gateway 在检测到更改时会透明地重建 agent。API 密钥和工具/技能配置仍需要通常的重载路径。
 :::
@@ -581,7 +587,7 @@ auxiliary:
 ```yaml
 compression:
   enabled: true
-  threshold: 0.50
+  threshold: 0.70
 ```
 使用您的主 provider 和主模型。如果您希望在比主聊天模型更便宜的模型上进行压缩，请覆盖每任务（例如 `auxiliary.compression.provider: openrouter` + `model: google/gemini-2.5-flash`）。
 
@@ -612,7 +618,7 @@ auxiliary:
 | 任意 | 已设置 | 直接使用自定义端点（忽略 provider） |
 
 :::warning 摘要模型上下文长度要求
-摘要模型**必须**具有至少与您的主 agent 模型一样大的上下文窗口。压缩器将对话的完整中间部分发送给摘要模型 —— 如果该模型的上下文窗口小于主模型的，摘要调用将因上下文长度错误而失败。发生这种情况时，中间轮次将**在没有摘要的情况下被丢弃**，静默丢失对话上下文。如果您覆盖模型，请验证其上下文长度满足或超过您的主模型。
+摘要模型**必须**具有足以容纳主 agent 模型被压缩中间部分的上下文窗口。压缩器会将对话的完整中间部分发送给摘要模型 —— 如果该模型的上下文窗口太小，摘要调用将因上下文长度错误而失败。默认情况下，Hermes 会中止压缩并原样保留消息。如果覆盖 `model.context_length`，仅应在 provider 元数据错误时这样做。
 :::
 
 ## 上下文引擎

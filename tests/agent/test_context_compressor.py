@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
-from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX
+from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX, _MIN_SUMMARY_TOKENS
 
 
 @pytest.fixture()
@@ -15,6 +15,7 @@ def compressor():
             threshold_percent=0.85,
             protect_first_n=2,
             protect_last_n=2,
+            abort_on_summary_failure=False,
             quiet_mode=True,
         )
         return c
@@ -104,7 +105,7 @@ class TestCompress:
         # Should keep system message and last N
         assert result[0]["role"] == "system"
         assert compressor.compression_count == 1
-        # Abort flag must NOT fire under the default config.
+        # This fixture opts into the historical fallback behavior.
         assert compressor._last_compress_aborted is False
         assert compressor._last_summary_fallback_used is True
 
@@ -120,6 +121,7 @@ class TestCompress:
                 protect_first_n=1,
                 protect_last_n=2,
                 quiet_mode=True,
+                abort_on_summary_failure=False,
             )
 
         msgs = [
@@ -157,7 +159,7 @@ class TestCompress:
             result = c.compress(msgs)
 
         combined = "\n".join(str(m.get("content", "")) for m in result)
-        assert "## Active Task" in combined
+        assert "## Pending User Asks" in combined
         assert "Please fix the compression summary failure" in combined
         assert "read_file" in combined
         assert "agent/context_compressor.py" in combined
@@ -168,8 +170,7 @@ class TestCompress:
 
     def test_compression_increments_count(self, compressor):
         msgs = self._make_messages(10)
-        # Default config (abort_on_summary_failure=False) — fallback path
-        # increments the count even on summary failure.
+        # Fixture opts into fallback path, which increments count even on summary failure.
         compressor.compress(msgs)
         assert compressor.compression_count == 1
         compressor.compress(msgs)
@@ -217,7 +218,13 @@ class TestGenerateSummaryNoneContent:
     def test_none_content_in_system_message_compress(self):
         """System message with content=None should not crash during compress."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
 
         msgs = [{"role": "system", "content": None}] + [
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
@@ -811,14 +818,20 @@ class TestAuxModelFallbackSurfacedToCallers:
 
 
 class TestSummaryFailureTrackingForGatewayWarning:
-    """Default behavior (compression.abort_on_summary_failure=False):
+    """Historical fallback behavior (compression.abort_on_summary_failure=False):
     summary-generation failure inserts a static fallback placeholder and
     records dropped count + fallback flag so gateway hygiene & /compress
     can surface a visible warning."""
 
     def test_compress_records_fallback_and_dropped_count_on_summary_failure(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
 
         msgs = [
             {"role": "system", "content": "sys"},
@@ -837,7 +850,7 @@ class TestSummaryFailureTrackingForGatewayWarning:
         assert c._last_summary_fallback_used is True
         assert c._last_summary_dropped_count > 0
         assert c._last_summary_error is not None
-        # Default mode: abort flag must NOT fire.
+        # Explicit fallback mode: abort flag must NOT fire.
         assert c._last_compress_aborted is False
         # Result must still be well-formed with a local fallback summary that
         # preserves redacted excerpts instead of a bare loss marker.
@@ -847,16 +860,22 @@ class TestSummaryFailureTrackingForGatewayWarning:
         ]
         assert summary_messages
         summary = summary_messages[0]["content"]
-        assert "## Compression Failure" in summary
-        assert "## Extracted Prior Context" in summary
+        assert "## Critical Context" in summary
+        assert "## Last Dropped Turns" in summary
         assert "404 model not found" in summary
-        assert "[USER]: msg 3" in summary or "[ASSISTANT]: msg 4" in summary
+        assert "USER: msg 3" in summary or "ASSISTANT: msg 4" in summary
         assert "removed to free context space but could not be summarized" not in summary
 
     def test_summary_failure_uses_tighter_live_tail(self):
         """Timeout fallback should reduce enough context to avoid immediate re-compaction."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=2)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
 
         msgs = [{"role": "system", "content": "sys"}]
         for i in range(30):
@@ -880,7 +899,13 @@ class TestSummaryFailureTrackingForGatewayWarning:
 
     def test_summary_failure_fallback_preserves_tool_paths_and_redacts_secret_context(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=1)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=1,
+                abort_on_summary_failure=False,
+            )
 
         secret = "ghp_" + ("a" * 36)
         msgs = [
@@ -917,7 +942,13 @@ class TestSummaryFailureTrackingForGatewayWarning:
 
     def test_summary_failure_fallback_supports_object_tool_calls_and_content_path_mentions(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=1)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=1,
+                abort_on_summary_failure=False,
+            )
 
         tool_call = MagicMock()
         tool_call.id = "call-object"
@@ -949,7 +980,13 @@ class TestSummaryFailureTrackingForGatewayWarning:
 
     def test_summary_failure_fallback_preserves_last_dropped_turns_without_tail(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=1)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=1,
+                abort_on_summary_failure=False,
+            )
 
         msgs = [
             {"role": "system", "content": "sys"},
@@ -973,7 +1010,13 @@ class TestSummaryFailureTrackingForGatewayWarning:
 
     def test_summary_failure_fallback_is_bounded(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=1)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=1,
+                abort_on_summary_failure=False,
+            )
 
         long_text = "important detail " * 2000
         msgs = [
@@ -1001,7 +1044,13 @@ class TestSummaryFailureTrackingForGatewayWarning:
         mock_response.choices[0].message.content = "summary text"
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
 
         msgs = [
             {"role": "system", "content": "sys"},
@@ -1582,23 +1631,56 @@ class TestSummaryTargetRatio:
         """Tail token budget should be threshold_tokens * summary_target_ratio."""
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
-        # 200K * 0.50 threshold * 0.40 ratio = 40K
-        assert c.tail_token_budget == 40_000
+        # 200K * 0.70 threshold * 0.40 ratio = 56K
+        assert c.tail_token_budget == 56_000
 
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
-        # 1M * 0.50 threshold * 0.40 ratio = 200K
-        assert c.tail_token_budget == 200_000
+        # 1M * 0.70 threshold * 0.40 ratio = 280K
+        assert c.tail_token_budget == 280_000
 
-    def test_summary_cap_scales_with_context(self):
-        """Max summary tokens should be 5% of context, capped at 12K."""
+    def test_default_summary_cap_is_configurable_default(self):
+        """Max summary tokens default to a configurable 32K cap."""
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True)
-        assert c.max_summary_tokens == 10_000  # 200K * 0.05
+        assert c.max_summary_tokens == 32_000
 
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             c = ContextCompressor(model="test", quiet_mode=True)
-        assert c.max_summary_tokens == 12_000  # capped at 12K ceiling
+        assert c.max_summary_tokens == 32_000
+
+    def test_summary_budget_uses_configured_ratio(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+            c = ContextCompressor(model="test", quiet_mode=True, summary_ratio=0.50)
+        with patch("agent.context_compressor.estimate_messages_tokens_rough", return_value=20_000):
+            assert c._compute_summary_budget([{"role": "user", "content": "x"}]) == 10_000
+
+    def test_summary_budget_uses_configured_cap(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+            c = ContextCompressor(model="test", quiet_mode=True, max_summary_tokens=6_000)
+        with patch("agent.context_compressor.estimate_messages_tokens_rough", return_value=100_000):
+            assert c._compute_summary_budget([{"role": "user", "content": "x"}]) == 6_000
+
+    def test_invalid_summary_budget_config_falls_back_safely(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                summary_ratio=None,
+                max_summary_tokens="not-an-int",
+            )
+        assert c.summary_ratio == 0.25
+        assert c.max_summary_tokens == 32_000
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                summary_ratio=-1,
+                max_summary_tokens=10,
+            )
+        assert c.summary_ratio == 0.25
+        assert c.max_summary_tokens == _MIN_SUMMARY_TOKENS
 
     def test_ratio_clamped(self):
         """Ratio should be clamped to [0.10, 0.80]."""
@@ -1610,26 +1692,30 @@ class TestSummaryTargetRatio:
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.95)
         assert c.summary_target_ratio == 0.80
 
-    def test_default_threshold_is_50_percent(self):
-        """Default compression threshold should be 50%, with a 64K floor."""
+    def test_default_threshold_is_70_percent(self):
+        """Default compression threshold should be 70%, with a 64K floor."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             c = ContextCompressor(model="test", quiet_mode=True)
-        assert c.threshold_percent == 0.50
-        # 50% of 100K = 50K, but the floor is 64K
-        assert c.threshold_tokens == 64_000
+        assert c.threshold_percent == 0.70
+        assert c.threshold_tokens == 70_000
 
     def test_threshold_floor_does_not_apply_above_128k(self):
-        """On large-context models the 50% percentage is used directly."""
+        """On large-context models the 70% percentage is used directly."""
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True)
-        # 50% of 200K = 100K, which is above the 64K floor
-        assert c.threshold_tokens == 100_000
+        # 70% of 200K = 140K, which is above the 64K floor
+        assert c.threshold_tokens == 140_000
 
-    def test_default_protect_last_n_is_20(self):
-        """Default protect_last_n should be 20."""
+    def test_default_protect_last_n_is_50(self):
+        """Default protect_last_n should be 50."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             c = ContextCompressor(model="test", quiet_mode=True)
-        assert c.protect_last_n == 20
+        assert c.protect_last_n == 50
+
+    def test_default_abort_on_summary_failure_is_true(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+        assert c.abort_on_summary_failure is True
 
     def test_default_protect_first_n_is_3(self):
         """Default protect_first_n is 3 (system + 3 extra non-system messages =
@@ -1664,6 +1750,7 @@ class TestSummaryTargetRatio:
                 quiet_mode=True,
                 protect_first_n=0,
                 protect_last_n=2,
+                abort_on_summary_failure=False,
             )
         msgs = (
             [{"role": "system", "content": "System prompt"}]
@@ -2042,12 +2129,10 @@ class TestUpdateModelBudgets:
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             comp = ContextCompressor("model-a", threshold_percent=0.50, quiet_mode=True)
         old_tail = comp.tail_token_budget
-        old_max_summary = comp.max_summary_tokens
 
         comp.update_model("model-b", context_length=32_000)
         assert comp.tail_token_budget != old_tail, "tail_token_budget should change"
         assert comp.tail_token_budget < old_tail, "smaller context → smaller budget"
-        assert comp.max_summary_tokens != old_max_summary, "max_summary_tokens should change"
 
     def test_budgets_proportional(self):
         """Budgets should be proportional to context_length after update."""
@@ -2056,7 +2141,18 @@ class TestUpdateModelBudgets:
             comp = ContextCompressor("model-a", threshold_percent=0.50, quiet_mode=True)
         comp.update_model("model-b", context_length=10_000)
         assert comp.tail_token_budget == int(comp.threshold_tokens * comp.summary_target_ratio)
-        assert comp.max_summary_tokens == min(int(10_000 * 0.05), 4000)
+
+    def test_update_model_preserves_configured_summary_cap(self):
+        from unittest.mock import patch
+        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+            comp = ContextCompressor(
+                "model-a",
+                threshold_percent=0.50,
+                quiet_mode=True,
+                max_summary_tokens=8_000,
+            )
+        comp.update_model("model-b", context_length=10_000)
+        assert comp.max_summary_tokens == 8_000
 
 
 class TestTruncateToolCallArgsJson:

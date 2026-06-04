@@ -995,9 +995,11 @@ DEFAULT_CONFIG = {
 
     "compression": {
         "enabled": True,
-        "threshold": 0.50,            # compress when context usage exceeds this ratio
-        "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
-        "protect_last_n": 20,         # minimum recent messages to keep uncompressed
+        "threshold": 0.70,            # compress when context usage exceeds this ratio
+        "target_ratio": 0.35,         # fraction of threshold to preserve as recent tail
+        "protect_last_n": 50,         # minimum recent messages to keep uncompressed
+        "summary_ratio": 0.25,        # fraction of compressed content allocated to summary
+        "max_summary_tokens": 32_000, # configurable summary token ceiling
         "hygiene_hard_message_limit": 400,  # gateway session-hygiene force-compress threshold by message count
         "protect_first_n": 3,         # non-system head messages always preserved
                                       # verbatim, in ADDITION to the system prompt
@@ -1005,7 +1007,7 @@ DEFAULT_CONFIG = {
                                       # 0 for long-running rolling-compaction sessions
                                       # where you want nothing pinned except the
                                       # system prompt + rolling summary + recent tail.
-        "abort_on_summary_failure": False,  # When True, auto-compression that fails
+        "abort_on_summary_failure": True,  # When True, auto-compression that fails
                                       # to generate a summary (aux LLM errored / returned
                                       # non-JSON / timed out) aborts entirely instead of
                                       # dropping the middle window with a static
@@ -1013,9 +1015,9 @@ DEFAULT_CONFIG = {
                                       # preserved unchanged and the session "freezes" at
                                       # its current size until the user runs /compress
                                       # (which bypasses the failure cooldown) or /new.
-                                      # Default False matches historical behavior; set to
-                                      # True if you'd rather pause than silently lose
-                                      # context turns when your aux model is flaky.
+                                      # Set False only if you explicitly prefer the
+                                      # historical deterministic fallback that drops the
+                                      # middle window when your aux model is flaky.
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
@@ -5662,9 +5664,9 @@ def show_config():
     enabled = compression.get('enabled', True)
     print(f"  Enabled:      {'yes' if enabled else 'no'}")
     if enabled:
-        print(f"  Threshold:    {compression.get('threshold', 0.50) * 100:.0f}%")
-        print(f"  Target ratio: {compression.get('target_ratio', 0.20) * 100:.0f}% of threshold preserved")
-        print(f"  Protect last: {compression.get('protect_last_n', 20)} messages")
+        print(f"  Threshold:    {compression.get('threshold', 0.70) * 100:.0f}%")
+        print(f"  Target ratio: {compression.get('target_ratio', 0.35) * 100:.0f}% of threshold preserved")
+        print(f"  Protect last: {compression.get('protect_last_n', 50)} messages")
         print(f"  Protect first: {compression.get('protect_first_n', 3)} non-system head messages")
         _aux_comp = config.get('auxiliary', {}).get('compression', {})
         _sm = _aux_comp.get('model', '') or '(auto)'

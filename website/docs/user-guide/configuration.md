@@ -628,10 +628,13 @@ All compression settings live in `config.yaml` (no environment variables).
 ```yaml
 compression:
   enabled: true                                     # Toggle compression on/off
-  threshold: 0.50                                   # Compress at this % of context limit
-  target_ratio: 0.20                                # Fraction of threshold to preserve as recent tail
-  protect_last_n: 20                                # Min recent messages to keep uncompressed
+  threshold: 0.70                                   # Compress at this % of context limit
+  target_ratio: 0.35                                # Fraction of threshold to preserve as recent tail
+  protect_last_n: 50                                # Min recent messages to keep uncompressed
   protect_first_n: 3                                # Non-system head messages pinned across compactions (0 = pin nothing)
+  summary_ratio: 0.25                               # Fraction of compressed content allocated to summary
+  max_summary_tokens: 32000                         # Summary token ceiling
+  abort_on_summary_failure: true                    # Preserve messages unchanged if summary fails
   hygiene_hard_message_limit: 400                   # Gateway safety valve — see below
 
 # The summarization model/provider is configured under auxiliary:
@@ -650,6 +653,8 @@ Older configs with `compression.summary_model`, `compression.summary_provider`, 
 
 `protect_first_n` controls how many **non-system** head messages are pinned across every compaction. Default `3` — the opening user/assistant exchange survives every summarizer pass so the original goal stays visible. On long-running rolling-compaction sessions where the opening turn is no longer relevant, set `protect_first_n: 0` to pin nothing but the system prompt + summary + tail. The system prompt itself is always preserved regardless of this setting.
 
+`abort_on_summary_failure` defaults to `true`: if the summarizer fails, Hermes preserves the original messages unchanged rather than dropping the middle window. Set it to `false` only if you explicitly prefer the historical deterministic fallback summary and degraded compaction behavior.
+
 :::tip Gateway hot-reload of compression and context length
 As of recent releases, editing `model.context_length` or any `compression.*` key in `config.yaml` on a running gateway takes effect on the next message — no gateway restart, no `/reset`, no session rotation required. The cached-agent signature includes these keys, so the gateway transparently rebuilds the agent when it sees a change. API keys and tool/skill config still require the usual reload paths.
 :::
@@ -660,7 +665,7 @@ As of recent releases, editing `model.context_length` or any `compression.*` key
 ```yaml
 compression:
   enabled: true
-  threshold: 0.50
+  threshold: 0.70
 ```
 Uses your main provider and main model. Override per-task (e.g. `auxiliary.compression.provider: openrouter` + `model: google/gemini-2.5-flash`) if you want compression on a cheaper model than your main chat model.
 
@@ -691,7 +696,7 @@ Points at a custom OpenAI-compatible endpoint. Uses `OPENAI_API_KEY` for auth.
 | any | set | Use the custom endpoint directly (provider ignored) |
 
 :::warning Summary model context length requirement
-The summary model **must** have a context window at least as large as your main agent model's. The compressor sends the full middle section of the conversation to the summary model — if that model's context window is smaller than the main model's, the summarization call will fail with a context length error. When this happens, the middle turns are **dropped without a summary**, losing conversation context silently. If you override the model, verify its context length meets or exceeds your main model's.
+The summary model **must** have a context window large enough for the main agent model's compressed middle section. The compressor sends the full middle section of the conversation to the summary model — if that model's context window is too small, the summarization call will fail with a context length error. By default Hermes aborts compression and preserves the original messages unchanged. If you override `model.context_length`, do so only when provider metadata is wrong.
 :::
 
 ## Context Engine

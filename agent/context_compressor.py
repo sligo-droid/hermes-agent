@@ -83,10 +83,10 @@ _HISTORICAL_SUMMARY_PREFIXES = (
 
 # Minimum tokens for the summary output
 _MIN_SUMMARY_TOKENS = 2000
-# Proportion of compressed content to allocate for summary
-_SUMMARY_RATIO = 0.20
-# Absolute ceiling for summary tokens (even on very large context windows)
-_SUMMARY_TOKENS_CEILING = 12_000
+# Default proportion of compressed content to allocate for summary
+_DEFAULT_SUMMARY_RATIO = 0.25
+# Default ceiling for summary tokens (configurable per compressor)
+_DEFAULT_MAX_SUMMARY_TOKENS = 32_000
 _LOCAL_FALLBACK_MAX_CHARS = 8_000
 _LOCAL_FALLBACK_TAIL_RATIO = 0.50
 _LOCAL_FALLBACK_MIN_TAIL_TOKENS = 3_000
@@ -113,6 +113,24 @@ _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 # become another unbounded transcript copy after the LLM summarizer failed.
 _FALLBACK_SUMMARY_MAX_CHARS = 8_000
 _FALLBACK_TURN_MAX_CHARS = 700
+
+
+def _coerce_summary_ratio(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return _DEFAULT_SUMMARY_RATIO
+    if parsed <= 0:
+        return _DEFAULT_SUMMARY_RATIO
+    return parsed
+
+
+def _coerce_max_summary_tokens(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = _DEFAULT_MAX_SUMMARY_TOKENS
+    return max(_MIN_SUMMARY_TOKENS, parsed)
 
 
 _PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")
@@ -528,7 +546,7 @@ class ContextCompressor(ContextEngine):
     Algorithm:
       1. Prune old tool results (cheap, no LLM call)
       2. Protect head messages (system prompt + first exchange)
-      3. Protect tail messages by token budget (most recent ~20K tokens)
+      3. Protect tail messages by token budget (recent verbatim context)
       4. Summarize middle turns with structured LLM prompt
       5. On subsequent compactions, iteratively update the previous summary
     """
@@ -578,19 +596,17 @@ class ContextCompressor(ContextEngine):
         )
         # Recalculate token budgets for the new context length so the
         # compressor stays calibrated after a model switch (e.g. 200K → 32K).
+        # The summary cap is user-configured and intentionally preserved.
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
-        self.max_summary_tokens = min(
-            int(context_length * 0.05), _SUMMARY_TOKENS_CEILING,
-        )
 
     def __init__(
         self,
         model: str,
-        threshold_percent: float = 0.50,
+        threshold_percent: float = 0.70,
         protect_first_n: int = 3,
-        protect_last_n: int = 20,
-        summary_target_ratio: float = 0.20,
+        protect_last_n: int = 50,
+        summary_target_ratio: float = 0.35,
         quiet_mode: bool = False,
         summary_model_override: str = None,
         base_url: str = "",
@@ -598,7 +614,9 @@ class ContextCompressor(ContextEngine):
         config_context_length: int | None = None,
         provider: str = "",
         api_mode: str = "",
-        abort_on_summary_failure: bool = False,
+        abort_on_summary_failure: bool = True,
+        summary_ratio: float | None = None,
+        max_summary_tokens: int | None = None,
     ):
         self.model = model
         self.base_url = base_url
@@ -610,11 +628,13 @@ class ContextCompressor(ContextEngine):
         self.protect_last_n = protect_last_n
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
-        # When True, summary-generation failure aborts compression entirely
-        # (returns messages unchanged, sets _last_compress_aborted=True).
-        # When False (default = historical behavior), insert a
+        # When True (default), summary-generation failure aborts compression
+        # entirely (returns messages unchanged, sets _last_compress_aborted=True).
+        # When False, insert a
         # deterministic "summary unavailable" handoff and drop the middle window.
         self.abort_on_summary_failure = abort_on_summary_failure
+        self.summary_ratio = _coerce_summary_ratio(summary_ratio)
+        self.max_summary_tokens = _coerce_max_summary_tokens(max_summary_tokens)
 
         self.context_length = get_model_context_length(
             model, base_url=base_url, api_key=api_key,
@@ -634,9 +654,6 @@ class ContextCompressor(ContextEngine):
         # Derive token budgets: ratio is relative to the threshold, not total context
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
-        self.max_summary_tokens = min(
-            int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING,
-        )
 
         if not quiet_mode:
             logger.info(
@@ -929,12 +946,11 @@ class ContextCompressor(ContextEngine):
     def _compute_summary_budget(self, turns_to_summarize: List[Dict[str, Any]]) -> int:
         """Scale summary token budget with the amount of content being compressed.
 
-        The maximum scales with the model's context window (5% of context,
-        capped at ``_SUMMARY_TOKENS_CEILING``) so large-context models get
-        richer summaries instead of being hard-capped at 8K tokens.
+        The budget uses the configured summary ratio and is capped by the
+        configured maximum so large-context models can keep richer summaries.
         """
         content_tokens = estimate_messages_tokens_rough(turns_to_summarize)
-        budget = int(content_tokens * _SUMMARY_RATIO)
+        budget = int(content_tokens * self.summary_ratio)
         return max(_MIN_SUMMARY_TOKENS, min(budget, self.max_summary_tokens))
 
     # Truncation limits for the summarizer input.  These bound how much of
@@ -1833,7 +1849,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         Algorithm:
           1. Prune old tool results (cheap pre-pass, no LLM call)
           2. Protect head messages (system prompt + first exchange)
-          3. Find tail boundary by token budget (~20K tokens of recent context)
+          3. Find tail boundary by token budget (recent verbatim context)
           4. Summarize middle turns with structured LLM prompt
           5. On re-compression, iteratively update the previous summary
 

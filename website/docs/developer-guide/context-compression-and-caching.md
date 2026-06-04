@@ -46,7 +46,7 @@ Hermes has two separate compression layers that operate independently:
                                    │
                                    ▼
                      ┌──────────────────────────┐
-                     │   Agent ContextCompressor │  Fires at 50% of context (default)
+                     │   Agent ContextCompressor │  Fires at 70% of context (default)
                      │   (in-loop, real tokens)  │  Normal context management
                      └──────────────────────────┘
 ```
@@ -64,10 +64,10 @@ grow too large between turns (e.g., overnight accumulation in Telegram/Discord).
 - **Purpose**: Catch sessions that escaped the agent's own compressor
 
 The gateway hygiene threshold is intentionally higher than the agent's compressor.
-Setting it at 50% (same as the agent) caused premature compression on every turn
-in long gateway sessions.
+Setting it too close to the agent threshold caused premature compression on every
+turn in long gateway sessions.
 
-### 2. Agent ContextCompressor (50% threshold, configurable)
+### 2. Agent ContextCompressor (70% threshold, configurable)
 
 Located in `agent/context_compressor.py`. This is the **primary compression
 system** that runs inside the agent's tool loop with access to accurate,
@@ -81,9 +81,13 @@ All compression settings are read from `config.yaml` under the `compression` key
 ```yaml
 compression:
   enabled: true              # Enable/disable compression (default: true)
-  threshold: 0.50            # Fraction of context window (default: 0.50 = 50%)
-  target_ratio: 0.20         # How much of threshold to keep as tail (default: 0.20)
-  protect_last_n: 20         # Minimum protected tail messages (default: 20)
+  threshold: 0.70            # Fraction of context window (default: 0.70 = 70%)
+  target_ratio: 0.35         # How much of threshold to keep as tail (default: 0.35)
+  protect_last_n: 50         # Minimum protected tail messages (default: 50)
+  protect_first_n: 3         # Non-system head messages preserved (default: 3)
+  summary_ratio: 0.25        # Summary budget as fraction of compressed content
+  max_summary_tokens: 32000  # Summary budget ceiling
+  abort_on_summary_failure: true  # Preserve messages unchanged if summary fails
 
 # Summarization model/provider configured under auxiliary:
 auxiliary:
@@ -97,29 +101,33 @@ auxiliary:
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `threshold` | `0.50` | 0.0-1.0 | Compression triggers when prompt tokens ≥ `threshold × context_length` |
-| `target_ratio` | `0.20` | 0.10-0.80 | Controls tail protection token budget: `threshold_tokens × target_ratio` |
-| `protect_last_n` | `20` | ≥1 | Minimum number of recent messages always preserved |
-| `protect_first_n` | `3` | (hardcoded) | System prompt + first exchange always preserved |
+| `threshold` | `0.70` | 0.0-1.0 | Compression triggers when prompt tokens ≥ `threshold × context_length` |
+| `target_ratio` | `0.35` | 0.10-0.80 | Controls tail protection token budget: `threshold_tokens × target_ratio` |
+| `protect_last_n` | `50` | ≥1 | Minimum number of recent messages always preserved |
+| `protect_first_n` | `3` | ≥0 | Non-system head messages preserved in addition to the system prompt |
+| `summary_ratio` | `0.25` | >0 | Summary output budget: `compressed_content_tokens × summary_ratio` |
+| `max_summary_tokens` | `32000` | ≥2000 | Configurable ceiling for summary output tokens; lower values are clamped to the compressor minimum |
+| `abort_on_summary_failure` | `true` | boolean | If summary generation fails, preserve the original messages unchanged instead of dropping the middle window with a local fallback summary |
+
+Set `abort_on_summary_failure: false` only when you explicitly prefer the historical degraded fallback behavior: Hermes will insert a deterministic "summary unavailable" handoff and drop the middle window if the auxiliary summarizer fails.
 
 ### Computed Values (for a 200K context model at defaults)
 
 ```
 context_length       = 200,000
-threshold_tokens     = 200,000 × 0.50 = 100,000
-tail_token_budget    = 100,000 × 0.20 = 20,000
-max_summary_tokens   = min(200,000 × 0.05, 12,000) = 10,000
+threshold_tokens     = 200,000 × 0.70 = 140,000
+tail_token_budget    = 140,000 × 0.35 = 49,000
+summary_budget       = compressed_content_tokens × 0.25
+max_summary_tokens   = 32,000
 ```
 
 :::note Threshold is derived from the MAIN model's context window
 `threshold_tokens` is always `threshold × context_length`, where `context_length`
 is the **main agent model's** context window — never the auxiliary/summary
-model's. On a 262,144-token model at the default `0.50`, the threshold is
-`262,144 × 0.50 = 131,072`. That number being close to a common "128K context"
-is a coincidence of the percentage, not a sign that the auxiliary model's window
-is the trigger. The auxiliary model's context window is a separate concern — see
-the "Summary model context length" warning below for how it affects whether a
-summary can be produced, not when compression fires.
+model's. On a 262,144-token model at the default `0.70`, the threshold is
+`262,144 × 0.70 = 183,500`. The auxiliary model's context window is a separate
+concern — see the "Summary model context length" warning below for how it
+affects whether a summary can be produced, not when compression fires.
 :::
 
 
@@ -161,7 +169,7 @@ to find the parent assistant message, keeping groups intact.
 ### Phase 3: Generate Structured Summary
 
 :::warning Summary model context length
-The summary model must have a context window **at least as large** as the main agent model's. The entire middle section is sent to the summary model in a single `call_llm(task="compression")` call. If the summary model's context is smaller, the API returns a context-length error — `_generate_summary()` catches it, logs a warning, and returns `None`. The compressor then drops the middle turns **without a summary**, silently losing conversation context. This is the most common cause of degraded compaction quality.
+The summary model must have a context window **at least as large** as the main agent model's compressed middle section. The entire middle section is sent to the summary model in a single `call_llm(task="compression")` call. If the summary model's context is smaller, the API returns a context-length error — `_generate_summary()` catches it, logs a warning, and returns `None`. By default, the compressor now aborts and preserves the original messages unchanged. If `abort_on_summary_failure: false` is set, Hermes uses the historical deterministic fallback summary and drops the middle turns. This is a common cause of degraded compaction quality.
 :::
 
 The middle turns are summarized using the auxiliary LLM with a structured
@@ -196,9 +204,11 @@ template:
 ```
 
 Summary budget scales with the amount of content being compressed:
-- Formula: `content_tokens × 0.20` (the `_SUMMARY_RATIO` constant)
+- Formula: `content_tokens × summary_ratio` (default `0.25`)
 - Minimum: 2,000 tokens
-- Maximum: `min(context_length × 0.05, 12,000)` tokens
+- Maximum: `max_summary_tokens` (default `32,000`) tokens
+
+Use `model.context_length` overrides only when provider metadata is wrong or unavailable. The main model context length drives compression thresholds; setting it incorrectly can make Hermes compress too early, too late, or fail the minimum-context guard.
 
 ### Phase 4: Assemble Compressed Messages
 

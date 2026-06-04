@@ -50,7 +50,7 @@ Hermes 有两个独立运行的压缩层：
                                    │
                                    ▼
                      ┌──────────────────────────┐
-                     │   Agent ContextCompressor │  Fires at 50% of context (default)
+                     │   Agent ContextCompressor │  Fires at 70% of context (default)
                      │   (in-loop, real tokens)  │  Normal context management
                      └──────────────────────────┘
 ```
@@ -64,9 +64,9 @@ Hermes 有两个独立运行的压缩层：
 - **触发条件**：仅当 `len(history) >= 4` 且压缩已启用时
 - **目的**：捕获逃过 agent 自身压缩器的会话
 
-Gateway 清理阈值有意高于 agent 压缩器的阈值。将其设置为 50%（与 agent 相同）会导致长 gateway 会话在每一轮都过早触发压缩。
+Gateway 清理阈值有意高于 agent 压缩器的阈值。将其设置得过低会导致长 gateway 会话在每一轮都过早触发压缩。
 
-### 2. Agent ContextCompressor（50% 阈值，可配置）
+### 2. Agent ContextCompressor（70% 阈值，可配置）
 
 位于 `agent/context_compressor.py`。这是**主要压缩系统**，在 agent 的工具循环内运行，可访问准确的 API 报告 token 数。
 
@@ -78,9 +78,13 @@ Gateway 清理阈值有意高于 agent 压缩器的阈值。将其设置为 50%�
 ```yaml
 compression:
   enabled: true              # Enable/disable compression (default: true)
-  threshold: 0.50            # Fraction of context window (default: 0.50 = 50%)
-  target_ratio: 0.20         # How much of threshold to keep as tail (default: 0.20)
-  protect_last_n: 20         # Minimum protected tail messages (default: 20)
+  threshold: 0.70            # Fraction of context window (default: 0.70 = 70%)
+  target_ratio: 0.35         # How much of threshold to keep as tail (default: 0.35)
+  protect_last_n: 50         # Minimum protected tail messages (default: 50)
+  protect_first_n: 3         # Non-system head messages preserved (default: 3)
+  summary_ratio: 0.25        # Summary budget as fraction of compressed content
+  max_summary_tokens: 32000  # Summary budget ceiling
+  abort_on_summary_failure: true  # Preserve messages unchanged if summary fails
 
 # Summarization model/provider configured under auxiliary:
 auxiliary:
@@ -94,18 +98,24 @@ auxiliary:
 
 | 参数 | 默认值 | 范围 | 描述 |
 |-----------|---------|-------|-------------|
-| `threshold` | `0.50` | 0.0-1.0 | 当 prompt token 数 ≥ `threshold × context_length` 时触发压缩 |
-| `target_ratio` | `0.20` | 0.10-0.80 | 控制尾部保护 token 预算：`threshold_tokens × target_ratio` |
-| `protect_last_n` | `20` | ≥1 | 始终保留的最近消息最小数量 |
-| `protect_first_n` | `3` | （硬编码）| 系统提示词 + 首次交互始终保留 |
+| `threshold` | `0.70` | 0.0-1.0 | 当 prompt token 数 ≥ `threshold × context_length` 时触发压缩 |
+| `target_ratio` | `0.35` | 0.10-0.80 | 控制尾部保护 token 预算：`threshold_tokens × target_ratio` |
+| `protect_last_n` | `50` | ≥1 | 始终保留的最近消息最小数量 |
+| `protect_first_n` | `3` | ≥0 | 除系统提示词外始终保留的非 system 头部消息数量 |
+| `summary_ratio` | `0.25` | >0 | 摘要输出预算：`compressed_content_tokens × summary_ratio` |
+| `max_summary_tokens` | `32000` | ≥2000 | 摘要输出 token 上限；更低值会被钳制到压缩器最小值 |
+| `abort_on_summary_failure` | `true` | boolean | 摘要生成失败时保留原消息不变，而不是丢弃中间窗口 |
+
+仅当你明确希望使用历史降级回退行为时，才设置 `abort_on_summary_failure: false`：Hermes 会插入确定性的“summary unavailable”交接摘要，并在辅助摘要器失败时丢弃中间窗口。
 
 ### 计算值（200K 上下文模型，默认参数）
 
 ```
 context_length       = 200,000
-threshold_tokens     = 200,000 × 0.50 = 100,000
-tail_token_budget    = 100,000 × 0.20 = 20,000
-max_summary_tokens   = min(200,000 × 0.05, 12,000) = 10,000
+threshold_tokens     = 200,000 × 0.70 = 140,000
+tail_token_budget    = 140,000 × 0.35 = 49,000
+summary_budget       = compressed_content_tokens × 0.25
+max_summary_tokens   = 32,000
 ```
 
 
@@ -142,7 +152,7 @@ max_summary_tokens   = min(200,000 × 0.05, 12,000) = 10,000
 ### 阶段 3：生成结构化摘要
 
 :::warning 摘要模型上下文长度
-摘要模型的上下文窗口必须**至少与主 agent 模型一样大**。整个中间部分通过单次 `call_llm(task="compression")` 调用发送给摘要模型。如果摘要模型的上下文更小，API 将返回上下文长度错误——`_generate_summary()` 会捕获该错误，记录警告并返回 `None`。压缩器随后会**在没有摘要的情况下丢弃中间轮次**，静默丢失对话上下文。这是压缩质量下降最常见的原因。
+摘要模型的上下文窗口必须**至少能容纳主 agent 模型的被压缩中间部分**。整个中间部分通过单次 `call_llm(task="compression")` 调用发送给摘要模型。如果摘要模型的上下文更小，API 将返回上下文长度错误——`_generate_summary()` 会捕获该错误，记录警告并返回 `None`。默认情况下，压缩器会中止并原样保留消息；如果设置了 `abort_on_summary_failure: false`，Hermes 会使用历史确定性回退摘要并丢弃中间轮次。
 :::
 
 中间轮次使用辅助 LLM 以结构化模板进行摘要：
@@ -176,9 +186,11 @@ max_summary_tokens   = min(200,000 × 0.05, 12,000) = 10,000
 ```
 
 摘要预算随被压缩内容的量动态调整：
-- 公式：`content_tokens × 0.20`（`_SUMMARY_RATIO` 常量）
+- 公式：`content_tokens × summary_ratio`（默认 `0.25`）
 - 最小值：2,000 token
-- 最大值：`min(context_length × 0.05, 12,000)` token
+- 最大值：`max_summary_tokens`（默认 `32,000`）token
+
+仅当 provider 元数据错误或不可用时才使用 `model.context_length` 覆盖。主模型上下文长度会驱动压缩阈值；设置错误可能导致 Hermes 过早压缩、过晚压缩，或触发最小上下文保护。
 
 ### 阶段 4：组装压缩后的消息
 
@@ -323,4 +335,4 @@ CLI 在启动时显示缓存状态：
 
 ## 上下文压力警告
 
-中间上下文压力警告已被移除（参见 `run_agent.py` 中的迭代预算块，其中注明："No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"）。压缩在 prompt token 达到配置的 `compression.threshold`（默认 50%）时触发，无需事先警告步骤；gateway 会话清理作为二级安全网在模型上下文窗口的 85% 处触发。
+中间上下文压力警告已被移除（参见 `run_agent.py` 中的迭代预算块，其中注明："No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"）。压缩在 prompt token 达到配置的 `compression.threshold`（默认 70%）时触发，无需事先警告步骤；gateway 会话清理作为二级安全网在模型上下文窗口的 85% 处触发。
