@@ -265,14 +265,22 @@ def ingest_proposal_output(
             )
             row = conn.execute("SELECT id FROM proposal_runs WHERE source_key = ?", (key,)).fetchone()
             run_db_id = int(row["id"])
+            existing_cards = {
+                card_row["proposal_id"]: dict(card_row)
+                for card_row in conn.execute(
+                    """
+                    SELECT proposal_id, status, kanban_task_id, worker_url, rejected_reason, archived_at
+                    FROM proposal_cards
+                    WHERE run_db_id = ?
+                    """,
+                    (run_db_id,),
+                ).fetchall()
+            }
             conn.execute("DELETE FROM proposal_cards WHERE run_db_id = ?", (run_db_id,))
             if normalized:
                 for card in normalized["cards"]:
-                    existing_card = conn.execute(
-                        "SELECT kanban_task_id, worker_url, rejected_reason, archived_at FROM proposal_cards WHERE proposal_id = ?",
-                        (card["proposal_id"],),
-                    ).fetchone()
-                    action_state = dict(existing_card) if existing_card else {}
+                    action_state = existing_cards.get(card["proposal_id"], {})
+                    preserved_status = action_state.get("status") or card["status"]
                     conn.execute(
                         """
                         INSERT OR REPLACE INTO proposal_cards(
@@ -294,7 +302,7 @@ def ingest_proposal_output(
                             card["rationale"],
                             card["priority"],
                             card.get("severity"),
-                            card["status"],
+                            preserved_status,
                             card.get("idempotency_key"),
                             card["created_at"],
                             _json_dumps(card.get("source_excerpts", [])),

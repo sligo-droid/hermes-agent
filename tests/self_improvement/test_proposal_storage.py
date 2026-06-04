@@ -147,6 +147,50 @@ def test_approval_and_rejection_state_are_persisted_and_audited(tmp_path, monkey
     assert [event["action"] for event in events] == ["approved", "rejected"]
 
 
+def test_reingesting_approved_card_preserves_review_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    source = _fenced("proposal_run_pid_valid.json")
+    proposal_storage.ingest_proposal_output(source)
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    approved = proposal_storage.record_approval(
+        card["proposal_id"],
+        kanban_task_id="t_approved",
+        worker_url="/workers?task=t_approved",
+        actor="operator",
+    )
+
+    proposal_storage.ingest_proposal_output(source)
+
+    reingested = proposal_storage.get_card(card["proposal_id"])
+    assert reingested["status"] == "approved"
+    assert reingested["kanban_task_id"] == "t_approved"
+    assert reingested["worker_url"] == "/workers?task=t_approved"
+    assert reingested["run_db_id"] == approved["run_db_id"]
+    assert proposal_storage.list_audit_events(card["proposal_id"])[0]["action"] == "approved"
+    summary = proposal_storage.summarize_feedback_history(project="pid", prong="airflow_scraper_doctor")
+    assert summary["projects"][0]["prongs"][0]["accepted"][0]["kanban_task_id"] == "t_approved"
+
+
+def test_reingesting_rejected_card_preserves_review_state_and_hidden_grouping(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    source = _fenced("proposal_run_pid_valid.json")
+    proposal_storage.ingest_proposal_output(source)
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    rejected = proposal_storage.record_rejection(card["proposal_id"], reason="not actionable", actor="operator")
+
+    proposal_storage.ingest_proposal_output(source)
+
+    reingested = proposal_storage.get_card(card["proposal_id"])
+    assert reingested["status"] == "rejected"
+    assert reingested["rejected_reason"] == "not actionable"
+    assert reingested["archived_at"] == rejected["archived_at"]
+    assert reingested["run_db_id"] == rejected["run_db_id"]
+    assert proposal_storage.grouped_cards()["projects"] == []
+    assert proposal_storage.list_audit_events(card["proposal_id"])[0]["action"] == "rejected"
+    summary = proposal_storage.summarize_feedback_history(project="pid", prong="airflow_scraper_doctor")
+    assert summary["projects"][0]["prongs"][0]["rejected"][0]["reason"] == "not actionable"
+
+
 def test_feedback_summary_empty_history(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
 
