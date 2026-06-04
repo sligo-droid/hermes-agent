@@ -226,6 +226,38 @@ code { font-size: 0.875rem; }
   font-family: var(--theme-font-mono);
 }
 
+/* Scoped light mode for the Sligo Command Center shell only. */
+.sligo-light [class*="border-white/10"],
+.sligo-light [class*="border-white/15"] {
+  border-color: rgb(203 213 225 / 0.9) !important;
+}
+.sligo-light [class*="bg-white/[0.035]"],
+.sligo-light [class*="bg-white/[0.045]"],
+.sligo-light [class*="bg-slate-950/45"],
+.sligo-light [class*="bg-[#08090a]/80"] {
+  background-color: rgb(255 255 255 / 0.86) !important;
+}
+.sligo-light [class*="bg-black/20"] {
+  background-color: rgb(241 245 249 / 0.88) !important;
+}
+.sligo-light [class*="text-white"],
+.sligo-light [class*="text-slate-100"],
+.sligo-light [class*="text-slate-200"],
+.sligo-light [class*="text-slate-300"] {
+  color: rgb(15 23 42) !important;
+}
+.sligo-light [class*="text-slate-400"],
+.sligo-light [class*="text-slate-500"] {
+  color: rgb(71 85 105) !important;
+}
+.sligo-light [class*="text-cyan-50"],
+.sligo-light [class*="text-cyan-100"] {
+  color: rgb(14 116 144) !important;
+}
+.sligo-light [class*="text-indigo-100"] {
+  color: rgb(67 56 202) !important;
+}
+
 /* Subtle grain overlay for badges. */
 .grain {
   position: relative;
@@ -250,4 +282,3 @@ code { font-size: 0.875rem; }
 :root[style*="--theme-asset-bg:"] .theme-default-filler {
   display: none;
 }
-

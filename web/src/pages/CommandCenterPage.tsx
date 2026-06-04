@@ -35,7 +35,7 @@ type ActionKind = "approve" | "reject" | "pause" | "resume" | "undo" | "archive"
 
 declare global {
   interface Window {
-    __commandCenterRefresh?: () => void;
+    __commandCenterRefresh?: () => Promise<void> | void;
   }
 }
 
@@ -252,6 +252,16 @@ function SourceBadge({ source }: { source: CommandCenterSource }) {
   );
 }
 
+function discordSourceUrl(source?: CommandCenterSource | null): string | null {
+  if (!source || !["discord", "discord_thread"].includes(source.kind)) return null;
+  const ref = source.ref || {};
+  for (const key of ["discord_url", "source_url", "discord_thread_url"]) {
+    const value = ref[key];
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return null;
+}
+
 function WorkItemCard({
   activeAction,
   item,
@@ -273,6 +283,7 @@ function WorkItemCard({
   const canResume = Boolean((item.status === "paused" || item.execution?.paused || item.execution?.resumable) && (proposalId || (item.execution?.resume_action && item.execution.board)) && item.status !== "archived");
   const canUndo = Boolean(proposalId && item.status === "shipped");
   const canArchive = Boolean((item.execution?.archiveable && item.execution.board && item.execution.board !== "default" && item.id.startsWith("kanban-board:")) || proposalCanArchive);
+  const discordUrl = discordSourceUrl(item.source);
   return (
     <article
       className={cn(
@@ -289,11 +300,14 @@ function WorkItemCard({
           </div>
           <h3 className="text-base font-semibold leading-snug text-white">{item.title}</h3>
         </button>
-        {item.execution?.worker_url ? (
+        {item.execution?.worker_url || discordUrl ? (
           <div className="flex shrink-0 items-center gap-2">
-            <a className="inline-flex h-8 items-center gap-1.5 rounded-full border border-cyan-100/25 px-2.5 text-xs font-semibold text-cyan-50 transition hover:border-cyan-100/40 hover:bg-cyan-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/35" href={item.execution.worker_url} rel="noopener noreferrer" target="_blank">
+            {discordUrl && <a aria-label={`Open Discord source for ${item.title}`} className="inline-flex h-8 items-center gap-1.5 rounded-full border border-indigo-200/25 px-2.5 text-xs font-semibold text-indigo-100 transition hover:border-indigo-100/40 hover:bg-indigo-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-100/35" href={discordUrl} rel="noopener noreferrer" target="_blank">
+              Discord <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span>
+            </a>}
+            {item.execution?.worker_url && <a className="inline-flex h-8 items-center gap-1.5 rounded-full border border-cyan-100/25 px-2.5 text-xs font-semibold text-cyan-50 transition hover:border-cyan-100/40 hover:bg-cyan-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/35" href={item.execution.worker_url} rel="noopener noreferrer" target="_blank">
               Worker <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span>
-            </a>
+            </a>}
           </div>
         ) : null}
       </div>
@@ -374,6 +388,7 @@ function DetailPanel({ selection }: { selection: Selection | null }) {
   }
   if (selection.kind === "source") {
     const source = selection.source;
+    const discordUrl = discordSourceUrl(source);
     return (
       <Card className="sticky top-4 border-white/10 bg-white/[0.045]">
         <CardHeader>
@@ -385,6 +400,7 @@ function DetailPanel({ selection }: { selection: Selection | null }) {
             <h3 className="mt-3 text-lg font-semibold text-white">{source.title || source.id}</h3>
             <p className="mt-1 text-xs uppercase tracking-[0.16em] text-slate-500">{source.label}</p>
           </div>
+          {discordUrl && <a aria-label={`Open Discord source for ${source.title || source.id}`} className="inline-flex w-fit items-center gap-1 rounded border border-indigo-200/25 px-3 py-1.5 text-xs text-indigo-100 hover:bg-indigo-100/10" href={discordUrl} rel="noopener noreferrer" target="_blank">Discord <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span></a>}
           <KeyValue data={source.ref} />
         </CardContent>
       </Card>
@@ -409,6 +425,7 @@ function DetailPanel({ selection }: { selection: Selection | null }) {
     );
   }
   const item = selection.item;
+  const discordUrl = discordSourceUrl(item.source);
   return (
     <Card className="sticky top-4 border-white/10 bg-white/[0.045]">
       <CardHeader>
@@ -421,6 +438,7 @@ function DetailPanel({ selection }: { selection: Selection | null }) {
           <p className="mt-2 leading-6 text-slate-300">{item.summary || item.body_preview}</p>
         </div>
         <div className="flex flex-wrap gap-2">
+          {discordUrl && <a aria-label={`Open Discord source for ${item.title}`} className="inline-flex items-center gap-1 rounded border border-indigo-200/25 px-3 py-1.5 text-xs text-indigo-100 hover:bg-indigo-100/10" href={discordUrl} rel="noopener noreferrer" target="_blank">Discord <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span></a>}
           {item.execution?.worker_url && <a className="inline-flex items-center gap-1 rounded border border-cyan-100/25 px-3 py-1.5 text-xs text-cyan-50 hover:bg-cyan-100/10" href={item.execution.worker_url} rel="noopener noreferrer" target="_blank">Worker board <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span></a>}
           {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && <a className="inline-flex items-center gap-1 rounded border border-white/10 px-3 py-1.5 text-xs text-slate-200 hover:bg-white/10" href={item.execution.task_url} rel="noopener noreferrer" target="_blank">Ticket <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span></a>}
           {item.execution?.console_url && <Link className="inline-flex items-center gap-1 rounded border border-white/10 px-3 py-1.5 text-xs text-slate-200 hover:bg-white/10" to={item.execution.console_url}>Console <ArrowRight className="h-3 w-3" /></Link>}
@@ -593,9 +611,7 @@ export default function CommandCenterPage() {
   }, [refresh]);
 
   useEffect(() => {
-    const invokeRefresh = () => {
-      void refresh();
-    };
+    const invokeRefresh = refresh;
     window.__commandCenterRefresh = invokeRefresh;
     const refreshFromShell = () => {
       void refresh();
