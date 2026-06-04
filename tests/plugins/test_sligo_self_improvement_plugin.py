@@ -114,7 +114,7 @@ def test_plugin_approve_is_idempotent_and_creates_one_kanban_task(client, hermes
     assert approved["status"] == "enqueued"
     assert approved["kanban_board"] == "pid"
     assert approved["kanban_task_id"]
-    assert approved["worker_public_url"].startswith("/kanban?board=pid")
+    assert approved["worker_public_url"].startswith("/workers?board=pid")
 
     second = client.post(
         f"/api/plugins/sligo/proposals/{card['id']}/approve",
@@ -131,6 +131,28 @@ def test_plugin_approve_is_idempotent_and_creates_one_kanban_task(client, hermes
     assert len(tasks) == 1
     assert tasks[0].id == approved["kanban_task_id"]
     assert tasks[0].idempotency_key == f"self-improvement:{card['id']}"
+
+
+def test_plugin_runs_api_exposes_parse_failures_and_source(client, hermes_home):
+    r = client.post(
+        "/api/plugins/sligo/proposals/ingest",
+        json={
+            "project": "pid",
+            "prong": "visible-ux",
+            "cron_output_text": "# unparseable\ntoken=secret-value",
+            "source_kind": "test",
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["parse_status"] == "failed"
+
+    runs = client.get("/api/plugins/sligo/runs?project=pid&prong=visible-ux")
+    assert runs.status_code == 200
+    run = runs.json()["runs"][0]
+    assert run["parse_status"] == "failed"
+    assert "no strict proposal JSON" in run["parse_error"]
+    assert "[REDACTED]" in run["raw_summary"]
+    assert "secret-value" not in run["raw_summary"]
 
 
 def test_plugin_reject_hides_from_default_list_but_feedback_remains(client, hermes_home):

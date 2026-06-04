@@ -64,6 +64,7 @@ def test_approve_proposal_creates_idempotent_kanban_task(hermes_home):
 
     assert first["status"] == "enqueued"
     assert first["task_id"] == second["task_id"]
+    assert first["worker_public_url"].startswith("/workers?board=hermes-agent")
     with kanban_db.connect(board="hermes-agent") as conn:
         tasks = kanban_db.list_tasks(conn, include_archived=True)
     assert len(tasks) == 1
@@ -108,3 +109,18 @@ def test_ingest_accepts_cards_alias(hermes_home):
     proposal = sip.get_proposal("card-1")
     assert proposal is not None
     assert proposal["prong"] == "api"
+
+
+def test_parse_failure_run_retains_sanitized_source_for_board_api(hermes_home):
+    result = sip.ingest_proposals(
+        project_slug="hermes-agent",
+        prong_slug="quality",
+        cron_job_id="cron-1",
+        cron_output_text="# No cards\napi_key=should-not-leak",
+    )
+
+    assert result["parse_status"] == "failed"
+    run = sip.list_runs(project="hermes-agent", prong="quality")[0]
+    assert run["parse_error"]
+    assert "[REDACTED]" in run["raw_summary"]
+    assert "should-not-leak" not in run["raw_summary"]

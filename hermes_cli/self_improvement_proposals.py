@@ -888,7 +888,7 @@ def _task_body(card: dict[str, Any]) -> str:
 
 
 def _task_public_url(board: str, task_id: str) -> str:
-    return f"/kanban?board={quote(board)}&task={quote(task_id)}"
+    return f"/workers?board={quote(board)}&task={quote(task_id)}"
 
 
 def approve_proposal(

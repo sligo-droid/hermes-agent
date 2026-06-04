@@ -181,6 +181,11 @@
       },
         h("strong", null, run.cron_job_name || run.prong_name || run.id),
         h("span", null, `${run.parse_status} · ${fmtDate(run.created_at)}`),
+        run.parse_status === "failed" && h("span", { className: "si-run-error" }, run.parse_error || "Parse failed"),
+        run.parse_status === "failed" && run.raw_summary && h("details", { className: "si-run-source", onClick: (e) => e.stopPropagation() },
+          h("summary", null, "Source output"),
+          h("pre", { className: "si-pre" }, run.raw_summary),
+        ),
       )
     ));
   }
