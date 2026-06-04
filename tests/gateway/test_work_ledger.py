@@ -11,7 +11,7 @@ from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
-from gateway.work_ledger import GatewayWorkLedger
+from gateway.work_ledger import GatewayWorkLedger, classify_delivery_completion
 
 
 DISCORD_EPOCH_SECONDS = 1_420_070_400.0
@@ -38,6 +38,13 @@ def _discord_event(message_id="m1", text="do the work"):
         source=source,
         message_id=message_id,
     )
+
+
+def _repo_discord_event(message_id="m1", text="do the work"):
+    event = _discord_event(message_id=message_id, text=text)
+    event.source.project_path = "/home/droid/hermes"
+    event.source.project_github_url = "https://github.com/sligohub/hermes-agent"
+    return event
 
 
 def test_ledger_deduplicates_discord_message_ids(tmp_path):
@@ -176,6 +183,215 @@ def test_ledger_records_discord_board_final_response_provenance(tmp_path, monkey
         ("normal final answer", None),
         ("normal final answer", "result-1"),
     ]
+
+
+def test_repo_backed_self_declared_incomplete_response_is_blocked(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event()
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="Not done yet: no commit, PR, or deploy. Current working tree has the feature changes but is not committed.",
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["summary_status"] == "Blocked"
+    assert stored["completion_gate"]["allowed_to_complete"] is False
+    ledger.mark_summary_updated(item["id"])
+    ledger.mark_completed(item["id"])
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "blocked"
+    assert ledger.incomplete_items() == []
+
+
+def test_explicit_pr_only_request_allows_intentionally_unmerged_final(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Open a PR but don't merge it")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="PR opened and intentionally left unmerged per instruction.",
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["summary_status"] == "Complete"
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert stored["completion_gate"]["delivery_intent"] == "pr_only"
+    ledger.mark_summary_updated(item["id"])
+    ledger.mark_completed(item["id"])
+    assert ledger.get(item["id"])["status"] == "completed"
+
+
+def test_default_repo_project_pr_opened_but_unmerged_is_blocked(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Implement the feature")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="PR opened but not merged/deployed.",
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["completion_gate"]["allowed_to_complete"] is False
+    assert stored["summary_status"] == "Blocked"
+
+
+def test_generic_discord_incomplete_wording_preserves_old_completion_behavior(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(text="answer this question")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="Not done yet: no commit, PR, or deploy.",
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["summary_status"] == "Complete"
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert classify_delivery_completion(stored)["reason"] == "not_repo_backed"
+    ledger.mark_summary_updated(item["id"])
+    ledger.mark_completed(item["id"])
+    assert ledger.get(item["id"])["status"] == "completed"
+
+
+def test_review_only_request_allows_no_delivery_artifacts_when_review_finished(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Review only; do not implement anything")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="Review complete. No commit, PR, or deploy was needed for this review-only request.",
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["summary_status"] == "Complete"
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert stored["completion_gate"]["delivery_intent"] == "review_only"
+    assert stored["completion_gate"]["reason"] == "intentional_review_only_terminal"
+
+
+def test_open_pr_for_review_still_requires_pr_artifact(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Open a PR for review but don't merge it")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="Review complete. No PR opened.",
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["completion_gate"]["delivery_intent"] == "pr_only"
+    assert stored["completion_gate"]["allowed_to_complete"] is False
+    assert stored["summary_status"] == "Blocked"
+
+
+def test_for_review_without_pr_scope_does_not_disable_delivery_gate(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Implement the feature for review")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="Review complete. No commit, PR, or deploy.",
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["completion_gate"]["delivery_intent"] == "full_lifecycle"
+    assert stored["completion_gate"]["allowed_to_complete"] is False
+    assert stored["summary_status"] == "Blocked"
+
+
+@pytest.mark.asyncio
+async def test_post_delivery_summary_uses_blocked_status_for_gated_work(tmp_path):
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    callbacks = []
+    adapter = SimpleNamespace(
+        register_post_delivery_callback=lambda session_key, callback, generation=None: callbacks.append(callback)
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+
+    event = _repo_discord_event(message_id="m1")
+    event.feature_summary = {"message_id": "summary-1", "initial_request": "Implement it"}
+    session_key = build_session_key(event.source)
+    item = runner.work_ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+    event.work_item_id = item["id"]
+    final_response = "Not done yet: no commit, PR, or deploy. Current working tree has the feature changes but is not committed."
+    runner.work_ledger.mark_agent_done(
+        item["id"],
+        final_response=final_response,
+        session_id="session-1",
+        summary_status="Complete",
+        feature_summary=event.feature_summary,
+    )
+
+    runner._register_discord_summary_post_delivery(
+        event=event,
+        source=event.source,
+        session_key=session_key,
+        run_generation=None,
+        session_id="session-1",
+        final_response=final_response,
+        agent_result={},
+    )
+
+    assert len(callbacks) == 1
+    assert await callbacks[0]() is True
+    runner._update_discord_summaries.assert_awaited_once()
+    assert runner._update_discord_summaries.await_args.kwargs["status"] == "Blocked"
+    stored = runner.work_ledger.get(item["id"])
+    assert stored["status"] == "blocked"
+    assert stored["summary_status"] == "Blocked"
 
 
 @pytest.mark.asyncio
@@ -344,6 +560,48 @@ async def test_startup_delivers_agent_done_work_without_rerunning_agent(tmp_path
     assert adapter._send_with_retry.await_args.kwargs["content"] == "normal final answer"
     adapter.update_feature_summary.assert_awaited_once()
     assert runner.work_ledger.get(item["id"])["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_startup_delivers_repo_incomplete_work_as_blocked_not_completed(tmp_path):
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    runner._background_tasks = set()
+    runner._session_db = None
+    adapter = SimpleNamespace(
+        handle_message=AsyncMock(),
+        _send_with_retry=AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="result-1")
+        ),
+        update_feature_summary=AsyncMock(return_value=True),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+
+    event = _repo_discord_event(message_id="m1")
+    event.feature_summary = {"message_id": "summary-1", "initial_request": "Implement it"}
+    session_key = build_session_key(event.source)
+    item = runner.work_ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+    runner.work_ledger.mark_agent_done(
+        item["id"],
+        final_response="Not done yet: no commit, PR, or deploy. Current working tree has the feature changes but is not committed.",
+        session_id="session-1",
+        summary_status="Complete",
+        feature_summary=event.feature_summary,
+    )
+
+    scheduled = runner._schedule_incomplete_discord_work_items()
+    if runner._background_tasks:
+        await asyncio.gather(*runner._background_tasks)
+
+    assert scheduled == 1
+    adapter.handle_message.assert_not_called()
+    adapter._send_with_retry.assert_awaited_once()
+    adapter.update_feature_summary.assert_awaited_once()
+    assert adapter.update_feature_summary.await_args.kwargs["status"] == "Blocked"
+    stored = runner.work_ledger.get(item["id"])
+    assert stored["status"] == "blocked"
+    assert stored["summary_status"] == "Blocked"
 
 
 @pytest.mark.asyncio

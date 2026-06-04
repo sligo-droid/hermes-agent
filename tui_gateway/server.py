@@ -3551,6 +3551,15 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             streamer = make_stream_renderer(cols)
             prompt = text
 
+            if isinstance(prompt, str):
+                from hermes_cli.grill_me import build_grill_me_prompt, detect_grill_me_trigger
+
+                if detect_grill_me_trigger(prompt):
+                    prompt = build_grill_me_prompt(
+                        prompt,
+                        runtime_note="TUI natural-language grill-me trigger detected.",
+                    )
+
             if isinstance(prompt, str) and "@" in prompt:
                 from agent.context_references import preprocess_context_references
                 from agent.model_metadata import get_model_context_length

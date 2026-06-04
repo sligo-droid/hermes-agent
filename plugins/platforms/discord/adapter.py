@@ -27,6 +27,12 @@ from typing import Callable, Dict, Iterable, List, Optional, Any, Tuple, cast
 from urllib.parse import quote, urlparse
 
 from hermes_cli.discord_time import discord_message_exceeds_age_limit
+from hermes_cli.discord_thread_context import (
+    expand_discord_thread_references,
+    format_discord_thread_expansions,
+    has_discord_thread_reference,
+)
+from hermes_cli.discord_plan_artifacts import persist_discord_plan_artifact
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +78,10 @@ _DISCORD_GOAL_THREAD_CONTEXT_MAX_MESSAGE_CHARS = 1_500
 _DISCORD_MISSED_THREAD_BACKFILL_LIMIT = 20
 _DISCORD_MISSED_THREAD_BACKFILL_THREAD_LIMIT = 50
 _DISCORD_MISSED_THREAD_BACKFILL_MAX_AGE_SECONDS = 24 * 60 * 60
+_DISCORD_ROOT_MENTION_RECOVERY_STATE_FILENAME = "discord_root_channel_recovery.json"
+_DISCORD_ROOT_MENTION_RECOVERY_LIMIT = 25
+_DISCORD_ROOT_MENTION_RECOVERY_PAGE_LIMIT = 4
+_DISCORD_ROOT_MENTION_RECOVERY_MAX_AGE_SECONDS = 10 * 60
 _DISCORD_ALLOW_BOTS_MODES = {"none", "mentions", "all"}
 
 
@@ -148,6 +158,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     SUPPORTED_DOCUMENT_TYPES,
 )
+from hermes_cli.grill_me import detect_grill_me_trigger
 from tools.url_safety import is_safe_url
 
 
@@ -768,6 +779,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._bot_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None
         self._thread_backfill_task: Optional[asyncio.Task] = None
+        self._root_mention_recovery_state_lock = threading.RLock()
         # Dedup cache: prevents duplicate bot responses when Discord
         # RESUME replays events after reconnects.
         self._dedup = MessageDeduplicator()
@@ -2934,6 +2946,12 @@ class DiscordAdapter(BasePlatformAdapter):
 
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
+                # Run root-channel recovery before releasing queued on_message
+                # handlers from the ready gate.  Otherwise a live message that
+                # arrives just after READY could advance the root-channel
+                # watermark past an older offline-gap mention and make it
+                # unrecoverable.
+                await adapter_self._run_root_channel_missed_mention_recovery_task()
                 adapter_self._ready_event.set()
 
                 if adapter_self._post_connect_task and not adapter_self._post_connect_task.done():
@@ -2974,6 +2992,8 @@ class DiscordAdapter(BasePlatformAdapter):
                         _hard_ignore_reason,
                     )
                     return
+
+                adapter_self._record_discord_root_channel_seen_message(message)
 
                 # Bot message filtering (DISCORD_ALLOW_BOTS):
                 #   "none"     — ignore all other bots (default)
@@ -3055,14 +3075,22 @@ class DiscordAdapter(BasePlatformAdapter):
                             return
 
                 await self._handle_message(message)
+                # _handle_message() can bootstrap a project-channel mapping
+                # for newly seen project channels.  Record again after that
+                # path so future offline-gap recovery has a baseline even when
+                # the channel was not preconfigured in allowed/free lists.
+                adapter_self._record_discord_root_channel_seen_message(message)
 
             @self._client.event
             async def on_disconnect():
+                adapter_self._ready_event.clear()
                 logger.warning("[%s] Discord gateway disconnected; discord.py should attempt to resume", adapter_self.name)
 
             @self._client.event
             async def on_resumed():
                 logger.info("[%s] Discord gateway session resumed", adapter_self.name)
+                await adapter_self._run_root_channel_missed_mention_recovery_task()
+                adapter_self._ready_event.set()
                 if adapter_self._thread_backfill_task and not adapter_self._thread_backfill_task.done():
                     adapter_self._thread_backfill_task.cancel()
                 adapter_self._thread_backfill_task = asyncio.create_task(
@@ -3345,11 +3373,20 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[%s] Discord tracked-thread backfill failed: %s", self.name, e, exc_info=True)
 
+    async def _run_root_channel_missed_mention_recovery_task(self) -> None:
+        try:
+            await self._recover_missed_root_channel_mentions()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("[%s] Discord root-channel mention recovery failed: %s", self.name, e, exc_info=True)
+
     async def _run_post_connect_initialization(self) -> None:
         """Finish non-critical startup work after Discord is connected."""
         if not self._client:
             return
         try:
+            await self._run_root_channel_missed_mention_recovery_task()
             await self._run_tracked_thread_backfill_task()
 
             sync_policy = self._get_discord_command_sync_policy()
@@ -3955,6 +3992,71 @@ class DiscordAdapter(BasePlatformAdapter):
             lines.append(f"Kanban: {public_url}")
         return "\n".join(lines)
 
+    @staticmethod
+    def _is_discord_thread_object(channel: Any) -> bool:
+        type_name = type(channel).__name__.lower()
+        if type_name.endswith("thread") or "thread" in type_name:
+            return True
+        channel_type = getattr(channel, "type", None)
+        channel_type_name = str(getattr(channel_type, "name", channel_type) or "").lower()
+        return channel_type_name in {"public_thread", "private_thread", "news_thread"}
+
+    def _persist_plan_artifact_for_send(
+        self,
+        *,
+        channel: Any,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+        reply_to: Optional[str],
+        message_ids: list[str],
+        chunk_count: int,
+    ) -> Optional[Dict[str, str]]:
+        try:
+            meta = dict(metadata or {})
+            target_channel_id = str(getattr(channel, "id", "") or chat_id or "").strip()
+            explicit_thread_id = str(meta.get("thread_id") or "").strip()
+            is_thread = bool(explicit_thread_id) or self._is_discord_thread_object(channel)
+            thread_id = explicit_thread_id or (target_channel_id if is_thread else "")
+            guild = getattr(channel, "guild", None)
+            guild_id = str(getattr(guild, "id", "") or "").strip()
+            parent_channel_id = ""
+            if is_thread:
+                parent = getattr(channel, "parent", None)
+                parent_channel_id = str(
+                    getattr(parent, "id", "") or getattr(channel, "parent_id", "") or ""
+                ).strip()
+            source_message_id = str(
+                meta.get("source_message_id")
+                or meta.get("reply_to_message_id")
+                or reply_to
+                or ""
+            ).strip()
+            record = persist_discord_plan_artifact(
+                content,
+                thread_id=thread_id,
+                channel_id=target_channel_id,
+                guild_id=guild_id,
+                parent_channel_id=parent_channel_id,
+                source_message_id=source_message_id,
+                session_id=str(meta.get("session_id") or ""),
+                command=str(meta.get("command") or meta.get("invoked_command") or ""),
+                kind=str(meta.get("plan_artifact_kind") or "discord_plan"),
+                bot_message_ids=message_ids,
+                metadata=meta,
+                chunk_count=chunk_count,
+            )
+            if record is None:
+                return None
+            return {
+                "artifact_id": record.artifact_id,
+                "artifact_path": record.artifact_path,
+                "content_sha256": record.content_sha256,
+            }
+        except Exception as exc:
+            logger.debug("[%s] Discord plan artifact persistence skipped: %s", self.name, exc, exc_info=True)
+            return None
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Mark a Discord turn as in-progress.
 
@@ -4124,10 +4226,26 @@ class DiscordAdapter(BasePlatformAdapter):
                 _target_id = thread_id or chat_id
                 self._last_self_message_id[_target_id] = message_ids[-1]
 
+            plan_artifact = None
+            if message_ids:
+                plan_artifact = self._persist_plan_artifact_for_send(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content=formatted,
+                    metadata=metadata,
+                    reply_to=reply_to,
+                    message_ids=message_ids,
+                    chunk_count=len(chunks),
+                )
+
+            raw_response: Dict[str, Any] = {"message_ids": message_ids}
+            if plan_artifact:
+                raw_response["plan_artifact"] = plan_artifact
+
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
-                raw_response={"message_ids": message_ids}
+                raw_response=raw_response
             )
 
         except Exception as e:  # pragma: no cover - defensive logging
@@ -4180,7 +4298,19 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.warning("[%s] %s", self.name, warning)
                 warnings.append(warning)
 
+        plan_artifact = self._persist_plan_artifact_for_send(
+            channel=thread_channel,
+            chat_id=str(getattr(forum_channel, "id", "") or ""),
+            content=formatted,
+            metadata={"thread_id": thread_id},
+            reply_to=None,
+            message_ids=message_ids,
+            chunk_count=len(chunks),
+        )
+
         raw_response: Dict[str, Any] = {"message_ids": message_ids, "thread_id": thread_id}
+        if plan_artifact:
+            raw_response["plan_artifact"] = plan_artifact
         if warnings:
             raw_response["warnings"] = warnings
 
@@ -6556,6 +6686,10 @@ class DiscordAdapter(BasePlatformAdapter):
         goal_thread_context = ""
         if thread_channel is not None:
             goal_thread_context = await self._fetch_goal_thread_context(thread_channel)
+        goal_thread_context = self._merge_thread_context_blocks(
+            goal_thread_context,
+            await self._expand_discord_thread_refs_for_context(args),
+        )
 
         try:
             await interaction.edit_original_response(content=f"Goal started in <#{thread_id}>.")
@@ -6574,6 +6708,28 @@ class DiscordAdapter(BasePlatformAdapter):
             ),
             label=f"/goal {thread_id}",
         )
+
+    async def _expand_discord_thread_refs_for_context(self, text: str) -> str:
+        if not has_discord_thread_reference(text):
+            return ""
+        try:
+            expansions = await asyncio.to_thread(expand_discord_thread_references, text)
+        except Exception as exc:
+            logger.debug("[%s] Discord thread reference expansion failed: %s", self.name, exc)
+            return ""
+        return format_discord_thread_expansions(expansions)
+
+    @staticmethod
+    def _merge_thread_context_blocks(base: Optional[str], extra: Optional[str]) -> str:
+        base_text = str(base or "").strip()
+        extra_text = str(extra or "").strip()
+        if not extra_text:
+            return base_text
+        if extra_text in base_text:
+            return base_text
+        if base_text:
+            return f"{base_text}\n\n{extra_text}"
+        return extra_text
 
     def _resolve_channel_skills(self, channel_id: str, parent_id: str | None = None) -> list[str] | None:
         """Look up auto-skill bindings for a Discord channel/forum thread.
@@ -6783,6 +6939,502 @@ class DiscordAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             value = _DISCORD_MISSED_THREAD_BACKFILL_MAX_AGE_SECONDS
         return max(0.0, value)
+
+    def _discord_root_mention_recovery_enabled(self) -> bool:
+        configured = self.config.extra.get("root_mention_recovery")
+        if configured is None:
+            configured = self.config.extra.get("missed_root_mention_recovery")
+        if configured is not None:
+            return is_truthy_value(configured, default=True)
+        raw = os.getenv("DISCORD_ROOT_MENTION_RECOVERY")
+        if raw is None:
+            raw = os.getenv("DISCORD_MISSED_ROOT_MENTION_RECOVERY")
+        return is_truthy_value(raw, default=True)
+
+    def _discord_root_mention_recovery_limit(self) -> int:
+        configured = self.config.extra.get("root_mention_recovery_limit")
+        if configured is None:
+            configured = self.config.extra.get("missed_root_mention_recovery_limit")
+        raw = configured if configured is not None else os.getenv("DISCORD_ROOT_MENTION_RECOVERY_LIMIT")
+        if raw is None:
+            raw = os.getenv("DISCORD_MISSED_ROOT_MENTION_RECOVERY_LIMIT")
+        try:
+            value = int(raw) if raw is not None else _DISCORD_ROOT_MENTION_RECOVERY_LIMIT
+        except (TypeError, ValueError):
+            value = _DISCORD_ROOT_MENTION_RECOVERY_LIMIT
+        return max(1, min(value, 100))
+
+    def _discord_root_mention_recovery_max_age_seconds(self) -> float:
+        configured = self.config.extra.get("root_mention_recovery_max_age_seconds")
+        if configured is None:
+            configured = self.config.extra.get("missed_root_mention_recovery_max_age_seconds")
+        raw = configured if configured is not None else os.getenv("DISCORD_ROOT_MENTION_RECOVERY_MAX_AGE_SECONDS")
+        if raw is None:
+            raw = os.getenv("DISCORD_MISSED_ROOT_MENTION_RECOVERY_MAX_AGE_SECONDS")
+        try:
+            value = float(raw) if raw is not None else _DISCORD_ROOT_MENTION_RECOVERY_MAX_AGE_SECONDS
+        except (TypeError, ValueError):
+            value = _DISCORD_ROOT_MENTION_RECOVERY_MAX_AGE_SECONDS
+        return max(0.0, value)
+
+    def _discord_root_mention_recovery_state_path(self) -> _Path:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / "gateway" / _DISCORD_ROOT_MENTION_RECOVERY_STATE_FILENAME
+
+    def _read_discord_root_mention_recovery_state(self) -> Dict[str, Any]:
+        path = self._discord_root_mention_recovery_state_path()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {"version": 1, "channels": {}}
+        except Exception:
+            logger.debug("[%s] Discord root-channel recovery state unreadable", self.name, exc_info=True)
+            return {"version": 1, "channels": {}}
+        if not isinstance(payload, dict):
+            return {"version": 1, "channels": {}}
+        channels = payload.get("channels")
+        if not isinstance(channels, dict):
+            payload["channels"] = {}
+        payload.setdefault("version", 1)
+        return payload
+
+    def _write_discord_root_mention_recovery_state(self, state: Dict[str, Any]) -> None:
+        atomic_json_write(
+            self._discord_root_mention_recovery_state_path(),
+            state,
+            indent=2,
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _discord_channel_id_set(raw: Any) -> set[str]:
+        if raw is None:
+            return set()
+        if isinstance(raw, (list, tuple, set)):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        s = str(raw).strip()
+        if not s:
+            return set()
+        return {part.strip() for part in s.split(",") if part.strip()}
+
+    def _discord_allowed_channel_ids(self) -> set[str]:
+        raw = self.config.extra.get("allowed_channels")
+        if raw is None:
+            raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "")
+        return self._discord_channel_id_set(raw)
+
+    def _discord_ignored_channel_ids(self) -> set[str]:
+        raw = self.config.extra.get("ignored_channels")
+        if raw is None:
+            raw = os.getenv("DISCORD_IGNORED_CHANNELS", "")
+        return self._discord_channel_id_set(raw)
+
+    def _discord_no_thread_channel_ids(self) -> set[str]:
+        raw = self.config.extra.get("no_thread_channels")
+        if raw is None:
+            raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
+        return self._discord_channel_id_set(raw)
+
+    def _discord_project_mapping_root_channel_ids(self) -> set[str]:
+        """Return root project channels known to Hermes' Discord project map.
+
+        Project channels like ``#pid`` are often not listed in
+        ``allowed_channels`` / ``feature_request_channels`` because normal
+        routing resolves them through the project mapping DB.  Recovery must
+        include those exact mapped roots, but only those roots — never every
+        guild channel — to avoid historical sweeps.
+        """
+        try:
+            from hermes_state import SessionDB
+
+            db = SessionDB()
+        except Exception as exc:
+            logger.debug("[%s] Discord project mappings unavailable for root recovery: %s", self.name, exc)
+            return set()
+        try:
+            try:
+                rows = db.list_discord_project_mappings()
+            except Exception as exc:
+                logger.debug("[%s] Discord project mappings unreadable for root recovery: %s", self.name, exc)
+                return set()
+        finally:
+            close = getattr(db, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+        ids: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            channel_id = str(row.get("channel_id") or "").strip()
+            if channel_id:
+                ids.add(channel_id)
+        return ids
+
+    def _discord_relevant_root_channel_ids(self) -> list[str]:
+        ids: set[str] = set()
+        allowed = self._discord_allowed_channel_ids()
+        if allowed and "*" not in allowed:
+            ids.update(allowed)
+        ids.update(self._discord_project_mapping_root_channel_ids())
+        ids.update(ch for ch in self._discord_free_response_channels() if ch != "*")
+        ids.update(ch for ch in self._discord_feature_request_channels() if ch != "*")
+        ids.update(ch for ch in self._discord_no_thread_channel_ids() if ch != "*")
+        ignored = self._discord_ignored_channel_ids()
+        if "*" in ignored:
+            return []
+        ids.difference_update(ignored)
+        return sorted(ids, key=lambda value: int(value) if value.isdigit() else value)
+
+    async def _resolve_root_channel_for_recovery(self, channel_id: str) -> Optional[Any]:
+        if not self._client:
+            return None
+        try:
+            numeric_id = int(channel_id)
+        except (TypeError, ValueError):
+            return None
+        channel = None
+        get_channel = getattr(self._client, "get_channel", None)
+        if callable(get_channel):
+            try:
+                channel = get_channel(numeric_id)
+            except Exception:
+                channel = None
+        if channel is None:
+            fetch_channel = getattr(self._client, "fetch_channel", None)
+            if callable(fetch_channel):
+                try:
+                    channel = fetch_channel(numeric_id)
+                    if inspect.isawaitable(channel):
+                        channel = await channel
+                except Exception as exc:
+                    logger.debug("[%s] Discord root channel %s fetch failed: %s", self.name, channel_id, exc)
+                    return None
+        if channel is None or not callable(getattr(channel, "history", None)):
+            return None
+        if isinstance(channel, discord.DMChannel) or isinstance(channel, discord.Thread):
+            return None
+        return channel
+
+    async def _latest_root_channel_message_id_for_recovery(self, channel: Any) -> Optional[str]:
+        history = getattr(channel, "history", None)
+        if not callable(history):
+            return None
+        try:
+            async for msg in history(limit=1, oldest_first=False):
+                message_id = str(getattr(msg, "id", "") or "")
+                return message_id or None
+        except TypeError:
+            async for msg in history(limit=1):
+                message_id = str(getattr(msg, "id", "") or "")
+                return message_id or None
+        except Exception as exc:
+            logger.debug("[%s] Discord root-channel latest message fetch failed: %s", self.name, exc)
+        return None
+
+    def _discord_message_newer_than_root_recovery_cutoff(self, message: Any, cutoff_ts: float) -> bool:
+        if cutoff_ts <= 0:
+            return True
+        created_at = getattr(message, "created_at", None)
+        if created_at is not None:
+            try:
+                return float(created_at.timestamp()) >= cutoff_ts
+            except Exception:
+                pass
+        message_id = str(getattr(message, "id", "") or "")
+        if not message_id:
+            return False
+        max_age = max(0.0, time.time() - cutoff_ts)
+        return not discord_message_exceeds_age_limit(message_id, max_age_seconds=max_age)
+
+    def _update_discord_root_channel_recovery_watermark(
+        self,
+        channel_id: str,
+        message_id: str,
+        *,
+        observed_at: Optional[float] = None,
+        seeded_at: Optional[float] = None,
+    ) -> None:
+        """Merge a root-channel recovery watermark without moving backwards."""
+        channel_id = str(channel_id or "").strip()
+        message_id = str(message_id or "").strip() or "0"
+        if not channel_id:
+            return
+        try:
+            new_id_num = int(message_id) if message_id.isdigit() else 0
+        except Exception:
+            new_id_num = 0
+        observed = time.time() if observed_at is None else float(observed_at)
+        with self._root_mention_recovery_state_lock:
+            state = self._read_discord_root_mention_recovery_state()
+            channels = state.setdefault("channels", {})
+            if not isinstance(channels, dict):
+                channels = {}
+                state["channels"] = channels
+            existing = channels.get(channel_id)
+            if not isinstance(existing, dict):
+                existing = {}
+            current_id = str(existing.get("last_seen_message_id") or "")
+            try:
+                current_id_num = int(current_id) if current_id.isdigit() else 0
+            except Exception:
+                current_id_num = 0
+            if new_id_num < current_id_num:
+                return
+            next_entry = {
+                **existing,
+                "last_seen_message_id": message_id,
+                "last_online_at": observed,
+            }
+            if seeded_at is not None and "seeded_at" not in next_entry:
+                next_entry["seeded_at"] = float(seeded_at)
+            channels[channel_id] = next_entry
+            self._write_discord_root_mention_recovery_state(state)
+
+    def _record_discord_root_channel_seen_message(self, message: Any) -> None:
+        channel = getattr(message, "channel", None)
+        if self._client is None or channel is None:
+            return
+        if isinstance(channel, discord.DMChannel) or isinstance(channel, discord.Thread):
+            return
+        channel_id = str(getattr(channel, "id", "") or "")
+        if not channel_id or channel_id not in set(self._discord_relevant_root_channel_ids()):
+            return
+        message_id = str(getattr(message, "id", "") or "")
+        if not message_id:
+            return
+        try:
+            self._update_discord_root_channel_recovery_watermark(
+                channel_id,
+                message_id,
+                observed_at=time.time(),
+            )
+        except Exception:
+            logger.debug("[%s] Failed to update Discord root-channel recovery watermark", self.name, exc_info=True)
+
+    async def _recent_root_channel_messages_for_recovery(
+        self,
+        channel: Any,
+        *,
+        after_message_id: str,
+        cutoff_ts: float,
+    ) -> List[Any]:
+        history = getattr(channel, "history", None)
+        if not callable(history):
+            return []
+        after_obj = self._discord_history_after_object(after_message_id)
+        if after_obj is None:
+            return []
+        kwargs: Dict[str, Any] = {
+            "limit": self._discord_root_mention_recovery_limit(),
+            "after": after_obj,
+            # Page from the oldest unseen message forward.  If a channel has
+            # more unseen traffic than the recovery cap, advancing only to the
+            # last inspected message is safer than sampling the newest page and
+            # making older missed mentions unrecoverable.
+            "oldest_first": True,
+        }
+        messages: List[Any] = []
+        try:
+            async for msg in history(**kwargs):
+                messages.append(msg)
+        except TypeError:
+            kwargs.pop("oldest_first", None)
+            async for msg in history(**kwargs):
+                messages.append(msg)
+        except Exception as exc:
+            logger.debug("[%s] Discord root-channel history fetch failed: %s", self.name, exc)
+            return []
+        messages.sort(key=self._discord_sortable_message_id)
+        return messages
+
+    async def _should_replay_root_channel_message(self, message: Any, channel_id: str, cutoff_ts: float) -> bool:
+        message_id = str(getattr(message, "id", "") or "")
+        if not message_id:
+            return False
+        if not self._discord_message_newer_than_root_recovery_cutoff(message, cutoff_ts):
+            return False
+        if self._discord_message_seen_in_session_history(message_id):
+            return False
+
+        channel = getattr(message, "channel", None)
+        if channel is None or str(getattr(channel, "id", "") or "") != channel_id:
+            return False
+        if isinstance(channel, discord.DMChannel) or isinstance(channel, discord.Thread):
+            return False
+
+        author = getattr(message, "author", None)
+        if self._discord_author_is_self(author) or getattr(author, "bot", False):
+            return False
+
+        message_type = getattr(message, "type", None)
+        discord_message_type = getattr(discord, "MessageType", None)
+        allowed_types = {
+            getattr(discord_message_type, "default", None),
+            getattr(discord_message_type, "reply", None),
+        }
+        allowed_types.discard(None)
+        if allowed_types and message_type not in allowed_types:
+            return False
+
+        hard_ignore_reason = self._discord_hard_ignore_reason(channel)
+        if hard_ignore_reason:
+            logger.debug("[%s] Discord root recovery skipping %s: %s", self.name, message_id, hard_ignore_reason)
+            return False
+
+        channel_ids = {channel_id}
+        allowed_channels = self._discord_allowed_channel_ids()
+        if allowed_channels and "*" not in allowed_channels and not (channel_ids & allowed_channels):
+            return False
+        ignored_channels = self._discord_ignored_channel_ids()
+        if "*" in ignored_channels or (channel_ids & ignored_channels):
+            return False
+
+        guild = getattr(message, "guild", None) or getattr(channel, "guild", None)
+        if not self._is_allowed_user(
+            str(getattr(author, "id", "") or ""),
+            author,
+            guild=guild,
+            is_dm=False,
+        ):
+            return False
+
+        if self._message_mentions_self(message):
+            self._ensure_self_mention_visible_to_handle_message(message)
+            return True
+        if await self._message_replies_to_self_for_replay(message):
+            return True
+        return False
+
+    async def _recover_missed_root_channel_mentions(self) -> int:
+        """Replay bounded root-channel bot triggers missed during a known offline gap.
+
+        First observation of a channel only seeds its high-water mark to the
+        latest visible message. Recovery begins on later restarts, bounded by
+        the previous online timestamp plus a short freshness cap.
+        """
+        if not self._discord_root_mention_recovery_enabled() or not self._client:
+            return 0
+        channel_ids = self._discord_relevant_root_channel_ids()
+        if not channel_ids:
+            return 0
+
+        with self._root_mention_recovery_state_lock:
+            state = self._read_discord_root_mention_recovery_state()
+            channels = state.setdefault("channels", {})
+            if not isinstance(channels, dict):
+                channels = {}
+                state["channels"] = channels
+        now_ts = time.time()
+        max_age = self._discord_root_mention_recovery_max_age_seconds()
+        replayed = 0
+        inspected = 0
+
+        for channel_id in channel_ids:
+            channel = await self._resolve_root_channel_for_recovery(channel_id)
+            if channel is None:
+                continue
+            existing = channels.get(channel_id)
+            if not isinstance(existing, dict):
+                existing = {}
+            last_seen_id = str(existing.get("last_seen_message_id") or "")
+            last_online_at = existing.get("last_online_at")
+
+            if not last_seen_id:
+                latest_id = await self._latest_root_channel_message_id_for_recovery(channel)
+                self._update_discord_root_channel_recovery_watermark(
+                    channel_id,
+                    latest_id or "0",
+                    observed_at=now_ts,
+                    seeded_at=now_ts,
+                )
+                logger.info(
+                    "[%s] Seeded Discord root-channel recovery watermark channel_id=%s message_id=%s",
+                    self.name,
+                    channel_id,
+                    latest_id or "0",
+                )
+                continue
+
+            try:
+                offline_start = float(last_online_at)
+            except (TypeError, ValueError):
+                offline_start = now_ts
+            cutoff_ts = offline_start
+            if max_age > 0:
+                cutoff_ts = max(cutoff_ts, now_ts - max_age)
+
+            high_water = int(last_seen_id) if last_seen_id.isdigit() else 0
+            page_limit = self._discord_root_mention_recovery_limit()
+            max_pages = max(1, _DISCORD_ROOT_MENTION_RECOVERY_PAGE_LIMIT)
+            pages = 0
+            caught_up = False
+            while pages < max_pages:
+                messages = await self._recent_root_channel_messages_for_recovery(
+                    channel,
+                    after_message_id=str(high_water or last_seen_id),
+                    cutoff_ts=cutoff_ts,
+                )
+                if not messages:
+                    caught_up = True
+                    break
+                pages += 1
+                for message in messages:
+                    inspected += 1
+                    message_id = str(getattr(message, "id", "") or "")
+                    sortable_id = self._discord_sortable_message_id(message)
+                    if sortable_id > high_water:
+                        high_water = sortable_id
+                    if not await self._should_replay_root_channel_message(message, channel_id, cutoff_ts):
+                        continue
+                    if self._dedup.is_duplicate(message_id):
+                        continue
+                    logger.info(
+                        "[%s] Replaying missed Discord root-channel message %s in channel %s",
+                        self.name,
+                        message_id,
+                        channel_id,
+                    )
+                    try:
+                        await self._handle_message(message)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "[%s] Failed to replay Discord root-channel message %s in channel %s: %s",
+                            self.name,
+                            message_id,
+                            channel_id,
+                            exc,
+                            exc_info=True,
+                        )
+                        continue
+                    replayed += 1
+                if len(messages) < page_limit:
+                    caught_up = True
+                    break
+
+            self._update_discord_root_channel_recovery_watermark(
+                channel_id,
+                str(high_water or last_seen_id),
+                # If we hit the page cap, preserve the original offline-start
+                # cutoff so a later recovery can continue this gap instead of
+                # treating uninspected messages as pre-cutoff history.
+                observed_at=now_ts if caught_up else offline_start,
+            )
+
+        logger.info(
+            "[%s] Discord root-channel mention recovery complete: replayed=%d inspected_messages=%d inspected_channels=%d",
+            self.name,
+            replayed,
+            inspected,
+            len(channel_ids),
+        )
+        return replayed
 
     def _tracked_discord_thread_ids(self) -> List[str]:
         ids = getattr(self._threads, "ids", None)
@@ -7499,12 +8151,17 @@ class DiscordAdapter(BasePlatformAdapter):
         reason = f"Requested by {display_name} via /thread"
         starter_message = (message or "").strip()
 
+        direct_thread_kwargs = {
+            "name": name,
+            "auto_archive_duration": auto_archive_duration,
+            "reason": reason,
+        }
+        public_thread_type = getattr(getattr(discord, "ChannelType", None), "public_thread", None)
+        if public_thread_type is not None:
+            direct_thread_kwargs["type"] = public_thread_type
+
         try:
-            thread = await parent_channel.create_thread(
-                name=name,
-                auto_archive_duration=auto_archive_duration,
-                reason=reason,
-            )
+            thread = await parent_channel.create_thread(**direct_thread_kwargs)
             if starter_message:
                 await thread.send(starter_message)
             return {
@@ -8485,6 +9142,7 @@ class DiscordAdapter(BasePlatformAdapter):
             self._slash_command_starts_threaded_work(normalized_content)
             or slash_goal_uses_attachment_body
         )
+        grill_me_trigger = detect_grill_me_trigger(normalized_content)
 
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
@@ -8572,7 +9230,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 auto_threaded_channel = thread
                 self._threads.mark(thread_id)
 
-        if not is_thread and not isinstance(message.channel, discord.DMChannel):
+        if grill_me_trigger and is_parent_channel_message:
+            _stage_started = time.perf_counter()
+            thread = await self._auto_create_thread(message)
+            self._mark_discord_stage(_intake_timing, "thread_create", _stage_started)
+            direct_question_prompt = True
+            if thread:
+                parent_channel_id = str(message.channel.id)
+                is_thread = True
+                thread_id = str(thread.id)
+                auto_threaded_channel = thread
+                auto_threaded_direct_question = True
+                self._threads.mark(thread_id)
+
+        if not grill_me_trigger and not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
             has_discord_message_link = self._contains_discord_message_link(normalized_content)
@@ -8634,6 +9305,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if (
             feature_request_intent is None
             and not is_meeting_command_message
+            and not grill_me_trigger
             and (
                 (is_parent_channel_message and mention_prefix)
                 or (is_thread and (mention_prefix or replies_to_self))
@@ -8654,6 +9326,7 @@ class DiscordAdapter(BasePlatformAdapter):
             is_parent_channel_message
             and mention_prefix
             and direct_question_prompt is False
+            and not grill_me_trigger
         ):
             project_summary_handle = await self.initialize_project_summary(
                 message.channel,
@@ -8976,6 +9649,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._mark_discord_stage(_intake_timing, "history_backfill", _stage_started)
                 if _backfill_text:
                     _channel_context = _backfill_text
+        _expanded_thread_refs = await self._expand_discord_thread_refs_for_context(event_text)
+        if _expanded_thread_refs:
+            _channel_context = self._merge_thread_context_blocks(
+                _channel_context,
+                _expanded_thread_refs,
+            )
 
         # Defense-in-depth: prevent empty user messages from entering session
         # (can happen when user sends @mention-only with no other text).
@@ -8988,6 +9667,11 @@ class DiscordAdapter(BasePlatformAdapter):
         if is_thread and slash_command_starts_threaded_work:
             context_channel = effective_channel if auto_threaded_channel is not None else message.channel
             _goal_thread_context = await self._fetch_goal_thread_context(context_channel, before=message)
+        if slash_command_starts_threaded_work and _expanded_thread_refs:
+            _goal_thread_context = self._merge_thread_context_blocks(
+                _goal_thread_context,
+                _expanded_thread_refs,
+            )
 
         _chan = message.channel
         _parent_id = str(getattr(_chan, "parent_id", "") or "")

@@ -38,6 +38,7 @@ def _ensure_discord_mock():
         discord_mod.Intents.default.return_value = MagicMock()
         discord_mod.Client = MagicMock
         discord_mod.File = MagicMock
+        discord_mod.Object = lambda id: SimpleNamespace(id=id)
         discord_mod.DMChannel = type("DMChannel", (), {})
         discord_mod.Thread = type("Thread", (), {})
         discord_mod.ForumChannel = type("ForumChannel", (), {})
@@ -63,12 +64,53 @@ def _ensure_discord_mock():
         sys.modules.setdefault("discord.ext.commands", commands_mod)
 
     sys.modules["discord"].AllowedMentions = _FakeAllowedMentions
+    if isinstance(getattr(sys.modules["discord"], "Object", None), MagicMock):
+        setattr(sys.modules["discord"], "Object", lambda id: SimpleNamespace(id=id))
 
 
 _ensure_discord_mock()
 
 import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+
+
+class _FakeDiscordRootChannel:
+    def __init__(self, channel_id, messages):
+        self.id = int(channel_id)
+        self.name = f"channel-{channel_id}"
+        self.guild = SimpleNamespace(id=1, name="Guild")
+        self._messages = list(messages)
+        for message in self._messages:
+            message.channel = self
+            message.guild = self.guild
+
+    def history(self, **kwargs):
+        limit = kwargs.get("limit")
+        after = kwargs.get("after")
+        oldest_first = kwargs.get("oldest_first", False)
+        after_id = int(getattr(after, "id", 0) or 0) if after is not None else 0
+        messages = [msg for msg in self._messages if int(getattr(msg, "id", 0) or 0) > after_id]
+        messages.sort(key=lambda msg: int(getattr(msg, "id", 0) or 0), reverse=not oldest_first)
+        if limit is not None:
+            messages = messages[:limit]
+
+        async def _iter():
+            for message in messages:
+                yield message
+
+        return _iter()
+
+
+def _fake_discord_root_message(message_id, *, author=None, mentions=None, created_at=None):
+    return SimpleNamespace(
+        id=int(message_id),
+        author=author or SimpleNamespace(id=42, bot=False),
+        mentions=list(mentions or []),
+        type=discord_platform.discord.MessageType.default,
+        created_at=created_at,
+        reference=None,
+        content="hello",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -542,9 +584,191 @@ async def test_post_connect_initialization_skips_sync_when_policy_off(monkeypatc
 
     fake_tree = SimpleNamespace(sync=AsyncMock())
     adapter._client = SimpleNamespace(tree=fake_tree)
+    root_recovery = AsyncMock(return_value=0)
+    thread_recovery = AsyncMock(return_value=None)
+    monkeypatch.setattr(adapter, "_recover_missed_root_channel_mentions", root_recovery)
+    monkeypatch.setattr(adapter, "_backfill_missed_tracked_thread_messages", thread_recovery)
     await adapter._run_post_connect_initialization()
 
     fake_tree.sync.assert_not_called()
+    root_recovery.assert_awaited_once()
+    thread_recovery.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_root_channel_recovery_first_run_seeds_without_replay(tmp_path, monkeypatch):
+    adapter = DiscordAdapter(
+        PlatformConfig(enabled=True, token="test-token", extra={"allowed_channels": ["555"]})
+    )
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    bot_user = SimpleNamespace(id=999, bot=True)
+    old_message = _fake_discord_root_message(123, mentions=[bot_user])
+    channel = _FakeDiscordRootChannel("555", [old_message])
+    adapter._client = SimpleNamespace(user=bot_user, get_channel=lambda channel_id: channel if channel_id == 555 else None)
+    adapter._handle_message = AsyncMock()
+
+    recovered = await adapter._recover_missed_root_channel_mentions()
+
+    assert recovered == 0
+    adapter._handle_message.assert_not_awaited()
+    state = json.loads((tmp_path / "gateway" / discord_platform._DISCORD_ROOT_MENTION_RECOVERY_STATE_FILENAME).read_text())
+    assert state["channels"]["555"]["last_seen_message_id"] == "123"
+
+
+@pytest.mark.asyncio
+async def test_root_channel_recovery_replays_newer_missed_mention(tmp_path, monkeypatch):
+    adapter = DiscordAdapter(
+        PlatformConfig(enabled=True, token="test-token", extra={"allowed_channels": ["555"]})
+    )
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(discord_platform.time, "time", lambda: 1_000.0)
+    bot_user = SimpleNamespace(id=999, bot=True)
+    missed = _fake_discord_root_message(125, mentions=[bot_user])
+    channel = _FakeDiscordRootChannel("555", [missed])
+    state_path = tmp_path / "gateway" / discord_platform._DISCORD_ROOT_MENTION_RECOVERY_STATE_FILENAME
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"version": 1, "channels": {"555": {"last_seen_message_id": "123", "last_online_at": 950.0}}}))
+    adapter._client = SimpleNamespace(user=bot_user, get_channel=lambda channel_id: channel if channel_id == 555 else None)
+    adapter._handle_message = AsyncMock()
+
+    recovered = await adapter._recover_missed_root_channel_mentions()
+
+    assert recovered == 1
+    adapter._handle_message.assert_awaited_once_with(missed)
+    state = json.loads(state_path.read_text())
+    assert state["channels"]["555"]["last_seen_message_id"] == "125"
+
+
+@pytest.mark.asyncio
+async def test_root_channel_recovery_includes_project_mapped_channels(tmp_path, monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(discord_platform.time, "time", lambda: 1_000.0)
+
+    class FakeSessionDB:
+        def list_discord_project_mappings(self):
+            return [{"channel_id": "555"}]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("hermes_state.SessionDB", FakeSessionDB)
+    bot_user = SimpleNamespace(id=999, bot=True)
+    missed = _fake_discord_root_message(125, mentions=[bot_user])
+    channel = _FakeDiscordRootChannel("555", [missed])
+    state_path = tmp_path / "gateway" / discord_platform._DISCORD_ROOT_MENTION_RECOVERY_STATE_FILENAME
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"version": 1, "channels": {"555": {"last_seen_message_id": "123", "last_online_at": 950.0}}}))
+    adapter._client = SimpleNamespace(user=bot_user, get_channel=lambda channel_id: channel if channel_id == 555 else None)
+    adapter._handle_message = AsyncMock()
+
+    recovered = await adapter._recover_missed_root_channel_mentions()
+
+    assert recovered == 1
+    adapter._handle_message.assert_awaited_once_with(missed)
+
+
+@pytest.mark.asyncio
+async def test_root_channel_recovery_skips_older_than_cutoff_and_watermark(tmp_path, monkeypatch):
+    adapter = DiscordAdapter(
+        PlatformConfig(enabled=True, token="test-token", extra={"allowed_channels": ["555"], "root_mention_recovery_max_age_seconds": 60})
+    )
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(discord_platform.time, "time", lambda: 1_000.0)
+    bot_user = SimpleNamespace(id=999, bot=True)
+    too_old = _fake_discord_root_message(125, mentions=[bot_user], created_at=SimpleNamespace(timestamp=lambda: 900.0))
+    newer = _fake_discord_root_message(126, mentions=[bot_user], created_at=SimpleNamespace(timestamp=lambda: 970.0))
+    channel = _FakeDiscordRootChannel("555", [too_old, newer])
+    state_path = tmp_path / "gateway" / discord_platform._DISCORD_ROOT_MENTION_RECOVERY_STATE_FILENAME
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"version": 1, "channels": {"555": {"last_seen_message_id": "125", "last_online_at": 800.0}}}))
+    adapter._client = SimpleNamespace(user=bot_user, get_channel=lambda channel_id: channel if channel_id == 555 else None)
+    adapter._handle_message = AsyncMock()
+
+    recovered = await adapter._recover_missed_root_channel_mentions()
+
+    assert recovered == 1
+    adapter._handle_message.assert_awaited_once_with(newer)
+
+
+@pytest.mark.asyncio
+async def test_root_channel_recovery_is_idempotent(tmp_path, monkeypatch):
+    adapter = DiscordAdapter(
+        PlatformConfig(enabled=True, token="test-token", extra={"allowed_channels": ["555"]})
+    )
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(discord_platform.time, "time", lambda: 1_000.0)
+    bot_user = SimpleNamespace(id=999, bot=True)
+    missed = _fake_discord_root_message(125, mentions=[bot_user])
+    channel = _FakeDiscordRootChannel("555", [missed])
+    state_path = tmp_path / "gateway" / discord_platform._DISCORD_ROOT_MENTION_RECOVERY_STATE_FILENAME
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"version": 1, "channels": {"555": {"last_seen_message_id": "123", "last_online_at": 950.0}}}))
+    adapter._client = SimpleNamespace(user=bot_user, get_channel=lambda channel_id: channel if channel_id == 555 else None)
+    adapter._handle_message = AsyncMock()
+
+    assert await adapter._recover_missed_root_channel_mentions() == 1
+    assert await adapter._recover_missed_root_channel_mentions() == 0
+    adapter._handle_message.assert_awaited_once_with(missed)
+
+
+@pytest.mark.asyncio
+async def test_root_channel_recovery_page_cap_preserves_offline_cutoff(tmp_path, monkeypatch):
+    adapter = DiscordAdapter(
+        PlatformConfig(enabled=True, token="test-token", extra={"allowed_channels": ["555"], "root_mention_recovery_limit": 1})
+    )
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(discord_platform.time, "time", lambda: 1_000.0)
+    bot_user = SimpleNamespace(id=999, bot=True)
+    messages = [_fake_discord_root_message(mid, mentions=[bot_user]) for mid in [124, 125, 126, 127, 128]]
+    channel = _FakeDiscordRootChannel("555", messages)
+    state_path = tmp_path / "gateway" / discord_platform._DISCORD_ROOT_MENTION_RECOVERY_STATE_FILENAME
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"version": 1, "channels": {"555": {"last_seen_message_id": "123", "last_online_at": 950.0}}}))
+    adapter._client = SimpleNamespace(user=bot_user, get_channel=lambda channel_id: channel if channel_id == 555 else None)
+    adapter._handle_message = AsyncMock()
+
+    assert await adapter._recover_missed_root_channel_mentions() == 4
+    state = json.loads(state_path.read_text())
+    assert state["channels"]["555"]["last_seen_message_id"] == "127"
+    assert state["channels"]["555"]["last_online_at"] == 950.0
+
+    assert await adapter._recover_missed_root_channel_mentions() == 1
+    state = json.loads(state_path.read_text())
+    assert state["channels"]["555"]["last_seen_message_id"] == "128"
+    assert state["channels"]["555"]["last_online_at"] == 1_000.0
+
+
+@pytest.mark.asyncio
+async def test_root_channel_recovery_skips_bot_ignored_and_non_allowed_messages(tmp_path, monkeypatch):
+    adapter = DiscordAdapter(
+        PlatformConfig(enabled=True, token="test-token", extra={"allowed_channels": ["555"], "ignored_channels": ["666"]})
+    )
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(discord_platform.time, "time", lambda: 1_000.0)
+    bot_user = SimpleNamespace(id=999, bot=True)
+    bot_message = _fake_discord_root_message(125, author=SimpleNamespace(id=7, bot=True), mentions=[bot_user])
+    ignored_message = _fake_discord_root_message(225, mentions=[bot_user])
+    non_allowed_message = _fake_discord_root_message(325, mentions=[bot_user])
+    channels = {
+        555: _FakeDiscordRootChannel("555", [bot_message]),
+        666: _FakeDiscordRootChannel("666", [ignored_message]),
+        777: _FakeDiscordRootChannel("777", [non_allowed_message]),
+    }
+    state_path = tmp_path / "gateway" / discord_platform._DISCORD_ROOT_MENTION_RECOVERY_STATE_FILENAME
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"version": 1, "channels": {
+        "555": {"last_seen_message_id": "123", "last_online_at": 950.0},
+        "666": {"last_seen_message_id": "223", "last_online_at": 950.0},
+        "777": {"last_seen_message_id": "323", "last_online_at": 950.0},
+    }}))
+    adapter._client = SimpleNamespace(user=bot_user, get_channel=lambda channel_id: channels.get(channel_id))
+    adapter._handle_message = AsyncMock()
+
+    recovered = await adapter._recover_missed_root_channel_mentions()
+
+    assert recovered == 0
+    adapter._handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

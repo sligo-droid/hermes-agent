@@ -346,6 +346,17 @@ def delegate_coding_task(
         except Exception as exc:
             return tool_error(f"could not import OpenCode worker backend: {exc}")
 
+        def _touch_opencode_activity(event: dict) -> None:
+            try:
+                event_type = str(event.get("type") or event.get("method") or "event")
+                agent = str(event.get("agent") or "")
+                suffix = f": {agent}" if agent else ""
+                touch_activity = getattr(parent_agent, "_touch_activity", None)
+                if callable(touch_activity):
+                    touch_activity(f"OpenCode coding worker event: {event_type}{suffix}")
+            except Exception:
+                pass
+
         started = time.monotonic()
         result = run_opencode_task(
             worker_prompt,
@@ -353,6 +364,7 @@ def delegate_coding_task(
             timeout=timeout,
             context_for_classification=classification_context,
             title="Hermes delegated coding task",
+            on_event=_touch_opencode_activity,
         )
         duration = round(time.monotonic() - started, 2)
         success = bool(result.final_text) and not result.error and not result.interrupted

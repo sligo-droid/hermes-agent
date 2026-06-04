@@ -56,6 +56,7 @@ from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.grill_me import build_grill_me_prompt, detect_grill_me_trigger
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -4606,7 +4607,11 @@ class GatewayRunner:
         )
         if summary_ok:
             ledger.mark_summary_updated(work_id)
-            ledger.mark_completed(work_id)
+            gate = item.get("completion_gate") if isinstance(item.get("completion_gate"), dict) else {}
+            if gate and not gate.get("allowed_to_complete"):
+                ledger.mark_blocked(work_id, reason=str(gate.get("reason") or "completion_gate"))
+            else:
+                ledger.mark_completed(work_id)
 
     async def start(self) -> bool:
         """
@@ -10111,6 +10116,16 @@ class GatewayRunner:
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
 
+        if not command and detect_grill_me_trigger(event.text or ""):
+            event = dataclasses.replace(
+                event,
+                text=build_grill_me_prompt(
+                    event.text or "",
+                    runtime_note="Gateway natural-language grill-me trigger detected.",
+                ),
+            )
+            source = event.source
+
         if self._is_telegram_topic_root_lobby(source):
             # Debounce the lobby reminder so a user who forgets about
             # topic mode and fires ten prompts doesn't get ten copies.
@@ -11596,15 +11611,19 @@ class GatewayRunner:
                 await self._send_voice_reply(event, response)
 
             if _already_sent and not agent_result.get("failed"):
+                work_item_id = getattr(event, "work_item_id", None)
+                summary_status = self._discord_ledger_summary_status(
+                    work_item_id,
+                    self._discord_summary_status(agent_result),
+                )
                 summary_ok = await self._update_discord_summaries(
                     source=source,
                     feature_summary=getattr(event, "feature_summary", None),
                     project_summary=getattr(event, "project_summary", None),
                     final_response=response,
-                    status=self._discord_summary_status(agent_result),
+                    status=summary_status,
                     session_id=session_entry.session_id,
                 )
-                work_item_id = getattr(event, "work_item_id", None)
                 if work_item_id and source.platform == Platform.DISCORD and summary_ok:
                     try:
                         self._ledger().mark_summary_updated(str(work_item_id))
@@ -13854,7 +13873,11 @@ class GatewayRunner:
         try:
             self._enqueue_goal_work(
                 event,
-                mgr.initial_work_prompt() or self._goal_kickoff_prompt(state.goal),
+                self._goal_initial_work_prompt(
+                    mgr,
+                    state.goal,
+                    str(getattr(event, "goal_thread_context", "") or ""),
+                ),
             )
             self._log_gateway_flow_telemetry(
                 route_type="slash_goal",
@@ -13868,6 +13891,14 @@ class GatewayRunner:
             logger.debug("goal kickoff enqueue failed: %s", exc)
 
         return t("gateway.goal.set", budget=state.max_turns, goal=state.goal)
+
+    @staticmethod
+    def _goal_initial_work_prompt(mgr: Any, goal: str, context: str) -> str:
+        base = mgr.initial_work_prompt() or GatewayRunner._goal_kickoff_prompt(goal)
+        context = str(context or "").strip()
+        if not context:
+            return base
+        return f"{base}\n\n[Discord goal thread context]\n{context}"
 
     async def _handle_subgoal_command(self, event: "MessageEvent") -> str:
         """Handle /subgoal for gateway platforms (mirror of CLI handler).
@@ -14017,6 +14048,20 @@ class GatewayRunner:
             return "Failed"
         return "Complete"
 
+    def _discord_ledger_summary_status(self, work_item_id: Optional[Any], fallback: str) -> str:
+        if not work_item_id:
+            return fallback
+        try:
+            item = self._ledger().get(str(work_item_id))
+        except Exception:
+            return fallback
+        if not isinstance(item, dict):
+            return fallback
+        gate = item.get("completion_gate") if isinstance(item.get("completion_gate"), dict) else None
+        if gate and not gate.get("allowed_to_complete"):
+            return str(gate.get("summary_status") or item.get("summary_status") or "Blocked")
+        return str(item.get("summary_status") or fallback)
+
     def _fallback_discord_feature_outcome(self, final_response: str, *, limit: int = 420) -> str:
         text = re.sub(r"MEDIA:\s*\S+", "", str(final_response or "")).strip()
         text = text.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "").strip()
@@ -14150,6 +14195,7 @@ class GatewayRunner:
             return
         status = self._discord_summary_status(agent_result)
         work_item_id = getattr(event, "work_item_id", None)
+        status = self._discord_ledger_summary_status(work_item_id, status)
 
         async def _deliver():
             summary_ok = await self._update_discord_summaries(

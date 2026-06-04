@@ -24,6 +24,11 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 from hermes_cli import kanban_db
 from hermes_cli.discord_time import discord_message_exceeds_age_limit
+from hermes_cli.discord_thread_context import (
+    expand_discord_thread_references,
+    format_discord_thread_expansions,
+    has_discord_thread_reference,
+)
 from hermes_cli.discord_worker_roles import (
     BOARD_RUN_SUMMARY_FILENAME,
     DEV_TICKET_BODY_GUIDANCE,
@@ -73,6 +78,8 @@ _POSIX_PATH_RE = re.compile(
     r"(?:/[^\s\"'<>),;{}\[\]]*)?"
 )
 _WINDOWS_PATH_RE = re.compile(r"(?<![\w:/.-])[A-Za-z]:\\[^\s\"'<>),;{}\[\]]+")
+_CONTEXT_PACK_JSON_FILENAME = "context-pack.json"
+_CONTEXT_PACK_MARKDOWN_FILENAME = "context-pack.md"
 
 
 class TicketMoveConflict(RuntimeError):
@@ -101,6 +108,134 @@ def _metadata_path(board: str) -> Path:
 def board_run_summary_path(board: str) -> Path:
     """Return the deterministic terminal summary sidecar path for a board."""
     return kanban_db.board_dir(board) / BOARD_RUN_SUMMARY_FILENAME
+
+
+def context_pack_path(board: str) -> Path:
+    return kanban_db.board_dir(board) / _CONTEXT_PACK_JSON_FILENAME
+
+
+def context_pack_markdown_path(board: str) -> Path:
+    return kanban_db.board_dir(board) / _CONTEXT_PACK_MARKDOWN_FILENAME
+
+
+def _context_pack_digest(root_goal: str, request: str, thread_context: str) -> str:
+    payload = json.dumps(
+        {
+            "root_goal": str(root_goal or ""),
+            "request": str(request or ""),
+            "discord_thread_context": str(thread_context or ""),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _context_pack_message_count(thread_context: str) -> int:
+    lines = [line for line in str(thread_context or "").splitlines() if line.strip()]
+    return sum(1 for line in lines if line.lstrip().startswith("[") and not line.startswith("[Goal thread context"))
+
+
+def _context_pack_source_message_ids(text: str) -> list[str]:
+    seen: set[str] = set()
+    ids: list[str] = []
+    for match in re.finditer(r"\b\d{16,24}\b", str(text or "")):
+        value = match.group(0)
+        if value not in seen:
+            seen.add(value)
+            ids.append(value)
+    return ids
+
+
+def render_context_pack_markdown(pack: dict[str, Any]) -> str:
+    warnings = [str(item) for item in pack.get("warnings") or [] if str(item).strip()]
+    source_ids = [str(item) for item in pack.get("source_message_ids") or [] if str(item).strip()]
+    lines = [
+        "# Discord Goal Context Pack",
+        "",
+        f"Version: {pack.get('version') or 1}",
+        f"Updated at: {pack.get('updated_at') or ''}",
+        f"Truncated: {bool(pack.get('truncated'))}",
+        f"Message count: {int(pack.get('message_count') or 0)}",
+        "",
+        "## Root Goal",
+        str(pack.get("root_goal") or ""),
+        "",
+        "## Request",
+        str(pack.get("request") or ""),
+        "",
+        "## Source Message IDs",
+        ", ".join(source_ids) if source_ids else "None detected.",
+        "",
+        "## Warnings",
+        "\n".join(f"- {item}" for item in warnings) if warnings else "None.",
+        "",
+        "## Discord Thread Context",
+        str(pack.get("discord_thread_context") or ""),
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def read_context_pack(board: str) -> dict[str, Any]:
+    try:
+        with context_pack_path(board).open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        return payload if isinstance(payload, dict) else {}
+    except OSError:
+        return {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _context_pack_summary(board: str, pack: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    data = dict(pack or read_context_pack(board) or {})
+    if not data and not context_pack_path(board).exists():
+        return {}
+    return {
+        "json_path": str(context_pack_path(board)),
+        "markdown_path": str(context_pack_markdown_path(board)),
+        "version": int(data.get("version") or 1),
+        "truncated": bool(data.get("truncated")),
+        "warnings": [str(item) for item in data.get("warnings") or [] if str(item).strip()],
+        "message_count": int(data.get("message_count") or 0),
+        "source_message_ids": [
+            str(item) for item in data.get("source_message_ids") or [] if str(item).strip()
+        ],
+    }
+
+
+def write_context_pack(board: str, *, root_goal: str, request: str, thread_context: str) -> dict[str, Any]:
+    existing = read_context_pack(board)
+    digest = _context_pack_digest(root_goal, request, thread_context)
+    version = int(existing.get("version") or 0) if existing else 0
+    if existing.get("content_digest") != digest:
+        version += 1
+    elif version <= 0:
+        version = 1
+    truncated = str(thread_context or "").lstrip().startswith("[Goal thread context truncated")
+    warnings = ["Discord thread context was truncated to recent messages."] if truncated else []
+    updated_at = int(existing.get("updated_at") or _now()) if existing.get("content_digest") == digest else _now()
+    pack: dict[str, Any] = {
+        "version": version,
+        "updated_at": updated_at,
+        "root_goal": str(root_goal or ""),
+        "request": str(request or ""),
+        "discord_thread_context": str(thread_context or ""),
+        "message_count": _context_pack_message_count(thread_context),
+        "truncated": truncated,
+        "source_message_ids": _context_pack_source_message_ids("\n".join([root_goal, request, thread_context])),
+        "warnings": warnings,
+        "content_digest": digest,
+    }
+    pack["markdown"] = render_context_pack_markdown(pack)
+    json_path = context_pack_path(board)
+    md_path = context_pack_markdown_path(board)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json_write(json_path, pack, indent=2)
+    md_path.write_text(pack["markdown"], encoding="utf-8")
+    return pack
 
 
 def _write_metadata(board: str, metadata: dict[str, Any]) -> dict[str, Any]:
@@ -3876,7 +4011,10 @@ def start_planner_request(
         request_id=request_id,
         include_request_id=starts_new_goal_run,
     )
-    thread_context_text = str(thread_context or "").strip()
+    thread_context_text = _merge_expanded_discord_thread_context(
+        raw_request,
+        str(thread_context or ""),
+    )
     if request_changed:
         _clear_generated_summary_title(worker)
     if starts_new_goal_run:
@@ -3898,6 +4036,21 @@ def start_planner_request(
         worker["latest_goal_thread_context"] = thread_context_text
     else:
         worker.pop("latest_goal_thread_context", None)
+    context_pack = write_context_pack(
+        board.slug,
+        root_goal=raw_request,
+        request=raw_request,
+        thread_context=thread_context_text,
+    )
+    worker.update(
+        {
+            "context_pack_path": str(context_pack_path(board.slug)),
+            "context_pack_markdown_path": str(context_pack_markdown_path(board.slug)),
+            "context_version": int(context_pack.get("version") or 1),
+            "context_updated_at": int(context_pack.get("updated_at") or _now()),
+            "context_truncated": bool(context_pack.get("truncated")),
+        }
+    )
     metadata = _update_worker_meta(board.slug, worker)
     _ensure_planner_task(
         board.slug,
@@ -3920,6 +4073,20 @@ def _canonical_planner_request_text(request: str) -> str:
     if args.lower() in GOAL_CONTROL_COMMANDS:
         return text
     return args
+
+
+def _merge_expanded_discord_thread_context(request: str, thread_context: str) -> str:
+    base = str(thread_context or "").strip()
+    if not has_discord_thread_reference(request):
+        return base
+    expanded = format_discord_thread_expansions(expand_discord_thread_references(request))
+    if not expanded:
+        return base
+    if expanded in base:
+        return base
+    if base:
+        return f"{base}\n\n{expanded}"
+    return expanded
 
 
 def _planner_request_fingerprint(request: str) -> str:
@@ -3949,6 +4116,8 @@ def _planner_instructions() -> list[str]:
     return [
         "Act as the planner for this Discord session Kanban board.",
         "Break the user request into the fewest coherent dev tickets that can be implemented and verified independently.",
+        "Use discord_thread_context and context_pack at planning boundaries, but do not paste the full thread context into dev tickets.",
+        "Return requirements with stable IDs when the thread/request implies distinct obligations, and put only relevant requirement_ids on each dev ticket.",
         "Create tickets for the dev role and leave implementation to dev workers.",
         "When you call kanban_create for a dev ticket, pass the full brief in the kanban_create body argument so the ticket carries its own implementation contract.",
         DEV_TICKET_BODY_GUIDANCE,
@@ -4096,7 +4265,12 @@ def _ensure_planner_task(
         if allow_existing:
             existing = _find_existing_planner_task(conn, planner_request)
             if existing:
-                _set_planner_thread_context(conn, existing, thread_context_text)
+                _set_planner_thread_context(
+                    conn,
+                    existing,
+                    thread_context_text,
+                    context_pack=_context_pack_summary(board),
+                )
                 return existing
         body = json.dumps(
             {
@@ -4104,6 +4278,7 @@ def _ensure_planner_task(
                 "root_goal": worker.get("root_goal") or worker.get("initial_request") or "",
                 "request": planner_request,
                 "discord_thread_context": thread_context_text,
+                "context_pack": _context_pack_summary(board),
                 "discord_references": _discord_reference_context(planner_request, worker),
                 "planner_instructions": _planner_instructions(),
                 "acceptance_criteria": worker.get("criteria") or [],
@@ -4131,9 +4306,13 @@ def _ensure_planner_task(
         conn.close()
 
 
-def _set_planner_thread_context(conn, task_id: str, thread_context: str) -> None:
-    if not thread_context:
-        return
+def _set_planner_thread_context(
+    conn,
+    task_id: str,
+    thread_context: str,
+    *,
+    context_pack: Optional[dict[str, Any]] = None,
+) -> None:
     row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if not row:
         return
@@ -4141,9 +4320,17 @@ def _set_planner_thread_context(conn, task_id: str, thread_context: str) -> None
         payload = json.loads(row["body"] or "{}")
     except Exception:
         return
-    if not isinstance(payload, dict) or str(payload.get("discord_thread_context") or "").strip():
+    if not isinstance(payload, dict):
         return
-    payload["discord_thread_context"] = thread_context
+    changed = False
+    if thread_context and str(payload.get("discord_thread_context") or "") != thread_context:
+        payload["discord_thread_context"] = thread_context
+        changed = True
+    if context_pack:
+        payload["context_pack"] = context_pack
+        changed = True
+    if not changed:
+        return
     conn.execute(
         "UPDATE tasks SET body = ? WHERE id = ?",
         (json.dumps(payload, indent=2, ensure_ascii=False), task_id),
@@ -4546,6 +4733,8 @@ def reconcile_board(board: str) -> Optional[str]:
                     "role": ROLE_REVIEWER,
                     "root_goal": worker.get("root_goal") or worker.get("initial_request") or "",
                     "acceptance_criteria": worker.get("criteria") or [],
+                    "context_pack": _context_pack_summary(board),
+                    "requirements": worker.get("requirements") or [],
                     "review_loop": loops,
                     "loop_limit": loop_limit,
                 },

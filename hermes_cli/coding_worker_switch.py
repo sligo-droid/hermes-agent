@@ -507,8 +507,11 @@ def assess_worker_routing(
                 "prepare a bounded worker brief, then review the changed files "
                 "after the worker returns. Run only a minimal sanity check unless "
                 "the worker skipped verification; comprehensive testing belongs "
-                "to the worker. Do not use direct mutation tools before the coding "
-                "worker has run.]\n\n"
+                "to the worker. At the PR boundary, if the worker returned code "
+                "changes or a committed repo fix, load/use github-pr-workflow and "
+                "complete PR->CI->merge->pull unless explicitly review-only or "
+                "blocked. Do not use direct mutation tools before the coding worker "
+                "has run.]\n\n"
             ),
             required=True,
             should_delegate=True,
