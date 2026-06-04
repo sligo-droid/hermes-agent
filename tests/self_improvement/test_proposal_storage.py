@@ -222,6 +222,14 @@ def test_dashboard_read_only_routes_return_proposal_shapes(tmp_path, monkeypatch
     assert failures.status_code == 200
     assert failures.json()["failures"][0]["source_ref"]["cron_output_path"] == "/tmp/bad.md"
 
+    snapshot = client.get("/api/plugins/kanban/command-center/snapshot")
+    assert snapshot.status_code == 200
+    payload = snapshot.json()
+    assert payload["schema_version"] == 1
+    assert payload["summary"].startswith("Sources create canonical Work Items")
+    assert payload["work_items"][0]["source"]["kind"] == "self_improvement"
+    assert payload["work_items"][0]["source"]["id"].startswith("source:self-improvement-proposal:")
+
 
 def test_approval_and_rejection_state_are_persisted_and_audited(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))

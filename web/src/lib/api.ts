@@ -328,6 +328,19 @@ export const api = {
   deleteCronJob: (id: string, profile = "default") =>
     fetchJSON<{ ok: boolean }>(`/api/cron/jobs/${encodeURIComponent(id)}?profile=${encodeURIComponent(profile)}`, { method: "DELETE" }),
 
+  // Command Center aggregate
+  getCommandCenterSnapshot: (params?: { includeArchived?: boolean; recentRunLimitPerBoard?: number }) => {
+    const qs = new URLSearchParams();
+    if (params?.includeArchived) qs.set("include_archived", "true");
+    if (params?.recentRunLimitPerBoard !== undefined) {
+      qs.set("recent_run_limit_per_board", String(params.recentRunLimitPerBoard));
+    }
+    const suffix = qs.toString();
+    return fetchJSON<CommandCenterSnapshot>(
+      `/api/plugins/kanban/command-center/snapshot${suffix ? `?${suffix}` : ""}`,
+    );
+  },
+
   // Self-improvement proposal board
   getSelfImprovementProposals: () =>
     fetchJSON<SelfImprovementProposalsResponse>(
@@ -826,6 +839,110 @@ export interface CronJob {
   last_run_at?: string | null;
   next_run_at?: string | null;
   last_error?: string | null;
+}
+
+export interface CommandCenterSourceRef {
+  [key: string]: unknown;
+}
+
+export interface CommandCenterSource {
+  id: string;
+  kind: string;
+  label: string;
+  title?: string | null;
+  status?: string | null;
+  bucket?: string | null;
+  created_at?: string | number | null;
+  updated_at?: string | number | null;
+  ref: CommandCenterSourceRef;
+}
+
+export interface CommandCenterExecution {
+  board?: string | null;
+  board_name?: string | null;
+  task_id?: string | null;
+  task_status?: string | null;
+  task_url?: string | null;
+  worker_url?: string | null;
+  console_url?: string | null;
+  active_run_id?: number | null;
+  worker_unit?: string | null;
+  worker_pid?: number | null;
+  workspace_kind?: string | null;
+  workspace_path?: string | null;
+}
+
+export interface CommandCenterWorkItem {
+  id: string;
+  title: string;
+  summary?: string | null;
+  body_preview?: string | null;
+  project?: string | null;
+  priority?: string | number | null;
+  priority_rank?: number;
+  severity?: string | null;
+  status: string;
+  status_detail?: string | null;
+  created_at?: string | number | null;
+  updated_at?: string | number | null;
+  source: CommandCenterSource;
+  decision?: {
+    needed?: boolean;
+    proposal_id?: string | null;
+    approve_action?: string | null;
+    reject_action?: string | null;
+  };
+  execution?: CommandCenterExecution | null;
+  runs?: CommandCenterRun[];
+  artifacts?: Array<{ kind: string; label: string; url?: string | null }>;
+  source_excerpts?: SelfImprovementProposalCard["source_excerpts"];
+  raw?: Record<string, unknown>;
+}
+
+export interface CommandCenterRun {
+  id: number;
+  board?: string;
+  task_id: string;
+  task_title?: string | null;
+  task_status?: string | null;
+  task_assignee?: string | null;
+  profile?: string | null;
+  step_key?: string | null;
+  status: string;
+  worker_pid?: number | null;
+  worker_unit?: string | null;
+  started_at: number;
+  ended_at?: number | null;
+  outcome?: string | null;
+  summary?: string | null;
+  error?: string | null;
+  metadata?: Record<string, unknown> | null;
+}
+
+export interface CommandCenterSnapshot {
+  schema_version: number;
+  generated_at: number;
+  summary: string;
+  work_items: CommandCenterWorkItem[];
+  sources: CommandCenterSource[];
+  runs: CommandCenterRun[];
+  boards: Array<Record<string, unknown>>;
+  metrics: {
+    total_work_items: number;
+    inbox: number;
+    active_work: number;
+    blocked: number;
+    review: number;
+    shipped: number;
+    recommendations: number;
+    discord_origin: number;
+    parse_failures: number;
+    active_runs: number;
+    recent_runs: number;
+    boards: number;
+    by_status: Record<string, number>;
+    by_source: Record<string, number>;
+  };
 }
 
 export interface SelfImprovementProposalCard {

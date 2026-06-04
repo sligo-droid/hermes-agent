@@ -51,7 +51,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, Web
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from hermes_cli import kanban_db
+from hermes_cli import command_center, kanban_db
 from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY, ROLE_DEV
 from hermes_cli import kanban_diagnostics as kd
 from self_improvement import discord_publish, proposal_storage
@@ -1335,6 +1335,27 @@ def list_diagnostics(
     finally:
         conn.close()
 
+
+
+# ---------------------------------------------------------------------------
+# Command Center aggregate — one operator read model across sources/work/runs
+# ---------------------------------------------------------------------------
+
+@router.get("/command-center/snapshot")
+def command_center_snapshot(
+    include_archived: bool = Query(False),
+    recent_run_limit_per_board: int = Query(20, ge=0, le=100),
+):
+    """Return Sligo Labs' canonical operator read model.
+
+    Self-improvement proposals, Discord threads, and manual Kanban entries are
+    sources of Work Items; worker boards and task runs are execution detail.
+    """
+
+    return command_center.build_command_center_snapshot(
+        include_archived=include_archived,
+        recent_run_limit_per_board=recent_run_limit_per_board,
+    )
 
 
 # ---------------------------------------------------------------------------
