@@ -133,6 +133,7 @@ def test_self_improvement_approve_is_idempotent_and_audited(client):
     assert first.json()["task"]["id"] == second.json()["task"]["id"]
     assert first.json()["card"]["kanban_task_id"] == first.json()["task"]["id"]
     assert first.json()["card"]["worker_url"] == f"/workers?task={first.json()['task']['id']}"
+    assert first.json()["worker_url"] == f"/workers?task={first.json()['task']['id']}"
 
     conn = kb.connect()
     try:
@@ -234,6 +235,11 @@ def test_self_improvement_approve_creates_task_on_discord_thread_board(client, m
     assert first.status_code == 200, first.text
     assert second.status_code == 200, second.text
     assert first.json()["task"]["id"] == second.json()["task"]["id"]
+    expected_worker_url = first.json()["worker_url"]
+    assert expected_worker_url.endswith(f"/workers/discord-777-m-555/tickets/{first.json()['task']['id']}")
+    assert first.json()["worker_url"] == expected_worker_url
+    assert first.json()["card"]["worker_url"] == expected_worker_url
+    assert second.json()["worker_url"] == expected_worker_url
     assert calls[0]["existing"] == {}
     assert calls[1]["existing"]["discord_thread_id"] == "777"
 
@@ -253,6 +259,40 @@ def test_self_improvement_approve_creates_task_on_discord_thread_board(client, m
     assert audit[-1]["metadata"]["board"] == "discord-777-m-555"
     assert audit[-1]["metadata"]["discord_top_level_message_id"] == "555"
     assert audit[-1]["metadata"]["discord_thread_id"] == "777"
+
+    grouped = client.get("/api/plugins/kanban/self-improvement/proposals")
+    assert grouped.status_code == 200
+    grouped_card = grouped.json()["projects"][0]["prongs"][0]["cards"][0]
+    assert grouped_card["worker_url"] == expected_worker_url
+    detail = client.get(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}")
+    assert detail.status_code == 200
+    assert detail.json()["card"]["worker_url"] == expected_worker_url
+
+    conn = proposal_storage.connect()
+    try:
+        conn.execute(
+            "UPDATE proposal_cards SET worker_url = ? WHERE proposal_id = ?",
+            (f"/workers?task={first.json()['task']['id']}", card["proposal_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    repaired = client.get(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}")
+    assert repaired.status_code == 200
+    assert repaired.json()["card"]["worker_url"] == expected_worker_url
+
+    conn = proposal_storage.connect()
+    try:
+        conn.execute(
+            "UPDATE proposal_cards SET worker_url = ? WHERE proposal_id = ?",
+            ("/workers", card["proposal_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    repaired_index_link = client.get(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}")
+    assert repaired_index_link.status_code == 200
+    assert repaired_index_link.json()["card"]["worker_url"] == expected_worker_url
 
     from hermes_cli import discord_worker_boards as dwb
 
