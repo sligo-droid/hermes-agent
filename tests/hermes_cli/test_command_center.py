@@ -219,6 +219,46 @@ def test_self_improvement_board_rollup_preserves_proposal_controls(tmp_path, mon
     assert item["decision"]["undo_followup_action"].endswith(f"/{card['proposal_id']}/undo-followup")
 
 
+def test_self_improvement_board_rollup_preserves_proposal_naming_and_context(tmp_path, monkeypatch):
+    _ingest_valid(monkeypatch, tmp_path)
+    card = _first_card()
+    board = "self-improvement-named-worker-board"
+    kanban_db.write_board_metadata(board, name="Verbose Generic Worker Board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Generic downstream task title", board=board, initial_status="running")
+        with conn:
+            conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                (task_id, "running", 100, None, None),
+            )
+            run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute("UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?", (run_id, task_id))
+    finally:
+        conn.close()
+    proposal_storage.record_approval(
+        card["proposal_id"],
+        kanban_task_id=task_id,
+        worker_url=f"/workers/{board}/tickets/{task_id}",
+        actor="operator",
+        metadata={"board": board},
+    )
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+
+    assert snapshot["work_items"][0]["id"] == f"kanban-board:{board}"
+    assert item["status"] == "running"
+    assert item["title"] == card["title"]
+    assert item["summary"] == card["summary"]
+    assert item["project"] == card["project"]
+    assert item["priority"] == card["priority"]
+    assert item["priority_rank"] == command_center._priority_rank(card["priority"])
+    assert item["severity"] == card["severity"]
+    assert item["source"]["kind"] == "self_improvement"
+    assert item["raw"]["proposal_action_context"]["title"] == card["title"]
+
+
 def test_direct_discord_board_rollup_has_no_self_improvement_controls(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     board = "discord-direct-no-proposal"

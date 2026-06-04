@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import {
   AlertTriangle,
+  Archive,
   ArrowRight,
   Check,
   CircleDot,
@@ -30,16 +31,18 @@ type Selection =
   | { kind: "source"; source: CommandCenterSource }
   | { kind: "run"; run: CommandCenterRun };
 
-type ActionKind = "approve" | "reject" | "halt" | "undo";
+type ActionKind = "approve" | "reject" | "halt" | "undo" | "archive";
+
+declare global {
+  interface Window {
+    __commandCenterRefresh?: () => void;
+  }
+}
 
 function viewFromPath(pathname: string): ViewKey {
   const normalized = pathname.replace(/\/+$/, "") || "/";
-  if (normalized === "/self-improvement") return "recommendations";
   if (normalized.includes("/inbox")) return "inbox";
   if (normalized.includes("/work")) return "work";
-  if (normalized.includes("/runs")) return "runs";
-  if (normalized.includes("/recommendations")) return "recommendations";
-  if (normalized.includes("/sources")) return "sources";
   return "overview";
 }
 
@@ -139,18 +142,18 @@ function ActionButton({
   onClick: () => void;
 }) {
   const config = {
-    approve: { label: "Approve", icon: Check, className: "border-emerald-200/80 bg-emerald-400 text-emerald-950 hover:bg-emerald-300", visibleLabel: false },
-    reject: { label: "Reject", icon: X, className: "border-red-200/80 bg-red-500 text-white hover:bg-red-400", visibleLabel: false },
-    halt: { label: "Cancel", icon: PauseCircle, className: "border-amber-200/45 bg-amber-300/10 text-amber-100 hover:bg-amber-300/15", visibleLabel: true },
-    undo: { label: "Revert", icon: RotateCcw, className: "border-sky-200/45 bg-sky-300/10 text-sky-100 hover:bg-sky-300/15", visibleLabel: true },
+    approve: { label: "Approve", icon: Check, className: "border-emerald-200/80 bg-emerald-400 text-emerald-950 hover:bg-emerald-300" },
+    reject: { label: "Reject", icon: X, className: "border-red-200/80 bg-red-500 text-white hover:bg-red-400" },
+    halt: { label: "Cancel", icon: PauseCircle, className: "border-amber-200/45 bg-amber-300/10 text-amber-100 hover:bg-amber-300/15" },
+    undo: { label: "Revert", icon: RotateCcw, className: "border-sky-200/45 bg-sky-300/10 text-sky-100 hover:bg-sky-300/15" },
+    archive: { label: "Archive board", icon: Archive, className: "border-slate-200/35 bg-slate-300/10 text-slate-100 hover:bg-slate-300/15" },
   }[kind];
   const Icon = config.icon;
   return (
     <button
       aria-label={config.label}
       className={cn(
-        "inline-flex h-9 items-center justify-center rounded-full border text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70",
-        config.visibleLabel ? "gap-1.5 px-3 sm:min-w-20" : "w-9",
+        "inline-flex h-9 w-9 items-center justify-center rounded-full border text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70",
         config.className,
         disabled && "cursor-not-allowed opacity-45",
       )}
@@ -159,8 +162,8 @@ function ActionButton({
       title={config.label}
       type="button"
     >
-      {busy ? <Spinner className="text-xs" /> : <Icon className="h-3.5 w-3.5" />}
-      <span className={config.visibleLabel ? undefined : "sr-only"}>{config.label}</span>
+      <Icon className={cn("h-3.5 w-3.5", busy && "animate-pulse")} />
+      <span className="sr-only">{config.label}</span>
     </button>
   );
 }
@@ -192,7 +195,7 @@ function WorkItemCard({
   const canApproveReject = Boolean(proposalId && item.status === "proposed");
   const canHalt = Boolean(proposalId && ["queued", "running", "review", "blocked", "accepted"].includes(item.status));
   const canUndo = Boolean(proposalId && item.status === "shipped");
-  const canArchive = Boolean(item.execution?.archiveable && item.execution.board && item.id.startsWith("kanban-board:"));
+  const canArchive = Boolean(item.execution?.archiveable && item.execution.board && item.execution.board !== "default" && item.id.startsWith("kanban-board:"));
   return (
     <article
       className={cn(
@@ -210,7 +213,6 @@ function WorkItemCard({
           <h3 className="text-base font-semibold leading-snug text-white">{item.title}</h3>
         </button>
         <div className="flex shrink-0 items-center gap-2">
-          {canArchive && <span className="rounded-full border border-slate-400/20 bg-white/[0.035] px-2.5 py-1 text-[0.66rem] font-semibold uppercase tracking-[0.14em] text-slate-400">Archiveable</span>}
           {item.execution?.worker_url ? (
             <a className="inline-flex h-8 items-center gap-1.5 rounded-full border border-cyan-100/25 px-2.5 text-xs font-semibold text-cyan-50 hover:bg-cyan-100/10" href={item.execution.worker_url}>
               Worker <ExternalLink className="h-3 w-3" />
@@ -223,7 +225,7 @@ function WorkItemCard({
       <button className="mt-3 block w-full text-left" onClick={onSelect} type="button">
         <p className="text-sm leading-6 text-slate-300">{item.summary || item.body_preview || "No summary recorded."}</p>
       </button>
-      {(item.execution?.task_url && item.execution.task_url !== item.execution.worker_url) || canApproveReject || canHalt || canUndo ? (
+      {(item.execution?.task_url && item.execution.task_url !== item.execution.worker_url) || canApproveReject || canArchive || canHalt || canUndo ? (
         <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/10 pt-3">
           {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && (
             <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 hover:bg-white/10" href={item.execution.task_url}>
@@ -232,6 +234,7 @@ function WorkItemCard({
           )}
           {canApproveReject && <ActionButton busy={actionBusy("approve")} kind="approve" onClick={() => onAction("approve", item)} />}
           {canApproveReject && <ActionButton busy={actionBusy("reject")} kind="reject" onClick={() => onAction("reject", item)} />}
+          {canArchive && <ActionButton busy={actionBusy("archive")} kind="archive" onClick={() => onAction("archive", item)} />}
           {canHalt && <ActionButton busy={actionBusy("halt")} kind="halt" onClick={() => onAction("halt", item)} />}
           {canUndo && <ActionButton busy={actionBusy("undo")} kind="undo" onClick={() => onAction("undo", item)} />}
         </div>
@@ -469,11 +472,20 @@ export default function CommandCenterPage() {
   }, [refresh]);
 
   useEffect(() => {
+    const invokeRefresh = () => {
+      void refresh();
+    };
+    window.__commandCenterRefresh = invokeRefresh;
     const refreshFromShell = () => {
       void refresh();
     };
     window.addEventListener("command-center:refresh", refreshFromShell);
-    return () => window.removeEventListener("command-center:refresh", refreshFromShell);
+    return () => {
+      if (window.__commandCenterRefresh === invokeRefresh) {
+        delete window.__commandCenterRefresh;
+      }
+      window.removeEventListener("command-center:refresh", refreshFromShell);
+    };
   }, [refresh]);
 
   const inboxItems = useMemo(
@@ -490,10 +502,15 @@ export default function CommandCenterPage() {
   );
   const overviewItems = useMemo(() => {
     const seen = new Set<string>();
-    return [...inboxItems, ...workItems].filter((item) => {
+    const merged = [...inboxItems, ...workItems].filter((item) => {
       if (seen.has(item.id)) return false;
       seen.add(item.id);
       return true;
+    });
+    return merged.sort((a, b) => {
+      const runningDelta = Number(b.status === "running") - Number(a.status === "running");
+      if (runningDelta) return runningDelta;
+      return 0;
     });
   }, [inboxItems, workItems]);
   const recommendations = useMemo(
@@ -503,20 +520,27 @@ export default function CommandCenterPage() {
 
   const handleAction = useCallback(async (kind: ActionKind, item: CommandCenterWorkItem) => {
     const proposalId = item.decision?.proposal_id;
-    if (!proposalId) return;
+    const board = item.execution?.board;
+    if (kind === "archive" && (!item.execution?.archiveable || !board || board === "default")) return;
+    if (kind !== "archive" && !proposalId) return;
     setActiveAction({ id: item.id, kind });
     setError(null);
     try {
-      if (kind === "approve") {
+      if (kind === "archive") {
+        if (!board) return;
+        const confirmed = window.confirm(`Archive worker board ${board}?`);
+        if (!confirmed) return;
+        await api.archiveKanbanBoard(board);
+      } else if (proposalId && kind === "approve") {
         await api.approveSelfImprovementProposal(proposalId);
-      } else if (kind === "reject") {
+      } else if (proposalId && kind === "reject") {
         const reason = window.prompt("Reject reason for future prong feedback?", "Not worth doing right now.");
         if (!reason) return;
         await api.rejectSelfImprovementProposal(proposalId, reason);
-      } else if (kind === "halt") {
+      } else if (proposalId && kind === "halt") {
         const reason = window.prompt("Reason to cancel downstream work?", "Operator cancelled from Command Center.") || undefined;
         await api.haltSelfImprovementProposal(proposalId, reason);
-      } else if (kind === "undo") {
+      } else if (proposalId && kind === "undo") {
         const reason = window.prompt("Reason for revert follow-up?", "Operator requested revert follow-up from Command Center.") || undefined;
         await api.requestSelfImprovementUndoFollowup(proposalId, reason);
       }

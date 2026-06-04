@@ -452,7 +452,18 @@ def _task_work_item(
     }
 
 
-def _board_title(board: str, board_meta: dict[str, Any]) -> str:
+def _first_text(*values: Any) -> str | None:
+    for value in values:
+        if str(value or "").strip():
+            return str(value).strip()
+    return None
+
+
+def _board_title(board: str, board_meta: dict[str, Any], proposal_action_context: dict[str, Any] | None = None) -> str:
+    if proposal_action_context:
+        title = _first_text(proposal_action_context.get("title"))
+        if title:
+            return title
     worker = _board_worker_meta(board_meta)
     for key in ("summary_title", "root_goal", "initial_request"):
         value = worker.get(key)
@@ -461,7 +472,11 @@ def _board_title(board: str, board_meta: dict[str, Any]) -> str:
     return str(board_meta.get("name") or board)
 
 
-def _board_summary(board_meta: dict[str, Any], tasks: list[dict[str, Any]]) -> str:
+def _board_summary(board_meta: dict[str, Any], tasks: list[dict[str, Any]], proposal_action_context: dict[str, Any] | None = None) -> str:
+    if proposal_action_context:
+        summary = _first_text(proposal_action_context.get("summary")) or _text_preview(proposal_action_context.get("body_preview"))
+        if summary:
+            return summary
     worker = _board_worker_meta(board_meta)
     summary = _text_preview(worker.get("root_goal"), worker.get("initial_request"), board_meta.get("description"))
     if summary:
@@ -494,6 +509,7 @@ def _board_work_item(
     created_candidates = [task.get("created_at") for task in tasks if task.get("created_at")]
     updated_candidates = [task.get("completed_at") or task.get("started_at") or task.get("created_at") for task in tasks]
     latest_updated = max((_epoch_or_none(value) or 0 for value in updated_candidates), default=0) or board_meta.get("created_at")
+    proposal_source = proposal_action_context.get("source") if proposal_action_context else None
     decision = {"needed": False}
     if proposal_action_context:
         proposal_id = str(proposal_action_context.get("proposal_id") or "")
@@ -507,23 +523,23 @@ def _board_work_item(
             )
     return {
         "id": f"kanban-board:{board}",
-        "title": _board_title(board, board_meta),
-        "summary": _board_summary(board_meta, tasks),
-        "body_preview": None,
-        "project": None,
-        "priority": None,
-        "priority_rank": 0,
-        "severity": None,
+        "title": _board_title(board, board_meta, proposal_action_context),
+        "summary": _board_summary(board_meta, tasks, proposal_action_context),
+        "body_preview": proposal_action_context.get("body_preview") if proposal_action_context else None,
+        "project": proposal_action_context.get("project") if proposal_action_context else None,
+        "priority": proposal_action_context.get("priority") if proposal_action_context else None,
+        "priority_rank": proposal_action_context.get("priority_rank") if proposal_action_context else 0,
+        "severity": proposal_action_context.get("severity") if proposal_action_context else None,
         "status": canonical_status,
         "status_detail": status_detail,
         "created_at": min((_epoch_or_none(value) or 0 for value in created_candidates), default=0) or board_meta.get("created_at"),
         "updated_at": latest_updated,
-        "source": source,
+        "source": proposal_source if isinstance(proposal_source, dict) else source,
         "decision": decision,
         "execution": _execution_from_board(board=board, board_meta=board_meta, tasks=tasks, runs=runs),
         "runs": runs,
-        "artifacts": _artifacts_from_task_and_board({}, board_meta),
-        "source_excerpts": [],
+        "artifacts": proposal_action_context.get("artifacts") if proposal_action_context else _artifacts_from_task_and_board({}, board_meta),
+        "source_excerpts": proposal_action_context.get("source_excerpts") if proposal_action_context else [],
         "raw": {
             "board": board_meta,
             "rollup": {"task_counts": _task_status_counts(tasks), "task_count": len(tasks), "run_count": len(runs)},
@@ -673,8 +689,15 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
                     {
                         "proposal_id": proposal_id,
                         "title": card.get("title"),
+                        "summary": card.get("summary"),
+                        "body_preview": item.get("body_preview"),
+                        "project": item.get("project"),
+                        "priority": item.get("priority"),
+                        "priority_rank": item.get("priority_rank"),
+                        "severity": item.get("severity"),
                         "source": item.get("source"),
                         "artifacts": item.get("artifacts") or [],
+                        "source_excerpts": item.get("source_excerpts") or [],
                     },
                 )
         if board and card.get("kanban_task_id"):
@@ -756,9 +779,9 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
 
 def _work_item_sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
     status_weight = {
-        "proposed": 0,
-        "blocked": 1,
-        "running": 2,
+        "running": 0,
+        "proposed": 1,
+        "blocked": 2,
         "review": 3,
         "queued": 4,
         "accepted": 5,
