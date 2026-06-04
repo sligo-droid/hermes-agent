@@ -263,6 +263,16 @@ def _is_discord_board(board: str, board_meta: dict[str, Any]) -> bool:
     return bool(worker) or str(board).startswith("discord-")
 
 
+def _is_internal_discord_foreman_task(task: dict[str, Any]) -> bool:
+    if task.get("created_by") == "discord-worker-foreman":
+        return True
+    idempotency_key = str(task.get("idempotency_key") or "")
+    if idempotency_key.startswith("discord-foreman:"):
+        return True
+    body = str(task.get("body") or "")
+    return "<foreman-metadata>" in body
+
+
 def _source_from_task_board(board: str, board_meta: dict[str, Any]) -> dict[str, Any]:
     worker = _board_worker_meta(board_meta)
     if _is_discord_board(board, board_meta):
@@ -796,6 +806,8 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
                 for task_dict in task_dicts:
                     key = (board, str(task_dict.get("id")))
                     if key in seen_execution_tasks:
+                        continue
+                    if _is_internal_discord_foreman_task(task_dict):
                         continue
                     task_runs = _task_runs(conn, str(task_dict.get("id")), board=board)
                     work_items.append(_task_work_item(task_dict, board=board, board_meta=board_meta, runs=task_runs))
