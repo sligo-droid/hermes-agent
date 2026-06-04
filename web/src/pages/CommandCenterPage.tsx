@@ -7,7 +7,6 @@ import {
   CircleDot,
   ExternalLink,
   FileText,
-  GitBranch,
   Inbox,
   ListChecks,
   PauseCircle,
@@ -99,6 +98,10 @@ function isWorkItem(item: CommandCenterWorkItem): boolean {
   return item.status !== "proposed" && item.status !== "rejected" && item.status !== "archived";
 }
 
+function runIsActive(run: CommandCenterRun): boolean {
+  return !run.ended_at && run.task_status === "running";
+}
+
 function initialSelectionForView(snapshot: CommandCenterSnapshot, activeView: ViewKey): Selection | null {
   if (activeView === "runs") {
     const run = snapshot.runs[0];
@@ -160,8 +163,9 @@ function ActionButton({
   const Icon = config.icon;
   return (
     <button
+      aria-label={config.label}
       className={cn(
-        "inline-flex h-9 items-center gap-1.5 rounded-full border px-3 text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70",
+        "inline-flex h-9 w-9 items-center justify-center rounded-full border text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70",
         config.className,
         disabled && "cursor-not-allowed opacity-45",
       )}
@@ -170,7 +174,7 @@ function ActionButton({
       type="button"
     >
       {busy ? <Spinner className="text-xs" /> : <Icon className="h-3.5 w-3.5" />}
-      {config.label}
+      <span className="sr-only">{config.label}</span>
     </button>
   );
 }
@@ -188,12 +192,14 @@ function WorkItemCard({
   activeAction,
   item,
   onAction,
+  onArchive,
   onSelect,
   selected,
 }: {
   activeAction: { id: string; kind: ActionKind } | null;
   item: CommandCenterWorkItem;
   onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
+  onArchive: (item: CommandCenterWorkItem) => void;
   onSelect: () => void;
   selected: boolean;
 }) {
@@ -202,6 +208,7 @@ function WorkItemCard({
   const canApproveReject = Boolean(proposalId && item.status === "proposed");
   const canHalt = Boolean(proposalId && item.execution?.task_id && ["queued", "running", "review", "blocked", "accepted"].includes(item.status));
   const canUndo = Boolean(proposalId && item.status === "shipped");
+  const canArchive = Boolean(item.execution?.archiveable && item.execution.board && item.id.startsWith("kanban-board:"));
   return (
     <article
       className={cn(
@@ -223,13 +230,7 @@ function WorkItemCard({
         </div>
         <p className="mt-3 text-sm leading-6 text-slate-300">{item.summary || item.body_preview || "No summary recorded."}</p>
       </button>
-      <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-white/10 pt-3">
-        <div className="flex flex-wrap gap-2 text-xs text-slate-500">
-          {item.execution?.board && <span>board: <span className="font-mono-ui text-slate-300">{item.execution.board}</span></span>}
-          {item.execution?.task_id && <span>task: <span className="font-mono-ui text-slate-300">{item.execution.task_id}</span></span>}
-          {item.runs?.length ? <span>{item.runs.length} run{item.runs.length === 1 ? "" : "s"}</span> : null}
-        </div>
-        <div className="flex flex-wrap justify-end gap-2">
+      <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/10 pt-3">
           {item.execution?.worker_url && (
             <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-cyan-100/25 px-3 text-xs font-semibold text-cyan-50 hover:bg-cyan-100/10" href={item.execution.worker_url}>
               Worker <ExternalLink className="h-3.5 w-3.5" />
@@ -244,7 +245,11 @@ function WorkItemCard({
           {canApproveReject && <ActionButton busy={actionBusy("reject")} kind="reject" onClick={() => onAction("reject", item)} />}
           {canHalt && <ActionButton busy={actionBusy("halt")} kind="halt" onClick={() => onAction("halt", item)} />}
           {canUndo && <ActionButton busy={actionBusy("undo")} kind="undo" onClick={() => onAction("undo", item)} />}
-        </div>
+          {canArchive && (
+            <button className="inline-flex h-9 items-center rounded-full border border-slate-400/25 px-3 text-xs font-semibold text-slate-200 hover:bg-white/10" onClick={() => onArchive(item)} type="button">
+              Archive
+            </button>
+          )}
       </div>
     </article>
   );
@@ -274,7 +279,7 @@ function SourceCard({ source, onSelect, selected }: { source: CommandCenterSourc
 }
 
 function RunCard({ run, onSelect, selected }: { run: CommandCenterRun; onSelect: () => void; selected: boolean }) {
-  const active = run.ended_at === null || run.ended_at === undefined;
+  const active = runIsActive(run);
   return (
     <button
       className={cn(
@@ -330,7 +335,7 @@ function DetailPanel({ selection }: { selection: Selection | null }) {
         </CardHeader>
         <CardContent className="space-y-4 text-sm text-slate-300">
           <div>
-            <StatusPill value={run.ended_at ? run.outcome || run.status : "running"} />
+            <StatusPill value={runIsActive(run) ? "running" : run.outcome || run.status} />
             <h3 className="mt-3 text-lg font-semibold text-white">Run #{run.id}</h3>
             <p className="mt-1 text-xs text-slate-500">{run.task_title || run.task_id}</p>
           </div>
@@ -406,12 +411,14 @@ function WorkList({
   activeAction,
   items,
   onAction,
+  onArchive,
   onSelect,
   selectedId,
 }: {
   activeAction: { id: string; kind: ActionKind } | null;
   items: CommandCenterWorkItem[];
   onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
+  onArchive: (item: CommandCenterWorkItem) => void;
   onSelect: (item: CommandCenterWorkItem) => void;
   selectedId?: string;
 }) {
@@ -424,6 +431,7 @@ function WorkList({
           item={item}
           key={item.id}
           onAction={onAction}
+          onArchive={onArchive}
           onSelect={() => onSelect(item)}
           selected={selectedId === item.id}
         />
@@ -453,14 +461,14 @@ export default function CommandCenterPage() {
         }
         if (current.kind === "work") {
           const updated = next.work_items.find((item) => item.id === current.item.id);
-          return updated ? { kind: "work", item: updated } : current;
+          return updated ? { kind: "work", item: updated } : initialSelectionForView(next, activeView);
         }
         if (current.kind === "source") {
           const updated = next.sources.find((source) => source.id === current.source.id);
-          return updated ? { kind: "source", source: updated } : current;
+          return updated ? { kind: "source", source: updated } : initialSelectionForView(next, activeView);
         }
         const updated = next.runs.find((run) => run.id === current.run.id && run.board === current.run.board);
-        return updated ? { kind: "run", run: updated } : current;
+        return updated ? { kind: "run", run: updated } : initialSelectionForView(next, activeView);
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -526,35 +534,33 @@ export default function CommandCenterPage() {
     }
   }, [refresh]);
 
+  const handleArchive = useCallback(async (item: CommandCenterWorkItem) => {
+    const board = item.execution?.board;
+    if (!board || board === "default") return;
+    if (!window.confirm(`Archive worker board "${item.title || board}"?`)) return;
+    setActiveAction({ id: item.id, kind: "halt" });
+    setError(null);
+    try {
+      await api.archiveKanbanBoard(board);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setActiveAction(null);
+    }
+  }, [refresh]);
+
   const selectedWorkId = selection?.kind === "work" ? selection.item.id : undefined;
   const selectedSourceId = selection?.kind === "source" ? selection.source.id : undefined;
   const selectedRunId = selection?.kind === "run" ? `${selection.run.board || "default"}:${selection.run.id}` : undefined;
 
   return (
     <div className="flex flex-col gap-5">
-      <section className="relative overflow-hidden rounded-3xl border border-cyan-300/20 bg-[radial-gradient(circle_at_top_left,rgba(34,211,238,0.18),transparent_34%),linear-gradient(135deg,rgba(8,47,73,0.88),rgba(2,6,23,0.96))] p-5 shadow-2xl shadow-cyan-950/30 sm:p-7">
-        <div className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
-          <div className="max-w-4xl">
-            <Badge className="border-cyan-200/30 bg-cyan-200/10 px-2.5 py-1 text-[0.68rem] uppercase tracking-[0.18em] text-cyan-100">
-              Command Center
-            </Badge>
-            <h1 className="mt-4 text-3xl font-semibold tracking-tight text-white sm:text-4xl">
-              One ledger for sources, work items, and worker runs.
-            </h1>
-            <p className="mt-3 max-w-3xl text-sm leading-6 text-cyan-50/75">
-              Self-improvement and Discord are intake sources. Worker boards are execution runs. This surface keeps the parent Work Item coherent while preserving the existing Kanban and public worker pages.
-            </p>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Button className="border-cyan-100/25 bg-cyan-100 text-slate-950 hover:bg-cyan-50" disabled={loading} onClick={() => void refresh()}>
-              {loading ? <Spinner className="mr-2 text-xs" /> : <RefreshCw className="mr-2 h-4 w-4" />} Refresh
-            </Button>
-            <a className="inline-flex items-center rounded-md border border-cyan-100/25 px-4 py-2 text-sm font-medium text-cyan-50 hover:bg-cyan-100/10" href="/workers">
-              Legacy Workers <ExternalLink className="ml-2 h-4 w-4" />
-            </a>
-          </div>
-        </div>
-      </section>
+      <div className="flex justify-end">
+        <Button className="border-cyan-100/25 bg-cyan-100 text-slate-950 hover:bg-cyan-50" disabled={loading} onClick={() => void refresh()}>
+          {loading ? <Spinner className="mr-2 text-xs" /> : <RefreshCw className="mr-2 h-4 w-4" />} Refresh
+        </Button>
+      </div>
 
       <nav aria-label="Command Center views" className="flex flex-wrap gap-1 rounded-full border border-white/10 bg-white/[0.035] p-1">
         {TABS.map((tab) => {
@@ -575,11 +581,10 @@ export default function CommandCenterPage() {
         })}
       </nav>
 
-      <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+      <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-5">
         <MetricCard label="Inbox" value={metric(snapshot, "inbox")} tone="text-cyan-100" />
         <MetricCard label="Active work" value={metric(snapshot, "active_work")} tone="text-amber-100" />
         <MetricCard label="Recommendations" value={metric(snapshot, "recommendations")} tone="text-fuchsia-100" />
-        <MetricCard label="Discord-origin" value={metric(snapshot, "discord_origin")} tone="text-indigo-100" />
         <MetricCard label="Active runs" value={metric(snapshot, "active_runs")} tone="text-emerald-100" />
         <MetricCard label="Parse failures" value={metric(snapshot, "parse_failures")} tone="text-red-100" />
       </div>
@@ -604,27 +609,17 @@ export default function CommandCenterPage() {
           <section className="min-w-0">
             {activeView === "overview" && (
               <div className="grid gap-5">
-                <Card className="border-white/10 bg-white/[0.035]">
-                  <CardHeader>
-                    <CardTitle className="flex items-center gap-2 text-lg text-white"><GitBranch className="h-5 w-5 text-cyan-200" /> Operating model</CardTitle>
-                  </CardHeader>
-                  <CardContent className="grid gap-3 text-sm text-slate-300 md:grid-cols-3">
-                    <div className="rounded-2xl border border-white/10 bg-black/20 p-4"><Sparkles className="mb-3 h-5 w-5 text-cyan-200" /><strong className="text-white">Sources</strong><p className="mt-2 leading-6">Self-improvement, Discord, crons, and manual entries create or attach to work.</p></div>
-                    <div className="rounded-2xl border border-white/10 bg-black/20 p-4"><ListChecks className="mb-3 h-5 w-5 text-cyan-200" /><strong className="text-white">Work Items</strong><p className="mt-2 leading-6">One parent object owns status, provenance, decision state, and execution links.</p></div>
-                    <div className="rounded-2xl border border-white/10 bg-black/20 p-4"><Wrench className="mb-3 h-5 w-5 text-cyan-200" /><strong className="text-white">Runs</strong><p className="mt-2 leading-6">Workers and Kanban attempts are execution detail, not competing boards.</p></div>
-                  </CardContent>
-                </Card>
-                <WorkList activeAction={activeAction} items={overviewItems.slice(0, 10)} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
+                <WorkList activeAction={activeAction} items={overviewItems} onAction={handleAction} onArchive={handleArchive} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
               </div>
             )}
             {activeView === "inbox" && (
               <div className="grid gap-4">
-                <WorkList activeAction={activeAction} items={inboxItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
+                <WorkList activeAction={activeAction} items={inboxItems} onAction={handleAction} onArchive={handleArchive} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
                 {inboxSources.map((source) => <SourceCard key={source.id} onSelect={() => setSelection({ kind: "source", source })} selected={selectedSourceId === source.id} source={source} />)}
               </div>
             )}
-            {activeView === "work" && <WorkList activeAction={activeAction} items={workItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
-            {activeView === "recommendations" && <WorkList activeAction={activeAction} items={recommendations} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
+            {activeView === "work" && <WorkList activeAction={activeAction} items={workItems} onAction={handleAction} onArchive={handleArchive} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
+            {activeView === "recommendations" && <WorkList activeAction={activeAction} items={recommendations} onAction={handleAction} onArchive={handleArchive} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
             {activeView === "runs" && (
               <div className="grid gap-3">
                 {snapshot?.runs.length ? snapshot.runs.map((run) => (
@@ -649,7 +644,7 @@ export default function CommandCenterPage() {
       <Card className="border-white/10 bg-white/[0.035]">
         <CardContent className="flex flex-col gap-3 py-4 text-xs leading-5 text-slate-500 sm:flex-row sm:items-center sm:justify-between">
           <span>{snapshot?.summary || "Sources create Work Items; workers execute them."}</span>
-          <span>Generated {formatTime(snapshot?.generated_at)} · <Send className="inline h-3 w-3" /> worker work from Discord is included as Discord-origin work.</span>
+          <span>Generated {formatTime(snapshot?.generated_at)} · <Send className="inline h-3 w-3" /> worker-board work rolls up board-level execution.</span>
         </CardContent>
       </Card>
     </div>

@@ -340,6 +340,11 @@ export const api = {
       `/api/plugins/kanban/command-center/snapshot${suffix ? `?${suffix}` : ""}`,
     );
   },
+  archiveKanbanBoard: (slug: string) =>
+    fetchJSON<{ result: Record<string, unknown>; current: string }>(
+      `/api/plugins/kanban/boards/${encodeURIComponent(slug)}`,
+      { method: "DELETE" },
+    ),
 
   // Self-improvement proposal board
   getSelfImprovementProposals: () =>
@@ -870,6 +875,10 @@ export interface CommandCenterExecution {
   worker_pid?: number | null;
   workspace_kind?: string | null;
   workspace_path?: string | null;
+  archive_action?: string | null;
+  archiveable?: boolean;
+  task_counts?: Record<string, number>;
+  run_count?: number;
 }
 
 export interface CommandCenterWorkItem {
