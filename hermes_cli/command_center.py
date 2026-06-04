@@ -225,7 +225,8 @@ def _task_runs(conn: sqlite3.Connection, task_id: str, *, board: str, limit: int
 
 def _recent_board_runs(conn: sqlite3.Connection, *, board: str, limit: int = 20) -> list[dict[str, Any]]:
     base_sql = (
-        "SELECT r.*, t.title AS task_title, t.status AS task_status, t.assignee AS task_assignee "
+        "SELECT r.*, t.title AS task_title, t.status AS task_status, t.assignee AS task_assignee, "
+        "t.created_by AS task_created_by, t.idempotency_key AS task_idempotency_key, t.body AS task_body "
         "FROM task_runs r LEFT JOIN tasks t ON t.id = r.task_id "
     )
     active_rows = conn.execute(
@@ -243,6 +244,14 @@ def _recent_board_runs(conn: sqlite3.Connection, *, board: str, limit: int = 20)
     for row in [*active_rows, *recent_rows]:
         row_id = int(row["id"])
         if row_id in seen_ids:
+            continue
+        if board == kanban_db.DEFAULT_BOARD and _is_internal_discord_foreman_task(
+            {
+                "created_by": row["task_created_by"],
+                "idempotency_key": row["task_idempotency_key"],
+                "body": row["task_body"],
+            }
+        ):
             continue
         seen_ids.add(row_id)
         run = _run_to_dict(kanban_db.Run.from_row(row), board=board)
