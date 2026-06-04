@@ -248,7 +248,8 @@ def test_self_improvement_approve_creates_task_on_discord_thread_board(client, m
     assert second.status_code == 200, second.text
     assert first.json()["task"]["id"] == second.json()["task"]["id"]
     expected_worker_url = first.json()["worker_url"]
-    assert expected_worker_url.endswith(f"/workers/discord-777-m-555/tickets/{first.json()['task']['id']}")
+    assert expected_worker_url.endswith("/workers/discord-777-m-555")
+    assert "/tickets/" not in expected_worker_url
     assert first.json()["worker_url"] == expected_worker_url
     assert first.json()["card"]["worker_url"] == expected_worker_url
     assert second.json()["worker_url"] == expected_worker_url
@@ -285,6 +286,19 @@ def test_self_improvement_approve_creates_task_on_discord_thread_board(client, m
     detail = client.get(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}")
     assert detail.status_code == 200
     assert detail.json()["card"]["worker_url"] == expected_worker_url
+
+    conn = proposal_storage.connect()
+    try:
+        conn.execute(
+            "UPDATE proposal_cards SET worker_url = ? WHERE proposal_id = ?",
+            (f"{expected_worker_url}/tickets/{first.json()['task']['id']}", card["proposal_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    repaired_ticket_link = client.get(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}")
+    assert repaired_ticket_link.status_code == 200
+    assert repaired_ticket_link.json()["card"]["worker_url"] == expected_worker_url
 
     conn = proposal_storage.connect()
     try:

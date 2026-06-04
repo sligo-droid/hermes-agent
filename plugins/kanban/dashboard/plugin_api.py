@@ -717,23 +717,28 @@ def _worker_url(task_id: str) -> str:
     return f"/workers?task={quote(task_id, safe='')}"
 
 
-def _worker_ticket_url(task_id: str, *, board: str | None = None, board_public_url: str | None = None) -> str:
-    encoded_task = quote(task_id, safe="")
+def _worker_board_url(*, board: str | None = None, board_public_url: str | None = None) -> str:
     public_url = str(board_public_url or "").strip()
     if public_url:
-        return f"{public_url.rstrip('/')}/tickets/{encoded_task}"
+        return public_url.rstrip("/")
     if board:
-        return f"/workers/{quote(str(board), safe='')}/tickets/{encoded_task}"
+        return f"/workers/{quote(str(board), safe='')}"
+    return ""
+
+
+def _worker_ticket_url(task_id: str, *, board: str | None = None, board_public_url: str | None = None) -> str:
+    board_url = _worker_board_url(board=board, board_public_url=board_public_url)
+    if board_url:
+        return f"{board_url}/tickets/{quote(task_id, safe='')}"
     return _worker_url(task_id)
 
 
 def _approval_worker_url(task_id: str, discord_route: discord_publish.DiscordApprovalRoute | None, board: str | None) -> str:
     if discord_route and (discord_route.board or discord_route.board_public_url):
-        return _worker_ticket_url(
-            task_id,
+        return _worker_board_url(
             board=discord_route.board or board,
             board_public_url=discord_route.board_public_url,
-        )
+        ) or _worker_url(task_id)
     return _worker_url(task_id)
 
 
@@ -1589,16 +1594,25 @@ def _repair_card_worker_url(card: dict[str, Any]) -> None:
     if not task_id:
         return
     current = str(card.get("worker_url") or "").strip()
-    legacy_url = _worker_url(task_id)
-    if current and current not in {legacy_url, "/workers"} and not current.startswith("/workers?"):
-        return
     metadata = _latest_discord_approval_metadata(str(card.get("proposal_id") or ""))
     board = metadata.get("discord_board") or metadata.get("board")
     if board == "default":
         board = None
     board_public_url = metadata.get("discord_board_public_url")
-    if board or board_public_url:
-        card["worker_url"] = _worker_ticket_url(task_id, board=board, board_public_url=board_public_url)
+    board_url = _worker_board_url(board=board, board_public_url=board_public_url)
+    if not board_url:
+        return
+
+    legacy_url = _worker_url(task_id)
+    ticket_url = _worker_ticket_url(task_id, board=board, board_public_url=board_public_url)
+    repairable = (
+        not current
+        or current in {legacy_url, "/workers", board_url, ticket_url}
+        or current.startswith("/workers?")
+        or current.startswith(f"{board_url}/tickets/")
+    )
+    if repairable:
+        card["worker_url"] = board_url
 
 
 def _latest_discord_approval_metadata(proposal_id: str) -> dict[str, Any]:
