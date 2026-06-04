@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import {
   AlertTriangle,
@@ -141,30 +141,32 @@ function ActionButton({
   kind: ActionKind;
   onClick: () => void;
 }) {
+  const tooltipId = useId();
   const config = {
-    approve: { label: "Approve", icon: Check, className: "border-emerald-200/80 bg-emerald-400 text-emerald-950 hover:bg-emerald-300 focus-visible:ring-emerald-100/75" },
-    reject: { label: "Reject", icon: X, className: "border-red-200/80 bg-red-500 text-white hover:bg-red-400 focus-visible:ring-red-100/75" },
-    halt: { label: "Cancel", icon: PauseCircle, className: "border-orange-200/75 bg-orange-400 text-orange-950 hover:bg-orange-300 focus-visible:ring-orange-100/75", strong: true },
-    undo: { label: "Revert", icon: RotateCcw, className: "border-sky-200/70 bg-sky-400 text-sky-950 hover:bg-sky-300 focus-visible:ring-sky-100/75" },
-    archive: { label: "Archive board", icon: Archive, className: "border-violet-200/65 bg-violet-400 text-violet-950 hover:bg-violet-300 focus-visible:ring-violet-100/75" },
+    approve: { label: "Approve", icon: Check, className: "border-emerald-200/70 bg-emerald-400 text-emerald-950 hover:bg-emerald-300 focus-visible:ring-emerald-100/75" },
+    reject: { label: "Reject", icon: X, className: "border-red-200/75 bg-red-500 text-white hover:bg-red-400 focus-visible:ring-red-100/75", strong: true },
+    halt: { label: "Cancel work", icon: PauseCircle, className: "border-orange-200/70 bg-orange-400 text-orange-950 hover:bg-orange-300 focus-visible:ring-orange-100/75", strong: true },
+    undo: { label: "Revert", icon: RotateCcw, className: "border-sky-200/65 bg-sky-400 text-sky-950 hover:bg-sky-300 focus-visible:ring-sky-100/75" },
+    archive: { label: "Archive board", icon: Archive, className: "border-violet-200/60 bg-violet-400 text-violet-950 hover:bg-violet-300 focus-visible:ring-violet-100/75" },
   }[kind];
   const Icon = config.icon;
   return (
     <span className="group/action relative inline-flex">
       <button
+        aria-describedby={tooltipId}
         aria-label={config.label}
         className={cn(
-          "inline-flex h-9 w-9 items-center justify-center rounded-full border text-xs font-semibold shadow-sm shadow-black/20 transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950 disabled:cursor-not-allowed disabled:border-slate-500/25 disabled:bg-slate-700/35 disabled:text-slate-400 disabled:opacity-70 disabled:shadow-none",
+          "inline-flex h-10 w-10 items-center justify-center rounded-full border text-xs font-semibold shadow-sm shadow-black/20 transition hover:shadow-black/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950 disabled:cursor-not-allowed disabled:border-slate-500/25 disabled:bg-slate-700/35 disabled:text-slate-400 disabled:opacity-70 disabled:shadow-none",
           config.className,
         )}
         disabled={disabled || busy}
         onClick={onClick}
         type="button"
       >
-        <Icon className={cn(config.strong ? "h-5 w-5 stroke-[2.4]" : "h-4.5 w-4.5 stroke-[2.2]", busy && "animate-pulse")} />
+        <Icon className={cn(config.strong ? "h-6 w-6 stroke-[2.35]" : "h-5 w-5 stroke-[2.15]", busy && "animate-pulse")} />
         <span className="sr-only">{config.label}</span>
       </button>
-      <span className="pointer-events-none absolute bottom-full left-1/2 z-20 mb-2 -translate-x-1/2 translate-y-1 rounded-md border border-white/15 bg-slate-950/95 px-2 py-1 text-[0.67rem] font-semibold uppercase tracking-[0.12em] text-slate-100 opacity-0 shadow-xl shadow-black/35 transition duration-150 group-hover/action:translate-y-0 group-hover/action:opacity-100 group-focus-within/action:translate-y-0 group-focus-within/action:opacity-100">
+      <span id={tooltipId} role="tooltip" className="pointer-events-none absolute bottom-full left-1/2 z-20 mb-2 -translate-x-1/2 translate-y-1 whitespace-nowrap rounded-md border border-white/15 bg-[#090a0c]/95 px-2.5 py-1 text-[0.68rem] font-medium text-slate-100 opacity-0 shadow-xl shadow-black/35 transition duration-150 group-hover/action:translate-y-0 group-hover/action:opacity-100 group-focus-within/action:translate-y-0 group-focus-within/action:opacity-100">
         {config.label}
       </span>
     </span>
@@ -202,8 +204,8 @@ function WorkItemCard({
   return (
     <article
       className={cn(
-        "rounded-2xl border bg-[#08090a]/70 p-4 transition",
-        selected ? "border-cyan-100/65 bg-cyan-100/[0.035] ring-1 ring-cyan-100/20" : "border-white/10 hover:border-cyan-100/30 hover:bg-white/[0.035]",
+        "rounded-2xl border bg-[#08090a]/80 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.025)] transition",
+        selected ? "border-cyan-100/55 bg-cyan-100/[0.03] ring-1 ring-cyan-100/15" : "border-white/10 hover:border-white/20 hover:bg-white/[0.03]",
       )}
     >
       <div className="flex items-start justify-between gap-3">
@@ -217,7 +219,7 @@ function WorkItemCard({
         </button>
         <div className="flex shrink-0 items-center gap-2">
           {item.execution?.worker_url ? (
-            <a className="inline-flex h-8 items-center gap-1.5 rounded-full border border-cyan-100/25 px-2.5 text-xs font-semibold text-cyan-50 hover:bg-cyan-100/10" href={item.execution.worker_url}>
+            <a className="inline-flex h-8 items-center gap-1.5 rounded-full border border-cyan-100/25 px-2.5 text-xs font-semibold text-cyan-50 transition hover:border-cyan-100/40 hover:bg-cyan-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/35" href={item.execution.worker_url}>
               Worker <ExternalLink className="h-3 w-3" />
             </a>
           ) : (
@@ -226,12 +228,12 @@ function WorkItemCard({
         </div>
       </div>
       <button className="mt-3 block w-full text-left" onClick={onSelect} type="button">
-        <p className="text-sm leading-6 text-slate-300">{item.summary || item.body_preview || "No summary recorded."}</p>
+        <p className="text-sm leading-6 text-slate-300">{item.summary || item.body_preview || "No summary yet."}</p>
       </button>
       {(item.execution?.task_url && item.execution.task_url !== item.execution.worker_url) || canApproveReject || canArchive || canHalt || canUndo ? (
         <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3">
           {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && (
-            <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 hover:bg-white/10" href={item.execution.task_url}>
+            <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/[0.07] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" href={item.execution.task_url}>
               Ticket <ExternalLink className="h-3.5 w-3.5" />
             </a>
           )}
@@ -392,7 +394,7 @@ function EmptyState({ label, message }: { label: string; message?: string }) {
       <CardContent className="flex flex-col items-center gap-3 py-16 text-center text-sm text-slate-400">
         <Inbox className="h-9 w-9 text-cyan-100/75" />
         <div className="text-lg font-semibold text-white">No {label}</div>
-        <p className="max-w-md leading-6">{message || "The Command Center ledger is empty for this view."}</p>
+        <p className="max-w-md leading-6">{message || "Nothing is waiting in this view."}</p>
       </CardContent>
     </Card>
   );
@@ -467,9 +469,9 @@ function OverviewWorkList({
       {runningItems.map(renderItem)}
       {runningItems.length > 0 && remainingItems.length > 0 ? (
         <div className="flex items-center gap-3 py-1.5" aria-hidden="true">
-          <div className="h-px flex-1 bg-gradient-to-r from-transparent via-white/16 to-transparent" />
-          <span className="text-[0.62rem] font-semibold uppercase tracking-[0.18em] text-slate-500">Proposed and parked</span>
-          <div className="h-px flex-1 bg-gradient-to-r from-transparent via-white/16 to-transparent" />
+          <div className="h-px flex-1 bg-gradient-to-r from-transparent via-white/12 to-transparent" />
+          <span className="text-[0.62rem] font-medium uppercase tracking-[0.18em] text-slate-500">Proposed and parked</span>
+          <div className="h-px flex-1 bg-gradient-to-r from-transparent via-white/12 to-transparent" />
         </div>
       ) : null}
       {remainingItems.map(renderItem)}
@@ -634,17 +636,17 @@ export default function CommandCenterPage() {
           <section className="min-w-0">
             {activeView === "overview" && (
               <div className="grid gap-5">
-                <OverviewWorkList activeAction={activeAction} emptyMessage="No recent decisions, worker boards, or active ledger items are visible yet." items={overviewItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
+                <OverviewWorkList activeAction={activeAction} emptyMessage="No recent decisions, worker boards, or active work yet." items={overviewItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
               </div>
             )}
             {activeView === "inbox" && (
               <div className="grid gap-4">
-                <WorkList activeAction={activeAction} emptyLabel="pending decisions" emptyMessage="Inbox is clear. Finished, blocked, and archiveable worker boards stay on Overview or Work." items={inboxItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
+                <WorkList activeAction={activeAction} emptyLabel="pending decisions" emptyMessage="Inbox is clear. Finished, blocked, and archiveable boards stay on Overview or Work." items={inboxItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
                 {inboxSources.map((source) => <SourceCard key={source.id} onSelect={() => setSelection({ kind: "source", source })} selected={selectedSourceId === source.id} source={source} />)}
               </div>
             )}
-            {activeView === "work" && <WorkList activeAction={activeAction} emptyMessage="No active or recently shipped worker ledger items are visible." items={workItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
-            {activeView === "recommendations" && <WorkList activeAction={activeAction} emptyLabel="recommendations" emptyMessage="No self-improvement recommendations are waiting in the ledger." items={recommendations} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
+            {activeView === "work" && <WorkList activeAction={activeAction} emptyMessage="No active or recently shipped work is visible." items={workItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
+            {activeView === "recommendations" && <WorkList activeAction={activeAction} emptyLabel="recommendations" emptyMessage="No self-improvement recommendations are waiting." items={recommendations} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
             {activeView === "runs" && (
               <div className="grid gap-3">
                 {snapshot?.runs.length ? snapshot.runs.map((run) => (
@@ -668,8 +670,8 @@ export default function CommandCenterPage() {
 
       <Card className="border-white/10 bg-white/[0.035]">
         <CardContent className="flex flex-col gap-3 py-4 text-xs leading-5 text-slate-500 sm:flex-row sm:items-center sm:justify-between">
-          <span>{snapshot?.summary || "Sources create Work Items; workers execute them."}</span>
-          <span>Generated {formatTime(snapshot?.generated_at)} · <Send className="inline h-3 w-3" /> worker-board work rolls up board-level execution.</span>
+          <span>{snapshot?.summary || "Sources create work items; workers move them forward."}</span>
+          <span>Generated {formatTime(snapshot?.generated_at)} · <Send className="inline h-3 w-3" /> Worker-board work rolls up board-level execution.</span>
         </CardContent>
       </Card>
     </div>
