@@ -5,7 +5,6 @@ import {
   Archive,
   ArrowRight,
   Check,
-  CircleDot,
   ExternalLink,
   Inbox,
   PauseCircle,
@@ -290,15 +289,13 @@ function WorkItemCard({
           </div>
           <h3 className="text-base font-semibold leading-snug text-white">{item.title}</h3>
         </button>
-        <div className="flex shrink-0 items-center gap-2">
-          {item.execution?.worker_url ? (
+        {item.execution?.worker_url ? (
+          <div className="flex shrink-0 items-center gap-2">
             <a className="inline-flex h-8 items-center gap-1.5 rounded-full border border-cyan-100/25 px-2.5 text-xs font-semibold text-cyan-50 transition hover:border-cyan-100/40 hover:bg-cyan-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/35" href={item.execution.worker_url} rel="noopener noreferrer" target="_blank">
               Worker <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span>
             </a>
-          ) : (
-            <CircleDot className="mt-1 h-4 w-4 text-cyan-200/70" />
-          )}
-        </div>
+          </div>
+        ) : null}
       </div>
       <button className="mt-3 block w-full text-left" onClick={onSelect} type="button">
         <p className="text-sm leading-6 text-slate-300">{item.summary || item.body_preview || "No summary yet."}</p>
@@ -425,7 +422,7 @@ function DetailPanel({ selection }: { selection: Selection | null }) {
         </div>
         <div className="flex flex-wrap gap-2">
           {item.execution?.worker_url && <a className="inline-flex items-center gap-1 rounded border border-cyan-100/25 px-3 py-1.5 text-xs text-cyan-50 hover:bg-cyan-100/10" href={item.execution.worker_url} rel="noopener noreferrer" target="_blank">Worker board <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span></a>}
-          {item.execution?.task_url && <a className="inline-flex items-center gap-1 rounded border border-white/10 px-3 py-1.5 text-xs text-slate-200 hover:bg-white/10" href={item.execution.task_url} rel="noopener noreferrer" target="_blank">Ticket <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span></a>}
+          {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && <a className="inline-flex items-center gap-1 rounded border border-white/10 px-3 py-1.5 text-xs text-slate-200 hover:bg-white/10" href={item.execution.task_url} rel="noopener noreferrer" target="_blank">Ticket <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span></a>}
           {item.execution?.console_url && <Link className="inline-flex items-center gap-1 rounded border border-white/10 px-3 py-1.5 text-xs text-slate-200 hover:bg-white/10" to={item.execution.console_url}>Console <ArrowRight className="h-3 w-3" /></Link>}
         </div>
         <KeyValue data={{ source: item.source.ref, execution: item.execution, status_detail: item.status_detail }} />
