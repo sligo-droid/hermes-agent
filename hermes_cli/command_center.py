@@ -15,7 +15,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from hermes_cli import kanban_db
 from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
@@ -83,7 +83,10 @@ def _text_preview(*parts: Any, limit: int = 260) -> str:
 
 def _worker_board_url(board: str | None, public_url: str | None = None) -> str | None:
     if public_url:
-        return str(public_url).rstrip("/")
+        candidate = str(public_url).rstrip("/")
+        path = urlsplit(candidate).path.rstrip("/")
+        if path not in {"/workers", "workers"}:
+            return candidate
     if board and board != kanban_db.DEFAULT_BOARD:
         return f"/workers/{quote(str(board), safe='')}"
     return None

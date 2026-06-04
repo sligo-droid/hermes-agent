@@ -220,6 +220,28 @@ def test_snapshot_running_board_rollup_outranks_blocked_tasks(tmp_path, monkeypa
     assert snapshot["work_items"].index(running_item) < snapshot["work_items"].index(blocked_item)
 
 
+def test_worker_board_url_rejects_top_level_public_worker_urls():
+    board = "discord-worker-board"
+
+    for public_url in (
+        "/workers",
+        "/workers/",
+        "/workers?filter=active",
+        "/workers/#active",
+        "https://hermes.sligolabs.com/workers",
+        "https://hermes.sligolabs.com/workers/?filter=active#running",
+    ):
+        assert command_center._worker_board_url(board, public_url) == f"/workers/{board}"
+
+    assert command_center._worker_board_url(board, "/workers/discord-worker-board") == "/workers/discord-worker-board"
+    assert (
+        command_center._worker_board_url(board, "https://hermes.sligolabs.com/workers/discord-worker-board")
+        == "https://hermes.sligolabs.com/workers/discord-worker-board"
+    )
+    assert command_center._worker_board_url(kanban_db.DEFAULT_BOARD, "/workers") is None
+    assert command_center._worker_board_url(None, "https://hermes.sligolabs.com/workers/") is None
+
+
 def test_snapshot_worker_url_requires_started_execution_and_named_board(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     unstarted_board = "discord-worker-not-started"
