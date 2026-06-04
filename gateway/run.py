@@ -18372,6 +18372,10 @@ class GatewayRunner:
         ("compression", "threshold"),
         ("compression", "target_ratio"),
         ("compression", "protect_last_n"),
+        ("compression", "protect_first_n"),
+        ("compression", "abort_on_summary_failure"),
+        ("compression", "summary_ratio"),
+        ("compression", "max_summary_tokens"),
         ("agent", "disabled_toolsets"),
         ("memory", "provider"),
     )

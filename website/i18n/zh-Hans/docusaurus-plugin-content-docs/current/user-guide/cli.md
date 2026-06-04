@@ -368,7 +368,7 @@ CLI 会话存储在 Hermes 的 SQLite 状态数据库 `~/.hermes/state.db` 中�
 # 在 ~/.hermes/config.yaml 中
 compression:
   enabled: true
-  threshold: 0.50    # 默认在上下文限制的 50% 时压缩
+  threshold: 0.70    # 默认在上下文限制的 70% 时压缩
 
 # 摘要模型在 auxiliary 下配置：
 auxiliary:
@@ -376,7 +376,9 @@ auxiliary:
     model: ""  # 留空则使用主聊天模型（默认）。或指定一个廉价快速的模型，如 "google/gemini-3-flash-preview"。
 ```
 
-压缩触发时，中间轮次会被摘要，同时始终保留前 3 轮和后 20 轮。
+默认情况下，摘要生成失败时 Hermes 会原样保留消息。仅当你明确希望使用历史降级回退行为时，才设置 `compression.abort_on_summary_failure: false`。
+
+压缩触发时，中间轮次会被摘要，同时始终保留前 3 轮和后 50 轮。
 
 ## 后台会话
 

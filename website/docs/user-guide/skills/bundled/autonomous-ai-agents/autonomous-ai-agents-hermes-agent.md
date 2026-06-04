@@ -373,7 +373,7 @@ Edit with `hermes config edit` or `hermes config set section.key value`.
 | `model` | `default`, `provider`, `base_url`, `api_key`, `context_length` |
 | `agent` | `max_turns` (1000), `tool_use_enforcement` |
 | `terminal` | `backend` (local/docker/ssh/modal), `cwd`, `timeout` (180) |
-| `compression` | `enabled`, `threshold` (0.50), `target_ratio` (0.20) |
+| `compression` | `enabled`, `threshold` (0.70), `target_ratio` (0.35), `summary_ratio` (0.25), `max_summary_tokens` (32000), `abort_on_summary_failure` (true) |
 | `display` | `skin`, `tool_progress`, `show_reasoning`, `show_cost` |
 | `stt` | `enabled`, `provider` (local/groq/openai/mistral) |
 | `tts` | `provider` (edge/elevenlabs/openai/minimax/mistral/neutts) |

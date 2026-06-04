@@ -167,6 +167,27 @@ class TestAgentConfigSignature:
         )
         assert sig_on != sig_off
 
+    def test_new_compression_construction_keys_bust_cache(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        changed_values = {
+            "compression.summary_ratio": (0.25, 0.40),
+            "compression.max_summary_tokens": (32_000, 16_000),
+            "compression.abort_on_summary_failure": (True, False),
+            "compression.protect_first_n": (3, 0),
+        }
+        for key, (before, after) in changed_values.items():
+            sig_before = GatewayRunner._agent_config_signature(
+                "m", runtime, [], "",
+                cache_keys={key: before},
+            )
+            sig_after = GatewayRunner._agent_config_signature(
+                "m", runtime, [], "",
+                cache_keys={key: after},
+            )
+            assert sig_before != sig_after, f"{key} must bust cached agents"
+
     def test_cache_keys_key_order_does_not_matter(self):
         """Signature must be stable regardless of dict key insertion order."""
         from gateway.run import GatewayRunner
@@ -228,6 +249,10 @@ class TestExtractCacheBustingConfig:
                     "threshold": 0.6,
                     "target_ratio": 0.3,
                     "protect_last_n": 25,
+                    "protect_first_n": 3,
+                    "abort_on_summary_failure": True,
+                    "summary_ratio": 0.25,
+                    "max_summary_tokens": 32000,
                     "some_other_key": "ignored",
                 }
             }
@@ -236,6 +261,10 @@ class TestExtractCacheBustingConfig:
         assert out["compression.threshold"] == 0.6
         assert out["compression.target_ratio"] == 0.3
         assert out["compression.protect_last_n"] == 25
+        assert out["compression.protect_first_n"] == 3
+        assert out["compression.abort_on_summary_failure"] is True
+        assert out["compression.summary_ratio"] == 0.25
+        assert out["compression.max_summary_tokens"] == 32000
 
     def test_missing_keys_yield_none(self):
         """Absent config keys must produce None values (still contribute to signature)."""

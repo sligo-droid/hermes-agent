@@ -372,7 +372,7 @@ Long conversations are automatically summarized when approaching context limits:
 # In ~/.hermes/config.yaml
 compression:
   enabled: true
-  threshold: 0.50    # Compress at 50% of context limit by default
+  threshold: 0.70    # Compress at 70% of context limit by default
 
 # Summarization model configured under auxiliary:
 auxiliary:
@@ -380,7 +380,9 @@ auxiliary:
     model: ""  # Leave empty to use the main chat model (default). Or pin a cheap fast model, e.g. "google/gemini-3-flash-preview".
 ```
 
-When compression triggers, middle turns are summarized while the first 3 and last 20 turns are always preserved.
+By default, Hermes preserves the original messages unchanged if summary generation fails. Set `compression.abort_on_summary_failure: false` only if you explicitly prefer the historical degraded fallback behavior.
+
+When compression triggers, middle turns are summarized while the first 3 non-system head messages and at least the last 50 recent messages are preserved verbatim.
 
 ## Background Sessions
 

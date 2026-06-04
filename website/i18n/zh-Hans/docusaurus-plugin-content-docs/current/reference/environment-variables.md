@@ -601,9 +601,12 @@ Graph 事件（Teams 会议、日历、聊天等）的入站变更通知监听�
 ```yaml
 compression:
   enabled: true
-  threshold: 0.50
-  target_ratio: 0.20         # fraction of threshold to preserve as recent tail
-  protect_last_n: 20         # minimum recent messages to keep uncompressed
+  threshold: 0.70
+  target_ratio: 0.35         # fraction of threshold to preserve as recent tail
+  protect_last_n: 50         # minimum recent messages to keep uncompressed
+  summary_ratio: 0.25        # fraction of compressed content allocated to summary
+  max_summary_tokens: 32000  # summary token ceiling
+  abort_on_summary_failure: true
 ```
 
 :::info 旧版迁移
