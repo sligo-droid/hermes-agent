@@ -291,6 +291,32 @@ def test_snapshot_worker_url_requires_started_execution_and_named_board(tmp_path
     assert default_item["execution"]["worker_url"] is None
 
 
+def test_snapshot_skips_internal_default_board_foreman_tasks(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    conn = kanban_db.connect()
+    try:
+        foreman_task_id = kanban_db.create_task(
+            conn,
+            title="Recover discord-1512215349011943478/t_84004635",
+            body="<foreman-metadata>{}</foreman-metadata>",
+            created_by="discord-worker-foreman",
+            idempotency_key="discord-foreman:discord-1512215349011943478:t_84004635",
+        )
+        ordinary_task_id = kanban_db.create_task(
+            conn,
+            title="Manual operator request",
+            created_by="operator",
+        )
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    item_ids = {item["id"] for item in snapshot["work_items"]}
+
+    assert f"kanban:default:{foreman_task_id}" not in item_ids
+    assert f"kanban:default:{ordinary_task_id}" in item_ids
+
+
 def test_snapshot_inbox_metric_only_counts_pending_decisions_and_inbox_sources(tmp_path, monkeypatch):
     _ingest_valid(monkeypatch, tmp_path)
     proposed_card = _first_card()
