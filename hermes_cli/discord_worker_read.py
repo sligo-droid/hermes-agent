@@ -173,6 +173,17 @@ def _valid_discord_api_path(path: str) -> bool:
     return True
 
 
+def _worker_read_only() -> bool:
+    return os.getenv("HERMES_DISCORD_WORKER_READ_ONLY", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _require_control_access(action: str) -> None:
+    if _worker_read_only():
+        raise RuntimeError(
+            f"Discord worker helper is read-only in this role; {action} is reserved for the finalizer/operator"
+        )
+
+
 def _broker_request(
     path: str,
     params: dict[str, str] | None = None,
@@ -180,18 +191,34 @@ def _broker_request(
     method: str = "GET",
     body: Any = None,
 ) -> Any:
-    base_url = (
-        os.getenv("HERMES_DISCORD_WORKER_CONTROL_URL", "").strip()
-        or os.getenv("HERMES_DISCORD_WORKER_READ_URL", "").strip()
-    ).rstrip("/")
-    bearer = (
-        os.getenv("HERMES_DISCORD_WORKER_CONTROL_TOKEN", "").strip()
-        or os.getenv("HERMES_DISCORD_WORKER_READ_TOKEN", "").strip()
-    )
+    method = method.upper()
+    control_url = os.getenv("HERMES_DISCORD_WORKER_CONTROL_URL", "").strip()
+    control_token = os.getenv("HERMES_DISCORD_WORKER_CONTROL_TOKEN", "").strip()
+    read_url = os.getenv("HERMES_DISCORD_WORKER_READ_URL", "").strip()
+    read_token = os.getenv("HERMES_DISCORD_WORKER_READ_TOKEN", "").strip()
+    if method != "GET":
+        _require_control_access("Discord REST mutation")
+        base_url = control_url.rstrip("/")
+        bearer = control_token
+        token_name = "HERMES_DISCORD_WORKER_CONTROL_TOKEN"
+    elif control_url and control_token:
+        base_url = control_url.rstrip("/")
+        bearer = control_token
+        token_name = "HERMES_DISCORD_WORKER_CONTROL_TOKEN"
+    elif read_url:
+        base_url = read_url.rstrip("/")
+        bearer = read_token
+        token_name = "HERMES_DISCORD_WORKER_READ_TOKEN"
+    elif control_url:
+        base_url = control_url.rstrip("/")
+        bearer = control_token
+        token_name = "HERMES_DISCORD_WORKER_CONTROL_TOKEN"
+    else:
+        return None
     if not base_url:
         return None
     if not bearer:
-        raise RuntimeError("HERMES_DISCORD_WORKER_CONTROL_TOKEN is required for Discord worker access")
+        raise RuntimeError(f"{token_name} is required for Discord worker access")
     query = f"?{parse.urlencode(params)}" if params else ""
     data = None
     headers = {"Authorization": f"Bearer {bearer}"}
@@ -235,6 +262,8 @@ def discord_request(
         raise ValueError(f"unsupported Discord method: {method}")
     if not _valid_discord_api_path(path):
         raise ValueError("Discord API path must be an absolute API path")
+    if method != "GET":
+        _require_control_access("Discord REST mutation")
     broker_payload = _broker_request(path, params=params, method=method, body=body)
     if broker_payload is not None:
         return broker_payload
@@ -280,6 +309,7 @@ def update_board(
     persist_summary: bool = False,
     dispatch_reason: str = "worker-board-update",
 ) -> dict[str, Any]:
+    _require_control_access("board metadata mutation")
     from hermes_cli import kanban_db
     from hermes_cli.discord_worker_boards import mark_dispatch_dirty, persist_board_run_summary
     from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
@@ -342,6 +372,7 @@ def update_task_status(
     result: str | None = None,
     block_reason: str | None = None,
 ) -> dict[str, Any]:
+    _require_control_access("task status mutation")
     from hermes_cli import kanban_db
     from hermes_cli.discord_worker_boards import mark_dispatch_dirty
 
@@ -434,6 +465,7 @@ def sync_summary_message(
     title: str | None = None,
     outcome: str | None = None,
 ) -> dict[str, Any]:
+    _require_control_access("Discord summary mutation")
     from hermes_cli.discord_worker_boards import feature_summary_snapshot, mark_thread_status_synced
 
     board = str(board or "").strip()

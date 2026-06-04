@@ -16,6 +16,7 @@ from agent.transports.codex_app_server_session import CodexAppServerSession
 from hermes_cli import kanban_db
 from hermes_cli.discord_worker_boards import (
     DEV_TICKET_BODY_GUIDANCE,
+    DISCORD_WORKER_META_KEY,
     MERGE_POLICY_AUTO,
     MERGE_POLICY_MANUAL,
     MERGE_POLICY_NEVER,
@@ -119,37 +120,148 @@ def main() -> int:
 
 
 def _build_prompt(conn: Any, task_id: str, role: str) -> str:
-    context = kanban_db.build_worker_context(conn, task_id)
+    context = (
+        _build_reviewer_context(conn, task_id)
+        if role == ROLE_REVIEWER
+        else kanban_db.build_worker_context(conn, task_id)
+    )
     outcome = _role_outcome_frame(role)
     schema = _schema_instructions(role)
     git = _git_summary(os.environ.get("HERMES_KANBAN_WORKSPACE", "") or os.getcwd())
     discord_access = (
         "Discord and board control access:\n"
+        "- Planner/dev/reviewer workers are read-only for normal Discord access. "
+        "The finalizer/operator owns board and Discord mutation.\n"
         "- You may inspect Discord message context with "
         "`python -m hermes_cli.discord_worker_read fetch-message --channel-id <id> --message-id <id>`.\n"
         "- You may inspect recent thread/channel history with "
         "`python -m hermes_cli.discord_worker_read fetch-messages --channel-id <id> --limit 25`.\n"
-        "- You may call Discord REST actions with "
-        "`python -m hermes_cli.discord_worker_read discord-request --method PATCH --path /channels/<channel_id>/messages/<message_id> --body-json '{\"content\":\"...\"}'`.\n"
-        "- You may update any Hermes/Discord worker board metadata with "
-        "`python -m hermes_cli.discord_worker_read update-board --board <slug> --goal-status done --phase complete --sync-summary --sync-reaction`.\n"
-        "- You may move tickets on any accessible board with "
-        "`python -m hermes_cli.discord_worker_read task-status --board <slug> --task-id <id> --status ready`.\n"
-        "- You may patch the Discord feature summary from board state with "
-        "`python -m hermes_cli.discord_worker_read sync-summary --board <slug>`.\n\n"
+        "- Do not call mutation helpers such as Discord REST writes, board updates, task status changes, or summary syncs from this role.\n\n"
+    )
+    frontend_smoke = (
+        "Frontend preview smoke contract:\n"
+        "- If you start a frontend preview server, every smoke probe must use the exact host:port you started.\n"
+        "- Do not fall back to framework defaults, stale browser tabs, or another worker's port.\n"
+        "- Prefer `python -m hermes_cli.worker_frontend_smoke --url <exact-url> --cmd '<preview command with that host:port>' --route /` when practical.\n\n"
     )
     pr_policy = _pr_policy_prompt_note(role)
     return (
         f"You are the Discord Kanban {role} worker.\n"
-        "Use the repository, shell, files, and worker helper commands available in this worker environment to complete the task; mutate Hermes/Discord state when that is the correct outcome.\n"
+        "Use the repository, shell, files, and worker helper commands available in this worker environment to complete the task.\n"
         f"{pr_policy}"
         "Return exactly one raw JSON object matching the schema below, with no Markdown fence or surrounding prose.\n\n"
         f"{outcome}\n\n"
         f"{discord_access}"
+        f"{frontend_smoke}"
         f"{schema}\n\n"
         f"Git context:\n{git}\n\n"
         f"Kanban context:\n{context}"
     )
+
+
+def _build_reviewer_context(conn: Any, task_id: str) -> str:
+    task = kanban_db.get_task(conn, task_id)
+    if not task:
+        raise ValueError(f"unknown task {task_id}")
+    lines = [
+        f"# Kanban reviewer task {task.id}: {task.title}",
+        "",
+        f"Assignee: {task.assignee or '(unassigned)'}",
+        f"Status:   {task.status}",
+    ]
+    if task.tenant:
+        lines.append(f"Tenant:   {task.tenant}")
+    lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+    lines.append("")
+
+    worker: dict[str, Any] = {}
+    if task.tenant:
+        metadata = kanban_db.read_board_metadata(task.tenant)
+        worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    lines.append("## Board review inputs")
+    goal = str(worker.get("root_goal") or worker.get("initial_request") or "").strip()
+    if goal:
+        lines.append(f"Goal: {goal[:1000]}")
+    criteria = worker.get("criteria") if isinstance(worker.get("criteria"), list) else []
+    if criteria:
+        lines.append("Acceptance criteria:")
+        lines.extend(f"- {str(item)[:500]}" for item in criteria[:20])
+    requirements = worker.get("requirements") if isinstance(worker.get("requirements"), list) else []
+    if requirements:
+        lines.append("Requirements:")
+        for item in requirements[:30]:
+            if isinstance(item, dict):
+                lines.append(f"- {item.get('id') or 'REQ'}: {str(item.get('text') or '')[:500]}")
+            else:
+                lines.append(f"- {str(item)[:500]}")
+    context_paths = [
+        str(worker.get("context_pack_markdown_path") or "").strip(),
+        str(worker.get("context_pack_path") or "").strip(),
+    ]
+    context_paths = [path for path in context_paths if path]
+    if context_paths:
+        lines.append("Context pack paths:")
+        lines.extend(f"- {path}" for path in context_paths)
+    lines.append("")
+
+    parent_rows = conn.execute(
+        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+        (task_id,),
+    ).fetchall()
+    if parent_rows:
+        lines.append("## Parent task handoff manifests")
+        for row in parent_rows:
+            parent_id = row["parent_id"]
+            parent = kanban_db.get_task(conn, parent_id)
+            if not parent or parent.status != "done":
+                continue
+            runs = [run for run in kanban_db.list_runs(conn, parent_id) if run.outcome == "completed"]
+            runs.sort(key=lambda run: run.started_at, reverse=True)
+            run = runs[0] if runs else None
+            metadata = run.metadata if run and isinstance(run.metadata, dict) else {}
+            lines.append(f"### {parent_id}: {parent.title}")
+            if run and run.summary:
+                lines.append(str(run.summary).strip()[:1000])
+            handoff = metadata.get("handoff") if isinstance(metadata, dict) else None
+            if isinstance(handoff, dict):
+                lines.append("handoff:")
+                lines.append(json.dumps(handoff, ensure_ascii=False, sort_keys=True)[:4000])
+            elif metadata:
+                subset = {
+                    key: metadata.get(key)
+                    for key in ("changed_files", "tests", "verification", "preview", "known_warnings")
+                    if key in metadata
+                }
+                if subset:
+                    lines.append(json.dumps(subset, ensure_ascii=False, sort_keys=True)[:3000])
+            lines.append("")
+
+    if task.tenant:
+        rows = conn.execute(
+            "SELECT t.id, t.title, r.summary, r.ended_at "
+            "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
+            "WHERE r.profile = ? AND r.task_id != ? AND r.outcome = 'completed' AND t.tenant = ? "
+            "ORDER BY r.ended_at DESC LIMIT 5",
+            (ROLE_REVIEWER, task_id, task.tenant),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT t.id, t.title, r.summary, r.ended_at "
+            "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
+            "WHERE r.profile = ? AND r.task_id != ? AND r.outcome = 'completed' "
+            "ORDER BY r.ended_at DESC LIMIT 5",
+            (ROLE_REVIEWER, task_id),
+        ).fetchall()
+    comments = kanban_db.list_comments(conn, task_id)[-5:]
+    if rows or comments:
+        lines.append("## Recent reviewer history and comments")
+        for row in rows:
+            first = str(row["summary"] or "").strip().splitlines()
+            lines.append(f"- {row['id']} — {row['title']}: {(first[0] if first else '(no summary)')[:300]}")
+        for comment in comments:
+            lines.append(f"- comment from worker `{str(comment.author).replace('`', '')}`: {comment.body[:500]}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _role_outcome_frame(role: str) -> str:
@@ -182,7 +294,7 @@ def _role_outcome_frame(role: str) -> str:
         "Success means:\n"
         "- The smallest correct change within ticket scope is implemented.\n"
         "- Focused verification is run when available and recorded in tests.\n"
-        "- changed_files, tests, pr_ready, and blocker reflect the actual repository state.\n"
+        "- changed_files, tests, handoff, pr_ready, and blocker reflect the actual repository state.\n"
         "- Remote push and PR lifecycle work are not attempted by this role.\n"
         "Stop when: Return the JSON completion, checkpoint, or blocker object."
     )
@@ -229,12 +341,17 @@ def _schema_instructions(role: str) -> str:
             'Schema: {"status":"approved|changes_requested|blocked","summary":"...","findings":["..."],'
             '"new_tasks":[{"title":"...","body":"...","priority":0}],"criteria_assessment":{}, "blocker":null} '
             "Assess any requirements included in the Kanban context for coverage gaps. "
+            "Use parent task handoff manifests as primary review inputs, along with focused code/tests inspection. "
             "When requesting changes, each new_tasks body must be a self-contained follow-up brief that opens with Goal, Success means, and Stop when. "
             "Do not emit new_tasks for pure PR lifecycle chores: git push, gh pr create/view/checks, updating an existing PR, waiting on checks, or merging."
         )
     return (
         'Schema: {"status":"completed|blocked|checkpoint","summary":"...","changed_files":["..."],'
-        '"tests":[{"command":"...","result":"passed|failed|not_run","output":"..."}],"blocker":null,"pr_ready":false} '
+        '"tests":[{"command":"...","result":"passed|failed|not_run","output":"..."}],'
+        '"handoff":{"changed_files":["..."],"tests":[{"command":"...","result":"passed|failed|not_run","output":"..."}],'
+        '"verification":["..."],"preview":{"url":"...","command":"...","status":"passed|failed|not_run"},'
+        '"smoke_routes":["..."],"known_warnings":["..."],"notes":"..."},"blocker":null,"pr_ready":false} '
+        "Always include handoff so reviewers can audit the exact changed files, checks, preview URL/command, smoke routes, warnings, and notes. "
         "Never push to a remote branch and never create, update, or merge a PR; stop after local code and verification."
     )
 
@@ -334,6 +451,16 @@ def _cleanup_pr_mutation_guard(path: Optional[Path]) -> None:
         pass
 
 
+def _role_read_only_discord_env(role: str) -> dict[str, str]:
+    if role not in _PR_GUARDED_ROLES:
+        return {}
+    return {
+        "HERMES_DISCORD_WORKER_READ_ONLY": "1",
+        "HERMES_DISCORD_WORKER_CONTROL_URL": "",
+        "HERMES_DISCORD_WORKER_CONTROL_TOKEN": "",
+    }
+
+
 def _restore_environ(old_values: dict[str, Optional[str]]) -> None:
     for key, old in old_values.items():
         if old is None:
@@ -373,13 +500,14 @@ def _run_codex(
             pass
 
     guard_env, guard_dir = _role_pr_mutation_guard_env(role)
+    runtime_env = {**guard_env, **_role_read_only_discord_env(role)}
     try:
         attempt = 0
         while True:
             worker_env = {
                 "HERMES_DISABLE_MCP": "1",
                 "HERMES_CODEX_WORKER_NETWORK_ACCESS": "1",
-                **guard_env,
+                **runtime_env,
             }
             session = CodexAppServerSession(
                 cwd=workspace,
@@ -508,8 +636,9 @@ def _run_opencode(
         )
     )
     guard_env, guard_dir = _role_pr_mutation_guard_env(role)
-    old_env = {key: os.environ.get(key) for key in guard_env}
-    os.environ.update(guard_env)
+    runtime_env = {**guard_env, **_role_read_only_discord_env(role)}
+    old_env = {key: os.environ.get(key) for key in runtime_env}
+    os.environ.update(runtime_env)
     try:
         if role == ROLE_PLANNER:
             cfg = load_opencode_config()
@@ -821,6 +950,7 @@ def _apply_role_output(
         metadata={
             "changed_files": _string_list(payload.get("changed_files")),
             "tests": payload.get("tests") if isinstance(payload.get("tests"), list) else [],
+            "handoff": payload.get("handoff") if isinstance(payload.get("handoff"), dict) else {},
             "pr_ready": bool(payload.get("pr_ready")),
             "raw": payload,
         },
