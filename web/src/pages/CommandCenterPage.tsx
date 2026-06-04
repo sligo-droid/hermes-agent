@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useMemo, useState } from "react";
-import { Link, useLocation } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
   AlertTriangle,
   Archive,
@@ -45,6 +45,9 @@ function viewFromPath(pathname: string): ViewKey {
   if (normalized.includes("/inbox")) return "inbox";
   if (normalized.includes("/work")) return "work";
   if (normalized.includes("/archive")) return "archive";
+  if (normalized.includes("/runs")) return "runs";
+  if (normalized.includes("/recommendations")) return "recommendations";
+  if (normalized.includes("/sources")) return "sources";
   return "overview";
 }
 
@@ -88,7 +91,7 @@ function isWorkItem(item: CommandCenterWorkItem): boolean {
 }
 
 function isArchivedItem(item: CommandCenterWorkItem): boolean {
-  return item.status === "archived";
+  return item.status === "archived" || item.status === "rejected";
 }
 
 function isRunningWorkItem(item: CommandCenterWorkItem): boolean {
@@ -152,25 +155,78 @@ function MetricCard({ label, value, detail, tone }: { label: string; value: numb
   );
 }
 
-function IssuePulseChart({
+function workStateRouteForStatus(status: string): string {
+  const normalized = status.toLowerCase();
+  if (["proposed"].includes(normalized)) return "/sligo/inbox";
+  if (["archived", "rejected"].includes(normalized)) return "/sligo/archive";
+  if (["accepted", "blocked", "done", "paused", "queued", "review", "running", "shipped"].includes(normalized)) {
+    return "/sligo/work";
+  }
+  return "/sligo";
+}
+
+function WorkStatePanel({
   activeStatus,
+  activeView,
   data,
-  onSelect,
+  laneCounts,
+  onClearStatus,
+  onSelectStatus,
 }: {
   activeStatus?: string;
+  activeView: ViewKey;
   data?: CommandCenterSnapshot["metrics"]["issue_pulse"];
-  onSelect: (status: string) => void;
+  laneCounts: { overview: number; inbox: number; work: number; archive: number; workers: number };
+  onClearStatus: () => void;
+  onSelectStatus: (status: string) => void;
 }) {
   const points = data?.length ? data : [];
   const maxCount = Math.max(1, ...points.map((point) => point.count));
+  const lanes = [
+    { key: "overview", label: "Overview", href: "/sligo", value: laneCounts.overview, detail: "open ledger" },
+    { key: "inbox", label: "Inbox", href: "/sligo/inbox", value: laneCounts.inbox, detail: "needs decision" },
+    { key: "work", label: "Work", href: "/sligo/work", value: laneCounts.work, detail: "accepted / active" },
+    { key: "archive", label: "Archive", href: "/sligo/archive", value: laneCounts.archive, detail: "terminal / hidden" },
+    { key: "workers", label: "Workers", href: "/workers", value: laneCounts.workers, detail: "opens monitor", external: true },
+  ];
+  const tileClass = (selected: boolean) => cn(
+    "group rounded-2xl border px-3.5 py-3 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
+    selected ? "border-cyan-100/55 bg-cyan-100/10 text-cyan-50" : "border-white/10 bg-white/[0.035] text-slate-300 hover:border-cyan-100/35 hover:bg-cyan-100/[0.055]",
+  );
   return (
     <Card className="border-white/10 bg-white/[0.035]">
-      <CardHeader>
-        <CardTitle className="text-base text-white">Issue Pulse</CardTitle>
+      <CardHeader className="gap-1">
+        <CardTitle className="text-base text-white">Work State</CardTitle>
+        <p className="text-xs leading-5 text-slate-500">Use this as the Command Center map: lanes move between views, statuses focus the ledger, and Workers opens the execution monitor in a new tab.</p>
       </CardHeader>
-      <CardContent>
+      <CardContent className="space-y-4">
+        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-5" aria-label="Command Center lanes">
+          {lanes.map((lane) => {
+            const selected = !lane.external && activeView === lane.key;
+            const content = (
+              <>
+                <span className="block text-xl font-semibold tracking-tight text-white">{lane.value}</span>
+                <span className="mt-1 block text-[0.68rem] font-semibold uppercase tracking-[0.16em]">{lane.label}</span>
+                <span className="mt-1 block text-xs text-slate-500 transition group-hover:text-slate-400">{lane.detail}</span>
+              </>
+            );
+            if (lane.external) {
+              return (
+                <a className={tileClass(selected)} href={lane.href} key={lane.key} rel="noopener noreferrer" target="_blank">
+                  {content}
+                  <span className="sr-only">opens in a new tab</span>
+                </a>
+              );
+            }
+            return (
+              <Link className={tileClass(selected)} key={lane.key} onClick={onClearStatus} to={lane.href}>
+                {content}
+              </Link>
+            );
+          })}
+        </div>
         {points.length ? (
-          <div className="flex h-28 items-end gap-2" role="list" aria-label="Issue Pulse by work status">
+          <div className="flex h-28 items-end gap-2" role="list" aria-label="Work states by status">
             {points.map((point) => {
               const selected = activeStatus === point.status;
               return (
@@ -182,7 +238,7 @@ function IssuePulseChart({
                     selected && "border-cyan-100/60 bg-cyan-100/10 text-cyan-50",
                   )}
                   key={point.status}
-                  onClick={() => onSelect(point.status)}
+                  onClick={() => onSelectStatus(point.status)}
                   title={`${point.label || point.status}: ${point.count}`}
                   type="button"
                 >
@@ -198,7 +254,7 @@ function IssuePulseChart({
             })}
           </div>
         ) : (
-          <p className="text-sm text-slate-400">No work-item status pulse is available yet.</p>
+          <p className="text-sm text-slate-400">No work-state distribution is available yet.</p>
         )}
       </CardContent>
     </Card>
@@ -297,8 +353,8 @@ function WorkItemCard({
         </button>
         <div className="flex shrink-0 items-center gap-2">
           {item.execution?.worker_url ? (
-            <a className="inline-flex h-8 items-center gap-1.5 rounded-full border border-cyan-100/25 px-2.5 text-xs font-semibold text-cyan-50 transition hover:border-cyan-100/40 hover:bg-cyan-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/35" href={item.execution.worker_url}>
-              Worker <ExternalLink className="h-3 w-3" />
+            <a className="inline-flex h-8 items-center gap-1.5 rounded-full border border-cyan-100/25 px-2.5 text-xs font-semibold text-cyan-50 transition hover:border-cyan-100/40 hover:bg-cyan-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/35" href={item.execution.worker_url} rel="noopener noreferrer" target="_blank">
+              Worker <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span>
             </a>
           ) : (
             <CircleDot className="mt-1 h-4 w-4 text-cyan-200/70" />
@@ -311,8 +367,8 @@ function WorkItemCard({
       {(item.execution?.task_url && item.execution.task_url !== item.execution.worker_url) || canApproveReject || canArchive || canPause || canResume || canUndo ? (
         <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3">
           {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && (
-            <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/[0.07] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" href={item.execution.task_url}>
-              Ticket <ExternalLink className="h-3.5 w-3.5" />
+            <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/[0.07] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" href={item.execution.task_url} rel="noopener noreferrer" target="_blank">
+              Ticket <ExternalLink className="h-3.5 w-3.5" /><span className="sr-only">opens in a new tab</span>
             </a>
           )}
           {canApproveReject && <ActionButton busy={actionBusy("approve")} kind="approve" onClick={() => onAction("approve", item)} />}
@@ -429,8 +485,8 @@ function DetailPanel({ selection }: { selection: Selection | null }) {
           <p className="mt-2 leading-6 text-slate-300">{item.summary || item.body_preview}</p>
         </div>
         <div className="flex flex-wrap gap-2">
-          {item.execution?.worker_url && <a className="inline-flex items-center gap-1 rounded border border-cyan-100/25 px-3 py-1.5 text-xs text-cyan-50 hover:bg-cyan-100/10" href={item.execution.worker_url}>Worker board <ExternalLink className="h-3 w-3" /></a>}
-          {item.execution?.task_url && <a className="inline-flex items-center gap-1 rounded border border-white/10 px-3 py-1.5 text-xs text-slate-200 hover:bg-white/10" href={item.execution.task_url}>Ticket <ExternalLink className="h-3 w-3" /></a>}
+          {item.execution?.worker_url && <a className="inline-flex items-center gap-1 rounded border border-cyan-100/25 px-3 py-1.5 text-xs text-cyan-50 hover:bg-cyan-100/10" href={item.execution.worker_url} rel="noopener noreferrer" target="_blank">Worker board <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span></a>}
+          {item.execution?.task_url && <a className="inline-flex items-center gap-1 rounded border border-white/10 px-3 py-1.5 text-xs text-slate-200 hover:bg-white/10" href={item.execution.task_url} rel="noopener noreferrer" target="_blank">Ticket <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span></a>}
           {item.execution?.console_url && <Link className="inline-flex items-center gap-1 rounded border border-white/10 px-3 py-1.5 text-xs text-slate-200 hover:bg-white/10" to={item.execution.console_url}>Console <ArrowRight className="h-3 w-3" /></Link>}
         </div>
         <KeyValue data={{ source: item.source.ref, execution: item.execution, status_detail: item.status_detail }} />
@@ -560,6 +616,7 @@ function OverviewWorkList({
 
 export default function CommandCenterPage() {
   const location = useLocation();
+  const navigate = useNavigate();
   const activeView = viewFromPath(location.pathname);
   const [snapshot, setSnapshot] = useState<CommandCenterSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -647,10 +704,77 @@ export default function CommandCenterPage() {
     () => snapshot?.work_items.filter((item) => item.source.kind === "self_improvement") ?? [],
     [snapshot],
   );
-  const overviewVisibleItems = useMemo(
+  const visibleOverviewItems = useMemo(
     () => (pulseStatus ? overviewItems.filter((item) => item.status === pulseStatus) : overviewItems),
     [overviewItems, pulseStatus],
   );
+  const visibleInboxItems = useMemo(
+    () => (pulseStatus ? inboxItems.filter((item) => item.status === pulseStatus) : inboxItems),
+    [inboxItems, pulseStatus],
+  );
+  const visibleInboxSources = useMemo(
+    () => (pulseStatus ? inboxSources.filter((source) => source.status === pulseStatus) : inboxSources),
+    [inboxSources, pulseStatus],
+  );
+  const visibleWorkItems = useMemo(
+    () => (pulseStatus ? workItems.filter((item) => item.status === pulseStatus) : workItems),
+    [workItems, pulseStatus],
+  );
+  const visibleArchivedItems = useMemo(
+    () => (pulseStatus ? archivedItems.filter((item) => item.status === pulseStatus) : archivedItems),
+    [archivedItems, pulseStatus],
+  );
+  const visibleRecommendations = useMemo(
+    () => (pulseStatus ? recommendations.filter((item) => item.status === pulseStatus) : recommendations),
+    [recommendations, pulseStatus],
+  );
+
+  const clearPulseStatus = useCallback(() => setPulseStatus(null), []);
+  const handleSelectPulseStatus = useCallback((status: string) => {
+    const nextStatus = pulseStatus === status ? null : status;
+    setPulseStatus(nextStatus);
+    if (nextStatus) navigate(workStateRouteForStatus(status));
+  }, [navigate, pulseStatus]);
+  const visibleSources = useMemo(
+    () => (pulseStatus ? (snapshot?.sources.filter((source) => source.status === pulseStatus) ?? []) : (snapshot?.sources ?? [])),
+    [pulseStatus, snapshot],
+  );
+  const laneCounts = useMemo(() => ({
+    overview: overviewItems.length,
+    inbox: inboxItems.length + inboxSources.length,
+    work: workItems.length,
+    archive: archivedItems.length,
+    workers: metric(snapshot, "active_runs"),
+  }), [archivedItems.length, inboxItems.length, inboxSources.length, overviewItems.length, snapshot, workItems.length]);
+  const activeViewWorkItems = useMemo(() => {
+    if (activeView === "overview") return visibleOverviewItems;
+    if (activeView === "inbox") return visibleInboxItems;
+    if (activeView === "work") return visibleWorkItems;
+    if (activeView === "archive") return visibleArchivedItems;
+    if (activeView === "recommendations") return visibleRecommendations;
+    return [];
+  }, [activeView, visibleArchivedItems, visibleInboxItems, visibleOverviewItems, visibleRecommendations, visibleWorkItems]);
+  const activeViewSources = useMemo(() => {
+    if (activeView === "inbox") return visibleInboxSources;
+    if (activeView === "sources") return visibleSources;
+    return [];
+  }, [activeView, visibleInboxSources, visibleSources]);
+  const activeViewRuns = useMemo(() => activeView === "runs" ? (snapshot?.runs ?? []) : [], [activeView, snapshot]);
+
+  useEffect(() => {
+    if (!snapshot || loading) return;
+    setSelection((current) => {
+      if (current?.kind === "work" && activeViewWorkItems.some((item) => item.id === current.item.id)) return current;
+      if (current?.kind === "source" && activeViewSources.some((source) => source.id === current.source.id)) return current;
+      if (current?.kind === "run" && activeViewRuns.some((run) => run.id === current.run.id && run.board === current.run.board)) return current;
+      const item = activeViewWorkItems[0];
+      if (item) return { kind: "work", item };
+      const source = activeViewSources[0];
+      if (source) return { kind: "source", source };
+      const run = activeViewRuns[0];
+      return run ? { kind: "run", run } : null;
+    });
+  }, [activeViewRuns, activeViewSources, activeViewWorkItems, loading, snapshot]);
 
   const handleAction = useCallback(async (kind: ActionKind, item: CommandCenterWorkItem) => {
     const proposalId = item.decision?.proposal_id;
@@ -704,10 +828,13 @@ export default function CommandCenterPage() {
         <MetricCard label="Parse failures" value={metric(snapshot, "parse_failures")} tone="text-red-100" />
       </div>
 
-      <IssuePulseChart
+      <WorkStatePanel
         activeStatus={pulseStatus || undefined}
+        activeView={activeView}
         data={snapshot?.metrics.issue_pulse}
-        onSelect={(status) => setPulseStatus((current) => (current === status ? null : status))}
+        laneCounts={laneCounts}
+        onClearStatus={clearPulseStatus}
+        onSelectStatus={handleSelectPulseStatus}
       />
 
       {error && (
@@ -728,26 +855,24 @@ export default function CommandCenterPage() {
       ) : (
         <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_25rem]">
           <section className="min-w-0">
-            {activeView === "overview" && (
-              <div className="grid gap-5">
-                {pulseStatus && (
-                  <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-cyan-100/20 bg-cyan-100/[0.045] px-4 py-3 text-sm text-cyan-50">
-                    <span>Showing Issue Pulse status: <strong>{pulseStatus}</strong></span>
-                    <button className="rounded-full border border-cyan-100/30 px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] text-cyan-50 transition hover:bg-cyan-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/35" onClick={() => setPulseStatus(null)} type="button">Clear</button>
-                  </div>
-                )}
-                <OverviewWorkList activeAction={activeAction} emptyMessage={pulseStatus ? `No ${pulseStatus} work items are visible.` : "No recent decisions, worker boards, or active work yet."} items={overviewVisibleItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
+            {pulseStatus && (
+              <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-cyan-100/20 bg-cyan-100/[0.045] px-4 py-3 text-sm text-cyan-50">
+                <span>Showing Work State: <strong>{pulseStatus}</strong></span>
+                <button className="rounded-full border border-cyan-100/30 px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] text-cyan-50 transition hover:bg-cyan-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/35" onClick={clearPulseStatus} type="button">Clear</button>
               </div>
+            )}
+            {activeView === "overview" && (
+              <OverviewWorkList activeAction={activeAction} emptyMessage={pulseStatus ? `No ${pulseStatus} work items are visible.` : "No recent decisions, worker boards, or active work yet."} items={visibleOverviewItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
             )}
             {activeView === "inbox" && (
               <div className="grid gap-4">
-                <WorkList activeAction={activeAction} emptyLabel="pending decisions" emptyMessage="Inbox is clear. Finished, blocked, and archiveable boards stay on Overview or Work." items={inboxItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
-                {inboxSources.map((source) => <SourceCard key={source.id} onSelect={() => setSelection({ kind: "source", source })} selected={selectedSourceId === source.id} source={source} />)}
+                <WorkList activeAction={activeAction} emptyLabel="pending decisions" emptyMessage={pulseStatus ? `No ${pulseStatus} decisions are visible.` : "Inbox is clear. Finished, blocked, and archiveable boards stay on Overview or Work."} items={visibleInboxItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
+                {visibleInboxSources.map((source) => <SourceCard key={source.id} onSelect={() => setSelection({ kind: "source", source })} selected={selectedSourceId === source.id} source={source} />)}
               </div>
             )}
-            {activeView === "work" && <WorkList activeAction={activeAction} emptyMessage="No active or recently shipped work is visible." items={workItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
-            {activeView === "archive" && <WorkList activeAction={activeAction} emptyLabel="archived items" emptyMessage="Archived worker boards and work items will appear here." items={archivedItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
-            {activeView === "recommendations" && <WorkList activeAction={activeAction} emptyLabel="recommendations" emptyMessage="No self-improvement recommendations are waiting." items={recommendations} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
+            {activeView === "work" && <WorkList activeAction={activeAction} emptyMessage={pulseStatus ? `No ${pulseStatus} work is visible.` : "No active or recently shipped work is visible."} items={visibleWorkItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
+            {activeView === "archive" && <WorkList activeAction={activeAction} emptyLabel="archived items" emptyMessage={pulseStatus ? `No ${pulseStatus} archived items are visible.` : "Archived worker boards and work items will appear here."} items={visibleArchivedItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
+            {activeView === "recommendations" && <WorkList activeAction={activeAction} emptyLabel="recommendations" emptyMessage={pulseStatus ? `No ${pulseStatus} recommendations are visible.` : "No self-improvement recommendations are waiting."} items={visibleRecommendations} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
             {activeView === "runs" && (
               <div className="grid gap-3">
                 {snapshot?.runs.length ? snapshot.runs.map((run) => (
@@ -757,7 +882,7 @@ export default function CommandCenterPage() {
             )}
             {activeView === "sources" && (
               <div className="grid gap-3">
-                {snapshot?.sources.length ? snapshot.sources.map((source) => (
+                {visibleSources.length ? visibleSources.map((source) => (
                   <SourceCard key={source.id} onSelect={() => setSelection({ kind: "source", source })} selected={selectedSourceId === source.id} source={source} />
                 )) : <EmptyState label="sources" />}
               </div>
