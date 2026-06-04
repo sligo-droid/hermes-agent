@@ -266,10 +266,13 @@ def test_self_improvement_approve_creates_task_on_discord_thread_board(client, m
         assert board_conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
         task = kb.get_task(board_conn, first.json()["task"]["id"])
         assert task is not None
-        assert task.idempotency_key == f"self-improvement:{card['proposal_id']}"
-        assert task.workspace_kind == "dir"
+        assert task.assignee == "planner"
+        assert task.created_by == "self-improvement"
+        assert task.idempotency_key.startswith("discord-777-m-555:planner:request-")
         assert task.workspace_path == worker["worktree_path"]
-        assert task.max_runtime_seconds == 3600
+        assert task.max_runtime_seconds == 1800
+        assert worker["latest_planner_task_id"] == task.id
+        kb.complete_task(board_conn, task.id, summary="Planner handed off dev tickets.")
     finally:
         default_conn.close()
         board_conn.close()
@@ -285,7 +288,10 @@ def test_self_improvement_approve_creates_task_on_discord_thread_board(client, m
     assert grouped_card["worker_url"] == expected_worker_url
     detail = client.get(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}")
     assert detail.status_code == 200
-    assert detail.json()["card"]["worker_url"] == expected_worker_url
+    detail_card = detail.json()["card"]
+    assert detail_card["worker_url"] == expected_worker_url
+    assert detail_card["downstream_task_status"] == "active"
+    assert detail_card["downstream_board_status"] == "active"
 
     conn = proposal_storage.connect()
     try:
@@ -328,11 +334,22 @@ def test_self_improvement_approve_creates_task_on_discord_thread_board(client, m
 
     worker = kb.read_board_metadata("discord-777-m-555")[dwb.DISCORD_WORKER_META_KEY]
     assert worker["goal_status"] == "active"
-    assert worker["phase"] == "dev"
+    assert worker["phase"] == "planning"
     assert worker["execution_mode"] == "kanban_pipeline"
+    assert worker["criteria"]
     assert worker["thread_id"] == "777"
     assert worker["source_message_id"] == "555"
     assert dwb.dispatch_dirty_marker_path().exists()
+
+    halted = client.post(
+        f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/halt",
+        json={"reason": "operator stopped full board"},
+    )
+    assert halted.status_code == 200, halted.text
+    stopped_worker = kb.read_board_metadata("discord-777-m-555")[dwb.DISCORD_WORKER_META_KEY]
+    assert stopped_worker["goal_status"] == "cancelled"
+    assert stopped_worker["phase"] == "cancelled"
+    assert halted.json()["card"]["downstream_task_status"] == "cancelled"
 
 
 def test_self_improvement_approve_falls_back_without_discord_channel(client, monkeypatch):
