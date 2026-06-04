@@ -345,6 +345,16 @@ export const api = {
       `/api/plugins/kanban/boards/${encodeURIComponent(slug)}`,
       { method: "DELETE" },
     ),
+  pauseKanbanBoard: (slug: string) =>
+    fetchJSON<{ result: Record<string, unknown>; board: Record<string, unknown> }>(
+      `/api/plugins/kanban/boards/${encodeURIComponent(slug)}/pause`,
+      { method: "POST" },
+    ),
+  resumeKanbanBoard: (slug: string) =>
+    fetchJSON<{ result: Record<string, unknown>; board: Record<string, unknown> }>(
+      `/api/plugins/kanban/boards/${encodeURIComponent(slug)}/resume`,
+      { method: "POST" },
+    ),
 
   // Self-improvement proposal board
   getSelfImprovementProposals: () =>
@@ -377,6 +387,16 @@ export const api = {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ reason: reason || undefined }),
       },
+    ),
+  pauseSelfImprovementProposal: (proposalId: string) =>
+    fetchJSON<SelfImprovementProposalActionResponse>(
+      `/api/plugins/kanban/self-improvement/proposals/${encodeURIComponent(proposalId)}/pause`,
+      { method: "POST" },
+    ),
+  resumeSelfImprovementProposal: (proposalId: string) =>
+    fetchJSON<SelfImprovementProposalActionResponse>(
+      `/api/plugins/kanban/self-improvement/proposals/${encodeURIComponent(proposalId)}/resume`,
+      { method: "POST" },
     ),
   requestSelfImprovementUndoFollowup: (proposalId: string, reason?: string) =>
     fetchJSON<SelfImprovementProposalActionResponse>(
@@ -876,6 +896,10 @@ export interface CommandCenterExecution {
   workspace_kind?: string | null;
   workspace_path?: string | null;
   archive_action?: string | null;
+  pause_action?: string | null;
+  resume_action?: string | null;
+  paused?: boolean;
+  resumable?: boolean;
   archiveable?: boolean;
   task_counts?: Record<string, number>;
   run_count?: number;
@@ -901,6 +925,9 @@ export interface CommandCenterWorkItem {
     approve_action?: string | null;
     reject_action?: string | null;
     halt_action?: string | null;
+    pause_action?: string | null;
+    resume_action?: string | null;
+    archive_action?: string | null;
     undo_followup_action?: string | null;
   };
   execution?: CommandCenterExecution | null;
@@ -943,6 +970,7 @@ export interface CommandCenterSnapshot {
     inbox: number;
     active_work: number;
     blocked: number;
+    archived: number;
     review: number;
     shipped: number;
     recommendations: number;

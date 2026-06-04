@@ -125,16 +125,19 @@ def _canonical_status_from_board(
     tasks: list[dict[str, Any]],
     *,
     board_meta: dict[str, Any],
+    runs: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str]:
     worker = _board_worker_meta(board_meta)
     goal_status = str(worker.get("goal_status") or "").lower()
     if board_meta.get("archived"):
         return "archived", "archived"
     counts = _task_status_counts(tasks)
+    if counts.get("running", 0) or any(_is_active_run(run) for run in runs or []):
+        return "running", "running"
+    if board_meta.get("command_center_paused") or worker.get("paused") or goal_status == "paused" or str(worker.get("phase") or "").lower() == "paused":
+        return "paused", str(worker.get("paused_reason") or "paused")
     if counts.get("blocked", 0):
         return "blocked", "blocked"
-    if counts.get("running", 0):
-        return "running", "running"
     if counts.get("review", 0):
         return "review", "review"
     if sum(counts.get(status, 0) for status in _WAITING_TASK_STATUSES):
@@ -278,6 +281,8 @@ def _execution_from_task(task: dict[str, Any], *, board: str, board_meta: dict[s
     worker = _board_worker_meta(board_meta)
     public_url = worker.get("public_url") if isinstance(worker, dict) else None
     task_id = str(task.get("id") or "")
+    task_status = str(task.get("status") or "").lower()
+    paused = task_status in {"blocked", "scheduled"}
     return {
         "board": board,
         "board_name": board_meta.get("name") or board,
@@ -287,6 +292,8 @@ def _execution_from_task(task: dict[str, Any], *, board: str, board_meta: dict[s
         "worker_url": _worker_board_url(board, public_url),
         "console_url": _worker_console_url(task_id, board=board),
         "active_run_id": task.get("current_run_id"),
+        "paused": paused,
+        "resumable": paused,
         "worker_unit": task.get("worker_unit"),
         "worker_pid": task.get("worker_pid"),
         "workspace_kind": task.get("workspace_kind"),
@@ -304,6 +311,14 @@ def _execution_from_board(
     worker = _board_worker_meta(board_meta)
     public_url = worker.get("public_url") if isinstance(worker, dict) else None
     active_run = next((run for run in runs if _is_active_run(run)), None)
+    paused = bool(
+        worker.get("paused")
+        or board_meta.get("command_center_paused")
+        or str(worker.get("goal_status") or "").lower() == "paused"
+        or str(worker.get("phase") or "").lower() == "paused"
+    )
+    active_statuses = {str(task.get("status") or "").lower() for task in tasks}
+    resumable = paused or bool(active_statuses & {"blocked", "scheduled"})
     return {
         "board": board,
         "board_name": board_meta.get("name") or board,
@@ -313,7 +328,11 @@ def _execution_from_board(
         "worker_url": _worker_board_url(board, public_url),
         "console_url": None,
         "active_run_id": active_run.get("id") if active_run else None,
+        "pause_action": f"/api/plugins/kanban/boards/{quote(board, safe='')}/pause",
+        "resume_action": f"/api/plugins/kanban/boards/{quote(board, safe='')}/resume",
         "archive_action": f"/api/plugins/kanban/boards/{quote(board, safe='')}",
+        "paused": paused,
+        "resumable": board != kanban_db.DEFAULT_BOARD and not bool(board_meta.get("archived")) and resumable,
         "archiveable": board != kanban_db.DEFAULT_BOARD and not bool(board_meta.get("archived")),
         "task_counts": _task_status_counts(tasks),
         "run_count": len(runs),
@@ -386,6 +405,9 @@ def _proposal_work_item(
             "proposal_id": card.get("proposal_id"),
             "approve_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/approve",
             "reject_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/reject",
+            "pause_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/pause",
+            "resume_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/resume",
+            "archive_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/halt",
         },
         "execution": execution,
         "runs": runs,
@@ -504,7 +526,7 @@ def _board_work_item(
     runs: list[dict[str, Any]],
     proposal_action_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    canonical_status, status_detail = _canonical_status_from_board(tasks, board_meta=board_meta)
+    canonical_status, status_detail = _canonical_status_from_board(tasks, board_meta=board_meta, runs=runs)
     source = _source_from_task_board(board, board_meta)
     created_candidates = [task.get("created_at") for task in tasks if task.get("created_at")]
     updated_candidates = [task.get("completed_at") or task.get("started_at") or task.get("created_at") for task in tasks]
@@ -518,6 +540,8 @@ def _board_work_item(
                 {
                     "proposal_id": proposal_id,
                     "halt_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(proposal_id, safe='')}/halt",
+                    "pause_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(proposal_id, safe='')}/pause",
+                    "resume_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(proposal_id, safe='')}/resume",
                     "undo_followup_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(proposal_id, safe='')}/undo-followup",
                 }
             )
@@ -781,13 +805,14 @@ def _work_item_sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
     status_weight = {
         "running": 0,
         "proposed": 1,
-        "blocked": 2,
-        "review": 3,
-        "queued": 4,
-        "accepted": 5,
-        "shipped": 6,
-        "rejected": 7,
-        "archived": 8,
+        "paused": 2,
+        "blocked": 3,
+        "review": 4,
+        "queued": 5,
+        "accepted": 6,
+        "shipped": 7,
+        "rejected": 8,
+        "archived": 9,
     }.get(str(item.get("status") or ""), 9)
     updated = _epoch_or_none(item.get("updated_at")) or _epoch_or_none(item.get("created_at")) or 0
     return (status_weight, -updated, str(item.get("id") or ""))
@@ -820,6 +845,7 @@ def _metrics(
         + sum(1 for source in sources if source.get("bucket") == "inbox"),
         "active_work": sum(1 for item in work_items if item.get("status") in {"queued", "running", "review"}),
         "blocked": by_status.get("blocked", 0),
+        "archived": by_status.get("archived", 0),
         "review": by_status.get("review", 0),
         "shipped": by_status.get("shipped", 0),
         "recommendations": by_source.get("self_improvement", 0),
