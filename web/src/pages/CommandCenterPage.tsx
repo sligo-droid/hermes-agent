@@ -1,25 +1,18 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link, NavLink, useLocation } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import {
   AlertTriangle,
   ArrowRight,
   Check,
   CircleDot,
   ExternalLink,
-  FileText,
   Inbox,
-  ListChecks,
   PauseCircle,
-  RefreshCw,
   RotateCcw,
   Send,
-  Sparkles,
-  Workflow,
-  Wrench,
   X,
 } from "lucide-react";
 import { Badge } from "@nous-research/ui/ui/components/badge";
-import { Button } from "@nous-research/ui/ui/components/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@nous-research/ui/ui/components/card";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { api } from "@/lib/api";
@@ -38,15 +31,6 @@ type Selection =
   | { kind: "run"; run: CommandCenterRun };
 
 type ActionKind = "approve" | "reject" | "halt" | "undo";
-
-const TABS: Array<{ key: ViewKey; label: string; path: string; icon: typeof Inbox }> = [
-  { key: "overview", label: "Overview", path: "/sligo", icon: Workflow },
-  { key: "inbox", label: "Inbox", path: "/sligo/inbox", icon: Inbox },
-  { key: "work", label: "Work", path: "/sligo/work", icon: ListChecks },
-  { key: "runs", label: "Runs", path: "/sligo/runs", icon: Wrench },
-  { key: "recommendations", label: "Recommendations", path: "/sligo/recommendations", icon: Sparkles },
-  { key: "sources", label: "Sources", path: "/sligo/sources", icon: FileText },
-];
 
 function viewFromPath(pathname: string): ViewKey {
   const normalized = pathname.replace(/\/+$/, "") || "/";
@@ -91,7 +75,7 @@ function metric(snapshot: CommandCenterSnapshot | null, key: keyof CommandCenter
 }
 
 function isInboxItem(item: CommandCenterWorkItem): boolean {
-  return item.status === "proposed" || item.status === "blocked";
+  return Boolean(item.decision?.needed) || item.status === "proposed";
 }
 
 function isWorkItem(item: CommandCenterWorkItem): boolean {
@@ -135,8 +119,8 @@ function initialSelectionForView(snapshot: CommandCenterSnapshot, activeView: Vi
 
 function MetricCard({ label, value, detail, tone }: { label: string; value: number | string; detail?: string; tone?: string }) {
   return (
-    <div className="rounded-2xl border border-white/10 bg-white/[0.055] px-4 py-3 shadow-inner shadow-white/[0.02]">
-      <div className={cn("text-2xl font-semibold tracking-tight text-white", tone)}>{value}</div>
+    <div className="rounded-xl border border-white/10 bg-white/[0.045] px-3.5 py-3">
+      <div className={cn("text-xl font-semibold tracking-tight text-white", tone)}>{value}</div>
       <div className="mt-1 text-[0.68rem] uppercase tracking-[0.18em] text-slate-400">{label}</div>
       {detail && <div className="mt-2 text-xs text-slate-500">{detail}</div>}
     </div>
@@ -155,26 +139,28 @@ function ActionButton({
   onClick: () => void;
 }) {
   const config = {
-    approve: { label: "Approve", icon: Check, className: "border-emerald-200/80 bg-emerald-400 text-emerald-950 hover:bg-emerald-300" },
-    reject: { label: "Reject", icon: X, className: "border-red-200/80 bg-red-500 text-white hover:bg-red-400" },
-    halt: { label: "Halt", icon: PauseCircle, className: "border-amber-200/80 bg-amber-400 text-amber-950 hover:bg-amber-300" },
-    undo: { label: "Undo follow-up", icon: RotateCcw, className: "border-sky-200/80 bg-sky-400 text-sky-950 hover:bg-sky-300" },
+    approve: { label: "Approve", icon: Check, className: "border-emerald-200/80 bg-emerald-400 text-emerald-950 hover:bg-emerald-300", visibleLabel: false },
+    reject: { label: "Reject", icon: X, className: "border-red-200/80 bg-red-500 text-white hover:bg-red-400", visibleLabel: false },
+    halt: { label: "Cancel", icon: PauseCircle, className: "border-amber-200/45 bg-amber-300/10 text-amber-100 hover:bg-amber-300/15", visibleLabel: true },
+    undo: { label: "Revert", icon: RotateCcw, className: "border-sky-200/45 bg-sky-300/10 text-sky-100 hover:bg-sky-300/15", visibleLabel: true },
   }[kind];
   const Icon = config.icon;
   return (
     <button
       aria-label={config.label}
       className={cn(
-        "inline-flex h-9 w-9 items-center justify-center rounded-full border text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70",
+        "inline-flex h-9 items-center justify-center rounded-full border text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70",
+        config.visibleLabel ? "gap-1.5 px-3 sm:min-w-20" : "w-9",
         config.className,
         disabled && "cursor-not-allowed opacity-45",
       )}
       disabled={disabled || busy}
       onClick={onClick}
+      title={config.label}
       type="button"
     >
       {busy ? <Spinner className="text-xs" /> : <Icon className="h-3.5 w-3.5" />}
-      <span className="sr-only">{config.label}</span>
+      <span className={config.visibleLabel ? undefined : "sr-only"}>{config.label}</span>
     </button>
   );
 }
@@ -192,50 +178,53 @@ function WorkItemCard({
   activeAction,
   item,
   onAction,
-  onArchive,
   onSelect,
   selected,
 }: {
   activeAction: { id: string; kind: ActionKind } | null;
   item: CommandCenterWorkItem;
   onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
-  onArchive: (item: CommandCenterWorkItem) => void;
   onSelect: () => void;
   selected: boolean;
 }) {
   const proposalId = item.decision?.proposal_id;
   const actionBusy = (kind: ActionKind) => activeAction?.id === item.id && activeAction.kind === kind;
   const canApproveReject = Boolean(proposalId && item.status === "proposed");
-  const canHalt = Boolean(proposalId && item.execution?.task_id && ["queued", "running", "review", "blocked", "accepted"].includes(item.status));
+  const canHalt = Boolean(proposalId && ["queued", "running", "review", "blocked", "accepted"].includes(item.status));
   const canUndo = Boolean(proposalId && item.status === "shipped");
   const canArchive = Boolean(item.execution?.archiveable && item.execution.board && item.id.startsWith("kanban-board:"));
   return (
     <article
       className={cn(
-        "rounded-3xl border bg-slate-950/55 p-4 shadow-2xl shadow-black/20 transition",
-        selected ? "border-cyan-100/80 ring-2 ring-cyan-100/20" : "border-white/10 hover:border-cyan-100/35 hover:bg-slate-900/80",
+        "rounded-2xl border bg-[#08090a]/70 p-4 transition",
+        selected ? "border-cyan-100/65 ring-1 ring-cyan-100/20" : "border-white/10 hover:border-cyan-100/30 hover:bg-white/[0.045]",
       )}
     >
-      <button className="block w-full text-left" onClick={onSelect} type="button">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="min-w-0">
-            <div className="mb-2 flex flex-wrap items-center gap-2">
-              <SourceBadge source={item.source} />
-              <StatusPill value={item.status} />
-              {item.project && <span className="text-xs uppercase tracking-[0.16em] text-slate-500">{item.project}</span>}
-            </div>
-            <h3 className="text-base font-semibold leading-snug text-white">{item.title}</h3>
+      <div className="flex items-start justify-between gap-3">
+        <button className="min-w-0 flex-1 text-left" onClick={onSelect} type="button">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <SourceBadge source={item.source} />
+            <StatusPill value={item.status} />
+            {item.project && <span className="text-xs uppercase tracking-[0.16em] text-slate-500">{item.project}</span>}
           </div>
-          <CircleDot className="mt-1 h-4 w-4 shrink-0 text-cyan-200/70" />
-        </div>
-        <p className="mt-3 text-sm leading-6 text-slate-300">{item.summary || item.body_preview || "No summary recorded."}</p>
-      </button>
-      <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/10 pt-3">
-          {item.execution?.worker_url && (
-            <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-cyan-100/25 px-3 text-xs font-semibold text-cyan-50 hover:bg-cyan-100/10" href={item.execution.worker_url}>
-              Worker <ExternalLink className="h-3.5 w-3.5" />
+          <h3 className="text-base font-semibold leading-snug text-white">{item.title}</h3>
+        </button>
+        <div className="flex shrink-0 items-center gap-2">
+          {canArchive && <span className="rounded-full border border-slate-400/20 bg-white/[0.035] px-2.5 py-1 text-[0.66rem] font-semibold uppercase tracking-[0.14em] text-slate-400">Archiveable</span>}
+          {item.execution?.worker_url ? (
+            <a className="inline-flex h-8 items-center gap-1.5 rounded-full border border-cyan-100/25 px-2.5 text-xs font-semibold text-cyan-50 hover:bg-cyan-100/10" href={item.execution.worker_url}>
+              Worker <ExternalLink className="h-3 w-3" />
             </a>
+          ) : (
+            <CircleDot className="mt-1 h-4 w-4 text-cyan-200/70" />
           )}
+        </div>
+      </div>
+      <button className="mt-3 block w-full text-left" onClick={onSelect} type="button">
+        <p className="text-sm leading-6 text-slate-300">{item.summary || item.body_preview || "No summary recorded."}</p>
+      </button>
+      {(item.execution?.task_url && item.execution.task_url !== item.execution.worker_url) || canApproveReject || canHalt || canUndo ? (
+        <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/10 pt-3">
           {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && (
             <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 hover:bg-white/10" href={item.execution.task_url}>
               Ticket <ExternalLink className="h-3.5 w-3.5" />
@@ -245,12 +234,8 @@ function WorkItemCard({
           {canApproveReject && <ActionButton busy={actionBusy("reject")} kind="reject" onClick={() => onAction("reject", item)} />}
           {canHalt && <ActionButton busy={actionBusy("halt")} kind="halt" onClick={() => onAction("halt", item)} />}
           {canUndo && <ActionButton busy={actionBusy("undo")} kind="undo" onClick={() => onAction("undo", item)} />}
-          {canArchive && (
-            <button className="inline-flex h-9 items-center rounded-full border border-slate-400/25 px-3 text-xs font-semibold text-slate-200 hover:bg-white/10" onClick={() => onArchive(item)} type="button">
-              Archive
-            </button>
-          )}
-      </div>
+        </div>
+      ) : null}
     </article>
   );
 }
@@ -395,13 +380,13 @@ function KeyValue({ data }: { data: Record<string, unknown> | null | undefined }
   );
 }
 
-function EmptyState({ label }: { label: string }) {
+function EmptyState({ label, message }: { label: string; message?: string }) {
   return (
     <Card className="border-white/10 bg-white/[0.035]">
       <CardContent className="flex flex-col items-center gap-3 py-16 text-center text-sm text-slate-400">
         <Inbox className="h-9 w-9 text-cyan-100/75" />
         <div className="text-lg font-semibold text-white">No {label}</div>
-        <p className="max-w-md leading-6">The Command Center ledger is empty for this view.</p>
+        <p className="max-w-md leading-6">{message || "The Command Center ledger is empty for this view."}</p>
       </CardContent>
     </Card>
   );
@@ -409,20 +394,22 @@ function EmptyState({ label }: { label: string }) {
 
 function WorkList({
   activeAction,
+  emptyLabel,
+  emptyMessage,
   items,
   onAction,
-  onArchive,
   onSelect,
   selectedId,
 }: {
   activeAction: { id: string; kind: ActionKind } | null;
+  emptyLabel?: string;
+  emptyMessage?: string;
   items: CommandCenterWorkItem[];
   onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
-  onArchive: (item: CommandCenterWorkItem) => void;
   onSelect: (item: CommandCenterWorkItem) => void;
   selectedId?: string;
 }) {
-  if (!items.length) return <EmptyState label="work items" />;
+  if (!items.length) return <EmptyState label={emptyLabel || "work items"} message={emptyMessage} />;
   return (
     <div className="grid gap-3">
       {items.map((item) => (
@@ -431,7 +418,6 @@ function WorkList({
           item={item}
           key={item.id}
           onAction={onAction}
-          onArchive={onArchive}
           onSelect={() => onSelect(item)}
           selected={selectedId === item.id}
         />
@@ -482,6 +468,14 @@ export default function CommandCenterPage() {
     void refresh();
   }, [refresh]);
 
+  useEffect(() => {
+    const refreshFromShell = () => {
+      void refresh();
+    };
+    window.addEventListener("command-center:refresh", refreshFromShell);
+    return () => window.removeEventListener("command-center:refresh", refreshFromShell);
+  }, [refresh]);
+
   const inboxItems = useMemo(
     () => snapshot?.work_items.filter(isInboxItem) ?? [],
     [snapshot],
@@ -520,28 +514,12 @@ export default function CommandCenterPage() {
         if (!reason) return;
         await api.rejectSelfImprovementProposal(proposalId, reason);
       } else if (kind === "halt") {
-        const reason = window.prompt("Reason to halt downstream work?", "Operator halted from Command Center.") || undefined;
+        const reason = window.prompt("Reason to cancel downstream work?", "Operator cancelled from Command Center.") || undefined;
         await api.haltSelfImprovementProposal(proposalId, reason);
       } else if (kind === "undo") {
-        const reason = window.prompt("Reason for undo follow-up?", "Operator requested undo follow-up from Command Center.") || undefined;
+        const reason = window.prompt("Reason for revert follow-up?", "Operator requested revert follow-up from Command Center.") || undefined;
         await api.requestSelfImprovementUndoFollowup(proposalId, reason);
       }
-      await refresh();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setActiveAction(null);
-    }
-  }, [refresh]);
-
-  const handleArchive = useCallback(async (item: CommandCenterWorkItem) => {
-    const board = item.execution?.board;
-    if (!board || board === "default") return;
-    if (!window.confirm(`Archive worker board "${item.title || board}"?`)) return;
-    setActiveAction({ id: item.id, kind: "halt" });
-    setError(null);
-    try {
-      await api.archiveKanbanBoard(board);
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -556,31 +534,6 @@ export default function CommandCenterPage() {
 
   return (
     <div className="flex flex-col gap-5">
-      <div className="flex justify-end">
-        <Button className="border-cyan-100/25 bg-cyan-100 text-slate-950 hover:bg-cyan-50" disabled={loading} onClick={() => void refresh()}>
-          {loading ? <Spinner className="mr-2 text-xs" /> : <RefreshCw className="mr-2 h-4 w-4" />} Refresh
-        </Button>
-      </div>
-
-      <nav aria-label="Command Center views" className="flex flex-wrap gap-1 rounded-full border border-white/10 bg-white/[0.035] p-1">
-        {TABS.map((tab) => {
-          const Icon = tab.icon;
-          const active = activeView === tab.key;
-          return (
-            <NavLink
-              className={cn(
-                "inline-flex items-center gap-2 rounded-full px-3 py-2 text-sm font-medium transition focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-200/70",
-                active ? "bg-cyan-100 text-slate-950" : "text-slate-300 hover:bg-white/10 hover:text-white",
-              )}
-              key={tab.key}
-              to={tab.path}
-            >
-              <Icon className="h-4 w-4" /> {tab.label}
-            </NavLink>
-          );
-        })}
-      </nav>
-
       <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-5">
         <MetricCard label="Inbox" value={metric(snapshot, "inbox")} tone="text-cyan-100" />
         <MetricCard label="Active work" value={metric(snapshot, "active_work")} tone="text-amber-100" />
@@ -609,17 +562,17 @@ export default function CommandCenterPage() {
           <section className="min-w-0">
             {activeView === "overview" && (
               <div className="grid gap-5">
-                <WorkList activeAction={activeAction} items={overviewItems} onAction={handleAction} onArchive={handleArchive} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
+                <WorkList activeAction={activeAction} emptyMessage="No recent decisions, worker boards, or active ledger items are visible yet." items={overviewItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
               </div>
             )}
             {activeView === "inbox" && (
               <div className="grid gap-4">
-                <WorkList activeAction={activeAction} items={inboxItems} onAction={handleAction} onArchive={handleArchive} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
+                <WorkList activeAction={activeAction} emptyLabel="pending decisions" emptyMessage="Inbox is clear. Finished, blocked, and archiveable worker boards stay on Overview or Work." items={inboxItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
                 {inboxSources.map((source) => <SourceCard key={source.id} onSelect={() => setSelection({ kind: "source", source })} selected={selectedSourceId === source.id} source={source} />)}
               </div>
             )}
-            {activeView === "work" && <WorkList activeAction={activeAction} items={workItems} onAction={handleAction} onArchive={handleArchive} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
-            {activeView === "recommendations" && <WorkList activeAction={activeAction} items={recommendations} onAction={handleAction} onArchive={handleArchive} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
+            {activeView === "work" && <WorkList activeAction={activeAction} emptyMessage="No active or recently shipped worker ledger items are visible." items={workItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
+            {activeView === "recommendations" && <WorkList activeAction={activeAction} emptyLabel="recommendations" emptyMessage="No self-improvement recommendations are waiting in the ledger." items={recommendations} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
             {activeView === "runs" && (
               <div className="grid gap-3">
                 {snapshot?.runs.length ? snapshot.runs.map((run) => (

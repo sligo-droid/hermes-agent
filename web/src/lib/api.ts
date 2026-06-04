@@ -900,6 +900,8 @@ export interface CommandCenterWorkItem {
     proposal_id?: string | null;
     approve_action?: string | null;
     reject_action?: string | null;
+    halt_action?: string | null;
+    undo_followup_action?: string | null;
   };
   execution?: CommandCenterExecution | null;
   runs?: CommandCenterRun[];
