@@ -221,17 +221,20 @@ def activate_approved_proposal(
     if route is None or not route.thread_id or not route.board:
         return route
     try:
-        from hermes_cli.discord_worker_boards import mark_dispatch_dirty, start_direct_goal
+        from hermes_cli.discord_worker_boards import mark_dispatch_dirty, start_planner_request
 
-        board = start_direct_goal(
+        criteria = _acceptance_criteria(card)
+        board = start_planner_request(
             thread_id=route.thread_id,
-            goal=_initial_request(card),
+            request=_initial_request(card),
             chat_id=route.channel_id,
             guild_id=route.guild_id,
             parent_channel_id=route.channel_id,
             project_context=_project_context(card, route.channel_id),
             request_id=route.top_level_message_id,
             board_slug=route.board,
+            created_by="self-improvement",
+            acceptance_criteria=criteria,
         )
         mark_dispatch_dirty(board=board.slug, reason="self-improvement-approved")
         return replace(route, board=board.slug, board_public_url=board.public_url)
@@ -264,6 +267,59 @@ def _project_context(card: dict[str, Any], channel_id: str) -> dict[str, Any]:
         "self_improvement_prong": str(card.get("prong") or ""),
     }
     return {key: value for key, value in context.items() if value is not None}
+
+
+def _acceptance_criteria(card: dict[str, Any]) -> list[str]:
+    criteria = _explicit_acceptance_criteria(card)
+    if criteria:
+        return criteria
+
+    parts: list[str] = []
+    task = card.get("kanban_task") if isinstance(card.get("kanban_task"), dict) else {}
+    for value in (
+        task.get("body"),
+        card.get("body"),
+        card.get("summary"),
+        card.get("rationale"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            parts.append(text)
+    body = "\n\n".join(parts).strip()
+    if not body:
+        return [_initial_request(card)]
+    return [body]
+
+
+def _explicit_acceptance_criteria(card: dict[str, Any]) -> list[str]:
+    task = card.get("kanban_task") if isinstance(card.get("kanban_task"), dict) else {}
+    candidates = (
+        task.get("acceptance_criteria"),
+        card.get("acceptance_criteria"),
+        card.get("criteria"),
+    )
+    for candidate in candidates:
+        criteria = _coerce_criteria(candidate)
+        if criteria:
+            return criteria
+    return []
+
+
+def _coerce_criteria(value: object) -> list[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if not isinstance(value, list):
+        return []
+    criteria: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            text = str(item.get("text") or item.get("criterion") or item.get("body") or "").strip()
+        else:
+            text = str(item or "").strip()
+        if text and text not in criteria:
+            criteria.append(text)
+    return criteria
 
 
 def _feature_embed(card: dict[str, Any]) -> dict[str, Any]:

@@ -4133,6 +4133,7 @@ def start_planner_request(
     thread_context: Optional[str] = None,
     created_by: str = "discord-feature-request",
     board_slug: Optional[str] = None,
+    acceptance_criteria: Optional[list[Any]] = None,
 ) -> DiscordBoard:
     raw_request = _canonical_planner_request_text(request)
     board = ensure_discord_thread_board(
@@ -4183,6 +4184,8 @@ def start_planner_request(
             "cancelled": False,
         }
     )
+    if acceptance_criteria is not None:
+        worker["criteria"] = acceptance_criteria
     if thread_context_text:
         worker["latest_goal_thread_context"] = thread_context_text
     else:
@@ -4203,7 +4206,7 @@ def start_planner_request(
         }
     )
     metadata = _update_worker_meta(board.slug, worker)
-    _ensure_planner_task(
+    planner_task_id = _ensure_planner_task(
         board.slug,
         metadata[DISCORD_WORKER_META_KEY],
         request=raw_request,
@@ -4212,6 +4215,9 @@ def start_planner_request(
         thread_context=thread_context_text,
         allow_existing=not starts_new_goal_run,
     )
+    worker = dict(metadata[DISCORD_WORKER_META_KEY])
+    worker["latest_planner_task_id"] = planner_task_id
+    metadata = _update_worker_meta(board.slug, worker)
     return DiscordBoard(slug=board.slug, metadata=metadata)
 
 
@@ -4273,6 +4279,7 @@ def _planner_instructions() -> list[str]:
         "When you call kanban_create for a dev ticket, pass the full brief in the kanban_create body argument so the ticket carries its own implementation contract.",
         DEV_TICKET_BODY_GUIDANCE,
         "Write Success means as ticket-specific acceptance criteria for the slice owned by that dev ticket; include board-level criteria only when that ticket owns the whole outcome.",
+        "Do not copy the board-level acceptance_criteria wholesale into every dev ticket. Each dev ticket must define its own Definition of Done, Success means, and Stop when for the slice it owns.",
         "Set Stop when to the concrete handoff point for that ticket, usually code changed and verification recorded or a blocker stated.",
         "Include enough surrounding context from the overall request for a fresh dev worker to execute the ticket without guessing, but keep the scope tight to the ticket.",
         "Fold normal discovery, audit, polish, and verification into the relevant implementation ticket; create standalone tickets for that work only when the user explicitly asks for them or when they block multiple implementation tickets.",
@@ -4421,6 +4428,8 @@ def _ensure_planner_task(
                     existing,
                     thread_context_text,
                     context_pack=_context_pack_summary(board),
+                    acceptance_criteria=worker.get("criteria") or [],
+                    planner_instructions=_planner_instructions(),
                 )
                 return existing
         body = json.dumps(
@@ -4463,6 +4472,8 @@ def _set_planner_thread_context(
     thread_context: str,
     *,
     context_pack: Optional[dict[str, Any]] = None,
+    acceptance_criteria: Optional[list[Any]] = None,
+    planner_instructions: Optional[list[str]] = None,
 ) -> None:
     row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if not row:
@@ -4479,6 +4490,12 @@ def _set_planner_thread_context(
         changed = True
     if context_pack:
         payload["context_pack"] = context_pack
+        changed = True
+    if acceptance_criteria is not None and payload.get("acceptance_criteria") != acceptance_criteria:
+        payload["acceptance_criteria"] = acceptance_criteria
+        changed = True
+    if planner_instructions is not None and payload.get("planner_instructions") != planner_instructions:
+        payload["planner_instructions"] = planner_instructions
         changed = True
     if not changed:
         return
