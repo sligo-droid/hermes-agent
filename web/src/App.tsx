@@ -382,24 +382,6 @@ function buildRoutes(
 
 const SIDEBAR_COLLAPSED_KEY = "hermes-sidebar-collapsed";
 
-function SligoNavLink({ children, to, end = to === "/sligo" }: { children: ReactNode; to: string; end?: boolean }) {
-  return (
-    <NavLink
-      className={({ isActive }) =>
-        cn(
-          "rounded-full px-3 py-2 text-sm font-medium text-slate-300 transition",
-          "hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-200/70",
-          isActive && "bg-cyan-200/12 text-cyan-50 ring-1 ring-cyan-200/25",
-        )
-      }
-      end={end}
-      to={to}
-    >
-      {children}
-    </NavLink>
-  );
-}
-
 function SligoSurfaceShell({ routes }: { routes: DashboardRoute[] }) {
   return (
     <div
@@ -421,34 +403,20 @@ function SligoSurfaceShell({ routes }: { routes: DashboardRoute[] }) {
             </span>
           </NavLink>
 
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-            <nav aria-label="Sligo operator navigation" className="flex flex-wrap gap-1 rounded-full border border-white/10 bg-white/[0.035] p-1">
-              <SligoNavLink to="/sligo">Overview</SligoNavLink>
-              <SligoNavLink to="/sligo/inbox">Inbox</SligoNavLink>
-              <SligoNavLink to="/sligo/work">Work</SligoNavLink>
-              <SligoNavLink to="/sligo/archive">Archive</SligoNavLink>
-              <a
-                className="rounded-full px-3 py-2 text-sm font-medium text-slate-300 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-200/70"
-                href="/workers"
-              >
-                Workers
-              </a>
-            </nav>
-            <button
-              aria-label="Refresh Command Center"
-              className="inline-flex h-9 items-center justify-center gap-2 rounded-full border border-cyan-100/25 bg-cyan-100/10 px-3 text-xs font-semibold uppercase tracking-[0.14em] text-cyan-50 transition hover:bg-cyan-100/15 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-200/70"
-              onClick={() => {
-                if (window.__commandCenterRefresh) {
-                  window.__commandCenterRefresh();
-                  return;
-                }
-                window.dispatchEvent(new CustomEvent("command-center:refresh"));
-              }}
-              type="button"
-            >
-              <RotateCw className="h-3.5 w-3.5" /> Refresh
-            </button>
-          </div>
+          <button
+            aria-label="Refresh Command Center"
+            className="inline-flex h-9 w-fit items-center justify-center gap-2 rounded-full border border-cyan-100/25 bg-cyan-100/10 px-3 text-xs font-semibold uppercase tracking-[0.14em] text-cyan-50 transition hover:bg-cyan-100/15 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-200/70 lg:self-auto"
+            onClick={() => {
+              if (window.__commandCenterRefresh) {
+                window.__commandCenterRefresh();
+                return;
+              }
+              window.dispatchEvent(new CustomEvent("command-center:refresh"));
+            }}
+            type="button"
+          >
+            <RotateCw className="h-3.5 w-3.5" /> Refresh
+          </button>
         </div>
       </header>
 
