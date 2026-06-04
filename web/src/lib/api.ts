@@ -351,6 +351,24 @@ export const api = {
         body: JSON.stringify({ reason }),
       },
     ),
+  haltSelfImprovementProposal: (proposalId: string, reason?: string) =>
+    fetchJSON<SelfImprovementProposalActionResponse>(
+      `/api/plugins/kanban/self-improvement/proposals/${encodeURIComponent(proposalId)}/halt`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: reason || undefined }),
+      },
+    ),
+  requestSelfImprovementUndoFollowup: (proposalId: string, reason?: string) =>
+    fetchJSON<SelfImprovementProposalActionResponse>(
+      `/api/plugins/kanban/self-improvement/proposals/${encodeURIComponent(proposalId)}/undo-followup`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: reason || undefined }),
+      },
+    ),
   getSelfImprovementRun: (runId: string | number) =>
     fetchJSON<{ run: SelfImprovementProposalRun }>(
       `/api/plugins/kanban/self-improvement/runs/${encodeURIComponent(String(runId))}`,
@@ -824,6 +842,10 @@ export interface SelfImprovementProposalCard {
   status: string;
   idempotency_key?: string | null;
   kanban_task_id?: string | null;
+  downstream_board?: string | null;
+  downstream_task_status?: string | null;
+  downstream_task_missing?: boolean;
+  downstream_task?: Record<string, unknown> | null;
   worker_url?: string | null;
   rejected_reason?: string | null;
   archived_at?: string | null;

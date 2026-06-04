@@ -588,6 +588,10 @@ class ProposalRejectBody(BaseModel):
     reason: str = Field(..., min_length=1, max_length=2000)
 
 
+class ProposalFollowupBody(BaseModel):
+    reason: Optional[str] = Field(default=None, max_length=2000)
+
+
 def _proposal_actor() -> str:
     return os.environ.get("USER") or os.environ.get("USERNAME") or "dashboard"
 
@@ -627,6 +631,58 @@ def _proposal_task_body(card: dict[str, Any]) -> str:
             source_block,
         ]
     )
+
+
+def _latest_self_improvement_board(proposal_id: str) -> str:
+    try:
+        events = proposal_storage.list_audit_events(proposal_id)
+    except Exception:
+        return "default"
+    for event in reversed(events):
+        metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+        board = metadata.get("board")
+        if board:
+            return str(board)
+    return "default"
+
+
+def _self_improvement_card_with_downstream(card: dict[str, Any] | None) -> dict[str, Any] | None:
+    if card is None:
+        return None
+    enriched = dict(card)
+    task_id = enriched.get("kanban_task_id")
+    if not task_id:
+        return enriched
+    board = _latest_self_improvement_board(str(enriched.get("proposal_id") or ""))
+    enriched["downstream_board"] = board
+    try:
+        conn = _conn(board=_resolve_board(board))
+    except HTTPException:
+        enriched["downstream_task_status"] = "missing"
+        enriched["downstream_task_missing"] = True
+        return enriched
+    try:
+        task = kanban_db.get_task(conn, str(task_id))
+        if task is None:
+            enriched["downstream_task_status"] = "missing"
+            enriched["downstream_task_missing"] = True
+        else:
+            enriched["downstream_task_status"] = task.status
+            enriched["downstream_task"] = _task_dict(task)
+    finally:
+        conn.close()
+    return enriched
+
+
+def _self_improvement_grouped_with_downstream() -> dict[str, Any]:
+    grouped = proposal_storage.grouped_cards()
+    for project in grouped.get("projects", []):
+        for prong in project.get("prongs", []):
+            prong["cards"] = [
+                _self_improvement_card_with_downstream(card) or card
+                for card in prong.get("cards", [])
+            ]
+    return grouped
 
 
 def _proposal_priority(value: Any) -> int:
@@ -1312,7 +1368,7 @@ def self_improvement_proposals_endpoint():
     payload, but this endpoint is read-only and never creates Kanban tasks.
     """
 
-    return proposal_storage.grouped_cards()
+    return _self_improvement_grouped_with_downstream()
 
 
 @router.get("/self-improvement/runs")
@@ -1327,7 +1383,7 @@ def self_improvement_proposal_detail_endpoint(proposal_id: str):
     card = proposal_storage.get_card(proposal_id)
     if card is None:
         raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")
-    return {"card": card}
+    return {"card": _self_improvement_card_with_downstream(card)}
 
 
 @router.post("/self-improvement/proposals/{proposal_id}/approve")
@@ -1387,7 +1443,89 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
             **({"discord_channel_id": channel_id, "discord_publish": "unavailable"} if channel_id and not discord_route else {}),
         },
     )
-    return {"card": approved, "task": _task_dict(task) if task else None, "worker_url": _worker_url(task_id)}
+    return {"card": _self_improvement_card_with_downstream(approved), "task": _task_dict(task) if task else None, "worker_url": _worker_url(task_id)}
+
+
+@router.post("/self-improvement/proposals/{proposal_id}/halt")
+def self_improvement_proposal_halt_endpoint(proposal_id: str, payload: ProposalFollowupBody | None = None):
+    card = proposal_storage.get_card(proposal_id)
+    if card is None:
+        raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")
+    task_id = card.get("kanban_task_id")
+    if not task_id:
+        raise HTTPException(status_code=409, detail="proposal has no downstream task")
+    board = _latest_self_improvement_board(proposal_id)
+    conn = _conn(board=_resolve_board(board))
+    try:
+        task = kanban_db.get_task(conn, str(task_id))
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"downstream task {task_id!r} not found")
+        if task.status in {"done", "archived"}:
+            raise HTTPException(status_code=409, detail="downstream task is no longer in flight")
+        kanban_db.archive_task(conn, str(task_id))
+        next_task = kanban_db.get_task(conn, str(task_id))
+    finally:
+        conn.close()
+    proposal_storage.record_audit_event(
+        proposal_id,
+        action="halted",
+        actor=_proposal_actor(),
+        kanban_task_id=str(task_id),
+        reason=(payload.reason.strip() if payload and payload.reason else None),
+        metadata={"board": board, "previous_status": task.status},
+    )
+    return {"card": _self_improvement_card_with_downstream(proposal_storage.get_card(proposal_id)), "task": _task_dict(next_task) if next_task else None}
+
+
+@router.post("/self-improvement/proposals/{proposal_id}/undo-followup")
+def self_improvement_proposal_undo_followup_endpoint(proposal_id: str, payload: ProposalFollowupBody | None = None):
+    card = proposal_storage.get_card(proposal_id)
+    if card is None:
+        raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")
+    task_id = card.get("kanban_task_id")
+    if not task_id:
+        raise HTTPException(status_code=409, detail="proposal has no downstream task")
+    board = _latest_self_improvement_board(proposal_id)
+    conn = _conn(board=_resolve_board(board))
+    try:
+        task = kanban_db.get_task(conn, str(task_id))
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"downstream task {task_id!r} not found")
+        if task.status != "done":
+            raise HTTPException(status_code=409, detail="downstream task is not fully implemented")
+        idempotency_key = f"self-improvement:{proposal_id}:undo-followup"
+        followup_id = kanban_db.create_task(
+            conn,
+            title=f"Review undo path for: {card.get('title') or proposal_id}",
+            body="\n".join(
+                [
+                    "Review the approved self-improvement change and prepare the safest undo path if needed.",
+                    "",
+                    f"Original proposal: {proposal_id}",
+                    f"Completed downstream task: {task_id}",
+                    f"Reason: {(payload.reason.strip() if payload and payload.reason else 'operator requested follow-up')}",
+                ]
+            ),
+            assignee="dev",
+            created_by="self-improvement",
+            workspace_kind="dir",
+            tenant=str(card.get("project") or "self-improvement"),
+            priority=2,
+            idempotency_key=idempotency_key,
+            initial_status="blocked",
+        )
+        followup = kanban_db.get_task(conn, followup_id)
+    finally:
+        conn.close()
+    proposal_storage.record_audit_event(
+        proposal_id,
+        action="undo_followup_requested",
+        actor=_proposal_actor(),
+        kanban_task_id=str(task_id),
+        reason=(payload.reason.strip() if payload and payload.reason else None),
+        metadata={"board": board, "followup_task_id": followup_id, "idempotency_key": idempotency_key},
+    )
+    return {"card": _self_improvement_card_with_downstream(proposal_storage.get_card(proposal_id)), "task": _task_dict(followup) if followup else None}
 
 
 def _latest_discord_approval_metadata(proposal_id: str) -> dict[str, Any]:
@@ -1416,7 +1554,7 @@ def self_improvement_proposal_reject_endpoint(proposal_id: str, payload: Proposa
         reason=payload.reason.strip(),
         actor=_proposal_actor(),
     )
-    return {"card": rejected}
+    return {"card": _self_improvement_card_with_downstream(rejected)}
 
 
 @router.get("/self-improvement/proposals/{proposal_id}/audit")
