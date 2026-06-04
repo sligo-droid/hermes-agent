@@ -1,0 +1,43 @@
+{
+  "contract_version": "self_improvement.proposal_run.v1",
+  "project": "pid",
+  "prong": "airflow_scraper_doctor",
+  "run": {
+    "run_id": "cron-run-2026-06-04T02:00:00Z",
+    "cron_job_id": "abc123def456",
+    "cron_job_name": "Nightly PID Airflow scraper doctor",
+    "cron_output_path": "/tmp/hermes/cron/output/abc123def456/20260604.md",
+    "created_at": "2026-06-04T02:00:00Z",
+    "completed_at": "2026-06-04T02:04:00Z"
+  },
+  "generated_at": "2026-06-04T02:04:10Z",
+  "human_markdown": "One focused PID Airflow scraper maintenance proposal.",
+  "cards": [
+    {
+      "idempotency_key": "airflow-scraper-timeout-backoff-2026-06-04",
+      "title": "Add backoff logging to PID scraper timeout retries",
+      "summary": "Timeout retries are opaque in recent Airflow scraper runs.",
+      "body": "Instrument retry attempts and backoff duration for the PID Airflow scraper so operators can distinguish transient source latency from parser regressions.",
+      "rationale": "Recent cron output showed repeated timeout retries with no per-attempt timing, making triage slower.",
+      "priority": "high",
+      "severity": "major",
+      "status": "proposed",
+      "created_at": "2026-06-04T02:04:10Z",
+      "source_excerpts": [
+        {
+          "label": "cron output",
+          "text": "PID scraper retried timeout after 60s; final status succeeded after 3 attempts.",
+          "cron_output_path": "/tmp/hermes/cron/output/abc123def456/20260604.md",
+          "line_start": 12,
+          "line_end": 14
+        }
+      ],
+      "kanban_task": {
+        "title": "Instrument PID scraper timeout retry backoff",
+        "body": "Add logging for each timeout retry attempt, backoff duration, and final source URL in the PID Airflow scraper. Include a small regression test or log fixture proving the fields appear.",
+        "assignee": "dev",
+        "tags": ["pid", "airflow", "observability"]
+      }
+    }
+  ]
+}
