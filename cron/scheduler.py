@@ -1231,65 +1231,6 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
-def _self_improvement_proposal_config(job: dict, config: dict | None = None) -> tuple[str, str] | None:
-    """Return validated (project, prong) for cron proposal jobs, if enabled."""
-
-    proposal_cfg = job.get("self_improvement_proposal")
-    if not isinstance(proposal_cfg, dict) or proposal_cfg.get("enabled", True) is False:
-        return None
-    project = str(proposal_cfg.get("project") or "").strip()
-    prong = str(proposal_cfg.get("prong") or "").strip()
-    if not project or not prong:
-        raise ValueError("self_improvement_proposal requires project and prong")
-
-    from self_improvement.proposals import get_project_prong_config
-
-    get_project_prong_config(project, prong, config)
-    return project, prong
-
-
-def _ingest_self_improvement_proposal_output(
-    job: dict,
-    output: str,
-    output_file: Path,
-    final_response: str,
-) -> dict | None:
-    """Persist proposal cron output when the job declares a proposal prong."""
-
-    proposal = _self_improvement_proposal_config(job)
-    if proposal is None:
-        return None
-
-    from self_improvement import proposal_storage
-
-    job_id = str(job.get("id") or "")
-    run_id = str(job.get("last_run_id") or output_file.stem)
-    source: dict = {
-        "source_key": f"cron:{job_id}:{output_file.name}",
-        "cron_job_id": job_id,
-        "run_id": run_id,
-        "cron_output_path": str(output_file),
-        "cron_job_name": str(job.get("name") or job.get("prompt") or job_id or "cron job"),
-    }
-    for key in ("source_url", "url"):
-        if job.get(key):
-            source["source_url"] = str(job[key])
-            break
-
-    result = proposal_storage.ingest_proposal_output(
-        final_response if final_response.strip() else output,
-        source=source,
-    )
-    logger.info(
-        "Job '%s': ingested self-improvement proposal output status=%s cards=%s run_id=%s",
-        job_id,
-        result.get("status"),
-        result.get("card_count"),
-        result.get("run_id"),
-    )
-    return result
-
-
 def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
@@ -1303,13 +1244,6 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """
     prompt = str(job.get("prompt") or "")
     skills = job.get("skills")
-
-    proposal = _self_improvement_proposal_config(job)
-    if proposal is not None:
-        from self_improvement.proposals import build_cron_proposal_guidance
-
-        project, prong = proposal
-        prompt = f"{build_cron_proposal_guidance(project, prong)}\n\n{prompt}"
 
     # Run data-collection script if configured, inject output as context.
     script_path = job.get("script")
@@ -2257,7 +2191,6 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 output_file = save_job_output(job["id"], output)
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
-                _ingest_self_improvement_proposal_output(job, output, Path(output_file), final_response)
 
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but
