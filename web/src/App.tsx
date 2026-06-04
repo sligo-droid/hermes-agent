@@ -85,10 +85,25 @@ import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
 import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
+import { currentDashboardSurface, sligoHostUrl } from "@/lib/dashboard-host";
 import { api } from "@/lib/api";
 import type { StatusResponse } from "@/lib/api";
 
-function RootRedirect() {
+function RootRedirect({ to }: { to: string }) {
+  return <Navigate to={to} replace />;
+}
+
+function HermesToSligoRedirect() {
+  const location = useLocation();
+  useEffect(() => {
+    window.location.replace(
+      sligoHostUrl(`${location.pathname}${location.search}${location.hash}`),
+    );
+  }, [location.hash, location.pathname, location.search]);
+  return null;
+}
+
+function SessionsRootRedirect() {
   return <Navigate to="/sessions" replace />;
 }
 
@@ -136,7 +151,7 @@ const SELF_IMPROVEMENT_NAV_ITEM: NavItem = {
  * and nav highlight keep working.
  */
 const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
-  "/": RootRedirect,
+  "/": SessionsRootRedirect,
   "/sessions": SessionsPage,
   "/analytics": AnalyticsPage,
   "/models": ModelsPage,
@@ -148,6 +163,19 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/config": ConfigPage,
   "/env": EnvPage,
   "/docs": DocsPage,
+  "/sligo": SligoOperatorPage,
+  "/self-improvement": SelfImprovementBoardPage,
+  "/workers/:sessionId/tickets/:taskId/console": WorkerConsolePage,
+};
+
+const HERMES_HOST_REDIRECT_ROUTES: Record<string, ComponentType> = {
+  "/sligo": HermesToSligoRedirect,
+  "/self-improvement": HermesToSligoRedirect,
+  "/workers/:sessionId/tickets/:taskId/console": HermesToSligoRedirect,
+};
+
+const SLIGO_ROUTES: Record<string, ComponentType> = {
+  "/": SligoOperatorPage,
   "/sligo": SligoOperatorPage,
   "/self-improvement": SelfImprovementBoardPage,
   "/workers/:sessionId/tickets/:taskId/console": WorkerConsolePage,
@@ -373,6 +401,7 @@ export default function App() {
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isChatRoute = normalizedPath === "/chat";
   const embeddedChat = isDashboardEmbeddedChatEnabled();
+  const dashboardSurface = currentDashboardSurface();
 
   // `dashboard.show_token_analytics` gates the Analytics nav item.  The
   // page itself remains reachable by URL (it renders an explanation when
@@ -414,45 +443,56 @@ export default function App() {
   );
 
   const builtinRoutes = useMemo(
-    () => ({
-      ...BUILTIN_ROUTES_CORE,
-      ...(embeddedChat ? { "/chat": ChatRouteSink } : {}),
-    }),
-    [embeddedChat],
+    () => {
+      if (dashboardSurface === "sligo") return SLIGO_ROUTES;
+      return {
+        ...BUILTIN_ROUTES_CORE,
+        ...(dashboardSurface === "hermes" ? HERMES_HOST_REDIRECT_ROUTES : {}),
+        ...(embeddedChat ? { "/chat": ChatRouteSink } : {}),
+      };
+    },
+    [dashboardSurface, embeddedChat],
   );
 
   const builtinNav = useMemo(() => {
+    if (dashboardSurface === "sligo") {
+      return [SLIGO_NAV_ITEM, SELF_IMPROVEMENT_NAV_ITEM, WORKERS_NAV_ITEM];
+    }
     const base = embeddedChat
       ? [CHAT_NAV_ITEM, ...BUILTIN_NAV_REST]
       : BUILTIN_NAV_REST;
     return showTokenAnalytics
       ? base
       : base.filter((n) => n.path !== "/analytics");
-  }, [embeddedChat, showTokenAnalytics]);
+  }, [dashboardSurface, embeddedChat, showTokenAnalytics]);
 
   const sidebarNav = useMemo(
     () => {
-      const nav = partitionSidebarNav(builtinNav, manifests);
+      const navManifests = dashboardSurface === "sligo" ? [] : manifests;
+      const nav = partitionSidebarNav(builtinNav, navManifests);
+      if (dashboardSurface !== "combined") return nav;
       return {
         ...nav,
         pluginItems: [SLIGO_NAV_ITEM, SELF_IMPROVEMENT_NAV_ITEM, WORKERS_NAV_ITEM, ...nav.pluginItems],
       };
     },
-    [builtinNav, manifests],
+    [builtinNav, dashboardSurface, manifests],
   );
   const routes = useMemo(
-    () => buildRoutes(builtinRoutes, manifests),
-    [builtinRoutes, manifests],
+    () => buildRoutes(builtinRoutes, dashboardSurface === "sligo" ? [] : manifests),
+    [builtinRoutes, dashboardSurface, manifests],
   );
   const pluginTabMeta = useMemo(
-    () =>
-      manifests
+    () => {
+      if (dashboardSurface === "sligo") return [];
+      return manifests
         .filter((m) => !m.tab.hidden)
         .map((m) => ({
           path: m.tab.override ?? m.tab.path,
           label: m.label,
-        })),
-    [manifests],
+        }));
+    },
+    [dashboardSurface, manifests],
   );
 
   const layoutVariant = theme.layoutVariant ?? "standard";
@@ -741,7 +781,11 @@ export default function App() {
                   <Route
                     path="*"
                     element={
-                      <UnknownRouteFallback pluginsLoading={pluginsLoading} />
+                      dashboardSurface === "sligo" ? (
+                        <RootRedirect to="/sligo" />
+                      ) : (
+                        <UnknownRouteFallback pluginsLoading={pluginsLoading} />
+                      )
                     }
                   />
                 </Routes>

@@ -193,6 +193,56 @@ def _basic_auth_challenge() -> JSONResponse:
     )
 
 
+_DEFAULT_HERMES_DASHBOARD_HOST = "hermes.sligolabs.com"
+_DEFAULT_SLIGO_DASHBOARD_HOST = "sligo.sligolabs.com"
+
+
+def _dashboard_host_without_port(host: str) -> str:
+    value = (host or "").strip().lower()
+    if value.startswith("["):
+        close = value.find("]")
+        return value[1:close] if close >= 0 else value.strip("[]")
+    return value.rsplit(":", 1)[0] if ":" in value else value
+
+
+def dashboard_surface_for_host(host: str) -> str:
+    """Classify the requested dashboard host.
+
+    Unknown hosts stay in the combined legacy surface so localhost/dev and
+    custom deployments do not lose routes unless they opt into the public host
+    split by using the production Sligo Labs hostnames.
+    """
+    normalized = _dashboard_host_without_port(host)
+    hermes_host = os.getenv(
+        "HERMES_DASHBOARD_HOST",
+        _DEFAULT_HERMES_DASHBOARD_HOST,
+    ).lower()
+    sligo_host = os.getenv(
+        "SLIGO_DASHBOARD_HOST",
+        _DEFAULT_SLIGO_DASHBOARD_HOST,
+    ).lower()
+    if normalized == hermes_host:
+        return "hermes"
+    if normalized == sligo_host:
+        return "sligo"
+    return "combined"
+
+
+def _request_dashboard_host(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-host")
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip()
+    return request.headers.get("host", "")
+
+
+def sligo_dashboard_url_for_path(path: str, query_string: bytes = b"") -> str:
+    sligo_host = os.getenv("SLIGO_DASHBOARD_HOST", _DEFAULT_SLIGO_DASHBOARD_HOST)
+    url = f"https://{sligo_host}{path or '/'}"
+    if query_string:
+        url += "?" + query_string.decode("utf-8", errors="ignore")
+    return url
+
+
 def _require_token(request: Request) -> None:
     """Validate the ephemeral session token.  Raises 401 on mismatch."""
     if not _has_valid_session_token(request):
@@ -340,6 +390,33 @@ async def auth_middleware(request: Request, call_next):
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
     if not _has_dashboard_access(request):
         return _basic_auth_challenge()
+    return await call_next(request)
+
+
+def _is_sligo_operator_path(path: str) -> bool:
+    return (
+        path in {"/sligo", "/self-improvement", "/workers"}
+        or path.startswith("/sligo/")
+        or path.startswith("/self-improvement/")
+        or path.startswith("/workers/")
+        # Legacy/public worker board URLs should move with the Workers surface.
+        or path.startswith("/public/kanban/")
+        or path == "/kanban"
+        or path.startswith("/kanban/")
+    )
+
+
+@app.middleware("http")
+async def sligo_host_redirect_middleware(request: Request, call_next):
+    path = request.url.path
+    if (
+        dashboard_surface_for_host(_request_dashboard_host(request)) == "hermes"
+        and _is_sligo_operator_path(path)
+    ):
+        return RedirectResponse(
+            url=sligo_dashboard_url_for_path(path, request.scope.get("query_string", b"")),
+            status_code=307,
+        )
     return await call_next(request)
 
 
@@ -4582,11 +4659,13 @@ def mount_spa(application: FastAPI):
 
     _index_path = WEB_DIST / "index.html"
 
-    def _serve_index(prefix: str = ""):
+    def _serve_index(prefix: str = "", surface: str = "combined"):
         """Return index.html with the session token + base-path injected.
 
         ``prefix`` is the normalised ``X-Forwarded-Prefix`` (e.g. ``/hermes``)
-        or empty string when served at root.
+        or empty string when served at root. ``surface`` is the host-derived
+        dashboard surface (``hermes``, ``sligo``, or ``combined``) so the SPA can
+        route without hard-coding deployment state.
 
         When the OAuth auth gate is active (``app.state.auth_required``),
         the legacy ``_SESSION_TOKEN`` is NOT injected — the SPA reads
@@ -4598,12 +4677,20 @@ def mount_spa(application: FastAPI):
         chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
         gated = bool(getattr(app.state, "auth_required", False))
         gated_js = "true" if gated else "false"
+        surface_js = json.dumps(
+            surface if surface in {"hermes", "sligo", "combined"} else "combined"
+        )
+        sligo_host_js = json.dumps(
+            os.getenv("SLIGO_DASHBOARD_HOST", _DEFAULT_SLIGO_DASHBOARD_HOST)
+        )
         if gated:
             bootstrap_script = (
                 f"<script>"
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
+                f"window.__HERMES_DASHBOARD_SURFACE__={surface_js};"
+                f"window.__HERMES_SLIGO_DASHBOARD_HOST__={sligo_host_js};"
                 f"</script>"
             )
         else:
@@ -4612,6 +4699,8 @@ def mount_spa(application: FastAPI):
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
+                f"window.__HERMES_DASHBOARD_SURFACE__={surface_js};"
+                f"window.__HERMES_SLIGO_DASHBOARD_HOST__={sligo_host_js};"
                 f"</script>"
             )
         if prefix:
@@ -4657,6 +4746,7 @@ def mount_spa(application: FastAPI):
     @application.get("/{full_path:path}")
     async def serve_spa(full_path: str, request: Request):
         prefix = _normalise_prefix(request.headers.get("x-forwarded-prefix"))
+        surface = dashboard_surface_for_host(_request_dashboard_host(request))
         file_path = WEB_DIST / full_path
         # Prevent path traversal via url-encoded sequences (%2e%2e/)
         if (
@@ -4666,7 +4756,7 @@ def mount_spa(application: FastAPI):
             and file_path.is_file()
         ):
             return FileResponse(file_path)
-        return _serve_index(prefix)
+        return _serve_index(prefix, surface)
 
 
 # ---------------------------------------------------------------------------
