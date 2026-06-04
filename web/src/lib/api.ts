@@ -328,6 +328,24 @@ export const api = {
   deleteCronJob: (id: string, profile = "default") =>
     fetchJSON<{ ok: boolean }>(`/api/cron/jobs/${encodeURIComponent(id)}?profile=${encodeURIComponent(profile)}`, { method: "DELETE" }),
 
+  // Self-improvement proposal board (read-only)
+  getSelfImprovementProposals: () =>
+    fetchJSON<SelfImprovementProposalsResponse>(
+      "/api/plugins/kanban/self-improvement/proposals",
+    ),
+  getSelfImprovementProposal: (proposalId: string) =>
+    fetchJSON<{ card: SelfImprovementProposalCard }>(
+      `/api/plugins/kanban/self-improvement/proposals/${encodeURIComponent(proposalId)}`,
+    ),
+  getSelfImprovementRun: (runId: string | number) =>
+    fetchJSON<{ run: SelfImprovementProposalRun }>(
+      `/api/plugins/kanban/self-improvement/runs/${encodeURIComponent(String(runId))}`,
+    ),
+  getSelfImprovementParseFailures: () =>
+    fetchJSON<SelfImprovementParseFailuresResponse>(
+      "/api/plugins/kanban/self-improvement/parse-failures",
+    ),
+
   // Profiles (minimal)
   getProfiles: () =>
     fetchJSON<{ profiles: ProfileInfo[] }>("/api/profiles"),
@@ -776,6 +794,81 @@ export interface CronJob {
   last_run_at?: string | null;
   next_run_at?: string | null;
   last_error?: string | null;
+}
+
+export interface SelfImprovementProposalCard {
+  proposal_id: string;
+  run_db_id: number;
+  project: string;
+  prong: string;
+  title: string;
+  summary: string;
+  body: string;
+  rationale: string;
+  priority: string;
+  severity?: string | null;
+  status: string;
+  idempotency_key?: string | null;
+  created_at: string;
+  updated_at: string;
+  source_excerpts: Array<{
+    text: string;
+    label?: string;
+    url?: string;
+    cron_output_path?: string;
+    line_start?: number;
+    line_end?: number;
+  }>;
+  kanban_task: Record<string, unknown>;
+  payload: Record<string, unknown>;
+  source_key?: string | null;
+  run_id?: string | null;
+  cron_job_id?: string | null;
+  cron_output_path?: string | null;
+}
+
+export interface SelfImprovementProposalProng {
+  prong: string;
+  cards: SelfImprovementProposalCard[];
+}
+
+export interface SelfImprovementProposalProject {
+  project: string;
+  prongs: SelfImprovementProposalProng[];
+}
+
+export interface SelfImprovementProposalsResponse {
+  projects: SelfImprovementProposalProject[];
+}
+
+export interface SelfImprovementProposalRun {
+  id: number;
+  source_key: string;
+  contract_version?: string | null;
+  project?: string | null;
+  prong?: string | null;
+  run_id?: string | null;
+  cron_job_id?: string | null;
+  cron_job_name?: string | null;
+  cron_output_path?: string | null;
+  source_url?: string | null;
+  generated_at?: string | null;
+  created_at?: string | null;
+  completed_at?: string | null;
+  status: string;
+  card_count: number;
+  parse_error?: string | null;
+  human_markdown?: string;
+  source_markdown?: string;
+  source_ref: Record<string, unknown>;
+  payload: Record<string, unknown>;
+  ingested_at: string;
+  updated_at: string;
+  cards?: SelfImprovementProposalCard[];
+}
+
+export interface SelfImprovementParseFailuresResponse {
+  failures: SelfImprovementProposalRun[];
 }
 
 export interface SkillInfo {
