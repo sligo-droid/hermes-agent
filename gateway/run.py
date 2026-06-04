@@ -4607,7 +4607,11 @@ class GatewayRunner:
         )
         if summary_ok:
             ledger.mark_summary_updated(work_id)
-            ledger.mark_completed(work_id)
+            gate = item.get("completion_gate") if isinstance(item.get("completion_gate"), dict) else {}
+            if gate and not gate.get("allowed_to_complete"):
+                ledger.mark_blocked(work_id, reason=str(gate.get("reason") or "completion_gate"))
+            else:
+                ledger.mark_completed(work_id)
 
     async def start(self) -> bool:
         """
@@ -11607,15 +11611,19 @@ class GatewayRunner:
                 await self._send_voice_reply(event, response)
 
             if _already_sent and not agent_result.get("failed"):
+                work_item_id = getattr(event, "work_item_id", None)
+                summary_status = self._discord_ledger_summary_status(
+                    work_item_id,
+                    self._discord_summary_status(agent_result),
+                )
                 summary_ok = await self._update_discord_summaries(
                     source=source,
                     feature_summary=getattr(event, "feature_summary", None),
                     project_summary=getattr(event, "project_summary", None),
                     final_response=response,
-                    status=self._discord_summary_status(agent_result),
+                    status=summary_status,
                     session_id=session_entry.session_id,
                 )
-                work_item_id = getattr(event, "work_item_id", None)
                 if work_item_id and source.platform == Platform.DISCORD and summary_ok:
                     try:
                         self._ledger().mark_summary_updated(str(work_item_id))
@@ -14040,6 +14048,20 @@ class GatewayRunner:
             return "Failed"
         return "Complete"
 
+    def _discord_ledger_summary_status(self, work_item_id: Optional[Any], fallback: str) -> str:
+        if not work_item_id:
+            return fallback
+        try:
+            item = self._ledger().get(str(work_item_id))
+        except Exception:
+            return fallback
+        if not isinstance(item, dict):
+            return fallback
+        gate = item.get("completion_gate") if isinstance(item.get("completion_gate"), dict) else None
+        if gate and not gate.get("allowed_to_complete"):
+            return str(gate.get("summary_status") or item.get("summary_status") or "Blocked")
+        return str(item.get("summary_status") or fallback)
+
     def _fallback_discord_feature_outcome(self, final_response: str, *, limit: int = 420) -> str:
         text = re.sub(r"MEDIA:\s*\S+", "", str(final_response or "")).strip()
         text = text.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "").strip()
@@ -14173,6 +14195,7 @@ class GatewayRunner:
             return
         status = self._discord_summary_status(agent_result)
         work_item_id = getattr(event, "work_item_id", None)
+        status = self._discord_ledger_summary_status(work_item_id, status)
 
         async def _deliver():
             summary_ok = await self._update_discord_summaries(
