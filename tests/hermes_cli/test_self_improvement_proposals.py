@@ -279,6 +279,89 @@ def test_malformed_json_creates_visible_parse_failure_run(tmp_path):
     assert sip.list_proposals(config=cfg) == []
 
 
+def test_parse_failure_run_data_is_sanitized_before_storage_and_return(tmp_path):
+    cfg = _config(tmp_path)
+    raw_values = (
+        "sk-projectSecret1234567890",
+        "ghp_prongSecret1234567890",
+        "sk-cronJobSecret1234567890",
+        "ghp_runSecret1234567890",
+        "sk-modelSecret1234567890",
+        "ghp_providerSecret1234567890",
+        "sk-profileSecret1234567890",
+        "ghp_workdirSecret1234567890",
+        "sk-metaSecret1234567890",
+        "ghp_nestedSecret1234567890",
+        "sk-pathSecret1234567890",
+        "ghp_hashSecret1234567890",
+    )
+    metadata = {
+        "proposal_json": "{not json",
+        "project": raw_values[0],
+        "prong": raw_values[1],
+        "cron_job_name": raw_values[2],
+        "cron_run_id": raw_values[3],
+        "model": raw_values[4],
+        "provider": raw_values[5],
+        "profile": raw_values[6],
+        "workdir": raw_values[7],
+        "note": raw_values[8],
+        "nested": {"detail": raw_values[9]},
+        "cron_output_path": f"/tmp/{raw_values[10]}.txt",
+        "cron_output_sha256": raw_values[11],
+    }
+
+    result = sip.ingest_proposal_output(metadata=metadata, config=cfg)
+
+    assert result["parse_status"] == "parse_error"
+    returned = json.dumps(
+        {
+            "result": result,
+            "list": sip.list_runs(parse_status="parse_error", config=cfg),
+            "detail": sip.get_run_detail(result["run_id"], config=cfg),
+        },
+        sort_keys=True,
+    )
+    with sip.connect(config=cfg) as conn:
+        row = conn.execute("SELECT * FROM proposal_runs WHERE id = ?", (result["run_id"],)).fetchone()
+    stored = json.dumps(dict(row), sort_keys=True)
+    assert "[REDACTED STRUCTURED PROPOSAL]" in stored
+    for raw in raw_values:
+        assert raw not in returned
+        assert raw not in stored
+
+
+def test_parse_failure_payload_project_and_prong_do_not_leak(tmp_path):
+    cfg = _config(tmp_path)
+    project_secret = "sk-payloadProjectSecret1234567890"
+    prong_secret = "ghp_payloadProngSecret1234567890"
+    payload = _payload()
+    payload["project"] = project_secret
+    payload["prong"] = prong_secret
+
+    result = sip.ingest_proposal_output(
+        metadata={"proposal_json": json.dumps(payload), "cron_run_id": "payload-secret-run"},
+        config=cfg,
+    )
+
+    assert result["parse_status"] == "parse_error"
+    returned = json.dumps(
+        {
+            "result": result,
+            "list": sip.list_runs(parse_status="parse_error", config=cfg),
+            "detail": sip.get_run_detail(result["run_id"], config=cfg),
+        },
+        sort_keys=True,
+    )
+    with sip.connect(config=cfg) as conn:
+        row = conn.execute("SELECT project, prong, parse_error, metadata_json FROM proposal_runs").fetchone()
+    stored = json.dumps(dict(row), sort_keys=True)
+    assert project_secret not in returned
+    assert prong_secret not in returned
+    assert project_secret not in stored
+    assert prong_secret not in stored
+
+
 def test_strict_contract_rejects_unexpected_workspace_field(tmp_path):
     cfg = _config(tmp_path)
     payload = _payload()

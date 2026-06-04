@@ -310,12 +310,11 @@ def ingest_proposal_output(
         parse_error = None
         contract_version = CONTRACT_VERSION
     except Exception as exc:
-        project_id = _metadata_str(metadata, "project")
-        prong_id = _metadata_str(metadata, "prong")
+        project_id, prong_id = _safe_parse_failure_target(metadata, config)
         context = None
         cards = []
         parse_status = "parse_error"
-        parse_error = str(exc)
+        parse_error = _sanitize_free_text(str(exc))
         contract_version = None
 
     with connect(db_path, config) as conn:
@@ -912,22 +911,22 @@ def _with_worker_link(detail: dict[str, Any] | None, *, board: str, task_id: str
 def sanitize_run(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": row.get("id"),
-        "project": row.get("project"),
-        "prong": row.get("prong"),
+        "project": _sanitize_free_text(row.get("project")),
+        "prong": _sanitize_free_text(row.get("prong")),
         "parse_status": row.get("parse_status"),
-        "parse_error": row.get("parse_error"),
+        "parse_error": _sanitize_free_text(row.get("parse_error")),
         "parser_version": row.get("parser_version"),
         "contract_version": row.get("contract_version"),
-        "cron_job_id": row.get("cron_job_id"),
-        "cron_job_name": row.get("cron_job_name"),
-        "cron_run_id": row.get("cron_run_id"),
-        "cron_output_path": row.get("cron_output_path"),
-        "cron_output_sha256": row.get("cron_output_sha256"),
+        "cron_job_id": _sanitize_free_text(row.get("cron_job_id")),
+        "cron_job_name": _sanitize_free_text(row.get("cron_job_name")),
+        "cron_run_id": _sanitize_free_text(row.get("cron_run_id")),
+        "cron_output_path": _sanitize_free_text(row.get("cron_output_path")),
+        "cron_output_sha256": _sanitize_free_text(row.get("cron_output_sha256")),
         "source_timestamp": row.get("source_timestamp"),
-        "model": row.get("model"),
-        "provider": row.get("provider"),
-        "profile": row.get("profile"),
-        "workdir": row.get("workdir"),
+        "model": _sanitize_free_text(row.get("model")),
+        "provider": _sanitize_free_text(row.get("provider")),
+        "profile": _sanitize_free_text(row.get("profile")),
+        "workdir": _sanitize_free_text(row.get("workdir")),
         "created_at": row.get("created_at"),
     }
 
@@ -1076,22 +1075,22 @@ def _insert_run(conn: sqlite3.Connection, **kwargs: Any) -> int:
             metadata[key] = "[REDACTED STRUCTURED PROPOSAL]"
     fields = {
         "run_key": kwargs["run_key"],
-        "project": kwargs["project"],
-        "prong": kwargs["prong"],
+        "project": _sanitize_free_text(kwargs["project"]),
+        "prong": _sanitize_free_text(kwargs["prong"]),
         "parse_status": kwargs["parse_status"],
-        "parse_error": kwargs["parse_error"],
+        "parse_error": _sanitize_free_text(kwargs["parse_error"]),
         "parser_version": PARSER_VERSION,
         "contract_version": kwargs["contract_version"],
-        "cron_job_id": _metadata_str(metadata, "cron_job_id", "job_id"),
-        "cron_job_name": _metadata_str(metadata, "cron_job_name", "job_name"),
-        "cron_run_id": _metadata_str(metadata, "cron_run_id", "run_id"),
+        "cron_job_id": _sanitize_free_text(_metadata_str(metadata, "cron_job_id", "job_id")),
+        "cron_job_name": _sanitize_free_text(_metadata_str(metadata, "cron_job_name", "job_name")),
+        "cron_run_id": _sanitize_free_text(_metadata_str(metadata, "cron_run_id", "run_id")),
         "cron_output_path": _sanitize_free_text(kwargs["output_path"]),
-        "cron_output_sha256": kwargs["output_hash"],
+        "cron_output_sha256": _sanitize_free_text(kwargs["output_hash"]),
         "source_timestamp": kwargs["source_timestamp"],
-        "model": _metadata_str(metadata, "model"),
-        "provider": _metadata_str(metadata, "provider"),
-        "profile": _metadata_str(metadata, "profile"),
-        "workdir": _metadata_str(metadata, "workdir", "cwd"),
+        "model": _sanitize_free_text(_metadata_str(metadata, "model")),
+        "provider": _sanitize_free_text(_metadata_str(metadata, "provider")),
+        "profile": _sanitize_free_text(_metadata_str(metadata, "profile")),
+        "workdir": _sanitize_free_text(_metadata_str(metadata, "workdir", "cwd")),
         "metadata_json": json.dumps(metadata, sort_keys=True),
         "created_at": kwargs["now"],
     }
@@ -1160,6 +1159,21 @@ def _required_str(data: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ProposalParseError(f"{key} must be a non-empty string")
     return value.strip()
+
+
+def _safe_parse_failure_target(
+    metadata: dict[str, Any],
+    config: dict[str, Any] | None,
+) -> tuple[str | None, str | None]:
+    project = _metadata_str(metadata, "project")
+    prong = _metadata_str(metadata, "prong")
+    if project and prong:
+        try:
+            validate_project_prong(project, prong, config)
+            return project, prong
+        except ValueError:
+            return _sanitize_free_text(project), _sanitize_free_text(prong)
+    return _sanitize_free_text(project), _sanitize_free_text(prong)
 
 
 def _sanitize_free_text(value: str | None) -> str | None:
@@ -1313,7 +1327,7 @@ def _source_hash(output_path: str | None, output_text: str | None, metadata: dic
 def _run_key(metadata: dict[str, Any], output_path: str | None, output_hash: str | None, source_timestamp: int) -> str:
     explicit = _metadata_str(metadata, "proposal_run_key", "cron_run_id", "run_id")
     if explicit:
-        return explicit
+        return _stable_hash({"explicit": explicit})
     return _stable_hash({"path": output_path, "sha256": output_hash, "timestamp": source_timestamp})
 
 

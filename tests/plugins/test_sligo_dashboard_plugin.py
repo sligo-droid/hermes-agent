@@ -200,6 +200,10 @@ def test_feedback_and_action_api_redacts_visible_audit_fields(client, isolated):
 
 
 def test_parse_error_run_is_visible_without_proposal_cards(client):
+    raw_project = "sk-dashboardProjectSecret1234567890"
+    raw_prong = "ghp_dashboardProngSecret1234567890"
+    raw_path = "sk-dashboardPathSecret1234567890"
+    raw_meta = "ghp_dashboardMetaSecret1234567890"
     r = client.post(
         "/api/plugins/sligo/ingest",
         headers={"X-Hermes-Session-Token": "test-token"},
@@ -207,11 +211,12 @@ def test_parse_error_run_is_visible_without_proposal_cards(client):
             "metadata": {
                 "proposal_json": "{not json",
                 "cron_run_id": "bad-run",
-                "project": "sligo",
-                "prong": "airflow_doctor",
-                "cron_output_path": "/tmp/cron-output.txt",
+                "project": raw_project,
+                "prong": raw_prong,
+                "cron_output_path": f"/tmp/{raw_path}.txt",
                 "cron_output_sha256": "abc123",
                 "source_timestamp": 1700000000,
+                "note": raw_meta,
             }
         },
     )
@@ -220,14 +225,14 @@ def test_parse_error_run_is_visible_without_proposal_cards(client):
     assert r.json()["parse_status"] == "parse_error"
     headers = {"X-Hermes-Session-Token": "test-token"}
     runs = client.get("/api/plugins/sligo/runs?parse_status=parse_error", headers=headers).json()["runs"]
-    assert runs[0]["project"] == "sligo"
-    assert runs[0]["prong"] == "airflow_doctor"
-    assert runs[0]["cron_output_path"] == "/tmp/cron-output.txt"
     assert runs[0]["cron_output_sha256"] == "abc123"
     assert runs[0]["source_timestamp"] == 1700000000
     assert "Malformed proposal JSON" in runs[0]["parse_error"]
     detail = client.get(f"/api/plugins/sligo/runs/{runs[0]['id']}", headers=headers).json()["run"]
     assert detail["parse_error"] == runs[0]["parse_error"]
+    returned = json.dumps({"runs": runs, "detail": detail}, sort_keys=True)
+    for raw in (raw_project, raw_prong, raw_path, raw_meta):
+        assert raw not in returned
     assert client.get("/api/plugins/sligo/proposals", headers=headers).json()["proposals"] == []
 
 
