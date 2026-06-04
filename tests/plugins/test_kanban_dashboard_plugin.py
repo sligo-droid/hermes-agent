@@ -149,6 +149,26 @@ def test_self_improvement_approve_is_idempotent_and_audited(client):
     assert {event["kanban_task_id"] for event in audit} == {first.json()["task"]["id"]}
 
 
+def test_self_improvement_approve_maps_critical_priority_above_high(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+
+    conn = proposal_storage.connect()
+    try:
+        conn.execute(
+            "UPDATE proposal_cards SET priority = 'critical' WHERE proposal_id = ?",
+            (card["proposal_id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["priority"] == 4
+
+
 def test_self_improvement_reject_archives_and_persists_feedback(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]

@@ -630,7 +630,7 @@ def _proposal_task_body(card: dict[str, Any]) -> str:
 
 
 def _proposal_priority(value: Any) -> int:
-    return {"urgent": 4, "high": 3, "medium": 2, "low": 1}.get(str(value or "").lower(), 0)
+    return {"critical": 4, "urgent": 4, "high": 3, "medium": 2, "low": 1}.get(str(value or "").lower(), 0)
 
 
 def _worker_url(task_id: str) -> str:
