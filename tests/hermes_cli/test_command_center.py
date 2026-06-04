@@ -65,7 +65,7 @@ def test_snapshot_preserves_approval_artifacts_after_followup_audit_events(tmp_p
     artifact_urls = {artifact["url"] for artifact in item["artifacts"]}
 
     assert item["execution"]["board"] == "discord-command-center"
-    assert item["execution"]["worker_url"] == "/workers/discord-command-center"
+    assert item["execution"]["worker_url"] is None
     assert "https://discord.com/channels/1/2/3" in artifact_urls
     assert "/workers/discord-command-center" in artifact_urls
     assert item["raw"]["approval_metadata"]["halted_by"] == "operator"
@@ -85,7 +85,7 @@ def test_snapshot_uses_stored_worker_url_when_approval_metadata_is_absent(tmp_pa
     item = next(item for item in snapshot["work_items"] if item["id"] == f"self-improvement:{card['proposal_id']}")
     artifact_urls = {artifact["url"] for artifact in item["artifacts"]}
 
-    assert item["execution"]["worker_url"] == "/workers?task=t_legacy"
+    assert item["execution"]["worker_url"] is None
     assert item["execution"]["task_url"] == "/workers?task=t_legacy"
     assert "/workers?task=t_legacy" in artifact_urls
 
@@ -178,7 +178,7 @@ def test_snapshot_rolls_named_discord_board_tasks_up_to_board_work_item(tmp_path
     assert item["execution"]["task_id"] is None
     assert item["execution"]["archiveable"] is True
     assert item["execution"]["archive_action"] == f"/api/plugins/kanban/boards/{board}"
-    assert item["execution"]["worker_url"] == f"/workers/{board}"
+    assert item["execution"]["worker_url"] is None
     assert not any(row["id"] == f"kanban:{board}:{task_id}" for row in snapshot["work_items"])
     assert source["kind"] == "discord_thread"
     assert snapshot["metrics"]["discord_origin"] == 1
@@ -218,6 +218,77 @@ def test_snapshot_running_board_rollup_outranks_blocked_tasks(tmp_path, monkeypa
     assert running_item["status"] == "running"
     assert blocked_item["status"] == "blocked"
     assert snapshot["work_items"].index(running_item) < snapshot["work_items"].index(blocked_item)
+
+
+def test_worker_board_url_rejects_top_level_public_worker_urls():
+    board = "discord-worker-board"
+
+    for public_url in (
+        "/workers",
+        "/workers/",
+        "/workers?filter=active",
+        "/workers/#active",
+        "https://hermes.sligolabs.com/workers",
+        "https://hermes.sligolabs.com/workers/?filter=active#running",
+    ):
+        assert command_center._worker_board_url(board, public_url) == f"/workers/{board}"
+
+    assert command_center._worker_board_url(board, "/workers/discord-worker-board") == "/workers/discord-worker-board"
+    assert (
+        command_center._worker_board_url(board, "https://hermes.sligolabs.com/workers/discord-worker-board")
+        == "https://hermes.sligolabs.com/workers/discord-worker-board"
+    )
+    assert command_center._worker_board_url(kanban_db.DEFAULT_BOARD, "/workers") is None
+    assert command_center._worker_board_url(None, "https://hermes.sligolabs.com/workers/") is None
+
+
+def test_snapshot_worker_url_requires_started_execution_and_named_board(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    unstarted_board = "discord-worker-not-started"
+    started_board = "discord-worker-started"
+    kanban_db.write_board_metadata(unstarted_board, name="Unstarted Worker Board")
+    kanban_db.write_board_metadata(started_board, name="Started Worker Board")
+
+    conn = kanban_db.connect(board=unstarted_board)
+    try:
+        kanban_db.create_task(conn, title="Queued worker", board=unstarted_board)
+    finally:
+        conn.close()
+
+    conn = kanban_db.connect(board=started_board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Started worker", board=started_board, initial_status="running")
+        with conn:
+            conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                (task_id, "running", 100, None, None),
+            )
+            run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
+    finally:
+        conn.close()
+
+    default_conn = kanban_db.connect()
+    try:
+        default_task_id = kanban_db.create_task(default_conn, title="Default board started worker", initial_status="running")
+        with default_conn:
+            default_conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                (default_task_id, "running", 100, None, None),
+            )
+            default_run_id = default_conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            default_conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (default_run_id, default_task_id))
+    finally:
+        default_conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    unstarted_item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{unstarted_board}")
+    started_item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{started_board}")
+    default_item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban:default:{default_task_id}")
+
+    assert unstarted_item["execution"]["worker_url"] is None
+    assert started_item["execution"]["worker_url"] == f"/workers/{started_board}"
+    assert default_item["execution"]["worker_url"] is None
 
 
 def test_snapshot_inbox_metric_only_counts_pending_decisions_and_inbox_sources(tmp_path, monkeypatch):
