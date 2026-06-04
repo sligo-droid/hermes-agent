@@ -8,6 +8,7 @@ import { api, type OAuthProvider, type OAuthStartResponse } from "@/lib/api";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { useI18n } from "@/i18n";
 import { cn, themedBody } from "@/lib/utils";
+import { useModalBehavior } from "@/hooks/useModalBehavior";
 
 interface Props {
   provider: OAuthProvider;
@@ -150,6 +151,7 @@ export function OAuthLoginModal({ provider, onClose, onSuccess }: Props) {
     }
     onClose();
   };
+  const modalRef = useModalBehavior({ open: true, onClose: handleClose });
 
   const handleBackdrop = (e: React.MouseEvent) => {
     if (e.target === e.currentTarget) handleClose();
@@ -164,6 +166,7 @@ export function OAuthLoginModal({ provider, onClose, onSuccess }: Props) {
 
   return (
     <div
+      ref={modalRef}
       className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 backdrop-blur-sm p-4"
       onClick={handleBackdrop}
       role="dialog"
@@ -223,6 +226,7 @@ export function OAuthLoginModal({ provider, onClose, onSuccess }: Props) {
                   placeholder={t.oauth.pasteCode}
                   onKeyDown={(e) => e.key === "Enter" && handleSubmitPkceCode()}
                   autoFocus
+                  data-autofocus
                 />
                 <div className="flex items-center gap-2 justify-between">
                   <a

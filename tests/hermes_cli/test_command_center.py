@@ -191,6 +191,24 @@ def test_snapshot_inbox_metric_only_counts_pending_decisions_and_inbox_sources(t
     assert any(source["bucket"] == "inbox" and source["status"] == "parse_failed" for source in snapshot["sources"])
 
 
+def test_snapshot_exposes_issue_pulse_status_points(tmp_path, monkeypatch):
+    _ingest_valid(monkeypatch, tmp_path)
+    board = "discord-blocked-pulse"
+    kanban_db.write_board_metadata(board, name="Blocked Pulse Board")
+    conn = kanban_db.connect(board=board)
+    try:
+        kanban_db.create_task(conn, title="Blocked worker", board=board, initial_status="blocked")
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    pulse = {point["status"]: point for point in snapshot["metrics"]["issue_pulse"]}
+
+    assert pulse["blocked"]["count"] == snapshot["metrics"]["by_status"]["blocked"]
+    assert pulse["blocked"]["label"] == "Blocked"
+    assert pulse["proposed"]["count"] >= 1
+
+
 def test_self_improvement_board_rollup_preserves_proposal_controls(tmp_path, monkeypatch):
     _ingest_valid(monkeypatch, tmp_path)
     card = _first_card()
