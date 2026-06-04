@@ -307,14 +307,26 @@ def test_snapshot_skips_internal_default_board_foreman_tasks(tmp_path, monkeypat
             title="Manual operator request",
             created_by="operator",
         )
+        with conn:
+            conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                (foreman_task_id, "done", 100, 120, "completed"),
+            )
+            conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                (ordinary_task_id, "done", 200, 220, "completed"),
+            )
     finally:
         conn.close()
 
     snapshot = command_center.build_command_center_snapshot()
     item_ids = {item["id"] for item in snapshot["work_items"]}
+    run_task_ids = {run["task_id"] for run in snapshot["runs"]}
 
     assert f"kanban:default:{foreman_task_id}" not in item_ids
     assert f"kanban:default:{ordinary_task_id}" in item_ids
+    assert foreman_task_id not in run_task_ids
+    assert ordinary_task_id in run_task_ids
 
 
 def test_snapshot_inbox_metric_only_counts_pending_decisions_and_inbox_sources(tmp_path, monkeypatch):
