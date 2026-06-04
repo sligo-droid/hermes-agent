@@ -160,6 +160,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/sligo": CommandCenterPage,
   "/sligo/inbox": CommandCenterPage,
   "/sligo/work": CommandCenterPage,
+  "/sligo/archive": CommandCenterPage,
   "/sligo/runs": CommandCenterPage,
   "/sligo/recommendations": CommandCenterPage,
   "/sligo/sources": CommandCenterPage,
@@ -172,6 +173,7 @@ const HERMES_HOST_REDIRECT_ROUTES: Record<string, ComponentType> = {
   "/sligo": HermesToSligoRedirect,
   "/sligo/inbox": HermesToSligoRedirect,
   "/sligo/work": HermesToSligoRedirect,
+  "/sligo/archive": HermesToSligoRedirect,
   "/sligo/runs": HermesToSligoRedirect,
   "/sligo/recommendations": HermesToSligoRedirect,
   "/sligo/sources": HermesToSligoRedirect,
@@ -185,6 +187,7 @@ const SLIGO_ROUTES: Record<string, ComponentType> = {
   "/sligo": CommandCenterPage,
   "/sligo/inbox": CommandCenterPage,
   "/sligo/work": CommandCenterPage,
+  "/sligo/archive": CommandCenterPage,
   "/sligo/runs": CommandCenterPage,
   "/sligo/recommendations": CommandCenterPage,
   "/sligo/sources": CommandCenterPage,
@@ -423,6 +426,7 @@ function SligoSurfaceShell({ routes }: { routes: DashboardRoute[] }) {
               <SligoNavLink to="/sligo">Overview</SligoNavLink>
               <SligoNavLink to="/sligo/inbox">Inbox</SligoNavLink>
               <SligoNavLink to="/sligo/work">Work</SligoNavLink>
+              <SligoNavLink to="/sligo/archive">Archive</SligoNavLink>
               <a
                 className="rounded-full px-3 py-2 text-sm font-medium text-slate-300 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-200/70"
                 href="/workers"
@@ -581,6 +585,7 @@ export default function App() {
         { path: "/sligo", label: "Overview" },
         { path: "/sligo/inbox", label: "Inbox" },
         { path: "/sligo/work", label: "Work" },
+        { path: "/sligo/archive", label: "Archive" },
         { path: "/command-center", label: "Overview" },
         { path: "/self-improvement", label: "Overview" },
         { path: "/workers", label: "Workers" },

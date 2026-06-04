@@ -90,6 +90,32 @@ def test_snapshot_uses_stored_worker_url_when_approval_metadata_is_absent(tmp_pa
     assert "/workers?task=t_legacy" in artifact_urls
 
 
+def test_snapshot_marks_paused_default_proposal_task_resumable_and_archivable(tmp_path, monkeypatch):
+    _ingest_valid(monkeypatch, tmp_path)
+    card = _first_card()
+    conn = kanban_db.connect()
+    try:
+        task_id = kanban_db.create_task(conn, title="Paused downstream task", initial_status="blocked")
+    finally:
+        conn.close()
+    proposal_storage.record_approval(
+        card["proposal_id"],
+        kanban_task_id=task_id,
+        worker_url=f"/workers?task={task_id}",
+        actor="operator",
+    )
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"self-improvement:{card['proposal_id']}")
+
+    assert item["status"] == "blocked"
+    assert item["execution"]["paused"] is True
+    assert item["execution"]["resumable"] is True
+    assert item["decision"]["pause_action"].endswith(f"/{card['proposal_id']}/pause")
+    assert item["decision"]["resume_action"].endswith(f"/{card['proposal_id']}/resume")
+    assert item["decision"]["archive_action"].endswith(f"/{card['proposal_id']}/halt")
+
+
 def test_snapshot_always_includes_active_runs_outside_recent_limit(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     board = "discord-active-run-test"
@@ -156,6 +182,42 @@ def test_snapshot_rolls_named_discord_board_tasks_up_to_board_work_item(tmp_path
     assert not any(row["id"] == f"kanban:{board}:{task_id}" for row in snapshot["work_items"])
     assert source["kind"] == "discord_thread"
     assert snapshot["metrics"]["discord_origin"] == 1
+
+
+def test_snapshot_running_board_rollup_outranks_blocked_tasks(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    older_board = "discord-running-with-blocked"
+    newer_board = "discord-blocked-only"
+    kanban_db.write_board_metadata(older_board, name="Running Board")
+    kanban_db.write_board_metadata(newer_board, name="Blocked Board")
+
+    conn = kanban_db.connect(board=older_board)
+    try:
+        running_id = kanban_db.create_task(conn, title="Active worker", board=older_board, initial_status="running")
+        kanban_db.create_task(conn, title="Paused sibling", board=older_board, initial_status="blocked")
+        with conn:
+            conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                (running_id, "running", 100, None, None),
+            )
+            run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute("UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?", (run_id, running_id))
+    finally:
+        conn.close()
+
+    conn = kanban_db.connect(board=newer_board)
+    try:
+        kanban_db.create_task(conn, title="Blocked worker", board=newer_board, initial_status="blocked")
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    running_item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{older_board}")
+    blocked_item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{newer_board}")
+
+    assert running_item["status"] == "running"
+    assert blocked_item["status"] == "blocked"
+    assert snapshot["work_items"].index(running_item) < snapshot["work_items"].index(blocked_item)
 
 
 def test_snapshot_inbox_metric_only_counts_pending_decisions_and_inbox_sources(tmp_path, monkeypatch):
@@ -234,6 +296,8 @@ def test_self_improvement_board_rollup_preserves_proposal_controls(tmp_path, mon
     assert item["decision"]["needed"] is False
     assert item["decision"]["proposal_id"] == card["proposal_id"]
     assert item["decision"]["halt_action"].endswith(f"/{card['proposal_id']}/halt")
+    assert item["decision"]["pause_action"].endswith(f"/{card['proposal_id']}/pause")
+    assert item["decision"]["resume_action"].endswith(f"/{card['proposal_id']}/resume")
     assert item["decision"]["undo_followup_action"].endswith(f"/{card['proposal_id']}/undo-followup")
 
 

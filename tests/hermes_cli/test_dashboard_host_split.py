@@ -28,6 +28,7 @@ def test_sligo_operator_path_matches_sections_and_legacy_worker_urls():
         "/sligo",
         "/sligo/",
         "/sligo/work",
+        "/sligo/archive",
         "/command-center",
         "/command-center/",
         "/self-improvement",

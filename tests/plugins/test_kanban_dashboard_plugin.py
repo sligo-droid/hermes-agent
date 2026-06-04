@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -179,6 +180,75 @@ def test_self_improvement_halt_archives_in_flight_task_and_audits(client):
     audit = proposal_storage.list_audit_events(card["proposal_id"])
     assert audit[-1]["action"] == "halted"
     assert audit[-1]["metadata"]["previous_status"] == "ready"
+
+
+def test_self_improvement_pause_resume_is_repeatable_and_audited(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    assert approved.status_code == 200, approved.text
+
+    first_pause = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/pause")
+    second_pause = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/pause")
+    first_resume = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/resume")
+    second_resume = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/resume")
+
+    assert first_pause.status_code == 200, first_pause.text
+    assert second_pause.status_code == 200, second_pause.text
+    assert first_pause.json()["task"]["status"] == "blocked"
+    assert second_pause.json()["task"]["status"] == "blocked"
+    assert first_resume.status_code == 200, first_resume.text
+    assert second_resume.status_code == 200, second_resume.text
+    assert first_resume.json()["task"]["status"] == "ready"
+    assert second_resume.json()["task"]["status"] == "ready"
+    audit_actions = [event["action"] for event in proposal_storage.list_audit_events(card["proposal_id"])]
+    assert audit_actions[-4:] == ["paused", "paused", "resumed", "resumed"]
+
+
+def test_board_pause_resume_and_archive_stops_live_generic_board(client):
+    board = "command-center-generic-board"
+    kb.write_board_metadata(board, name="Generic Board")
+    conn = kb.connect(board=board)
+    try:
+        task_id = kb.create_task(conn, title="Running worker", board=board, initial_status="running")
+        with conn:
+            conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                (task_id, "running", 100, None, None),
+            )
+            run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute("UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?", (run_id, task_id))
+    finally:
+        conn.close()
+
+    paused = client.post(f"/api/plugins/kanban/boards/{board}/pause")
+    assert paused.status_code == 200, paused.text
+    conn = kb.connect(board=board)
+    try:
+        assert kb.get_task(conn, task_id).status == "blocked"
+    finally:
+        conn.close()
+
+    resumed = client.post(f"/api/plugins/kanban/boards/{board}/resume")
+    assert resumed.status_code == 200, resumed.text
+    conn = kb.connect(board=board)
+    try:
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.claim_task(conn, task_id) is not None
+    finally:
+        conn.close()
+
+    archived = client.delete(f"/api/plugins/kanban/boards/{board}")
+    assert archived.status_code == 200, archived.text
+    assert archived.json()["result"]["action"] == "archived"
+    archived_path = Path(archived.json()["result"]["new_path"])
+    assert archived_path.exists()
+    conn = sqlite3.connect(archived_path / "kanban.db")
+    conn.row_factory = sqlite3.Row
+    try:
+        assert kb.get_task(conn, task_id).status == "archived"
+    finally:
+        conn.close()
 
 
 def test_self_improvement_undo_followup_for_done_task_is_idempotent(client):
