@@ -15,6 +15,18 @@ from hermes_constants import get_hermes_home
 from self_improvement.proposals import ProposalValidationError, validate_proposal_run
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
+_PRIORITY_ALIASES = {
+    "p0": "critical",
+    "p1": "critical",
+    "p2": "high",
+    "p3": "medium",
+    "p4": "low",
+}
+_SEVERITY_ALIASES = {
+    "high": "major",
+    "medium": "minor",
+    "low": "info",
+}
 
 
 def utc_now() -> str:
@@ -174,6 +186,86 @@ def _source_key(payload: dict[str, Any] | None, source_markdown: str, source: di
     return "sha256:" + hashlib.sha256(source_markdown.encode("utf-8")).hexdigest()
 
 
+def _source_enriched_payload(payload: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
+    """Merge trusted scheduler metadata into parsed cron proposal payloads."""
+
+    if not source:
+        return payload
+    enriched = dict(payload)
+    run = dict(enriched.get("run") or {}) if isinstance(enriched.get("run"), dict) else {}
+    source_run_raw = source.get("run")
+    source_run: dict[str, Any] = source_run_raw if isinstance(source_run_raw, dict) else {}
+
+    for key in ("run_id", "cron_job_id", "cron_job_name", "cron_output_path", "source_url", "completed_at"):
+        value = source.get(key)
+        if value is None:
+            value = source_run.get(key)
+        if value is not None:
+            run[key] = value
+        elif key == "run_id" and run.get("run_id") is None and run.get("id") is not None:
+            run["run_id"] = run["id"]
+
+    for key in ("created_at", "generated_at", "timestamp"):
+        value = source.get(key)
+        if value is None:
+            value = source_run.get(key)
+        if value is not None:
+            run["created_at"] = value
+            break
+    if run.get("created_at") is None and enriched.get("generated_at") is not None:
+        run["created_at"] = enriched["generated_at"]
+
+    cards = enriched.get("cards")
+    if isinstance(cards, list):
+        normalized_cards: list[Any] = []
+        for card in cards:
+            if not isinstance(card, dict):
+                normalized_cards.append(card)
+                continue
+            normalized_card = dict(card)
+            idempotency_key = normalized_card.get("idempotency_key")
+            if isinstance(idempotency_key, (dict, list)):
+                normalized_card["idempotency_key"] = _json_dumps(idempotency_key)
+            elif idempotency_key == "":
+                normalized_card.pop("idempotency_key", None)
+            priority = normalized_card.get("priority")
+            if isinstance(priority, str):
+                alias = _PRIORITY_ALIASES.get(priority.strip().lower())
+                if alias:
+                    normalized_card["priority"] = alias
+            severity = normalized_card.get("severity")
+            if isinstance(severity, str):
+                alias = _SEVERITY_ALIASES.get(severity.strip().lower())
+                if alias:
+                    normalized_card["severity"] = alias
+            source_excerpts = normalized_card.get("source_excerpts")
+            if isinstance(source_excerpts, list):
+                normalized_excerpts: list[Any] = []
+                for excerpt in source_excerpts:
+                    if isinstance(excerpt, str):
+                        normalized_excerpts.append({"text": excerpt})
+                    elif isinstance(excerpt, dict) and "text" not in excerpt and excerpt.get("excerpt") is not None:
+                        normalized_excerpt = dict(excerpt)
+                        normalized_excerpt["text"] = normalized_excerpt["excerpt"]
+                        if normalized_excerpt.get("label") is None and normalized_excerpt.get("path") is not None:
+                            normalized_excerpt["label"] = str(normalized_excerpt["path"])
+                        lines = normalized_excerpt.get("lines")
+                        if isinstance(lines, str):
+                            line_parts = [part.strip() for part in lines.split("-", 1)]
+                            if len(line_parts) == 2 and all(part.isdigit() for part in line_parts):
+                                normalized_excerpt["line_start"] = int(line_parts[0])
+                                normalized_excerpt["line_end"] = int(line_parts[1])
+                        normalized_excerpts.append(normalized_excerpt)
+                    else:
+                        normalized_excerpts.append(excerpt)
+                normalized_card["source_excerpts"] = normalized_excerpts
+            normalized_cards.append(normalized_card)
+        enriched["cards"] = normalized_cards
+
+    enriched["run"] = run
+    return enriched
+
+
 def ingest_proposal_output(
     source_markdown: str,
     *,
@@ -191,15 +283,17 @@ def ingest_proposal_output(
     init_db(db_path)
     source = dict(source or {})
     parsed_payload: dict[str, Any] | None = None
+    validation_payload: dict[str, Any] | None = None
     normalized: dict[str, Any] | None = None
     parse_error: str | None = None
     try:
         parsed_payload = _parse_payload(source_markdown)
-        normalized = validate_proposal_run(parsed_payload, config=config)
+        validation_payload = _source_enriched_payload(parsed_payload, source)
+        normalized = validate_proposal_run(validation_payload, config=config)
     except ProposalValidationError as exc:
         parse_error = str(exc)
 
-    key = _source_key(parsed_payload, source_markdown, source)
+    key = _source_key(validation_payload or parsed_payload, source_markdown, source)
     now = utc_now()
     run = normalized.get("run", {}) if normalized else {}
     status = "malformed" if parse_error else ("empty" if not normalized.get("cards") else "valid")
@@ -255,7 +349,7 @@ def ingest_proposal_output(
                     status,
                     card_count,
                     parse_error,
-                    _json_dumps(normalized or parsed_payload or {}),
+                    _json_dumps(normalized or validation_payload or parsed_payload or {}),
                     normalized.get("human_markdown", "") if normalized else "",
                     source_markdown,
                     _json_dumps(source),

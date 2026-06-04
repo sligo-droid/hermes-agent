@@ -17,6 +17,10 @@ def _fenced(name: str) -> str:
     return "Human summary before JSON.\n```json\n" + _fixture_text(name) + "\n```"
 
 
+def _valid_payload() -> dict:
+    return json.loads(_fixture_text("proposal_run_pid_valid.json"))
+
+
 def test_profile_safe_db_path_and_initialization(tmp_path, monkeypatch):
     home = tmp_path / "profile-home"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -62,7 +66,7 @@ def test_ingest_malformed_run_persists_parse_failure(tmp_path, monkeypatch):
 
     result = proposal_storage.ingest_proposal_output(
         _fenced("proposal_run_malformed.json"),
-        source={"cron_job_id": "job-1", "run_id": "run-1", "cron_output_path": "/tmp/out.md"},
+        source={"run_id": "run-1", "cron_output_path": "/tmp/out.md"},
     )
     failures = proposal_storage.list_parse_failures()
 
@@ -70,6 +74,105 @@ def test_ingest_malformed_run_persists_parse_failure(tmp_path, monkeypatch):
     assert "run.cron_job_id" in result["parse_error"]
     assert len(failures["failures"]) == 1
     assert failures["failures"][0]["source_ref"]["cron_output_path"] == "/tmp/out.md"
+
+
+def test_ingest_run_with_audit_metadata_uses_trusted_source_run_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    payload = _valid_payload()
+    payload["run"] = {
+        "id": "audit-run-alias",
+        "status": "completed",
+        "delegated_workers": ["worker-1"],
+    }
+    payload["cards"][0]["idempotency_key"] = {"finding": "alias-shaped-card", "date": "2026-06-04"}
+    payload["cards"][0]["priority"] = "P1"
+    payload["cards"][0]["severity"] = "high"
+    payload["cards"][0]["source_excerpts"] = [
+        "plain string excerpt",
+        {"excerpt": "dict excerpt", "path": "src/example.py", "lines": "3-5"},
+    ]
+
+    result = proposal_storage.ingest_proposal_output(
+        "Human summary before JSON.\n```json\n" + json.dumps(payload) + "\n```",
+        source={
+            "run_id": "source-run-id",
+            "cron_job_id": "job-from-source",
+            "cron_job_name": "Source cron job",
+            "cron_output_path": "/tmp/out.md",
+            "generated_at": "2026-06-04T02:04:11Z",
+        },
+    )
+    run = proposal_storage.get_run(result["run_id"])
+    assert run is not None
+
+    assert result["status"] == "valid"
+    assert result["card_count"] == 1
+    assert run["run_id"] == "source-run-id"
+    assert run["cron_job_id"] == "job-from-source"
+    assert run["created_at"] == "2026-06-04T02:04:11Z"
+    card = run["cards"][0]
+    assert card["proposal_id"]
+    assert card["idempotency_key"] == '{"date":"2026-06-04","finding":"alias-shaped-card"}'
+    assert card["priority"] == "critical"
+    assert card["severity"] == "major"
+    assert card["source_excerpts"][0]["text"] == "plain string excerpt"
+    assert card["source_excerpts"][1]["text"] == "dict excerpt"
+    assert card["source_excerpts"][1]["label"] == "src/example.py"
+    assert card["source_excerpts"][1]["line_start"] == 3
+    assert card["source_excerpts"][1]["line_end"] == 5
+
+
+def test_ingest_run_id_alias_is_used_when_source_has_no_run_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    payload = _valid_payload()
+    payload["run"] = {"id": "audit-run-alias"}
+
+    result = proposal_storage.ingest_proposal_output(
+        "Human summary before JSON.\n```json\n" + json.dumps(payload) + "\n```",
+        source={
+            "cron_job_id": "job-from-source",
+            "generated_at": "2026-06-04T02:04:11Z",
+        },
+    )
+    run = proposal_storage.get_run(result["run_id"])
+    assert run is not None
+
+    assert result["status"] == "valid"
+    assert run["run_id"] == "audit-run-alias"
+
+
+def test_ingest_run_id_alias_keeps_distinct_source_keys_without_source_run_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    payload_one = _valid_payload()
+    payload_one["run"] = {"id": "alias-run-one"}
+    payload_two = _valid_payload()
+    payload_two["run"] = {"id": "alias-run-two"}
+    source = {"cron_job_id": "same-job", "generated_at": "2026-06-04T02:04:11Z"}
+
+    first = proposal_storage.ingest_proposal_output(json.dumps(payload_one), source=source)
+    second = proposal_storage.ingest_proposal_output(json.dumps(payload_two), source=source)
+
+    assert first["run_id"] != second["run_id"]
+    conn = proposal_storage.connect()
+    try:
+        rows = conn.execute("SELECT source_key FROM proposal_runs ORDER BY id").fetchall()
+    finally:
+        conn.close()
+    assert [row["source_key"] for row in rows] == ["same-job:alias-run-one", "same-job:alias-run-two"]
+
+
+def test_ingest_run_missing_metadata_stays_malformed_when_source_is_insufficient(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    payload = _valid_payload()
+    payload["run"] = {"status": "completed"}
+
+    result = proposal_storage.ingest_proposal_output(
+        "Human summary before JSON.\n```json\n" + json.dumps(payload) + "\n```",
+        source={"cron_job_id": "job-from-source", "cron_output_path": "/tmp/out.md"},
+    )
+
+    assert result["status"] == "malformed"
+    assert "run.run_id" in result["parse_error"]
 
 
 def test_grouped_reads_card_details_and_run_source(tmp_path, monkeypatch):

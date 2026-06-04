@@ -90,3 +90,12 @@ def test_cron_proposal_guidance_requests_json_and_no_kanban_mutation():
     assert "at most 5 proposal cards" in guidance
     assert "Do not create Kanban tasks" in guidance
     assert "human markdown" in guidance
+    assert "`run_id`" in guidance
+    assert "`cron_job_id`" in guidance
+    assert "`created_at`" in guidance
+    assert "critical`, `high`, `medium`, or `low`" in guidance
+    assert "do not use P0/P1/P2" in guidance
+    assert "`critical`, `major`, `minor`, or `info`" in guidance
+    assert "deterministic string `idempotency_key`" in guidance
+    assert "source_excerpts` as objects with a `text` field" in guidance
+    assert "Do not put audit notes" in guidance

@@ -271,8 +271,13 @@ def build_cron_proposal_guidance(
         "Each card must be independently approvable as a future Kanban task. Do not create Kanban tasks, mutate dashboards, or approve/reject proposals.\n\n"
         "Return both: (1) a concise human markdown summary, and (2) one strict JSON block fenced as ```json containing a proposal run matching "
         f"`{CONTRACT_VERSION}`. The JSON root fields are: `contract_version`, `project`, `prong`, `run`, `generated_at`, `human_markdown`, and `cards`. "
-        "Each card needs `proposal_id` or deterministic `idempotency_key` inputs, `title`, `summary`, `body`, `rationale`, `priority`, optional `severity`, "
-        "`source_excerpts`, `status: proposed`, `created_at`, and `kanban_task` with enough title/body detail to construct a later Kanban task."
+        "The `run` object is only scheduler identity metadata and must include non-empty `run_id`, non-empty `cron_job_id`, and ISO-8601 `created_at`; "
+        "it may also include `cron_job_name`, `cron_output_path`, `source_url`, and `completed_at`. Do not put audit notes, delegation details, status summaries, "
+        "worker logs, or other card/review metadata into `run`. "
+        "Each card needs `proposal_id` or a deterministic string `idempotency_key` (not an object), `title`, `summary`, `body`, `rationale`, "
+        "`priority` as one of `critical`, `high`, `medium`, or `low` (do not use P0/P1/P2 labels), optional `severity` as one of "
+        "`critical`, `major`, `minor`, or `info` (do not use high/medium/low severity labels), "
+        "`source_excerpts` as objects with a `text` field, `status: proposed`, `created_at`, and `kanban_task` with enough title/body detail to construct a later Kanban task."
     )
     feedback_cfg = _self_improvement_config(config).get("feedback_context", {})
     if not isinstance(feedback_cfg, dict) or feedback_cfg.get("enabled", True):
