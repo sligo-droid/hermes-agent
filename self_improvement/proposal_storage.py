@@ -88,6 +88,10 @@ def init_db(db_path: Path | None = None) -> None:
                 source_excerpts_json TEXT NOT NULL DEFAULT '[]',
                 kanban_task_json TEXT NOT NULL DEFAULT '{}',
                 payload_json TEXT NOT NULL,
+                kanban_task_id TEXT,
+                worker_url TEXT,
+                rejected_reason TEXT,
+                archived_at TEXT,
                 updated_at TEXT NOT NULL
             );
 
@@ -105,10 +109,22 @@ def init_db(db_path: Path | None = None) -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS proposal_audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                actor TEXT,
+                kanban_task_id TEXT,
+                reason TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
             VALUES (1, CURRENT_TIMESTAMP);
             """
         )
+        _ensure_card_action_columns(conn)
         conn.commit()
     finally:
         conn.close()
@@ -116,6 +132,18 @@ def init_db(db_path: Path | None = None) -> None:
 
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _ensure_card_action_columns(conn: sqlite3.Connection) -> None:
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(proposal_cards)")}
+    for name, ddl in {
+        "kanban_task_id": "kanban_task_id TEXT",
+        "worker_url": "worker_url TEXT",
+        "rejected_reason": "rejected_reason TEXT",
+        "archived_at": "archived_at TEXT",
+    }.items():
+        if name not in cols:
+            conn.execute(f"ALTER TABLE proposal_cards ADD COLUMN {ddl}")
 
 
 def _parse_payload(source_markdown: str) -> dict[str, Any]:
@@ -240,14 +268,20 @@ def ingest_proposal_output(
             conn.execute("DELETE FROM proposal_cards WHERE run_db_id = ?", (run_db_id,))
             if normalized:
                 for card in normalized["cards"]:
+                    existing_card = conn.execute(
+                        "SELECT kanban_task_id, worker_url, rejected_reason, archived_at FROM proposal_cards WHERE proposal_id = ?",
+                        (card["proposal_id"],),
+                    ).fetchone()
+                    action_state = dict(existing_card) if existing_card else {}
                     conn.execute(
                         """
                         INSERT OR REPLACE INTO proposal_cards(
                             proposal_id, run_db_id, project, prong, title, summary, body,
                             rationale, priority, severity, status, idempotency_key,
                             created_at, source_excerpts_json, kanban_task_json,
-                            payload_json, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            payload_json, kanban_task_id, worker_url, rejected_reason,
+                            archived_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             card["proposal_id"],
@@ -266,6 +300,10 @@ def ingest_proposal_output(
                             _json_dumps(card.get("source_excerpts", [])),
                             _json_dumps(card.get("kanban_task", {})),
                             _json_dumps(card),
+                            action_state.get("kanban_task_id"),
+                            action_state.get("worker_url"),
+                            action_state.get("rejected_reason"),
+                            action_state.get("archived_at"),
                             now,
                         ),
                     )
@@ -300,6 +338,7 @@ def grouped_cards(*, db_path: Path | None = None) -> dict[str, Any]:
             SELECT c.*, r.source_key, r.run_id, r.cron_job_id, r.cron_output_path
             FROM proposal_cards c
             JOIN proposal_runs r ON r.id = c.run_db_id
+            WHERE c.status != 'rejected' AND c.archived_at IS NULL
             ORDER BY c.project, c.prong, c.created_at DESC, c.proposal_id
             """
         ).fetchall()
@@ -317,6 +356,113 @@ def grouped_cards(*, db_path: Path | None = None) -> dict[str, Any]:
             for project in projects.values()
         ]
     }
+
+
+def record_approval(
+    proposal_id: str,
+    *,
+    kanban_task_id: str,
+    worker_url: str,
+    actor: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    init_db(db_path)
+    now = utc_now()
+    conn = connect(db_path)
+    try:
+        with conn:
+            row = conn.execute("SELECT * FROM proposal_cards WHERE proposal_id = ?", (proposal_id,)).fetchone()
+            if not row:
+                raise KeyError(proposal_id)
+            conn.execute(
+                """
+                UPDATE proposal_cards
+                SET status = 'approved', kanban_task_id = ?, worker_url = ?,
+                    rejected_reason = NULL, archived_at = NULL, updated_at = ?
+                WHERE proposal_id = ?
+                """,
+                (kanban_task_id, worker_url, now, proposal_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO proposal_audit_events(proposal_id, action, actor, kanban_task_id, metadata_json, created_at)
+                VALUES (?, 'approved', ?, ?, ?, ?)
+                """,
+                (proposal_id, actor, kanban_task_id, _json_dumps(metadata or {}), now),
+            )
+        card = get_card(proposal_id, db_path=db_path)
+        assert card is not None
+        return card
+    finally:
+        conn.close()
+
+
+def record_rejection(
+    proposal_id: str,
+    *,
+    reason: str,
+    actor: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    init_db(db_path)
+    now = utc_now()
+    conn = connect(db_path)
+    try:
+        with conn:
+            row = conn.execute("SELECT * FROM proposal_cards WHERE proposal_id = ?", (proposal_id,)).fetchone()
+            if not row:
+                raise KeyError(proposal_id)
+            conn.execute(
+                """
+                UPDATE proposal_cards
+                SET status = 'rejected', rejected_reason = ?, archived_at = ?, updated_at = ?
+                WHERE proposal_id = ?
+                """,
+                (reason, now, now, proposal_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO proposal_feedback(proposal_id, kind, body, metadata_json, created_at)
+                VALUES (?, 'rejected', ?, ?, ?)
+                """,
+                (proposal_id, reason, _json_dumps(metadata or {}), now),
+            )
+            conn.execute(
+                """
+                INSERT INTO proposal_audit_events(proposal_id, action, actor, reason, metadata_json, created_at)
+                VALUES (?, 'rejected', ?, ?, ?, ?)
+                """,
+                (proposal_id, actor, reason, _json_dumps(metadata or {}), now),
+            )
+        card = get_card(proposal_id, db_path=db_path)
+        assert card is not None
+        return card
+    finally:
+        conn.close()
+
+
+def list_audit_events(proposal_id: str, *, db_path: Path | None = None) -> list[dict[str, Any]]:
+    init_db(db_path)
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM proposal_audit_events
+            WHERE proposal_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (proposal_id,),
+        ).fetchall()
+        events = []
+        for row in rows:
+            event = dict(row)
+            event["metadata"] = json.loads(event.pop("metadata_json") or "{}")
+            events.append(event)
+        return events
+    finally:
+        conn.close()
 
 
 def get_card(proposal_id: str, *, db_path: Path | None = None) -> dict[str, Any] | None:

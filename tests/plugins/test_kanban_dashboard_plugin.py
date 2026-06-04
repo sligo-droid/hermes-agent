@@ -18,6 +18,13 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from self_improvement import proposal_storage
+
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "self_improvement"
+
+
+def _proposal_fixture(name: str = "proposal_run_pid_valid.json") -> str:
+    return "```json\n" + (FIXTURES / name).read_text(encoding="utf-8") + "\n```"
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +119,76 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_self_improvement_approve_is_idempotent_and_audited(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+
+    first = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    second = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["task"]["id"] == second.json()["task"]["id"]
+    assert first.json()["card"]["kanban_task_id"] == first.json()["task"]["id"]
+    assert first.json()["card"]["worker_url"] == f"/workers?task={first.json()['task']['id']}"
+
+    conn = kb.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+        task = kb.get_task(conn, first.json()["task"]["id"])
+        assert task is not None
+        assert task.idempotency_key == f"self-improvement:{card['proposal_id']}"
+        assert "proposal_id" in (task.body or "")
+    finally:
+        conn.close()
+
+    audit = proposal_storage.list_audit_events(card["proposal_id"])
+    assert [event["action"] for event in audit] == ["approved", "approved"]
+    assert {event["kanban_task_id"] for event in audit} == {first.json()["task"]["id"]}
+
+
+def test_self_improvement_reject_archives_and_persists_feedback(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+
+    response = client.post(
+        f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/reject",
+        json={"reason": "not actionable"},
+    )
+
+    assert response.status_code == 200, response.text
+    rejected = response.json()["card"]
+    assert rejected["status"] == "rejected"
+    assert rejected["rejected_reason"] == "not actionable"
+    assert rejected["archived_at"]
+    assert client.get("/api/plugins/kanban/self-improvement/proposals").json()["projects"] == []
+    detail = client.get(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}")
+    assert detail.json()["card"]["status"] == "rejected"
+
+    conn = proposal_storage.connect()
+    try:
+        feedback = conn.execute("SELECT kind, body FROM proposal_feedback").fetchone()
+        assert dict(feedback) == {"kind": "rejected", "body": "not actionable"}
+    finally:
+        conn.close()
+
+    audit = proposal_storage.list_audit_events(card["proposal_id"])
+    assert audit[0]["action"] == "rejected"
+    assert audit[0]["reason"] == "not actionable"
+
+
+def test_self_improvement_reject_validation_failure(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+
+    response = client.post(
+        f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/reject",
+        json={"reason": ""},
+    )
+
+    assert response.status_code == 422
 
 
 def test_scheduled_tasks_have_their_own_column_not_todo(client):

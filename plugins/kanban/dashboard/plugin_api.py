@@ -584,6 +584,59 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
 
 
+class ProposalRejectBody(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=2000)
+
+
+def _proposal_actor() -> str:
+    return os.environ.get("USER") or os.environ.get("USERNAME") or "dashboard"
+
+
+def _proposal_task_body(card: dict[str, Any]) -> str:
+    task = card.get("kanban_task") if isinstance(card.get("kanban_task"), dict) else {}
+    source_lines = []
+    for excerpt in card.get("source_excerpts") or []:
+        if not isinstance(excerpt, dict):
+            continue
+        label = excerpt.get("label") or "source"
+        text = str(excerpt.get("text") or "").strip()
+        if text:
+            source_lines.append(f"- {label}: {text[:500]}")
+    source_block = "\n".join(source_lines[:3]) or "- No source excerpt recorded."
+    tags = task.get("tags") if isinstance(task.get("tags"), list) else []
+    tag_line = ", ".join(str(tag) for tag in tags) if tags else "none"
+    return "\n".join(
+        [
+            str(task.get("body") or card.get("body") or "").strip(),
+            "",
+            "Self-improvement proposal metadata:",
+            f"- proposal_id: {card['proposal_id']}",
+            f"- project: {card['project']}",
+            f"- prong: {card['prong']}",
+            f"- priority: {card.get('priority') or 'medium'}",
+            f"- severity: {card.get('severity') or 'unspecified'}",
+            f"- cron_job_id: {card.get('cron_job_id') or 'unknown'}",
+            f"- run_id: {card.get('run_id') or card.get('run_db_id')}",
+            f"- cron_output_path: {card.get('cron_output_path') or 'unknown'}",
+            f"- tags: {tag_line}",
+            "",
+            "Rationale:",
+            str(card.get("rationale") or "No rationale recorded.").strip(),
+            "",
+            "Source excerpts:",
+            source_block,
+        ]
+    )
+
+
+def _proposal_priority(value: Any) -> int:
+    return {"urgent": 4, "high": 3, "medium": 2, "low": 1}.get(str(value or "").lower(), 0)
+
+
+def _worker_url(task_id: str) -> str:
+    return f"/workers?task={task_id}"
+
+
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
@@ -1268,6 +1321,68 @@ def self_improvement_proposal_detail_endpoint(proposal_id: str):
     if card is None:
         raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")
     return {"card": card}
+
+
+@router.post("/self-improvement/proposals/{proposal_id}/approve")
+def self_improvement_proposal_approve_endpoint(proposal_id: str):
+    card = proposal_storage.get_card(proposal_id)
+    if card is None:
+        raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")
+    if card.get("status") == "rejected":
+        raise HTTPException(status_code=409, detail="rejected proposals cannot be approved")
+
+    task_payload = card.get("kanban_task") if isinstance(card.get("kanban_task"), dict) else {}
+    board = _resolve_board(str(task_payload.get("board") or "") or None)
+    conn = _conn(board=board)
+    try:
+        idempotency_key = f"self-improvement:{proposal_id}"
+        task_id = kanban_db.create_task(
+            conn,
+            title=str(task_payload.get("title") or card["title"]),
+            body=_proposal_task_body(card),
+            assignee=str(task_payload.get("assignee") or "dev"),
+            created_by="self-improvement",
+            workspace_kind="dir",
+            tenant=str(task_payload.get("tenant") or card.get("project") or "self-improvement"),
+            priority=_proposal_priority(card.get("priority")),
+            idempotency_key=idempotency_key,
+        )
+        task = kanban_db.get_task(conn, task_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+    approved = proposal_storage.record_approval(
+        proposal_id,
+        kanban_task_id=task_id,
+        worker_url=_worker_url(task_id),
+        actor=_proposal_actor(),
+        metadata={"idempotency_key": idempotency_key, "board": board or "default"},
+    )
+    return {"card": approved, "task": _task_dict(task) if task else None, "worker_url": _worker_url(task_id)}
+
+
+@router.post("/self-improvement/proposals/{proposal_id}/reject")
+def self_improvement_proposal_reject_endpoint(proposal_id: str, payload: ProposalRejectBody):
+    card = proposal_storage.get_card(proposal_id)
+    if card is None:
+        raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")
+    if card.get("status") == "approved" or card.get("kanban_task_id"):
+        raise HTTPException(status_code=409, detail="approved proposals cannot be rejected")
+    rejected = proposal_storage.record_rejection(
+        proposal_id,
+        reason=payload.reason.strip(),
+        actor=_proposal_actor(),
+    )
+    return {"card": rejected}
+
+
+@router.get("/self-improvement/proposals/{proposal_id}/audit")
+def self_improvement_proposal_audit_endpoint(proposal_id: str):
+    if proposal_storage.get_card(proposal_id) is None:
+        raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")
+    return {"events": proposal_storage.list_audit_events(proposal_id)}
 
 
 @router.get("/self-improvement/runs/{run_id}")

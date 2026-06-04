@@ -328,7 +328,7 @@ export const api = {
   deleteCronJob: (id: string, profile = "default") =>
     fetchJSON<{ ok: boolean }>(`/api/cron/jobs/${encodeURIComponent(id)}?profile=${encodeURIComponent(profile)}`, { method: "DELETE" }),
 
-  // Self-improvement proposal board (read-only)
+  // Self-improvement proposal board
   getSelfImprovementProposals: () =>
     fetchJSON<SelfImprovementProposalsResponse>(
       "/api/plugins/kanban/self-improvement/proposals",
@@ -336,6 +336,20 @@ export const api = {
   getSelfImprovementProposal: (proposalId: string) =>
     fetchJSON<{ card: SelfImprovementProposalCard }>(
       `/api/plugins/kanban/self-improvement/proposals/${encodeURIComponent(proposalId)}`,
+    ),
+  approveSelfImprovementProposal: (proposalId: string) =>
+    fetchJSON<SelfImprovementProposalActionResponse>(
+      `/api/plugins/kanban/self-improvement/proposals/${encodeURIComponent(proposalId)}/approve`,
+      { method: "POST" },
+    ),
+  rejectSelfImprovementProposal: (proposalId: string, reason: string) =>
+    fetchJSON<{ card: SelfImprovementProposalCard }>(
+      `/api/plugins/kanban/self-improvement/proposals/${encodeURIComponent(proposalId)}/reject`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason }),
+      },
     ),
   getSelfImprovementRun: (runId: string | number) =>
     fetchJSON<{ run: SelfImprovementProposalRun }>(
@@ -809,6 +823,10 @@ export interface SelfImprovementProposalCard {
   severity?: string | null;
   status: string;
   idempotency_key?: string | null;
+  kanban_task_id?: string | null;
+  worker_url?: string | null;
+  rejected_reason?: string | null;
+  archived_at?: string | null;
   created_at: string;
   updated_at: string;
   source_excerpts: Array<{
@@ -825,6 +843,12 @@ export interface SelfImprovementProposalCard {
   run_id?: string | null;
   cron_job_id?: string | null;
   cron_output_path?: string | null;
+}
+
+export interface SelfImprovementProposalActionResponse {
+  card: SelfImprovementProposalCard;
+  task?: Record<string, unknown> | null;
+  worker_url?: string | null;
 }
 
 export interface SelfImprovementProposalProng {

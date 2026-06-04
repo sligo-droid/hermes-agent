@@ -102,6 +102,7 @@ function ProposalCard({ card, selected, onSelect }: { card: SelfImprovementPropo
       </p>
       <div className="mt-3 flex flex-wrap gap-2 text-[0.7rem] uppercase tracking-[0.14em] text-text-tertiary">
         <span>{formatTime(card.created_at)}</span>
+        {card.kanban_task_id && <span className="text-midground">worker {card.kanban_task_id}</span>}
         {meta.slice(0, 2).map((item) => (
           <span key={item} className="max-w-full truncate">
             {item}
@@ -112,7 +113,21 @@ function ProposalCard({ card, selected, onSelect }: { card: SelfImprovementPropo
   );
 }
 
-function DetailPanel({ selection, onLoadRun }: { selection: Selection | null; onLoadRun: (runId: number, mode: DetailMode) => void }) {
+function DetailPanel({
+  selection,
+  actionBusy,
+  actionMessage,
+  onApprove,
+  onReject,
+  onLoadRun,
+}: {
+  selection: Selection | null;
+  actionBusy: boolean;
+  actionMessage: string | null;
+  onApprove: (card: SelfImprovementProposalCard) => void;
+  onReject: (card: SelfImprovementProposalCard) => void;
+  onLoadRun: (runId: number, mode: DetailMode) => void;
+}) {
   if (!selection) {
     return (
       <Card className="border-current/15 bg-card/60 lg:sticky lg:top-4">
@@ -168,12 +183,21 @@ function DetailPanel({ selection, onLoadRun }: { selection: Selection | null; on
               <dt>Run</dt><dd className="truncate font-mono-ui">{card.run_id || card.run_db_id}</dd>
               <dt>Cron job</dt><dd className="truncate font-mono-ui">{card.cron_job_id || "-"}</dd>
               <dt>Idempotency</dt><dd className="truncate font-mono-ui">{card.idempotency_key || "-"}</dd>
+              <dt>Worker</dt><dd className="truncate font-mono-ui">{card.kanban_task_id || "-"}</dd>
             </dl>
           </section>
+          {card.worker_url && (
+            <a className="inline-flex w-fit items-center gap-1 text-sm text-midground underline underline-offset-4" href={card.worker_url}>
+              Open worker task <ExternalLink className="h-3 w-3" />
+            </a>
+          )}
+          {actionMessage && <div className="rounded-md border border-current/10 bg-black/20 p-3 text-xs text-text-secondary">{actionMessage}</div>}
           <div className="flex flex-wrap gap-2 border-t border-current/10 pt-4">
             <Button size="sm" onClick={() => onLoadRun(card.run_db_id, "source")}>View Source Run</Button>
-            <Button disabled ghost size="sm" title="Approve/reject side effects are implemented in a later task.">Approve</Button>
-            <Button disabled ghost size="sm" title="Approve/reject side effects are implemented in a later task.">Reject</Button>
+            <Button disabled={actionBusy || card.status === "approved"} ghost size="sm" onClick={() => onApprove(card)}>
+              {card.status === "approved" ? "Approved" : "Approve"}
+            </Button>
+            <Button disabled={actionBusy || card.status === "approved"} ghost size="sm" onClick={() => onReject(card)}>Reject</Button>
           </div>
         </CardContent>
       </Card>
@@ -221,6 +245,8 @@ export default function SelfImprovementBoardPage() {
   const [selection, setSelection] = useState<Selection | null>(null);
   const [loading, setLoading] = useState(true);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [actionBusy, setActionBusy] = useState(false);
+  const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const loadBoard = useCallback(async () => {
@@ -258,6 +284,65 @@ export default function SelfImprovementBoardPage() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setDetailLoading(false);
+    }
+  }, []);
+
+  const replaceCard = useCallback((next: SelfImprovementProposalCard | null) => {
+    if (!next) return;
+    setSelection({ mode: "card", card: next });
+    setData((current) => {
+      if (!current) return current;
+      return {
+        projects: current.projects.map((project) => ({
+          ...project,
+          prongs: project.prongs.map((prong) => ({
+            ...prong,
+            cards: prong.cards.map((card) => card.proposal_id === next.proposal_id ? next : card),
+          })),
+        })),
+      };
+    });
+  }, []);
+
+  const approveCard = useCallback(async (card: SelfImprovementProposalCard) => {
+    setActionBusy(true);
+    setActionMessage(null);
+    try {
+      const response = await api.approveSelfImprovementProposal(card.proposal_id);
+      replaceCard(response.card);
+      setActionMessage(`Approved into Kanban task ${response.card.kanban_task_id || "unknown"}.`);
+    } catch (err) {
+      setActionMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setActionBusy(false);
+    }
+  }, [replaceCard]);
+
+  const rejectCard = useCallback(async (card: SelfImprovementProposalCard) => {
+    const reason = window.prompt("Reason for rejecting this proposal?")?.trim();
+    if (!reason) return;
+    setActionBusy(true);
+    setActionMessage(null);
+    try {
+      const response = await api.rejectSelfImprovementProposal(card.proposal_id, reason);
+      setSelection(null);
+      setData((current) => {
+        if (!current) return current;
+        return {
+          projects: current.projects.map((project) => ({
+            ...project,
+            prongs: project.prongs.map((prong) => ({
+              ...prong,
+              cards: prong.cards.filter((item) => item.proposal_id !== response.card.proposal_id),
+            })),
+          })).filter((project) => project.prongs.some((prong) => prong.cards.length > 0)),
+        };
+      });
+      setActionMessage("Proposal rejected and archived from the default board view.");
+    } catch (err) {
+      setActionMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setActionBusy(false);
     }
   }, []);
 
@@ -343,7 +428,14 @@ export default function SelfImprovementBoardPage() {
             {detailLoading ? (
               <Card className="border-current/15 bg-card/60"><CardContent className="flex min-h-80 items-center justify-center"><Spinner /></CardContent></Card>
             ) : (
-              <DetailPanel selection={selection} onLoadRun={loadRun} />
+              <DetailPanel
+                actionBusy={actionBusy}
+                actionMessage={actionMessage}
+                onApprove={approveCard}
+                onLoadRun={loadRun}
+                onReject={rejectCard}
+                selection={selection}
+              />
             )}
           </div>
         </div>
