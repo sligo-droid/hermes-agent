@@ -122,7 +122,7 @@ function initialSelectionForView(snapshot: CommandCenterSnapshot, activeView: Vi
 
 function MetricCard({ label, value, detail, tone }: { label: string; value: number | string; detail?: string; tone?: string }) {
   return (
-    <div className="rounded-xl border border-white/10 bg-white/[0.045] px-3.5 py-3">
+    <div className="rounded-xl border border-white/10 bg-white/[0.035] px-3.5 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
       <div className={cn("text-xl font-semibold tracking-tight text-white", tone)}>{value}</div>
       <div className="mt-1 text-[0.68rem] uppercase tracking-[0.18em] text-slate-400">{label}</div>
       {detail && <div className="mt-2 text-xs text-slate-500">{detail}</div>}
@@ -142,29 +142,32 @@ function ActionButton({
   onClick: () => void;
 }) {
   const config = {
-    approve: { label: "Approve", icon: Check, className: "border-emerald-200/80 bg-emerald-400 text-emerald-950 hover:bg-emerald-300" },
-    reject: { label: "Reject", icon: X, className: "border-red-200/80 bg-red-500 text-white hover:bg-red-400" },
-    halt: { label: "Cancel", icon: PauseCircle, className: "border-amber-200/45 bg-amber-300/10 text-amber-100 hover:bg-amber-300/15" },
-    undo: { label: "Revert", icon: RotateCcw, className: "border-sky-200/45 bg-sky-300/10 text-sky-100 hover:bg-sky-300/15" },
-    archive: { label: "Archive board", icon: Archive, className: "border-slate-200/35 bg-slate-300/10 text-slate-100 hover:bg-slate-300/15" },
+    approve: { label: "Approve", icon: Check, className: "border-emerald-200/80 bg-emerald-400 text-emerald-950 hover:bg-emerald-300 focus-visible:ring-emerald-100/75" },
+    reject: { label: "Reject", icon: X, className: "border-red-200/80 bg-red-500 text-white hover:bg-red-400 focus-visible:ring-red-100/75" },
+    halt: { label: "Cancel", icon: PauseCircle, className: "border-orange-200/75 bg-orange-400 text-orange-950 hover:bg-orange-300 focus-visible:ring-orange-100/75", strong: true },
+    undo: { label: "Revert", icon: RotateCcw, className: "border-sky-200/70 bg-sky-400 text-sky-950 hover:bg-sky-300 focus-visible:ring-sky-100/75" },
+    archive: { label: "Archive board", icon: Archive, className: "border-violet-200/65 bg-violet-400 text-violet-950 hover:bg-violet-300 focus-visible:ring-violet-100/75" },
   }[kind];
   const Icon = config.icon;
   return (
-    <button
-      aria-label={config.label}
-      className={cn(
-        "inline-flex h-9 w-9 items-center justify-center rounded-full border text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70",
-        config.className,
-        disabled && "cursor-not-allowed opacity-45",
-      )}
-      disabled={disabled || busy}
-      onClick={onClick}
-      title={config.label}
-      type="button"
-    >
-      <Icon className={cn("h-3.5 w-3.5", busy && "animate-pulse")} />
-      <span className="sr-only">{config.label}</span>
-    </button>
+    <span className="group/action relative inline-flex">
+      <button
+        aria-label={config.label}
+        className={cn(
+          "inline-flex h-9 w-9 items-center justify-center rounded-full border text-xs font-semibold shadow-sm shadow-black/20 transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950 disabled:cursor-not-allowed disabled:border-slate-500/25 disabled:bg-slate-700/35 disabled:text-slate-400 disabled:opacity-70 disabled:shadow-none",
+          config.className,
+        )}
+        disabled={disabled || busy}
+        onClick={onClick}
+        type="button"
+      >
+        <Icon className={cn(config.strong ? "h-5 w-5 stroke-[2.4]" : "h-4.5 w-4.5 stroke-[2.2]", busy && "animate-pulse")} />
+        <span className="sr-only">{config.label}</span>
+      </button>
+      <span className="pointer-events-none absolute bottom-full left-1/2 z-20 mb-2 -translate-x-1/2 translate-y-1 rounded-md border border-white/15 bg-slate-950/95 px-2 py-1 text-[0.67rem] font-semibold uppercase tracking-[0.12em] text-slate-100 opacity-0 shadow-xl shadow-black/35 transition duration-150 group-hover/action:translate-y-0 group-hover/action:opacity-100 group-focus-within/action:translate-y-0 group-focus-within/action:opacity-100">
+        {config.label}
+      </span>
+    </span>
   );
 }
 
@@ -200,7 +203,7 @@ function WorkItemCard({
     <article
       className={cn(
         "rounded-2xl border bg-[#08090a]/70 p-4 transition",
-        selected ? "border-cyan-100/65 ring-1 ring-cyan-100/20" : "border-white/10 hover:border-cyan-100/30 hover:bg-white/[0.045]",
+        selected ? "border-cyan-100/65 bg-cyan-100/[0.035] ring-1 ring-cyan-100/20" : "border-white/10 hover:border-cyan-100/30 hover:bg-white/[0.035]",
       )}
     >
       <div className="flex items-start justify-between gap-3">
@@ -226,7 +229,7 @@ function WorkItemCard({
         <p className="text-sm leading-6 text-slate-300">{item.summary || item.body_preview || "No summary recorded."}</p>
       </button>
       {(item.execution?.task_url && item.execution.task_url !== item.execution.worker_url) || canApproveReject || canArchive || canHalt || canUndo ? (
-        <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/10 pt-3">
+        <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3">
           {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && (
             <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 hover:bg-white/10" href={item.execution.task_url}>
               Ticket <ExternalLink className="h-3.5 w-3.5" />
@@ -429,6 +432,51 @@ function WorkList({
   );
 }
 
+function OverviewWorkList({
+  activeAction,
+  emptyMessage,
+  items,
+  onAction,
+  onSelect,
+  selectedId,
+}: {
+  activeAction: { id: string; kind: ActionKind } | null;
+  emptyMessage?: string;
+  items: CommandCenterWorkItem[];
+  onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
+  onSelect: (item: CommandCenterWorkItem) => void;
+  selectedId?: string;
+}) {
+  if (!items.length) return <EmptyState label="work items" message={emptyMessage} />;
+
+  const runningItems = items.filter((item) => item.status === "running");
+  const remainingItems = items.filter((item) => item.status !== "running");
+  const renderItem = (item: CommandCenterWorkItem) => (
+    <WorkItemCard
+      activeAction={activeAction}
+      item={item}
+      key={item.id}
+      onAction={onAction}
+      onSelect={() => onSelect(item)}
+      selected={selectedId === item.id}
+    />
+  );
+
+  return (
+    <div className="grid gap-3">
+      {runningItems.map(renderItem)}
+      {runningItems.length > 0 && remainingItems.length > 0 ? (
+        <div className="flex items-center gap-3 py-1.5" aria-hidden="true">
+          <div className="h-px flex-1 bg-gradient-to-r from-transparent via-white/16 to-transparent" />
+          <span className="text-[0.62rem] font-semibold uppercase tracking-[0.18em] text-slate-500">Proposed and parked</span>
+          <div className="h-px flex-1 bg-gradient-to-r from-transparent via-white/16 to-transparent" />
+        </div>
+      ) : null}
+      {remainingItems.map(renderItem)}
+    </div>
+  );
+}
+
 export default function CommandCenterPage() {
   const location = useLocation();
   const activeView = viewFromPath(location.pathname);
@@ -586,7 +634,7 @@ export default function CommandCenterPage() {
           <section className="min-w-0">
             {activeView === "overview" && (
               <div className="grid gap-5">
-                <WorkList activeAction={activeAction} emptyMessage="No recent decisions, worker boards, or active ledger items are visible yet." items={overviewItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
+                <OverviewWorkList activeAction={activeAction} emptyMessage="No recent decisions, worker boards, or active ledger items are visible yet." items={overviewItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
               </div>
             )}
             {activeView === "inbox" && (
