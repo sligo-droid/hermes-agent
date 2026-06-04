@@ -52,6 +52,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
+from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY, ROLE_DEV
 from hermes_cli import kanban_diagnostics as kd
 from self_improvement import discord_publish, proposal_storage
 
@@ -146,6 +147,27 @@ BOARD_COLUMNS: list[str] = [
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
+
+
+def _discord_worker_task_defaults(board: Optional[str]) -> dict[str, Any]:
+    if not board:
+        return {}
+    worker = kanban_db.read_board_metadata(board).get(DISCORD_WORKER_META_KEY)
+    if not isinstance(worker, dict):
+        return {}
+    workspace_path = str(worker.get("worktree_path") or "").strip()
+    defaults: dict[str, Any] = {}
+    if workspace_path:
+        defaults["workspace_path"] = workspace_path
+    try:
+        from hermes_cli.discord_worker_boards import _role_runtime_seconds
+
+        runtime = _role_runtime_seconds(ROLE_DEV)
+    except Exception:
+        runtime = 3600
+    if runtime is not None:
+        defaults["max_runtime_seconds"] = runtime
+    return defaults
 
 
 def _task_dict(
@@ -1373,6 +1395,7 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
         else None
     )
     board = discord_route.board if discord_route and discord_route.board else _resolve_board(str(task_payload.get("board") or "") or None)
+    worker_task_defaults = _discord_worker_task_defaults(discord_route.board if discord_route and discord_route.board else None)
     conn = _conn(board=board)
     try:
         idempotency_key = f"self-improvement:{proposal_id}"
@@ -1386,6 +1409,7 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
             tenant=str(task_payload.get("tenant") or card.get("project") or "self-improvement"),
             priority=_proposal_priority(card.get("priority")),
             idempotency_key=idempotency_key,
+            **worker_task_defaults,
         )
         task = kanban_db.get_task(conn, task_id)
     except ValueError as e:
