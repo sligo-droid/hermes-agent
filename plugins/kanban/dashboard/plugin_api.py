@@ -52,7 +52,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
-from self_improvement import proposal_storage
+from self_improvement import discord_publish, proposal_storage
 
 log = logging.getLogger(__name__)
 
@@ -1339,7 +1339,18 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
         raise HTTPException(status_code=409, detail="rejected proposals cannot be approved")
 
     task_payload = card.get("kanban_task") if isinstance(card.get("kanban_task"), dict) else {}
-    board = _resolve_board(str(task_payload.get("board") or "") or None)
+    channel_id = discord_publish.configured_project_channel_id(card.get("project"))
+    existing_route = _latest_discord_approval_metadata(proposal_id)
+    discord_route = (
+        discord_publish.publish_approved_proposal(
+            card,
+            channel_id=channel_id,
+            existing=existing_route,
+        )
+        if channel_id
+        else None
+    )
+    board = discord_route.board if discord_route and discord_route.board else _resolve_board(str(task_payload.get("board") or "") or None)
     conn = _conn(board=board)
     try:
         idempotency_key = f"self-improvement:{proposal_id}"
@@ -1360,14 +1371,37 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
     finally:
         conn.close()
 
+    discord_route = discord_publish.activate_approved_proposal(card, discord_route)
+    if discord_route and discord_route.board:
+        board = discord_route.board
+
     approved = proposal_storage.record_approval(
         proposal_id,
         kanban_task_id=task_id,
         worker_url=_worker_url(task_id),
         actor=_proposal_actor(),
-        metadata={"idempotency_key": idempotency_key, "board": board or "default"},
+        metadata={
+            "idempotency_key": idempotency_key,
+            "board": board or "default",
+            **(discord_route.metadata() if discord_route else {}),
+            **({"discord_channel_id": channel_id, "discord_publish": "unavailable"} if channel_id and not discord_route else {}),
+        },
     )
     return {"card": approved, "task": _task_dict(task) if task else None, "worker_url": _worker_url(task_id)}
+
+
+def _latest_discord_approval_metadata(proposal_id: str) -> dict[str, Any]:
+    try:
+        events = proposal_storage.list_audit_events(proposal_id)
+    except Exception:
+        return {}
+    for event in reversed(events):
+        if event.get("action") != "approved":
+            continue
+        metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+        if metadata.get("discord_thread_id") and metadata.get("discord_top_level_message_id"):
+            return dict(metadata)
+    return {}
 
 
 @router.post("/self-improvement/proposals/{proposal_id}/reject")

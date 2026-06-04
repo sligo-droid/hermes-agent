@@ -1863,6 +1863,7 @@ DEFAULT_CONFIG = {
             "pid": {
                 "label": "PID",
                 "description": "Sligo PID operator self-improvement proposals.",
+                "discord_channel_id": "",
                 "prongs": {
                     "airflow_scraper_doctor": {
                         "label": "Nightly PID Airflow scraper doctor",
