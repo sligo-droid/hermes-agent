@@ -12,6 +12,7 @@ import re
 import subprocess
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -89,6 +90,28 @@ _SKILL_ACTIVATION_RE = re.compile(r"(?m)^\[IMPORTANT:.*?\bskill\b.*?\]")
 _POST_SKILL_CONTEXT_RE = re.compile(
     r"(?m)^\[System note:|^# Project Context\b|^Conversation started:\b"
 )
+_SKILL_NAME_RE = re.compile(r'"([^"]+)"\s+skill')
+_SKILL_DIR_RE = re.compile(r"(?m)^\[Skill directory:\s*(.*?)\]")
+_SKILL_DESCRIPTION_RE = re.compile(r"(?m)^description:\s*(.+?)\s*$")
+_WORKER_RELEVANT_SKILL_RE = re.compile(
+    r"(?i)\b(?:worker skill|worker-relevant skill|load worker skill|pass full skill)\s*:\s*([A-Za-z0-9_.:/-]+)"
+    r"|\bload worker skill\s+([A-Za-z0-9_.:/-]+)"
+    r"|\bpass full skill\s+([A-Za-z0-9_.:/-]+)"
+)
+
+# Budget for skill context inherited from the parent session.  Full active skill
+# bodies can be large; coding workers get compact references unless explicitly
+# marked worker-relevant, and this cap prevents runaway prompt growth.
+_INHERITED_SKILL_CONTEXT_BUDGET_CHARS = 12000
+_ALWAYS_FULL_WORKER_SKILL = "general-coding"
+
+
+@dataclass(frozen=True)
+class _SkillBlock:
+    name: str
+    body: str
+    summary: str = ""
+    directory: str = ""
 
 
 def _extract_active_skill_blocks(text: str) -> list[str]:
@@ -119,7 +142,75 @@ def _extract_active_skill_blocks(text: str) -> list[str]:
     return blocks
 
 
-def _parent_skill_context(parent_agent: Any, parent_messages: Optional[list[dict]] = None) -> str:
+def _extract_skill_name(block: str) -> str:
+    match = _SKILL_NAME_RE.search(block)
+    if match:
+        return match.group(1).strip()
+    return "unknown-skill"
+
+
+def _extract_skill_summary(block: str) -> str:
+    match = _SKILL_DESCRIPTION_RE.search(block)
+    if match:
+        return match.group(1).strip().strip('"\'')
+    for line in block.splitlines()[1:]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("[") or stripped.startswith("---"):
+            continue
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip()
+        return stripped[:240]
+    return "No summary available."
+
+
+def _extract_skill_directory(block: str) -> str:
+    match = _SKILL_DIR_RE.search(block)
+    return match.group(1).strip() if match else ""
+
+
+def _parse_skill_block(block: str) -> _SkillBlock:
+    return _SkillBlock(
+        name=_extract_skill_name(block),
+        body=block,
+        summary=_extract_skill_summary(block),
+        directory=_extract_skill_directory(block),
+    )
+
+
+def _worker_relevant_skill_names(task: str = "", context: str = "") -> set[str]:
+    names: set[str] = set()
+    for match in _WORKER_RELEVANT_SKILL_RE.finditer(f"{task}\n{context}"):
+        raw = next((group for group in match.groups() if group), "")
+        name = raw.strip().strip("`'\".,;)")
+        if name:
+            names.add(name.lower())
+    return names
+
+
+def _load_general_coding_skill() -> _SkillBlock | None:
+    try:
+        from tools.skills_tool import skill_view
+
+        loaded = json.loads(skill_view(_ALWAYS_FULL_WORKER_SKILL, preprocess=False))
+    except Exception:
+        return None
+    if not loaded.get("success"):
+        return None
+    content = str(loaded.get("content") or "").strip()
+    if not content:
+        return None
+    skill_dir = str(loaded.get("skill_dir") or "")
+    if skill_dir and "[Skill directory:" not in content:
+        content = f"{content}\n\n[Skill directory: {skill_dir}]"
+    return _SkillBlock(
+        name=str(loaded.get("name") or _ALWAYS_FULL_WORKER_SKILL),
+        body=content,
+        summary=str(loaded.get("description") or _extract_skill_summary(content)),
+        directory=skill_dir,
+    )
+
+
+def _parent_skill_blocks(parent_agent: Any, parent_messages: Optional[list[dict]] = None) -> list[_SkillBlock]:
     """Collect active skill instructions already visible to the parent agent."""
     candidates: list[str] = []
     for attr in ("ephemeral_system_prompt", "_cached_system_prompt"):
@@ -133,15 +224,106 @@ def _parent_skill_context(parent_agent: Any, parent_messages: Optional[list[dict
         if isinstance(content, str) and content.strip():
             candidates.append(content)
 
-    blocks: list[str] = []
+    blocks: list[_SkillBlock] = []
     seen: set[str] = set()
     for candidate in candidates:
         for block in _extract_active_skill_blocks(candidate):
             if block in seen:
                 continue
             seen.add(block)
-            blocks.append(block)
-    return "\n\n".join(blocks)
+            blocks.append(_parse_skill_block(block))
+    return blocks
+
+
+def _format_skill_reference(block: _SkillBlock) -> str:
+    parts = [f"- {block.name}: {block.summary}"]
+    if block.directory:
+        parts.append(f"  Skill directory: {block.directory}")
+    return "\n".join(parts)
+
+
+def _append_with_budget(
+    sections: list[str],
+    section: str,
+    used: int,
+    omitted: list[str],
+) -> int:
+    needed = len(section) + (2 if sections else 0)
+    if used + needed <= _INHERITED_SKILL_CONTEXT_BUDGET_CHARS:
+        sections.append(section)
+        return used + needed
+    names = ", ".join(_SKILL_NAME_RE.findall(section))
+    title = names or section.splitlines()[0].strip("# ").strip() or "skill context"
+    omitted.append(title)
+    return used
+
+
+def _parent_skill_context(
+    parent_agent: Any,
+    parent_messages: Optional[list[dict]] = None,
+    *,
+    task: str = "",
+    context: str = "",
+) -> str:
+    """Build bounded worker skill context from active parent skills."""
+    inherited = _parent_skill_blocks(parent_agent, parent_messages)
+    relevant = _worker_relevant_skill_names(task, context)
+    general_full: list[_SkillBlock] = []
+    full: list[_SkillBlock] = []
+    references: list[_SkillBlock] = []
+    seen_names: set[str] = set()
+
+    general = _load_general_coding_skill()
+    if general is not None:
+        general_full.append(general)
+        seen_names.add(general.name.lower())
+
+    for block in inherited:
+        normalized = block.name.lower()
+        if normalized == _ALWAYS_FULL_WORKER_SKILL:
+            if normalized not in seen_names:
+                full.append(block)
+                seen_names.add(normalized)
+            continue
+        if normalized in relevant:
+            full.append(block)
+        else:
+            references.append(block)
+
+    sections: list[str] = []
+    omitted: list[str] = []
+    used = 0
+    if general_full:
+        general_section = "\n\n".join(block.body for block in general_full)
+        sections.append("Full worker skill instructions:\n" + general_section)
+        # `general-coding` is intentionally always loaded in full.  Do not let
+        # that required baseline consume the inherited parent-skill budget, or
+        # compact references for omitted parent skills would disappear whenever
+        # general-coding itself is large.
+        used = 0
+    if full:
+        full_section = "\n\n".join(block.body for block in full)
+        used = _append_with_budget(
+            sections,
+            "Full explicitly worker-relevant inherited skill instructions:\n" + full_section,
+            used,
+            omitted,
+        )
+    if references:
+        reference_section = (
+            "Omitted active parent skills passed as compact references. "
+            "If one becomes relevant, inspect the listed skill directory before relying on it:\n"
+            + "\n".join(_format_skill_reference(block) for block in references)
+        )
+        used = _append_with_budget(sections, reference_section, used, omitted)
+    if omitted:
+        sections.append(
+            "Inherited skill context budget note: omitted or truncated sections because "
+            f"the {_INHERITED_SKILL_CONTEXT_BUDGET_CHARS}-character budget was exceeded: "
+            + ", ".join(omitted)
+            + "."
+        )
+    return "\n\n".join(sections)
 
 
 _PNPM_SCAN_SKIP_DIRS = {
@@ -337,7 +519,12 @@ def delegate_coding_task(
     if canonical_error:
         return tool_error(canonical_error)
     project_context = _worker_project_context(workdir)
-    skill_context = _parent_skill_context(parent_agent, parent_messages)
+    skill_context = _parent_skill_context(
+        parent_agent,
+        parent_messages,
+        task=task_text,
+        context=str(context or ""),
+    )
     repo_state_notes = _repo_state_guard_notes(workdir)
     dependency_notes = _prepare_pnpm_dependency_links(workdir)
 

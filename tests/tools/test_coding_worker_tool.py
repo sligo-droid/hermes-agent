@@ -51,6 +51,31 @@ def _parent(tmp_path, api_mode="chat_completions"):
     )
 
 
+def _skill_block(name, body, directory=None, description=None):
+    lines = [
+        f'[IMPORTANT: The user launched this CLI session with the "{name}" skill preloaded. Treat its instructions as active guidance for the duration of this session unless the user overrides them.]'
+    ]
+    if description:
+        lines.extend(["---", f"description: {description}", "---"])
+    lines.append(body)
+    if directory:
+        lines.append(f"[Skill directory: {directory}]")
+    return "\n".join(lines)
+
+
+def _stub_general_coding(monkeypatch, content="General coding full body."):
+    monkeypatch.setattr(
+        cwt,
+        "_load_general_coding_skill",
+        lambda: cwt._SkillBlock(
+            name="general-coding",
+            body=content,
+            summary="General coding rules.",
+            directory="/tmp/general-coding",
+        ),
+    )
+
+
 def test_requires_parent_agent():
     result = json.loads(cwt.delegate_coding_task(task="fix bug"))
     assert "requires a parent agent" in result["error"]
@@ -167,6 +192,7 @@ def test_delegate_inherits_parent_preloaded_skill_context(monkeypatch, tmp_path)
     assert result["success"] is True
     prompt = FakeSession.instances[0].run_calls[0]["user_input"]
     assert "Active skill instructions inherited from the parent Hermes session" in prompt
+    assert "Omitted active parent skills passed as compact references" in prompt
     assert "hermes-agent-dev" in prompt
     assert "Use scripts/run_tests.sh for verification" in prompt
     assert "base prompt" not in prompt
@@ -237,6 +263,172 @@ def test_delegate_inherits_runtime_skill_invocation_from_parent_messages(monkeyp
     assert "Active skill instructions inherited from the parent Hermes session" in prompt
     assert "autoreview" in prompt
     assert "Run the autoreview helper after focused checks." in prompt
+
+
+def test_delegate_always_includes_general_coding_full_body(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    _stub_general_coding(monkeypatch, content="General coding full body. Run focused checks.")
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the parser",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "Full worker skill instructions" in prompt
+    assert "General coding full body. Run focused checks." in prompt
+
+
+def test_delegate_summarizes_inherited_hermes_and_pr_skills_by_default(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setattr(cwt, "_load_general_coding_skill", lambda: None)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    parent = _parent(tmp_path)
+    parent.ephemeral_system_prompt = "\n\n".join(
+        [
+            _skill_block(
+                "hermes-agent",
+                "Hermes summary line.\nFull Hermes body must stay omitted.",
+                directory="/tmp/hermes-agent",
+            ),
+            _skill_block(
+                "github-pr-workflow",
+                "PR summary line.\nFull PR body must stay omitted.",
+                directory="/tmp/github-pr-workflow",
+            ),
+        ]
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the parser",
+            parent_agent=parent,
+        )
+    )
+
+    assert result["success"] is True
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "Omitted active parent skills passed as compact references" in prompt
+    assert "hermes-agent: Hermes summary line" in prompt
+    assert "Skill directory: /tmp/hermes-agent" in prompt
+    assert "github-pr-workflow: PR summary line" in prompt
+    assert "Skill directory: /tmp/github-pr-workflow" in prompt
+    assert "Full Hermes body must stay omitted" not in prompt
+    assert "Full PR body must stay omitted" not in prompt
+
+
+def test_delegate_passes_full_body_for_explicit_worker_relevant_skill(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setattr(cwt, "_load_general_coding_skill", lambda: None)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    parent = _parent(tmp_path)
+    parent.ephemeral_system_prompt = _skill_block(
+        "autoreview",
+        "Autoreview summary line. Full autoreview worker instructions.",
+        directory="/tmp/autoreview",
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the parser\nworker-relevant skill: autoreview",
+            parent_agent=parent,
+        )
+    )
+
+    assert result["success"] is True
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "Full explicitly worker-relevant inherited skill instructions" in prompt
+    assert "Full autoreview worker instructions." in prompt
+    assert "Omitted active parent skills" not in prompt
+
+
+def test_general_coding_does_not_consume_inherited_skill_budget(monkeypatch, tmp_path):
+    monkeypatch.setattr(cwt, "_INHERITED_SKILL_CONTEXT_BUDGET_CHARS", 500)
+    _stub_general_coding(monkeypatch, content="General coding full body. " + "g" * 2000)
+    parent = _parent(tmp_path)
+    parent.ephemeral_system_prompt = _skill_block(
+        "hermes-agent",
+        "Hermes compact summary.\nFull Hermes body must stay omitted.",
+        directory="/tmp/hermes-agent",
+    )
+
+    context = cwt._parent_skill_context(parent)
+
+    assert "General coding full body" in context
+    assert "hermes-agent: Hermes compact summary" in context
+    assert "Skill directory: /tmp/hermes-agent" in context
+    assert "Full Hermes body must stay omitted" not in context
+
+
+def test_parent_skill_context_budget_omits_oversized_relevant_skill(monkeypatch, tmp_path):
+    monkeypatch.setattr(cwt, "_load_general_coding_skill", lambda: None)
+    monkeypatch.setattr(cwt, "_INHERITED_SKILL_CONTEXT_BUDGET_CHARS", 250)
+    parent = _parent(tmp_path)
+    parent.ephemeral_system_prompt = _skill_block(
+        "big-skill",
+        "x" * 500,
+        directory="/tmp/big-skill",
+    )
+
+    context = cwt._parent_skill_context(
+        parent,
+        task="fix bug\npass full skill: big-skill",
+    )
+
+    assert "Inherited skill context budget note" in context
+    assert "250-character budget" in context
+    assert "big-skill" not in context.split("Inherited skill context budget note", 1)[0]
+
+
+def test_registry_parent_messages_dispatch_keeps_relevant_skill_full(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setattr(cwt, "_load_general_coding_skill", lambda: None)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    parent_messages = [
+        {
+            "role": "user",
+            "content": _skill_block(
+                "autoreview",
+                "Autoreview summary line. Registry dispatch full body.",
+                directory="/tmp/autoreview",
+            ),
+        }
+    ]
+
+    result = json.loads(
+        cwt.registry.dispatch(
+            "delegate_coding_task",
+            {
+                "task": "fix the parser\nworker skill: autoreview",
+                "_parent_messages": parent_messages,
+            },
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "Registry dispatch full body." in prompt
 
 
 def test_delegate_does_not_add_skill_context_when_parent_has_no_loaded_skills(monkeypatch, tmp_path):
