@@ -52,7 +52,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
-from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY, ROLE_DEV
+from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY, ROLE_PLANNER
 from hermes_cli import kanban_diagnostics as kd
 from self_improvement import discord_publish, proposal_storage
 
@@ -147,27 +147,6 @@ BOARD_COLUMNS: list[str] = [
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
-
-
-def _discord_worker_task_defaults(board: Optional[str]) -> dict[str, Any]:
-    if not board:
-        return {}
-    worker = kanban_db.read_board_metadata(board).get(DISCORD_WORKER_META_KEY)
-    if not isinstance(worker, dict):
-        return {}
-    workspace_path = str(worker.get("worktree_path") or "").strip()
-    defaults: dict[str, Any] = {}
-    if workspace_path:
-        defaults["workspace_path"] = workspace_path
-    try:
-        from hermes_cli.discord_worker_boards import _role_runtime_seconds
-
-        runtime = _role_runtime_seconds(ROLE_DEV)
-    except Exception:
-        runtime = 3600
-    if runtime is not None:
-        defaults["max_runtime_seconds"] = runtime
-    return defaults
 
 
 def _task_dict(
@@ -669,6 +648,71 @@ def _latest_self_improvement_board(proposal_id: str) -> str:
     return "default"
 
 
+def _discord_worker_meta(board: str | None) -> dict[str, Any]:
+    board = str(board or "").strip()
+    if not board or board == "default":
+        return {}
+    try:
+        worker = kanban_db.read_board_metadata(board).get(DISCORD_WORKER_META_KEY)
+    except Exception:
+        return {}
+    if not isinstance(worker, dict) or worker.get("kind") != "discord_worker_board":
+        return {}
+    return worker
+
+
+def _discord_worker_board_status(worker: dict[str, Any]) -> str:
+    status = str(worker.get("goal_status") or "").strip().lower()
+    phase = str(worker.get("phase") or "").strip().lower()
+    if status == "done" or phase == "complete":
+        return "done"
+    if status:
+        return status
+    if worker.get("cancelled"):
+        return "cancelled"
+    if worker.get("paused"):
+        return "paused"
+    return phase
+
+
+def _planner_task_matches_card(task: kanban_db.Task, card: dict[str, Any]) -> bool:
+    if task.assignee != ROLE_PLANNER or task.created_by != "self-improvement":
+        return False
+    expected = " ".join(discord_publish._initial_request(card).split())
+    if not expected:
+        return True
+    try:
+        payload = json.loads(task.body or "{}")
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    observed = " ".join(str(payload.get("request") or payload.get("root_goal") or "").split())
+    return observed == expected
+
+
+def _self_improvement_planner_task(board: str | None, card: dict[str, Any]) -> kanban_db.Task | None:
+    board = str(board or "default")
+    worker = _discord_worker_meta(board)
+    preferred_id = str(worker.get("latest_planner_task_id") or "").strip()
+    conn = _conn(board=board)
+    try:
+        if preferred_id:
+            task = kanban_db.get_task(conn, preferred_id)
+            if task is not None and _planner_task_matches_card(task, card):
+                return task
+        matches = [
+            task
+            for task in kanban_db.list_tasks(conn, include_archived=False)
+            if _planner_task_matches_card(task, card)
+        ]
+        if not matches:
+            return None
+        return sorted(matches, key=lambda item: (int(item.created_at or 0), item.id), reverse=True)[0]
+    finally:
+        conn.close()
+
+
 def _self_improvement_card_with_downstream(card: dict[str, Any] | None) -> dict[str, Any] | None:
     if card is None:
         return None
@@ -679,6 +723,12 @@ def _self_improvement_card_with_downstream(card: dict[str, Any] | None) -> dict[
     _repair_card_worker_url(enriched)
     board = _latest_self_improvement_board(str(enriched.get("proposal_id") or ""))
     enriched["downstream_board"] = board
+    worker = _discord_worker_meta(board)
+    board_status = ""
+    if worker:
+        board_status = _discord_worker_board_status(worker)
+        enriched["downstream_board_status"] = board_status
+        enriched["downstream_board_phase"] = str(worker.get("phase") or "")
     try:
         conn = _conn(board=_resolve_board(board))
     except HTTPException:
@@ -691,7 +741,7 @@ def _self_improvement_card_with_downstream(card: dict[str, Any] | None) -> dict[
             enriched["downstream_task_status"] = "missing"
             enriched["downstream_task_missing"] = True
         else:
-            enriched["downstream_task_status"] = task.status
+            enriched["downstream_task_status"] = board_status or task.status
             enriched["downstream_task"] = _task_dict(task)
     finally:
         conn.close()
@@ -1455,30 +1505,39 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
         if channel_id
         else None
     )
-    board = discord_route.board if discord_route and discord_route.board else _resolve_board(str(task_payload.get("board") or "") or None)
-    worker_task_defaults = _discord_worker_task_defaults(discord_route.board if discord_route and discord_route.board else None)
-    conn = _conn(board=board)
-    try:
-        idempotency_key = f"self-improvement:{proposal_id}"
-        task_id = kanban_db.create_task(
-            conn,
-            title=str(task_payload.get("title") or card["title"]),
-            body=_proposal_task_body(card),
-            assignee=str(task_payload.get("assignee") or "dev"),
-            created_by="self-improvement",
-            workspace_kind="dir",
-            tenant=str(task_payload.get("tenant") or card.get("project") or "self-improvement"),
-            priority=_proposal_priority(card.get("priority")),
-            idempotency_key=idempotency_key,
-            **worker_task_defaults,
-        )
-        task = kanban_db.get_task(conn, task_id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        conn.close()
+    idempotency_key = f"self-improvement:{proposal_id}"
+    task = None
+    task_id = ""
+    if discord_route and discord_route.board:
+        discord_route = discord_publish.activate_approved_proposal(card, discord_route)
+        board = discord_route.board if discord_route and discord_route.board else _resolve_board(str(task_payload.get("board") or "") or None)
+        if discord_route and discord_route.error:
+            raise HTTPException(status_code=500, detail=f"Discord worker activation failed: {discord_route.error}")
+        task = _self_improvement_planner_task(board, card)
+        if task is None:
+            raise HTTPException(status_code=500, detail="Discord planner task was not created")
+        task_id = task.id
+    else:
+        board = _resolve_board(str(task_payload.get("board") or "") or None)
+        conn = _conn(board=board)
+        try:
+            task_id = kanban_db.create_task(
+                conn,
+                title=str(task_payload.get("title") or card["title"]),
+                body=_proposal_task_body(card),
+                assignee=str(task_payload.get("assignee") or "dev"),
+                created_by="self-improvement",
+                workspace_kind="dir",
+                tenant=str(task_payload.get("tenant") or card.get("project") or "self-improvement"),
+                priority=_proposal_priority(card.get("priority")),
+                idempotency_key=idempotency_key,
+            )
+            task = kanban_db.get_task(conn, task_id)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        finally:
+            conn.close()
 
-    discord_route = discord_publish.activate_approved_proposal(card, discord_route)
     if discord_route and discord_route.board:
         board = discord_route.board
 
@@ -1507,6 +1566,31 @@ def self_improvement_proposal_halt_endpoint(proposal_id: str, payload: ProposalF
     if not task_id:
         raise HTTPException(status_code=409, detail="proposal has no downstream task")
     board = _latest_self_improvement_board(proposal_id)
+    worker = _discord_worker_meta(board)
+    if worker:
+        board_status = _discord_worker_board_status(worker)
+        if board_status in {"done", "cancelled"}:
+            raise HTTPException(status_code=409, detail="downstream board is no longer in flight")
+        reason = payload.reason.strip() if payload and payload.reason else "self-improvement-halted"
+        from hermes_cli import discord_worker_boards as dwb
+
+        stop_result = dwb.stop_board_execution(board, reason=reason)
+        conn = _conn(board=board)
+        try:
+            task = kanban_db.get_task(conn, str(task_id))
+            next_task = task
+        finally:
+            conn.close()
+        proposal_storage.record_audit_event(
+            proposal_id,
+            action="halted",
+            actor=_proposal_actor(),
+            kanban_task_id=str(task_id),
+            reason=(payload.reason.strip() if payload and payload.reason else None),
+            metadata={"board": board, "previous_status": board_status, "stop_result": stop_result},
+        )
+        return {"card": _self_improvement_card_with_downstream(proposal_storage.get_card(proposal_id)), "task": _task_dict(next_task) if next_task else None}
+
     conn = _conn(board=_resolve_board(board))
     try:
         task = kanban_db.get_task(conn, str(task_id))
@@ -1538,6 +1622,9 @@ def self_improvement_proposal_undo_followup_endpoint(proposal_id: str, payload: 
     if not task_id:
         raise HTTPException(status_code=409, detail="proposal has no downstream task")
     board = _latest_self_improvement_board(proposal_id)
+    worker = _discord_worker_meta(board)
+    if worker and _discord_worker_board_status(worker) != "done":
+        raise HTTPException(status_code=409, detail="downstream board is not fully implemented")
     conn = _conn(board=_resolve_board(board))
     try:
         task = kanban_db.get_task(conn, str(task_id))

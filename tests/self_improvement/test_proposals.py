@@ -114,6 +114,80 @@ def test_self_improvement_discord_initial_reaction_url_encodes_unicode(monkeypat
     ]
 
 
+def test_self_improvement_activation_uses_planner_flow_with_board_criteria(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://example.test")
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    card = {
+        "proposal_id": "pid-visible-123",
+        "project": "pid",
+        "prong": "visible_ui_ux_recommendations",
+        "title": "Improve worker board approvals",
+        "summary": "Approved self-improvement proposal should use the full worker flow.",
+        "body": "Users can approve a proposal and see planner-created tickets move through review.",
+        "rationale": "Direct dev execution skipped planning and reviewer loop expectations.",
+        "kanban_task": {
+            "title": "Route approved proposal through planner",
+            "body": "Implement the approval activation so the Discord worker board starts in planning and produces dev tickets.",
+        },
+    }
+    route = discord_publish.DiscordApprovalRoute(
+        channel_id="555",
+        top_level_message_id="666",
+        thread_id="777",
+        thread_url="https://discord.com/channels/999/777",
+        board="discord-777-m-666",
+        board_public_url="https://example.test/workers/discord-777-m-666",
+        guild_id="999",
+    )
+    dwb.ensure_discord_thread_board(
+        thread_id=route.thread_id,
+        chat_id=route.channel_id,
+        guild_id=route.guild_id,
+        parent_channel_id=route.channel_id,
+        initial_request=discord_publish._initial_request(card),
+        project_context={"project_name": "pid"},
+        request_id=route.top_level_message_id,
+        source_message_id=route.top_level_message_id,
+        board_slug=route.board,
+    )
+
+    activated = discord_publish.activate_approved_proposal(card, route)
+
+    assert activated is not None
+    assert activated.board == "discord-777-m-666"
+    worker = kanban_db.read_board_metadata(activated.board)[dwb.DISCORD_WORKER_META_KEY]
+    assert worker["goal_status"] == "active"
+    assert worker["phase"] == "planning"
+    assert worker["execution_mode"] == "kanban_pipeline"
+    assert worker["criteria"]
+    assert "starts in planning" in worker["criteria"][0]
+    assert "reviewer loop" in worker["criteria"][0]
+    assert worker["latest_planner_task_id"]
+
+    conn = kanban_db.connect(board=activated.board)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task.assignee == "planner"
+    assert task.created_by == "self-improvement"
+    assert worker["latest_planner_task_id"] == task.id
+    assert "dev" not in task.assignee
+    payload = json.loads(task.body or "{}")
+    assert payload["role"] == "planner"
+    assert payload["acceptance_criteria"] == worker["criteria"]
+    assert "starts in planning" in payload["acceptance_criteria"][0]
+    instructions = "\n".join(payload["planner_instructions"])
+    assert "ticket-specific acceptance criteria" in instructions
+    assert "Definition of Done, Success means, and Stop when" in instructions
+    assert "Do not copy the board-level acceptance_criteria wholesale" in instructions
+
+
 def test_valid_pid_proposal_run_is_accepted_and_gets_stable_id():
     payload = _fixture("proposal_run_pid_valid.json")
 
