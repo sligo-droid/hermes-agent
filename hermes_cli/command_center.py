@@ -86,7 +86,7 @@ def _worker_board_url(board: str | None, public_url: str | None = None) -> str |
         return str(public_url).rstrip("/")
     if board and board != kanban_db.DEFAULT_BOARD:
         return f"/workers/{quote(str(board), safe='')}"
-    return "/workers" if board == kanban_db.DEFAULT_BOARD else None
+    return None
 
 
 def _worker_ticket_url(task_id: str, *, board: str | None, public_url: str | None = None) -> str:
@@ -100,6 +100,14 @@ def _worker_console_url(task_id: str, *, board: str | None) -> str | None:
     if not board or board == kanban_db.DEFAULT_BOARD:
         return None
     return f"/workers/{quote(str(board), safe='')}/tickets/{quote(task_id, safe='')}/console"
+
+
+def _has_started_execution(task: dict[str, Any] | None = None, *, runs: list[dict[str, Any]] | None = None) -> bool:
+    if runs:
+        return True
+    if not task:
+        return False
+    return any(task.get(key) for key in ("current_run_id", "worker_unit", "worker_pid"))
 
 
 def _canonical_status_from_task(task: dict[str, Any] | None) -> tuple[str, str]:
@@ -277,19 +285,26 @@ def _source_from_task_board(board: str, board_meta: dict[str, Any]) -> dict[str,
     }
 
 
-def _execution_from_task(task: dict[str, Any], *, board: str, board_meta: dict[str, Any]) -> dict[str, Any]:
+def _execution_from_task(
+    task: dict[str, Any],
+    *,
+    board: str,
+    board_meta: dict[str, Any],
+    runs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     worker = _board_worker_meta(board_meta)
     public_url = worker.get("public_url") if isinstance(worker, dict) else None
     task_id = str(task.get("id") or "")
     task_status = str(task.get("status") or "").lower()
     paused = task_status in {"blocked", "scheduled"}
+    started = _has_started_execution(task, runs=runs)
     return {
         "board": board,
         "board_name": board_meta.get("name") or board,
         "task_id": task_id,
         "task_status": task.get("status"),
         "task_url": _worker_ticket_url(task_id, board=board, public_url=public_url),
-        "worker_url": _worker_board_url(board, public_url),
+        "worker_url": _worker_board_url(board, public_url) if started else None,
         "console_url": _worker_console_url(task_id, board=board),
         "active_run_id": task.get("current_run_id"),
         "paused": paused,
@@ -325,7 +340,7 @@ def _execution_from_board(
         "task_id": None,
         "task_status": None,
         "task_url": None,
-        "worker_url": _worker_board_url(board, public_url),
+        "worker_url": _worker_board_url(board, public_url) if _has_started_execution(runs=runs) else None,
         "console_url": None,
         "active_run_id": active_run.get("id") if active_run else None,
         "pause_action": f"/api/plugins/kanban/boards/{quote(board, safe='')}/pause",
@@ -379,12 +394,13 @@ def _proposal_work_item(
             task or {"id": task_id, "status": status_detail},
             board=effective_board,
             board_meta={**effective_meta, DISCORD_WORKER_META_KEY: _board_worker_meta(effective_meta)},
+            runs=runs,
         )
         if public_url:
-            execution["worker_url"] = _worker_board_url(effective_board, str(public_url))
+            if _has_started_execution(task, runs=runs):
+                execution["worker_url"] = _worker_board_url(effective_board, str(public_url))
             execution["task_url"] = _worker_ticket_url(task_id, board=effective_board, public_url=str(public_url))
         elif worker_url_fallback:
-            execution["worker_url"] = str(worker_url_fallback)
             execution["task_url"] = str(worker_url_fallback)
     return {
         "id": f"self-improvement:{card['proposal_id']}",
@@ -466,7 +482,7 @@ def _task_work_item(
             },
         },
         "decision": {"needed": False},
-        "execution": _execution_from_task(task, board=board, board_meta=board_meta),
+        "execution": _execution_from_task(task, board=board, board_meta=board_meta, runs=runs),
         "runs": runs,
         "artifacts": _artifacts_from_task_and_board(task, board_meta),
         "source_excerpts": [],

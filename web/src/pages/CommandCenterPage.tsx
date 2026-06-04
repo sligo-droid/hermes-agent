@@ -689,8 +689,6 @@ export default function CommandCenterPage() {
     setError(null);
     try {
       if (kind === "archive") {
-        const confirmed = window.confirm(board && board !== "default" ? `Archive worker board ${board}?` : "Archive this work item and halt downstream execution?");
-        if (!confirmed) return;
         if (board && board !== "default") await api.archiveKanbanBoard(board);
         else if (proposalId) await api.haltSelfImprovementProposal(proposalId);
       } else if (proposalId && kind === "approve") {

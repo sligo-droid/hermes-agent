@@ -33,6 +33,28 @@ def test_command_center_worker_and_ticket_links_open_new_tabs():
     assert ticket_link_markers >= 2
 
 
+def test_command_center_archive_action_is_one_click_without_removing_other_prompts():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    archive_branch = source.split('if (kind === "archive") {', 1)[1].split('} else if (proposalId && kind === "approve")', 1)[0]
+
+    assert "window.confirm" not in archive_branch
+    assert "archiveKanbanBoard" in archive_branch
+    assert "haltSelfImprovementProposal" in archive_branch
+    assert 'window.prompt("Reject reason for future prong feedback?"' in source
+    assert 'window.prompt("Reason for revert follow-up?"' in source
+
+
+def test_command_center_worker_pill_has_no_workers_fallback():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
+    detail_source = source.split("function DetailPanel", 1)[1].split("function KeyValue", 1)[0]
+
+    assert "item.execution?.worker_url ?" in card_source
+    assert "item.execution?.worker_url &&" in detail_source
+    assert 'href="/workers"' not in card_source
+    assert 'to="/workers"' not in card_source
+
+
 def test_sligo_shell_has_no_duplicate_top_tab_navigation():
     source = (ROOT / "web/src/App.tsx").read_text(encoding="utf-8")
     shell_source = source.split("function SligoSurfaceShell", 1)[1].split("export default function App", 1)[0]
