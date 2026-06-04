@@ -264,7 +264,7 @@ def build_cron_proposal_guidance(
     max_cards = int(prong_cfg.get("max_cards_per_run") or _self_improvement_config(config).get("default_max_cards_per_run") or 5)
     label = prong_cfg.get("label") or prong
     focus = prong_cfg.get("focus") or "discrete operator-improvement proposals"
-    return (
+    guidance = (
         "## Self-Improvement Proposal Output\n"
         f"Project: `{project}`. Prong: `{prong}` ({label}). Focus: {focus}\n\n"
         f"Emit at most {max_cards} proposal cards. Prefer zero cards over weak, duplicate, or wall-of-text output. "
@@ -274,3 +274,18 @@ def build_cron_proposal_guidance(
         "Each card needs `proposal_id` or deterministic `idempotency_key` inputs, `title`, `summary`, `body`, `rationale`, `priority`, optional `severity`, "
         "`source_excerpts`, `status: proposed`, `created_at`, and `kanban_task` with enough title/body detail to construct a later Kanban task."
     )
+    feedback_cfg = _self_improvement_config(config).get("feedback_context", {})
+    if not isinstance(feedback_cfg, dict) or feedback_cfg.get("enabled", True):
+        try:
+            from self_improvement.proposal_storage import format_feedback_history_context, summarize_feedback_history
+
+            summary = summarize_feedback_history(
+                project=project,
+                prong=prong,
+                max_items_per_kind=int(feedback_cfg.get("max_items_per_kind", 3)) if isinstance(feedback_cfg, dict) else 3,
+                max_text_chars=int(feedback_cfg.get("max_text_chars", 180)) if isinstance(feedback_cfg, dict) else 180,
+            )
+            guidance = f"{guidance}\n\n{format_feedback_history_context(summary)}"
+        except Exception:
+            pass
+    return guidance

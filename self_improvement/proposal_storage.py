@@ -329,6 +329,124 @@ def _row_to_card(row: sqlite3.Row) -> dict[str, Any]:
     return data
 
 
+def _compact_text(value: str | None, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def summarize_feedback_history(
+    *,
+    project: str | None = None,
+    prong: str | None = None,
+    max_items_per_kind: int = 3,
+    max_text_chars: int = 180,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    """Return bounded approve/reject context grouped by project and prong."""
+
+    max_items = max(0, int(max_items_per_kind))
+    text_limit = max(0, int(max_text_chars))
+    init_db(db_path)
+    conn = connect(db_path)
+    try:
+        params: list[Any] = []
+        where = ["c.status IN ('approved', 'rejected')"]
+        if project:
+            where.append("c.project = ?")
+            params.append(project)
+        if prong:
+            where.append("c.prong = ?")
+            params.append(prong)
+        rows = conn.execute(
+            f"""
+            SELECT
+                c.proposal_id, c.project, c.prong, c.title, c.summary, c.priority,
+                c.severity, c.status, c.kanban_task_id, c.worker_url,
+                c.rejected_reason, c.updated_at,
+                f.body AS feedback_body, f.created_at AS feedback_created_at
+            FROM proposal_cards c
+            LEFT JOIN proposal_feedback f
+                ON f.id = (
+                    SELECT f2.id
+                    FROM proposal_feedback f2
+                    WHERE f2.proposal_id = c.proposal_id AND f2.kind = c.status
+                    ORDER BY f2.created_at DESC, f2.id DESC
+                    LIMIT 1
+                )
+            WHERE {' AND '.join(where)}
+            ORDER BY c.project, c.prong, c.status, COALESCE(f.created_at, c.updated_at) DESC, c.proposal_id
+            """,
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    projects: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        kind = row["status"]
+        project_group = projects.setdefault(row["project"], {"project": row["project"], "prongs": {}})
+        prong_group = project_group["prongs"].setdefault(
+            row["prong"],
+            {"prong": row["prong"], "accepted": [], "rejected": []},
+        )
+        bucket_name = "accepted" if kind == "approved" else "rejected"
+        bucket = prong_group[bucket_name]
+        if len(bucket) >= max_items:
+            continue
+        item = {
+            "proposal_id": row["proposal_id"],
+            "title": _compact_text(row["title"], text_limit),
+            "summary": _compact_text(row["summary"], text_limit),
+            "priority": row["priority"],
+            "severity": row["severity"],
+            "outcome": "accepted" if kind == "approved" else "rejected",
+            "updated_at": row["feedback_created_at"] or row["updated_at"],
+        }
+        if kind == "approved":
+            item["kanban_task_id"] = row["kanban_task_id"]
+            item["worker_url"] = row["worker_url"]
+        else:
+            item["reason"] = _compact_text(row["feedback_body"] or row["rejected_reason"], text_limit)
+        bucket.append(item)
+
+    return {
+        "projects": [
+            {"project": group["project"], "prongs": list(group["prongs"].values())}
+            for group in projects.values()
+        ],
+        "limits": {"max_items_per_kind": max_items, "max_text_chars": text_limit},
+    }
+
+
+def format_feedback_history_context(summary: dict[str, Any]) -> str:
+    """Render feedback summary as compact prompt context."""
+
+    lines = ["## Recent Proposal Feedback", "Use this accepted/rejected proposal history to avoid repeating rejected ideas and to build on accepted work."]
+    projects = summary.get("projects") if isinstance(summary, dict) else None
+    if not projects:
+        lines.append("No accepted or rejected proposal history is available for this project/prong yet.")
+        return "\n".join(lines)
+
+    for project in projects:
+        for prong in project.get("prongs", []):
+            lines.append(f"Project `{project.get('project')}` / prong `{prong.get('prong')}`:")
+            accepted = prong.get("accepted") or []
+            rejected = prong.get("rejected") or []
+            if accepted:
+                lines.append("Accepted recently:")
+                for item in accepted:
+                    task = f" -> {item.get('kanban_task_id')}" if item.get("kanban_task_id") else ""
+                    lines.append(f"- {item.get('title')} ({item.get('priority')}{task}): {item.get('summary')}")
+            if rejected:
+                lines.append("Rejected recently:")
+                for item in rejected:
+                    reason = item.get("reason") or "no reason recorded"
+                    lines.append(f"- {item.get('title')} ({item.get('priority')}): {item.get('summary')} Reason: {reason}")
+    return "\n".join(lines)
+
+
 def grouped_cards(*, db_path: Path | None = None) -> dict[str, Any]:
     init_db(db_path)
     conn = connect(db_path)

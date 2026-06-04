@@ -1854,6 +1854,11 @@ DEFAULT_CONFIG = {
     "self_improvement": {
         "proposal_contract_version": "self_improvement.proposal_run.v1",
         "default_max_cards_per_run": 5,
+        "feedback_context": {
+            "enabled": True,
+            "max_items_per_kind": 3,
+            "max_text_chars": 180,
+        },
         "projects": {
             "pid": {
                 "label": "PID",
