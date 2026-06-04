@@ -3,15 +3,37 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_issue_pulse_uses_native_button_keyboard_activation():
+def test_work_state_uses_native_button_keyboard_activation():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
 
-    assert "function IssuePulseChart" in source
-    issue_pulse_source = source.split("function IssuePulseChart", 1)[1].split("function SourceBadge", 1)[0]
-    assert "<button" in issue_pulse_source
-    assert "type=\"button\"" in issue_pulse_source
-    assert "aria-label" in issue_pulse_source
-    assert "onClick={() => onSelect(point.status)}" in issue_pulse_source
+    assert "function WorkStatePanel" in source
+    assert "Issue Pulse" not in source
+    work_state_source = source.split("function WorkStatePanel", 1)[1].split("function ActionButton", 1)[0]
+    assert "Work State" in work_state_source
+    assert "<button" in work_state_source
+    assert "type=\"button\"" in work_state_source
+    assert "aria-label" in work_state_source
+    assert "onClick={() => onSelectStatus(point.status)}" in work_state_source
+    assert 'if (normalized.includes("/runs")) return "runs";' in source
+    assert "opens in a new tab" in work_state_source
+
+
+def test_command_center_worker_and_ticket_links_open_new_tabs():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+
+    worker_link_markers = source.count('href={item.execution.worker_url} rel="noopener noreferrer" target="_blank"')
+    ticket_link_markers = source.count('href={item.execution.task_url} rel="noopener noreferrer" target="_blank"')
+    assert worker_link_markers >= 2
+    assert ticket_link_markers >= 2
+
+
+def test_sligo_shell_has_no_duplicate_top_tab_navigation():
+    source = (ROOT / "web/src/App.tsx").read_text(encoding="utf-8")
+    shell_source = source.split("function SligoSurfaceShell", 1)[1].split("export default function App", 1)[0]
+
+    assert "Sligo operator navigation" not in shell_source
+    assert "<SligoNavLink" not in shell_source
+    assert "Refresh Command Center" in shell_source
 
 
 def test_modal_behavior_traps_focus_and_restores_safely():
