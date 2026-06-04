@@ -30,6 +30,8 @@ class DiscordThreadPlanExpansion:
     thread_id: str
     thread_name: str = ""
     selected_message_ids: tuple[str, ...] = ()
+    artifact_path: str = ""
+    content_sha256: str = ""
     warnings: tuple[str, ...] = ()
     truncated: bool = False
     content: str = ""
@@ -43,6 +45,10 @@ class DiscordThreadPlanExpansion:
         lines.append(f"Source: {self.source}")
         if self.selected_message_ids:
             lines.append("Selected plan messages: " + ", ".join(self.selected_message_ids))
+        if self.artifact_path:
+            lines.append(f"Artifact: {self.artifact_path}")
+        if self.content_sha256:
+            lines.append(f"Content SHA256: {self.content_sha256}")
         if self.warnings:
             lines.append("Warnings: " + "; ".join(self.warnings))
         lines.append("")
@@ -97,24 +103,39 @@ def expand_discord_thread_references(
     refs = find_discord_thread_references(text)
     if not refs:
         return []
+    expansions: list[DiscordThreadPlanExpansion] = []
+    unresolved_refs: list[dict[str, str]] = []
+    seen_threads: set[str] = set()
+    for ref in refs:
+        artifact_expansion = _expand_artifact_reference(ref, max_output_chars=max_output_chars)
+        if artifact_expansion is None:
+            unresolved_refs.append(ref)
+            continue
+        key = artifact_expansion.thread_id or ref["source"]
+        if key in seen_threads:
+            continue
+        seen_threads.add(key)
+        expansions.append(artifact_expansion)
+    if not unresolved_refs:
+        return expansions
+
     token = _resolve_discord_token(token)
     if not token:
-        return [
+        expansions.extend(
             DiscordThreadPlanExpansion(
                 source=ref["source"],
                 thread_id=ref.get("target_id", ""),
                 warnings=("Discord thread expansion skipped: DISCORD_BOT_TOKEN is not set.",),
             )
-            for ref in refs
-        ]
+            for ref in unresolved_refs
+        )
+        return expansions
     if request_func is None:
         from tools.discord_tool import _discord_request
 
         request_func = _discord_request
 
-    expansions: list[DiscordThreadPlanExpansion] = []
-    seen_threads: set[str] = set()
-    for ref in refs:
+    for ref in unresolved_refs:
         try:
             expansion = _expand_one_reference(
                 ref,
@@ -141,6 +162,45 @@ def expand_discord_thread_references(
 def format_discord_thread_expansions(expansions: list[DiscordThreadPlanExpansion]) -> str:
     blocks = [expansion.formatted() for expansion in expansions if expansion.formatted()]
     return "\n\n".join(blocks).strip()
+
+
+def _expand_artifact_reference(
+    ref: dict[str, str],
+    *,
+    max_output_chars: int,
+) -> Optional[DiscordThreadPlanExpansion]:
+    target_id = ref.get("target_id", "")
+    if not target_id:
+        return None
+    try:
+        from hermes_cli.discord_plan_artifacts import lookup_discord_plan_artifact
+
+        artifact = lookup_discord_plan_artifact(target_id)
+    except Exception:
+        return None
+    if artifact is None:
+        return None
+
+    content = artifact.content.strip()
+    warnings: list[str] = []
+    truncated = False
+    if len(content) > max_output_chars:
+        content = content[:max_output_chars].rstrip() + "\n[Artifact content truncated to output cap.]"
+        warnings.append("Artifact plan text was truncated to output cap.")
+        truncated = True
+    if not content:
+        warnings.append("Artifact was indexed but the artifact file could not be read.")
+
+    return DiscordThreadPlanExpansion(
+        source=ref.get("source", target_id),
+        thread_id=artifact.thread_id or target_id,
+        selected_message_ids=artifact.bot_message_ids,
+        artifact_path=artifact.artifact_path,
+        content_sha256=artifact.content_sha256,
+        warnings=tuple(warnings),
+        truncated=truncated,
+        content=content,
+    )
 
 
 def _resolve_discord_token(token: Optional[str]) -> str:

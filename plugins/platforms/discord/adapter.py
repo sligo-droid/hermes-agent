@@ -32,6 +32,7 @@ from hermes_cli.discord_thread_context import (
     format_discord_thread_expansions,
     has_discord_thread_reference,
 )
+from hermes_cli.discord_plan_artifacts import persist_discord_plan_artifact
 
 logger = logging.getLogger(__name__)
 
@@ -3991,6 +3992,71 @@ class DiscordAdapter(BasePlatformAdapter):
             lines.append(f"Kanban: {public_url}")
         return "\n".join(lines)
 
+    @staticmethod
+    def _is_discord_thread_object(channel: Any) -> bool:
+        type_name = type(channel).__name__.lower()
+        if type_name.endswith("thread") or "thread" in type_name:
+            return True
+        channel_type = getattr(channel, "type", None)
+        channel_type_name = str(getattr(channel_type, "name", channel_type) or "").lower()
+        return channel_type_name in {"public_thread", "private_thread", "news_thread"}
+
+    def _persist_plan_artifact_for_send(
+        self,
+        *,
+        channel: Any,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+        reply_to: Optional[str],
+        message_ids: list[str],
+        chunk_count: int,
+    ) -> Optional[Dict[str, str]]:
+        try:
+            meta = dict(metadata or {})
+            target_channel_id = str(getattr(channel, "id", "") or chat_id or "").strip()
+            explicit_thread_id = str(meta.get("thread_id") or "").strip()
+            is_thread = bool(explicit_thread_id) or self._is_discord_thread_object(channel)
+            thread_id = explicit_thread_id or (target_channel_id if is_thread else "")
+            guild = getattr(channel, "guild", None)
+            guild_id = str(getattr(guild, "id", "") or "").strip()
+            parent_channel_id = ""
+            if is_thread:
+                parent = getattr(channel, "parent", None)
+                parent_channel_id = str(
+                    getattr(parent, "id", "") or getattr(channel, "parent_id", "") or ""
+                ).strip()
+            source_message_id = str(
+                meta.get("source_message_id")
+                or meta.get("reply_to_message_id")
+                or reply_to
+                or ""
+            ).strip()
+            record = persist_discord_plan_artifact(
+                content,
+                thread_id=thread_id,
+                channel_id=target_channel_id,
+                guild_id=guild_id,
+                parent_channel_id=parent_channel_id,
+                source_message_id=source_message_id,
+                session_id=str(meta.get("session_id") or ""),
+                command=str(meta.get("command") or meta.get("invoked_command") or ""),
+                kind=str(meta.get("plan_artifact_kind") or "discord_plan"),
+                bot_message_ids=message_ids,
+                metadata=meta,
+                chunk_count=chunk_count,
+            )
+            if record is None:
+                return None
+            return {
+                "artifact_id": record.artifact_id,
+                "artifact_path": record.artifact_path,
+                "content_sha256": record.content_sha256,
+            }
+        except Exception as exc:
+            logger.debug("[%s] Discord plan artifact persistence skipped: %s", self.name, exc, exc_info=True)
+            return None
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Mark a Discord turn as in-progress.
 
@@ -4160,10 +4226,26 @@ class DiscordAdapter(BasePlatformAdapter):
                 _target_id = thread_id or chat_id
                 self._last_self_message_id[_target_id] = message_ids[-1]
 
+            plan_artifact = None
+            if message_ids:
+                plan_artifact = self._persist_plan_artifact_for_send(
+                    channel=channel,
+                    chat_id=chat_id,
+                    content=formatted,
+                    metadata=metadata,
+                    reply_to=reply_to,
+                    message_ids=message_ids,
+                    chunk_count=len(chunks),
+                )
+
+            raw_response: Dict[str, Any] = {"message_ids": message_ids}
+            if plan_artifact:
+                raw_response["plan_artifact"] = plan_artifact
+
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
-                raw_response={"message_ids": message_ids}
+                raw_response=raw_response
             )
 
         except Exception as e:  # pragma: no cover - defensive logging
@@ -4216,7 +4298,19 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.warning("[%s] %s", self.name, warning)
                 warnings.append(warning)
 
+        plan_artifact = self._persist_plan_artifact_for_send(
+            channel=thread_channel,
+            chat_id=str(getattr(forum_channel, "id", "") or ""),
+            content=formatted,
+            metadata={"thread_id": thread_id},
+            reply_to=None,
+            message_ids=message_ids,
+            chunk_count=len(chunks),
+        )
+
         raw_response: Dict[str, Any] = {"message_ids": message_ids, "thread_id": thread_id}
+        if plan_artifact:
+            raw_response["plan_artifact"] = plan_artifact
         if warnings:
             raw_response["warnings"] = warnings
 
