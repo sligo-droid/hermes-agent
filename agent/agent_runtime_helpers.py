@@ -1711,6 +1711,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     elif function_name == "delegate_task":
         return _finish(agent._dispatch_delegate_task(function_args))
     elif function_name == "delegate_coding_task":
+        function_args = dict(function_args or {})
+        function_args["_parent_messages"] = list(messages or [])
         return _finish(agent._dispatch_coding_task(function_args))
     else:
         return _ra().handle_function_call(
