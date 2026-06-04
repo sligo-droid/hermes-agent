@@ -856,6 +856,10 @@ def _metrics(
         "boards": len(boards),
         "by_status": by_status,
         "by_source": by_source,
+        "issue_pulse": [
+            {"status": status, "count": count, "label": status.replace("_", " ").title()}
+            for status, count in sorted(by_status.items())
+        ],
     }
 
 

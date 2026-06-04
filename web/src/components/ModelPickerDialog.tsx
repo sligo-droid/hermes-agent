@@ -7,6 +7,7 @@ import { Check, Search, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { cn, themedBody } from "@/lib/utils";
+import { useModalBehavior } from "@/hooks/useModalBehavior";
 
 /**
  * Two-stage model picker modal.
@@ -89,6 +90,7 @@ export function ModelPickerDialog(props: Props) {
   const [persistGlobal, setPersistGlobal] = useState(alwaysGlobal);
   const [applying, setApplying] = useState(false);
   const closedRef = useRef(false);
+  const modalRef = useModalBehavior({ open: true, onClose });
 
   // Load providers + models on open.
   useEffect(() => {
@@ -126,18 +128,6 @@ export function ModelPickerDialog(props: Props) {
     // Deliberately omit props from deps — stable for the dialog's lifetime.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  // Esc closes.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
 
   const selectedProvider = useMemo(
     () => providers.find((p) => p.slug === selectedSlug) ?? null,
@@ -206,6 +196,7 @@ export function ModelPickerDialog(props: Props) {
   // Toast.tsx for the same pattern.
   return createPortal(
     <div
+      ref={modalRef}
       className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 backdrop-blur-sm p-4"
       onClick={(e) => e.target === e.currentTarget && onClose()}
       role="dialog"
@@ -246,6 +237,7 @@ export function ModelPickerDialog(props: Props) {
             <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
             <Input
               autoFocus
+              data-autofocus
               placeholder="Filter providers and models…"
               value={query}
               onChange={(e) => setQuery(e.target.value)}

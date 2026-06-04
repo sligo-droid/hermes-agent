@@ -295,6 +295,7 @@ export default function ProfilesPage() {
                 <Input
                   id="profile-name"
                   autoFocus
+                  data-autofocus
                   placeholder={t.profiles.namePlaceholder}
                   value={newName}
                   onChange={(e) => setNewName(e.target.value)}
