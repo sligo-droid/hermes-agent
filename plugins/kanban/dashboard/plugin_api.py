@@ -45,6 +45,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
@@ -634,7 +635,27 @@ def _proposal_priority(value: Any) -> int:
 
 
 def _worker_url(task_id: str) -> str:
-    return f"/workers?task={task_id}"
+    return f"/workers?task={quote(task_id, safe='')}"
+
+
+def _worker_ticket_url(task_id: str, *, board: str | None = None, board_public_url: str | None = None) -> str:
+    encoded_task = quote(task_id, safe="")
+    public_url = str(board_public_url or "").strip()
+    if public_url:
+        return f"{public_url.rstrip('/')}/tickets/{encoded_task}"
+    if board:
+        return f"/workers/{quote(str(board), safe='')}/tickets/{encoded_task}"
+    return _worker_url(task_id)
+
+
+def _approval_worker_url(task_id: str, discord_route: discord_publish.DiscordApprovalRoute | None, board: str | None) -> str:
+    if discord_route and (discord_route.board or discord_route.board_public_url):
+        return _worker_ticket_url(
+            task_id,
+            board=discord_route.board or board,
+            board_public_url=discord_route.board_public_url,
+        )
+    return _worker_url(task_id)
 
 
 @router.post("/tasks")
@@ -1312,7 +1333,7 @@ def self_improvement_proposals_endpoint():
     payload, but this endpoint is read-only and never creates Kanban tasks.
     """
 
-    return proposal_storage.grouped_cards()
+    return _repair_grouped_worker_urls(proposal_storage.grouped_cards())
 
 
 @router.get("/self-improvement/runs")
@@ -1327,6 +1348,7 @@ def self_improvement_proposal_detail_endpoint(proposal_id: str):
     card = proposal_storage.get_card(proposal_id)
     if card is None:
         raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")
+    _repair_card_worker_url(card)
     return {"card": card}
 
 
@@ -1375,10 +1397,11 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
     if discord_route and discord_route.board:
         board = discord_route.board
 
+    worker_url = _approval_worker_url(task_id, discord_route, board)
     approved = proposal_storage.record_approval(
         proposal_id,
         kanban_task_id=task_id,
-        worker_url=_worker_url(task_id),
+        worker_url=worker_url,
         actor=_proposal_actor(),
         metadata={
             "idempotency_key": idempotency_key,
@@ -1387,7 +1410,33 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
             **({"discord_channel_id": channel_id, "discord_publish": "unavailable"} if channel_id and not discord_route else {}),
         },
     )
-    return {"card": approved, "task": _task_dict(task) if task else None, "worker_url": _worker_url(task_id)}
+    return {"card": approved, "task": _task_dict(task) if task else None, "worker_url": worker_url}
+
+
+def _repair_grouped_worker_urls(grouped: dict[str, Any]) -> dict[str, Any]:
+    for project in grouped.get("projects") or []:
+        for prong in project.get("prongs") or []:
+            for card in prong.get("cards") or []:
+                if isinstance(card, dict):
+                    _repair_card_worker_url(card)
+    return grouped
+
+
+def _repair_card_worker_url(card: dict[str, Any]) -> None:
+    task_id = str(card.get("kanban_task_id") or "").strip()
+    if not task_id:
+        return
+    current = str(card.get("worker_url") or "").strip()
+    legacy_url = _worker_url(task_id)
+    if current and current not in {legacy_url, "/workers"} and not current.startswith("/workers?"):
+        return
+    metadata = _latest_discord_approval_metadata(str(card.get("proposal_id") or ""))
+    board = metadata.get("discord_board") or metadata.get("board")
+    if board == "default":
+        board = None
+    board_public_url = metadata.get("discord_board_public_url")
+    if board or board_public_url:
+        card["worker_url"] = _worker_ticket_url(task_id, board=board, board_public_url=board_public_url)
 
 
 def _latest_discord_approval_metadata(proposal_id: str) -> dict[str, Any]:
