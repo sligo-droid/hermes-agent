@@ -1994,6 +1994,11 @@ class TestPluginAPIAuth:
         resp = self.client.post("/api/plugins/kanban/tasks", json={"title": "test"})
         assert resp.status_code == 401
 
+    def test_self_improvement_action_requires_auth(self):
+        """Proposal approve/reject actions inherit plugin mutation auth."""
+        resp = self.client.post("/api/plugins/kanban/self-improvement/proposals/p_1/approve")
+        assert resp.status_code == 401
+
     def test_plugin_patch_requires_auth(self):
         """Plugin PATCH routes should return 401 without a valid session token.
 

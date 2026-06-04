@@ -29,6 +29,7 @@ import {
   FileText,
   Globe,
   Heart,
+  Home,
   KeyRound,
   Menu,
   MessageSquare,
@@ -74,6 +75,8 @@ import SkillsPage from "@/pages/SkillsPage";
 import PluginsPage from "@/pages/PluginsPage";
 import ChatPage from "@/pages/ChatPage";
 import WorkerConsolePage from "@/pages/WorkerConsolePage";
+import SelfImprovementBoardPage from "@/pages/SelfImprovementBoardPage";
+import SligoOperatorPage from "@/pages/SligoOperatorPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -111,6 +114,18 @@ const WORKERS_NAV_ITEM: NavItem = {
   reloadDocument: true,
 };
 
+const SLIGO_NAV_ITEM: NavItem = {
+  path: "/sligo",
+  label: "Sligo Home",
+  icon: Home,
+};
+
+const SELF_IMPROVEMENT_NAV_ITEM: NavItem = {
+  path: "/self-improvement",
+  label: "Self-Improvement",
+  icon: Sparkles,
+};
+
 /**
  * Built-in routes except /chat.  Chat is rendered persistently (outside
  * <Routes>) when embedded — see the persistent chat host block rendered
@@ -133,6 +148,8 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/config": ConfigPage,
   "/env": EnvPage,
   "/docs": DocsPage,
+  "/sligo": SligoOperatorPage,
+  "/self-improvement": SelfImprovementBoardPage,
   "/workers/:sessionId/tickets/:taskId/console": WorkerConsolePage,
 };
 
@@ -198,6 +215,7 @@ const ICON_MAP: Record<string, ComponentType<{ className?: string }>> = {
   Wrench,
   Zap,
   Heart,
+  Home,
   Star,
   Code,
   Eye,
@@ -417,7 +435,7 @@ export default function App() {
       const nav = partitionSidebarNav(builtinNav, manifests);
       return {
         ...nav,
-        pluginItems: [WORKERS_NAV_ITEM, ...nav.pluginItems],
+        pluginItems: [SLIGO_NAV_ITEM, SELF_IMPROVEMENT_NAV_ITEM, WORKERS_NAV_ITEM, ...nav.pluginItems],
       };
     },
     [builtinNav, manifests],

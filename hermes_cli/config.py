@@ -1851,6 +1851,44 @@ DEFAULT_CONFIG = {
         "memory_mode": "off",
     },
 
+    "self_improvement": {
+        "proposal_contract_version": "self_improvement.proposal_run.v1",
+        "default_max_cards_per_run": 5,
+        "feedback_context": {
+            "enabled": True,
+            "max_items_per_kind": 3,
+            "max_text_chars": 180,
+        },
+        "projects": {
+            "pid": {
+                "label": "PID",
+                "description": "Sligo PID operator self-improvement proposals.",
+                "prongs": {
+                    "airflow_scraper_doctor": {
+                        "label": "Nightly PID Airflow scraper doctor",
+                        "focus": "Airflow scraper reliability, observability, and source-ingestion maintenance.",
+                        "max_cards_per_run": 5,
+                    },
+                    "admin_dogfood_ux_bugfix": {
+                        "label": "Daily PID admin dogfood UX bugfix",
+                        "focus": "Admin dogfood issues that can become discrete UX bugfix tasks.",
+                        "max_cards_per_run": 5,
+                    },
+                    "invisible_technical_recommendations": {
+                        "label": "Daily PID invisible technical recommendations",
+                        "focus": "Backend, infrastructure, data quality, and maintainability improvements invisible to end users.",
+                        "max_cards_per_run": 5,
+                    },
+                    "visible_ui_ux_recommendations": {
+                        "label": "Daily PID visible UI/UX recommendations",
+                        "focus": "User-facing PID interface improvements with clear operator or customer value.",
+                        "max_cards_per_run": 5,
+                    },
+                },
+            },
+        },
+    },
+
     # Kanban multi-agent coordination — controls the dispatcher loop that
     # spawns workers for ready tasks. The dispatcher ticks every N seconds
     # (default 10), reclaims stale claims, promotes dependency-satisfied
