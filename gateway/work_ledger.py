@@ -452,6 +452,7 @@ class GatewayWorkLedger:
         title: str | None = None,
         feature_summary: dict[str, Any] | None = None,
         project_summary: dict[str, Any] | None = None,
+        runtime_breakdown: dict[str, Any] | None = None,
         already_delivered: bool = False,
     ) -> bool:
         data = self._read()
@@ -473,6 +474,8 @@ class GatewayWorkLedger:
             item["feature_summary"] = _durable_metadata(feature_summary)
         if project_summary is not None:
             item["project_summary"] = _durable_metadata(project_summary)
+        if runtime_breakdown is not None:
+            item["runtime_breakdown"] = _durable_metadata(runtime_breakdown)
         gate = classify_delivery_completion(item)
         item["completion_gate"] = gate
         if not gate.get("allowed_to_complete"):

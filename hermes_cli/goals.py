@@ -178,6 +178,7 @@ class GoalState:
     # them into the verdict. Backwards-compatible: defaults to empty so
     # old state_meta rows load unchanged.
     subgoals: List[str] = field(default_factory=list)
+    runtime_breakdown: Dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -201,6 +202,7 @@ class GoalState:
             paused_reason=data.get("paused_reason"),
             consecutive_parse_failures=int(data.get("consecutive_parse_failures", 0) or 0),
             subgoals=subgoals,
+            runtime_breakdown=data.get("runtime_breakdown") if isinstance(data.get("runtime_breakdown"), dict) else {},
         )
 
     # --- subgoals helpers -------------------------------------------------
@@ -743,6 +745,7 @@ class GoalManager:
         last_response: str,
         *,
         user_initiated: bool = True,
+        runtime_breakdown: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Run the judge and update state. Return a decision dict.
 
@@ -772,6 +775,17 @@ class GoalManager:
         # Count the turn that just finished.
         state.turns_used += 1
         state.last_turn_at = time.time()
+        if isinstance(runtime_breakdown, dict) and runtime_breakdown:
+            try:
+                from agent.runtime_breakdown import merge_runtime_breakdowns
+
+                existing = state.runtime_breakdown if isinstance(state.runtime_breakdown, dict) else {}
+                state.runtime_breakdown = merge_runtime_breakdowns(
+                    [existing, runtime_breakdown] if existing else [runtime_breakdown],
+                    scope="goal",
+                )
+            except Exception:
+                logger.debug("GoalManager: runtime accumulation failed", exc_info=True)
 
         verdict, reason, parse_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None
@@ -797,6 +811,7 @@ class GoalManager:
                 "verdict": "done",
                 "reason": reason,
                 "message": f"✓ Goal achieved: {reason}",
+                "runtime_breakdown": state.runtime_breakdown,
             }
 
         if verdict == "blocked":
@@ -810,6 +825,7 @@ class GoalManager:
                 "verdict": "blocked",
                 "reason": reason,
                 "message": f"⏸ Goal paused — blocked: {reason}",
+                "runtime_breakdown": state.runtime_breakdown,
             }
 
         # Auto-pause when the judge model can't produce the expected JSON
@@ -840,6 +856,7 @@ class GoalManager:
                     "      model: google/gemini-3-flash-preview\n"
                     "Then /goal resume to continue."
                 ),
+                "runtime_breakdown": state.runtime_breakdown,
             }
 
         if state.turns_used >= state.max_turns:
@@ -856,6 +873,7 @@ class GoalManager:
                     f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used. "
                     "Use /goal resume to keep going, or /goal clear to stop."
                 ),
+                "runtime_breakdown": state.runtime_breakdown,
             }
 
         save_goal(self.session_id, state)
@@ -868,6 +886,7 @@ class GoalManager:
             "message": (
                 f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}"
             ),
+            "runtime_breakdown": state.runtime_breakdown,
         }
 
     def next_continuation_prompt(self) -> Optional[str]:

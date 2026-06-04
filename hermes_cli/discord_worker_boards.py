@@ -57,6 +57,7 @@ from hermes_cli.discord_worker_state import (
     record_codex_worker_event,
     record_codex_worker_result,
 )
+from agent.runtime_breakdown import render_runtime_breakdown_text
 from utils import atomic_json_write
 
 
@@ -2504,6 +2505,79 @@ def _summary_timestamps(worker: dict[str, Any], tasks: list[Any], runs: list[Any
     return started, completed, duration
 
 
+def _run_phase_name(task: Any, run: Any) -> str:
+    assignee = str(getattr(task, "assignee", "") or "").strip().lower()
+    unit = str(getattr(run, "worker_unit", "") or "").strip().lower()
+    step = str(getattr(run, "step_key", "") or "").strip().lower()
+    joined = " ".join(part for part in (assignee, unit, step) if part)
+    if assignee == ROLE_PLANNER or "planner" in joined or "plan" in joined:
+        return "Plan"
+    if assignee == ROLE_REVIEWER or "reviewer" in joined or "review" in joined:
+        return "Review"
+    if "ci" in joined or "check" in joined or "test" in joined:
+        return "CI"
+    if "deploy" in joined or "release" in joined:
+        return "Deploy"
+    if assignee == ROLE_DEV or "dev" in joined or "build" in joined:
+        return "Build"
+    return "Work"
+
+
+def _board_runtime_breakdown(
+    worker: dict[str, Any],
+    tasks: list[Any],
+    runs_by_task: dict[str, list[Any]],
+) -> dict[str, Any]:
+    runs = [run for run_list in runs_by_task.values() for run in run_list]
+    started_at, completed_at, duration_seconds = _summary_timestamps(worker, tasks, runs)
+    if started_at and completed_at is None:
+        duration_seconds = max(0, _now() - int(started_at))
+    task_by_id = {str(getattr(task, "id", "") or ""): task for task in tasks}
+    phases: dict[str, dict[str, Any]] = {}
+    active = 0.0
+    now = _now()
+    for run in runs:
+        start = getattr(run, "started_at", None)
+        if start is None:
+            continue
+        try:
+            start_i = int(start)
+        except (TypeError, ValueError):
+            continue
+        end_raw = getattr(run, "ended_at", None)
+        try:
+            end_i = int(end_raw) if end_raw is not None else now
+        except (TypeError, ValueError):
+            end_i = now
+        if end_i < start_i:
+            continue
+        duration = float(end_i - start_i)
+        task = task_by_id.get(str(getattr(run, "task_id", "") or ""))
+        phase = _run_phase_name(task, run)
+        slot = phases.setdefault(phase, {"name": phase, "duration_s": 0.0, "count": 0})
+        slot["duration_s"] += duration
+        slot["count"] += 1
+        active += duration
+    wall = float(duration_seconds or 0)
+    queue = max(0.0, wall - active) if wall else 0.0
+    rows = sorted(phases.values(), key=lambda item: item["duration_s"], reverse=True)
+    if queue:
+        rows.append({"name": "Queue", "duration_s": queue, "count": 0})
+    return {
+        "schema_version": 1,
+        "scope": "discord_worker_board",
+        "wall_s": wall,
+        "model_s": 0.0,
+        "tools_s": active,
+        "overhead_s": queue,
+        "active_s": active,
+        "api_calls": 0,
+        "tool_calls": len(runs),
+        "phases": rows[:6],
+        "active_exceeds_wall": bool(wall and active > wall + 0.25),
+    }
+
+
 def _pr_summary(worker: dict[str, Any]) -> dict[str, Any]:
     checks_status = str(worker.get("pr_checks_status") or "").strip() or "not checked"
     merge_state = str(worker.get("pr_merge_state") or "").strip() or "unknown"
@@ -2544,6 +2618,7 @@ def build_board_run_summary(board: str) -> dict[str, Any]:
 
     runs = [run for run_list in runs_by_task.values() for run in run_list]
     started_at, completed_at, duration_seconds = _summary_timestamps(worker, tasks, runs)
+    runtime_breakdown = _board_runtime_breakdown(worker, tasks, runs_by_task)
     task_rows = [
         {
             "id": str(getattr(task, "id", "") or ""),
@@ -2594,6 +2669,7 @@ def build_board_run_summary(board: str) -> dict[str, Any]:
         "started_at": started_at,
         "completed_at": completed_at,
         "duration_seconds": duration_seconds,
+        "runtime_breakdown": runtime_breakdown,
         "latest_tasks": task_rows,
     }
     return summary
@@ -2729,6 +2805,9 @@ def render_board_run_summary_text(summary: dict[str, Any]) -> str:
     duration = summary.get("duration_seconds")
     duration_text = f"{duration}s" if duration is not None else "unknown"
     lines.append(f"Timing: started {started}; completed {completed}; duration {duration_text}")
+    runtime_text = render_runtime_breakdown_text(summary.get("runtime_breakdown"), compact=True)
+    if runtime_text:
+        lines.append(f"Runtime: {runtime_text.replace(chr(10), '; ')}")
     return "\n".join(lines)
 
 
@@ -2763,6 +2842,7 @@ def feature_summary_snapshot(board: str) -> dict[str, Any]:
         summaries = kanban_db.latest_summaries(conn, [t.id for t in tasks])
         counts = kanban_db.board_stats(conn).get("by_status", {})
         running = _running_ticket_snapshot(conn)
+        runs_by_task = {t.id: kanban_db.list_runs(conn, t.id) for t in tasks}
     finally:
         conn.close()
 
@@ -2784,6 +2864,13 @@ def feature_summary_snapshot(board: str) -> dict[str, Any]:
     )
     if terminal_summary:
         outcome = _terminal_summary_outcome(terminal_summary)
+        runtime_breakdown = terminal_summary.get("runtime_breakdown") if isinstance(terminal_summary.get("runtime_breakdown"), dict) else {}
+    else:
+        runtime_breakdown = _board_runtime_breakdown(
+            worker,
+            tasks,
+            runs_by_task,
+        )
     snapshot = {
         "board": board,
         "thread_id": str(worker.get("thread_id") or ""),
@@ -2800,6 +2887,7 @@ def feature_summary_snapshot(board: str) -> dict[str, Any]:
         "pr_url": str(worker.get("pr_url") or "").strip(),
         "pr_number": str(worker.get("pr_number") or "").strip(),
         "public_url": str(worker.get("public_url") or "").strip(),
+        "runtime_breakdown": runtime_breakdown,
         "terminal_summary_updated_at": terminal_summary.get("generated_at") if terminal_summary else None,
         "updated_at": worker.get("updated_at"),
     }
@@ -2872,6 +2960,7 @@ def thread_status_targets() -> list[dict[str, Any]]:
             "pr_url": summary.get("pr_url") or "",
             "pr_number": summary.get("pr_number") or "",
             "public_url": summary.get("public_url") or "",
+            "runtime_breakdown": summary.get("runtime_breakdown") or {},
             "sync_key": summary.get("sync_key") or "",
             "terminal_reaction_sync_pending": bool(worker.get("terminal_reaction_sync_pending")),
             "terminal_summary_sync_pending": bool(worker.get("terminal_summary_sync_pending")),

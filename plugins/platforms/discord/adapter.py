@@ -33,6 +33,7 @@ from hermes_cli.discord_thread_context import (
     has_discord_thread_reference,
 )
 from hermes_cli.discord_plan_artifacts import persist_discord_plan_artifact
+from agent.runtime_breakdown import render_runtime_breakdown_text
 
 logger = logging.getLogger(__name__)
 
@@ -2157,6 +2158,7 @@ class DiscordAdapter(BasePlatformAdapter):
         source_kanban_url: Optional[str] = None,
         source_discord_thread_url: Optional[str] = None,
         hide_source_links: bool = False,
+        runtime_breakdown: Optional[Dict[str, Any]] = None,
     ):
         metadata = metadata or self._collect_discord_project_metadata()
         embed_kwargs = {
@@ -2186,6 +2188,9 @@ class DiscordAdapter(BasePlatformAdapter):
             fields.append(("Branch", branch, True))
         if metadata.get("pr_url"):
             fields.append(("GitHub PR", metadata["pr_url"], False))
+        runtime_text = render_runtime_breakdown_text(runtime_breakdown, compact=True)
+        if runtime_text:
+            fields.append(("Time Spent", runtime_text, False))
         if kanban_url:
             if source_board:
                 duplicates_source_url = any(
@@ -2410,6 +2415,7 @@ class DiscordAdapter(BasePlatformAdapter):
         status: str = "Complete",
         title: Optional[str] = None,
         kanban_sync: bool = False,
+        runtime_breakdown: Optional[Dict[str, Any]] = None,
     ) -> bool:
         if not handle:
             return False
@@ -2426,6 +2432,8 @@ class DiscordAdapter(BasePlatformAdapter):
             status = self._feature_kanban_summary_status(handle) or status
             final_response = str(kanban_snapshot.get("outcome") or final_response or "")
             title = str(title or kanban_snapshot.get("title") or "") or None
+            if not runtime_breakdown and isinstance(kanban_snapshot.get("runtime_breakdown"), dict):
+                runtime_breakdown = kanban_snapshot.get("runtime_breakdown")
         else:
             status = self._feature_kanban_summary_status(handle) or status
         try:
@@ -2486,6 +2494,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 source_kanban_url=str(handle.get("source_kanban_url") or "") or None,
                 source_discord_thread_url=str(handle.get("source_discord_thread_url") or "") or None,
                 hide_source_links=bool(handle.get("hide_source_links")),
+                runtime_breakdown=runtime_breakdown,
             )
             edit_key = self._feature_summary_edit_cache_key(handle, msg)
             payload = self._feature_summary_embed_payload(embed)
