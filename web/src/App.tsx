@@ -304,14 +304,16 @@ function partitionSidebarNav(
   return { coreItems, pluginItems };
 }
 
-function buildRoutes(
-  builtinRoutes: Record<string, ComponentType>,
-  manifests: PluginManifest[],
-): Array<{
+type DashboardRoute = {
   key: string;
   path: string;
   element: ReactNode;
-}> {
+};
+
+function buildRoutes(
+  builtinRoutes: Record<string, ComponentType>,
+  manifests: PluginManifest[],
+): DashboardRoute[] {
   const byOverride = new Map<string, PluginManifest>();
   const addons: PluginManifest[] = [];
 
@@ -323,11 +325,7 @@ function buildRoutes(
     }
   }
 
-  const routes: Array<{
-    key: string;
-    path: string;
-    element: ReactNode;
-  }> = [];
+  const routes: DashboardRoute[] = [];
 
   for (const [path, Component] of Object.entries(builtinRoutes)) {
     const om = byOverride.get(path);
@@ -368,6 +366,76 @@ function buildRoutes(
 }
 
 const SIDEBAR_COLLAPSED_KEY = "hermes-sidebar-collapsed";
+
+function SligoNavLink({ children, to }: { children: ReactNode; to: string }) {
+  return (
+    <NavLink
+      className={({ isActive }) =>
+        cn(
+          "rounded-full px-3 py-2 text-sm font-medium text-slate-300 transition",
+          "hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-200/70",
+          isActive && "bg-cyan-200/12 text-cyan-50 ring-1 ring-cyan-200/25",
+        )
+      }
+      to={to}
+    >
+      {children}
+    </NavLink>
+  );
+}
+
+function SligoSurfaceShell({ routes }: { routes: DashboardRoute[] }) {
+  return (
+    <div
+      data-layout-variant="sligo-operator"
+      className="relative flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-[#050713] text-slate-100 antialiased"
+    >
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_15%_10%,rgba(34,211,238,0.16),transparent_30%),radial-gradient(circle_at_85%_0%,rgba(16,185,129,0.12),transparent_26%),linear-gradient(180deg,#060817,#03050d)]" />
+      <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-cyan-200/60 to-transparent" />
+
+      <header className="relative z-20 border-b border-white/10 bg-[#060817]/88 backdrop-blur-xl">
+        <div className="mx-auto flex max-w-[1560px] flex-col gap-3 px-4 py-3 sm:px-6 lg:flex-row lg:items-center lg:justify-between lg:px-8">
+          <NavLink className="flex w-fit items-center gap-3" to="/sligo">
+            <span className="flex h-10 w-10 items-center justify-center rounded-2xl border border-cyan-200/25 bg-cyan-200/10 text-sm font-bold tracking-[0.18em] text-cyan-50 shadow-lg shadow-cyan-950/20">
+              SL
+            </span>
+            <span>
+              <span className="block text-sm font-semibold uppercase tracking-[0.18em] text-white">Sligo Labs</span>
+              <span className="block text-xs uppercase tracking-[0.16em] text-slate-500">Operator surface</span>
+            </span>
+          </NavLink>
+
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+            <nav aria-label="Sligo operator navigation" className="flex flex-wrap gap-1 rounded-full border border-white/10 bg-white/[0.035] p-1">
+              <SligoNavLink to="/sligo">Home</SligoNavLink>
+              <SligoNavLink to="/self-improvement">Proposal tickets</SligoNavLink>
+              <a
+                className="rounded-full px-3 py-2 text-sm font-medium text-slate-300 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-200/70"
+                href="/workers"
+              >
+                Workers
+              </a>
+            </nav>
+            <div className="hidden rounded-full border border-white/10 px-3 py-2 text-xs uppercase tracking-[0.16em] text-slate-500 sm:block">
+              Protected internal ops
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main className="relative z-10 min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto w-full max-w-[1560px] px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
+          <Routes>
+            {routes.map(({ key, path, element }) => (
+              <Route key={key} path={path} element={element} />
+            ))}
+            <Route path="*" element={<RootRedirect to="/sligo" />} />
+          </Routes>
+        </div>
+      </main>
+    </div>
+  );
+}
 
 export default function App() {
   const { t } = useI18n();
@@ -526,6 +594,10 @@ export default function App() {
     mql.addEventListener("change", onChange);
     return () => mql.removeEventListener("change", onChange);
   }, []);
+
+  if (dashboardSurface === "sligo") {
+    return <SligoSurfaceShell routes={routes} />;
+  }
 
   return (
     <div
@@ -787,13 +859,7 @@ export default function App() {
                   ))}
                   <Route
                     path="*"
-                    element={
-                      dashboardSurface === "sligo" ? (
-                        <RootRedirect to="/sligo" />
-                      ) : (
-                        <UnknownRouteFallback pluginsLoading={pluginsLoading} />
-                      )
-                    }
+                    element={<UnknownRouteFallback pluginsLoading={pluginsLoading} />}
                   />
                 </Routes>
 
