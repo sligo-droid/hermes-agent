@@ -309,10 +309,10 @@ function WorkItemCard({
           )}
           {canApproveReject && <ActionButton busy={actionBusy("approve")} kind="approve" onClick={() => onAction("approve", item)} />}
           {canApproveReject && <ActionButton busy={actionBusy("reject")} kind="reject" onClick={() => onAction("reject", item)} />}
-          {canArchive && <ActionButton busy={actionBusy("archive")} kind="archive" onClick={() => onAction("archive", item)} />}
           {canResume && <ActionButton busy={actionBusy("resume")} kind="resume" onClick={() => onAction("resume", item)} />}
           {canPause && <ActionButton busy={actionBusy("pause")} kind="pause" onClick={() => onAction("pause", item)} />}
           {canUndo && <ActionButton busy={actionBusy("undo")} kind="undo" onClick={() => onAction("undo", item)} />}
+          {canArchive && <ActionButton busy={actionBusy("archive")} kind="archive" onClick={() => onAction("archive", item)} />}
         </div>
       ) : null}
     </article>

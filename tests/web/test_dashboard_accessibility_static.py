@@ -44,6 +44,16 @@ def test_command_center_archive_action_is_one_click_without_removing_other_promp
     assert 'window.prompt("Reason for revert follow-up?"' in source
 
 
+def test_command_center_archive_action_renders_last_in_row_rail():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    row_rail = source.split('className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3"', 1)[1].split("</div>", 1)[0]
+
+    assert row_rail.index('kind="approve"') < row_rail.index('kind="reject"')
+    assert row_rail.index('kind="resume"') < row_rail.index('kind="archive"')
+    assert row_rail.index('kind="pause"') < row_rail.index('kind="archive"')
+    assert row_rail.index('kind="undo"') < row_rail.index('kind="archive"')
+
+
 def test_command_center_worker_pill_has_no_workers_fallback():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
     card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
