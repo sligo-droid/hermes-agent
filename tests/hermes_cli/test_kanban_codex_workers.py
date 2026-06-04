@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1327,6 +1328,105 @@ def test_reviewer_output_creates_next_round_dev_ticket(monkeypatch, tmp_path):
     assert [item.title for item in dev_tasks] == ["R2: Fix follow-up"]
 
 
+def test_reviewer_pr_lifecycle_task_finalizes_without_dev_ticket(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+
+    board = dwb.start_direct_goal(thread_id="review-pr-chore", goal="Ship it")
+    calls = []
+    monkeypatch.setattr(worker, "_ensure_pr", lambda board, workspace: calls.append((board, workspace)) or True)
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        reviewer_id = kanban_db.create_task(
+            conn,
+            title="R2: Review Discord implementation",
+            assignee=ROLE_REVIEWER,
+            tenant=board.slug,
+        )
+        claimed = kanban_db.claim_task(conn, reviewer_id)
+        assert claimed is not None
+
+        worker._apply_role_output(
+            conn,
+            claimed.id,
+            ROLE_REVIEWER,
+            {
+                "status": "changes_requested",
+                "summary": "Implementation is fine; PR branch is stale.",
+                "new_tasks": [
+                    {
+                        "title": "R3: Update PR 239 with final branch state",
+                        "body": "Push the worker branch, run gh pr checks --watch, and confirm the PR view is current.",
+                        "priority": 10,
+                    }
+                ],
+            },
+            board=board.slug,
+            workspace=str(tmp_path / "repo"),
+            expected_run_id=claimed.current_run_id,
+        )
+        dev_tasks = [
+            item for item in kanban_db.list_tasks(conn, include_archived=False)
+            if item.assignee == "dev"
+        ]
+    finally:
+        conn.close()
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert dev_tasks == []
+    assert calls == [(board.slug, str(tmp_path / "repo"))]
+    assert meta["phase"] == "complete"
+    assert meta["goal_status"] == "done"
+
+
+def test_reviewer_pr_lifecycle_task_filter_keeps_real_code_followup(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+
+    board = dwb.start_direct_goal(thread_id="review-mixed-followup", goal="Ship it")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        reviewer_id = kanban_db.create_task(
+            conn,
+            title="R2: Review Discord implementation",
+            assignee=ROLE_REVIEWER,
+            tenant=board.slug,
+        )
+        claimed = kanban_db.claim_task(conn, reviewer_id)
+        assert claimed is not None
+
+        worker._apply_role_output(
+            conn,
+            claimed.id,
+            ROLE_REVIEWER,
+            {
+                "status": "changes_requested",
+                "summary": "Needs one code fix and one PR chore.",
+                "new_tasks": [
+                    {"title": "Update PR 239", "body": "Push branch and wait for checks.", "priority": 10},
+                    {"title": "Fix failing CI test", "body": "Goal: repair the failing unit test.", "priority": 9},
+                ],
+            },
+            board=board.slug,
+            workspace=str(tmp_path / "repo"),
+            expected_run_id=claimed.current_run_id,
+        )
+        dev_tasks = [
+            item for item in kanban_db.list_tasks(conn, include_archived=False)
+            if item.assignee == "dev"
+        ]
+    finally:
+        conn.close()
+
+    assert [item.title for item in dev_tasks] == ["R1: Fix failing CI test"]
+
+
 def test_reviewer_approval_blocks_board_when_pr_publication_fails(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -1428,7 +1528,7 @@ def test_planner_schema_uses_parents_not_depends_on():
 
 def test_worker_role_frames_are_outcome_first():
     from hermes_cli import kanban_codex_worker as worker
-    from hermes_cli.discord_worker_boards import ROLE_DEV, ROLE_REVIEWER
+    from hermes_cli.discord_worker_boards import ROLE_DEV, ROLE_PLANNER, ROLE_REVIEWER
 
     dev_frame = worker._role_outcome_frame(ROLE_DEV)
     reviewer_frame = worker._role_outcome_frame(ROLE_REVIEWER)
@@ -1442,6 +1542,40 @@ def test_worker_role_frames_are_outcome_first():
     assert "Stop when: Return the JSON review verdict." in reviewer_frame
     assert "new_tasks body must be a self-contained follow-up brief" in reviewer_schema
     assert "opens with Goal, Success means, and Stop when" in reviewer_schema
+    assert "Do not create dev tickets whose goal is to push a branch" in worker._schema_instructions(ROLE_PLANNER)
+    assert "Do not emit new_tasks for pure PR lifecycle chores" in reviewer_schema
+    assert "Never push to a remote branch" in worker._schema_instructions(ROLE_DEV)
+
+
+def test_worker_pr_mutation_guard_blocks_push_and_pr_mutation(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+
+    monkeypatch.setattr(worker.shutil, "which", lambda binary: "/bin/true")
+    guard_env, guard_dir = worker._role_pr_mutation_guard_env(ROLE_DEV)
+    assert guard_dir is not None
+    env = os.environ.copy()
+    env.update(guard_env)
+    try:
+        git_push = subprocess.run(["git", "push"], env=env, capture_output=True, text=True, timeout=10)
+        gh_create = subprocess.run(["gh", "pr", "create"], env=env, capture_output=True, text=True, timeout=10)
+        gh_repo_create = subprocess.run(
+            ["gh", "--repo", "sligo-labs/PID", "pr", "create"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        git_status = subprocess.run(["git", "status"], env=env, capture_output=True, text=True, timeout=10)
+    finally:
+        worker._cleanup_pr_mutation_guard(guard_dir)
+
+    assert git_push.returncode == 126
+    assert gh_create.returncode == 126
+    assert gh_repo_create.returncode == 126
+    assert "deterministic finalizer" in git_push.stderr
+    assert "deterministic finalizer" in gh_create.stderr
+    assert git_status.returncode == 0
 
 
 def test_worker_prompt_mentions_discord_read_helper(monkeypatch, tmp_path):
@@ -1716,6 +1850,74 @@ def test_update_phase_refreshes_worker_updated_at(monkeypatch, tmp_path):
     assert meta["terminal_reaction_sync_pending"] is True
     assert meta["terminal_summary_sync_pending"] is True
     assert meta["terminal_completion_message_pending"] is True
+
+
+def test_pr_policy_defaults_auto_but_explicit_do_not_merge_sets_never(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    auto_board = dwb.start_direct_goal(thread_id="auto-pr-policy", goal="Implement and ship it")
+    never_board = dwb.start_direct_goal(
+        thread_id="never-pr-policy",
+        goal="Implement this, open a PR at the end, but DO NOT merge it.",
+    )
+
+    auto_meta = kanban_db.read_board_metadata(auto_board.slug)["discord_worker"]
+    never_meta = kanban_db.read_board_metadata(never_board.slug)["discord_worker"]
+    assert auto_meta["pr_open_policy"] == "after_review_approval"
+    assert auto_meta["merge_policy"] == "auto"
+    assert never_meta["pr_open_policy"] == "after_review_approval"
+    assert never_meta["merge_policy"] == "never"
+
+
+def test_ensure_pr_never_policy_opens_without_merging(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="open-only-pr",
+        goal="Open a PR at the end but DO NOT merge it.",
+        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
+    )
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/321\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=_pr_view_json(
+                    number=321,
+                    state="OPEN",
+                    merge_state="UNSTABLE",
+                    checks=[{"name": "ci", "status": "IN_PROGRESS", "conclusion": ""}],
+                ),
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr(board.slug, str(workspace)) is True
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert ["git", "push", "-u", "origin", "discord/open-only-pr"] in calls
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
+    assert meta["merge_policy"] == "never"
+    assert meta["pr_state"] == "OPEN"
+    assert meta["pr_checks_status"] == "pending"
+    assert meta["pr_merge_skipped"] is True
+    assert meta["pr_merge_skipped_reason"] == "never"
+    assert meta["pr_blocker"] == ""
 
 
 def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeypatch, tmp_path):

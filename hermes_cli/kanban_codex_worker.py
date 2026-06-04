@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -14,9 +16,14 @@ from agent.transports.codex_app_server_session import CodexAppServerSession
 from hermes_cli import kanban_db
 from hermes_cli.discord_worker_boards import (
     DEV_TICKET_BODY_GUIDANCE,
+    MERGE_POLICY_AUTO,
+    MERGE_POLICY_MANUAL,
+    MERGE_POLICY_NEVER,
+    PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL,
     ROLE_DEV,
     ROLE_PLANNER,
     ROLE_REVIEWER,
+    VALID_MERGE_POLICIES,
     active_dev_round_for_board,
     format_role_round_title,
     is_cancelled,
@@ -27,6 +34,36 @@ from hermes_cli.discord_worker_boards import (
 
 _OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV}
 _CODEX_AUTH_RETRY_LIMIT = 2
+_PR_GUARDED_ROLES = {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER}
+_GH_PR_MUTATING_SUBCOMMANDS = {
+    "close",
+    "create",
+    "edit",
+    "lock",
+    "merge",
+    "ready",
+    "reopen",
+    "review",
+    "unlock",
+}
+_PR_LIFECYCLE_RE = re.compile(
+    r"\b("
+    r"git\s+push|push\s+(?:the\s+)?(?:branch|head)|remote\s+branch|"
+    r"gh\s+pr\s+(?:checks|create|edit|merge|status|view|watch)|"
+    r"(?:open|create|update|sync)\s+(?:the\s+)?(?:pull\s+request|pr)|"
+    r"(?:pull\s+request|pr)\s+(?:checks|status|metadata|description|title)|"
+    r"wait\s+for\s+(?:ci|checks)|final\s+branch\s+state"
+    r")\b",
+    re.IGNORECASE,
+)
+_CODE_CHANGE_SIGNAL_RE = re.compile(
+    r"\b("
+    r"fix|implement|refactor|debug|repair|change\s+code|modify\s+code|"
+    r"update\s+(?:code|tests?|docs?|files?)|failing\s+(?:test|check|ci)|"
+    r"test\s+failure|lint\s+failure|type\s+error|regression|bug"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def main() -> int:
@@ -101,9 +138,11 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
         "- You may patch the Discord feature summary from board state with "
         "`python -m hermes_cli.discord_worker_read sync-summary --board <slug>`.\n\n"
     )
+    pr_policy = _pr_policy_prompt_note(role)
     return (
         f"You are the Discord Kanban {role} worker.\n"
         "Use the repository, shell, files, and worker helper commands available in this worker environment to complete the task; mutate Hermes/Discord state when that is the correct outcome.\n"
+        f"{pr_policy}"
         "Return exactly one raw JSON object matching the schema below, with no Markdown fence or surrounding prose.\n\n"
         f"{outcome}\n\n"
         f"{discord_access}"
@@ -122,6 +161,7 @@ def _role_outcome_frame(role: str) -> str:
             "- The JSON status is planned or blocked.\n"
             "- The board-level acceptance_criteria list is deduplicated and canonical.\n"
             "- Each dev ticket body opens with Goal, Success means, and Stop when, then gives the worker scope, files, dependencies, verification, and out-of-scope boundaries.\n"
+            "- Dev tickets stop at local verified branch state; they do not open PRs, push remotes, or merge.\n"
             "Stop when: Return the JSON plan or a concise blocker."
         )
     if role == ROLE_REVIEWER:
@@ -132,6 +172,7 @@ def _role_outcome_frame(role: str) -> str:
             "- The JSON status is approved, changes_requested, or blocked.\n"
             "- Findings name concrete issues, or findings is empty when the work is approved.\n"
             "- New dev tasks are outcome-first follow-up briefs when changes are required.\n"
+            "- PR lifecycle chores are excluded from new dev tasks; the deterministic finalizer owns push/open/merge after approval.\n"
             "- criteria_assessment maps each criterion to evidence or a gap.\n"
             "Stop when: Return the JSON review verdict."
         )
@@ -142,7 +183,25 @@ def _role_outcome_frame(role: str) -> str:
         "- The smallest correct change within ticket scope is implemented.\n"
         "- Focused verification is run when available and recorded in tests.\n"
         "- changed_files, tests, pr_ready, and blocker reflect the actual repository state.\n"
+        "- Remote push and PR lifecycle work are not attempted by this role.\n"
         "Stop when: Return the JSON completion, checkpoint, or blocker object."
+    )
+
+
+def _pr_policy_prompt_note(role: str) -> str:
+    if role == ROLE_PLANNER:
+        return (
+            "PR lifecycle policy: Dev workers must not open pull requests, push to remote branches, wait on remote checks, or merge. "
+            "Plan tickets only for local implementation/verification; Hermes opens/syncs/merges the PR after reviewer approval according to board merge_policy.\n"
+        )
+    if role == ROLE_REVIEWER:
+        return (
+            "PR lifecycle policy: Do not create new dev tickets for pure PR chores such as git push, gh pr create/view/checks, updating a PR, or waiting on checks. "
+            "If the implementation satisfies the goal and only PR lifecycle work remains, approve it; Hermes finalizes the PR deterministically.\n"
+        )
+    return (
+        "PR lifecycle policy: Do not run git push, gh pr create, gh pr merge, or other remote/PR mutation commands. "
+        "Complete local implementation and verification only; Hermes performs final push/open/merge after reviewer approval.\n"
     )
 
 
@@ -159,6 +218,7 @@ def _schema_instructions(role: str) -> str:
             f"{DEV_TICKET_BODY_GUIDANCE} "
             "Write Success means as ticket-specific acceptance criteria for the slice owned by that dev ticket; include board-level criteria only when that ticket owns the whole outcome. "
             "Set Stop when to the concrete handoff point for that ticket, usually code changed and verification recorded or a blocker stated. "
+            "Do not create dev tickets whose goal is to push a branch, open/update a PR, watch PR checks, or merge; those are finalizer chores after review approval. "
             "Include enough surrounding context from the overall request for a fresh dev worker to execute the ticket without guessing, but keep the scope tight to the ticket. "
             "Do not paste the full Discord thread context into dev tickets; use requirement IDs, context_pack paths, and concise relevant notes instead. "
             "The top-level acceptance_criteria must be one deduplicated canonical board-level list; if criteria already exist in the Kanban context, reuse them instead of paraphrasing or adding near-duplicates. "
@@ -169,11 +229,13 @@ def _schema_instructions(role: str) -> str:
             'Schema: {"status":"approved|changes_requested|blocked","summary":"...","findings":["..."],'
             '"new_tasks":[{"title":"...","body":"...","priority":0}],"criteria_assessment":{}, "blocker":null} '
             "Assess any requirements included in the Kanban context for coverage gaps. "
-            "When requesting changes, each new_tasks body must be a self-contained follow-up brief that opens with Goal, Success means, and Stop when."
+            "When requesting changes, each new_tasks body must be a self-contained follow-up brief that opens with Goal, Success means, and Stop when. "
+            "Do not emit new_tasks for pure PR lifecycle chores: git push, gh pr create/view/checks, updating an existing PR, waiting on checks, or merging."
         )
     return (
         'Schema: {"status":"completed|blocked|checkpoint","summary":"...","changed_files":["..."],'
-        '"tests":[{"command":"...","result":"passed|failed|not_run","output":"..."}],"blocker":null,"pr_ready":false}'
+        '"tests":[{"command":"...","result":"passed|failed|not_run","output":"..."}],"blocker":null,"pr_ready":false} '
+        "Never push to a remote branch and never create, update, or merge a PR; stop after local code and verification."
     )
 
 
@@ -194,6 +256,90 @@ def _backend_label(role: str) -> str:
 
 def _role_uses_opencode(role: str) -> bool:
     return role in _OPENCODE_ROLES and _configured_backend() == "opencode"
+
+
+def _role_pr_mutation_guard_env(role: str) -> tuple[dict[str, str], Optional[Path]]:
+    """Prepend git/gh wrappers that block worker-owned PR mutations.
+
+    The deterministic finalizer is the only code path allowed to push, open,
+    or merge PRs. Role workers may still inspect local git state and run safe
+    read-only gh commands through the real binaries.
+    """
+    if role not in _PR_GUARDED_ROLES:
+        return {}, None
+    guard_dir = Path(tempfile.mkdtemp(prefix="hermes-kanban-pr-guard-"))
+    real_git = shutil.which("git")
+    real_gh = shutil.which("gh")
+    if real_git:
+        _write_pr_guard_wrapper(
+            guard_dir / "git",
+            real_binary=real_git,
+            kind="git",
+        )
+    if real_gh:
+        _write_pr_guard_wrapper(
+            guard_dir / "gh",
+            real_binary=real_gh,
+            kind="gh",
+        )
+    if not any(guard_dir.iterdir()):
+        _cleanup_pr_mutation_guard(guard_dir)
+        return {}, None
+    path = f"{guard_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+    return {"PATH": path, "HERMES_KANBAN_PR_GUARD": "1"}, guard_dir
+
+
+def _write_pr_guard_wrapper(path: Path, *, real_binary: str, kind: str) -> None:
+    mutating = sorted(_GH_PR_MUTATING_SUBCOMMANDS)
+    script = f"""#!/usr/bin/env python3
+import os
+import sys
+
+REAL_BINARY = {json.dumps(real_binary)}
+KIND = {json.dumps(kind)}
+GH_PR_MUTATING_SUBCOMMANDS = {json.dumps(mutating)}
+
+args = sys.argv[1:]
+blocked = False
+if KIND == "git":
+    blocked = "push" in args
+elif KIND == "gh":
+    for index, arg in enumerate(args[:-1]):
+        if arg == "pr" and args[index + 1] in GH_PR_MUTATING_SUBCOMMANDS:
+            blocked = True
+            break
+
+if blocked:
+    print(
+        "Hermes Kanban role workers may not push branches or mutate PRs; "
+        "the deterministic finalizer handles PR sync/open/merge after reviewer approval.",
+        file=sys.stderr,
+    )
+    sys.exit(126)
+
+os.execv(REAL_BINARY, [REAL_BINARY, *args])
+"""
+    path.write_text(script, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _cleanup_pr_mutation_guard(path: Optional[Path]) -> None:
+    if not path:
+        return
+    try:
+        for child in path.iterdir():
+            child.unlink()
+        path.rmdir()
+    except Exception:
+        pass
+
+
+def _restore_environ(old_values: dict[str, Optional[str]]) -> None:
+    for key, old in old_values.items():
+        if old is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = old
 
 
 def _run_role_backend(
@@ -226,17 +372,20 @@ def _run_codex(
         except Exception:
             pass
 
+    guard_env, guard_dir = _role_pr_mutation_guard_env(role)
     try:
         attempt = 0
         while True:
+            worker_env = {
+                "HERMES_DISABLE_MCP": "1",
+                "HERMES_CODEX_WORKER_NETWORK_ACCESS": "1",
+                **guard_env,
+            }
             session = CodexAppServerSession(
                 cwd=workspace,
                 codex_home=os.environ.get("CODEX_HOME"),
                 extra_args=extra_args,
-                env={
-                    "HERMES_DISABLE_MCP": "1",
-                    "HERMES_CODEX_WORKER_NETWORK_ACCESS": "1",
-                },
+                env=worker_env,
                 on_event=on_event,
             )
             try:
@@ -264,6 +413,7 @@ def _run_codex(
                 return result
             attempt += 1
     finally:
+        _cleanup_pr_mutation_guard(guard_dir)
         if os.environ.get("HERMES_CODEX_WORKER_CLEANUP_HOME") == "1":
             try:
                 from agent.codex_worker_auth import cleanup_codex_worker_home
@@ -357,31 +507,38 @@ def _run_opencode(
             prompt,
         )
     )
-    if role == ROLE_PLANNER:
-        cfg = load_opencode_config()
-        reasoning_level = _scheduled_opencode_reasoning(
-            cfg["complex_plan_reasoning_level"]
-        )
-        result = run_opencode_single_pass(
-            prompt,
-            workspace,
-            timeout=_role_timeout(role),
-            agent=cfg["plan_agent"],
-            reasoning_level=reasoning_level,
-            title=f"kanban {task_id}",
-            on_event=on_event,
-        )
-    else:
-        result = run_opencode_task(
-            prompt,
-            workspace,
-            timeout=_role_timeout(role),
-            context_for_classification=context,
-            force_plan=False,
-            title=f"kanban {task_id}",
-            worker_config=_scheduled_opencode_worker_config(),
-            on_event=on_event,
-        )
+    guard_env, guard_dir = _role_pr_mutation_guard_env(role)
+    old_env = {key: os.environ.get(key) for key in guard_env}
+    os.environ.update(guard_env)
+    try:
+        if role == ROLE_PLANNER:
+            cfg = load_opencode_config()
+            reasoning_level = _scheduled_opencode_reasoning(
+                cfg["complex_plan_reasoning_level"]
+            )
+            result = run_opencode_single_pass(
+                prompt,
+                workspace,
+                timeout=_role_timeout(role),
+                agent=cfg["plan_agent"],
+                reasoning_level=reasoning_level,
+                title=f"kanban {task_id}",
+                on_event=on_event,
+            )
+        else:
+            result = run_opencode_task(
+                prompt,
+                workspace,
+                timeout=_role_timeout(role),
+                context_for_classification=context,
+                force_plan=False,
+                title=f"kanban {task_id}",
+                worker_config=_scheduled_opencode_worker_config(),
+                on_event=on_event,
+            )
+    finally:
+        _restore_environ(old_env)
+        _cleanup_pr_mutation_guard(guard_dir)
     _attach_scheduled_runtime(result, role)
     try:
         record_codex_worker_result(task_id, board=board, result=result)
@@ -597,18 +754,42 @@ def _apply_role_output(
                 return
             _update_phase(board, "blocked", goal_status="blocked")
             return
-        new_tasks = payload.get("new_tasks") if isinstance(payload.get("new_tasks"), list) else []
+        raw_new_tasks = payload.get("new_tasks")
+        new_tasks: list[Any] = raw_new_tasks if isinstance(raw_new_tasks, list) else []
+        filtered_new_tasks, pr_lifecycle_tasks = _filter_pr_lifecycle_tasks(new_tasks)
+        if pr_lifecycle_tasks and not filtered_new_tasks:
+            metadata = {
+                "raw": payload,
+                "filtered_pr_lifecycle_tasks": pr_lifecycle_tasks,
+            }
+            completed = kanban_db.complete_task(
+                conn,
+                task_id,
+                summary=summary or "Reviewer found only PR lifecycle follow-up; finalizing PR.",
+                metadata=metadata,
+                expected_run_id=expected_run_id,
+            )
+            if not completed:
+                return
+            if _ensure_pr(board, workspace):
+                _update_phase(board, "complete", goal_status="done")
+            else:
+                _update_phase(board, "blocked", goal_status="blocked")
+            return
         dev_round = active_dev_round_for_board(board)
-        specs = _reviewer_dev_task_specs(new_tasks, dev_round=dev_round, workspace=workspace, board=board)
+        specs = _reviewer_dev_task_specs(filtered_new_tasks, dev_round=dev_round, workspace=workspace, board=board)
         _add_context_headers(specs, board=board)
         created: list[str] = []
         try:
             created = _create_planned_dev_tasks(conn, specs, created_by=ROLE_REVIEWER)
+            metadata = {"created_tasks": created, "raw": payload}
+            if pr_lifecycle_tasks:
+                metadata["filtered_pr_lifecycle_tasks"] = pr_lifecycle_tasks
             completed = kanban_db.complete_task(
                 conn,
                 task_id,
                 summary=summary or "Reviewer requested changes.",
-                metadata={"created_tasks": created, "raw": payload},
+                metadata=metadata,
                 created_cards=created,
                 expected_run_id=expected_run_id,
             )
@@ -651,6 +832,35 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(v).strip() for v in value if str(v).strip()]
+
+
+def _filter_pr_lifecycle_tasks(tasks: list[Any]) -> tuple[list[Any], list[dict[str, str]]]:
+    kept: list[Any] = []
+    filtered: list[dict[str, str]] = []
+    for item in tasks:
+        if _is_pure_pr_lifecycle_task(item):
+            filtered.append(
+                {
+                    "title": str(item.get("title") or "").strip() if isinstance(item, dict) else str(item),
+                    "body": str(item.get("body") or "").strip() if isinstance(item, dict) else "",
+                }
+            )
+            continue
+        kept.append(item)
+    return kept, filtered
+
+
+def _is_pure_pr_lifecycle_task(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    title = str(item.get("title") or "")
+    body = str(item.get("body") or "")
+    text = re.sub(r"\s+", " ", f"{title} {body}").strip()
+    if not text or not _PR_LIFECYCLE_RE.search(text):
+        return False
+    if _CODE_CHANGE_SIGNAL_RE.search(text):
+        return False
+    return True
 
 
 def _priority(value: Any, default: int) -> int:
@@ -1051,6 +1261,33 @@ def _pr_is_merged(worker: dict[str, Any]) -> bool:
     return state == "MERGED" or bool(worker.get("pr_merged_at"))
 
 
+def _pr_is_open_or_merged(worker: dict[str, Any]) -> bool:
+    state = str(worker.get("pr_state") or "").strip().upper()
+    return state in {"OPEN", "MERGED"} or bool(worker.get("pr_merged_at"))
+
+
+def _pr_open_blocker(worker: dict[str, Any]) -> str:
+    if worker.get("pr_error"):
+        return str(worker.get("pr_error") or "")
+    if worker.get("pr_status_error"):
+        return str(worker.get("pr_status_error") or "")
+    if not worker.get("pr_url"):
+        return "PR not opened"
+    state = str(worker.get("pr_state") or "").strip().upper()
+    if state in {"OPEN", "MERGED"}:
+        if worker.get("pr_is_draft") is True:
+            return "PR is draft"
+        return ""
+    if state and state != "UNKNOWN":
+        return f"PR state: {state}"
+    return ""
+
+
+def _merge_policy(worker: dict[str, Any]) -> str:
+    policy = str(worker.get("merge_policy") or MERGE_POLICY_AUTO).strip().lower()
+    return policy if policy in VALID_MERGE_POLICIES else MERGE_POLICY_AUTO
+
+
 def _pr_blocker(worker: dict[str, Any]) -> str:
     if worker.get("pr_error"):
         return str(worker.get("pr_error") or "")
@@ -1148,6 +1385,103 @@ def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None
     worker["pr_blocker"] = _pr_blocker(worker)
 
 
+def _ensure_pr_open(
+    worker: dict[str, Any],
+    *,
+    root: Path,
+    repo: str,
+    branch: str,
+    base: str,
+    board: Optional[str],
+) -> bool:
+    pushed = subprocess.run(
+        ["git", "push", "-u", "origin", branch],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if pushed.returncode != 0:
+        worker["pr_error"] = (pushed.stderr or pushed.stdout or "git push failed").strip()
+        worker["pr_checks_status"] = "not checked"
+        worker["pr_merge_state"] = "unknown"
+        worker["pr_blocker"] = worker["pr_error"]
+        return False
+
+    existing_url = str(worker.get("pr_url") or "").strip()
+    if not existing_url:
+        existing = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--head",
+                branch,
+                "--base",
+                base,
+                "--state",
+                "open",
+                "--json",
+                "url",
+                "--jq",
+                ".[0].url",
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        existing_url = (existing.stdout or "").strip()
+    if existing_url and existing_url != "null":
+        worker["pr_url"] = existing_url
+    else:
+        title_source = str(
+            worker.get("root_goal")
+            or worker.get("initial_request")
+            or "implementation"
+        )
+        title = f"Discord worker: {title_source[:80]}"
+        body = (
+            f"Board: {worker.get('public_url') or board}\n\n"
+            f"Goal:\n{worker.get('root_goal') or worker.get('initial_request') or ''}"
+        )
+        created = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "create",
+                "--repo",
+                repo,
+                "--base",
+                base,
+                "--head",
+                branch,
+                "--title",
+                title,
+                "--body",
+                body,
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if created.returncode == 0 and (created.stdout or "").strip():
+            worker["pr_url"] = created.stdout.strip()
+        else:
+            worker["pr_error"] = (created.stderr or created.stdout or "gh pr create failed").strip()
+            worker.setdefault("pr_checks_status", "not checked")
+            worker.setdefault("pr_merge_state", "unknown")
+            worker["pr_blocker"] = _pr_open_blocker(worker)
+            return False
+
+    _refresh_pr_status(worker, root=root, repo=repo)
+    worker["pr_blocker"] = _pr_open_blocker(worker)
+    return not bool(worker.get("pr_blocker")) and _pr_is_open_or_merged(worker)
+
+
 def _ensure_pr_merged(worker: dict[str, Any], *, root: Path, repo: str) -> bool:
     pr_ref = _pr_ref(worker)
     if not pr_ref:
@@ -1158,8 +1492,11 @@ def _ensure_pr_merged(worker: dict[str, Any], *, root: Path, repo: str) -> bool:
 
     deadline = time.monotonic() + _pr_merge_wait_seconds()
     poll_seconds = _pr_merge_poll_seconds()
+    first = True
     while True:
-        _refresh_pr_status(worker, root=root, repo=repo)
+        if not first or not worker.get("pr_state"):
+            _refresh_pr_status(worker, root=root, repo=repo)
+        first = False
         if _pr_is_merged(worker):
             worker["pr_blocker"] = ""
             return True
@@ -1208,6 +1545,9 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
     branch = str(worker.get("worker_branch") or "").strip()
     base = str(worker.get("base_branch") or "main").strip() or "main"
     repo = _resolve_github_repo(worker, root)
+    policy = _merge_policy(worker)
+    worker["pr_open_policy"] = str(worker.get("pr_open_policy") or PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL)
+    worker["merge_policy"] = policy
     _reset_pr_status_fields(worker)
     try:
         missing = []
@@ -1221,6 +1561,7 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
             worker["pr_merge_state"] = "unknown"
             worker["pr_blocker"] = worker["pr_error"]
             raise RuntimeError(worker["pr_error"])
+        assert repo is not None
         has_commits = _branch_has_commits(root, base=base, branch=branch)
         if _is_foreman_generated_worker(worker) and has_commits is False:
             worker["pr_skipped_no_changes"] = True
@@ -1232,95 +1573,24 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
             worker["pr_mergeable"] = True
             worker["pr_blocker"] = ""
         else:
-            existing_url = ""
-            if worker.get("pr_url"):
-                existing_url = str(worker.get("pr_url") or "").strip()
-            if not existing_url:
-                existing = subprocess.run(
-                    [
-                        "gh",
-                        "pr",
-                        "list",
-                        "--repo",
-                        repo,
-                        "--head",
-                        branch,
-                        "--base",
-                        base,
-                        "--state",
-                        "open",
-                        "--json",
-                        "url",
-                        "--jq",
-                        ".[0].url",
-                    ],
-                    cwd=root,
-                    capture_output=True,
-                    text=True,
-                    timeout=20,
-                )
-                existing_url = (existing.stdout or "").strip()
-            if existing_url and existing_url != "null":
-                worker["pr_url"] = existing_url
-            else:
-                pushed = subprocess.run(
-                    ["git", "push", "-u", "origin", branch],
-                    cwd=root,
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                )
-                if pushed.returncode != 0:
-                    worker["pr_error"] = (
-                        pushed.stderr or pushed.stdout or "git push failed"
-                    ).strip()
-                    worker["pr_checks_status"] = "not checked"
-                    worker["pr_merge_state"] = "unknown"
-                    worker["pr_blocker"] = worker["pr_error"]
-                    raise RuntimeError(worker["pr_error"])
-                title_source = str(
-                    worker.get("root_goal")
-                    or worker.get("initial_request")
-                    or "implementation"
-                )
-                title = f"Discord worker: {title_source[:80]}"
-                body = (
-                    f"Board: {worker.get('public_url') or board}\n\n"
-                    f"Goal:\n{worker.get('root_goal') or worker.get('initial_request') or ''}"
-                )
-                created = subprocess.run(
-                    [
-                        "gh",
-                        "pr",
-                        "create",
-                        "--repo",
-                        repo,
-                        "--base",
-                        base,
-                        "--head",
-                        branch,
-                        "--title",
-                        title,
-                        "--body",
-                        body,
-                    ],
-                    cwd=root,
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                )
-                if created.returncode == 0 and (created.stdout or "").strip():
-                    worker["pr_url"] = created.stdout.strip()
-                else:
-                    worker["pr_error"] = (
-                        created.stderr or created.stdout or "gh pr create failed"
-                    ).strip()
-        if worker.get("pr_url"):
-            _ensure_pr_merged(worker, root=root, repo=repo)
-        elif not worker.get("pr_skipped_no_changes"):
-            worker.setdefault("pr_checks_status", "not checked")
-            worker.setdefault("pr_merge_state", "unknown")
-            worker["pr_blocker"] = _pr_blocker(worker)
+            opened = _ensure_pr_open(
+                worker,
+                root=root,
+                repo=repo,
+                branch=branch,
+                base=base,
+                board=board,
+            )
+            if opened and policy == MERGE_POLICY_AUTO:
+                _ensure_pr_merged(worker, root=root, repo=repo)
+            elif opened and policy in {MERGE_POLICY_MANUAL, MERGE_POLICY_NEVER}:
+                worker["pr_merge_skipped"] = True
+                worker["pr_merge_skipped_reason"] = policy
+                worker["pr_blocker"] = _pr_open_blocker(worker)
+            elif not worker.get("pr_skipped_no_changes"):
+                worker.setdefault("pr_checks_status", "not checked")
+                worker.setdefault("pr_merge_state", "unknown")
+                worker["pr_blocker"] = _pr_open_blocker(worker)
     except Exception as exc:
         worker.setdefault("pr_error", str(exc))
         worker.setdefault("pr_checks_status", "not checked")
@@ -1329,12 +1599,11 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
     metadata[DISCORD_WORKER_META_KEY] = worker
     metadata.pop("db_path", None)
     atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
-    has_pr_or_skip = bool(worker.get("pr_url")) or bool(
-        worker.get("pr_skipped_no_changes")
-    )
     if worker.get("pr_skipped_no_changes"):
         return not bool(worker.get("pr_error"))
-    return has_pr_or_skip and _pr_is_merged(worker) and not bool(worker.get("pr_error"))
+    if policy == MERGE_POLICY_AUTO:
+        return bool(worker.get("pr_url")) and _pr_is_merged(worker) and not bool(worker.get("pr_error"))
+    return bool(worker.get("pr_url")) and _pr_is_open_or_merged(worker) and not bool(_pr_open_blocker(worker))
 
 
 def _merge_criteria(board: Optional[str], criteria: list[str]) -> None:
