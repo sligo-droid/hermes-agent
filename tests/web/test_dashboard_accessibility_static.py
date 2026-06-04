@@ -59,7 +59,8 @@ def test_command_center_worker_pill_has_no_workers_fallback():
     card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
     detail_source = source.split("function DetailPanel", 1)[1].split("function KeyValue", 1)[0]
 
-    assert "item.execution?.worker_url ?" in card_source
+    assert "item.execution?.worker_url || discordUrl ?" in card_source
+    assert "item.execution?.worker_url &&" in card_source
     assert "item.execution?.worker_url &&" in detail_source
     assert 'href="/workers"' not in card_source
     assert 'to="/workers"' not in card_source
@@ -72,6 +73,31 @@ def test_sligo_shell_has_no_duplicate_top_tab_navigation():
     assert "Sligo operator navigation" not in shell_source
     assert "<SligoNavLink" not in shell_source
     assert "Refresh Command Center" in shell_source
+
+
+def test_sligo_shell_refresh_feedback_and_light_toggle():
+    source = (ROOT / "web/src/App.tsx").read_text(encoding="utf-8")
+    shell_source = source.split("function SligoSurfaceShell", 1)[1].split("export default function App", 1)[0]
+
+    assert "sligo-command-center-color-mode" in source
+    assert "data-sligo-theme={sligoMode}" in shell_source
+    assert "Switch Command Center to light mode" in shell_source
+    assert "Switch Command Center to dark mode" in shell_source
+    assert "aria-busy={isRefreshing}" in shell_source
+    assert "animate-spin" in shell_source
+    assert "Refreshing" in shell_source
+    assert "await window.__commandCenterRefresh()" in shell_source
+
+
+def test_command_center_discord_links_open_new_tabs():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+
+    assert "function discordSourceUrl" in source
+    assert "discord_thread" in source
+    assert "discord_url" in source
+    assert "discord_thread_url" in source
+    assert "Open Discord source for" in source
+    assert 'href={discordUrl} rel="noopener noreferrer" target="_blank"' in source
 
 
 def test_modal_behavior_traps_focus_and_restores_safely():

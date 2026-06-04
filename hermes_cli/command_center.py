@@ -105,6 +105,17 @@ def _worker_console_url(task_id: str, *, board: str | None) -> str | None:
     return f"/workers/{quote(str(board), safe='')}/tickets/{quote(task_id, safe='')}/console"
 
 
+def _discord_urls(ref: dict[str, Any]) -> dict[str, str]:
+    guild_id = str(ref.get("guild_id") or "").strip()
+    thread_id = str(ref.get("thread_id") or ref.get("chat_id") or "").strip()
+    if not guild_id or not thread_id:
+        return {}
+    thread_url = f"https://discord.com/channels/{guild_id}/{thread_id}"
+    message_id = str(ref.get("source_message_id") or ref.get("request_id") or "").strip()
+    discord_url = f"{thread_url}/{message_id}" if message_id else thread_url
+    return {"discord_url": discord_url, "source_url": discord_url, "discord_thread_url": thread_url}
+
+
 def _has_started_execution(task: dict[str, Any] | None = None, *, runs: list[dict[str, Any]] | None = None) -> bool:
     if runs:
         return True
@@ -285,19 +296,21 @@ def _is_internal_discord_foreman_task(task: dict[str, Any]) -> bool:
 def _source_from_task_board(board: str, board_meta: dict[str, Any]) -> dict[str, Any]:
     worker = _board_worker_meta(board_meta)
     if _is_discord_board(board, board_meta):
+        ref = {
+            "board": board,
+            "thread_id": worker.get("thread_id") or worker.get("chat_id"),
+            "source_message_id": worker.get("source_message_id") or worker.get("request_id"),
+            "summary_message_id": worker.get("summary_message_id"),
+            "guild_id": worker.get("guild_id"),
+            "parent_channel_id": worker.get("parent_channel_id"),
+            "public_url": worker.get("public_url"),
+        }
+        ref.update(_discord_urls(ref))
         return {
             "id": f"source:discord:{board}",
             "kind": "discord",
             "label": "Discord worker thread",
-            "ref": {
-                "board": board,
-                "thread_id": worker.get("thread_id") or worker.get("chat_id"),
-                "source_message_id": worker.get("source_message_id") or worker.get("request_id"),
-                "summary_message_id": worker.get("summary_message_id"),
-                "guild_id": worker.get("guild_id"),
-                "parent_channel_id": worker.get("parent_channel_id"),
-                "public_url": worker.get("public_url"),
-            },
+            "ref": ref,
         }
     return {
         "id": f"source:kanban-board:{board}",
@@ -613,6 +626,14 @@ def _board_work_item(
 def _artifacts_from_task_and_board(task: dict[str, Any], board_meta: dict[str, Any]) -> list[dict[str, Any]]:
     artifacts: list[dict[str, Any]] = []
     worker = _board_worker_meta(board_meta)
+    discord_ref = {
+        "thread_id": worker.get("thread_id") or worker.get("chat_id"),
+        "source_message_id": worker.get("source_message_id") or worker.get("request_id"),
+        "guild_id": worker.get("guild_id"),
+    }
+    discord_url = _discord_urls(discord_ref).get("discord_url")
+    if discord_url:
+        artifacts.append({"kind": "discord_source", "label": "Discord", "url": discord_url})
     public_url = worker.get("public_url")
     if public_url:
         artifacts.append({"kind": "worker_board", "label": "Worker board", "url": str(public_url)})
@@ -688,6 +709,16 @@ def _source_from_proposal_run(run: dict[str, Any]) -> dict[str, Any]:
 
 def _source_from_discord_board(board: str, board_meta: dict[str, Any]) -> dict[str, Any]:
     worker = _board_worker_meta(board_meta)
+    ref = {
+        "board": board,
+        "thread_id": worker.get("thread_id") or worker.get("chat_id"),
+        "source_message_id": worker.get("source_message_id") or worker.get("request_id"),
+        "summary_message_id": worker.get("summary_message_id"),
+        "guild_id": worker.get("guild_id"),
+        "parent_channel_id": worker.get("parent_channel_id"),
+        "public_url": worker.get("public_url"),
+    }
+    ref.update(_discord_urls(ref))
     return {
         "id": f"source:discord:{board}",
         "kind": "discord_thread",
@@ -697,15 +728,7 @@ def _source_from_discord_board(board: str, board_meta: dict[str, Any]) -> dict[s
         "bucket": "sources",
         "created_at": worker.get("created_at") or board_meta.get("created_at"),
         "updated_at": worker.get("updated_at") or board_meta.get("created_at"),
-        "ref": {
-            "board": board,
-            "thread_id": worker.get("thread_id") or worker.get("chat_id"),
-            "source_message_id": worker.get("source_message_id") or worker.get("request_id"),
-            "summary_message_id": worker.get("summary_message_id"),
-            "guild_id": worker.get("guild_id"),
-            "parent_channel_id": worker.get("parent_channel_id"),
-            "public_url": worker.get("public_url"),
-        },
+        "ref": ref,
     }
 
 

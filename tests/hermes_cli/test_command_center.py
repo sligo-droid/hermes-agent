@@ -184,6 +184,45 @@ def test_snapshot_rolls_named_discord_board_tasks_up_to_board_work_item(tmp_path
     assert snapshot["metrics"]["discord_origin"] == 1
 
 
+def test_snapshot_adds_discord_source_urls_for_worker_boards(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "discord-source-url-test"
+    meta = kanban_db.write_board_metadata(board, name="Discord Source URL Test")
+    meta.pop("db_path", None)
+    meta[command_center.DISCORD_WORKER_META_KEY] = {
+        "guild_id": "111",
+        "thread_id": "222",
+        "source_message_id": "333",
+    }
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    conn = kanban_db.connect(board=board)
+    try:
+        kanban_db.create_task(conn, title="Discord linked worker", board=board)
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+    source = next(source for source in snapshot["sources"] if source["id"] == f"source:discord:{board}")
+    artifact_urls = {artifact["url"] for artifact in item["artifacts"]}
+
+    assert item["source"]["ref"]["discord_url"] == "https://discord.com/channels/111/222/333"
+    assert item["source"]["ref"]["source_url"] == "https://discord.com/channels/111/222/333"
+    assert item["source"]["ref"]["discord_thread_url"] == "https://discord.com/channels/111/222"
+    assert source["ref"]["discord_url"] == "https://discord.com/channels/111/222/333"
+    assert "https://discord.com/channels/111/222/333" in artifact_urls
+
+
+def test_discord_url_helper_requires_guild_and_thread():
+    assert command_center._discord_urls({"guild_id": "111", "thread_id": "222"}) == {
+        "discord_url": "https://discord.com/channels/111/222",
+        "source_url": "https://discord.com/channels/111/222",
+        "discord_thread_url": "https://discord.com/channels/111/222",
+    }
+    assert command_center._discord_urls({"guild_id": "111"}) == {}
+    assert command_center._discord_urls({"thread_id": "222"}) == {}
+
+
 def test_snapshot_running_board_rollup_outranks_blocked_tasks(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     older_board = "discord-running-with-blocked"
