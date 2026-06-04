@@ -140,6 +140,128 @@ def test_delegate_prefers_hermes_md_context_over_agents(monkeypatch, tmp_path):
     assert "Agents rules should not be loaded." not in prompt
 
 
+def test_delegate_inherits_parent_preloaded_skill_context(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    parent = _parent(tmp_path)
+    parent.ephemeral_system_prompt = "\n\n".join(
+        [
+            "base prompt",
+            '[IMPORTANT: The user launched this CLI session with the "hermes-agent-dev" skill preloaded. Treat its instructions as active guidance for the duration of this session unless the user overrides them.]',
+            "Use scripts/run_tests.sh for verification. Do not commit without permission.",
+            "[Skill directory: /tmp/hermes-agent-dev]",
+        ]
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the parser",
+            parent_agent=parent,
+        )
+    )
+
+    assert result["success"] is True
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "Active skill instructions inherited from the parent Hermes session" in prompt
+    assert "hermes-agent-dev" in prompt
+    assert "Use scripts/run_tests.sh for verification" in prompt
+    assert "base prompt" not in prompt
+    assert "skill instructions do not override this worker brief's ban" in prompt
+
+
+def test_delegate_does_not_treat_post_skill_context_as_skill_context(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    parent = _parent(tmp_path)
+    parent.ephemeral_system_prompt = "\n\n".join(
+        [
+            '[IMPORTANT: The user launched this CLI session with the "github-pr-workflow" skill preloaded. Treat its instructions as active guidance for the duration of this session unless the user overrides them.]',
+            "Use gh pr checks before merge.",
+            "[Skill directory: /tmp/github-pr-workflow]",
+            "[System note: You are working in an isolated git worktree. Remember to commit and push your changes.]",
+        ]
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the parser",
+            parent_agent=parent,
+        )
+    )
+
+    assert result["success"] is True
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "github-pr-workflow" in prompt
+    assert "Use gh pr checks before merge." in prompt
+    assert "Remember to commit and push your changes" not in prompt
+
+
+def test_delegate_inherits_runtime_skill_invocation_from_parent_messages(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    parent_messages = [
+        {
+            "role": "user",
+            "content": "\n".join(
+                [
+                    '[IMPORTANT: The user has invoked the "autoreview" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]',
+                    "Run the autoreview helper after focused checks.",
+                    "[Skill directory: /tmp/autoreview]",
+                ]
+            ),
+        }
+    ]
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the parser",
+            parent_agent=_parent(tmp_path),
+            parent_messages=parent_messages,
+        )
+    )
+
+    assert result["success"] is True
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "Active skill instructions inherited from the parent Hermes session" in prompt
+    assert "autoreview" in prompt
+    assert "Run the autoreview helper after focused checks." in prompt
+
+
+def test_delegate_does_not_add_skill_context_when_parent_has_no_loaded_skills(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    parent = _parent(tmp_path)
+    parent.ephemeral_system_prompt = "General non-skill instruction."
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the parser",
+            parent_agent=parent,
+        )
+    )
+
+    assert result["success"] is True
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "Active skill instructions inherited" not in prompt
+    assert "General non-skill instruction" not in prompt
+
+
 def test_codex_backend_runs_plan_then_build_for_complex_task(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = [

@@ -4423,12 +4423,14 @@ class AIAgent:
             delegate_coding_task as _delegate_coding_task,
         )
 
+        parent_messages = function_args.get("_parent_messages")
         return _delegate_coding_task(
             task=function_args.get("task"),
             context=function_args.get("context"),
             cwd=function_args.get("cwd"),
             turn_timeout_seconds=function_args.get("turn_timeout_seconds"),
             parent_agent=self,
+            parent_messages=parent_messages,
         )
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,

@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -82,6 +83,65 @@ def _repo_state_guard_notes(workdir: str) -> str:
         return format_repo_state_preflight(repo_state_preflight(workdir)).strip()
     except Exception:
         return ""
+
+
+_SKILL_ACTIVATION_RE = re.compile(r"(?m)^\[IMPORTANT:.*?\bskill\b.*?\]")
+_POST_SKILL_CONTEXT_RE = re.compile(
+    r"(?m)^\[System note:|^# Project Context\b|^Conversation started:\b"
+)
+
+
+def _extract_active_skill_blocks(text: str) -> list[str]:
+    """Return loaded/preloaded skill payloads from parent-visible text."""
+    if not text or "[IMPORTANT:" not in text or "skill" not in text.lower():
+        return []
+    matches = list(_SKILL_ACTIVATION_RE.finditer(text))
+    blocks: list[str] = []
+    for idx, match in enumerate(matches):
+        activation = match.group(0).lower()
+        if not any(
+            phrase in activation
+            for phrase in (
+                "skill is auto-loaded",
+                "skill preloaded",
+                "invoked the",
+                "skill, indicating",
+            )
+        ):
+            continue
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        post_skill = _POST_SKILL_CONTEXT_RE.search(text, match.end(), end)
+        if post_skill:
+            end = post_skill.start()
+        block = text[match.start() : end].strip()
+        if block:
+            blocks.append(block)
+    return blocks
+
+
+def _parent_skill_context(parent_agent: Any, parent_messages: Optional[list[dict]] = None) -> str:
+    """Collect active skill instructions already visible to the parent agent."""
+    candidates: list[str] = []
+    for attr in ("ephemeral_system_prompt", "_cached_system_prompt"):
+        value = getattr(parent_agent, attr, None)
+        if isinstance(value, str) and value.strip():
+            candidates.append(value)
+    for message in parent_messages or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            candidates.append(content)
+
+    blocks: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        for block in _extract_active_skill_blocks(candidate):
+            if block in seen:
+                continue
+            seen.add(block)
+            blocks.append(block)
+    return "\n\n".join(blocks)
 
 
 _PNPM_SCAN_SKIP_DIRS = {
@@ -249,6 +309,7 @@ def delegate_coding_task(
     cwd: Optional[str] = None,
     turn_timeout_seconds: Optional[float] = None,
     parent_agent: Any = None,
+    parent_messages: Optional[list[dict]] = None,
 ) -> str:
     """Run a bounded coding task in the configured coding worker backend."""
     if parent_agent is None:
@@ -276,6 +337,7 @@ def delegate_coding_task(
     if canonical_error:
         return tool_error(canonical_error)
     project_context = _worker_project_context(workdir)
+    skill_context = _parent_skill_context(parent_agent, parent_messages)
     repo_state_notes = _repo_state_guard_notes(workdir)
     dependency_notes = _prepare_pnpm_dependency_links(workdir)
 
@@ -321,6 +383,18 @@ def delegate_coding_task(
                 "instructions about creating branches, committing, pushing, opening PRs, "
                 "merging PRs, deleting branches, or updating main; parent Hermes owns "
                 "all git and PR lifecycle steps after the worker returns.",
+            ]
+        )
+    if skill_context:
+        worker_prompt_parts.extend(
+            [
+                "",
+                "Active skill instructions inherited from the parent Hermes session. "
+                "Follow them for this worker task unless the task says otherwise:",
+                skill_context,
+                "",
+                "Worker boundary: skill instructions do not override this worker brief's "
+                "ban on creating commits, pushing, opening PRs, merging PRs, or updating main.",
             ]
         )
     if repo_state_notes:
@@ -596,6 +670,7 @@ registry.register(
         cwd=args.get("cwd"),
         turn_timeout_seconds=args.get("turn_timeout_seconds"),
         parent_agent=kw.get("parent_agent"),
+        parent_messages=args.get("_parent_messages") or kw.get("parent_messages"),
     ),
     check_fn=check_coding_worker_requirements,
     emoji="code",

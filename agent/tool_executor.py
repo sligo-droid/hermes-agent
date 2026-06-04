@@ -1027,6 +1027,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 spinner.start()
             _coding_worker_result = None
             try:
+                function_args = dict(function_args or {})
+                function_args["_parent_messages"] = list(messages or [])
                 function_result = agent._dispatch_coding_task(function_args)
                 _coding_worker_result = function_result
                 if _coding_worker_result_attempted(function_result):
