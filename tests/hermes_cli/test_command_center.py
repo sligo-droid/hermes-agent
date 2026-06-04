@@ -158,6 +158,84 @@ def test_snapshot_rolls_named_discord_board_tasks_up_to_board_work_item(tmp_path
     assert snapshot["metrics"]["discord_origin"] == 1
 
 
+def test_snapshot_inbox_metric_only_counts_pending_decisions_and_inbox_sources(tmp_path, monkeypatch):
+    _ingest_valid(monkeypatch, tmp_path)
+    proposed_card = _first_card()
+    board = "discord-finished-not-inbox"
+    kanban_db.write_board_metadata(board, name="Finished Discord Board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Finished worker", board=board)
+        with conn:
+            conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200, task_id))
+    finally:
+        conn.close()
+
+    storage_conn = proposal_storage.connect()
+    try:
+        with storage_conn:
+            storage_conn.execute(
+                "UPDATE proposal_runs SET status = ?, parse_error = ? WHERE id = (SELECT MIN(id) FROM proposal_runs)",
+                ("malformed", "bad json"),
+            )
+    finally:
+        storage_conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    board_item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+
+    assert board_item["status"] == "shipped"
+    assert board_item["execution"]["archiveable"] is True
+    assert snapshot["metrics"]["inbox"] == 2
+    assert any(item["id"] == f"self-improvement:{proposed_card['proposal_id']}" for item in snapshot["work_items"])
+    assert any(source["bucket"] == "inbox" and source["status"] == "parse_failed" for source in snapshot["sources"])
+
+
+def test_self_improvement_board_rollup_preserves_proposal_controls(tmp_path, monkeypatch):
+    _ingest_valid(monkeypatch, tmp_path)
+    card = _first_card()
+    board = "self-improvement-worker-board"
+    kanban_db.write_board_metadata(board, name="Self Improvement Worker Board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Approved recommendation worker", board=board, initial_status="blocked")
+    finally:
+        conn.close()
+    proposal_storage.record_approval(
+        card["proposal_id"],
+        kanban_task_id=task_id,
+        worker_url=f"/workers/{board}/tickets/{task_id}",
+        actor="operator",
+        metadata={"board": board},
+    )
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+
+    assert not any(row["id"] == f"self-improvement:{card['proposal_id']}" for row in snapshot["work_items"])
+    assert item["decision"]["needed"] is False
+    assert item["decision"]["proposal_id"] == card["proposal_id"]
+    assert item["decision"]["halt_action"].endswith(f"/{card['proposal_id']}/halt")
+    assert item["decision"]["undo_followup_action"].endswith(f"/{card['proposal_id']}/undo-followup")
+
+
+def test_direct_discord_board_rollup_has_no_self_improvement_controls(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "discord-direct-no-proposal"
+    kanban_db.write_board_metadata(board, name="Direct Discord Board")
+    conn = kanban_db.connect(board=board)
+    try:
+        kanban_db.create_task(conn, title="Direct Discord worker", board=board, initial_status="blocked")
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+
+    assert item["source"]["kind"] == "discord"
+    assert item["decision"] == {"needed": False}
+
+
 def test_snapshot_active_runs_ignores_stale_open_runs_for_terminal_tasks(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     board = "discord-stale-open-run"

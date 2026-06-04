@@ -439,9 +439,14 @@ function SligoSurfaceShell({ routes }: { routes: DashboardRoute[] }) {
                 Workers
               </a>
             </nav>
-            <div className="hidden rounded-full border border-white/10 px-3 py-2 text-xs uppercase tracking-[0.16em] text-slate-500 sm:block">
-              Protected internal ops
-            </div>
+            <button
+              aria-label="Refresh Command Center"
+              className="inline-flex h-9 items-center justify-center gap-2 rounded-full border border-cyan-100/25 bg-cyan-100/10 px-3 text-xs font-semibold uppercase tracking-[0.14em] text-cyan-50 transition hover:bg-cyan-100/15 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-200/70"
+              onClick={() => window.dispatchEvent(new CustomEvent("command-center:refresh"))}
+              type="button"
+            >
+              <RotateCw className="h-3.5 w-3.5" /> Refresh
+            </button>
           </div>
         </div>
       </header>

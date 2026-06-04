@@ -487,12 +487,24 @@ def _board_work_item(
     board_meta: dict[str, Any],
     tasks: list[dict[str, Any]],
     runs: list[dict[str, Any]],
+    proposal_action_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     canonical_status, status_detail = _canonical_status_from_board(tasks, board_meta=board_meta)
     source = _source_from_task_board(board, board_meta)
     created_candidates = [task.get("created_at") for task in tasks if task.get("created_at")]
     updated_candidates = [task.get("completed_at") or task.get("started_at") or task.get("created_at") for task in tasks]
     latest_updated = max((_epoch_or_none(value) or 0 for value in updated_candidates), default=0) or board_meta.get("created_at")
+    decision = {"needed": False}
+    if proposal_action_context:
+        proposal_id = str(proposal_action_context.get("proposal_id") or "")
+        if proposal_id:
+            decision.update(
+                {
+                    "proposal_id": proposal_id,
+                    "halt_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(proposal_id, safe='')}/halt",
+                    "undo_followup_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(proposal_id, safe='')}/undo-followup",
+                }
+            )
     return {
         "id": f"kanban-board:{board}",
         "title": _board_title(board, board_meta),
@@ -507,12 +519,16 @@ def _board_work_item(
         "created_at": min((_epoch_or_none(value) or 0 for value in created_candidates), default=0) or board_meta.get("created_at"),
         "updated_at": latest_updated,
         "source": source,
-        "decision": {"needed": False},
+        "decision": decision,
         "execution": _execution_from_board(board=board, board_meta=board_meta, tasks=tasks, runs=runs),
         "runs": runs,
         "artifacts": _artifacts_from_task_and_board({}, board_meta),
         "source_excerpts": [],
-        "raw": {"board": board_meta, "rollup": {"task_counts": _task_status_counts(tasks), "task_count": len(tasks), "run_count": len(runs)}},
+        "raw": {
+            "board": board_meta,
+            "rollup": {"task_counts": _task_status_counts(tasks), "task_count": len(tasks), "run_count": len(runs)},
+            "proposal_action_context": proposal_action_context,
+        },
     }
 
 
@@ -628,6 +644,7 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
     sources: list[dict[str, Any]] = []
     runs: list[dict[str, Any]] = []
     seen_execution_tasks: set[tuple[str, str]] = set()
+    board_proposal_action_context: dict[str, dict[str, Any]] = {}
 
     for card in _all_proposal_cards(include_archived=include_archived):
         task, task_runs, board, board_meta = _load_task_for_proposal(card)
@@ -648,6 +665,18 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
         )
         if not has_board_rollup:
             work_items.append(item)
+        elif board:
+            proposal_id = card.get("proposal_id")
+            if proposal_id and item.get("source", {}).get("kind") == "self_improvement":
+                board_proposal_action_context.setdefault(
+                    board,
+                    {
+                        "proposal_id": proposal_id,
+                        "title": card.get("title"),
+                        "source": item.get("source"),
+                        "artifacts": item.get("artifacts") or [],
+                    },
+                )
         if board and card.get("kanban_task_id"):
             seen_execution_tasks.add((board, str(card["kanban_task_id"])))
 
@@ -688,7 +717,15 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
                 task_dicts.append(task_dict)
             board_runs = _recent_board_runs(conn, board=board, limit=recent_run_limit_per_board)
             if board != kanban_db.DEFAULT_BOARD:
-                work_items.append(_board_work_item(board=board, board_meta=board_meta, tasks=task_dicts, runs=board_runs))
+                work_items.append(
+                    _board_work_item(
+                        board=board,
+                        board_meta=board_meta,
+                        tasks=task_dicts,
+                        runs=board_runs,
+                        proposal_action_context=board_proposal_action_context.get(board),
+                    )
+                )
             else:
                 for task_dict in task_dicts:
                     key = (board, str(task_dict.get("id")))
@@ -756,7 +793,7 @@ def _metrics(
     active_runs = [run for run in runs if _is_active_run(run)]
     return {
         "total_work_items": len(work_items),
-        "inbox": sum(1 for item in work_items if item.get("status") in {"proposed", "blocked"})
+        "inbox": sum(1 for item in work_items if _is_inbox_work_item(item))
         + sum(1 for source in sources if source.get("bucket") == "inbox"),
         "active_work": sum(1 for item in work_items if item.get("status") in {"queued", "running", "review"}),
         "blocked": by_status.get("blocked", 0),
@@ -771,6 +808,10 @@ def _metrics(
         "by_status": by_status,
         "by_source": by_source,
     }
+
+
+def _is_inbox_work_item(item: dict[str, Any]) -> bool:
+    return bool((item.get("decision") or {}).get("needed")) or item.get("status") == "proposed"
 
 
 def _is_active_run(run: dict[str, Any]) -> bool:
