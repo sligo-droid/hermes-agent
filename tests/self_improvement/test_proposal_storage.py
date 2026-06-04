@@ -1,0 +1,269 @@
+import json
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from self_improvement import proposal_storage
+
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "self_improvement"
+
+
+def _fixture_text(name: str) -> str:
+    return (FIXTURES / name).read_text(encoding="utf-8")
+
+
+def _fenced(name: str) -> str:
+    return "Human summary before JSON.\n```json\n" + _fixture_text(name) + "\n```"
+
+
+def test_profile_safe_db_path_and_initialization(tmp_path, monkeypatch):
+    home = tmp_path / "profile-home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    proposal_storage.init_db()
+
+    assert proposal_storage.proposals_db_path() == home / "self_improvement" / "proposals.db"
+    assert proposal_storage.proposals_db_path().exists()
+
+
+def test_ingest_valid_run_is_idempotent_and_replaces_cards(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    first = proposal_storage.ingest_proposal_output(_fenced("proposal_run_pid_valid.json"))
+    second = proposal_storage.ingest_proposal_output(_fenced("proposal_run_pid_valid.json"))
+
+    assert first["status"] == "valid"
+    assert first["run_id"] == second["run_id"]
+    assert second["card_count"] == 1
+
+    conn = proposal_storage.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM proposal_runs").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM proposal_cards").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_ingest_empty_run_records_empty_status(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    result = proposal_storage.ingest_proposal_output(_fenced("proposal_run_pid_empty.json"))
+
+    run = proposal_storage.get_run(result["run_id"])
+
+    assert result["status"] == "empty"
+    assert run["status"] == "empty"
+    assert run["cards"] == []
+
+
+def test_ingest_malformed_run_persists_parse_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    result = proposal_storage.ingest_proposal_output(
+        _fenced("proposal_run_malformed.json"),
+        source={"cron_job_id": "job-1", "run_id": "run-1", "cron_output_path": "/tmp/out.md"},
+    )
+    failures = proposal_storage.list_parse_failures()
+
+    assert result["status"] == "malformed"
+    assert "run.cron_job_id" in result["parse_error"]
+    assert len(failures["failures"]) == 1
+    assert failures["failures"][0]["source_ref"]["cron_output_path"] == "/tmp/out.md"
+
+
+def test_grouped_reads_card_details_and_run_source(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    result = proposal_storage.ingest_proposal_output(_fenced("proposal_run_pid_valid.json"))
+
+    grouped = proposal_storage.grouped_cards()
+    prong = grouped["projects"][0]["prongs"][0]
+    card = prong["cards"][0]
+    detail = proposal_storage.get_card(card["proposal_id"])
+    run = proposal_storage.get_run(result["run_id"])
+
+    assert grouped["projects"][0]["project"] == "pid"
+    assert prong["prong"] == "airflow_scraper_doctor"
+    assert detail["kanban_task"]["title"] == "Instrument PID scraper timeout retry backoff"
+    assert run["source_markdown"].startswith("Human summary before JSON")
+    assert run["cards"][0]["proposal_id"] == card["proposal_id"]
+
+
+def test_dashboard_read_only_routes_return_proposal_shapes(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    proposal_storage.ingest_proposal_output(_fenced("proposal_run_pid_valid.json"))
+    proposal_storage.ingest_proposal_output(
+        "not json",
+        source={"source_key": "bad-output", "cron_output_path": "/tmp/bad.md"},
+    )
+
+    from plugins.kanban.dashboard.plugin_api import router
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api/plugins/kanban")
+    client = TestClient(app)
+
+    grouped = client.get("/api/plugins/kanban/self-improvement/proposals")
+    assert grouped.status_code == 200
+    card = grouped.json()["projects"][0]["prongs"][0]["cards"][0]
+
+    detail = client.get(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}")
+    assert detail.status_code == 200
+    assert detail.json()["card"]["proposal_id"] == card["proposal_id"]
+
+    run = client.get(f"/api/plugins/kanban/self-improvement/runs/{card['run_db_id']}")
+    assert run.status_code == 200
+    assert run.json()["run"]["source_markdown"]
+
+    failures = client.get("/api/plugins/kanban/self-improvement/parse-failures")
+    assert failures.status_code == 200
+    assert failures.json()["failures"][0]["source_ref"]["cron_output_path"] == "/tmp/bad.md"
+
+
+def test_approval_and_rejection_state_are_persisted_and_audited(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    proposal_storage.ingest_proposal_output(_fenced("proposal_run_pid_valid.json"))
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+
+    approved = proposal_storage.record_approval(
+        card["proposal_id"],
+        kanban_task_id="t_123",
+        worker_url="/workers?task=t_123",
+        actor="operator",
+    )
+
+    assert approved["status"] == "approved"
+    assert approved["kanban_task_id"] == "t_123"
+    assert approved["worker_url"] == "/workers?task=t_123"
+    events = proposal_storage.list_audit_events(card["proposal_id"])
+    assert events[0]["action"] == "approved"
+    assert events[0]["actor"] == "operator"
+
+    rejected = proposal_storage.record_rejection(card["proposal_id"], reason="too broad", actor="operator")
+    assert rejected["status"] == "rejected"
+    assert rejected["rejected_reason"] == "too broad"
+    assert proposal_storage.grouped_cards()["projects"] == []
+    events = proposal_storage.list_audit_events(card["proposal_id"])
+    assert [event["action"] for event in events] == ["approved", "rejected"]
+
+
+def test_reingesting_approved_card_preserves_review_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    source = _fenced("proposal_run_pid_valid.json")
+    proposal_storage.ingest_proposal_output(source)
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    approved = proposal_storage.record_approval(
+        card["proposal_id"],
+        kanban_task_id="t_approved",
+        worker_url="/workers?task=t_approved",
+        actor="operator",
+    )
+
+    proposal_storage.ingest_proposal_output(source)
+
+    reingested = proposal_storage.get_card(card["proposal_id"])
+    assert reingested["status"] == "approved"
+    assert reingested["kanban_task_id"] == "t_approved"
+    assert reingested["worker_url"] == "/workers?task=t_approved"
+    assert reingested["run_db_id"] == approved["run_db_id"]
+    assert proposal_storage.list_audit_events(card["proposal_id"])[0]["action"] == "approved"
+    summary = proposal_storage.summarize_feedback_history(project="pid", prong="airflow_scraper_doctor")
+    assert summary["projects"][0]["prongs"][0]["accepted"][0]["kanban_task_id"] == "t_approved"
+
+
+def test_reingesting_rejected_card_preserves_review_state_and_hidden_grouping(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    source = _fenced("proposal_run_pid_valid.json")
+    proposal_storage.ingest_proposal_output(source)
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    rejected = proposal_storage.record_rejection(card["proposal_id"], reason="not actionable", actor="operator")
+
+    proposal_storage.ingest_proposal_output(source)
+
+    reingested = proposal_storage.get_card(card["proposal_id"])
+    assert reingested["status"] == "rejected"
+    assert reingested["rejected_reason"] == "not actionable"
+    assert reingested["archived_at"] == rejected["archived_at"]
+    assert reingested["run_db_id"] == rejected["run_db_id"]
+    assert proposal_storage.grouped_cards()["projects"] == []
+    assert proposal_storage.list_audit_events(card["proposal_id"])[0]["action"] == "rejected"
+    summary = proposal_storage.summarize_feedback_history(project="pid", prong="airflow_scraper_doctor")
+    assert summary["projects"][0]["prongs"][0]["rejected"][0]["reason"] == "not actionable"
+
+
+def test_feedback_summary_empty_history(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    summary = proposal_storage.summarize_feedback_history(project="pid", prong="airflow_scraper_doctor")
+
+    assert summary["projects"] == []
+
+
+def test_feedback_summary_groups_filters_and_limits(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    payload = json.loads(_fixture_text("proposal_run_pid_valid.json"))
+    payload["cards"] = []
+    for idx in range(3):
+        card = json.loads(_fixture_text("proposal_run_pid_valid.json"))["cards"][0]
+        card["idempotency_key"] = f"accepted-{idx}"
+        card["title"] = f"Accepted card {idx}"
+        card["summary"] = "Accepted summary " + ("x" * 80)
+        payload["cards"].append(card)
+    for idx in range(2):
+        card = json.loads(_fixture_text("proposal_run_pid_valid.json"))["cards"][0]
+        card["idempotency_key"] = f"rejected-{idx}"
+        card["title"] = f"Rejected card {idx}"
+        card["summary"] = "Rejected summary " + ("y" * 80)
+        payload["cards"].append(card)
+    proposal_storage.ingest_proposal_output(json.dumps(payload))
+    cards = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"]
+
+    for card in cards[:3]:
+        proposal_storage.record_approval(card["proposal_id"], kanban_task_id=f"t_{card['title'][-1]}", worker_url="/workers")
+    for card in cards[3:]:
+        proposal_storage.record_rejection(card["proposal_id"], reason="duplicate and too broad " + ("z" * 80))
+
+    summary = proposal_storage.summarize_feedback_history(
+        project="pid",
+        prong="airflow_scraper_doctor",
+        max_items_per_kind=2,
+        max_text_chars=40,
+    )
+    prong = summary["projects"][0]["prongs"][0]
+
+    assert summary["projects"][0]["project"] == "pid"
+    assert prong["prong"] == "airflow_scraper_doctor"
+    assert len(prong["accepted"]) == 2
+    assert len(prong["rejected"]) == 2
+    assert prong["accepted"][0]["outcome"] == "accepted"
+    assert prong["rejected"][0]["outcome"] == "rejected"
+    assert len(prong["accepted"][0]["summary"]) <= 40
+    assert len(prong["rejected"][0]["reason"]) <= 40
+
+    other = proposal_storage.summarize_feedback_history(project="pid", prong="admin_dogfood_ux_bugfix")
+    assert other["projects"] == []
+
+
+def test_feedback_context_formatter_is_compact(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    proposal_storage.ingest_proposal_output(_fenced("proposal_run_pid_valid.json"))
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    proposal_storage.record_rejection(card["proposal_id"], reason="already handled elsewhere")
+
+    context = proposal_storage.format_feedback_history_context(
+        proposal_storage.summarize_feedback_history(project="pid", prong="airflow_scraper_doctor")
+    )
+
+    assert "Recent Proposal Feedback" in context
+    assert "Rejected recently" in context
+    assert "already handled elsewhere" in context
+    assert card["body"] not in context
+
+
+def test_json_fence_parser_accepts_plain_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    payload = json.loads(_fixture_text("proposal_run_pid_empty.json"))
+
+    result = proposal_storage.ingest_proposal_output(json.dumps(payload))
+
+    assert result["status"] == "empty"
