@@ -36,6 +36,14 @@ def test_build_grill_me_prompt_is_planning_only_and_preserves_request():
 
     assert "planning mode is active" in prompt
     assert "Do not implement code" in prompt
+    assert "AGENTS.md" in prompt
+    assert "CONTEXT.md" in prompt
+    assert "CONTEXT-MAP.md" in prompt
+    assert "docs/adr/" in prompt
+    assert "propose precise canonical language" in prompt
+    assert "inspect that context instead of asking the user" in prompt
+    assert "Do not edit docs in grill-me planning mode" in prompt
+    assert "after explicit confirmation" in prompt
     assert "Do not batch dependent questions" in prompt
     assert "grill me: dashboard auth flow" in prompt
     assert "Discord thread" in prompt
