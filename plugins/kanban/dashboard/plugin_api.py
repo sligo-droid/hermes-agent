@@ -675,6 +675,89 @@ def _discord_worker_board_status(worker: dict[str, Any]) -> str:
     return phase
 
 
+def _pause_generic_task(conn: sqlite3.Connection, task_id: str, *, reason: str) -> bool:
+    task = kanban_db.get_task(conn, task_id)
+    if task is None or task.status in {"done", "archived"}:
+        return False
+    if task.status in {"blocked", "scheduled"}:
+        return True
+    if task.status == "running" or task.claim_lock:
+        kanban_db.reclaim_task(conn, task_id, reason=reason)
+        task = kanban_db.get_task(conn, task_id)
+        if task is None or task.status in {"done", "archived"}:
+            return False
+    return kanban_db.block_task(conn, task_id, reason=reason)
+
+
+def _resume_generic_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    task = kanban_db.get_task(conn, task_id)
+    if task is None or task.status in {"done", "archived"}:
+        return False
+    if task.status in {"ready", "running", "review"}:
+        return True
+    if task.status in {"blocked", "scheduled"}:
+        return kanban_db.unblock_task(conn, task_id)
+    if task.status in {"todo", "triage"}:
+        return kanban_db.set_status_direct(conn, task_id, "ready", source="dashboard/command-center-resume")
+    return False
+
+
+def _pause_generic_board(board: str, *, reason: str) -> dict[str, Any]:
+    conn = _conn(board=_resolve_board(board))
+    paused: list[str] = []
+    try:
+        for task in kanban_db.list_tasks(conn, include_archived=False):
+            if task.status in {"done", "archived"}:
+                continue
+            if _pause_generic_task(conn, task.id, reason=reason):
+                paused.append(task.id)
+    finally:
+        conn.close()
+    meta = kanban_db.read_board_metadata(board)
+    meta.pop("db_path", None)
+    meta["command_center_paused"] = True
+    meta["command_center_pause_reason"] = reason
+    meta["command_center_paused_at"] = int(time.time())
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return {"board": board, "paused": paused}
+
+
+def _resume_generic_board(board: str) -> dict[str, Any]:
+    conn = _conn(board=_resolve_board(board))
+    resumed: list[str] = []
+    try:
+        for task in kanban_db.list_tasks(conn, include_archived=False):
+            if task.status in {"blocked", "scheduled"} and _resume_generic_task(conn, task.id):
+                resumed.append(task.id)
+    finally:
+        conn.close()
+    meta = kanban_db.read_board_metadata(board)
+    meta.pop("db_path", None)
+    meta["command_center_paused"] = False
+    meta.pop("command_center_pause_reason", None)
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return {"board": board, "resumed": resumed}
+
+
+def _stop_generic_board_for_archive(board: str, *, reason: str) -> dict[str, Any]:
+    conn = _conn(board=_resolve_board(board))
+    archived: list[str] = []
+    reclaimed: list[str] = []
+    try:
+        for task in kanban_db.list_tasks(conn, include_archived=False):
+            if task.status == "done":
+                continue
+            if task.status == "running" or task.claim_lock:
+                if kanban_db.reclaim_task(conn, task.id, reason=reason):
+                    reclaimed.append(task.id)
+            latest = kanban_db.get_task(conn, task.id)
+            if latest and latest.status != "archived" and kanban_db.archive_task(conn, task.id):
+                archived.append(task.id)
+    finally:
+        conn.close()
+    return {"board": board, "archived_tasks": archived, "reclaimed": reclaimed}
+
+
 def _planner_task_matches_card(task: kanban_db.Task, card: dict[str, Any]) -> bool:
     if task.assignee != ROLE_PLANNER or task.created_by != "self-improvement":
         return False
@@ -1634,6 +1717,90 @@ def self_improvement_proposal_halt_endpoint(proposal_id: str, payload: ProposalF
     return {"card": _self_improvement_card_with_downstream(proposal_storage.get_card(proposal_id)), "task": _task_dict(next_task) if next_task else None}
 
 
+@router.post("/self-improvement/proposals/{proposal_id}/pause")
+def self_improvement_proposal_pause_endpoint(proposal_id: str, payload: ProposalFollowupBody | None = None):
+    card = proposal_storage.get_card(proposal_id)
+    if card is None:
+        raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")
+    task_id = card.get("kanban_task_id")
+    if not task_id:
+        raise HTTPException(status_code=409, detail="proposal has no downstream task")
+    board = _latest_self_improvement_board(proposal_id)
+    reason = payload.reason.strip() if payload and payload.reason else "command-center-paused"
+    worker = _discord_worker_meta(board)
+    result: dict[str, Any]
+    if worker:
+        from hermes_cli import discord_worker_boards as dwb
+
+        dwb.pause_board(board, reason=reason)
+        result = {"board": board, "paused": True}
+        conn = _conn(board=board)
+    else:
+        conn = _conn(board=_resolve_board(board))
+        result = {"board": board, "paused": False}
+    try:
+        task = kanban_db.get_task(conn, str(task_id))
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"downstream task {task_id!r} not found")
+        if not worker and task.status not in {"done", "archived"}:
+            result["paused"] = _pause_generic_task(conn, str(task_id), reason=reason)
+        next_task = kanban_db.get_task(conn, str(task_id))
+    finally:
+        conn.close()
+    proposal_storage.record_audit_event(
+        proposal_id,
+        action="paused",
+        actor=_proposal_actor(),
+        kanban_task_id=str(task_id),
+        reason=(payload.reason.strip() if payload and payload.reason else None),
+        metadata={"board": board, "previous_status": task.status, "result": result},
+    )
+    return {"card": _self_improvement_card_with_downstream(proposal_storage.get_card(proposal_id)), "task": _task_dict(next_task) if next_task else None}
+
+
+@router.post("/self-improvement/proposals/{proposal_id}/resume")
+def self_improvement_proposal_resume_endpoint(proposal_id: str):
+    card = proposal_storage.get_card(proposal_id)
+    if card is None:
+        raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")
+    task_id = card.get("kanban_task_id")
+    if not task_id:
+        raise HTTPException(status_code=409, detail="proposal has no downstream task")
+    board = _latest_self_improvement_board(proposal_id)
+    worker = _discord_worker_meta(board)
+    result: dict[str, Any]
+    if worker:
+        from hermes_cli import discord_worker_boards as dwb
+
+        dwb.resume_board(board)
+        try:
+            dwb.mark_dispatch_dirty(board=board, reason="command-center-resumed")
+        except Exception:
+            pass
+        result = {"board": board, "resumed": True}
+        conn = _conn(board=board)
+    else:
+        conn = _conn(board=_resolve_board(board))
+        result = {"board": board, "resumed": False}
+    try:
+        task = kanban_db.get_task(conn, str(task_id))
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"downstream task {task_id!r} not found")
+        if not worker:
+            result["resumed"] = _resume_generic_task(conn, str(task_id))
+        next_task = kanban_db.get_task(conn, str(task_id))
+    finally:
+        conn.close()
+    proposal_storage.record_audit_event(
+        proposal_id,
+        action="resumed",
+        actor=_proposal_actor(),
+        kanban_task_id=str(task_id),
+        metadata={"board": board, "previous_status": task.status, "result": result},
+    )
+    return {"card": _self_improvement_card_with_downstream(proposal_storage.get_card(proposal_id)), "task": _task_dict(next_task) if next_task else None}
+
+
 @router.post("/self-improvement/proposals/{proposal_id}/undo-followup")
 def self_improvement_proposal_undo_followup_endpoint(proposal_id: str, payload: ProposalFollowupBody | None = None):
     card = proposal_storage.get_card(proposal_id)
@@ -2427,10 +2594,64 @@ def rename_board(slug: str, payload: RenameBoardBody):
     return {"board": meta}
 
 
+@router.post("/boards/{slug}/pause")
+def pause_board(slug: str, payload: ProposalFollowupBody | None = None):
+    """Pause a Command Center board without archiving it."""
+    try:
+        normed = kanban_db._normalize_board_slug(slug)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not normed or not kanban_db.board_exists(normed):
+        raise HTTPException(status_code=404, detail=f"board {slug!r} does not exist")
+    reason = payload.reason.strip() if payload and payload.reason else "command-center-paused"
+    worker = _discord_worker_meta(normed)
+    if worker:
+        from hermes_cli import discord_worker_boards as dwb
+
+        dwb.pause_board(normed, reason=reason)
+        result = {"board": normed, "paused": True}
+    else:
+        result = _pause_generic_board(normed, reason=reason)
+    return {"result": result, "board": kanban_db.read_board_metadata(normed)}
+
+
+@router.post("/boards/{slug}/resume")
+def resume_board(slug: str):
+    """Resume a paused Command Center board."""
+    try:
+        normed = kanban_db._normalize_board_slug(slug)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not normed or not kanban_db.board_exists(normed):
+        raise HTTPException(status_code=404, detail=f"board {slug!r} does not exist")
+    worker = _discord_worker_meta(normed)
+    if worker:
+        from hermes_cli import discord_worker_boards as dwb
+
+        dwb.resume_board(normed)
+        try:
+            dwb.mark_dispatch_dirty(board=normed, reason="command-center-resumed")
+        except Exception:
+            pass
+        result = {"board": normed, "resumed": True}
+    else:
+        result = _resume_generic_board(normed)
+    return {"result": result, "board": kanban_db.read_board_metadata(normed)}
+
+
 @router.delete("/boards/{slug}")
 def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete instead of archive")):
     """Archive (default) or hard-delete a board."""
     try:
+        normed = kanban_db._normalize_board_slug(slug)
+        if not delete and normed and kanban_db.board_exists(normed):
+            worker = _discord_worker_meta(normed)
+            if worker:
+                from hermes_cli import discord_worker_boards as dwb
+
+                dwb.stop_board_execution(normed, reason="archived-from-command-center")
+            else:
+                _stop_generic_board_for_archive(normed, reason="archived-from-command-center")
         res = kanban_db.remove_board(slug, archive=not delete)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

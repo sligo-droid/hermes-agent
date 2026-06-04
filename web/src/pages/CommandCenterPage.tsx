@@ -10,6 +10,7 @@ import {
   Inbox,
   PauseCircle,
   RotateCcw,
+  PlayCircle,
   Send,
   X,
 } from "lucide-react";
@@ -25,13 +26,13 @@ import type {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-type ViewKey = "overview" | "inbox" | "work" | "runs" | "recommendations" | "sources";
+type ViewKey = "overview" | "inbox" | "work" | "archive" | "runs" | "recommendations" | "sources";
 type Selection =
   | { kind: "work"; item: CommandCenterWorkItem }
   | { kind: "source"; source: CommandCenterSource }
   | { kind: "run"; run: CommandCenterRun };
 
-type ActionKind = "approve" | "reject" | "halt" | "undo" | "archive";
+type ActionKind = "approve" | "reject" | "pause" | "resume" | "undo" | "archive";
 
 declare global {
   interface Window {
@@ -43,6 +44,7 @@ function viewFromPath(pathname: string): ViewKey {
   const normalized = pathname.replace(/\/+$/, "") || "/";
   if (normalized.includes("/inbox")) return "inbox";
   if (normalized.includes("/work")) return "work";
+  if (normalized.includes("/archive")) return "archive";
   return "overview";
 }
 
@@ -85,6 +87,22 @@ function isWorkItem(item: CommandCenterWorkItem): boolean {
   return item.status !== "proposed" && item.status !== "rejected" && item.status !== "archived";
 }
 
+function isArchivedItem(item: CommandCenterWorkItem): boolean {
+  return item.status === "archived";
+}
+
+function isRunningWorkItem(item: CommandCenterWorkItem): boolean {
+  return item.status === "running" || Boolean(item.execution?.active_run_id) || Boolean(item.runs?.some(runIsActive));
+}
+
+function workItemViewSort(a: CommandCenterWorkItem, b: CommandCenterWorkItem): number {
+  const runningDelta = Number(isRunningWorkItem(b)) - Number(isRunningWorkItem(a));
+  if (runningDelta) return runningDelta;
+  const pausedDelta = Number(b.status === "paused") - Number(a.status === "paused");
+  if (pausedDelta) return pausedDelta;
+  return 0;
+}
+
 function runIsActive(run: CommandCenterRun): boolean {
   return !run.ended_at && run.task_status === "running";
 }
@@ -110,6 +128,10 @@ function initialSelectionForView(snapshot: CommandCenterSnapshot, activeView: Vi
   }
   if (activeView === "work") {
     const item = snapshot.work_items.find(isWorkItem);
+    return item ? { kind: "work", item } : null;
+  }
+  if (activeView === "archive") {
+    const item = snapshot.work_items.find(isArchivedItem);
     return item ? { kind: "work", item } : null;
   }
   const item = snapshot.work_items[0];
@@ -198,7 +220,8 @@ function ActionButton({
   const config = {
     approve: { label: "Approve", icon: Check, className: "border-emerald-200/70 bg-emerald-400 text-emerald-950 hover:bg-emerald-300 focus-visible:ring-emerald-100/75" },
     reject: { label: "Reject", icon: X, className: "border-red-200/75 bg-red-500 text-white hover:bg-red-400 focus-visible:ring-red-100/75", strong: true },
-    halt: { label: "Cancel work", icon: PauseCircle, className: "border-orange-200/70 bg-orange-400 text-orange-950 hover:bg-orange-300 focus-visible:ring-orange-100/75", strong: true },
+    pause: { label: "Pause", icon: PauseCircle, className: "border-orange-200/70 bg-orange-400 text-orange-950 hover:bg-orange-300 focus-visible:ring-orange-100/75", strong: true },
+    resume: { label: "Resume", icon: PlayCircle, className: "border-emerald-200/70 bg-emerald-400 text-emerald-950 hover:bg-emerald-300 focus-visible:ring-emerald-100/75", strong: true },
     undo: { label: "Revert", icon: RotateCcw, className: "border-sky-200/65 bg-sky-400 text-sky-950 hover:bg-sky-300 focus-visible:ring-sky-100/75" },
     archive: { label: "Archive board", icon: Archive, className: "border-violet-200/60 bg-violet-400 text-violet-950 hover:bg-violet-300 focus-visible:ring-violet-100/75" },
   }[kind];
@@ -251,9 +274,11 @@ function WorkItemCard({
   const proposalId = item.decision?.proposal_id;
   const actionBusy = (kind: ActionKind) => activeAction?.id === item.id && activeAction.kind === kind;
   const canApproveReject = Boolean(proposalId && item.status === "proposed");
-  const canHalt = Boolean(proposalId && ["queued", "running", "review", "blocked", "accepted"].includes(item.status));
+  const proposalCanArchive = Boolean(proposalId && ["queued", "running", "review", "blocked", "accepted", "paused"].includes(item.status));
+  const canPause = Boolean(["queued", "running", "review", "accepted"].includes(item.status) && (proposalId || (item.execution?.pause_action && item.execution.board)) && !item.execution?.paused);
+  const canResume = Boolean((item.status === "paused" || item.execution?.paused || item.execution?.resumable) && (proposalId || (item.execution?.resume_action && item.execution.board)) && item.status !== "archived");
   const canUndo = Boolean(proposalId && item.status === "shipped");
-  const canArchive = Boolean(item.execution?.archiveable && item.execution.board && item.execution.board !== "default" && item.id.startsWith("kanban-board:"));
+  const canArchive = Boolean((item.execution?.archiveable && item.execution.board && item.execution.board !== "default" && item.id.startsWith("kanban-board:")) || proposalCanArchive);
   return (
     <article
       className={cn(
@@ -283,7 +308,7 @@ function WorkItemCard({
       <button className="mt-3 block w-full text-left" onClick={onSelect} type="button">
         <p className="text-sm leading-6 text-slate-300">{item.summary || item.body_preview || "No summary yet."}</p>
       </button>
-      {(item.execution?.task_url && item.execution.task_url !== item.execution.worker_url) || canApproveReject || canArchive || canHalt || canUndo ? (
+      {(item.execution?.task_url && item.execution.task_url !== item.execution.worker_url) || canApproveReject || canArchive || canPause || canResume || canUndo ? (
         <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3">
           {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && (
             <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/[0.07] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" href={item.execution.task_url}>
@@ -293,7 +318,8 @@ function WorkItemCard({
           {canApproveReject && <ActionButton busy={actionBusy("approve")} kind="approve" onClick={() => onAction("approve", item)} />}
           {canApproveReject && <ActionButton busy={actionBusy("reject")} kind="reject" onClick={() => onAction("reject", item)} />}
           {canArchive && <ActionButton busy={actionBusy("archive")} kind="archive" onClick={() => onAction("archive", item)} />}
-          {canHalt && <ActionButton busy={actionBusy("halt")} kind="halt" onClick={() => onAction("halt", item)} />}
+          {canResume && <ActionButton busy={actionBusy("resume")} kind="resume" onClick={() => onAction("resume", item)} />}
+          {canPause && <ActionButton busy={actionBusy("pause")} kind="pause" onClick={() => onAction("pause", item)} />}
           {canUndo && <ActionButton busy={actionBusy("undo")} kind="undo" onClick={() => onAction("undo", item)} />}
         </div>
       ) : null}
@@ -473,7 +499,7 @@ function WorkList({
   if (!items.length) return <EmptyState label={emptyLabel || "work items"} message={emptyMessage} />;
   return (
     <div className="grid gap-3">
-      {items.map((item) => (
+      {[...items].sort(workItemViewSort).map((item) => (
         <WorkItemCard
           activeAction={activeAction}
           item={item}
@@ -504,8 +530,8 @@ function OverviewWorkList({
 }) {
   if (!items.length) return <EmptyState label="work items" message={emptyMessage} />;
 
-  const runningItems = items.filter((item) => item.status === "running");
-  const remainingItems = items.filter((item) => item.status !== "running");
+  const runningItems = items.filter(isRunningWorkItem);
+  const remainingItems = items.filter((item) => !isRunningWorkItem(item));
   const renderItem = (item: CommandCenterWorkItem) => (
     <WorkItemCard
       activeAction={activeAction}
@@ -546,7 +572,7 @@ export default function CommandCenterPage() {
     setLoading(true);
     setError(null);
     try {
-      const next = await api.getCommandCenterSnapshot({ recentRunLimitPerBoard: 25 });
+      const next = await api.getCommandCenterSnapshot({ includeArchived: true, recentRunLimitPerBoard: 25 });
       setSnapshot(next);
       setSelection((current) => {
         if (!current) {
@@ -604,6 +630,10 @@ export default function CommandCenterPage() {
     () => snapshot?.work_items.filter(isWorkItem) ?? [],
     [snapshot],
   );
+  const archivedItems = useMemo(
+    () => snapshot?.work_items.filter(isArchivedItem) ?? [],
+    [snapshot],
+  );
   const overviewItems = useMemo(() => {
     const seen = new Set<string>();
     const merged = [...inboxItems, ...workItems].filter((item) => {
@@ -611,11 +641,7 @@ export default function CommandCenterPage() {
       seen.add(item.id);
       return true;
     });
-    return merged.sort((a, b) => {
-      const runningDelta = Number(b.status === "running") - Number(a.status === "running");
-      if (runningDelta) return runningDelta;
-      return 0;
-    });
+    return merged.sort(workItemViewSort);
   }, [inboxItems, workItems]);
   const recommendations = useMemo(
     () => snapshot?.work_items.filter((item) => item.source.kind === "self_improvement") ?? [],
@@ -629,25 +655,29 @@ export default function CommandCenterPage() {
   const handleAction = useCallback(async (kind: ActionKind, item: CommandCenterWorkItem) => {
     const proposalId = item.decision?.proposal_id;
     const board = item.execution?.board;
-    if (kind === "archive" && (!item.execution?.archiveable || !board || board === "default")) return;
-    if (kind !== "archive" && !proposalId) return;
+    if (kind === "archive" && !proposalId && (!item.execution?.archiveable || !board || board === "default")) return;
+    if (["approve", "reject", "undo"].includes(kind) && !proposalId) return;
+    if (["pause", "resume"].includes(kind) && !proposalId && (!board || board === "default")) return;
     setActiveAction({ id: item.id, kind });
     setError(null);
     try {
       if (kind === "archive") {
-        if (!board) return;
-        const confirmed = window.confirm(`Archive worker board ${board}?`);
+        const confirmed = window.confirm(board && board !== "default" ? `Archive worker board ${board}?` : "Archive this work item and halt downstream execution?");
         if (!confirmed) return;
-        await api.archiveKanbanBoard(board);
+        if (board && board !== "default") await api.archiveKanbanBoard(board);
+        else if (proposalId) await api.haltSelfImprovementProposal(proposalId);
       } else if (proposalId && kind === "approve") {
         await api.approveSelfImprovementProposal(proposalId);
       } else if (proposalId && kind === "reject") {
         const reason = window.prompt("Reject reason for future prong feedback?", "Not worth doing right now.");
         if (!reason) return;
         await api.rejectSelfImprovementProposal(proposalId, reason);
-      } else if (proposalId && kind === "halt") {
-        const reason = window.prompt("Reason to cancel downstream work?", "Operator cancelled from Command Center.") || undefined;
-        await api.haltSelfImprovementProposal(proposalId, reason);
+      } else if (kind === "pause") {
+        if (proposalId) await api.pauseSelfImprovementProposal(proposalId);
+        else if (board) await api.pauseKanbanBoard(board);
+      } else if (kind === "resume") {
+        if (proposalId) await api.resumeSelfImprovementProposal(proposalId);
+        else if (board) await api.resumeKanbanBoard(board);
       } else if (proposalId && kind === "undo") {
         const reason = window.prompt("Reason for revert follow-up?", "Operator requested revert follow-up from Command Center.") || undefined;
         await api.requestSelfImprovementUndoFollowup(proposalId, reason);
@@ -716,6 +746,7 @@ export default function CommandCenterPage() {
               </div>
             )}
             {activeView === "work" && <WorkList activeAction={activeAction} emptyMessage="No active or recently shipped work is visible." items={workItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
+            {activeView === "archive" && <WorkList activeAction={activeAction} emptyLabel="archived items" emptyMessage="Archived worker boards and work items will appear here." items={archivedItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
             {activeView === "recommendations" && <WorkList activeAction={activeAction} emptyLabel="recommendations" emptyMessage="No self-improvement recommendations are waiting." items={recommendations} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
             {activeView === "runs" && (
               <div className="grid gap-3">
