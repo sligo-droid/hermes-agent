@@ -75,6 +75,18 @@ Important invariants:
 
 The Sligo shell in `web/src/App.tsx` provides the focused internal navigation for `sligo.sligolabs.com`. The combined/local dashboard can still surface Command Center links, but Hermes-host Sligo routes redirect to the Sligo host.
 
+## Feature Requests Without Worker Boards
+
+Feature requests should enter the Command Center as Work Items even before a dedicated Kanban worker board exists. The request row should use a stable `source_ref` that points at the intake object, such as a Discord message, form submission, or manual operator record, and should remain separate from child worker tickets.
+
+If the request later receives a worker board, attach the board slug to the Work Item execution metadata and let the board become the active execution rollup. The Work Item remains the canonical request identity; the board contributes task counts, run history, artifacts, and worker-board links.
+
+Status ownership belongs to the Work Item until a worker board is attached. After attachment, board/task rollup can drive execution statuses such as queued, running, review, blocked, and shipped, while operator decisions such as accepted, rejected, parked, or archived stay on the Work Item.
+
+Artifacts should be collected on the Work Item regardless of whether they originate from intake or execution. Examples include source links, Discord thread URLs, worker-board URLs, run summaries, pull requests, deployment notes, and follow-up decisions.
+
+The UI should group individual feature request cards apart from worker-board cards. Request cards should be labeled by source kind and request title, while worker-board cards should use `kanban-board:<slug>` identities and board/source badges. This prevents standalone requests from looking like individual worker tickets and keeps ticket-level detail inside the board rollup or detail panel.
+
 ## Verification
 
 Focused verification for this surface should cover:

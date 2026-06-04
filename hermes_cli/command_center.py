@@ -121,6 +121,32 @@ def _canonical_status_from_task(task: dict[str, Any] | None) -> tuple[str, str]:
     return "accepted", status or "unknown"
 
 
+def _canonical_status_from_board(
+    tasks: list[dict[str, Any]],
+    *,
+    board_meta: dict[str, Any],
+) -> tuple[str, str]:
+    worker = _board_worker_meta(board_meta)
+    goal_status = str(worker.get("goal_status") or "").lower()
+    if board_meta.get("archived"):
+        return "archived", "archived"
+    counts = _task_status_counts(tasks)
+    if counts.get("blocked", 0):
+        return "blocked", "blocked"
+    if counts.get("running", 0):
+        return "running", "running"
+    if counts.get("review", 0):
+        return "review", "review"
+    if sum(counts.get(status, 0) for status in _WAITING_TASK_STATUSES):
+        return "queued", "queued"
+    active_tasks = [task for task in tasks if str(task.get("status") or "").lower() != "archived"]
+    if active_tasks and all(str(task.get("status") or "").lower() == "done" for task in active_tasks):
+        return "shipped", goal_status or "done"
+    if goal_status in {"done", "shipped", "complete", "completed"}:
+        return "shipped", goal_status
+    return "accepted", goal_status or "board"
+
+
 def _canonical_status_from_proposal(card: dict[str, Any], task: dict[str, Any] | None) -> tuple[str, str]:
     status = str(card.get("status") or "").lower()
     if status == "rejected" or card.get("archived_at"):
@@ -242,8 +268,8 @@ def _source_from_task_board(board: str, board_meta: dict[str, Any]) -> dict[str,
         }
     return {
         "id": f"source:kanban-board:{board}",
-        "kind": "kanban",
-        "label": "Kanban task",
+        "kind": "kanban_board",
+        "label": "Kanban board",
         "ref": {"board": board},
     }
 
@@ -265,6 +291,32 @@ def _execution_from_task(task: dict[str, Any], *, board: str, board_meta: dict[s
         "worker_pid": task.get("worker_pid"),
         "workspace_kind": task.get("workspace_kind"),
         "workspace_path": task.get("workspace_path"),
+    }
+
+
+def _execution_from_board(
+    *,
+    board: str,
+    board_meta: dict[str, Any],
+    tasks: list[dict[str, Any]],
+    runs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    worker = _board_worker_meta(board_meta)
+    public_url = worker.get("public_url") if isinstance(worker, dict) else None
+    active_run = next((run for run in runs if _is_active_run(run)), None)
+    return {
+        "board": board,
+        "board_name": board_meta.get("name") or board,
+        "task_id": None,
+        "task_status": None,
+        "task_url": None,
+        "worker_url": _worker_board_url(board, public_url),
+        "console_url": None,
+        "active_run_id": active_run.get("id") if active_run else None,
+        "archive_action": f"/api/plugins/kanban/boards/{quote(board, safe='')}",
+        "archiveable": board != kanban_db.DEFAULT_BOARD and not bool(board_meta.get("archived")),
+        "task_counts": _task_status_counts(tasks),
+        "run_count": len(runs),
     }
 
 
@@ -400,6 +452,70 @@ def _task_work_item(
     }
 
 
+def _board_title(board: str, board_meta: dict[str, Any]) -> str:
+    worker = _board_worker_meta(board_meta)
+    for key in ("summary_title", "root_goal", "initial_request"):
+        value = worker.get(key)
+        if str(value or "").strip():
+            return str(value).strip()
+    return str(board_meta.get("name") or board)
+
+
+def _board_summary(board_meta: dict[str, Any], tasks: list[dict[str, Any]]) -> str:
+    worker = _board_worker_meta(board_meta)
+    summary = _text_preview(worker.get("root_goal"), worker.get("initial_request"), board_meta.get("description"))
+    if summary:
+        return summary
+    counts = _task_status_counts(tasks)
+    if counts:
+        parts = [f"{count} {status}" for status, count in sorted(counts.items()) if count]
+        return "Board rollup: " + ", ".join(parts)
+    return "Worker board with no active task detail recorded."
+
+
+def _task_status_counts(tasks: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for task in tasks:
+        status = str(task.get("status") or "unknown").lower()
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _board_work_item(
+    *,
+    board: str,
+    board_meta: dict[str, Any],
+    tasks: list[dict[str, Any]],
+    runs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    canonical_status, status_detail = _canonical_status_from_board(tasks, board_meta=board_meta)
+    source = _source_from_task_board(board, board_meta)
+    created_candidates = [task.get("created_at") for task in tasks if task.get("created_at")]
+    updated_candidates = [task.get("completed_at") or task.get("started_at") or task.get("created_at") for task in tasks]
+    latest_updated = max((_epoch_or_none(value) or 0 for value in updated_candidates), default=0) or board_meta.get("created_at")
+    return {
+        "id": f"kanban-board:{board}",
+        "title": _board_title(board, board_meta),
+        "summary": _board_summary(board_meta, tasks),
+        "body_preview": None,
+        "project": None,
+        "priority": None,
+        "priority_rank": 0,
+        "severity": None,
+        "status": canonical_status,
+        "status_detail": status_detail,
+        "created_at": min((_epoch_or_none(value) or 0 for value in created_candidates), default=0) or board_meta.get("created_at"),
+        "updated_at": latest_updated,
+        "source": source,
+        "decision": {"needed": False},
+        "execution": _execution_from_board(board=board, board_meta=board_meta, tasks=tasks, runs=runs),
+        "runs": runs,
+        "artifacts": _artifacts_from_task_and_board({}, board_meta),
+        "source_excerpts": [],
+        "raw": {"board": board_meta, "rollup": {"task_counts": _task_status_counts(tasks), "task_count": len(tasks), "run_count": len(runs)}},
+    }
+
+
 def _artifacts_from_task_and_board(task: dict[str, Any], board_meta: dict[str, Any]) -> list[dict[str, Any]]:
     artifacts: list[dict[str, Any]] = []
     worker = _board_worker_meta(board_meta)
@@ -433,6 +549,8 @@ def _load_task_for_proposal(
     if not task_id:
         return None, [], None, None
     board = _latest_self_improvement_board(str(card.get("proposal_id") or ""))
+    if board != kanban_db.DEFAULT_BOARD and not kanban_db.board_exists(board):
+        return None, [], board, kanban_db.read_board_metadata(board)
     try:
         kanban_db.init_db(board=board)
         conn = kanban_db.connect(board=board)
@@ -522,7 +640,14 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
             board_meta=board_meta,
             metadata=metadata,
         )
-        work_items.append(item)
+        has_board_rollup = bool(
+            board
+            and board != kanban_db.DEFAULT_BOARD
+            and item.get("status") not in {"proposed", "rejected", "archived"}
+            and kanban_db.board_exists(board)
+        )
+        if not has_board_rollup:
+            work_items.append(item)
         if board and card.get("kanban_task_id"):
             seen_execution_tasks.add((board, str(card["kanban_task_id"])))
 
@@ -556,15 +681,22 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
         try:
             tasks = kanban_db.list_tasks(conn, include_archived=include_archived, order_by="updated")
             summaries = kanban_db.latest_summaries(conn, [task.id for task in tasks])
+            task_dicts = []
             for task in tasks:
-                key = (board, task.id)
-                if key in seen_execution_tasks:
-                    continue
                 task_dict = _task_to_dict(task)
                 task_dict["latest_summary"] = summaries.get(task.id)
-                task_runs = _task_runs(conn, task.id, board=board)
-                work_items.append(_task_work_item(task_dict, board=board, board_meta=board_meta, runs=task_runs))
-            runs.extend(_recent_board_runs(conn, board=board, limit=recent_run_limit_per_board))
+                task_dicts.append(task_dict)
+            board_runs = _recent_board_runs(conn, board=board, limit=recent_run_limit_per_board)
+            if board != kanban_db.DEFAULT_BOARD:
+                work_items.append(_board_work_item(board=board, board_meta=board_meta, tasks=task_dicts, runs=board_runs))
+            else:
+                for task_dict in task_dicts:
+                    key = (board, str(task_dict.get("id")))
+                    if key in seen_execution_tasks:
+                        continue
+                    task_runs = _task_runs(conn, str(task_dict.get("id")), board=board)
+                    work_items.append(_task_work_item(task_dict, board=board, board_meta=board_meta, runs=task_runs))
+            runs.extend(board_runs)
         finally:
             conn.close()
 
@@ -621,7 +753,7 @@ def _metrics(
         by_status[status] = by_status.get(status, 0) + 1
         source_kind = str((item.get("source") or {}).get("kind") or "unknown")
         by_source[source_kind] = by_source.get(source_kind, 0) + 1
-    active_runs = [run for run in runs if run.get("ended_at") is None]
+    active_runs = [run for run in runs if _is_active_run(run)]
     return {
         "total_work_items": len(work_items),
         "inbox": sum(1 for item in work_items if item.get("status") in {"proposed", "blocked"})
@@ -639,3 +771,10 @@ def _metrics(
         "by_status": by_status,
         "by_source": by_source,
     }
+
+
+def _is_active_run(run: dict[str, Any]) -> bool:
+    if run.get("ended_at") is not None:
+        return False
+    task_status = str(run.get("task_status") or "").lower()
+    return task_status in _RUNNING_TASK_STATUSES

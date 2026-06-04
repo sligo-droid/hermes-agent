@@ -126,7 +126,7 @@ def test_snapshot_always_includes_active_runs_outside_recent_limit(tmp_path, mon
     assert snapshot["metrics"]["active_runs"] == 1
 
 
-def test_snapshot_promotes_discord_board_tasks_to_discord_origin_work_items(tmp_path, monkeypatch):
+def test_snapshot_rolls_named_discord_board_tasks_up_to_board_work_item(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     board = "discord-1512105486609289247"
     kanban_db.write_board_metadata(board, name="Discord Feature Thread")
@@ -143,15 +143,45 @@ def test_snapshot_promotes_discord_board_tasks_to_discord_origin_work_items(tmp_
         conn.close()
 
     snapshot = command_center.build_command_center_snapshot()
-    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban:{board}:{task_id}")
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
     source = next(source for source in snapshot["sources"] if source["id"] == f"source:discord:{board}")
 
     assert item["source"]["kind"] == "discord"
     assert item["source"]["id"] == f"source:discord:{board}"
     assert item["execution"]["board"] == board
+    assert item["execution"]["task_id"] is None
+    assert item["execution"]["archiveable"] is True
+    assert item["execution"]["archive_action"] == f"/api/plugins/kanban/boards/{board}"
     assert item["execution"]["worker_url"] == f"/workers/{board}"
+    assert not any(row["id"] == f"kanban:{board}:{task_id}" for row in snapshot["work_items"])
     assert source["kind"] == "discord_thread"
     assert snapshot["metrics"]["discord_origin"] == 1
+
+
+def test_snapshot_active_runs_ignores_stale_open_runs_for_terminal_tasks(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "discord-stale-open-run"
+    kanban_db.write_board_metadata(board, name="Discord Stale Run")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Finished worker", board=board)
+        with conn:
+            conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                (task_id, "running", 100, None, None),
+            )
+            conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200, task_id))
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    stale_run = next(run for run in snapshot["runs"] if run["board"] == board and run["task_id"] == task_id)
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+
+    assert stale_run["ended_at"] is None
+    assert stale_run["task_status"] == "done"
+    assert snapshot["metrics"]["active_runs"] == 0
+    assert item["status"] == "shipped"
 
 
 def test_snapshot_sorts_iso_timestamped_work_items_by_recency(tmp_path, monkeypatch):
