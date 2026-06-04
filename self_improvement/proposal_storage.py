@@ -685,6 +685,34 @@ def list_audit_events(proposal_id: str, *, db_path: Path | None = None) -> list[
         conn.close()
 
 
+def record_audit_event(
+    proposal_id: str,
+    *,
+    action: str,
+    actor: str | None = None,
+    kanban_task_id: str | None = None,
+    reason: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    db_path: Path | None = None,
+) -> None:
+    init_db(db_path)
+    conn = connect(db_path)
+    try:
+        with conn:
+            row = conn.execute("SELECT 1 FROM proposal_cards WHERE proposal_id = ?", (proposal_id,)).fetchone()
+            if not row:
+                raise KeyError(proposal_id)
+            conn.execute(
+                """
+                INSERT INTO proposal_audit_events(proposal_id, action, actor, kanban_task_id, reason, metadata_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (proposal_id, action, actor, kanban_task_id, reason, _json_dumps(metadata or {}), utc_now()),
+            )
+    finally:
+        conn.close()
+
+
 def get_card(proposal_id: str, *, db_path: Path | None = None) -> dict[str, Any] | None:
     init_db(db_path)
     conn = connect(db_path)

@@ -150,6 +150,61 @@ def test_self_improvement_approve_is_idempotent_and_audited(client):
     assert {event["kanban_task_id"] for event in audit} == {first.json()["task"]["id"]}
 
 
+def test_self_improvement_cards_include_downstream_task_status(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    assert approved.status_code == 200, approved.text
+
+    grouped = client.get("/api/plugins/kanban/self-improvement/proposals")
+
+    assert grouped.status_code == 200, grouped.text
+    enriched = grouped.json()["projects"][0]["prongs"][0]["cards"][0]
+    assert enriched["downstream_board"] == "default"
+    assert enriched["downstream_task_status"] == "ready"
+    assert enriched["downstream_task"]["id"] == approved.json()["task"]["id"]
+
+
+def test_self_improvement_halt_archives_in_flight_task_and_audits(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    assert approved.status_code == 200, approved.text
+
+    halted = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/halt")
+
+    assert halted.status_code == 200, halted.text
+    assert halted.json()["task"]["status"] == "archived"
+    assert halted.json()["card"]["downstream_task_status"] == "archived"
+    audit = proposal_storage.list_audit_events(card["proposal_id"])
+    assert audit[-1]["action"] == "halted"
+    assert audit[-1]["metadata"]["previous_status"] == "ready"
+
+
+def test_self_improvement_undo_followup_for_done_task_is_idempotent(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    assert approved.status_code == 200, approved.text
+    task_id = approved.json()["task"]["id"]
+    conn = kb.connect()
+    try:
+        kb.complete_task(conn, task_id, summary="implemented")
+    finally:
+        conn.close()
+
+    first = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/undo-followup")
+    second = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/undo-followup")
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["task"]["id"] == second.json()["task"]["id"]
+    assert first.json()["task"]["status"] == "blocked"
+    audit = proposal_storage.list_audit_events(card["proposal_id"])
+    assert audit[-1]["action"] == "undo_followup_requested"
+    assert audit[-1]["metadata"]["followup_task_id"] == first.json()["task"]["id"]
+
+
 def test_self_improvement_approve_creates_task_on_discord_thread_board(client, monkeypatch):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]

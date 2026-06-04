@@ -1,15 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
+  Ban,
   Check,
   CheckCircle2,
   ExternalLink,
   FileText,
-  GitBranch,
   Inbox,
-  Layers3,
+  RotateCcw,
   RefreshCw,
-  ShieldCheck,
   X,
 } from "lucide-react";
 import { Badge } from "@nous-research/ui/ui/components/badge";
@@ -25,7 +24,7 @@ import type {
 import { cn } from "@/lib/utils";
 
 type DetailMode = "card" | "source" | "failure";
-type ActionKind = "approve" | "reject";
+type ActionKind = "approve" | "reject" | "halt" | "undo";
 
 type Selection =
   | { mode: "card"; card: SelfImprovementProposalCard }
@@ -47,23 +46,6 @@ function truncate(value: string, max = 220): string {
   return value.length > max ? `${value.slice(0, max).trimEnd()}...` : value;
 }
 
-function cardMeta(card: SelfImprovementProposalCard): string[] {
-  return [
-    card.project ? `project ${card.project}` : null,
-    card.prong ? `prong ${card.prong}` : null,
-    card.run_id ? `run ${card.run_id}` : null,
-    card.cron_job_id ? `cron ${card.cron_job_id}` : null,
-  ].filter((value): value is string => Boolean(value));
-}
-
-function priorityTone(priority: string): string {
-  const normalized = priority.toLowerCase();
-  if (["critical", "urgent", "p0", "p1"].includes(normalized)) return "border-red-300/50 bg-red-400/10 text-red-100";
-  if (normalized === "high") return "border-orange-300/50 bg-orange-400/10 text-orange-100";
-  if (normalized === "medium") return "border-amber-300/50 bg-amber-300/10 text-amber-100";
-  return "border-slate-300/20 bg-white/[0.04] text-slate-300";
-}
-
 function statusTone(status: string): string {
   const normalized = status.toLowerCase();
   if (normalized === "approved" || normalized === "enqueued") return "border-emerald-300/50 bg-emerald-400/10 text-emerald-100";
@@ -82,6 +64,14 @@ function isRejected(card: SelfImprovementProposalCard): boolean {
 
 function isActionable(card: SelfImprovementProposalCard): boolean {
   return !isApproved(card) && !isRejected(card);
+}
+
+function isImplemented(card: SelfImprovementProposalCard): boolean {
+  return isApproved(card) && card.downstream_task_status === "done";
+}
+
+function isInFlight(card: SelfImprovementProposalCard): boolean {
+  return isApproved(card) && Boolean(card.kanban_task_id) && !["done", "archived", "missing"].includes(card.downstream_task_status || "");
 }
 
 function StatusPill({ value }: { value: string }) {
@@ -136,21 +126,42 @@ function ActionButton({
   onClick: () => void;
 }) {
   const approve = kind === "approve";
+  const config = approve
+    ? {
+      label: "Approve proposal",
+      icon: <Check className="h-4.5 w-4.5" />,
+      tone: "border-emerald-200/80 bg-emerald-400 text-emerald-950 shadow-lg shadow-emerald-500/25 hover:bg-emerald-300 hover:shadow-emerald-400/35",
+    }
+    : kind === "reject"
+      ? {
+        label: "Decline proposal",
+        icon: <X className="h-4.5 w-4.5" />,
+        tone: "border-red-200/80 bg-red-500 text-white shadow-lg shadow-red-500/25 hover:bg-red-400 hover:shadow-red-400/35",
+      }
+      : kind === "halt"
+        ? {
+          label: "Stop downstream work",
+          icon: <Ban className="h-4.5 w-4.5" />,
+          tone: "border-amber-200/80 bg-amber-400 text-amber-950 shadow-lg shadow-amber-500/25 hover:bg-amber-300 hover:shadow-amber-400/35",
+        }
+        : {
+          label: "Request undo follow-up",
+          icon: <RotateCcw className="h-4.5 w-4.5" />,
+          tone: "border-sky-200/80 bg-sky-400 text-sky-950 shadow-lg shadow-sky-500/25 hover:bg-sky-300 hover:shadow-sky-400/35",
+        };
   return (
     <button
+      aria-label={config.label}
       className={cn(
-        "inline-flex h-9 items-center justify-center gap-2 rounded-full border px-3 text-xs font-semibold uppercase tracking-[0.14em] transition",
-        approve
-          ? "border-emerald-300/40 bg-emerald-300/12 text-emerald-50 hover:border-emerald-200/70 hover:bg-emerald-300/20"
-          : "border-red-300/35 bg-red-300/10 text-red-50 hover:border-red-200/70 hover:bg-red-300/18",
-        disabled && "cursor-not-allowed opacity-45 hover:bg-transparent",
+        "inline-flex h-10 w-10 items-center justify-center rounded-full border transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/80",
+        config.tone,
+        disabled && "cursor-not-allowed opacity-50 shadow-none hover:bg-current",
       )}
       disabled={disabled}
       onClick={onClick}
       type="button"
     >
-      {busy ? <Spinner className="text-sm" /> : approve ? <Check className="h-3.5 w-3.5" /> : <X className="h-3.5 w-3.5" />}
-      {approve ? "Approve" : "Reject"}
+      {busy ? <Spinner className="text-sm" /> : config.icon}
     </button>
   );
 }
@@ -159,104 +170,80 @@ function ProposalTicket({
   activeAction,
   card,
   onApprove,
-  onLoadRun,
+  onHalt,
   onReject,
   onSelect,
+  onUndo,
   selected,
 }: {
   activeAction: ActiveAction | null;
   card: SelfImprovementProposalCard;
   onApprove: (card: SelfImprovementProposalCard) => void;
-  onLoadRun: (runId: number, mode: DetailMode) => void;
+  onHalt: (card: SelfImprovementProposalCard) => void;
   onReject: (card: SelfImprovementProposalCard) => void;
   onSelect: () => void;
+  onUndo: (card: SelfImprovementProposalCard) => void;
   selected: boolean;
 }) {
-  const meta = cardMeta(card);
   const approved = isApproved(card);
   const actionable = isActionable(card);
   const approveBusy = activeAction?.proposalId === card.proposal_id && activeAction.kind === "approve";
   const rejectBusy = activeAction?.proposalId === card.proposal_id && activeAction.kind === "reject";
+  const haltBusy = activeAction?.proposalId === card.proposal_id && activeAction.kind === "halt";
+  const undoBusy = activeAction?.proposalId === card.proposal_id && activeAction.kind === "undo";
   const anyBusy = activeAction !== null;
 
   return (
     <article
       className={cn(
-        "group rounded-3xl border bg-slate-950/60 p-4 shadow-2xl shadow-black/20 transition",
-        "hover:-translate-y-0.5 hover:border-cyan-100/35 hover:bg-slate-900/70",
-        selected ? "border-cyan-100/60 ring-1 ring-cyan-100/20" : "border-white/10",
+        "group rounded-3xl border bg-slate-900/90 p-4 shadow-2xl shadow-black/20 transition",
+        "hover:-translate-y-0.5 hover:border-cyan-100/50 hover:bg-slate-800/95",
+        selected ? "border-cyan-100/80 ring-2 ring-cyan-100/25" : "border-slate-600/70",
       )}
     >
       <button className="block w-full text-left" onClick={onSelect} type="button">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
-            <div className="mb-2 flex flex-wrap gap-1.5">
-              <StatusPill value={card.status} />
-              <Badge className={cn("w-fit border px-2 py-0.5 text-[0.68rem] uppercase tracking-[0.16em]", priorityTone(card.priority))}>
-                {card.priority}
-              </Badge>
-              {card.severity && (
-                <Badge className="w-fit border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[0.68rem] uppercase tracking-[0.16em] text-slate-300">
-                  {card.severity}
-                </Badge>
-              )}
-            </div>
-            <h3 className="text-base font-semibold leading-snug text-white group-hover:text-cyan-50">
+            <h3 className="text-lg font-semibold leading-snug text-white group-hover:text-cyan-50">
               {card.title}
             </h3>
           </div>
           {approved && <CheckCircle2 className="mt-1 h-5 w-5 shrink-0 text-emerald-200" />}
         </div>
-        <p className="mt-3 text-sm leading-6 text-slate-300">
+        <p className="mt-3 text-sm leading-6 text-slate-100">
           {truncate(card.summary || card.body || "No summary provided.")}
         </p>
-        <div className="mt-4 flex flex-wrap gap-2 text-[0.68rem] uppercase tracking-[0.15em] text-slate-500">
-          <span>{formatTime(card.created_at)}</span>
-          {meta.slice(0, 3).map((item) => (
-            <span key={item} className="max-w-full truncate">
-              {item}
-            </span>
-          ))}
-        </div>
       </button>
 
-      <div className="mt-4 flex flex-col gap-3 border-t border-white/10 pt-4 sm:flex-row sm:items-center sm:justify-between">
-        <div className="min-w-0 text-xs text-slate-500">
-          {card.kanban_task_id ? (
-            <span className="font-mono-ui text-emerald-100">worker {card.kanban_task_id}</span>
-          ) : (
-            <span className="font-mono-ui">{card.proposal_id}</span>
-          )}
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <button
-            className="inline-flex h-9 items-center justify-center rounded-full border border-white/10 px-3 text-xs font-semibold uppercase tracking-[0.14em] text-slate-300 transition hover:border-cyan-100/40 hover:text-cyan-50"
-            onClick={() => onLoadRun(card.run_db_id, "source")}
-            type="button"
+      <div className="mt-4 flex flex-wrap justify-end gap-2 border-t border-slate-600/70 pt-4">
+        {card.worker_url && (
+          <a
+            aria-label="Open worker task"
+            className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-emerald-200/50 bg-emerald-300/15 text-emerald-50 transition hover:border-emerald-100 hover:bg-emerald-300/25"
+            href={card.worker_url}
+            title="Open worker task"
           >
-            Source
-          </button>
-          {card.worker_url && (
-            <a
-              className="inline-flex h-9 items-center justify-center gap-1 rounded-full border border-white/10 px-3 text-xs font-semibold uppercase tracking-[0.14em] text-slate-300 transition hover:border-emerald-200/50 hover:text-emerald-50"
-              href={card.worker_url}
-            >
-              Worker <ExternalLink className="h-3 w-3" />
-            </a>
-          )}
-          <ActionButton
-            busy={approveBusy}
-            disabled={!actionable || anyBusy}
-            kind="approve"
-            onClick={() => onApprove(card)}
-          />
-          <ActionButton
-            busy={rejectBusy}
-            disabled={!actionable || anyBusy}
-            kind="reject"
-            onClick={() => onReject(card)}
-          />
-        </div>
+            <ExternalLink className="h-4 w-4" />
+          </a>
+        )}
+        {isImplemented(card) && (
+          <ActionButton busy={undoBusy} disabled={anyBusy} kind="undo" onClick={() => onUndo(card)} />
+        )}
+        {isInFlight(card) && (
+          <ActionButton busy={haltBusy} disabled={anyBusy} kind="halt" onClick={() => onHalt(card)} />
+        )}
+        <ActionButton
+          busy={approveBusy}
+          disabled={!actionable || anyBusy}
+          kind="approve"
+          onClick={() => onApprove(card)}
+        />
+        <ActionButton
+          busy={rejectBusy}
+          disabled={!actionable || anyBusy}
+          kind="reject"
+          onClick={() => onReject(card)}
+        />
       </div>
     </article>
   );
@@ -266,15 +253,19 @@ function DetailPanel({
   activeAction,
   actionMessage,
   onApprove,
+  onHalt,
   onReject,
   onLoadRun,
+  onUndo,
   selection,
 }: {
   activeAction: ActiveAction | null;
   actionMessage: string | null;
   onApprove: (card: SelfImprovementProposalCard) => void;
+  onHalt: (card: SelfImprovementProposalCard) => void;
   onReject: (card: SelfImprovementProposalCard) => void;
   onLoadRun: (runId: number, mode: DetailMode) => void;
+  onUndo: (card: SelfImprovementProposalCard) => void;
   selection: Selection | null;
 }) {
   if (!selection) {
@@ -293,6 +284,8 @@ function DetailPanel({
     const actionable = isActionable(card);
     const approveBusy = activeAction?.proposalId === card.proposal_id && activeAction.kind === "approve";
     const rejectBusy = activeAction?.proposalId === card.proposal_id && activeAction.kind === "reject";
+    const haltBusy = activeAction?.proposalId === card.proposal_id && activeAction.kind === "halt";
+    const undoBusy = activeAction?.proposalId === card.proposal_id && activeAction.kind === "undo";
     return (
       <Card className="border-white/10 bg-slate-950/70 shadow-2xl shadow-black/25 xl:sticky xl:top-24">
         <CardHeader>
@@ -336,6 +329,7 @@ function DetailPanel({
               <dt>Cron job</dt><dd className="truncate font-mono-ui">{card.cron_job_id || "-"}</dd>
               <dt>Idempotency</dt><dd className="truncate font-mono-ui">{card.idempotency_key || "-"}</dd>
               <dt>Worker</dt><dd className="truncate font-mono-ui">{card.kanban_task_id || "-"}</dd>
+              <dt>Worker status</dt><dd className="truncate font-mono-ui">{card.downstream_task_status || "-"}</dd>
             </dl>
           </section>
           {card.worker_url && (
@@ -346,6 +340,12 @@ function DetailPanel({
           {actionMessage && <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-3 text-xs text-slate-300">{actionMessage}</div>}
           <div className="flex flex-wrap gap-2 border-t border-white/10 pt-4">
             <Button size="sm" onClick={() => onLoadRun(card.run_db_id, "source")}>View source run</Button>
+            {isImplemented(card) && (
+              <ActionButton busy={undoBusy} disabled={activeAction !== null} kind="undo" onClick={() => onUndo(card)} />
+            )}
+            {isInFlight(card) && (
+              <ActionButton busy={haltBusy} disabled={activeAction !== null} kind="halt" onClick={() => onHalt(card)} />
+            )}
             <ActionButton
               busy={approveBusy}
               disabled={!actionable || activeAction !== null}
@@ -442,8 +442,7 @@ export default function SelfImprovementBoardPage() {
     const actionable = cards.filter(isActionable).length;
     const approved = cards.filter(isApproved).length;
     const highPriority = cards.filter((card) => ["critical", "urgent", "high"].includes(card.priority.toLowerCase())).length;
-    const prongCount = data?.projects.reduce((count, project) => count + project.prongs.length, 0) ?? 0;
-    return { actionable, approved, highPriority, prongCount };
+    return { actionable, approved, highPriority };
   }, [cards, data]);
 
   const loadRun = useCallback(async (runId: number, mode: DetailMode) => {
@@ -519,21 +518,50 @@ export default function SelfImprovementBoardPage() {
     }
   }, []);
 
+  const haltCard = useCallback(async (card: SelfImprovementProposalCard) => {
+    setActiveAction({ proposalId: card.proposal_id, kind: "halt" });
+    setActionMessage(null);
+    try {
+      const response = await api.haltSelfImprovementProposal(card.proposal_id);
+      replaceCard(response.card);
+      setActionMessage("Downstream work stopped and archived.");
+    } catch (err) {
+      setActionMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setActiveAction(null);
+    }
+  }, [replaceCard]);
+
+  const undoCard = useCallback(async (card: SelfImprovementProposalCard) => {
+    setActiveAction({ proposalId: card.proposal_id, kind: "undo" });
+    setActionMessage(null);
+    try {
+      const response = await api.requestSelfImprovementUndoFollowup(card.proposal_id);
+      replaceCard(response.card);
+      const task = response.task as { id?: string } | null | undefined;
+      setActionMessage(`Undo follow-up requested${task?.id ? ` as ${task.id}` : ""}.`);
+    } catch (err) {
+      setActionMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setActiveAction(null);
+    }
+  }, [replaceCard]);
+
   return (
     <div className="mx-auto flex w-full max-w-[1500px] flex-col gap-6">
-      <section className="relative overflow-hidden rounded-[2rem] border border-white/10 bg-[radial-gradient(circle_at_top_left,rgba(34,211,238,0.2),transparent_34%),radial-gradient(circle_at_bottom_right,rgba(16,185,129,0.16),transparent_30%),linear-gradient(135deg,rgba(2,6,23,0.96),rgba(8,13,28,0.94))] p-5 shadow-2xl shadow-black/40 sm:p-7">
+      <section className="relative overflow-hidden rounded-[2rem] border border-slate-500/60 bg-[radial-gradient(circle_at_top_left,rgba(34,211,238,0.24),transparent_34%),radial-gradient(circle_at_bottom_right,rgba(16,185,129,0.18),transparent_30%),linear-gradient(135deg,rgba(15,23,42,0.98),rgba(30,41,59,0.96))] p-5 shadow-2xl shadow-black/30 sm:p-7">
         <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-cyan-200/60 to-transparent" />
-        <div className="flex flex-col gap-6 xl:flex-row xl:items-end xl:justify-between">
+        <div className="flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between">
           <div className="max-w-4xl">
             <Badge className="border-cyan-200/35 bg-cyan-200/10 px-3 py-1 text-[0.68rem] uppercase tracking-[0.2em] text-cyan-100">
               Self-improvement command deck
             </Badge>
             <h1 className="mt-5 max-w-3xl text-4xl font-semibold tracking-tight text-white sm:text-5xl">
-              Decide on proposals where the tickets live.
+              Command Center
             </h1>
-            <p className="mt-4 max-w-3xl text-sm leading-6 text-slate-300 sm:text-base">
-              Cron-generated recommendations land as operator tickets. Approve creates real downstream work; reject archives the proposal with feedback. The evidence drawer is for inspection, not a required control path.
-            </p>
+            <Button className="mt-5 w-fit" disabled={loading} ghost size="sm" onClick={() => void loadBoard()}>
+              {loading ? <Spinner /> : <RefreshCw className="h-4 w-4" />} Refresh
+            </Button>
           </div>
           <div className="grid min-w-0 grid-cols-2 gap-3 sm:grid-cols-4 xl:min-w-[32rem]">
             <MetricCard label="Tickets" value={cards.length} />
@@ -543,23 +571,6 @@ export default function SelfImprovementBoardPage() {
           </div>
         </div>
       </section>
-
-      <div className="flex flex-col gap-3 rounded-3xl border border-white/10 bg-white/[0.03] p-4 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex flex-wrap items-center gap-2 text-xs uppercase tracking-[0.16em] text-slate-400">
-          <span className="inline-flex items-center gap-2 rounded-full border border-white/10 px-3 py-1.5">
-            <ShieldCheck className="h-3.5 w-3.5 text-emerald-200" /> idempotent approvals
-          </span>
-          <span className="inline-flex items-center gap-2 rounded-full border border-white/10 px-3 py-1.5">
-            <Layers3 className="h-3.5 w-3.5 text-cyan-200" /> {metrics.prongCount} prongs
-          </span>
-          <span className="inline-flex items-center gap-2 rounded-full border border-white/10 px-3 py-1.5">
-            <GitBranch className="h-3.5 w-3.5 text-slate-300" /> workers stay downstream
-          </span>
-        </div>
-        <Button className="w-fit" disabled={loading} ghost size="sm" onClick={() => void loadBoard()}>
-          {loading ? <Spinner /> : <RefreshCw className="h-4 w-4" />} Refresh
-        </Button>
-      </div>
 
       {actionMessage && (
         <div className="rounded-2xl border border-white/10 bg-white/[0.045] px-4 py-3 text-sm text-slate-300">
@@ -608,14 +619,14 @@ export default function SelfImprovementBoardPage() {
                     {project.prongs.reduce((count, prong) => count + prong.cards.length, 0)} tickets
                   </span>
                 </div>
-                <div className="grid gap-4 2xl:grid-cols-2">
+                <div className="grid gap-5 2xl:grid-cols-2">
                   {project.prongs.map((prong) => (
-                    <div className="rounded-[1.5rem] border border-white/10 bg-black/20 p-3" key={`${project.project}:${prong.prong}`}>
-                      <div className="mb-3 flex items-center justify-between gap-3 px-1">
-                        <h3 className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                    <div className="rounded-[1.5rem] border border-slate-500/60 bg-slate-900/70 p-4 shadow-xl shadow-black/20" key={`${project.project}:${prong.prong}`}>
+                      <div className="mb-4 flex items-center justify-between gap-3 border-b border-slate-600/70 px-1 pb-3">
+                        <h3 className="text-base font-semibold uppercase tracking-[0.14em] text-slate-100">
                           {prong.prong}
                         </h3>
-                        <span className="text-xs text-slate-500">{prong.cards.length}</span>
+                        <span className="rounded-full border border-slate-500/70 px-2 py-0.5 text-xs text-slate-200">{prong.cards.length}</span>
                       </div>
                       <div className="grid gap-3">
                         {prong.cards.map((card) => (
@@ -624,9 +635,10 @@ export default function SelfImprovementBoardPage() {
                             card={card}
                             key={card.proposal_id}
                             onApprove={approveCard}
-                            onLoadRun={loadRun}
+                            onHalt={haltCard}
                             onReject={rejectCard}
                             onSelect={() => setSelection({ mode: "card", card })}
+                            onUndo={undoCard}
                             selected={selection?.mode === "card" && selection.card.proposal_id === card.proposal_id}
                           />
                         ))}
@@ -646,8 +658,10 @@ export default function SelfImprovementBoardPage() {
                 activeAction={activeAction}
                 actionMessage={actionMessage}
                 onApprove={approveCard}
+                onHalt={haltCard}
                 onLoadRun={loadRun}
                 onReject={rejectCard}
+                onUndo={undoCard}
                 selection={selection}
               />
             )}
