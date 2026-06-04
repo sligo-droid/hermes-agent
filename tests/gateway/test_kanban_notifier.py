@@ -65,6 +65,28 @@ class CompletionNoticeAdapter(DiscordStatusSyncAdapter):
         return target.get("board")
 
 
+class WorkerThreadAdapter(DiscordStatusSyncAdapter):
+    def __init__(self):
+        super().__init__()
+        self.created_threads = []
+
+    async def create_worker_task_thread(self, parent_chat_id, **kwargs):
+        self.created_threads.append({"parent_chat_id": parent_chat_id, **kwargs})
+        return {
+            "thread_id": f"thread-{len(self.created_threads)}",
+            "thread_name": kwargs.get("name") or "worker task",
+            "message_id": f"message-{len(self.created_threads)}",
+        }
+
+    async def send_worker_task_embed(self, thread_chat_id, **kwargs):
+        self.created_threads.append({"thread_chat_id": thread_chat_id, **kwargs})
+        return {
+            "thread_id": str(thread_chat_id),
+            "thread_name": kwargs.get("title") or "worker task",
+            "message_id": f"message-{len(self.created_threads)}",
+        }
+
+
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
 
@@ -168,6 +190,227 @@ def test_discord_worker_dirty_marker_wakes_dispatch_sleep(tmp_path, monkeypatch)
         assert woke is True
 
     asyncio.run(run())
+
+
+def test_discord_worker_task_threads_are_enabled_by_default_independent_of_foreman():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    worker_cfg = DEFAULT_CONFIG["kanban"]["discord_worker"]
+    assert worker_cfg["task_threads"]["enabled"] is True
+    assert worker_cfg["foreman"]["enabled"] is False
+
+
+def test_discord_worker_dirty_marker_polls_below_old_one_second_ceiling(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+
+    async def run():
+        from hermes_cli import discord_worker_boards as dwb
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._running = True
+        runner._kanban_dispatch_dirty_marker_ns = dwb.dispatch_dirty_marker_mtime_ns()
+
+        async def mark_soon():
+            await asyncio.sleep(0.05)
+            dwb.mark_dispatch_dirty(board="discord-1", reason="test")
+
+        marker_task = asyncio.create_task(mark_soon())
+        started = asyncio.get_running_loop().time()
+        woke = await runner._sleep_until_kanban_dispatch_due(5.0)
+        elapsed = asyncio.get_running_loop().time() - started
+        await marker_task
+
+        assert woke is True
+        assert elapsed < 0.7
+
+    asyncio.run(run())
+
+
+def test_discord_worker_spawned_task_records_worker_thread_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://hermes.example.test")
+    import hermes_cli.config as cfg
+
+    monkeypatch.setattr(
+        cfg,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "discord_worker": {
+                    "task_threads": {
+                        "enabled": True,
+                    }
+                }
+            }
+        },
+    )
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_state import read_codex_worker_state
+
+    board = dwb.ensure_discord_thread_board(
+        thread_id="123",
+        chat_id="parent-123",
+        guild_id="guild-1",
+        parent_channel_id="dev-parent",
+        initial_request="/goal Ship the dashboard",
+        project_context={"project_name": "Hermes", "project_path": "/repo/hermes"},
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Build dashboard filters",
+            body="Add filter controls and verify them.",
+            assignee=dwb.ROLE_DEV,
+            tenant=board.slug,
+            initial_status="running",
+            board=board.slug,
+        )
+    finally:
+        conn.close()
+
+    adapter = WorkerThreadAdapter()
+    runner = _make_discord_runner(adapter)
+    result = SimpleNamespace(spawned=[(task_id, dwb.ROLE_DEV, "/tmp/hermes-worktree")])
+
+    asyncio.run(runner._discord_worker_announce_spawned_tasks([(board.slug, result)]))
+    asyncio.run(runner._discord_worker_announce_spawned_tasks([(board.slug, result)]))
+
+    assert adapter.created_threads == []
+
+    state = read_codex_worker_state(task_id, board=board.slug)
+    assert state["worker_task_thread"]["thread_id"] == "123"
+    assert state["worker_task_thread"]["message_id"] == ""
+    assert "foreman_thread" not in state
+
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        subs = kanban_db.list_notify_subs(conn, task_id)
+    finally:
+        conn.close()
+    assert subs == []
+
+
+def test_discord_worker_reads_legacy_foreman_thread_but_rewrites_worker_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    import hermes_cli.config as cfg
+
+    monkeypatch.setattr(
+        cfg,
+        "load_config",
+        lambda: {"kanban": {"discord_worker": {"task_threads": {"enabled": True}}}},
+    )
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_state import read_codex_worker_state, write_codex_worker_state
+
+    board = dwb.ensure_discord_thread_board(
+        thread_id="source-thread",
+        chat_id="source-thread",
+        guild_id="guild-1",
+        parent_channel_id="dev-parent",
+        initial_request="/goal Migrate state",
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Legacy task",
+            assignee=dwb.ROLE_DEV,
+            tenant=board.slug,
+            initial_status="running",
+            board=board.slug,
+        )
+    finally:
+        conn.close()
+    write_codex_worker_state(
+        task_id,
+        board=board.slug,
+        update={
+            "foreman_thread": {
+                "thread_id": "legacy-thread",
+                "parent_channel_id": "legacy-parent",
+                "message_id": "legacy-message",
+                "thread_name": "Legacy worker task",
+            }
+        },
+    )
+
+    runner = _make_discord_runner(WorkerThreadAdapter())
+    result = SimpleNamespace(spawned=[(task_id, dwb.ROLE_DEV, "")])
+
+    asyncio.run(runner._discord_worker_announce_spawned_tasks([(board.slug, result)]))
+
+    state = read_codex_worker_state(task_id, board=board.slug)
+    assert state["worker_task_thread"]["thread_id"] == "legacy-thread"
+    assert state["worker_task_thread"]["message_id"] == "legacy-message"
+    assert "foreman_thread" not in state
+
+
+def test_kanban_dispatcher_announces_spawned_tasks_with_worker_lifecycle_path(monkeypatch):
+    import hermes_cli.config as cfg
+    from hermes_cli import kanban_db
+    from hermes_cli import discord_worker_dispatch
+    from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
+
+    monkeypatch.setattr(
+        cfg,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+                "auto_decompose": False,
+                "discord_worker": {
+                    "max_global_workers": 8,
+                    "max_workers_per_board": 2,
+                },
+            }
+        },
+    )
+    monkeypatch.setattr(kanban_db, "reap_worker_zombies", lambda: [])
+    monkeypatch.setattr(kanban_db, "list_boards", lambda include_archived=False: [{"slug": "discord-1"}])
+    monkeypatch.setattr(
+        kanban_db,
+        "read_board_metadata",
+        lambda board: {DISCORD_WORKER_META_KEY: {"kind": "discord_worker_board"}},
+    )
+    monkeypatch.setattr(discord_worker_dispatch, "running_role_count", lambda board: 0)
+    result = SimpleNamespace(
+        spawned=[("task-1", "dev", "/tmp/hermes-worktree")],
+        reclaimed=0,
+        crashed=[],
+        timed_out=[],
+        promoted=0,
+        auto_blocked=[],
+    )
+    monkeypatch.setattr(
+        discord_worker_dispatch,
+        "dispatch_discord_worker_boards",
+        lambda *args, **kwargs: [("discord-1", result)],
+    )
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {}
+    announced = []
+
+    async def announce(results):
+        announced.extend(results)
+
+    async def stop_after_tick(interval):
+        runner._running = False
+        return False
+
+    runner._discord_worker_announce_spawned_tasks = announce
+    runner._sleep_until_kanban_dispatch_due = stop_after_tick
+
+    asyncio.run(runner._kanban_dispatcher_watcher())
+
+    assert announced == [("discord-1", result)]
 
 
 def _create_completed_subscription(summary="done once"):

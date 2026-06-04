@@ -70,7 +70,9 @@ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _DISCORD_KANBAN_REACTION_RESYNC_SECS = 30.0
 _DISCORD_FOREMAN_DEFAULT_CHANNEL_ID = "1504252294495998043"
 _DISCORD_FOREMAN_DEFAULT_MENTION = "<@&1503914570077442058>"
-_DISCORD_FOREMAN_THREAD_STATE_KEY = "foreman_thread"
+_DISCORD_WORKER_TASK_THREAD_STATE_KEY = "worker_task_thread"
+_DISCORD_LEGACY_FOREMAN_THREAD_STATE_KEY = "foreman_thread"
+_DISCORD_WORKER_DIRTY_MARKER_POLL_SECS = 0.2
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _CODEX_APP_SERVER_ACTIVITY_PREFIX = "Codex app-server event:"
 _MEETING_GOAL_SKILL_NAMES = {"meeting", "discord-meeting-intake"}
@@ -6107,7 +6109,7 @@ class GatewayRunner:
         while getattr(self, "_running", True) and remaining > 0:
             if self._discord_worker_dirty_marker_changed(marker_state_attr):
                 return True
-            step = min(1.0, remaining)
+            step = min(_DISCORD_WORKER_DIRTY_MARKER_POLL_SECS, remaining)
             if event is None:
                 await asyncio.sleep(step)
             else:
@@ -6837,7 +6839,7 @@ class GatewayRunner:
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                         )
                 if any_spawned:
-                    await self._discord_foreman_announce_spawned_tasks(results)
+                    await self._discord_worker_announce_spawned_tasks(results)
                 # Health telemetry (aggregate across boards)
                 ready_pending = await asyncio.to_thread(_ready_nonempty)
                 if ready_pending and not any_spawned:
@@ -7175,7 +7177,7 @@ class GatewayRunner:
             "mention": _DISCORD_FOREMAN_DEFAULT_MENTION,
             "master_board": str(raw.get("master_board") or "default").strip() or "default",
             "scan_interval_seconds": self._discord_foreman_clamped_int(
-                raw.get("scan_interval_seconds"), 300, 10, 3600,
+                raw.get("scan_interval_seconds"), 30, 10, 3600,
             ),
             "blocked_board_min_age_seconds": self._discord_foreman_clamped_int(
                 raw.get("blocked_board_min_age_seconds"),
@@ -7216,7 +7218,7 @@ class GatewayRunner:
             },
         }
 
-    def _discord_foreman_task_thread_info(
+    def _discord_worker_task_thread_info(
         self,
         board: str,
         task_id: str,
@@ -7233,7 +7235,9 @@ class GatewayRunner:
             return None
 
         state = read_codex_worker_state(task_id, board=board)
-        existing = state.get(_DISCORD_FOREMAN_THREAD_STATE_KEY)
+        existing = state.get(_DISCORD_WORKER_TASK_THREAD_STATE_KEY)
+        if not isinstance(existing, dict) or not str(existing.get("thread_id") or "").strip():
+            existing = state.get(_DISCORD_LEGACY_FOREMAN_THREAD_STATE_KEY)
         if isinstance(existing, dict) and str(existing.get("thread_id") or "").strip():
             return {"existing_thread": dict(existing)}
 
@@ -7279,6 +7283,23 @@ class GatewayRunner:
             "board_url": board_url,
             "ticket_url": ticket_url,
             "discord_thread_url": discord_thread_url,
+        }
+
+    @staticmethod
+    def _discord_worker_task_thread_config(config: dict[str, Any]) -> dict[str, Any]:
+        kanban_cfg = config.get("kanban") if isinstance(config, dict) else {}
+        kanban_cfg = kanban_cfg if isinstance(kanban_cfg, dict) else {}
+        worker_cfg = kanban_cfg.get("discord_worker") if isinstance(kanban_cfg, dict) else {}
+        worker_cfg = worker_cfg if isinstance(worker_cfg, dict) else {}
+        task_thread_cfg = worker_cfg.get("task_threads")
+        task_thread_cfg = task_thread_cfg if isinstance(task_thread_cfg, dict) else {}
+        legacy_foreman_cfg = worker_cfg.get("foreman")
+        legacy_foreman_cfg = legacy_foreman_cfg if isinstance(legacy_foreman_cfg, dict) else {}
+        return {
+            "enabled": is_truthy_value(
+                task_thread_cfg.get("enabled", legacy_foreman_cfg.get("enabled")),
+                default=False,
+            )
         }
 
     @staticmethod
@@ -7432,7 +7453,7 @@ class GatewayRunner:
             }
         )
 
-    def _discord_foreman_record_task_thread(
+    def _discord_worker_record_task_thread(
         self,
         *,
         board: str,
@@ -7440,37 +7461,53 @@ class GatewayRunner:
         channel_id: str,
         thread_handle: Dict[str, Any],
     ) -> None:
-        from hermes_cli.discord_worker_state import write_codex_worker_state
+        from hermes_cli.discord_worker_state import (
+            codex_worker_state_path,
+            read_codex_worker_state,
+            write_codex_worker_state,
+        )
+        from utils import atomic_json_write
 
         thread_id = str(thread_handle.get("thread_id") or "").strip()
         if not thread_id:
             return
 
-        write_codex_worker_state(
+        update = {
+            _DISCORD_WORKER_TASK_THREAD_STATE_KEY: {
+                "thread_id": thread_id,
+                "parent_channel_id": str(channel_id),
+                "message_id": str(thread_handle.get("message_id") or ""),
+                "thread_name": str(thread_handle.get("thread_name") or ""),
+                "created_at": int(thread_handle.get("created_at") or time.time()),
+            }
+        }
+        remove_legacy = False
+        try:
+            current = read_codex_worker_state(task_id, board=board)
+            remove_legacy = _DISCORD_LEGACY_FOREMAN_THREAD_STATE_KEY in current
+        except Exception:
+            pass
+
+        new_state = write_codex_worker_state(
             task_id,
             board=board,
-            update={
-                _DISCORD_FOREMAN_THREAD_STATE_KEY: {
-                    "thread_id": thread_id,
-                    "parent_channel_id": str(channel_id),
-                    "message_id": str(thread_handle.get("message_id") or ""),
-                    "thread_name": str(thread_handle.get("thread_name") or ""),
-                    "created_at": int(thread_handle.get("created_at") or time.time()),
-                }
-            },
+            update=update,
         )
+        if remove_legacy:
+            new_state.pop(_DISCORD_LEGACY_FOREMAN_THREAD_STATE_KEY, None)
+            atomic_json_write(codex_worker_state_path(task_id, board=board), new_state, indent=2)
 
-    async def _discord_foreman_announce_spawned_tasks(self, results: Any) -> None:
+    async def _discord_worker_announce_spawned_tasks(self, results: Any) -> None:
         if not results:
             return
         try:
             from hermes_cli.config import load_config as _load_config
 
-            watcher_cfg = self._discord_foreman_watcher_config(_load_config())
+            task_thread_cfg = self._discord_worker_task_thread_config(_load_config())
         except Exception as exc:
-            logger.debug("discord foreman: task-thread config unavailable: %s", exc)
+            logger.debug("discord worker: task-thread config unavailable: %s", exc)
             return
-        if not watcher_cfg.get("enabled"):
+        if not task_thread_cfg.get("enabled"):
             return
 
         for board, res in results:
@@ -7480,7 +7517,7 @@ class GatewayRunner:
             for task_id, assignee, workspace_path in spawned:
                 try:
                     info = await asyncio.to_thread(
-                        self._discord_foreman_task_thread_info,
+                        self._discord_worker_task_thread_info,
                         str(board),
                         str(task_id),
                         str(workspace_path or ""),
@@ -7490,7 +7527,7 @@ class GatewayRunner:
                     existing_thread = info.get("existing_thread")
                     if isinstance(existing_thread, dict) and str(existing_thread.get("thread_id") or "").strip():
                         await asyncio.to_thread(
-                            self._discord_foreman_record_task_thread,
+                            self._discord_worker_record_task_thread,
                             board=str(board),
                             task_id=str(task_id),
                             channel_id=str(
@@ -7505,7 +7542,7 @@ class GatewayRunner:
                     if not thread_id:
                         continue
                     await asyncio.to_thread(
-                        self._discord_foreman_record_task_thread,
+                        self._discord_worker_record_task_thread,
                         board=str(board),
                         task_id=str(task_id),
                         channel_id=str(info.get("chat_id") or thread_id),
@@ -7517,7 +7554,7 @@ class GatewayRunner:
                     )
                 except Exception:
                     logger.debug(
-                        "discord foreman: task-thread create failed for %s/%s",
+                        "discord worker: task-thread create failed for %s/%s",
                         board,
                         task_id,
                         exc_info=True,

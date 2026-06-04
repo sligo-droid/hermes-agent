@@ -23,22 +23,6 @@ class ForemanAdapter:
             raise self.error
         return self.result
 
-    async def create_worker_task_thread(self, parent_chat_id, **kwargs):
-        self.created_threads.append({"parent_chat_id": parent_chat_id, **kwargs})
-        return {
-            "thread_id": f"thread-{len(self.created_threads)}",
-            "thread_name": kwargs.get("name") or "worker task",
-            "message_id": f"message-{len(self.created_threads)}",
-        }
-
-    async def send_worker_task_embed(self, thread_chat_id, **kwargs):
-        self.created_threads.append({"thread_chat_id": thread_chat_id, **kwargs})
-        return {
-            "thread_id": str(thread_chat_id),
-            "thread_name": kwargs.get("title") or "worker task",
-            "message_id": f"message-{len(self.created_threads)}",
-        }
-
     async def create_foreman_goal_thread(self, parent_chat_id, **kwargs):
         self.created_goals.append({"parent_chat_id": parent_chat_id, **kwargs})
         if self.error:
@@ -145,6 +129,7 @@ def test_foreman_defaults_are_disabled_with_expected_discord_target():
     assert foreman["channel_id"] == "1504252294495998043"
     assert foreman["mention"] == "<@&1503914570077442058>"
     assert foreman["master_board"] == "default"
+    assert foreman["scan_interval_seconds"] == 30
     assert foreman["blocked_board_min_age_seconds"] == 600
 
 
@@ -164,58 +149,6 @@ def test_foreman_watcher_missing_config_does_not_scan(monkeypatch):
 
     assert adapter.sent == []
     assert adapter.created_goals == []
-
-
-def test_foreman_spawned_task_records_thread_state_without_transition_subscription(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
-    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://hermes.example.test")
-    _patch_config(monkeypatch, _enabled_config())
-
-    from hermes_cli import discord_worker_boards as dwb
-    from hermes_cli import kanban_db
-    from hermes_cli.discord_worker_state import read_codex_worker_state
-
-    board = dwb.ensure_discord_thread_board(
-        thread_id="123",
-        chat_id="parent-123",
-        guild_id="guild-1",
-        parent_channel_id="dev-parent",
-        initial_request="/goal Ship the dashboard",
-        project_context={"project_name": "Hermes", "project_path": "/repo/hermes"},
-    )
-    conn = kanban_db.connect(board=board.slug)
-    try:
-        task_id = kanban_db.create_task(
-            conn,
-            title="Build dashboard filters",
-            body="Add filter controls and verify them.",
-            assignee=dwb.ROLE_DEV,
-            tenant=board.slug,
-            initial_status="running",
-            board=board.slug,
-        )
-    finally:
-        conn.close()
-
-    adapter = ForemanAdapter()
-    runner = _runner(adapter)
-    result = SimpleNamespace(spawned=[(task_id, dwb.ROLE_DEV, "/tmp/hermes-worktree")])
-
-    asyncio.run(runner._discord_foreman_announce_spawned_tasks([(board.slug, result)]))
-    asyncio.run(runner._discord_foreman_announce_spawned_tasks([(board.slug, result)]))
-
-    assert adapter.created_threads == []
-
-    state = read_codex_worker_state(task_id, board=board.slug)
-    assert state["foreman_thread"]["thread_id"] == "123"
-    assert state["foreman_thread"]["message_id"] == ""
-
-    conn = kanban_db.connect(board=board.slug)
-    try:
-        subs = kanban_db.list_notify_subs(conn, task_id)
-    finally:
-        conn.close()
-    assert subs == []
 
 
 def test_foreman_watcher_disabled_config_does_not_scan(monkeypatch):
@@ -623,7 +556,7 @@ def test_foreman_dirty_marker_wakes_sleep_before_full_interval(tmp_path, monkeyp
         await marker_task
 
         assert woke is True
-        assert elapsed < 2.0
+        assert elapsed < 0.7
 
     asyncio.run(run())
 

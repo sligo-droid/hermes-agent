@@ -1941,12 +1941,18 @@ DEFAULT_CONFIG = {
             # tickets use isolated workspaces; shared checkout fanout is guarded.
             "max_dev_workers_per_board": 1,
             "review_loop_limit": 5,
+            "task_threads": {
+                # Normal worker lifecycle bookkeeping is not a Foreman concern.
+                # Keep it on by default so spawned Discord worker tasks remain
+                # visible even when recovery/escalation Foreman is disabled.
+                "enabled": True,
+            },
             "foreman": {
                 "enabled": False,
                 "channel_id": "1504252294495998043",
                 "mention": "<@&1503914570077442058>",
                 "master_board": "default",
-                "scan_interval_seconds": 300,
+                "scan_interval_seconds": 30,
                 "blocked_board_min_age_seconds": 600,
                 "cooldown_seconds": 3600,
                 "retry_backoff_seconds": 300,

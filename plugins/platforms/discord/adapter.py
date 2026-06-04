@@ -8422,7 +8422,7 @@ class DiscordAdapter(BasePlatformAdapter):
         thread_name = thread_name[:80] if len(thread_name) <= 80 else thread_name[:77].rstrip() + "..."
         if not thread_name:
             thread_name = "Hermes worker task"
-        reason = "Hermes foreman worker task"
+        reason = "Hermes worker task"
 
         thread = None
         try:
