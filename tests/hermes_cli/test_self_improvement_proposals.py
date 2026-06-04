@@ -349,6 +349,81 @@ def test_feedback_context_summarizes_approved_rejected_preferences_and_edges(tmp
     assert "Prefer read-only observability with tiny worker prompts." in preference_bodies
 
 
+def test_feedback_and_decision_audit_fields_redact_before_storage_return_and_context(tmp_path):
+    cfg = _config(tmp_path)
+    sip.ingest_proposal_output(metadata={"proposal_json": json.dumps(_payload()), "cron_run_id": "run-a"}, config=cfg)
+    approved_id = sip.list_proposals(config=cfg)[0]["card_id"]
+
+    raw_feedback_secret = "sk-proj-feedbackBodySecret1234567890"
+    raw_author_secret = "ghp_feedbackAuthorSecret1234567890"
+    feedback = sip.add_feedback(
+        approved_id,
+        feedback_type="comment",
+        body=f"Prefer this pattern with {raw_feedback_secret}",
+        author=f"operator {raw_author_secret}",
+        config=cfg,
+    )
+    approved = sip.approve_proposal(approved_id, actor="operator sk-proj-approveActorSecret1234567890", config=cfg)
+
+    payload = _payload()
+    payload["proposals"][0]["title"] = "Reject unsafe preference"
+    payload["proposals"][0]["summary"] = "Rejected proposal."
+    payload["proposals"][0]["worker_prompt"] = "Do not implement."
+    sip.ingest_proposal_output(metadata={"proposal_json": json.dumps(payload), "cron_run_id": "run-b"}, config=cfg)
+    rejected_id = [p for p in sip.list_proposals(config=cfg) if p["card_id"] != approved_id][0]["card_id"]
+    rejected = sip.reject_proposal(
+        rejected_id,
+        reason="No ghp_rejectReasonSecret1234567890",
+        strength="strong sk-proj-rejectStrengthSecret1234567890",
+        actor="reviewer ghp_rejectActorSecret1234567890",
+        config=cfg,
+    )
+
+    listed_feedback = sip.list_feedback(approved_id, config=cfg) + sip.list_feedback(rejected_id, config=cfg)
+    detail = sip.get_proposal_detail(rejected_id, config=cfg)
+    context = sip.build_feedback_context("sligo", "airflow_doctor", config=cfg)
+    prompt_context = sip.build_proposal_prompt_context("sligo", "airflow_doctor", config=cfg)
+    returned = json.dumps(
+        {
+            "feedback": feedback,
+            "approved": approved,
+            "rejected": rejected,
+            "listed_feedback": listed_feedback,
+            "detail": detail,
+            "context": context,
+            "prompt_context": prompt_context,
+        },
+        sort_keys=True,
+    )
+
+    with sqlite3.connect(str(tmp_path / "proposals.db")) as conn:
+        stored_rows = conn.execute(
+            """
+            SELECT body, author, metadata_json FROM proposal_feedback
+            WHERE card_id IN (?, ?)
+            ORDER BY id ASC
+            """,
+            (approved_id, rejected_id),
+        ).fetchall()
+        stored_card = conn.execute(
+            "SELECT decision_reason, decided_by FROM proposal_cards WHERE card_id = ?",
+            (rejected_id,),
+        ).fetchone()
+    stored = json.dumps({"feedback": stored_rows, "card": stored_card}, sort_keys=True)
+
+    for raw in (
+        raw_feedback_secret,
+        raw_author_secret,
+        "sk-proj-approveActorSecret1234567890",
+        "ghp_rejectReasonSecret1234567890",
+        "sk-proj-rejectStrengthSecret1234567890",
+        "ghp_rejectActorSecret1234567890",
+    ):
+        assert raw not in stored
+        assert raw not in returned
+    assert "[REDACTED]" in returned or "***" in returned
+
+
 def test_approve_is_idempotent_and_records_one_audit_event(tmp_path):
     cfg = _config(tmp_path)
     sip.ingest_proposal_output(metadata={"proposal_json": json.dumps(_payload()), "cron_run_id": "run-a"}, config=cfg)

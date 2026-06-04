@@ -157,6 +157,48 @@ def test_reject_records_feedback_without_task(client):
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
 
 
+def test_feedback_and_action_api_redacts_visible_audit_fields(client, isolated):
+    card_id = _ingest_card(client)
+    headers = {
+        "X-Hermes-Session-Token": "test-token",
+        "X-Hermes-Actor": "dashboard ghp_dashboardActorSecret1234567890",
+    }
+
+    feedback = client.post(
+        f"/api/plugins/sligo/proposals/{card_id}/feedback",
+        headers=headers,
+        json={
+            "body": "Looks good sk-proj-dashboardFeedbackSecret1234567890",
+            "author": "operator ghp_dashboardAuthorSecret1234567890",
+        },
+    )
+    approved = client.post(f"/api/plugins/sligo/proposals/{card_id}/approve", headers=headers)
+    detail = client.get(f"/api/plugins/sligo/proposals/{card_id}", headers=headers)
+
+    assert feedback.status_code == 200
+    assert approved.status_code == 200
+    assert detail.status_code == 200
+    returned = json.dumps(
+        {"feedback": feedback.json(), "approved": approved.json(), "detail": detail.json()},
+        sort_keys=True,
+    )
+    with sip.connect(config=isolated) as conn:
+        rows = conn.execute(
+            "SELECT body, author, metadata_json FROM proposal_feedback WHERE card_id = ? ORDER BY id ASC",
+            (card_id,),
+        ).fetchall()
+        card = conn.execute("SELECT decided_by FROM proposal_cards WHERE card_id = ?", (card_id,)).fetchone()
+    stored = json.dumps({"feedback": [dict(row) for row in rows], "card": dict(card)}, sort_keys=True)
+
+    for raw in (
+        "sk-proj-dashboardFeedbackSecret1234567890",
+        "ghp_dashboardAuthorSecret1234567890",
+        "ghp_dashboardActorSecret1234567890",
+    ):
+        assert raw not in returned
+        assert raw not in stored
+
+
 def test_parse_error_run_is_visible_without_proposal_cards(client):
     r = client.post(
         "/api/plugins/sligo/ingest",

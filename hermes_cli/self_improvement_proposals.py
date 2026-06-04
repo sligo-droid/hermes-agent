@@ -460,9 +460,11 @@ def add_feedback(
     feedback_type = str(feedback_type or "comment").strip().lower()
     if feedback_type not in {"comment", "reject", "approve", "edit", *_OUTCOME_FEEDBACK_TYPES}:
         raise ValueError("feedback_type must be comment, reject, approve, edit, outcome, or kanban_status")
-    body = str(body or "").strip()
+    body = _sanitize_free_text(str(body or "").strip()) or ""
     if not body:
         raise ValueError("feedback body is required")
+    author = _sanitize_free_text(author) if author is not None else None
+    clean_metadata = sanitize_payload(metadata or {})
     now = int(time.time())
     with connect(db_path, config) as conn:
         if conn.execute("SELECT 1 FROM proposal_cards WHERE card_id = ?", (card_id,)).fetchone() is None:
@@ -472,7 +474,7 @@ def add_feedback(
             INSERT INTO proposal_feedback (card_id, feedback_type, body, author, metadata_json, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (card_id, feedback_type, body, author, json.dumps(sanitize_payload(metadata or {}), sort_keys=True), now),
+            (card_id, feedback_type, body, author, json.dumps(clean_metadata, sort_keys=True), now),
         )
         conn.commit()
         return {
@@ -481,7 +483,7 @@ def add_feedback(
             "feedback_type": feedback_type,
             "body": body,
             "author": author,
-            "metadata": sanitize_payload(metadata or {}),
+            "metadata": clean_metadata,
             "created_at": now,
         }
 
@@ -497,18 +499,7 @@ def list_feedback(
             "SELECT * FROM proposal_feedback WHERE card_id = ? ORDER BY id ASC",
             (card_id,),
         ).fetchall()
-    return [
-        {
-            "id": row["id"],
-            "card_id": row["card_id"],
-            "feedback_type": row["feedback_type"],
-            "body": row["body"],
-            "author": row["author"],
-            "metadata": sanitize_payload(_json_value(row["metadata_json"], {})),
-            "created_at": row["created_at"],
-        }
-        for row in rows
-    ]
+    return [_sanitize_feedback_row(row) for row in rows]
 
 
 def edit_proposal(
@@ -578,6 +569,7 @@ def approve_proposal(
     db_path: str | Path | None = None,
 ) -> dict[str, Any]:
     now = int(time.time())
+    actor = _sanitize_free_text(actor) if actor is not None else None
     with connect(db_path, config) as conn:
         row = conn.execute("SELECT * FROM proposal_cards WHERE card_id = ?", (card_id,)).fetchone()
         if row is None:
@@ -628,7 +620,13 @@ def approve_proposal(
             INSERT INTO proposal_feedback (card_id, feedback_type, body, author, metadata_json, created_at)
             VALUES (?, 'approve', ?, ?, ?, ?)
             """,
-            (card_id, f"Approved into Kanban task {task_id}", actor, json.dumps({"board": board, "task_id": task_id}), now),
+            (
+                card_id,
+                _sanitize_free_text(f"Approved into Kanban task {task_id}"),
+                actor,
+                json.dumps(sanitize_payload({"board": board, "task_id": task_id}), sort_keys=True),
+                now,
+            ),
         )
         conn.commit()
     detail = get_proposal_detail(card_id, db_path=db_path, config=config)
@@ -646,7 +644,8 @@ def reject_proposal(
 ) -> dict[str, Any]:
     now = int(time.time())
     reason_text = _sanitize_free_text(str(reason or "").strip()) or ""
-    metadata = {"strength": str(strength).strip()} if strength else {}
+    actor = _sanitize_free_text(actor) if actor is not None else None
+    metadata = sanitize_payload({"strength": str(strength).strip()} if strength else {})
     with connect(db_path, config) as conn:
         row = conn.execute("SELECT * FROM proposal_cards WHERE card_id = ?", (card_id,)).fetchone()
         if row is None:
@@ -974,6 +973,18 @@ def sanitize_proposal(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _sanitize_feedback_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "card_id": row["card_id"],
+        "feedback_type": row["feedback_type"],
+        "body": _sanitize_free_text(row["body"]),
+        "author": _sanitize_free_text(row["author"]),
+        "metadata": sanitize_payload(_json_value(row["metadata_json"], {})),
+        "created_at": row["created_at"],
+    }
+
+
 def sanitize_payload(value: Any) -> Any:
     if isinstance(value, dict):
         clean: dict[str, Any] = {}
@@ -1193,8 +1204,8 @@ def _lifecycle_for_kanban_status(status: str) -> str:
 def _feedback_card_summary(row: dict[str, Any], *, include_reason: bool = False) -> dict[str, Any]:
     item = {
         "card_id": row.get("card_id"),
-        "title": row.get("title"),
-        "summary": row.get("summary"),
+        "title": _sanitize_free_text(row.get("title")),
+        "summary": _sanitize_free_text(row.get("summary")),
         "priority": row.get("priority"),
         "confidence": row.get("confidence"),
         "effort": row.get("effort"),
@@ -1202,7 +1213,7 @@ def _feedback_card_summary(row: dict[str, Any], *, include_reason: bool = False)
         "lifecycle_status": row.get("lifecycle_status"),
     }
     if include_reason and row.get("decision_reason"):
-        item["reason"] = row.get("decision_reason")
+        item["reason"] = _sanitize_free_text(row.get("decision_reason"))
     return item
 
 
@@ -1213,7 +1224,7 @@ def _operator_preferences(rows: list[sqlite3.Row], limit: int) -> list[dict[str,
         ftype = str(row["feedback_type"] or "")
         if ftype not in {"comment", "reject", "edit", "outcome", "kanban_status"}:
             continue
-        body = str(row["body"] or "").strip()
+        body = (_sanitize_free_text(row["body"]) or "").strip()
         if not body:
             continue
         compact = body[:300]
@@ -1221,7 +1232,7 @@ def _operator_preferences(rows: list[sqlite3.Row], limit: int) -> list[dict[str,
         if key in seen:
             continue
         seen.add(key)
-        prefs.append({"type": ftype, "body": compact, "author": row["author"]})
+        prefs.append({"type": ftype, "body": compact, "author": _sanitize_free_text(row["author"])})
         if len(prefs) >= limit:
             break
     return prefs
