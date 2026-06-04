@@ -953,6 +953,7 @@ export interface CommandCenterSnapshot {
     boards: number;
     by_status: Record<string, number>;
     by_source: Record<string, number>;
+    issue_pulse?: Array<{ status: string; count: number; label?: string }>;
   };
 }
 

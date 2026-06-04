@@ -130,6 +130,59 @@ function MetricCard({ label, value, detail, tone }: { label: string; value: numb
   );
 }
 
+function IssuePulseChart({
+  activeStatus,
+  data,
+  onSelect,
+}: {
+  activeStatus?: string;
+  data?: CommandCenterSnapshot["metrics"]["issue_pulse"];
+  onSelect: (status: string) => void;
+}) {
+  const points = data?.length ? data : [];
+  const maxCount = Math.max(1, ...points.map((point) => point.count));
+  return (
+    <Card className="border-white/10 bg-white/[0.035]">
+      <CardHeader>
+        <CardTitle className="text-base text-white">Issue Pulse</CardTitle>
+      </CardHeader>
+      <CardContent>
+        {points.length ? (
+          <div className="flex h-28 items-end gap-2" role="list" aria-label="Issue Pulse by work status">
+            {points.map((point) => {
+              const selected = activeStatus === point.status;
+              return (
+                <button
+                  aria-label={`${point.label || point.status}: ${point.count} work item${point.count === 1 ? "" : "s"}`}
+                  aria-pressed={selected}
+                  className={cn(
+                    "group flex min-w-10 flex-1 flex-col items-center justify-end gap-2 rounded-xl border border-white/10 bg-white/[0.035] px-2 py-2 text-xs text-slate-400 transition hover:border-cyan-100/40 hover:bg-cyan-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/45",
+                    selected && "border-cyan-100/60 bg-cyan-100/10 text-cyan-50",
+                  )}
+                  key={point.status}
+                  onClick={() => onSelect(point.status)}
+                  title={`${point.label || point.status}: ${point.count}`}
+                  type="button"
+                >
+                  <span className="font-semibold text-white">{point.count}</span>
+                  <span
+                    aria-hidden="true"
+                    className="w-full rounded-full bg-cyan-200/75 shadow-[0_0_16px_rgba(103,232,249,0.22)] transition group-hover:bg-cyan-100"
+                    style={{ height: `${Math.max(10, Math.round((point.count / maxCount) * 64))}px` }}
+                  />
+                  <span className="max-w-full truncate uppercase tracking-[0.14em]">{point.label || point.status}</span>
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <p className="text-sm text-slate-400">No work-item status pulse is available yet.</p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 function ActionButton({
   busy,
   disabled,
@@ -487,6 +540,7 @@ export default function CommandCenterPage() {
   const [loading, setLoading] = useState(true);
   const [activeAction, setActiveAction] = useState<{ id: string; kind: ActionKind } | null>(null);
   const [selection, setSelection] = useState<Selection | null>(null);
+  const [pulseStatus, setPulseStatus] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -567,6 +621,10 @@ export default function CommandCenterPage() {
     () => snapshot?.work_items.filter((item) => item.source.kind === "self_improvement") ?? [],
     [snapshot],
   );
+  const overviewVisibleItems = useMemo(
+    () => (pulseStatus ? overviewItems.filter((item) => item.status === pulseStatus) : overviewItems),
+    [overviewItems, pulseStatus],
+  );
 
   const handleAction = useCallback(async (kind: ActionKind, item: CommandCenterWorkItem) => {
     const proposalId = item.decision?.proposal_id;
@@ -616,6 +674,12 @@ export default function CommandCenterPage() {
         <MetricCard label="Parse failures" value={metric(snapshot, "parse_failures")} tone="text-red-100" />
       </div>
 
+      <IssuePulseChart
+        activeStatus={pulseStatus || undefined}
+        data={snapshot?.metrics.issue_pulse}
+        onSelect={(status) => setPulseStatus((current) => (current === status ? null : status))}
+      />
+
       {error && (
         <Card className="border-red-300/30 bg-red-950/30">
           <CardContent className="flex items-start gap-3 py-4 text-sm text-red-100">
@@ -636,7 +700,13 @@ export default function CommandCenterPage() {
           <section className="min-w-0">
             {activeView === "overview" && (
               <div className="grid gap-5">
-                <OverviewWorkList activeAction={activeAction} emptyMessage="No recent decisions, worker boards, or active work yet." items={overviewItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
+                {pulseStatus && (
+                  <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-cyan-100/20 bg-cyan-100/[0.045] px-4 py-3 text-sm text-cyan-50">
+                    <span>Showing Issue Pulse status: <strong>{pulseStatus}</strong></span>
+                    <button className="rounded-full border border-cyan-100/30 px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] text-cyan-50 transition hover:bg-cyan-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/35" onClick={() => setPulseStatus(null)} type="button">Clear</button>
+                  </div>
+                )}
+                <OverviewWorkList activeAction={activeAction} emptyMessage={pulseStatus ? `No ${pulseStatus} work items are visible.` : "No recent decisions, worker boards, or active work yet."} items={overviewVisibleItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
               </div>
             )}
             {activeView === "inbox" && (

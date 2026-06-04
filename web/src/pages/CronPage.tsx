@@ -324,6 +324,7 @@ export default function CronPage() {
                 <Input
                   id="cron-name"
                   autoFocus
+                  data-autofocus
                   placeholder={t.cron.namePlaceholder}
                   value={name}
                   onChange={(e) => setName(e.target.value)}
