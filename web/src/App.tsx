@@ -131,14 +131,8 @@ const WORKERS_NAV_ITEM: NavItem = {
 
 const COMMAND_CENTER_NAV_ITEM: NavItem = {
   path: "/sligo",
-  label: "Command Center",
+  label: "Overview",
   icon: Workflow,
-};
-
-const COMMAND_CENTER_RECOMMENDATIONS_NAV_ITEM: NavItem = {
-  path: "/sligo/recommendations",
-  label: "Recommendations",
-  icon: Sparkles,
 };
 
 /**
@@ -420,18 +414,15 @@ function SligoSurfaceShell({ routes }: { routes: DashboardRoute[] }) {
             </span>
             <span>
               <span className="block text-sm font-semibold uppercase tracking-[0.18em] text-white">Sligo Labs</span>
-              <span className="block text-xs uppercase tracking-[0.16em] text-slate-500">Operator surface</span>
+              <span className="block text-xs uppercase tracking-[0.16em] text-slate-500">Command Center</span>
             </span>
           </NavLink>
 
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
             <nav aria-label="Sligo operator navigation" className="flex flex-wrap gap-1 rounded-full border border-white/10 bg-white/[0.035] p-1">
-              <SligoNavLink to="/sligo">Command Center</SligoNavLink>
+              <SligoNavLink to="/sligo">Overview</SligoNavLink>
               <SligoNavLink to="/sligo/inbox">Inbox</SligoNavLink>
               <SligoNavLink to="/sligo/work">Work</SligoNavLink>
-              <SligoNavLink to="/sligo/runs">Runs</SligoNavLink>
-              <SligoNavLink to="/sligo/recommendations">Recommendations</SligoNavLink>
-              <SligoNavLink to="/sligo/sources">Sources</SligoNavLink>
               <a
                 className="rounded-full px-3 py-2 text-sm font-medium text-slate-300 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-200/70"
                 href="/workers"
@@ -442,7 +433,13 @@ function SligoSurfaceShell({ routes }: { routes: DashboardRoute[] }) {
             <button
               aria-label="Refresh Command Center"
               className="inline-flex h-9 items-center justify-center gap-2 rounded-full border border-cyan-100/25 bg-cyan-100/10 px-3 text-xs font-semibold uppercase tracking-[0.14em] text-cyan-50 transition hover:bg-cyan-100/15 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-200/70"
-              onClick={() => window.dispatchEvent(new CustomEvent("command-center:refresh"))}
+              onClick={() => {
+                if (window.__commandCenterRefresh) {
+                  window.__commandCenterRefresh();
+                  return;
+                }
+                window.dispatchEvent(new CustomEvent("command-center:refresh"));
+              }}
               type="button"
             >
               <RotateCw className="h-3.5 w-3.5" /> Refresh
@@ -552,7 +549,7 @@ export default function App() {
 
   const builtinNav = useMemo(() => {
     if (dashboardSurface === "sligo") {
-      return [COMMAND_CENTER_NAV_ITEM, COMMAND_CENTER_RECOMMENDATIONS_NAV_ITEM, WORKERS_NAV_ITEM];
+      return [COMMAND_CENTER_NAV_ITEM, WORKERS_NAV_ITEM];
     }
     const base = embeddedChat
       ? [CHAT_NAV_ITEM, ...BUILTIN_NAV_REST]
@@ -569,7 +566,7 @@ export default function App() {
       if (dashboardSurface !== "combined") return nav;
       return {
         ...nav,
-        pluginItems: [COMMAND_CENTER_NAV_ITEM, COMMAND_CENTER_RECOMMENDATIONS_NAV_ITEM, WORKERS_NAV_ITEM, ...nav.pluginItems],
+        pluginItems: [COMMAND_CENTER_NAV_ITEM, WORKERS_NAV_ITEM, ...nav.pluginItems],
       };
     },
     [builtinNav, dashboardSurface, manifests],
@@ -581,18 +578,15 @@ export default function App() {
   const pluginTabMeta = useMemo(
     () => {
       const commandCenterTabs = [
-        { path: "/sligo", label: "Command Center" },
+        { path: "/sligo", label: "Overview" },
         { path: "/sligo/inbox", label: "Inbox" },
         { path: "/sligo/work", label: "Work" },
-        { path: "/sligo/runs", label: "Runs" },
-        { path: "/sligo/recommendations", label: "Recommendations" },
-        { path: "/sligo/sources", label: "Sources" },
-        { path: "/command-center", label: "Command Center" },
-        { path: "/self-improvement", label: "Recommendations" },
+        { path: "/command-center", label: "Overview" },
+        { path: "/self-improvement", label: "Overview" },
         { path: "/workers", label: "Workers" },
       ];
       if (dashboardSurface === "sligo") {
-        return [{ path: "/", label: "Command Center" }, ...commandCenterTabs];
+        return [{ path: "/", label: "Overview" }, ...commandCenterTabs];
       }
       return [
         ...commandCenterTabs,
