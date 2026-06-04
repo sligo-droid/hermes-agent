@@ -54,6 +54,7 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from hermes_cli.discord_plan_artifacts import lookup_discord_plan_artifact  # noqa: E402
 
 
 @pytest.fixture()
@@ -218,6 +219,45 @@ class TestSendWithReplyToMode:
         assert len(calls) == 2
         assert calls[0].kwargs.get("reference") is ref_msg
         assert calls[1].kwargs.get("reference") is None
+
+    @pytest.mark.asyncio
+    async def test_plan_like_multi_chunk_send_persists_artifact(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter, channel, _ref_msg = _make_discord_adapter("first")
+        thread_id = "1511795999700680744"
+        parent_id = "1504252294495998043"
+        guild_id = "1502787243230756904"
+        source_message_id = "1511799412559708283"
+        channel.id = int(thread_id)
+        channel.guild = SimpleNamespace(id=int(guild_id))
+        channel.parent = SimpleNamespace(id=int(parent_id))
+        sent_one = SimpleNamespace(id=1511804847425458217)
+        sent_two = SimpleNamespace(id=1511804848025239594)
+        channel.send = AsyncMock(side_effect=[sent_one, sent_two])
+        adapter.truncate_message = lambda content, max_length=2000, len_fn=None: ["chunk1", "chunk2"]
+        plan = "## Implementation plan\n" + "\n".join(
+            f"{idx}. Phase {idx}: build and verify artifact-backed Discord plan context."
+            for idx in range(1, 90)
+        )
+
+        result = await adapter.send(
+            parent_id,
+            plan,
+            reply_to=source_message_id,
+            metadata={"thread_id": thread_id},
+        )
+
+        assert result.success
+        artifact = result.raw_response["plan_artifact"]
+        assert artifact["artifact_path"].startswith(str(tmp_path))
+        record = lookup_discord_plan_artifact(thread_id)
+        assert record is not None
+        assert record.artifact_path == artifact["artifact_path"]
+        assert record.thread_id == thread_id
+        assert record.parent_channel_id == parent_id
+        assert record.source_message_id == source_message_id
+        assert record.bot_message_ids == (str(sent_one.id), str(sent_two.id))
+        assert "artifact-backed Discord plan context" in record.content
 
 
 class TestConfigSerialization:
