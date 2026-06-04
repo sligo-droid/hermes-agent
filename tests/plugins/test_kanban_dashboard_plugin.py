@@ -216,13 +216,25 @@ def test_self_improvement_approve_creates_task_on_discord_thread_board(client, m
 
     def fake_publish(card_arg, *, channel_id, existing=None):
         calls.append({"proposal_id": card_arg["proposal_id"], "channel_id": channel_id, "existing": existing})
+        from hermes_cli.discord_worker_boards import ensure_discord_thread_board
+
+        board = ensure_discord_thread_board(
+            thread_id="777",
+            chat_id=channel_id,
+            guild_id="999",
+            parent_channel_id=channel_id,
+            initial_request=card_arg["title"],
+            project_context={"project_name": "pid"},
+            request_id="555",
+            source_message_id="555",
+        )
         return discord_publish.DiscordApprovalRoute(
             channel_id=channel_id,
             top_level_message_id="555",
             thread_id="777",
             thread_url="https://discord.com/channels/999/777",
-            board="discord-777-m-555",
-            board_public_url="https://workers.example/discord-777-m-555",
+            board=board.slug,
+            board_public_url=board.public_url,
             guild_id="999",
         )
 
@@ -246,11 +258,17 @@ def test_self_improvement_approve_creates_task_on_discord_thread_board(client, m
     default_conn = kb.connect()
     board_conn = kb.connect(board="discord-777-m-555")
     try:
+        from hermes_cli import discord_worker_boards as dwb
+
+        worker = kb.read_board_metadata("discord-777-m-555")[dwb.DISCORD_WORKER_META_KEY]
         assert default_conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
         assert board_conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
         task = kb.get_task(board_conn, first.json()["task"]["id"])
         assert task is not None
         assert task.idempotency_key == f"self-improvement:{card['proposal_id']}"
+        assert task.workspace_kind == "dir"
+        assert task.workspace_path == worker["worktree_path"]
+        assert task.max_runtime_seconds == 3600
     finally:
         default_conn.close()
         board_conn.close()
@@ -294,8 +312,6 @@ def test_self_improvement_approve_creates_task_on_discord_thread_board(client, m
     assert repaired_index_link.status_code == 200
     assert repaired_index_link.json()["card"]["worker_url"] == expected_worker_url
 
-    from hermes_cli import discord_worker_boards as dwb
-
     worker = kb.read_board_metadata("discord-777-m-555")[dwb.DISCORD_WORKER_META_KEY]
     assert worker["goal_status"] == "active"
     assert worker["phase"] == "dev"
@@ -323,6 +339,11 @@ def test_self_improvement_approve_falls_back_without_discord_channel(client, mon
     conn = kb.connect()
     try:
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+        task = kb.get_task(conn, response.json()["task"]["id"])
+        assert task is not None
+        assert task.workspace_kind == "dir"
+        assert task.workspace_path is None
+        assert task.max_runtime_seconds is None
     finally:
         conn.close()
 
