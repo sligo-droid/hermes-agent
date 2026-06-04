@@ -484,7 +484,14 @@ export default function App() {
   );
   const pluginTabMeta = useMemo(
     () => {
-      if (dashboardSurface === "sligo") return [];
+      if (dashboardSurface === "sligo") {
+        return [
+          { path: "/", label: "Sligo Home" },
+          { path: "/sligo", label: "Sligo Home" },
+          { path: "/self-improvement", label: "Self-Improvement" },
+          { path: "/workers", label: "Workers" },
+        ];
+      }
       return manifests
         .filter((m) => !m.tab.hidden)
         .map((m) => ({
