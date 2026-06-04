@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, ExternalLink, FileText, RefreshCw, Sparkles } from "lucide-react";
+import { AlertTriangle, ArrowRight, ExternalLink, FileText, RefreshCw, Sparkles } from "lucide-react";
+import { Link } from "react-router-dom";
 import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@nous-research/ui/ui/components/card";
@@ -348,6 +349,20 @@ export default function SelfImprovementBoardPage() {
 
   return (
     <div className="flex flex-col gap-5">
+      <div className="rounded-xl border border-cyan-200/20 bg-[linear-gradient(135deg,rgba(8,47,73,0.7),rgba(2,6,23,0.82))] p-4">
+        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div>
+            <p className="text-xs uppercase tracking-[0.2em] text-cyan-100/80">Sligo operator workflow</p>
+            <p className="mt-1 max-w-3xl text-sm text-cyan-50/75">
+              Review upstream proposal cards here, then send accepted work to the real Hermes Workers board for downstream execution.
+            </p>
+          </div>
+          <Link className="inline-flex w-fit items-center gap-2 rounded border border-cyan-100/25 px-3 py-1.5 text-sm text-cyan-50 hover:bg-cyan-100/10" to="/sligo">
+            Operator Home <ArrowRight className="h-4 w-4" />
+          </Link>
+        </div>
+      </div>
+
       <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
         <div>
           <p className="text-xs uppercase tracking-[0.2em] text-text-tertiary">Upstream proposal review</p>
