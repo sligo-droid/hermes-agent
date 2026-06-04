@@ -1245,6 +1245,15 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     prompt = str(job.get("prompt") or "")
     skills = job.get("skills")
 
+    proposal_cfg = job.get("self_improvement_proposal")
+    if isinstance(proposal_cfg, dict) and proposal_cfg.get("enabled", True):
+        project = str(proposal_cfg.get("project") or "").strip()
+        prong = str(proposal_cfg.get("prong") or "").strip()
+        if project and prong:
+            from self_improvement.proposals import build_cron_proposal_guidance
+
+            prompt = f"{build_cron_proposal_guidance(project, prong)}\n\n{prompt}"
+
     # Run data-collection script if configured, inject output as context.
     script_path = job.get("script")
     if script_path:
