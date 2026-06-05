@@ -3,7 +3,6 @@ import { Link, useLocation } from "react-router-dom";
 import {
   AlertTriangle,
   Archive,
-  ArrowRight,
   Check,
   ExternalLink,
   Inbox,
@@ -26,16 +25,26 @@ import type {
 import { cn } from "@/lib/utils";
 
 type ViewKey = "overview" | "inbox" | "work" | "archive" | "runs" | "recommendations" | "sources";
-type Selection =
-  | { kind: "work"; item: CommandCenterWorkItem }
-  | { kind: "source"; source: CommandCenterSource }
-  | { kind: "run"; run: CommandCenterRun };
-
 type ActionKind = "approve" | "reject" | "pause" | "resume" | "undo" | "archive";
+type ActiveAction = { id: string; kind: ActionKind };
+
+const ACTION_SETTLE_MS = 600;
+const ACTION_PROGRESS_LABELS: Record<ActionKind, string> = {
+  approve: "Approving",
+  reject: "Rejecting",
+  pause: "Pausing",
+  resume: "Resuming",
+  undo: "Requesting revert",
+  archive: "Archiving",
+};
+
+function waitForActionSettle(durationMs = ACTION_SETTLE_MS): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, durationMs));
+}
 
 declare global {
   interface Window {
-    __commandCenterRefresh?: () => void;
+    __commandCenterRefresh?: () => Promise<void> | void;
   }
 }
 
@@ -109,41 +118,6 @@ function runIsActive(run: CommandCenterRun): boolean {
   return !run.ended_at && run.task_status === "running";
 }
 
-function initialSelectionForView(snapshot: CommandCenterSnapshot, activeView: ViewKey): Selection | null {
-  if (activeView === "runs") {
-    const run = snapshot.runs[0];
-    return run ? { kind: "run", run } : null;
-  }
-  if (activeView === "sources") {
-    const source = snapshot.sources[0];
-    return source ? { kind: "source", source } : null;
-  }
-  if (activeView === "recommendations") {
-    const item = snapshot.work_items.find((candidate) => candidate.source.kind === "self_improvement");
-    return item ? { kind: "work", item } : null;
-  }
-  if (activeView === "inbox") {
-    const item = snapshot.work_items.find(isInboxItem);
-    if (item) return { kind: "work", item };
-    const source = snapshot.sources.find((candidate) => candidate.bucket === "inbox");
-    return source ? { kind: "source", source } : null;
-  }
-  if (activeView === "work") {
-    const item = snapshot.work_items.find(isWorkItem);
-    return item ? { kind: "work", item } : null;
-  }
-  if (activeView === "archive") {
-    const item = snapshot.work_items.find(isArchivedItem);
-    return item ? { kind: "work", item } : null;
-  }
-  const item = snapshot.work_items[0];
-  if (item) return { kind: "work", item };
-  const source = snapshot.sources[0];
-  if (source) return { kind: "source", source };
-  const run = snapshot.runs[0];
-  return run ? { kind: "run", run } : null;
-}
-
 function WorkStatePanel({
   activeView,
   laneCounts,
@@ -159,8 +133,8 @@ function WorkStatePanel({
     { key: "workers", label: "Workers", href: "/workers", value: laneCounts.workers, detail: "opens monitor", external: true },
   ];
   const tileClass = (selected: boolean) => cn(
-    "group rounded-2xl border px-3.5 py-3 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
-    selected ? "border-cyan-100/55 bg-cyan-100/10 text-cyan-50" : "border-white/10 bg-white/[0.035] text-slate-300 hover:border-cyan-100/35 hover:bg-cyan-100/[0.055]",
+    "command-center-lane group rounded-2xl border px-3.5 py-3 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
+    selected ? "command-center-lane-selected border-cyan-100/55 bg-cyan-100/10 text-cyan-50" : "border-white/10 bg-white/[0.035] text-slate-300 hover:border-cyan-100/35 hover:bg-cyan-100/[0.055]",
   );
   return (
     <Card className="border-white/10 bg-white/[0.035]">
@@ -174,9 +148,9 @@ function WorkStatePanel({
             const selected = !lane.external && activeView === lane.key;
             const content = (
               <>
-                <span className="block text-xl font-semibold tracking-tight text-white">{lane.value}</span>
+                <span className="command-center-lane-value block text-xl font-semibold tracking-tight text-white">{lane.value}</span>
                 <span className="mt-1 block text-[0.68rem] font-semibold uppercase tracking-[0.16em]">{lane.label}</span>
-                <span className="mt-1 block text-xs text-slate-500 transition group-hover:text-slate-400">{lane.detail}</span>
+                <span className="command-center-lane-detail mt-1 block text-xs text-slate-500 transition group-hover:text-slate-400">{lane.detail}</span>
               </>
             );
             if (lane.external) {
@@ -226,17 +200,20 @@ function ActionButton({
         aria-describedby={tooltipId}
         aria-label={config.label}
         className={cn(
-          "inline-flex h-10 w-10 items-center justify-center rounded-full border text-xs font-semibold shadow-sm shadow-black/20 transition hover:shadow-black/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950 disabled:cursor-not-allowed disabled:border-slate-500/25 disabled:bg-slate-700/35 disabled:text-slate-400 disabled:opacity-70 disabled:shadow-none",
+          "command-center-action-button inline-flex h-10 w-10 items-center justify-center rounded-full border text-xs font-semibold shadow-sm shadow-black/20 transition hover:shadow-black/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950 disabled:cursor-not-allowed disabled:border-slate-500/25 disabled:bg-slate-700/35 disabled:text-slate-400 disabled:opacity-70 disabled:shadow-none",
           config.className,
         )}
         disabled={disabled || busy}
-        onClick={onClick}
+        onClick={(event) => {
+          event.stopPropagation();
+          onClick();
+        }}
         type="button"
       >
         <Icon className={cn(config.strong ? "h-6 w-6 stroke-[2.35]" : "h-5 w-5 stroke-[2.15]", busy && "animate-pulse")} />
         <span className="sr-only">{config.label}</span>
       </button>
-      <span id={tooltipId} role="tooltip" className="pointer-events-none absolute bottom-full left-1/2 z-20 mb-2 -translate-x-1/2 translate-y-1 whitespace-nowrap rounded-md border border-white/15 bg-[#090a0c]/95 px-2.5 py-1 text-[0.68rem] font-medium text-slate-100 opacity-0 shadow-xl shadow-black/35 transition duration-150 group-hover/action:translate-y-0 group-hover/action:opacity-100 group-focus-within/action:translate-y-0 group-focus-within/action:opacity-100">
+      <span id={tooltipId} role="tooltip" className="command-center-action-tooltip pointer-events-none absolute bottom-full left-1/2 z-20 mb-2 -translate-x-1/2 translate-y-1 whitespace-nowrap rounded-md border border-white/15 bg-[#090a0c]/95 px-2.5 py-1 text-[0.68rem] font-medium text-slate-100 opacity-0 shadow-xl shadow-black/35 transition duration-150 group-hover/action:translate-y-0 group-hover/action:opacity-100 group-focus-within/action:translate-y-0 group-focus-within/action:opacity-100">
         {config.label}
       </span>
     </span>
@@ -252,83 +229,106 @@ function SourceBadge({ source }: { source: CommandCenterSource }) {
   );
 }
 
+function discordSourceUrl(source?: CommandCenterSource | null): string | null {
+  if (!source || !["discord", "discord_thread"].includes(source.kind)) return null;
+  const ref = source.ref || {};
+  for (const key of ["discord_url", "source_url", "discord_thread_url"]) {
+    const value = ref[key];
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return null;
+}
+
 function WorkItemCard({
   activeAction,
   item,
   onAction,
-  onSelect,
-  selected,
 }: {
-  activeAction: { id: string; kind: ActionKind } | null;
+  activeAction: ActiveAction | null;
   item: CommandCenterWorkItem;
   onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
-  onSelect: () => void;
-  selected: boolean;
 }) {
   const proposalId = item.decision?.proposal_id;
-  const actionBusy = (kind: ActionKind) => activeAction?.id === item.id && activeAction.kind === kind;
+  const rowBusy = activeAction?.id === item.id;
+  const actionBusy = (kind: ActionKind) => rowBusy && activeAction?.kind === kind;
+  const actionDisabled = (kind: ActionKind) => Boolean(activeAction) && !actionBusy(kind);
   const canApproveReject = Boolean(proposalId && item.status === "proposed");
   const proposalCanArchive = Boolean(proposalId && ["queued", "running", "review", "blocked", "accepted", "paused"].includes(item.status));
   const canPause = Boolean(["queued", "running", "review", "accepted"].includes(item.status) && (proposalId || (item.execution?.pause_action && item.execution.board)) && !item.execution?.paused);
   const canResume = Boolean((item.status === "paused" || item.execution?.paused || item.execution?.resumable) && (proposalId || (item.execution?.resume_action && item.execution.board)) && item.status !== "archived");
   const canUndo = Boolean(proposalId && item.status === "shipped");
   const canArchive = Boolean((item.execution?.archiveable && item.execution.board && item.execution.board !== "default" && item.id.startsWith("kanban-board:")) || proposalCanArchive);
+  const discordUrl = discordSourceUrl(item.source);
+  const workerUrl = item.execution?.worker_url || null;
+  const openWorker = () => {
+    if (!workerUrl) return;
+    window.open(workerUrl, "_blank", "noopener,noreferrer");
+  };
   return (
     <article
+      aria-label={workerUrl ? `Open worker board for ${item.title}` : undefined}
+      aria-busy={rowBusy || undefined}
       className={cn(
-        "rounded-2xl border bg-[#08090a]/80 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.025)] transition",
-        selected ? "border-cyan-100/55 bg-cyan-100/[0.03] ring-1 ring-cyan-100/15" : "border-white/10 hover:border-white/20 hover:bg-white/[0.03]",
+        "command-center-card rounded-2xl border bg-[#08090a]/80 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.025)] transition",
+        workerUrl ? "cursor-pointer border-white/10 hover:border-cyan-100/35 hover:bg-cyan-100/[0.045] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/35" : "border-white/10 hover:border-white/20 hover:bg-white/[0.03]",
       )}
+      onClick={workerUrl ? openWorker : undefined}
+      onKeyDown={workerUrl ? (event) => {
+        if (event.currentTarget !== event.target) return;
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        openWorker();
+      } : undefined}
+      role={workerUrl ? "link" : undefined}
+      tabIndex={workerUrl ? 0 : undefined}
     >
       <div className="flex items-start justify-between gap-3">
-        <button className="min-w-0 flex-1 text-left" onClick={onSelect} type="button">
+        <div className="min-w-0 flex-1 text-left">
           <div className="mb-2 flex flex-wrap items-center gap-2">
             <SourceBadge source={item.source} />
             <StatusPill value={item.status} />
             {item.project && <span className="text-xs uppercase tracking-[0.16em] text-slate-500">{item.project}</span>}
           </div>
           <h3 className="text-base font-semibold leading-snug text-white">{item.title}</h3>
-        </button>
-        {item.execution?.worker_url ? (
+        </div>
+        {discordUrl ? (
           <div className="flex shrink-0 items-center gap-2">
-            <a className="inline-flex h-8 items-center gap-1.5 rounded-full border border-cyan-100/25 px-2.5 text-xs font-semibold text-cyan-50 transition hover:border-cyan-100/40 hover:bg-cyan-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/35" href={item.execution.worker_url} rel="noopener noreferrer" target="_blank">
-              Worker <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span>
+            <a aria-label={`Open Discord source for ${item.title}`} className="inline-flex h-8 items-center gap-1.5 rounded-full border border-indigo-200/25 px-2.5 text-xs font-semibold text-indigo-100 transition hover:border-indigo-100/40 hover:bg-indigo-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-100/35" href={discordUrl} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank">
+              Discord <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span>
             </a>
           </div>
         ) : null}
       </div>
-      <button className="mt-3 block w-full text-left" onClick={onSelect} type="button">
+      <div className="mt-3 block w-full text-left">
         <p className="text-sm leading-6 text-slate-300">{item.summary || item.body_preview || "No summary yet."}</p>
-      </button>
+      </div>
       {(item.execution?.task_url && item.execution.task_url !== item.execution.worker_url) || canApproveReject || canArchive || canPause || canResume || canUndo ? (
-        <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3">
+        <div aria-busy={rowBusy} className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3">
           {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && (
-            <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/[0.07] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" href={item.execution.task_url} rel="noopener noreferrer" target="_blank">
+            <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/[0.07] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" href={item.execution.task_url} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank">
               Ticket <ExternalLink className="h-3.5 w-3.5" /><span className="sr-only">opens in a new tab</span>
             </a>
           )}
-          {canApproveReject && <ActionButton busy={actionBusy("approve")} kind="approve" onClick={() => onAction("approve", item)} />}
-          {canApproveReject && <ActionButton busy={actionBusy("reject")} kind="reject" onClick={() => onAction("reject", item)} />}
-          {canResume && <ActionButton busy={actionBusy("resume")} kind="resume" onClick={() => onAction("resume", item)} />}
-          {canPause && <ActionButton busy={actionBusy("pause")} kind="pause" onClick={() => onAction("pause", item)} />}
-          {canUndo && <ActionButton busy={actionBusy("undo")} kind="undo" onClick={() => onAction("undo", item)} />}
-          {canArchive && <ActionButton busy={actionBusy("archive")} kind="archive" onClick={() => onAction("archive", item)} />}
+          {rowBusy && activeAction && (
+            <span className="inline-flex h-9 items-center gap-2 rounded-full border border-cyan-100/25 bg-cyan-100/10 px-3 text-xs font-semibold text-cyan-50" aria-live="polite">
+              <Spinner /> {ACTION_PROGRESS_LABELS[activeAction.kind]}…
+            </span>
+          )}
+          {canApproveReject && <ActionButton busy={actionBusy("approve")} disabled={actionDisabled("approve")} kind="approve" onClick={() => onAction("approve", item)} />}
+          {canApproveReject && <ActionButton busy={actionBusy("reject")} disabled={actionDisabled("reject")} kind="reject" onClick={() => onAction("reject", item)} />}
+          {canResume && <ActionButton busy={actionBusy("resume")} disabled={actionDisabled("resume")} kind="resume" onClick={() => onAction("resume", item)} />}
+          {canPause && <ActionButton busy={actionBusy("pause")} disabled={actionDisabled("pause")} kind="pause" onClick={() => onAction("pause", item)} />}
+          {canUndo && <ActionButton busy={actionBusy("undo")} disabled={actionDisabled("undo")} kind="undo" onClick={() => onAction("undo", item)} />}
+          {canArchive && <ActionButton busy={actionBusy("archive")} disabled={actionDisabled("archive")} kind="archive" onClick={() => onAction("archive", item)} />}
         </div>
       ) : null}
     </article>
   );
 }
 
-function SourceCard({ source, onSelect, selected }: { source: CommandCenterSource; onSelect: () => void; selected: boolean }) {
+function SourceCard({ source }: { source: CommandCenterSource }) {
   return (
-    <button
-      className={cn(
-        "rounded-2xl border bg-slate-950/45 p-4 text-left transition",
-        selected ? "border-cyan-100/75 ring-2 ring-cyan-100/20" : "border-white/10 hover:border-cyan-100/35",
-      )}
-      onClick={onSelect}
-      type="button"
-    >
+    <article className="command-center-card rounded-2xl border border-white/10 bg-slate-950/45 p-4 text-left transition hover:border-cyan-100/35">
       <div className="flex flex-wrap items-center gap-2">
         <Badge className="border-white/10 bg-white/[0.055] text-slate-300">{source.label}</Badge>
         <StatusPill value={source.status} />
@@ -338,21 +338,14 @@ function SourceCard({ source, onSelect, selected }: { source: CommandCenterSourc
       {typeof source.ref?.parse_error === "string" && (
         <p className="mt-3 line-clamp-3 text-xs leading-5 text-red-100/80">{source.ref.parse_error}</p>
       )}
-    </button>
+    </article>
   );
 }
 
-function RunCard({ run, onSelect, selected }: { run: CommandCenterRun; onSelect: () => void; selected: boolean }) {
+function RunCard({ run }: { run: CommandCenterRun }) {
   const active = runIsActive(run);
   return (
-    <button
-      className={cn(
-        "rounded-2xl border bg-slate-950/45 p-4 text-left transition",
-        selected ? "border-cyan-100/75 ring-2 ring-cyan-100/20" : "border-white/10 hover:border-cyan-100/35",
-      )}
-      onClick={onSelect}
-      type="button"
-    >
+    <article className="command-center-card rounded-2xl border border-white/10 bg-slate-950/45 p-4 text-left transition hover:border-cyan-100/35">
       <div className="flex flex-wrap items-center gap-2">
         <StatusPill value={active ? "running" : run.outcome || run.status} />
         {run.board && <Badge className="border-white/10 bg-white/[0.055] text-slate-300">{run.board}</Badge>}
@@ -360,102 +353,7 @@ function RunCard({ run, onSelect, selected }: { run: CommandCenterRun; onSelect:
       <div className="mt-3 text-sm font-semibold text-white">{run.task_title || run.task_id}</div>
       <div className="mt-2 text-xs text-slate-500">Started {formatTime(run.started_at)}{run.ended_at ? ` · Ended ${formatTime(run.ended_at)}` : ""}</div>
       {run.error && <p className="mt-3 line-clamp-3 text-xs leading-5 text-red-100/80">{run.error}</p>}
-    </button>
-  );
-}
-
-function DetailPanel({ selection }: { selection: Selection | null }) {
-  if (!selection) {
-    return (
-      <Card className="sticky top-4 border-white/10 bg-white/[0.035]">
-        <CardContent className="py-8 text-sm text-slate-400">Select a work item, run, or source to inspect provenance and execution links.</CardContent>
-      </Card>
-    );
-  }
-  if (selection.kind === "source") {
-    const source = selection.source;
-    return (
-      <Card className="sticky top-4 border-white/10 bg-white/[0.045]">
-        <CardHeader>
-          <CardTitle className="text-base text-white">Source</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4 text-sm text-slate-300">
-          <div>
-            <StatusPill value={source.status} />
-            <h3 className="mt-3 text-lg font-semibold text-white">{source.title || source.id}</h3>
-            <p className="mt-1 text-xs uppercase tracking-[0.16em] text-slate-500">{source.label}</p>
-          </div>
-          <KeyValue data={source.ref} />
-        </CardContent>
-      </Card>
-    );
-  }
-  if (selection.kind === "run") {
-    const run = selection.run;
-    return (
-      <Card className="sticky top-4 border-white/10 bg-white/[0.045]">
-        <CardHeader>
-          <CardTitle className="text-base text-white">Worker Run</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4 text-sm text-slate-300">
-          <div>
-            <StatusPill value={runIsActive(run) ? "running" : run.outcome || run.status} />
-            <h3 className="mt-3 text-lg font-semibold text-white">Run #{run.id}</h3>
-            <p className="mt-1 text-xs text-slate-500">{run.task_title || run.task_id}</p>
-          </div>
-          <KeyValue data={run as unknown as Record<string, unknown>} />
-        </CardContent>
-      </Card>
-    );
-  }
-  const item = selection.item;
-  return (
-    <Card className="sticky top-4 border-white/10 bg-white/[0.045]">
-      <CardHeader>
-        <CardTitle className="text-base text-white">Work Item</CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-4 text-sm text-slate-300">
-        <div>
-          <div className="flex flex-wrap gap-2"><SourceBadge source={item.source} /><StatusPill value={item.status} /></div>
-          <h3 className="mt-3 text-lg font-semibold text-white">{item.title}</h3>
-          <p className="mt-2 leading-6 text-slate-300">{item.summary || item.body_preview}</p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          {item.execution?.worker_url && <a className="inline-flex items-center gap-1 rounded border border-cyan-100/25 px-3 py-1.5 text-xs text-cyan-50 hover:bg-cyan-100/10" href={item.execution.worker_url} rel="noopener noreferrer" target="_blank">Worker board <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span></a>}
-          {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && <a className="inline-flex items-center gap-1 rounded border border-white/10 px-3 py-1.5 text-xs text-slate-200 hover:bg-white/10" href={item.execution.task_url} rel="noopener noreferrer" target="_blank">Ticket <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span></a>}
-          {item.execution?.console_url && <Link className="inline-flex items-center gap-1 rounded border border-white/10 px-3 py-1.5 text-xs text-slate-200 hover:bg-white/10" to={item.execution.console_url}>Console <ArrowRight className="h-3 w-3" /></Link>}
-        </div>
-        <KeyValue data={{ source: item.source.ref, execution: item.execution, status_detail: item.status_detail }} />
-        {item.source_excerpts?.length ? (
-          <section>
-            <h4 className="mb-2 text-xs uppercase tracking-[0.16em] text-slate-500">Evidence</h4>
-            <div className="space-y-2">
-              {item.source_excerpts.slice(0, 4).map((excerpt, index) => (
-                <div className="rounded-xl border border-white/10 bg-black/20 p-3 text-xs leading-5 text-slate-300" key={`${excerpt.label || "excerpt"}-${index}`}>
-                  <div className="mb-1 text-slate-500">{excerpt.label || "source"}</div>
-                  {excerpt.text}
-                </div>
-              ))}
-            </div>
-          </section>
-        ) : null}
-      </CardContent>
-    </Card>
-  );
-}
-
-function KeyValue({ data }: { data: Record<string, unknown> | null | undefined }) {
-  const entries = Object.entries(data || {}).filter(([, value]) => value !== undefined && value !== null && value !== "");
-  if (!entries.length) return null;
-  return (
-    <dl className="grid gap-2 rounded-2xl border border-white/10 bg-black/20 p-3 text-xs">
-      {entries.map(([key, value]) => (
-        <div className="grid gap-1" key={key}>
-          <dt className="uppercase tracking-[0.16em] text-slate-500">{key.replaceAll("_", " ")}</dt>
-          <dd className="break-words font-mono-ui text-slate-300">{typeof value === "object" ? JSON.stringify(value) : String(value)}</dd>
-        </div>
-      ))}
-    </dl>
+    </article>
   );
 }
 
@@ -477,16 +375,12 @@ function WorkList({
   emptyMessage,
   items,
   onAction,
-  onSelect,
-  selectedId,
 }: {
-  activeAction: { id: string; kind: ActionKind } | null;
+  activeAction: ActiveAction | null;
   emptyLabel?: string;
   emptyMessage?: string;
   items: CommandCenterWorkItem[];
   onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
-  onSelect: (item: CommandCenterWorkItem) => void;
-  selectedId?: string;
 }) {
   if (!items.length) return <EmptyState label={emptyLabel || "work items"} message={emptyMessage} />;
   return (
@@ -497,8 +391,6 @@ function WorkList({
           item={item}
           key={item.id}
           onAction={onAction}
-          onSelect={() => onSelect(item)}
-          selected={selectedId === item.id}
         />
       ))}
     </div>
@@ -510,15 +402,11 @@ function OverviewWorkList({
   emptyMessage,
   items,
   onAction,
-  onSelect,
-  selectedId,
 }: {
-  activeAction: { id: string; kind: ActionKind } | null;
+  activeAction: ActiveAction | null;
   emptyMessage?: string;
   items: CommandCenterWorkItem[];
   onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
-  onSelect: (item: CommandCenterWorkItem) => void;
-  selectedId?: string;
 }) {
   if (!items.length) return <EmptyState label="work items" message={emptyMessage} />;
 
@@ -530,8 +418,6 @@ function OverviewWorkList({
       item={item}
       key={item.id}
       onAction={onAction}
-      onSelect={() => onSelect(item)}
-      selected={selectedId === item.id}
     />
   );
 
@@ -556,36 +442,26 @@ export default function CommandCenterPage() {
   const [snapshot, setSnapshot] = useState<CommandCenterSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [activeAction, setActiveAction] = useState<{ id: string; kind: ActionKind } | null>(null);
-  const [selection, setSelection] = useState<Selection | null>(null);
+  const [activeAction, setActiveAction] = useState<ActiveAction | null>(null);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (options?: { delayBeforeApplyMs?: number; settleAfterApplyMs?: number }) => {
     setLoading(true);
     setError(null);
     try {
       const next = await api.getCommandCenterSnapshot({ includeArchived: true, recentRunLimitPerBoard: 25 });
+      if (options?.delayBeforeApplyMs) {
+        await waitForActionSettle(options.delayBeforeApplyMs);
+      }
       setSnapshot(next);
-      setSelection((current) => {
-        if (!current) {
-          return initialSelectionForView(next, activeView);
-        }
-        if (current.kind === "work") {
-          const updated = next.work_items.find((item) => item.id === current.item.id);
-          return updated ? { kind: "work", item: updated } : initialSelectionForView(next, activeView);
-        }
-        if (current.kind === "source") {
-          const updated = next.sources.find((source) => source.id === current.source.id);
-          return updated ? { kind: "source", source: updated } : initialSelectionForView(next, activeView);
-        }
-        const updated = next.runs.find((run) => run.id === current.run.id && run.board === current.run.board);
-        return updated ? { kind: "run", run: updated } : initialSelectionForView(next, activeView);
-      });
+      if (options?.settleAfterApplyMs) {
+        await waitForActionSettle(options.settleAfterApplyMs);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
-  }, [activeView]);
+  }, []);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- initial async snapshot load mirrors existing dashboard data pages.
@@ -593,9 +469,7 @@ export default function CommandCenterPage() {
   }, [refresh]);
 
   useEffect(() => {
-    const invokeRefresh = () => {
-      void refresh();
-    };
+    const invokeRefresh = refresh;
     window.__commandCenterRefresh = invokeRefresh;
     const refreshFromShell = () => {
       void refresh();
@@ -646,37 +520,9 @@ export default function CommandCenterPage() {
     archive: archivedItems.length,
     workers: metric(snapshot, "active_runs"),
   }), [archivedItems.length, inboxItems.length, inboxSources.length, overviewItems.length, snapshot, workItems.length]);
-  const activeViewWorkItems = useMemo(() => {
-    if (activeView === "overview") return overviewItems;
-    if (activeView === "inbox") return inboxItems;
-    if (activeView === "work") return workItems;
-    if (activeView === "archive") return archivedItems;
-    if (activeView === "recommendations") return recommendations;
-    return [];
-  }, [activeView, archivedItems, inboxItems, overviewItems, recommendations, workItems]);
-  const activeViewSources = useMemo(() => {
-    if (activeView === "inbox") return inboxSources;
-    if (activeView === "sources") return sources;
-    return [];
-  }, [activeView, inboxSources, sources]);
-  const activeViewRuns = useMemo(() => activeView === "runs" ? (snapshot?.runs ?? []) : [], [activeView, snapshot]);
-
-  useEffect(() => {
-    if (!snapshot || loading) return;
-    setSelection((current) => {
-      if (current?.kind === "work" && activeViewWorkItems.some((item) => item.id === current.item.id)) return current;
-      if (current?.kind === "source" && activeViewSources.some((source) => source.id === current.source.id)) return current;
-      if (current?.kind === "run" && activeViewRuns.some((run) => run.id === current.run.id && run.board === current.run.board)) return current;
-      const item = activeViewWorkItems[0];
-      if (item) return { kind: "work", item };
-      const source = activeViewSources[0];
-      if (source) return { kind: "source", source };
-      const run = activeViewRuns[0];
-      return run ? { kind: "run", run } : null;
-    });
-  }, [activeViewRuns, activeViewSources, activeViewWorkItems, loading, snapshot]);
-
   const handleAction = useCallback(async (kind: ActionKind, item: CommandCenterWorkItem) => {
+    if (activeAction) return;
+    const startedAt = Date.now();
     const proposalId = item.decision?.proposal_id;
     const board = item.execution?.board;
     if (kind === "archive" && !proposalId && (!item.execution?.archiveable || !board || board === "default")) return;
@@ -704,17 +550,16 @@ export default function CommandCenterPage() {
         const reason = window.prompt("Reason for revert follow-up?", "Operator requested revert follow-up from Command Center.") || undefined;
         await api.requestSelfImprovementUndoFollowup(proposalId, reason);
       }
-      await refresh();
+      await refresh({
+        delayBeforeApplyMs: Math.max(0, ACTION_SETTLE_MS - (Date.now() - startedAt)),
+        settleAfterApplyMs: ACTION_SETTLE_MS,
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setActiveAction(null);
     }
-  }, [refresh]);
-
-  const selectedWorkId = selection?.kind === "work" ? selection.item.id : undefined;
-  const selectedSourceId = selection?.kind === "source" ? selection.source.id : undefined;
-  const selectedRunId = selection?.kind === "run" ? `${selection.run.board || "default"}:${selection.run.id}` : undefined;
+  }, [activeAction, refresh]);
 
   return (
     <div className="flex flex-col gap-5">
@@ -739,39 +584,34 @@ export default function CommandCenterPage() {
           </CardContent>
         </Card>
       ) : (
-        <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_25rem]">
-          <section className="min-w-0">
-            {activeView === "overview" && (
-              <OverviewWorkList activeAction={activeAction} emptyMessage="No recent decisions, worker boards, or active work yet." items={overviewItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
-            )}
-            {activeView === "inbox" && (
-              <div className="grid gap-4">
-                <WorkList activeAction={activeAction} emptyLabel="pending decisions" emptyMessage="Inbox is clear. Finished, blocked, and archiveable boards stay on Overview or Work." items={inboxItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />
-                {inboxSources.map((source) => <SourceCard key={source.id} onSelect={() => setSelection({ kind: "source", source })} selected={selectedSourceId === source.id} source={source} />)}
-              </div>
-            )}
-            {activeView === "work" && <WorkList activeAction={activeAction} emptyMessage="No active or recently shipped work is visible." items={workItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
-            {activeView === "archive" && <WorkList activeAction={activeAction} emptyLabel="archived items" emptyMessage="Archived worker boards and work items will appear here." items={archivedItems} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
-            {activeView === "recommendations" && <WorkList activeAction={activeAction} emptyLabel="recommendations" emptyMessage="No self-improvement recommendations are waiting." items={recommendations} onAction={handleAction} onSelect={(item) => setSelection({ kind: "work", item })} selectedId={selectedWorkId} />}
-            {activeView === "runs" && (
-              <div className="grid gap-3">
-                {snapshot?.runs.length ? snapshot.runs.map((run) => (
-                  <RunCard key={`${run.board || "default"}:${run.id}`} onSelect={() => setSelection({ kind: "run", run })} run={run} selected={selectedRunId === `${run.board || "default"}:${run.id}`} />
-                )) : <EmptyState label="worker runs" />}
-              </div>
-            )}
-            {activeView === "sources" && (
-              <div className="grid gap-3">
-                {sources.length ? sources.map((source) => (
-                  <SourceCard key={source.id} onSelect={() => setSelection({ kind: "source", source })} selected={selectedSourceId === source.id} source={source} />
-                )) : <EmptyState label="sources" />}
-              </div>
-            )}
-          </section>
-          <aside className="min-w-0">
-            <DetailPanel selection={selection} />
-          </aside>
-        </div>
+        <section className="min-w-0">
+          {activeView === "overview" && (
+            <OverviewWorkList activeAction={activeAction} emptyMessage="No recent decisions, worker boards, or active work yet." items={overviewItems} onAction={handleAction} />
+          )}
+          {activeView === "inbox" && (
+            <div className="grid gap-4">
+              <WorkList activeAction={activeAction} emptyLabel="pending decisions" emptyMessage="Inbox is clear. Finished, blocked, and archiveable boards stay on Overview or Work." items={inboxItems} onAction={handleAction} />
+              {inboxSources.map((source) => <SourceCard key={source.id} source={source} />)}
+            </div>
+          )}
+          {activeView === "work" && <WorkList activeAction={activeAction} emptyMessage="No active or recently shipped work is visible." items={workItems} onAction={handleAction} />}
+          {activeView === "archive" && <WorkList activeAction={activeAction} emptyLabel="archived items" emptyMessage="Archived worker boards and work items will appear here." items={archivedItems} onAction={handleAction} />}
+          {activeView === "recommendations" && <WorkList activeAction={activeAction} emptyLabel="recommendations" emptyMessage="No self-improvement recommendations are waiting." items={recommendations} onAction={handleAction} />}
+          {activeView === "runs" && (
+            <div className="grid gap-3">
+              {snapshot?.runs.length ? snapshot.runs.map((run) => (
+                <RunCard key={`${run.board || "default"}:${run.id}`} run={run} />
+              )) : <EmptyState label="worker runs" />}
+            </div>
+          )}
+          {activeView === "sources" && (
+            <div className="grid gap-3">
+              {sources.length ? sources.map((source) => (
+                <SourceCard key={source.id} source={source} />
+              )) : <EmptyState label="sources" />}
+            </div>
+          )}
+        </section>
       )}
 
       <Card className="border-white/10 bg-white/[0.035]">

@@ -32,6 +32,7 @@ import {
   Home,
   KeyRound,
   Menu,
+  Moon,
   MessageSquare,
   Package,
   PanelLeftClose,
@@ -42,6 +43,7 @@ import {
   Shield,
   Sparkles,
   Star,
+  Sun,
   Terminal,
   Users,
   Workflow,
@@ -381,42 +383,100 @@ function buildRoutes(
 }
 
 const SIDEBAR_COLLAPSED_KEY = "hermes-sidebar-collapsed";
+const SLIGO_COLOR_MODE_KEY = "sligo-command-center-color-mode";
+type SligoColorMode = "dark" | "light";
 
 function SligoSurfaceShell({ routes }: { routes: DashboardRoute[] }) {
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [sligoMode, setSligoMode] = useState<SligoColorMode>(() => {
+    try {
+      return localStorage.getItem(SLIGO_COLOR_MODE_KEY) === "light" ? "light" : "dark";
+    } catch {
+      return "dark";
+    }
+  });
+  const isLight = sligoMode === "light";
+  const handleRefresh = useCallback(async () => {
+    if (isRefreshing) return;
+    setIsRefreshing(true);
+    const startedAt = Date.now();
+    try {
+      if (window.__commandCenterRefresh) {
+        await window.__commandCenterRefresh();
+      } else {
+        window.dispatchEvent(new CustomEvent("command-center:refresh"));
+      }
+    } finally {
+      const remaining = Math.max(0, 600 - (Date.now() - startedAt));
+      window.setTimeout(() => setIsRefreshing(false), remaining);
+    }
+  }, [isRefreshing]);
+  const toggleSligoMode = useCallback(() => {
+    setSligoMode((current) => {
+      const next = current === "light" ? "dark" : "light";
+      try {
+        localStorage.setItem(SLIGO_COLOR_MODE_KEY, next);
+      } catch { /* localStorage may be unavailable in private browsing */ }
+      return next;
+    });
+  }, []);
+
   return (
     <div
       data-layout-variant="sligo-operator"
-      className="relative flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-[#050713] text-slate-100 antialiased"
+      data-sligo-theme={sligoMode}
+      className={cn(
+        "relative flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden antialiased",
+        isLight ? "sligo-light bg-slate-100 text-slate-950" : "bg-[#050713] text-slate-100",
+      )}
     >
-      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_15%_10%,rgba(34,211,238,0.16),transparent_30%),radial-gradient(circle_at_85%_0%,rgba(16,185,129,0.12),transparent_26%),linear-gradient(180deg,#060817,#03050d)]" />
-      <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-cyan-200/60 to-transparent" />
+      <div className={cn(
+        "pointer-events-none absolute inset-0",
+        isLight
+          ? "bg-[radial-gradient(circle_at_15%_10%,rgba(14,165,233,0.13),transparent_30%),radial-gradient(circle_at_85%_0%,rgba(16,185,129,0.10),transparent_26%),linear-gradient(180deg,#f8fafc,#e2e8f0)]"
+          : "bg-[radial-gradient(circle_at_15%_10%,rgba(34,211,238,0.16),transparent_30%),radial-gradient(circle_at_85%_0%,rgba(16,185,129,0.12),transparent_26%),linear-gradient(180deg,#060817,#03050d)]",
+      )} />
+      <div className={cn("pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent to-transparent", isLight ? "via-cyan-500/45" : "via-cyan-200/60")} />
 
-      <header className="relative z-20 border-b border-white/10 bg-[#060817]/88 backdrop-blur-xl">
+      <header className={cn("relative z-20 border-b backdrop-blur-xl", isLight ? "border-slate-300/80 bg-white/82" : "border-white/10 bg-[#060817]/88")}>
         <div className="mx-auto flex max-w-[1560px] flex-col gap-3 px-4 py-3 sm:px-6 lg:flex-row lg:items-center lg:justify-between lg:px-8">
           <NavLink className="flex w-fit items-center gap-3" to="/sligo">
-            <span className="flex h-10 w-10 items-center justify-center rounded-2xl border border-cyan-200/25 bg-cyan-200/10 text-sm font-bold tracking-[0.18em] text-cyan-50 shadow-lg shadow-cyan-950/20">
+            <span className={cn("flex h-10 w-10 items-center justify-center rounded-2xl border text-sm font-bold tracking-[0.18em] shadow-lg", isLight ? "border-cyan-600/25 bg-cyan-100 text-cyan-950 shadow-cyan-200/40" : "border-cyan-200/25 bg-cyan-200/10 text-cyan-50 shadow-cyan-950/20")}>
               SL
             </span>
             <span>
-              <span className="block text-sm font-semibold uppercase tracking-[0.18em] text-white">Sligo Labs</span>
-              <span className="block text-xs uppercase tracking-[0.16em] text-slate-500">Command Center</span>
+              <span className={cn("block text-sm font-semibold uppercase tracking-[0.18em]", isLight ? "text-slate-950" : "text-white")}>Sligo Labs</span>
+              <span className={cn("block text-xs uppercase tracking-[0.16em]", isLight ? "text-slate-500" : "text-slate-500")}>Command Center</span>
             </span>
           </NavLink>
 
-          <button
-            aria-label="Refresh Command Center"
-            className="inline-flex h-9 w-fit items-center justify-center gap-2 rounded-full border border-cyan-100/25 bg-cyan-100/10 px-3 text-xs font-semibold uppercase tracking-[0.14em] text-cyan-50 transition hover:bg-cyan-100/15 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-200/70 lg:self-auto"
-            onClick={() => {
-              if (window.__commandCenterRefresh) {
-                window.__commandCenterRefresh();
-                return;
-              }
-              window.dispatchEvent(new CustomEvent("command-center:refresh"));
-            }}
-            type="button"
-          >
-            <RotateCw className="h-3.5 w-3.5" /> Refresh
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              aria-label={isLight ? "Switch Command Center to dark mode" : "Switch Command Center to light mode"}
+              className={cn(
+                "inline-flex h-9 w-fit items-center justify-center gap-2 rounded-full border px-3 text-xs font-semibold uppercase tracking-[0.14em] transition focus-visible:outline-none focus-visible:ring-1 lg:self-auto",
+                isLight ? "border-slate-300 bg-white text-slate-700 hover:bg-slate-50 focus-visible:ring-cyan-500/60" : "border-white/15 bg-white/[0.06] text-slate-200 hover:bg-white/[0.09] focus-visible:ring-cyan-200/70",
+              )}
+              onClick={toggleSligoMode}
+              type="button"
+            >
+              {isLight ? <Moon className="h-3.5 w-3.5" /> : <Sun className="h-3.5 w-3.5" />}
+              {isLight ? "Dark" : "Light"}
+            </button>
+            <button
+              aria-busy={isRefreshing}
+              aria-label="Refresh Command Center"
+              className={cn(
+                "inline-flex h-9 w-fit items-center justify-center gap-2 rounded-full border px-3 text-xs font-semibold uppercase tracking-[0.14em] transition focus-visible:outline-none focus-visible:ring-1 disabled:cursor-not-allowed disabled:opacity-75 lg:self-auto",
+                isLight ? "border-cyan-600/25 bg-cyan-50 text-cyan-800 hover:bg-cyan-100 focus-visible:ring-cyan-500/60" : "border-cyan-100/25 bg-cyan-100/10 text-cyan-50 hover:bg-cyan-100/15 focus-visible:ring-cyan-200/70",
+              )}
+              disabled={isRefreshing}
+              onClick={() => void handleRefresh()}
+              type="button"
+            >
+              <RotateCw className={cn("h-3.5 w-3.5", isRefreshing && "animate-spin")} /> {isRefreshing ? "Refreshing" : "Refresh"}
+            </button>
+          </div>
         </div>
       </header>
 

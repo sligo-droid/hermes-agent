@@ -24,13 +24,15 @@ def test_work_state_is_only_command_center_navigation_filter():
     assert "opens in a new tab" in work_state_source
 
 
-def test_command_center_worker_and_ticket_links_open_new_tabs():
+def test_command_center_worker_rows_and_ticket_links_open_new_tabs():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
 
-    worker_link_markers = source.count('href={item.execution.worker_url} rel="noopener noreferrer" target="_blank"')
-    ticket_link_markers = source.count('href={item.execution.task_url} rel="noopener noreferrer" target="_blank"')
-    assert worker_link_markers >= 2
-    assert ticket_link_markers >= 2
+    assert 'window.open(workerUrl, "_blank", "noopener,noreferrer")' in card_source
+    assert 'role={workerUrl ? "link" : undefined}' in card_source
+    assert 'tabIndex={workerUrl ? 0 : undefined}' in card_source
+    assert 'href={item.execution.worker_url}' not in card_source
+    assert 'href={item.execution.task_url} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank"' in card_source
 
 
 def test_command_center_archive_action_is_one_click_without_removing_other_prompts():
@@ -54,13 +56,32 @@ def test_command_center_archive_action_renders_last_in_row_rail():
     assert row_rail.index('kind="undo"') < row_rail.index('kind="archive"')
 
 
-def test_command_center_worker_pill_has_no_workers_fallback():
+def test_command_center_row_actions_lock_during_refresh_settle():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
     card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
-    detail_source = source.split("function DetailPanel", 1)[1].split("function KeyValue", 1)[0]
+    handle_source = source.split("const handleAction = useCallback", 1)[1].split("return (", 1)[0]
 
-    assert "item.execution?.worker_url ?" in card_source
-    assert "item.execution?.worker_url &&" in detail_source
+    assert "const ACTION_SETTLE_MS = 600" in source
+    assert "const actionDisabled = (kind: ActionKind) => Boolean(activeAction) && !actionBusy(kind);" in card_source
+    assert "aria-busy={rowBusy || undefined}" in card_source
+    assert "<div aria-busy={rowBusy}" in card_source
+    assert "aria-live=\"polite\"" in card_source
+    for kind in ("approve", "reject", "resume", "pause", "undo", "archive"):
+        assert f'disabled={{actionDisabled("{kind}")}}' in card_source
+    assert "if (activeAction) return;" in handle_source
+    assert "delayBeforeApplyMs: Math.max(0, ACTION_SETTLE_MS - (Date.now() - startedAt))" in handle_source
+    assert "settleAfterApplyMs: ACTION_SETTLE_MS" in handle_source
+    assert "preserveMissingWorkItemId" not in source
+
+
+def test_command_center_worker_url_is_row_action_without_worker_button():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
+
+    assert "const workerUrl = item.execution?.worker_url || null" in card_source
+    assert "Open worker board for" in card_source
+    assert "Worker <ExternalLink" not in card_source
+    assert "function DetailPanel" not in source
     assert 'href="/workers"' not in card_source
     assert 'to="/workers"' not in card_source
 
@@ -72,6 +93,31 @@ def test_sligo_shell_has_no_duplicate_top_tab_navigation():
     assert "Sligo operator navigation" not in shell_source
     assert "<SligoNavLink" not in shell_source
     assert "Refresh Command Center" in shell_source
+
+
+def test_sligo_shell_refresh_feedback_and_light_toggle():
+    source = (ROOT / "web/src/App.tsx").read_text(encoding="utf-8")
+    shell_source = source.split("function SligoSurfaceShell", 1)[1].split("export default function App", 1)[0]
+
+    assert "sligo-command-center-color-mode" in source
+    assert "data-sligo-theme={sligoMode}" in shell_source
+    assert "Switch Command Center to light mode" in shell_source
+    assert "Switch Command Center to dark mode" in shell_source
+    assert "aria-busy={isRefreshing}" in shell_source
+    assert "animate-spin" in shell_source
+    assert "Refreshing" in shell_source
+    assert "await window.__commandCenterRefresh()" in shell_source
+
+
+def test_command_center_discord_links_open_new_tabs():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+
+    assert "function discordSourceUrl" in source
+    assert "discord_thread" in source
+    assert "discord_url" in source
+    assert "discord_thread_url" in source
+    assert "Open Discord source for" in source
+    assert 'href={discordUrl} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank"' in source
 
 
 def test_modal_behavior_traps_focus_and_restores_safely():
