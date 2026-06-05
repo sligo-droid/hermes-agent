@@ -109,6 +109,22 @@ def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
     assert "53 51 4c 69 74 17 03 03 00 13" in msg
 
 
+def test_board_metadata_non_utf8_bytes_fall_back_to_synthesized_metadata(kanban_home):
+    """One corrupt board.json must not take down board discovery/dashboard snapshots."""
+    board = "bad-metadata-board"
+    metadata_path = kb.board_metadata_path(board)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_bytes(b'{"name":"Bad"}\n' + bytes.fromhex("17 03 03 00 13 94 ee"))
+
+    meta = kb.read_board_metadata(board)
+
+    assert meta["slug"] == board
+    assert meta["name"] == "Bad Metadata Board"
+    assert meta["archived"] is False
+    assert meta["db_path"].endswith("kanban/boards/bad-metadata-board/kanban.db")
+    assert any(row["slug"] == board for row in kb.list_boards(include_archived=True))
+
+
 def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     """Legacy DBs missing additive indexed columns must migrate cleanly.
 
