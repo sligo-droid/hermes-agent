@@ -105,32 +105,6 @@ def _project_from_board(board: str, board_meta: dict[str, Any], tasks: list[dict
     return None
 
 
-def _is_default_discord_intake_task(task: dict[str, Any], *, board: str) -> bool:
-    if board != kanban_db.DEFAULT_BOARD:
-        return False
-    created_by = str(task.get("created_by") or "")
-    idempotency_key = str(task.get("idempotency_key") or "")
-    if created_by != "discord-default-intake" and not idempotency_key.startswith("discord-default-intake:"):
-        return False
-    title = str(task.get("title") or "")
-    body = str(task.get("body") or "")
-    required_body_markers = (
-        "Discord default-board intake.",
-        "Source URL:",
-        "Guild ID:",
-        "Channel IDs:",
-        "Thread ID:",
-        "Message ID:",
-    )
-    return title.startswith("#dev intake:") and all(marker in body for marker in required_body_markers)
-
-
-def _project_from_default_discord_intake_task(task: dict[str, Any], *, board: str) -> str | None:
-    if _is_default_discord_intake_task(task, board=board):
-        return "hermes"
-    return None
-
-
 def _with_project(value: dict[str, Any], project: str | None) -> dict[str, Any]:
     if project:
         value["project"] = project
@@ -599,51 +573,6 @@ def _artifacts_from_metadata(metadata: dict[str, Any], *, fallback_worker_url: A
     return artifacts
 
 
-def _task_work_item(
-    task: dict[str, Any],
-    *,
-    board: str,
-    board_meta: dict[str, Any],
-    runs: list[dict[str, Any]],
-) -> dict[str, Any]:
-    canonical_status, status_detail = _canonical_status_from_task(task)
-    source = _source_from_task_board(board, board_meta)
-    project = (
-        _project_from_default_discord_intake_task(task, board=board)
-        or _normalize_project_key(task.get("tenant") or task.get("project"))
-        or _project_from_board(board, board_meta)
-    )
-    return {
-        "id": f"kanban:{board}:{task['id']}",
-        "title": task.get("title") or task.get("id"),
-        "summary": _text_preview(task.get("latest_summary"), task.get("result"), task.get("body")),
-        "body_preview": _text_preview(task.get("body")),
-        "project": project or task.get("tenant"),
-        "priority": task.get("priority"),
-        "priority_rank": _priority_rank(task.get("priority")),
-        "severity": None,
-        "status": canonical_status,
-        "status_detail": status_detail,
-        "created_at": task.get("created_at"),
-        "updated_at": task.get("completed_at") or task.get("started_at") or task.get("created_at"),
-        "source": {
-            **source,
-            "ref": {
-                **source.get("ref", {}),
-                "task_id": task.get("id"),
-                "idempotency_key": task.get("idempotency_key"),
-                "session_id": task.get("session_id"),
-            },
-        },
-        "decision": {"needed": False},
-        "execution": _execution_from_task(task, board=board, board_meta=board_meta, runs=runs),
-        "runs": runs,
-        "artifacts": _artifacts_from_task_and_board(task, board_meta),
-        "source_excerpts": [],
-        "raw": {"task": task, "board": board_meta},
-    }
-
-
 def _first_text(*values: Any) -> str | None:
     for value in values:
         if str(value or "").strip():
@@ -870,7 +799,6 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
     work_items: list[dict[str, Any]] = []
     sources: list[dict[str, Any]] = []
     runs: list[dict[str, Any]] = []
-    seen_execution_tasks: set[tuple[str, str]] = set()
     board_proposal_action_context: dict[str, dict[str, Any]] = {}
 
     for card in _all_proposal_cards(include_archived=include_archived):
@@ -911,9 +839,6 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
                         "source_excerpts": item.get("source_excerpts") or [],
                     },
                 )
-        if board and card.get("kanban_task_id"):
-            seen_execution_tasks.add((board, str(card["kanban_task_id"])))
-
     proposal_runs = proposal_storage.list_runs().get("runs", [])
     for run in proposal_runs:
         sources.append(_source_from_proposal_run(run))
@@ -960,15 +885,6 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
                         proposal_action_context=board_proposal_action_context.get(board),
                     )
                 )
-            else:
-                for task_dict in task_dicts:
-                    key = (board, str(task_dict.get("id")))
-                    if key in seen_execution_tasks:
-                        continue
-                    if _is_internal_discord_foreman_task(task_dict):
-                        continue
-                    task_runs = _task_runs(conn, str(task_dict.get("id")), board=board)
-                    work_items.append(_task_work_item(task_dict, board=board, board_meta=board_meta, runs=task_runs))
             runs.extend(board_runs)
         finally:
             conn.close()
@@ -1081,21 +997,11 @@ def _filter_snapshot_by_project(
     return included_items, included_sources, included_runs, included_board_rows
 
 
-def _work_item_sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
-    status_weight = {
-        "running": 0,
-        "proposed": 1,
-        "paused": 2,
-        "blocked": 3,
-        "review": 4,
-        "queued": 5,
-        "accepted": 6,
-        "shipped": 7,
-        "rejected": 8,
-        "archived": 9,
-    }.get(str(item.get("status") or ""), 9)
-    updated = _epoch_or_none(item.get("updated_at")) or _epoch_or_none(item.get("created_at")) or 0
-    return (status_weight, -updated, str(item.get("id") or ""))
+def _work_item_sort_key(item: dict[str, Any]) -> tuple[int, str]:
+    created = _epoch_or_none(item.get("created_at"))
+    updated = _epoch_or_none(item.get("updated_at"))
+    recency = created if created is not None else updated or 0
+    return (-recency, str(item.get("id") or ""))
 
 
 def _source_sort_key(source: dict[str, Any]) -> tuple[int, int, str]:
