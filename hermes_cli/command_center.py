@@ -462,7 +462,7 @@ def _execution_from_board(
         "task_id": None,
         "task_status": None,
         "task_url": None,
-        "worker_url": _worker_board_url(board, public_url) if _has_started_execution(runs=runs) else None,
+        "worker_url": _worker_board_url(board, public_url),
         "console_url": None,
         "active_run_id": active_run.get("id") if active_run else None,
         "pause_action": f"/api/plugins/kanban/boards/{quote(board, safe='')}/pause",
