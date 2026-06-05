@@ -41,6 +41,8 @@ def test_snapshot_hides_rejected_cards_by_default_and_exposes_source_ids(tmp_pat
 def test_snapshot_preserves_approval_artifacts_after_followup_audit_events(tmp_path, monkeypatch):
     _ingest_valid(monkeypatch, tmp_path)
     card = _first_card()
+    board = "discord-command-center"
+    kanban_db.write_board_metadata(board, name="Discord Command Center")
     proposal_storage.record_approval(
         card["proposal_id"],
         kanban_task_id="t_approved",
@@ -61,36 +63,37 @@ def test_snapshot_preserves_approval_artifacts_after_followup_audit_events(tmp_p
     )
 
     snapshot = command_center.build_command_center_snapshot()
-    item = next(item for item in snapshot["work_items"] if item["id"] == f"self-improvement:{card['proposal_id']}")
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
     artifact_urls = {artifact["url"] for artifact in item["artifacts"]}
 
-    assert item["execution"]["board"] == "discord-command-center"
-    assert item["execution"]["worker_url"] is None
     assert "https://discord.com/channels/1/2/3" in artifact_urls
     assert "/workers/discord-command-center" in artifact_urls
-    assert item["raw"]["approval_metadata"]["halted_by"] == "operator"
+    assert not any(row["id"] == f"self-improvement:{card['proposal_id']}" for row in snapshot["work_items"])
 
 
-def test_snapshot_uses_stored_worker_url_when_approval_metadata_is_absent(tmp_path, monkeypatch):
+def test_snapshot_omits_default_board_approved_proposal_rows(tmp_path, monkeypatch):
     _ingest_valid(monkeypatch, tmp_path)
-    card = _first_card()
+    approved_card = _first_card()
+    payload = _fixture_payload()
+    payload["run"]["run_id"] = "second-run"
+    payload["cards"][0]["idempotency_key"] = "second-card"
+    payload["cards"][0]["title"] = "Pending recommendation"
+    proposal_storage.ingest_proposal_output(json.dumps(payload), source={"run_id": "second-run"})
     proposal_storage.record_approval(
-        card["proposal_id"],
+        approved_card["proposal_id"],
         kanban_task_id="t_legacy",
         worker_url="/workers?task=t_legacy",
         actor="operator",
     )
 
     snapshot = command_center.build_command_center_snapshot()
-    item = next(item for item in snapshot["work_items"] if item["id"] == f"self-improvement:{card['proposal_id']}")
-    artifact_urls = {artifact["url"] for artifact in item["artifacts"]}
+    item_ids = {item["id"] for item in snapshot["work_items"]}
 
-    assert item["execution"]["worker_url"] is None
-    assert item["execution"]["task_url"] == "/workers?task=t_legacy"
-    assert "/workers?task=t_legacy" in artifact_urls
+    assert f"self-improvement:{approved_card['proposal_id']}" not in item_ids
+    assert any(item["title"] == "Pending recommendation" and item["status"] == "proposed" for item in snapshot["work_items"])
 
 
-def test_snapshot_marks_paused_default_proposal_task_resumable_and_archivable(tmp_path, monkeypatch):
+def test_snapshot_omits_paused_default_proposal_task_work_item(tmp_path, monkeypatch):
     _ingest_valid(monkeypatch, tmp_path)
     card = _first_card()
     conn = kanban_db.connect()
@@ -106,14 +109,8 @@ def test_snapshot_marks_paused_default_proposal_task_resumable_and_archivable(tm
     )
 
     snapshot = command_center.build_command_center_snapshot()
-    item = next(item for item in snapshot["work_items"] if item["id"] == f"self-improvement:{card['proposal_id']}")
 
-    assert item["status"] == "blocked"
-    assert item["execution"]["paused"] is True
-    assert item["execution"]["resumable"] is True
-    assert item["decision"]["pause_action"].endswith(f"/{card['proposal_id']}/pause")
-    assert item["decision"]["resume_action"].endswith(f"/{card['proposal_id']}/resume")
-    assert item["decision"]["archive_action"].endswith(f"/{card['proposal_id']}/halt")
+    assert not any(item["id"] == f"self-improvement:{card['proposal_id']}" for item in snapshot["work_items"])
 
 
 def test_snapshot_always_includes_active_runs_outside_recent_limit(tmp_path, monkeypatch):

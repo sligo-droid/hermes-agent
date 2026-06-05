@@ -818,7 +818,7 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
             and item.get("status") not in {"proposed", "rejected", "archived"}
             and kanban_db.board_exists(board)
         )
-        if not has_board_rollup:
+        if not has_board_rollup and item.get("status") in {"proposed", "rejected", "archived"}:
             work_items.append(item)
         elif board:
             proposal_id = card.get("proposal_id")
