@@ -21,6 +21,7 @@ import type {
   CommandCenterRun,
   CommandCenterSnapshot,
   CommandCenterSource,
+  CommandCenterProject,
   CommandCenterWorkItem,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -147,9 +148,11 @@ function initialSelectionForView(snapshot: CommandCenterSnapshot, activeView: Vi
 function WorkStatePanel({
   activeView,
   laneCounts,
+  search,
 }: {
   activeView: ViewKey;
   laneCounts: { overview: number; inbox: number; work: number; archive: number; workers: number };
+  search: string;
 }) {
   const lanes = [
     { key: "overview", label: "Overview", href: "/sligo", value: laneCounts.overview, detail: "open ledger" },
@@ -188,7 +191,7 @@ function WorkStatePanel({
               );
             }
             return (
-              <Link className={tileClass(selected)} key={lane.key} to={lane.href}>
+              <Link className={tileClass(selected)} key={lane.key} to={{ pathname: lane.href, search }}>
                 {content}
               </Link>
             );
@@ -196,6 +199,44 @@ function WorkStatePanel({
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+function ProjectTabs({
+  currentProject,
+  pathname,
+  projects,
+}: {
+  currentProject: string | null;
+  pathname: string;
+  projects: CommandCenterProject[];
+}) {
+  if (!projects.length) return null;
+  const tabSearch = (project: string) => {
+    const params = new URLSearchParams();
+    params.set("project", project);
+    return `?${params.toString()}`;
+  };
+  return (
+    <nav aria-label="Command Center projects" className="command-center-project-tabs flex flex-wrap gap-2">
+      {projects.map((project) => {
+        const selected = currentProject === project.key;
+        return (
+          <Link
+            aria-current={selected ? "page" : undefined}
+            className={cn(
+              "rounded-full border px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.16em] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
+              selected ? "border-cyan-100/60 bg-cyan-100/15 text-cyan-50" : "border-white/10 bg-white/[0.035] text-slate-400 hover:border-cyan-100/35 hover:text-slate-100",
+            )}
+            key={project.key}
+            to={{ pathname, search: tabSearch(project.key) }}
+          >
+            <span>{project.label}</span>
+            {project.source_hint ? <span className="ml-2 text-slate-500">{project.source_hint}</span> : null}
+          </Link>
+        );
+      })}
+    </nav>
   );
 }
 
@@ -572,6 +613,10 @@ function OverviewWorkList({
 export default function CommandCenterPage() {
   const location = useLocation();
   const activeView = viewFromPath(location.pathname);
+  const selectedProject = useMemo(() => {
+    const value = new URLSearchParams(location.search).get("project");
+    return value && value.trim() ? value.trim().toLowerCase() : "hermes";
+  }, [location.search]);
   const [snapshot, setSnapshot] = useState<CommandCenterSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -582,7 +627,7 @@ export default function CommandCenterPage() {
     setLoading(true);
     setError(null);
     try {
-      const next = await api.getCommandCenterSnapshot({ includeArchived: true, recentRunLimitPerBoard: 25 });
+      const next = await api.getCommandCenterSnapshot({ includeArchived: true, recentRunLimitPerBoard: 25, project: selectedProject });
       setSnapshot(next);
       setSelection((current) => {
         if (!current) {
@@ -604,7 +649,7 @@ export default function CommandCenterPage() {
     } finally {
       setLoading(false);
     }
-  }, [activeView]);
+  }, [activeView, selectedProject]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- initial async snapshot load mirrors existing dashboard data pages.
@@ -663,6 +708,7 @@ export default function CommandCenterPage() {
     archive: archivedItems.length,
     workers: metric(snapshot, "active_runs"),
   }), [archivedItems.length, inboxItems.length, inboxSources.length, overviewItems.length, snapshot, workItems.length]);
+  const projectSearch = useMemo(() => `?project=${encodeURIComponent(selectedProject)}`, [selectedProject]);
   const activeViewWorkItems = useMemo(() => {
     if (activeView === "overview") return overviewItems;
     if (activeView === "inbox") return inboxItems;
@@ -735,9 +781,15 @@ export default function CommandCenterPage() {
 
   return (
     <div className="flex flex-col gap-5">
+      <ProjectTabs
+        currentProject={snapshot?.current_project || selectedProject}
+        pathname={location.pathname}
+        projects={snapshot?.projects ?? []}
+      />
       <WorkStatePanel
         activeView={activeView}
         laneCounts={laneCounts}
+        search={projectSearch}
       />
 
       {error && (

@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cron.scheduler import _build_job_prompt, tick
+from hermes_cli.config import DEFAULT_CONFIG
 from self_improvement import proposal_storage
 from self_improvement.proposals import CONTRACT_VERSION
 
@@ -25,6 +26,31 @@ def test_cron_job_prompt_includes_self_improvement_proposal_guidance():
     assert "at most 5 proposal cards" in prompt
     assert "Do not create Kanban tasks" in prompt
     assert "Review yesterday's PID admin dogfood notes." in prompt
+
+
+def test_hermes_self_improvement_prongs_are_valid_for_cron_prompts():
+    hermes = DEFAULT_CONFIG["self_improvement"]["projects"]["hermes"]
+
+    assert hermes["label"] == "Hermes"
+    assert set(hermes["prongs"]) >= {"daily-retrospective", "system-doctor"}
+
+    for prong in ("daily-retrospective", "system-doctor"):
+        prompt = _build_job_prompt(
+            {
+                "id": f"hermes-{prong}",
+                "name": f"Hermes {prong}",
+                "prompt": "Review Hermes #dev operations.",
+                "self_improvement_proposal": {
+                    "project": "hermes",
+                    "prong": prong,
+                },
+            }
+        )
+        assert "Project: `hermes`" in prompt
+        assert f"Prong: `{prong}`" in prompt
+        assert CONTRACT_VERSION in prompt
+        assert '"project": "hermes"' in prompt
+        assert f'"prong": "{prong}"' in prompt
 
 
 def test_cron_job_prompt_includes_scoped_feedback_context(tmp_path, monkeypatch):

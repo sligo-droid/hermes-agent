@@ -1478,6 +1478,7 @@ def list_diagnostics(
 def command_center_snapshot(
     include_archived: bool = Query(False),
     recent_run_limit_per_board: int = Query(20, ge=0, le=100),
+    project: str | None = Query(None),
 ):
     """Return Sligo Labs' canonical operator read model.
 
@@ -1488,6 +1489,7 @@ def command_center_snapshot(
     return command_center.build_command_center_snapshot(
         include_archived=include_archived,
         recent_run_limit_per_board=recent_run_limit_per_board,
+        project=project,
     )
 
 

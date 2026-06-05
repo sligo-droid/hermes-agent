@@ -184,6 +184,147 @@ def test_snapshot_rolls_named_discord_board_tasks_up_to_board_work_item(tmp_path
     assert snapshot["metrics"]["discord_origin"] == 1
 
 
+def test_snapshot_exposes_project_tabs_and_filters_hermes_dev_intake(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    hermes_board = "discord-hermes-dev"
+    pid_board = "discord-pid-work"
+    unknown_board = "discord-unknown-work"
+    for board, project in ((hermes_board, "Hermes"), (pid_board, "PID"), (unknown_board, None)):
+        meta = kanban_db.write_board_metadata(board, name=board)
+        meta.pop("db_path", None)
+        worker = {"thread_id": f"thread-{board}", "guild_id": "guild"}
+        if project:
+            worker["project_context"] = {"project_name": project}
+        meta[command_center.DISCORD_WORKER_META_KEY] = worker
+        kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+        conn = kanban_db.connect(board=board)
+        try:
+            kanban_db.create_task(conn, title=f"{board} task", board=board, tenant=project)
+        finally:
+            conn.close()
+
+    snapshot = command_center.build_command_center_snapshot(project="hermes")
+
+    assert {project["key"] for project in snapshot["projects"]} >= {"hermes", "pid"}
+    assert snapshot["current_project"] == "hermes"
+    assert {item["id"] for item in snapshot["work_items"]} == {f"kanban-board:{hermes_board}"}
+    assert snapshot["work_items"][0]["project"] == "hermes"
+    assert snapshot["sources"][0]["project"] == "hermes"
+    assert not any(pid_board in item["id"] for item in snapshot["work_items"])
+    assert not any(unknown_board in item["id"] for item in snapshot["work_items"])
+
+
+def test_snapshot_classifies_default_discord_intake_as_hermes_work_item(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    body = "\n".join(
+        [
+            "Discord default-board intake.",
+            "",
+            "Source URL: https://discord.com/channels/guild-1/thread-1/message-1",
+            "Guild ID: guild-1",
+            "Channel IDs: channel-1, thread-1",
+            "Thread ID: thread-1",
+            "Message ID: message-1",
+            "User: dev-user",
+            "Workspace: /home/droid/workspaces/hermes-agent",
+            "GitHub: https://github.com/sligodroid/hermes-agent",
+            "",
+            "Message:",
+            "make #dev feed the top board",
+        ],
+    )
+    idempotency_key = "discord-default-intake:guild-1:thread-1:message-1"
+    conn = kanban_db.connect(board=kanban_db.DEFAULT_BOARD)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="#dev intake: make #dev feed the top board",
+            body=body,
+            created_by="discord-default-intake",
+            tenant="discord-default-intake",
+            idempotency_key=idempotency_key,
+            initial_status="blocked",
+            board=kanban_db.DEFAULT_BOARD,
+        )
+    finally:
+        conn.close()
+
+    hermes_snapshot = command_center.build_command_center_snapshot(project="hermes")
+    item = next(item for item in hermes_snapshot["work_items"] if item["id"] == f"kanban:{kanban_db.DEFAULT_BOARD}:{task_id}")
+
+    assert item["project"] == "hermes"
+    assert item["status"] == "blocked"
+    assert item["source"]["kind"] == "kanban_board"
+    assert item["source"]["ref"]["task_id"] == task_id
+    assert item["source"]["ref"]["idempotency_key"] == idempotency_key
+    assert item["execution"]["board"] == kanban_db.DEFAULT_BOARD
+    assert item["execution"]["task_id"] == task_id
+    assert item["raw"]["task"]["tenant"] == "discord-default-intake"
+    assert item["raw"]["task"]["created_by"] == "discord-default-intake"
+
+    pid_snapshot = command_center.build_command_center_snapshot(project="pid")
+    assert not any(item["id"] == f"kanban:{kanban_db.DEFAULT_BOARD}:{task_id}" for item in pid_snapshot["work_items"])
+
+
+def test_snapshot_does_not_classify_arbitrary_default_discord_task_as_hermes(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    conn = kanban_db.connect(board=kanban_db.DEFAULT_BOARD)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Discord task from another intake",
+            body="Source URL: https://discord.com/channels/guild-1/channel-1/message-1",
+            created_by="discord-default-intake",
+            tenant="discord-default-intake",
+            idempotency_key="discord-default-intake:guild-1:channel-1:message-1",
+            initial_status="blocked",
+            board=kanban_db.DEFAULT_BOARD,
+        )
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot(project="hermes")
+
+    assert not any(item["id"] == f"kanban:{kanban_db.DEFAULT_BOARD}:{task_id}" for item in snapshot["work_items"])
+
+
+def test_snapshot_pid_filter_preserves_source_work_item_execution_relationship(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "discord-pid-relationship"
+    meta = kanban_db.write_board_metadata(board, name="PID Relationship Board")
+    meta.pop("db_path", None)
+    meta[command_center.DISCORD_WORKER_META_KEY] = {
+        "guild_id": "111",
+        "thread_id": "222",
+        "project_context": {"project_name": "PID"},
+    }
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="PID execution child", board=board, tenant="PID", initial_status="running")
+        with conn:
+            conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                (task_id, "running", 100, None, None),
+            )
+            run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute("UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?", (run_id, task_id))
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot(project="pid")
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+    source = next(source for source in snapshot["sources"] if source["id"] == item["source"]["id"])
+    run = next(run for run in snapshot["runs"] if run["board"] == board and run["task_id"] == task_id)
+
+    assert item["project"] == "pid"
+    assert item["source"]["kind"] == "discord"
+    assert item["execution"]["board"] == board
+    assert item["execution"]["active_run_id"] == run["id"]
+    assert source["project"] == "pid"
+    assert snapshot["metrics"]["total_work_items"] == 1
+
+
 def test_snapshot_adds_discord_source_urls_for_worker_boards(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     board = "discord-source-url-test"

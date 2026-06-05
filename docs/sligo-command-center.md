@@ -12,6 +12,10 @@ The Command Center uses one read-only ledger model:
 
 This keeps self-improvement and Discord as intake/provenance, not competing boards. Worker boards remain the execution monitor and ticket detail surface.
 
+Project tabs at the top of the Command Center scope this same ledger by project. The tabs are populated from project metadata in the snapshot, not hard-coded per view. Current projects are Hermes (`#dev`) and PID. Filtering by project keeps Sources as intake, Work Items as the status ledger, and worker boards/Kanban task runs as child execution artifacts.
+
+This code change only adds project/read-model support. Live Hermes recommendation cron jobs still need their `self_improvement_proposal.project` and `self_improvement_proposal.prong` fields updated by the operator/parent agent; the Command Center code does not mutate live cron jobs.
+
 ## Routes
 
 Canonical Sligo-host routes:
@@ -53,6 +57,8 @@ Snapshot shape:
   schema_version,
   generated_at,
   summary,
+  projects[],
+  current_project,
   work_items[],
   sources[],
   runs[],

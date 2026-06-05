@@ -1862,6 +1862,25 @@ DEFAULT_CONFIG = {
             "max_text_chars": 180,
         },
         "projects": {
+            "hermes": {
+                "label": "Hermes",
+                "description": "Hermes #dev self-improvement proposals.",
+                "discord_channel_id": "",
+                "discord_channel_name": "#dev",
+                "source_hint": "#dev",
+                "prongs": {
+                    "daily-retrospective": {
+                        "label": "Daily Retrospective",
+                        "focus": "Hermes daily retrospective findings and recommendations that can become discrete operator-improvement tasks.",
+                        "max_cards_per_run": 5,
+                    },
+                    "system-doctor": {
+                        "label": "System Doctor",
+                        "focus": "Hermes runtime health, gateway reliability, worker orchestration, and operational diagnostics.",
+                        "max_cards_per_run": 5,
+                    },
+                },
+            },
             "pid": {
                 "label": "PID",
                 "description": "Sligo PID operator self-improvement proposals.",

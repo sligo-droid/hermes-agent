@@ -26,6 +26,118 @@ _WAITING_TASK_STATUSES = {"triage", "todo", "scheduled", "ready"}
 _RUNNING_TASK_STATUSES = {"running"}
 _REVIEW_TASK_STATUSES = {"review"}
 _BLOCKED_TASK_STATUSES = {"blocked"}
+_PROJECT_ALIASES = {
+    "hermes": "hermes",
+    "hermes-agent": "hermes",
+    "dev": "hermes",
+    "#dev": "hermes",
+    "pid": "pid",
+}
+
+
+def _normalize_project_key(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    normalized = text.replace(" ", "-").replace("_", "-")
+    return _PROJECT_ALIASES.get(normalized, normalized)
+
+
+def _configured_projects() -> list[dict[str, Any]]:
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    section = cfg.get("self_improvement") if isinstance(cfg, dict) else None
+    configured = section.get("projects") if isinstance(section, dict) and isinstance(section.get("projects"), dict) else {}
+    projects: list[dict[str, Any]] = []
+    for raw_key, raw_project in configured.items():
+        key = _normalize_project_key(raw_key)
+        if not key or not isinstance(raw_project, dict):
+            continue
+        project = {
+            "key": key,
+            "label": str(raw_project.get("label") or raw_key),
+            "description": raw_project.get("description"),
+            "source_hint": raw_project.get("source_hint") or raw_project.get("discord_channel_name"),
+            "discord_channel_id": raw_project.get("discord_channel_id"),
+        }
+        projects.append(project)
+    seen = {project["key"] for project in projects}
+    for key, label, hint in (("hermes", "Hermes", "#dev"), ("pid", "PID", None)):
+        if key not in seen:
+            projects.append({"key": key, "label": label, "source_hint": hint})
+    return projects
+
+
+def _project_from_worker_meta(worker: dict[str, Any]) -> str | None:
+    context = worker.get("project_context") if isinstance(worker.get("project_context"), dict) else {}
+    for value in (
+        worker.get("project"),
+        worker.get("project_key"),
+        worker.get("project_name"),
+        context.get("project_key"),
+        context.get("project_name"),
+        context.get("self_improvement_project"),
+    ):
+        project = _normalize_project_key(value)
+        if project:
+            return project
+    return None
+
+
+def _project_from_board(board: str, board_meta: dict[str, Any], tasks: list[dict[str, Any]] | None = None) -> str | None:
+    worker = _board_worker_meta(board_meta)
+    for value in (board_meta.get("project"), board_meta.get("project_key"), board_meta.get("tenant")):
+        project = _normalize_project_key(value)
+        if project:
+            return project
+    project = _project_from_worker_meta(worker)
+    if project:
+        return project
+    if tasks:
+        task_projects = {_normalize_project_key(task.get("tenant") or task.get("project")) for task in tasks}
+        task_projects.discard(None)
+        if len(task_projects) == 1:
+            return next(iter(task_projects))
+    return None
+
+
+def _is_default_discord_intake_task(task: dict[str, Any], *, board: str) -> bool:
+    if board != kanban_db.DEFAULT_BOARD:
+        return False
+    created_by = str(task.get("created_by") or "")
+    idempotency_key = str(task.get("idempotency_key") or "")
+    if created_by != "discord-default-intake" and not idempotency_key.startswith("discord-default-intake:"):
+        return False
+    title = str(task.get("title") or "")
+    body = str(task.get("body") or "")
+    required_body_markers = (
+        "Discord default-board intake.",
+        "Source URL:",
+        "Guild ID:",
+        "Channel IDs:",
+        "Thread ID:",
+        "Message ID:",
+    )
+    return title.startswith("#dev intake:") and all(marker in body for marker in required_body_markers)
+
+
+def _project_from_default_discord_intake_task(task: dict[str, Any], *, board: str) -> str | None:
+    if _is_default_discord_intake_task(task, board=board):
+        return "hermes"
+    return None
+
+
+def _with_project(value: dict[str, Any], project: str | None) -> dict[str, Any]:
+    if project:
+        value["project"] = project
+        ref = value.get("ref")
+        if isinstance(ref, dict):
+            ref.setdefault("project", project)
+    return value
 
 
 def _epoch_or_none(value: Any) -> int | None:
@@ -295,6 +407,7 @@ def _is_internal_discord_foreman_task(task: dict[str, Any]) -> bool:
 
 def _source_from_task_board(board: str, board_meta: dict[str, Any]) -> dict[str, Any]:
     worker = _board_worker_meta(board_meta)
+    project = _project_from_board(board, board_meta)
     if _is_discord_board(board, board_meta):
         ref = {
             "board": board,
@@ -306,18 +419,18 @@ def _source_from_task_board(board: str, board_meta: dict[str, Any]) -> dict[str,
             "public_url": worker.get("public_url"),
         }
         ref.update(_discord_urls(ref))
-        return {
+        return _with_project({
             "id": f"source:discord:{board}",
             "kind": "discord",
             "label": "Discord worker thread",
             "ref": ref,
-        }
-    return {
+        }, project)
+    return _with_project({
         "id": f"source:kanban-board:{board}",
         "kind": "kanban_board",
         "label": "Kanban board",
         "ref": {"board": board},
-    }
+    }, project)
 
 
 def _execution_from_task(
@@ -391,7 +504,8 @@ def _execution_from_board(
 
 def _proposal_source(card: dict[str, Any]) -> dict[str, Any]:
     proposal_id = str(card.get("proposal_id") or "")
-    return {
+    project = _normalize_project_key(card.get("project"))
+    return _with_project({
         "id": f"source:self-improvement-proposal:{proposal_id}",
         "kind": "self_improvement",
         "label": "Self-improvement recommendation",
@@ -405,7 +519,7 @@ def _proposal_source(card: dict[str, Any]) -> dict[str, Any]:
             "cron_output_path": card.get("cron_output_path"),
             "source_key": card.get("source_key"),
         },
-    }
+    }, project)
 
 
 def _proposal_work_item(
@@ -442,7 +556,7 @@ def _proposal_work_item(
         "title": card.get("title") or card.get("proposal_id"),
         "summary": card.get("summary") or _text_preview(card.get("body")),
         "body_preview": _text_preview(card.get("body"), card.get("rationale")),
-        "project": card.get("project"),
+        "project": _normalize_project_key(card.get("project")) or card.get("project"),
         "priority": card.get("priority") or "medium",
         "priority_rank": _priority_rank(card.get("priority")),
         "severity": card.get("severity"),
@@ -494,12 +608,17 @@ def _task_work_item(
 ) -> dict[str, Any]:
     canonical_status, status_detail = _canonical_status_from_task(task)
     source = _source_from_task_board(board, board_meta)
+    project = (
+        _project_from_default_discord_intake_task(task, board=board)
+        or _normalize_project_key(task.get("tenant") or task.get("project"))
+        or _project_from_board(board, board_meta)
+    )
     return {
         "id": f"kanban:{board}:{task['id']}",
         "title": task.get("title") or task.get("id"),
         "summary": _text_preview(task.get("latest_summary"), task.get("result"), task.get("body")),
         "body_preview": _text_preview(task.get("body")),
-        "project": task.get("tenant"),
+        "project": project or task.get("tenant"),
         "priority": task.get("priority"),
         "priority_rank": _priority_rank(task.get("priority")),
         "severity": None,
@@ -579,6 +698,11 @@ def _board_work_item(
 ) -> dict[str, Any]:
     canonical_status, status_detail = _canonical_status_from_board(tasks, board_meta=board_meta, runs=runs)
     source = _source_from_task_board(board, board_meta)
+    project = (
+        _normalize_project_key(proposal_action_context.get("project"))
+        if proposal_action_context
+        else None
+    ) or _project_from_board(board, board_meta, tasks)
     created_candidates = [task.get("created_at") for task in tasks if task.get("created_at")]
     updated_candidates = [task.get("completed_at") or task.get("started_at") or task.get("created_at") for task in tasks]
     latest_updated = max((_epoch_or_none(value) or 0 for value in updated_candidates), default=0) or board_meta.get("created_at")
@@ -601,7 +725,7 @@ def _board_work_item(
         "title": _board_title(board, board_meta, proposal_action_context),
         "summary": _board_summary(board_meta, tasks, proposal_action_context),
         "body_preview": proposal_action_context.get("body_preview") if proposal_action_context else None,
-        "project": proposal_action_context.get("project") if proposal_action_context else None,
+        "project": project,
         "priority": proposal_action_context.get("priority") if proposal_action_context else None,
         "priority_rank": proposal_action_context.get("priority_rank") if proposal_action_context else 0,
         "severity": proposal_action_context.get("severity") if proposal_action_context else None,
@@ -684,7 +808,8 @@ def _load_task_for_proposal(
 
 def _source_from_proposal_run(run: dict[str, Any]) -> dict[str, Any]:
     status = "parse_failed" if run.get("parse_error") or run.get("status") == "malformed" else str(run.get("status") or "ingested")
-    return {
+    project = _normalize_project_key(run.get("project"))
+    return _with_project({
         "id": f"source:self-improvement-run:{run.get('id')}",
         "kind": "self_improvement_run",
         "label": "Self-improvement cron run",
@@ -704,11 +829,12 @@ def _source_from_proposal_run(run: dict[str, Any]) -> dict[str, Any]:
             "card_count": run.get("card_count"),
             "parse_error": run.get("parse_error"),
         },
-    }
+    }, project)
 
 
 def _source_from_discord_board(board: str, board_meta: dict[str, Any]) -> dict[str, Any]:
     worker = _board_worker_meta(board_meta)
+    project = _project_from_board(board, board_meta)
     ref = {
         "board": board,
         "thread_id": worker.get("thread_id") or worker.get("chat_id"),
@@ -719,7 +845,7 @@ def _source_from_discord_board(board: str, board_meta: dict[str, Any]) -> dict[s
         "public_url": worker.get("public_url"),
     }
     ref.update(_discord_urls(ref))
-    return {
+    return _with_project({
         "id": f"source:discord:{board}",
         "kind": "discord_thread",
         "label": "Discord worker thread",
@@ -729,10 +855,10 @@ def _source_from_discord_board(board: str, board_meta: dict[str, Any]) -> dict[s
         "created_at": worker.get("created_at") or board_meta.get("created_at"),
         "updated_at": worker.get("updated_at") or board_meta.get("created_at"),
         "ref": ref,
-    }
+    }, project)
 
 
-def build_command_center_snapshot(*, include_archived: bool = False, recent_run_limit_per_board: int = 20) -> dict[str, Any]:
+def build_command_center_snapshot(*, include_archived: bool = False, recent_run_limit_per_board: int = 20, project: str | None = None) -> dict[str, Any]:
     """Return the read-only Command Center snapshot.
 
     The response is intentionally denormalized: the frontend needs a fast,
@@ -847,6 +973,17 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
         finally:
             conn.close()
 
+    projects = _configured_projects()
+    project_filter = _normalize_project_key(project)
+    if project_filter:
+        work_items, sources, runs, boards = _filter_snapshot_by_project(
+            project_filter,
+            work_items=work_items,
+            sources=sources,
+            runs=runs,
+            boards=boards,
+        )
+
     work_items.sort(key=_work_item_sort_key)
     sources.sort(key=_source_sort_key)
     runs.sort(key=lambda run: _epoch_or_none(run.get("ended_at") or run.get("started_at")) or 0, reverse=True)
@@ -856,12 +993,92 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
         "schema_version": 1,
         "generated_at": now,
         "summary": "Sources create canonical Work Items; worker boards and task runs are execution detail.",
+        "projects": projects,
+        "current_project": project_filter,
         "work_items": work_items,
         "sources": sources,
         "runs": runs,
         "boards": boards,
         "metrics": metrics,
     }
+
+
+def _item_project(item: dict[str, Any]) -> str | None:
+    project = _normalize_project_key(item.get("project"))
+    if project:
+        return project
+    source = item.get("source") if isinstance(item.get("source"), dict) else {}
+    project = _normalize_project_key(source.get("project"))
+    if project:
+        return project
+    ref = source.get("ref") if isinstance(source.get("ref"), dict) else {}
+    return _normalize_project_key(ref.get("project"))
+
+
+def _source_project(source: dict[str, Any]) -> str | None:
+    project = _normalize_project_key(source.get("project"))
+    if project:
+        return project
+    ref = source.get("ref") if isinstance(source.get("ref"), dict) else {}
+    return _normalize_project_key(ref.get("project"))
+
+
+def _run_project(run: dict[str, Any], board_projects: dict[str, str | None], task_projects: dict[tuple[str, str], str | None]) -> str | None:
+    board = str(run.get("board") or kanban_db.DEFAULT_BOARD)
+    task_id = str(run.get("task_id") or "")
+    return task_projects.get((board, task_id)) or board_projects.get(board)
+
+
+def _filter_snapshot_by_project(
+    project: str,
+    *,
+    work_items: list[dict[str, Any]],
+    sources: list[dict[str, Any]],
+    runs: list[dict[str, Any]],
+    boards: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    included_items = [item for item in work_items if _item_project(item) == project]
+    source_ids = {str((item.get("source") or {}).get("id") or "") for item in included_items}
+    included_boards = {
+        str((item.get("execution") or {}).get("board") or "")
+        for item in included_items
+        if isinstance(item.get("execution"), dict) and (item.get("execution") or {}).get("board")
+    }
+    included_tasks = {
+        (
+            str((item.get("execution") or {}).get("board") or kanban_db.DEFAULT_BOARD),
+            str((item.get("execution") or {}).get("task_id") or ""),
+        )
+        for item in included_items
+        if isinstance(item.get("execution"), dict) and (item.get("execution") or {}).get("task_id")
+    }
+    board_projects = {
+        str(board.get("slug") or kanban_db.DEFAULT_BOARD): _project_from_board(str(board.get("slug") or kanban_db.DEFAULT_BOARD), board)
+        for board in boards
+    }
+    task_projects: dict[tuple[str, str], str | None] = {}
+    for item in work_items:
+        execution = item.get("execution") if isinstance(item.get("execution"), dict) else {}
+        board = str(execution.get("board") or kanban_db.DEFAULT_BOARD)
+        task_id = str(execution.get("task_id") or "")
+        if task_id:
+            task_projects[(board, task_id)] = _item_project(item)
+    included_sources = [
+        source for source in sources
+        if _source_project(source) == project or str(source.get("id") or "") in source_ids
+    ]
+    included_runs = [
+        run for run in runs
+        if _run_project(run, board_projects, task_projects) == project
+        or str(run.get("board") or kanban_db.DEFAULT_BOARD) in included_boards
+        or (str(run.get("board") or kanban_db.DEFAULT_BOARD), str(run.get("task_id") or "")) in included_tasks
+    ]
+    included_board_rows = [
+        board for board in boards
+        if _project_from_board(str(board.get("slug") or kanban_db.DEFAULT_BOARD), board) == project
+        or str(board.get("slug") or kanban_db.DEFAULT_BOARD) in included_boards
+    ]
+    return included_items, included_sources, included_runs, included_board_rows
 
 
 def _work_item_sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
