@@ -6528,6 +6528,7 @@ class GatewayRunner:
                             max_global_workers=discord_max_global_workers,
                             max_workers_per_board=discord_max_workers_per_board,
                             failure_limit=failure_limit,
+                            stale_timeout_seconds=stale_timeout_seconds,
                         )
                     )
                 except Exception:

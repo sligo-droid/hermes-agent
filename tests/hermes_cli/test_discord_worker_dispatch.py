@@ -79,6 +79,29 @@ def test_discord_worker_board_cap_counts_already_running(monkeypatch, tmp_path):
     assert len(results[0][1].spawned) == 1
 
 
+def test_discord_worker_dispatch_passes_stale_timeout(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
+
+    board = _prepare_board(monkeypatch, tmp_path, thread_id="stale-timeout")
+    captured = {}
+
+    def fake_dispatch_once(conn, **kwargs):
+        captured.update(kwargs)
+        return kanban_db.DispatchResult()
+
+    monkeypatch.setattr(kanban_db, "dispatch_once", fake_dispatch_once)
+
+    dispatch_discord_worker_boards(
+        [board.slug],
+        max_global_workers=4,
+        max_workers_per_board=2,
+        stale_timeout_seconds=60,
+    )
+
+    assert captured["stale_timeout_seconds"] == 60
+
+
 def test_discord_worker_dispatch_respects_global_live_cap(monkeypatch, tmp_path):
     from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
 

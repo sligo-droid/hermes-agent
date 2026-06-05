@@ -65,6 +65,8 @@ _CODE_CHANGE_SIGNAL_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_KANBAN_ACTIVITY_HEARTBEAT_INTERVAL_SECONDS = 10
+_last_activity_heartbeat_at: dict[tuple[str, str], float] = {}
 
 
 def main() -> int:
@@ -498,6 +500,7 @@ def _run_codex(
             record_codex_worker_event(task_id, board=board, event=note)
         except Exception:
             pass
+        _heartbeat_worker_activity(task_id, board=board)
 
     guard_env, guard_dir = _role_pr_mutation_guard_env(role)
     runtime_env = {**guard_env, **_role_read_only_discord_env(role)}
@@ -523,6 +526,7 @@ def _run_codex(
                     record_codex_worker_result(task_id, board=board, result=result)
                 except Exception:
                     pass
+                _heartbeat_worker_activity(task_id, board=board, force=True)
             finally:
                 session.close()
                 try:
@@ -620,6 +624,7 @@ def _run_opencode(
             )
         except Exception:
             pass
+        _heartbeat_worker_activity(task_id, board=board)
 
     from agent.opencode_worker import (
         load_opencode_config,
@@ -673,7 +678,51 @@ def _run_opencode(
         record_codex_worker_result(task_id, board=board, result=result)
     except Exception:
         pass
+    _heartbeat_worker_activity(task_id, board=board, force=True)
     return result
+
+
+def _heartbeat_worker_activity(task_id: str, *, board: Optional[str], force: bool = False) -> None:
+    """Best-effort Kanban liveness for coding-worker stream/result activity."""
+    now = time.monotonic()
+    key = (str(board or ""), str(task_id or ""))
+    if not force:
+        last = _last_activity_heartbeat_at.get(key)
+        if last is not None and now - last < _KANBAN_ACTIVITY_HEARTBEAT_INTERVAL_SECONDS:
+            return
+    _last_activity_heartbeat_at[key] = now
+    expected_run_id = _env_run_id(task_id)
+    try:
+        conn = kanban_db.connect(board=board)
+        try:
+            kanban_db.heartbeat_claim(
+                conn,
+                task_id,
+                claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
+            )
+            kanban_db.heartbeat_worker(
+                conn,
+                task_id,
+                note="coding worker activity",
+                expected_run_id=expected_run_id,
+            )
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _env_run_id(task_id: str) -> Optional[int]:
+    env_task = os.environ.get("HERMES_KANBAN_TASK")
+    if env_task and env_task != task_id:
+        return None
+    raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if raw in (None, ""):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _scheduled_opencode_reasoning(default: str) -> str:

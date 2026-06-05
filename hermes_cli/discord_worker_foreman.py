@@ -15,6 +15,7 @@ from hermes_cli import kanban_db
 from hermes_cli.discord_worker_boards import (
     board_thread_state,
     build_board_run_summary,
+    persist_board_run_summary,
     public_session_board_url,
     read_board_run_summary,
 )
@@ -27,7 +28,10 @@ from hermes_cli.discord_worker_state import read_codex_worker_state
 from utils import atomic_json_write
 
 
-STALE_RUNNING_SECONDS = kanban_db._STALE_HEARTBEAT_GAP_SECONDS
+# Foreman scans every 30s by default. Flag no-progress workers after 30s so
+# the next scan creates a recovery task within roughly one minute, while the
+# dispatcher still uses its 60s stale reclaim threshold as the hard reset.
+STALE_RUNNING_SECONDS = 30
 ERROR_OUTCOMES = frozenset({"spawn_failed", "crashed", "timed_out", "gave_up"})
 ALERT_DETECTOR_VERSION = 1
 ALERT_STATE_VERSION = 1
@@ -100,6 +104,10 @@ _ALLOWED_RENDER_EVIDENCE_KEYS = frozenset(
         "error_excerpt",
         "heartbeat_age_seconds",
         "last_heartbeat_at",
+        "latest_run_error",
+        "latest_run_id",
+        "latest_run_outcome",
+        "latest_run_status",
         "llm_assessed_at",
         "llm_confidence",
         "active_task_count",
@@ -119,10 +127,16 @@ _ALLOWED_RENDER_EVIDENCE_KEYS = frozenset(
         "run_status",
         "review_count",
         "session_url",
+        "sidecar_event_count",
         "sidecar_error",
         "sidecar_exit_code",
+        "sidecar_result_error",
+        "sidecar_tool_trace_tail",
         "sidecar_timed_out",
+        "sidecar_updated_at",
         "scheduled_count",
+        "source_public_board_url",
+        "source_public_ticket_url",
         "stalled_after_seconds",
         "stalled_age_seconds",
         "stalled_since",
@@ -132,6 +146,7 @@ _ALLOWED_RENDER_EVIDENCE_KEYS = frozenset(
         "thread_id",
         "thread_state",
         "todo_count",
+        "worker_log_path",
         "running_count",
         "source_board",
         "source_blocked_reason",
@@ -1001,18 +1016,19 @@ def _build_board_snapshot(
     finally:
         conn.close()
 
-    summary = read_board_run_summary(board)
-    if not summary:
-        try:
-            summary = build_board_run_summary(board)
-        except Exception:
-            summary = {}
+    thread_state = board_thread_state(board)
+    summary = _read_or_refresh_board_run_summary(
+        board,
+        worker,
+        task_snapshots,
+        thread_state=thread_state,
+    )
     return BoardSnapshot(
         board=board,
         thread_id=str(worker.get("thread_id") or ""),
         chat_id=str(worker.get("chat_id") or worker.get("thread_id") or ""),
         session_url=_public_worker_url_for_board(board, worker),
-        thread_state=board_thread_state(board),
+        thread_state=thread_state,
         run_summary=dict(summary) if isinstance(summary, dict) else {},
         tasks=task_snapshots,
         created_at=created_at,
@@ -1075,6 +1091,35 @@ def detect_stale_running(snapshot: BoardSnapshot, *, now: int) -> list[ForemanIs
             continue
         if heartbeat is None and not _running_task_old_enough(task, now=now):
             continue
+        latest = task.latest_run
+        sidecar = task.sidecar if isinstance(task.sidecar, dict) else {}
+        result = _sidecar_result(task)
+        events = sidecar.get("events") if isinstance(sidecar.get("events"), list) else []
+        trace = sidecar.get("tool_trace") if isinstance(sidecar.get("tool_trace"), list) else []
+        evidence: dict[str, Any] = {
+            "source_board": snapshot.board,
+            "source_task_id": task.id,
+            "source_public_board_url": snapshot.session_url,
+            "source_public_ticket_url": _public_ticket_url(snapshot, task),
+            "last_heartbeat_at": heartbeat,
+            "heartbeat_age_seconds": heartbeat_age,
+            "stale_after_seconds": STALE_RUNNING_SECONDS,
+            "worker_log_path": str(kanban_db.worker_log_path(task.id, board=snapshot.board)),
+            "sidecar_updated_at": sidecar.get("updated_at"),
+            "sidecar_event_count": len(events),
+            "sidecar_tool_trace_tail": trace[-3:],
+            "sidecar_result_error": result.get("error"),
+            "sidecar_timed_out": result.get("timed_out"),
+        }
+        if latest:
+            evidence.update(
+                {
+                    "latest_run_id": latest.id,
+                    "latest_run_status": latest.status,
+                    "latest_run_outcome": latest.outcome,
+                    "latest_run_error": latest.error,
+                }
+            )
         issues.append(
             _issue(
                 "stale_running",
@@ -1082,11 +1127,7 @@ def detect_stale_running(snapshot: BoardSnapshot, *, now: int) -> list[ForemanIs
                 task,
                 "warning",
                 "Running worker has no recent heartbeat",
-                {
-                    "last_heartbeat_at": heartbeat,
-                    "heartbeat_age_seconds": heartbeat_age,
-                    "stale_after_seconds": STALE_RUNNING_SECONDS,
-                },
+                evidence,
             )
         )
     return issues
@@ -1110,6 +1151,80 @@ def detect_missing_read_broker(snapshot: BoardSnapshot) -> list[ForemanIssue]:
             )
         )
     return issues
+
+
+def _read_or_refresh_board_run_summary(
+    board: str,
+    worker: dict[str, Any],
+    tasks: tuple[TaskSnapshot, ...],
+    *,
+    thread_state: str,
+) -> dict[str, Any]:
+    summary = read_board_run_summary(board)
+    if isinstance(summary, dict) and summary and not _board_run_summary_stale(
+        summary,
+        worker,
+        tasks,
+        thread_state=thread_state,
+    ):
+        return dict(summary)
+    try:
+        return persist_board_run_summary(board)
+    except Exception:
+        try:
+            return build_board_run_summary(board)
+        except Exception:
+            return dict(summary) if isinstance(summary, dict) else {}
+
+
+def _board_run_summary_stale(
+    summary: dict[str, Any],
+    worker: dict[str, Any],
+    tasks: tuple[TaskSnapshot, ...],
+    *,
+    thread_state: str,
+) -> bool:
+    if not isinstance(summary, dict) or summary.get("board") in (None, ""):
+        return True
+    generated_at = _coerce_optional_int(summary.get("generated_at")) or 0
+    worker_updated_at = _coerce_optional_int(worker.get("updated_at")) or 0
+    if worker_updated_at and worker_updated_at > generated_at:
+        return True
+    if str(summary.get("goal_status") or "") != str(worker.get("goal_status") or ""):
+        return True
+    if str(summary.get("phase") or "") != str(worker.get("phase") or ""):
+        return True
+    if str(summary.get("thread_state") or "") != str(thread_state or ""):
+        return True
+    return _normalized_task_counts(summary.get("task_counts") or {}) != _task_status_counts(tasks)
+
+
+def _normalized_task_counts(counts: dict[str, Any]) -> dict[str, int]:
+    normalized: dict[str, int] = {}
+    for key, value in dict(counts or {}).items():
+        if str(key) == "total":
+            continue
+        try:
+            count = int(value or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count:
+            normalized[str(key)] = count
+    return normalized
+
+
+def _task_status_counts(tasks: Iterable[TaskSnapshot]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for task in tasks:
+        status = str(task.status or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    return {key: value for key, value in counts.items() if value}
+
+
+def _public_ticket_url(snapshot: BoardSnapshot, task: TaskSnapshot) -> str:
+    if not snapshot.session_url:
+        return ""
+    return f"{snapshot.session_url.rstrip('/')}/tickets/{task.id}"
 
 
 def detect_stalled_blocked_board(
