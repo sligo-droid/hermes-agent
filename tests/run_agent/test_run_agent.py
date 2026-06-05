@@ -2485,6 +2485,46 @@ class TestConcurrentToolExecution:
         assert starts == [("c1", "web_search", {"query": "hello"})]
         assert completes == [("c1", "web_search", {"query": "hello"}, '{"success": true}')]
 
+    def test_browser_type_callbacks_redact_input_without_blocking_execution(self, agent):
+        tool_call = _mock_tool_call(
+            name="browser_type",
+            arguments='{"ref":"@e1","text":"super-secret-password"}',
+            call_id="c1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+        starts = []
+        completes = []
+        agent.tool_start_callback = lambda tool_call_id, function_name, function_args: starts.append((tool_call_id, function_name, function_args))
+        agent.tool_complete_callback = lambda tool_call_id, function_name, function_args, function_result: completes.append((tool_call_id, function_name, function_args, function_result))
+
+        with patch("run_agent.handle_function_call", return_value='{"success": true, "typed": "[REDACTED_BROWSER_INPUT]"}') as handle:
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        handle.assert_called_once()
+        assert handle.call_args.args[:3] == (
+            "browser_type",
+            {"ref": "@e1", "text": "super-secret-password"},
+            "task-1",
+        )
+        assert starts == [("c1", "browser_type", {"ref": "@e1", "text": "[REDACTED_BROWSER_INPUT]"})]
+        assert completes == [("c1", "browser_type", {"ref": "@e1", "text": "[REDACTED_BROWSER_INPUT]"}, '{"success": true, "typed": "[REDACTED_BROWSER_INPUT]"}')]
+        assert "super-secret-password" not in str(messages)
+
+    def test_build_assistant_message_redacts_browser_type_persisted_args(self, agent):
+        tool_call = _mock_tool_call(
+            name="browser_type",
+            arguments='{"ref":"@e1","text":"super-secret-password"}',
+            call_id="c1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+
+        result = agent._build_assistant_message(mock_msg, "tool_calls")
+
+        stored_args = json.loads(result["tool_calls"][0]["function"]["arguments"])
+        assert stored_args == {"ref": "@e1", "text": "[REDACTED_BROWSER_INPUT]"}
+        assert "super-secret-password" not in json.dumps(result)
+
     def test_concurrent_tool_callbacks_fire_for_each_tool(self, agent):
         tc1 = _mock_tool_call(name="web_search", arguments='{"query":"one"}', call_id="c1")
         tc2 = _mock_tool_call(name="web_search", arguments='{"query":"two"}', call_id="c2")
@@ -3912,6 +3952,46 @@ class TestRunConversation:
         assert agent.context_compressor.context_length == 200_000
         assert result["final_response"] == "Recovered after compression"
         assert result["completed"] is True
+
+    def test_overflow_retry_uses_emergency_shrink_when_normal_compression_stalls(self, agent):
+        self._setup_agent(agent)
+        agent.compression_enabled = True
+        err_400 = Exception("HTTP 400: context length exceeded")
+        err_400.status_code = 400
+        ok_resp = _mock_response(content="Recovered after emergency shrink", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [err_400, ok_resp]
+        prefill = [
+            {"role": "user", "content": "previous question"},
+            {"role": "assistant", "content": "previous answer"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"huge.log"}'},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "x" * 40_000},
+        ]
+
+        def no_progress_compress(messages, system_message, **kwargs):
+            return messages, agent._cached_system_prompt
+
+        with (
+            patch.object(agent, "_compress_context", side_effect=no_progress_compress),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("latest ask", conversation_history=prefill)
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered after emergency shrink"
+        second_call_messages = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        assert second_call_messages[-1]["content"] == "latest ask"
+        assert "x" * 1000 not in json.dumps(second_call_messages)
+        assert "huge.log" in json.dumps(second_call_messages)
 
     def test_length_finish_reason_requests_continuation(self, agent):
         """Normal truncation (partial real content) triggers continuation."""

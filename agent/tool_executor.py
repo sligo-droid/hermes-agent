@@ -50,6 +50,13 @@ from tools.tool_result_storage import (
 logger = logging.getLogger(__name__)
 
 
+def _storage_safe_tool_args(tool_name: str, args: dict) -> dict:
+    """Return callback/persistence-safe args without changing execution args."""
+    if tool_name != "browser_type" or not isinstance(args, dict) or "text" not in args:
+        return args
+    return {**args, "text": "[REDACTED_BROWSER_INPUT]"}
+
+
 def _current_session_cwd(agent: Any = None) -> str:
     if agent is not None:
         cwd = getattr(agent, "session_cwd", None)
@@ -345,7 +352,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             function_args = {}
         if not isinstance(function_args, dict):
             function_args = {}
-
         # ── Tool Search unwrap ────────────────────────────────────────
         # When the model invokes the tool_call bridge, peel it open so
         # every downstream check (checkpointing, guardrails, plugin
@@ -432,13 +438,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 except Exception:
                     pass
 
-        parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail))
+        storage_args = _storage_safe_tool_args(function_name, function_args)
+        parsed_calls.append((tool_call, function_name, function_args, storage_args, block_result, blocked_by_guardrail))
 
     # ── Logging / callbacks ──────────────────────────────────────────
-    tool_names_str = ", ".join(name for _, name, _, _, _ in parsed_calls)
+    tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
     if not agent.quiet_mode:
         print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
-        for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls, 1):
+        for i, (tc, name, args, storage_args, block_result, blocked_by_guardrail) in enumerate(parsed_calls, 1):
             args_str = json.dumps(args, ensure_ascii=False)
             if agent.verbose_logging:
                 print(f"  📞 Tool {i}: {name}({list(args.keys())})")
@@ -447,31 +454,31 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 args_preview = args_str[:agent.log_prefix_chars] + "..." if len(args_str) > agent.log_prefix_chars else args_str
                 print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
 
-    for tc, name, args, block_result, blocked_by_guardrail in parsed_calls:
+    for tc, name, args, storage_args, block_result, blocked_by_guardrail in parsed_calls:
         if block_result is not None:
             continue
         if agent.tool_progress_callback:
             try:
-                preview = _build_tool_preview(name, args)
-                agent.tool_progress_callback("tool.started", name, preview, args)
+                preview = _build_tool_preview(name, storage_args)
+                agent.tool_progress_callback("tool.started", name, preview, storage_args)
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
-    for tc, name, args, block_result, blocked_by_guardrail in parsed_calls:
+    for tc, name, args, storage_args, block_result, blocked_by_guardrail in parsed_calls:
         if block_result is not None:
             continue
         if agent.tool_start_callback:
             try:
-                agent.tool_start_callback(tc.id, name, args)
+                agent.tool_start_callback(tc.id, name, storage_args)
             except Exception as cb_err:
                 logging.debug(f"Tool start callback error: {cb_err}")
 
     # ── Concurrent execution ─────────────────────────────────────────
-    # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag)
+    # Each slot holds (function_name, execution_args, storage_args, result, duration, error_flag, blocked_flag)
     results = [None] * num_tools
-    for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
+    for i, (tc, name, args, storage_args, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
         if block_result is not None:
-            results[i] = (name, args, block_result, 0.0, True, True)
+            results[i] = (name, args, storage_args, block_result, 0.0, True, True)
 
     # Touch activity before launching workers so the gateway knows
     # we're executing tools (not stuck).
@@ -527,7 +534,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
-            results[index] = (function_name, function_args, result, duration, is_error, False)
+            results[index] = (
+                function_name,
+                function_args,
+                _storage_safe_tool_args(function_name, function_args),
+                result,
+                duration,
+                is_error,
+                False,
+            )
         finally:
             # Tear down worker-tid tracking.  Clear any interrupt bit we may
             # have set so the next task scheduled onto this recycled tid
@@ -552,7 +567,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     try:
         runnable_calls = [
             (i, tc, name, args)
-            for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls)
+            for i, (tc, name, args, storage_args, block_result, blocked_by_guardrail) in enumerate(parsed_calls)
             if block_result is None
         ]
         futures = []
@@ -616,13 +631,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         )
     finally:
         if spinner:
-            # Build a summary message for the spinner stop
+            # Build a summary message for the spinner stop. Results are
+            # (name, execution_args, storage_args, result, duration, is_error, blocked).
             completed = sum(1 for r in results if r is not None)
-            total_dur = sum(r[3] for r in results if r is not None)
+            total_dur = sum(r[4] for r in results if r is not None)
             spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
 
     # ── Post-execution: display per-tool results ─────────────────────
-    for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
+    for i, (tc, name, args, storage_args, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
         r = results[i]
         blocked = False
         if r is None:
@@ -634,7 +650,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_duration = 0.0
             is_error = True
         else:
-            function_name, function_args, function_result, tool_duration, is_error, blocked = r
+            function_name, function_args, result_storage_args, function_result, tool_duration, is_error, blocked = r
 
             if not blocked:
                 if (
@@ -660,7 +676,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if not blocked:
                 try:
                     agent._record_file_mutation_result(
-                        function_name, function_args, function_result, is_error,
+                        function_name, result_storage_args, function_result, is_error,
                     )
                 except Exception as _ver_err:
                     logging.debug("file-mutation verifier record failed: %s", _ver_err)
@@ -690,7 +706,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
         # Print cute message per tool
         if agent._should_emit_quiet_tool_messages():
-            cute_msg = _get_cute_tool_message_impl(name, args, tool_duration, result=function_result)
+            cute_msg = _get_cute_tool_message_impl(name, storage_args, tool_duration, result=function_result)
             agent._safe_print(f"  {cute_msg}")
         elif not agent.quiet_mode:
             _preview_str = _multimodal_text_summary(function_result)
@@ -706,7 +722,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
         if not blocked and agent.tool_complete_callback:
             try:
-                agent.tool_complete_callback(tc.id, name, args, function_result)
+                agent.tool_complete_callback(tc.id, name, storage_args, function_result)
             except Exception as cb_err:
                 logging.debug(f"Tool complete callback error: {cb_err}")
 
@@ -717,7 +733,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             env=get_active_env(effective_task_id),
         ) if not _is_multimodal_tool_result(function_result) else function_result
 
-        subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
+        subdir_hints = agent._subdirectory_hints.check_tool_call(name, storage_args)
         if subdir_hints:
             if _is_multimodal_tool_result(function_result):
                 # Append the hint to the text summary part so the model
@@ -807,6 +823,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         )
         except Exception:
             pass
+        storage_args = _storage_safe_tool_args(function_name, function_args)
 
         # Check plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
@@ -866,14 +883,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         if not _execution_blocked and agent.tool_progress_callback:
             try:
-                preview = _build_tool_preview(function_name, function_args)
-                agent.tool_progress_callback("tool.started", function_name, preview, function_args)
+                preview = _build_tool_preview(function_name, storage_args)
+                agent.tool_progress_callback("tool.started", function_name, preview, storage_args)
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
         if not _execution_blocked and agent.tool_start_callback:
             try:
-                agent.tool_start_callback(tool_call.id, function_name, function_args)
+                agent.tool_start_callback(tool_call.id, function_name, storage_args)
             except Exception as cb_err:
                 logging.debug(f"Tool start callback error: {cb_err}")
 
@@ -1196,7 +1213,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if not _execution_blocked:
             try:
                 agent._record_file_mutation_result(
-                    function_name, function_args, function_result, _is_error_result,
+                    function_name, storage_args, function_result, _is_error_result,
                 )
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
@@ -1221,7 +1238,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         if not _execution_blocked and agent.tool_complete_callback:
             try:
-                agent.tool_complete_callback(tool_call.id, function_name, function_args, function_result)
+                agent.tool_complete_callback(tool_call.id, function_name, storage_args, function_result)
             except Exception as cb_err:
                 logging.debug(f"Tool complete callback error: {cb_err}")
 
@@ -1233,7 +1250,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         ) if not _is_multimodal_tool_result(function_result) else function_result
 
         # Discover subdirectory context files from tool arguments
-        subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
+        subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, storage_args)
         if subdir_hints:
             if _is_multimodal_tool_result(function_result):
                 _append_subdir_hint_to_multimodal(function_result, subdir_hints)

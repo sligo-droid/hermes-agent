@@ -1167,6 +1167,7 @@ _recording_sessions: set = set()  # session_keys with active recordings
 # sidecar would fall back to the cloud session on its next snapshot call.
 _last_active_session_key: Dict[str, str] = {}  # task_id -> session_key
 _LOCAL_SUFFIX = "::local"
+_BROWSER_INPUT_REDACTION = "[REDACTED_BROWSER_INPUT]"
 
 # Flag to track if cleanup has been done
 _cleanup_done = False
@@ -2620,7 +2621,7 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     if result.get("success"):
         response = {
             "success": True,
-            "typed": text,
+            "typed": _BROWSER_INPUT_REDACTION,
             "element": ref
         }
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
