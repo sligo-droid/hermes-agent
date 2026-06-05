@@ -387,6 +387,52 @@ class TestHTTP413Compression:
             "content": "compressed summary",
         }
 
+    def test_context_length_retry_accepts_same_count_token_reduction(self, agent):
+        """A same-count compression can still be real progress via tool pruning."""
+        err_400 = Exception(
+            "Your input exceeds the context window of this model. "
+            "Please adjust your input and try again."
+        )
+        err_400.status_code = 400
+        ok_resp = _mock_response(content="Recovered after token pruning", finish_reason="stop")
+
+        request_payloads = []
+
+        def _side_effect(**kwargs):
+            request_payloads.append(kwargs)
+            if len(request_payloads) == 1:
+                raise err_400
+            return ok_resp
+
+        agent.client.chat.completions.create.side_effect = _side_effect
+
+        prefill = [
+            {"role": "user", "content": "x" * 240_000},
+            {"role": "assistant", "content": "noted"},
+        ]
+
+        def _same_count_compress(msgs, *_args, **_kwargs):
+            compressed = [m.copy() for m in msgs]
+            compressed[0]["content"] = "[old tool output pruned]"
+            return compressed, "compressed prompt"
+
+        with (
+            patch.object(agent, "_compress_context", side_effect=_same_count_compress) as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=prefill)
+
+        mock_compress.assert_called_once()
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered after token pruning"
+        assert len(request_payloads) == 2
+        # Same number of request messages (system + history + current user),
+        # but the retried payload carries the pruned smaller content.
+        assert len(request_payloads[1]["messages"]) == len(request_payloads[0]["messages"])
+        assert request_payloads[1]["messages"][1]["content"] == "[old tool output pruned]"
+
     def test_413_cannot_compress_further(self, agent):
         """When compression can't reduce messages, return partial result."""
         err_413 = _make_413_error()
@@ -444,6 +490,7 @@ class TestPreflightCompression:
         # that the compressed result (2 short messages) fits in a single pass.
         agent.context_compressor.context_length = 2000
         agent.context_compressor.threshold_tokens = 200
+        agent.context_compressor.protect_last_n = 10
 
         # Build a history that will be large enough to trigger preflight
         # (each message ~50 chars ≈ 13 tokens, 40 messages ≈ 520 tokens > 200 threshold)
@@ -497,6 +544,7 @@ class TestPreflightCompression:
         agent.context_compressor.last_prompt_tokens = 58_000
         agent.context_compressor.last_real_prompt_tokens = 58_000
         agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 113_000
+        agent.context_compressor.protect_last_n = 10
 
         big_history = []
         for i in range(20):
@@ -537,6 +585,7 @@ class TestPreflightCompression:
         agent.context_compressor.last_prompt_tokens = 58_000
         agent.context_compressor.last_real_prompt_tokens = 58_000
         agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 113_000
+        agent.context_compressor.protect_last_n = 10
 
         big_history = []
         for i in range(20):
@@ -639,6 +688,7 @@ class TestPreflightCompression:
         agent.compression_enabled = True
         agent.context_compressor.context_length = 2000
         agent.context_compressor.threshold_tokens = 200
+        agent.context_compressor.protect_last_n = 10
 
         big_history = []
         for i in range(20):
@@ -676,6 +726,7 @@ class TestPreflightCompression:
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 130_000
+        agent.context_compressor.protect_last_n = 10
         # Simulate a stale display value from an earlier, smaller turn.
         agent.context_compressor.last_prompt_tokens = 74_400
 
@@ -708,6 +759,7 @@ class TestPreflightCompression:
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 130_000
+        agent.context_compressor.protect_last_n = 10
         # A real, larger usage figure is already tracked.
         agent.context_compressor.last_prompt_tokens = 160_000
 

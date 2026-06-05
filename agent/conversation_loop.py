@@ -194,6 +194,43 @@ def _attach_runtime_breakdown(result: dict[str, Any], agent: Any, total_elapsed_
         if breakdown:
             result["runtime_breakdown"] = breakdown
     return result
+
+
+def _estimate_request_tokens_for_progress(
+    agent: Any,
+    messages: list[dict[str, Any]],
+    active_system_prompt: str | None,
+) -> int:
+    """Best-effort request estimate used to detect same-count compression wins."""
+    try:
+        return estimate_request_tokens_rough(
+            messages,
+            system_prompt=active_system_prompt or "",
+            tools=agent.tools or None,
+        )
+    except Exception:
+        return 0
+
+
+def _compression_made_progress(
+    *,
+    original_len: int,
+    original_tokens: int | None,
+    messages: list[dict[str, Any]],
+    compressed_tokens: int,
+) -> bool:
+    """Return True when compression reduced messages or request tokens."""
+    if len(messages) < original_len:
+        return True
+    if original_tokens and compressed_tokens and compressed_tokens < original_tokens:
+        return True
+    return False
+
+
+def _fmt_token_count(value: int | None) -> str:
+    return f"{int(value or 0):,}"
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -833,11 +870,25 @@ def run_conversation(
             # context windows (each pass summarises the middle N turns).
             for _pass in range(3):
                 _orig_len = len(messages)
+                _orig_tokens = _preflight_tokens
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
                 )
-                if len(messages) >= _orig_len:
+                # Re-estimate after compression.  A summary failure can still
+                # prune old tool results, which keeps message count unchanged
+                # while materially reducing request tokens.
+                _next_preflight_tokens = _estimate_request_tokens_for_progress(
+                    agent,
+                    messages,
+                    active_system_prompt,
+                )
+                if not _compression_made_progress(
+                    original_len=_orig_len,
+                    original_tokens=_orig_tokens,
+                    messages=messages,
+                    compressed_tokens=_next_preflight_tokens,
+                ):
                     break  # Cannot compress further
                 # Compression created a new session — clear the history
                 # reference so _flush_messages_to_session_db writes ALL
@@ -855,12 +906,7 @@ def run_conversation(
                 agent._last_content_with_tools = None
                 agent._last_content_tools_all_housekeeping = False
                 agent._mute_post_response = False
-                # Re-estimate after compression
-                _preflight_tokens = estimate_request_tokens_rough(
-                    messages,
-                    system_prompt=active_system_prompt or "",
-                    tools=agent.tools or None,
-                )
+                _preflight_tokens = _next_preflight_tokens
                 if not _compressor.should_compress(_preflight_tokens):
                     break  # Under threshold or anti-thrash guard stopped it
 
@@ -3047,6 +3093,7 @@ def run_conversation(
                     agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
 
                     original_len = len(messages)
+                    original_tokens = approx_tokens
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
@@ -3056,8 +3103,25 @@ def run_conversation(
                     # messages to the new session, not skipping them.
                     conversation_history = None
 
-                    if len(messages) < original_len:
-                        agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
+                    compressed_tokens = _estimate_request_tokens_for_progress(
+                        agent,
+                        messages,
+                        active_system_prompt,
+                    )
+                    if _compression_made_progress(
+                        original_len=original_len,
+                        original_tokens=original_tokens,
+                        messages=messages,
+                        compressed_tokens=compressed_tokens,
+                    ):
+                        if len(messages) < original_len:
+                            agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
+                        elif compressed_tokens:
+                            agent._buffer_status(
+                                f"🗜️ Reduced context estimate "
+                                f"{_fmt_token_count(original_tokens)} → "
+                                f"{_fmt_token_count(compressed_tokens)} tokens, retrying..."
+                            )
                         time.sleep(2)  # Brief pause between compression retries
                         restart_with_compressed_messages = True
                         break
@@ -3203,6 +3267,7 @@ def run_conversation(
                     agent._buffer_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
 
                     original_len = len(messages)
+                    original_tokens = approx_tokens
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message, approx_tokens=approx_tokens,
                         task_id=effective_task_id,
@@ -3212,9 +3277,28 @@ def run_conversation(
                     # messages to the new session, not skipping them.
                     conversation_history = None
 
-                    if len(messages) < original_len or new_ctx and new_ctx < old_ctx:
+                    compressed_tokens = _estimate_request_tokens_for_progress(
+                        agent,
+                        messages,
+                        active_system_prompt,
+                    )
+                    if (
+                        _compression_made_progress(
+                            original_len=original_len,
+                            original_tokens=original_tokens,
+                            messages=messages,
+                            compressed_tokens=compressed_tokens,
+                        )
+                        or new_ctx and new_ctx < old_ctx
+                    ):
                         if len(messages) < original_len:
                             agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
+                        elif compressed_tokens and compressed_tokens < (original_tokens or 0):
+                            agent._buffer_status(
+                                f"🗜️ Reduced context estimate "
+                                f"{_fmt_token_count(original_tokens)} → "
+                                f"{_fmt_token_count(compressed_tokens)} tokens, retrying..."
+                            )
                         time.sleep(2)  # Brief pause between compression retries
                         restart_with_compressed_messages = True
                         break
@@ -4099,14 +4183,7 @@ def run_conversation(
                 # request over the threshold before the provider gets a chance
                 # to reject it.
                 _compressor = agent.context_compressor
-                if _compressor.last_prompt_tokens > 0:
-                    # Only use prompt_tokens — completion/reasoning
-                    # tokens don't consume context window space.
-                    # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
-                    # inflate completion_tokens with reasoning,
-                    # causing premature compression.  (#12026)
-                    _real_tokens = _compressor.last_prompt_tokens
-                elif _compressor.last_prompt_tokens == -1:
+                if _compressor.last_prompt_tokens == -1:
                     # Compression just ran and no API-reported prompt count
                     # has arrived yet. Avoid treating a schema-heavy rough
                     # post-compression estimate as real context pressure.
@@ -4116,9 +4193,18 @@ def run_conversation(
                     # these add 20-30K tokens the messages-only
                     # estimate misses, which can skip compression
                     # past the configured threshold (#14695).
-                    _real_tokens = estimate_request_tokens_rough(
-                        messages, tools=agent.tools or None
+                    _rough_tokens = estimate_request_tokens_rough(
+                        messages,
+                        system_prompt=active_system_prompt or "",
+                        tools=agent.tools or None,
                     )
+                    # Only prompt_tokens consume context window space.
+                    # Completion/reasoning tokens are intentionally excluded
+                    # (#12026), but provider prompt usage is from the request
+                    # before the newly appended tool result. Use the larger
+                    # value so a huge tool output can trigger compression
+                    # immediately instead of waiting for a provider rejection.
+                    _real_tokens = max(_compressor.last_prompt_tokens or 0, _rough_tokens)
 
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")

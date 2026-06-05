@@ -308,10 +308,6 @@ def compress_context(
         f"{approx_tokens:,}" if approx_tokens else "unknown", agent.model,
         focus_topic,
     )
-    agent._emit_status(
-        "🗜️ Compacting context — summarizing earlier conversation so I can continue..."
-    )
-
     # ── Compression lock ────────────────────────────────────────────────
     # Atomic, state.db-backed lock per session_id.  Without this, two
     # AIAgent instances that share the same session_id (most commonly the
