@@ -269,6 +269,15 @@ code { font-size: 0.875rem; }
 .sligo-light .command-center-lane-selected .command-center-lane-detail {
   color: rgb(51 65 85) !important;
 }
+.sligo-light .command-center-project-tabs {
+  border-color: rgb(148 163 184 / 0.55) !important;
+}
+.sligo-light .command-center-project-tab-selected {
+  background-color: rgb(219 234 254 / 0.92) !important;
+  border-bottom-color: rgb(37 99 235) !important;
+  color: rgb(30 64 175) !important;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.78), 0 8px 20px rgb(37 99 235 / 0.14);
+}
 .sligo-light .command-center-card-selected {
   background-color: rgb(240 253 250 / 0.92) !important;
   border-color: rgb(6 182 212 / 0.68) !important;

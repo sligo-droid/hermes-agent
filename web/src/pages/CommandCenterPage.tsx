@@ -192,21 +192,22 @@ function ProjectTabs({
     return `?${params.toString()}`;
   };
   return (
-    <nav aria-label="Command Center projects" className="command-center-project-tabs flex flex-wrap gap-2">
+    <nav aria-label="Command Center projects" className="command-center-project-tabs flex border-b border-white/10">
       {projects.map((project) => {
         const selected = currentProject === project.key;
         return (
           <Link
             aria-current={selected ? "page" : undefined}
             className={cn(
-              "rounded-full border px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.16em] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
-              selected ? "border-cyan-100/60 bg-cyan-100/15 text-cyan-50" : "border-white/10 bg-white/[0.035] text-slate-400 hover:border-cyan-100/35 hover:text-slate-100",
+              "command-center-project-tab relative -mb-px border-b-2 px-4 py-2 text-sm font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
+              selected
+                ? "command-center-project-tab-selected border-cyan-200 bg-cyan-100/[0.08] text-cyan-50"
+                : "border-transparent text-slate-400 hover:border-cyan-100/35 hover:bg-white/[0.035] hover:text-slate-100",
             )}
             key={project.key}
             to={{ pathname, search: tabSearch(project.key) }}
           >
             <span>{project.label}</span>
-            {project.source_hint ? <span className="ml-2 text-slate-500">{project.source_hint}</span> : null}
           </Link>
         );
       })}
