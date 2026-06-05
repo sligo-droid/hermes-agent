@@ -193,6 +193,10 @@ def _basic_auth_challenge() -> JSONResponse:
     )
 
 
+def _env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 _DEFAULT_HERMES_DASHBOARD_HOST = "hermes.sligolabs.com"
 _DEFAULT_SLIGO_DASHBOARD_HOST = "sligo.sligolabs.com"
 
@@ -285,6 +289,22 @@ def should_require_auth(host: str, allow_public: bool) -> bool:
     exactly the threat model the gate is designed for.
     """
     return (host not in _LOOPBACK_HOST_VALUES) and (not allow_public)
+
+
+def _dashboard_basic_auth_required(request: Request) -> bool:
+    """Return whether the legacy Basic Auth gate should protect dashboard UI.
+
+    Loopback dashboards inject ``_SESSION_TOKEN`` into the SPA and still require
+    it for sensitive APIs. Keep Basic Auth for gated/non-loopback modes, and let
+    operators force the old loopback challenge with
+    ``HERMES_DASHBOARD_REQUIRE_BASIC_AUTH=1``.
+    """
+    if _env_flag_enabled("HERMES_DASHBOARD_REQUIRE_BASIC_AUTH"):
+        return True
+    if getattr(request.app.state, "auth_required", False):
+        return True
+    bound_host = getattr(request.app.state, "bound_host", "") or ""
+    return bound_host.lower() not in _LOOPBACK_HOST_VALUES
 
 
 def _is_accepted_host(host_header: str, bound_host: str) -> bool:
@@ -388,7 +408,7 @@ async def auth_middleware(request: Request, call_next):
     if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
         if not _has_valid_session_token(request):
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
-    if not _has_dashboard_access(request):
+    if _dashboard_basic_auth_required(request) and not _has_dashboard_access(request):
         return _basic_auth_challenge()
     return await call_next(request)
 
