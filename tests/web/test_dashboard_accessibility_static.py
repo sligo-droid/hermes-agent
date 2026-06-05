@@ -70,6 +70,24 @@ def test_command_center_archive_action_renders_last_in_row_rail():
     assert row_rail.index('kind="undo"') < row_rail.index('kind="archive"')
 
 
+def test_command_center_row_actions_lock_during_refresh_settle():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
+    handle_source = source.split("const handleAction = useCallback", 1)[1].split("const selectedWorkId", 1)[0]
+
+    assert "const ACTION_SETTLE_MS = 600" in source
+    assert "const actionDisabled = (kind: ActionKind) => Boolean(activeAction) && !actionBusy(kind);" in card_source
+    assert "aria-busy={rowBusy || undefined}" in card_source
+    assert "<div aria-busy={rowBusy}" in card_source
+    assert "aria-live=\"polite\"" in card_source
+    for kind in ("approve", "reject", "resume", "pause", "undo", "archive"):
+        assert f'disabled={{actionDisabled("{kind}")}}' in card_source
+    assert "if (activeAction) return;" in handle_source
+    assert "delayBeforeApplyMs: Math.max(0, ACTION_SETTLE_MS - (Date.now() - startedAt))" in handle_source
+    assert "settleAfterApplyMs: ACTION_SETTLE_MS" in handle_source
+    assert "preserveMissingWorkItemId: item.id" in handle_source
+
+
 def test_command_center_worker_pill_has_no_workers_fallback():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
     card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
