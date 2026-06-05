@@ -329,12 +329,13 @@ export const api = {
     fetchJSON<{ ok: boolean }>(`/api/cron/jobs/${encodeURIComponent(id)}?profile=${encodeURIComponent(profile)}`, { method: "DELETE" }),
 
   // Command Center aggregate
-  getCommandCenterSnapshot: (params?: { includeArchived?: boolean; recentRunLimitPerBoard?: number }) => {
+  getCommandCenterSnapshot: (params?: { includeArchived?: boolean; recentRunLimitPerBoard?: number; project?: string | null }) => {
     const qs = new URLSearchParams();
     if (params?.includeArchived) qs.set("include_archived", "true");
     if (params?.recentRunLimitPerBoard !== undefined) {
       qs.set("recent_run_limit_per_board", String(params.recentRunLimitPerBoard));
     }
+    if (params?.project) qs.set("project", params.project);
     const suffix = qs.toString();
     return fetchJSON<CommandCenterSnapshot>(
       `/api/plugins/kanban/command-center/snapshot${suffix ? `?${suffix}` : ""}`,
@@ -877,9 +878,18 @@ export interface CommandCenterSource {
   title?: string | null;
   status?: string | null;
   bucket?: string | null;
+  project?: string | null;
   created_at?: string | number | null;
   updated_at?: string | number | null;
   ref: CommandCenterSourceRef;
+}
+
+export interface CommandCenterProject {
+  key: string;
+  label: string;
+  description?: string | null;
+  source_hint?: string | null;
+  discord_channel_id?: string | null;
 }
 
 export interface CommandCenterExecution {
@@ -961,6 +971,8 @@ export interface CommandCenterSnapshot {
   schema_version: number;
   generated_at: number;
   summary: string;
+  projects?: CommandCenterProject[];
+  current_project?: string | null;
   work_items: CommandCenterWorkItem[];
   sources: CommandCenterSource[];
   runs: CommandCenterRun[];

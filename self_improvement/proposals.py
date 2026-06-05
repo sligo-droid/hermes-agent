@@ -271,6 +271,7 @@ def build_cron_proposal_guidance(
         "Each card must be independently approvable as a future Kanban task. Do not create Kanban tasks, mutate dashboards, or approve/reject proposals.\n\n"
         "Return both: (1) a concise human markdown summary, and (2) one strict JSON block fenced as ```json containing a proposal run matching "
         f"`{CONTRACT_VERSION}`. The JSON root fields are: `contract_version`, `project`, `prong`, `run`, `generated_at`, `human_markdown`, and `cards`. "
+        f"Set the JSON root exactly to `\"project\": \"{project}\"` and `\"prong\": \"{prong}\"`. "
         "The `run` object is only scheduler identity metadata and must include non-empty `run_id`, non-empty `cron_job_id`, and ISO-8601 `created_at`; "
         "it may also include `cron_job_name`, `cron_output_path`, `source_url`, and `completed_at`. Do not put audit notes, delegation details, status summaries, "
         "worker logs, or other card/review metadata into `run`. "

@@ -7,6 +7,7 @@ def test_work_state_is_only_command_center_navigation_filter():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
 
     assert "function WorkStatePanel" in source
+    assert "function ProjectTabs" in source
     assert "Issue Pulse" not in source
     work_state_source = source.split("function WorkStatePanel", 1)[1].split("function ActionButton", 1)[0]
     assert "Work State" in work_state_source
@@ -22,6 +23,22 @@ def test_work_state_is_only_command_center_navigation_filter():
     assert 'href={lane.href} key={lane.key} rel="noopener noreferrer" target="_blank"' in work_state_source
     assert 'if (normalized.includes("/runs")) return "runs";' in source
     assert "opens in a new tab" in work_state_source
+
+
+def test_command_center_project_tabs_render_above_work_state_and_preserve_lanes():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    page_source = source.split("export default function CommandCenterPage", 1)[1]
+    render_source = page_source.split("return (", 1)[1]
+
+    assert "Command Center projects" in source
+    assert "command-center-project-tabs" in source
+    assert "projects={snapshot?.projects ?? []}" in source
+    assert "to={{ pathname, search: tabSearch(project.key) }}" in source
+    assert "to={{ pathname: lane.href, search }}" in source
+    assert render_source.index("<ProjectTabs") < render_source.index("<WorkStatePanel")
+    for forbidden in ("Operator Surface", "KPI", "status distribution"):
+        assert forbidden not in source
+    assert "Sligo operator navigation" not in source
 
 
 def test_command_center_worker_rows_and_ticket_links_open_new_tabs():
