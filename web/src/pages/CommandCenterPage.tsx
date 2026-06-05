@@ -107,12 +107,23 @@ function isRunningWorkItem(item: CommandCenterWorkItem): boolean {
   return item.status === "running" || Boolean(item.execution?.active_run_id) || Boolean(item.runs?.some(runIsActive));
 }
 
+function workItemRecency(item: CommandCenterWorkItem): number {
+  const value = item.created_at || item.updated_at;
+  if (value === null || value === undefined || value === "") return 0;
+  const timestamp = typeof value === "number" ? value * 1000 : new Date(value).getTime();
+  return Number.isNaN(timestamp) ? 0 : timestamp;
+}
+
+function workItemCreatedSort(a: CommandCenterWorkItem, b: CommandCenterWorkItem): number {
+  const recencyDelta = workItemRecency(b) - workItemRecency(a);
+  if (recencyDelta) return recencyDelta;
+  return a.id.localeCompare(b.id);
+}
+
 function workItemViewSort(a: CommandCenterWorkItem, b: CommandCenterWorkItem): number {
   const runningDelta = Number(isRunningWorkItem(b)) - Number(isRunningWorkItem(a));
   if (runningDelta) return runningDelta;
-  const pausedDelta = Number(b.status === "paused") - Number(a.status === "paused");
-  if (pausedDelta) return pausedDelta;
-  return 0;
+  return workItemCreatedSort(a, b);
 }
 
 function runIsActive(run: CommandCenterRun): boolean {
@@ -343,26 +354,27 @@ function WorkItemCard({
       <div className="mt-3 block w-full text-left">
         <p className="text-sm leading-6 text-slate-300">{item.summary || item.body_preview || "No summary yet."}</p>
       </div>
-      {(item.execution?.task_url && item.execution.task_url !== item.execution.worker_url) || canApproveReject || canArchive || canPause || canResume || canUndo ? (
-        <div aria-busy={rowBusy} className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3">
-          {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && (
-            <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/[0.07] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" href={item.execution.task_url} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank">
-              Ticket <ExternalLink className="h-3.5 w-3.5" /><span className="sr-only">opens in a new tab</span>
-            </a>
-          )}
-          {rowBusy && activeAction && (
-            <span className="inline-flex h-9 items-center gap-2 rounded-full border border-cyan-100/25 bg-cyan-100/10 px-3 text-xs font-semibold text-cyan-50" aria-live="polite">
-              <Spinner /> {ACTION_PROGRESS_LABELS[activeAction.kind]}…
-            </span>
-          )}
-          {canApproveReject && <ActionButton busy={actionBusy("approve")} disabled={actionDisabled("approve")} kind="approve" onClick={() => onAction("approve", item)} />}
-          {canApproveReject && <ActionButton busy={actionBusy("reject")} disabled={actionDisabled("reject")} kind="reject" onClick={() => onAction("reject", item)} />}
-          {canResume && <ActionButton busy={actionBusy("resume")} disabled={actionDisabled("resume")} kind="resume" onClick={() => onAction("resume", item)} />}
-          {canPause && <ActionButton busy={actionBusy("pause")} disabled={actionDisabled("pause")} kind="pause" onClick={() => onAction("pause", item)} />}
-          {canUndo && <ActionButton busy={actionBusy("undo")} disabled={actionDisabled("undo")} kind="undo" onClick={() => onAction("undo", item)} />}
-          {canArchive && <ActionButton busy={actionBusy("archive")} disabled={actionDisabled("archive")} kind="archive" onClick={() => onAction("archive", item)} />}
+      <div aria-busy={rowBusy} className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3">
+        {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && (
+          <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/[0.07] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" href={item.execution.task_url} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank">
+            Ticket <ExternalLink className="h-3.5 w-3.5" /><span className="sr-only">opens in a new tab</span>
+          </a>
+        )}
+        {rowBusy && activeAction && (
+          <span className="inline-flex h-9 items-center gap-2 rounded-full border border-cyan-100/25 bg-cyan-100/10 px-3 text-xs font-semibold text-cyan-50" aria-live="polite">
+            <Spinner /> {ACTION_PROGRESS_LABELS[activeAction.kind]}…
+          </span>
+        )}
+        {canApproveReject && <ActionButton busy={actionBusy("approve")} disabled={actionDisabled("approve")} kind="approve" onClick={() => onAction("approve", item)} />}
+        {canApproveReject && <ActionButton busy={actionBusy("reject")} disabled={actionDisabled("reject")} kind="reject" onClick={() => onAction("reject", item)} />}
+        {canResume && <ActionButton busy={actionBusy("resume")} disabled={actionDisabled("resume")} kind="resume" onClick={() => onAction("resume", item)} />}
+        {canPause && <ActionButton busy={actionBusy("pause")} disabled={actionDisabled("pause")} kind="pause" onClick={() => onAction("pause", item)} />}
+        {canUndo && <ActionButton busy={actionBusy("undo")} disabled={actionDisabled("undo")} kind="undo" onClick={() => onAction("undo", item)} />}
+        {canArchive && <ActionButton busy={actionBusy("archive")} disabled={actionDisabled("archive")} kind="archive" onClick={() => onAction("archive", item)} />}
+        <div className="ml-auto min-w-fit pl-2 text-right text-[0.68rem] text-slate-500">
+          Created {formatTime(item.created_at)}
         </div>
-      ) : null}
+      </div>
     </article>
   );
 }
@@ -451,8 +463,8 @@ function OverviewWorkList({
 }) {
   if (!items.length) return <EmptyState label="work items" message={emptyMessage} />;
 
-  const runningItems = items.filter(isRunningWorkItem);
-  const remainingItems = items.filter((item) => !isRunningWorkItem(item));
+  const runningItems = items.filter(isRunningWorkItem).sort(workItemCreatedSort);
+  const remainingItems = items.filter((item) => !isRunningWorkItem(item)).sort(workItemCreatedSort);
   const renderItem = (item: CommandCenterWorkItem) => (
     <WorkItemCard
       activeAction={activeAction}

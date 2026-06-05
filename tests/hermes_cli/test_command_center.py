@@ -214,7 +214,7 @@ def test_snapshot_exposes_project_tabs_and_filters_hermes_dev_intake(tmp_path, m
     assert not any(unknown_board in item["id"] for item in snapshot["work_items"])
 
 
-def test_snapshot_classifies_default_discord_intake_as_hermes_work_item(tmp_path, monkeypatch):
+def test_snapshot_omits_default_discord_intake_from_work_items(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     body = "\n".join(
         [
@@ -250,17 +250,8 @@ def test_snapshot_classifies_default_discord_intake_as_hermes_work_item(tmp_path
         conn.close()
 
     hermes_snapshot = command_center.build_command_center_snapshot(project="hermes")
-    item = next(item for item in hermes_snapshot["work_items"] if item["id"] == f"kanban:{kanban_db.DEFAULT_BOARD}:{task_id}")
 
-    assert item["project"] == "hermes"
-    assert item["status"] == "blocked"
-    assert item["source"]["kind"] == "kanban_board"
-    assert item["source"]["ref"]["task_id"] == task_id
-    assert item["source"]["ref"]["idempotency_key"] == idempotency_key
-    assert item["execution"]["board"] == kanban_db.DEFAULT_BOARD
-    assert item["execution"]["task_id"] == task_id
-    assert item["raw"]["task"]["tenant"] == "discord-default-intake"
-    assert item["raw"]["task"]["created_by"] == "discord-default-intake"
+    assert not any(item["id"] == f"kanban:{kanban_db.DEFAULT_BOARD}:{task_id}" for item in hermes_snapshot["work_items"])
 
     pid_snapshot = command_center.build_command_center_snapshot(project="pid")
     assert not any(item["id"] == f"kanban:{kanban_db.DEFAULT_BOARD}:{task_id}" for item in pid_snapshot["work_items"])
@@ -364,7 +355,7 @@ def test_discord_url_helper_requires_guild_and_thread():
     assert command_center._discord_urls({"thread_id": "222"}) == {}
 
 
-def test_snapshot_running_board_rollup_outranks_blocked_tasks(tmp_path, monkeypatch):
+def test_snapshot_board_rollups_include_running_and_blocked_statuses(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     older_board = "discord-running-with-blocked"
     newer_board = "discord-blocked-only"
@@ -397,7 +388,6 @@ def test_snapshot_running_board_rollup_outranks_blocked_tasks(tmp_path, monkeypa
 
     assert running_item["status"] == "running"
     assert blocked_item["status"] == "blocked"
-    assert snapshot["work_items"].index(running_item) < snapshot["work_items"].index(blocked_item)
 
 
 def test_worker_board_url_rejects_top_level_public_worker_urls():
@@ -464,11 +454,9 @@ def test_snapshot_worker_url_requires_started_execution_and_named_board(tmp_path
     snapshot = command_center.build_command_center_snapshot()
     unstarted_item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{unstarted_board}")
     started_item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{started_board}")
-    default_item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban:default:{default_task_id}")
-
     assert unstarted_item["execution"]["worker_url"] is None
     assert started_item["execution"]["worker_url"] == f"/workers/{started_board}"
-    assert default_item["execution"]["worker_url"] is None
+    assert not any(item["id"] == f"kanban:default:{default_task_id}" for item in snapshot["work_items"])
 
 
 def test_snapshot_skips_internal_default_board_foreman_tasks(tmp_path, monkeypatch):
@@ -504,7 +492,7 @@ def test_snapshot_skips_internal_default_board_foreman_tasks(tmp_path, monkeypat
     run_task_ids = {run["task_id"] for run in snapshot["runs"]}
 
     assert f"kanban:default:{foreman_task_id}" not in item_ids
-    assert f"kanban:default:{ordinary_task_id}" in item_ids
+    assert f"kanban:default:{ordinary_task_id}" not in item_ids
     assert foreman_task_id not in run_task_ids
     assert ordinary_task_id in run_task_ids
 
@@ -704,3 +692,29 @@ def test_snapshot_sorts_iso_timestamped_work_items_by_recency(tmp_path, monkeypa
         "Add backoff logging to PID scraper timeout retries",
         "Older recommendation",
     ]
+
+
+def test_snapshot_omits_individual_kanban_task_work_items(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "discord-board-rollup-only"
+    kanban_db.write_board_metadata(board, name="Board Rollup Only")
+
+    default_conn = kanban_db.connect()
+    try:
+        default_task_id = kanban_db.create_task(default_conn, title="Default board task")
+    finally:
+        default_conn.close()
+
+    board_conn = kanban_db.connect(board=board)
+    try:
+        board_task_id = kanban_db.create_task(board_conn, title="Named board task", board=board)
+    finally:
+        board_conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    item_ids = {item["id"] for item in snapshot["work_items"]}
+
+    assert f"kanban-board:{board}" in item_ids
+    assert f"kanban:{kanban_db.DEFAULT_BOARD}:{default_task_id}" not in item_ids
+    assert f"kanban:{board}:{board_task_id}" not in item_ids
+    assert not any(item_id.startswith("kanban:") for item_id in item_ids)
