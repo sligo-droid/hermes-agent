@@ -273,10 +273,12 @@ code { font-size: 0.875rem; }
   border-color: rgb(148 163 184 / 0.55) !important;
 }
 .sligo-light .command-center-project-tab-selected {
-  background-color: rgb(219 234 254 / 0.92) !important;
-  border-bottom-color: rgb(37 99 235) !important;
+  background-color: rgb(191 219 254 / 0.98) !important;
+  border-color: rgb(37 99 235 / 0.88) !important;
+  border-bottom-color: rgb(29 78 216) !important;
   color: rgb(30 64 175) !important;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.78), 0 8px 20px rgb(37 99 235 / 0.14);
+  font-weight: 700;
+  box-shadow: 0 0 0 2px rgb(37 99 235 / 0.24), inset 0 1px 0 rgb(255 255 255 / 0.9), 0 8px 18px rgb(37 99 235 / 0.18);
 }
 .sligo-light .command-center-card-selected {
   background-color: rgb(240 253 250 / 0.92) !important;
