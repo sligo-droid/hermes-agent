@@ -61,7 +61,8 @@ def test_command_center_row_actions_lock_during_refresh_settle():
 
     assert "const ACTION_SETTLE_MS = 600" in source
     assert "const actionDisabled = (kind: ActionKind) => Boolean(activeAction) && !actionBusy(kind);" in card_source
-    assert "aria-busy={rowActionActive || undefined}" in card_source
+    assert "aria-busy={rowBusy || undefined}" in card_source
+    assert "<div aria-busy={rowBusy}" in card_source
     assert "aria-live=\"polite\"" in card_source
     for kind in ("approve", "reject", "resume", "pause", "undo", "archive"):
         assert f'disabled={{actionDisabled("{kind}")}}' in card_source

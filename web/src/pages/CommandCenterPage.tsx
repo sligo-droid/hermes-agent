@@ -174,8 +174,8 @@ function WorkStatePanel({
     { key: "workers", label: "Workers", href: "/workers", value: laneCounts.workers, detail: "opens monitor", external: true },
   ];
   const tileClass = (selected: boolean) => cn(
-    "group rounded-2xl border px-3.5 py-3 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
-    selected ? "border-cyan-100/55 bg-cyan-100/10 text-cyan-50" : "border-white/10 bg-white/[0.035] text-slate-300 hover:border-cyan-100/35 hover:bg-cyan-100/[0.055]",
+    "command-center-lane group rounded-2xl border px-3.5 py-3 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
+    selected ? "command-center-lane-selected border-cyan-100/55 bg-cyan-100/10 text-cyan-50" : "border-white/10 bg-white/[0.035] text-slate-300 hover:border-cyan-100/35 hover:bg-cyan-100/[0.055]",
   );
   return (
     <Card className="border-white/10 bg-white/[0.035]">
@@ -189,9 +189,9 @@ function WorkStatePanel({
             const selected = !lane.external && activeView === lane.key;
             const content = (
               <>
-                <span className="block text-xl font-semibold tracking-tight text-white">{lane.value}</span>
+                <span className="command-center-lane-value block text-xl font-semibold tracking-tight text-white">{lane.value}</span>
                 <span className="mt-1 block text-[0.68rem] font-semibold uppercase tracking-[0.16em]">{lane.label}</span>
-                <span className="mt-1 block text-xs text-slate-500 transition group-hover:text-slate-400">{lane.detail}</span>
+                <span className="command-center-lane-detail mt-1 block text-xs text-slate-500 transition group-hover:text-slate-400">{lane.detail}</span>
               </>
             );
             if (lane.external) {
@@ -241,7 +241,7 @@ function ActionButton({
         aria-describedby={tooltipId}
         aria-label={config.label}
         className={cn(
-          "inline-flex h-10 w-10 items-center justify-center rounded-full border text-xs font-semibold shadow-sm shadow-black/20 transition hover:shadow-black/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950 disabled:cursor-not-allowed disabled:border-slate-500/25 disabled:bg-slate-700/35 disabled:text-slate-400 disabled:opacity-70 disabled:shadow-none",
+          "command-center-action-button inline-flex h-10 w-10 items-center justify-center rounded-full border text-xs font-semibold shadow-sm shadow-black/20 transition hover:shadow-black/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950 disabled:cursor-not-allowed disabled:border-slate-500/25 disabled:bg-slate-700/35 disabled:text-slate-400 disabled:opacity-70 disabled:shadow-none",
           config.className,
         )}
         disabled={disabled || busy}
@@ -251,7 +251,7 @@ function ActionButton({
         <Icon className={cn(config.strong ? "h-6 w-6 stroke-[2.35]" : "h-5 w-5 stroke-[2.15]", busy && "animate-pulse")} />
         <span className="sr-only">{config.label}</span>
       </button>
-      <span id={tooltipId} role="tooltip" className="pointer-events-none absolute bottom-full left-1/2 z-20 mb-2 -translate-x-1/2 translate-y-1 whitespace-nowrap rounded-md border border-white/15 bg-[#090a0c]/95 px-2.5 py-1 text-[0.68rem] font-medium text-slate-100 opacity-0 shadow-xl shadow-black/35 transition duration-150 group-hover/action:translate-y-0 group-hover/action:opacity-100 group-focus-within/action:translate-y-0 group-focus-within/action:opacity-100">
+      <span id={tooltipId} role="tooltip" className="command-center-action-tooltip pointer-events-none absolute bottom-full left-1/2 z-20 mb-2 -translate-x-1/2 translate-y-1 whitespace-nowrap rounded-md border border-white/15 bg-[#090a0c]/95 px-2.5 py-1 text-[0.68rem] font-medium text-slate-100 opacity-0 shadow-xl shadow-black/35 transition duration-150 group-hover/action:translate-y-0 group-hover/action:opacity-100 group-focus-within/action:translate-y-0 group-focus-within/action:opacity-100">
         {config.label}
       </span>
     </span>
@@ -291,9 +291,9 @@ function WorkItemCard({
   selected: boolean;
 }) {
   const proposalId = item.decision?.proposal_id;
-  const actionBusy = (kind: ActionKind) => activeAction?.id === item.id && activeAction.kind === kind;
+  const rowBusy = activeAction?.id === item.id;
+  const actionBusy = (kind: ActionKind) => rowBusy && activeAction?.kind === kind;
   const actionDisabled = (kind: ActionKind) => Boolean(activeAction) && !actionBusy(kind);
-  const rowActionActive = activeAction?.id === item.id;
   const canApproveReject = Boolean(proposalId && item.status === "proposed");
   const proposalCanArchive = Boolean(proposalId && ["queued", "running", "review", "blocked", "accepted", "paused"].includes(item.status));
   const canPause = Boolean(["queued", "running", "review", "accepted"].includes(item.status) && (proposalId || (item.execution?.pause_action && item.execution.board)) && !item.execution?.paused);
@@ -303,10 +303,10 @@ function WorkItemCard({
   const discordUrl = discordSourceUrl(item.source);
   return (
     <article
-      aria-busy={rowActionActive || undefined}
+      aria-busy={rowBusy || undefined}
       className={cn(
-        "rounded-2xl border bg-[#08090a]/80 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.025)] transition",
-        selected ? "border-cyan-100/55 bg-cyan-100/[0.03] ring-1 ring-cyan-100/15" : "border-white/10 hover:border-white/20 hover:bg-white/[0.03]",
+        "command-center-card rounded-2xl border bg-[#08090a]/80 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.025)] transition",
+        selected ? "command-center-card-selected border-cyan-100/55 bg-cyan-100/[0.03] ring-1 ring-cyan-100/15" : "border-white/10 hover:border-white/20 hover:bg-white/[0.03]",
       )}
     >
       <div className="flex items-start justify-between gap-3">
@@ -333,13 +333,13 @@ function WorkItemCard({
         <p className="text-sm leading-6 text-slate-300">{item.summary || item.body_preview || "No summary yet."}</p>
       </button>
       {(item.execution?.task_url && item.execution.task_url !== item.execution.worker_url) || canApproveReject || canArchive || canPause || canResume || canUndo ? (
-        <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3">
+        <div aria-busy={rowBusy} className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3">
           {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && (
             <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/[0.07] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" href={item.execution.task_url} rel="noopener noreferrer" target="_blank">
               Ticket <ExternalLink className="h-3.5 w-3.5" /><span className="sr-only">opens in a new tab</span>
             </a>
           )}
-          {rowActionActive && (
+          {rowBusy && activeAction && (
             <span className="inline-flex h-9 items-center gap-2 rounded-full border border-cyan-100/25 bg-cyan-100/10 px-3 text-xs font-semibold text-cyan-50" aria-live="polite">
               <Spinner /> {ACTION_PROGRESS_LABELS[activeAction.kind]}…
             </span>
@@ -360,8 +360,8 @@ function SourceCard({ source, onSelect, selected }: { source: CommandCenterSourc
   return (
     <button
       className={cn(
-        "rounded-2xl border bg-slate-950/45 p-4 text-left transition",
-        selected ? "border-cyan-100/75 ring-2 ring-cyan-100/20" : "border-white/10 hover:border-cyan-100/35",
+        "command-center-card rounded-2xl border bg-slate-950/45 p-4 text-left transition",
+        selected ? "command-center-card-selected border-cyan-100/75 ring-2 ring-cyan-100/20" : "border-white/10 hover:border-cyan-100/35",
       )}
       onClick={onSelect}
       type="button"
@@ -384,8 +384,8 @@ function RunCard({ run, onSelect, selected }: { run: CommandCenterRun; onSelect:
   return (
     <button
       className={cn(
-        "rounded-2xl border bg-slate-950/45 p-4 text-left transition",
-        selected ? "border-cyan-100/75 ring-2 ring-cyan-100/20" : "border-white/10 hover:border-cyan-100/35",
+        "command-center-card rounded-2xl border bg-slate-950/45 p-4 text-left transition",
+        selected ? "command-center-card-selected border-cyan-100/75 ring-2 ring-cyan-100/20" : "border-white/10 hover:border-cyan-100/35",
       )}
       onClick={onSelect}
       type="button"
