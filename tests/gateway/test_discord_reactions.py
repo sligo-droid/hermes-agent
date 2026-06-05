@@ -438,7 +438,7 @@ async def test_top_level_feature_summary_reactions_target_triggering_user_messag
         ("foreman", "🔨"),
     ],
 )
-async def test_feature_summary_reactions_follow_kanban_state(adapter, state, emoji):
+async def test_feature_summary_reactions_follow_kanban_state(adapter, monkeypatch, state, emoji):
     raw_message = SimpleNamespace(
         add_reaction=AsyncMock(),
         remove_reaction=AsyncMock(),
@@ -450,6 +450,10 @@ async def test_feature_summary_reactions_follow_kanban_state(adapter, state, emo
         "kanban_board": {"slug": "discord-123"},
     }
     adapter._feature_kanban_reaction_state = MagicMock(return_value=state)
+    monkeypatch.setattr(
+        "hermes_cli.discord_worker_boards.thread_status_targets",
+        lambda: [{"thread_id": "123", "reaction_state": state}],
+    )
 
     await adapter.on_processing_start(event)
     removed_before_complete = len(raw_message.remove_reaction.await_args_list)
@@ -466,6 +470,51 @@ async def test_feature_summary_reactions_follow_kanban_state(adapter, state, emo
         for existing in STATUS_REACTION_EMOJIS
         if existing != emoji
     ]
+
+
+@pytest.mark.asyncio
+async def test_processing_complete_success_resolves_stale_kanban_running_to_done(
+    adapter,
+    monkeypatch,
+):
+    op_message = SimpleNamespace(
+        id=1512478961647616142,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="⏳", me=True)],
+    )
+    followup_message = SimpleNamespace(
+        id=999,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    thread = SimpleNamespace(
+        id=1512478961647616142,
+        starter_message=op_message,
+        parent_id=1505275259006484570,
+    )
+    followup_message.channel = thread
+    event = _make_event(str(followup_message.id), followup_message)
+    event.source.chat_type = "thread"
+    event.source.chat_id = str(thread.id)
+    event.source.thread_id = str(thread.id)
+    event.feature_summary = {
+        "thread_id": str(thread.id),
+        "message_id": "456",
+        "kanban_board": {"slug": "discord-123"},
+    }
+    adapter._feature_kanban_reaction_state = MagicMock(return_value="running")
+    monkeypatch.setattr("hermes_cli.discord_worker_boards.thread_status_targets", lambda: [])
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+    followup_message.add_reaction.assert_not_awaited()
+    followup_message.remove_reaction.assert_not_awaited()
+    assert [call.args for call in op_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="✅",
+    )
+    op_message.add_reaction.assert_awaited_once_with("✅")
 
 
 def test_feature_kanban_reaction_state_uses_reaction_specific_board_state(adapter, monkeypatch):
@@ -1255,7 +1304,7 @@ def test_feature_summary_loader_falls_back_to_source_scoped_thread_handle(adapte
 
 
 @pytest.mark.asyncio
-async def test_goal_thread_followup_uses_loaded_kanban_reaction(adapter):
+async def test_goal_thread_followup_uses_loaded_kanban_reaction(adapter, monkeypatch):
     origin_message = SimpleNamespace(
         id=1000,
         add_reaction=AsyncMock(),
@@ -1288,6 +1337,10 @@ async def test_goal_thread_followup_uses_loaded_kanban_reaction(adapter):
     adapter._read_project_summary_state = MagicMock(return_value=state)
     adapter._write_project_summary_state = MagicMock()
     adapter._feature_kanban_reaction_state = MagicMock(return_value="active")
+    monkeypatch.setattr(
+        "hermes_cli.discord_worker_boards.thread_status_targets",
+        lambda: [{"thread_id": "1000", "reaction_state": "active"}],
+    )
 
     event = _make_event("3000", followup_message)
     event.source.chat_type = "thread"

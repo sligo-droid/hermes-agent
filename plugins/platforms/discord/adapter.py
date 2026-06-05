@@ -1949,6 +1949,41 @@ class DiscordAdapter(BasePlatformAdapter):
             "foreman": "🔨",
         }.get(str(state or ""))
 
+    def _feature_kanban_completion_state(
+        self,
+        handle: Optional[Dict[str, Any]],
+        state: Optional[str],
+    ) -> Optional[str]:
+        state = str(state or "").strip()
+        if state not in {"active", "running"}:
+            return state or None
+        if not isinstance(handle, dict):
+            return state
+        if "kanban_board" not in handle:
+            return state
+        thread_id = str(handle.get("thread_id") or "").strip()
+        if not thread_id:
+            return state
+        try:
+            from hermes_cli.discord_worker_boards import thread_status_targets
+
+            saw_target = False
+            for candidate in thread_status_targets():
+                if str(candidate.get("thread_id") or "").strip() != thread_id:
+                    continue
+                saw_target = True
+                candidate_state = self._feature_source_task_reaction_state(candidate)
+                if candidate_state is None:
+                    candidate_state = str(
+                        candidate.get("reaction_state") or candidate.get("state") or ""
+                    ).strip() or None
+                if candidate_state in {"active", "running", "blocked", "errored", "foreman"}:
+                    return candidate_state
+            return None if not saw_target else "done"
+        except Exception as exc:
+            logger.debug("[%s] Failed to resolve Discord completion reaction state: %s", self.name, exc)
+            return state
+
     def _aggregate_thread_reaction_state(
         self,
         states: Iterable[Optional[str]],
@@ -4097,6 +4132,11 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._reactions_enabled():
             return
         kanban_state = self._feature_kanban_reaction_state(getattr(event, "feature_summary", None))
+        if outcome == ProcessingOutcome.SUCCESS:
+            kanban_state = self._feature_kanban_completion_state(
+                getattr(event, "feature_summary", None),
+                kanban_state,
+            )
         kanban_emoji = self._feature_kanban_reaction_emoji(kanban_state)
         has_feature_summary = getattr(event, "feature_summary", None) is not None
         messages = await self._processing_reaction_messages(event)
