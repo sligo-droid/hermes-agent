@@ -56,7 +56,96 @@ def configured_project_channel_id(project: object) -> str:
         value = str(project_cfg.get(key) or "").strip()
         if value:
             return value
-    return _mapped_project_channel_id(project_key)
+    mapped = _mapped_project_channel_id(project_key)
+    if mapped:
+        return mapped
+    for key in ("discord_channel_name", "discord_project_channel_name", "project_discord_channel_name"):
+        channel_name = str(project_cfg.get(key) or "").strip()
+        if not channel_name:
+            continue
+        resolved = _resolve_discord_channel_name(
+            channel_name,
+            guild_id=str(project_cfg.get("discord_guild_id") or project_cfg.get("guild_id") or "").strip(),
+            guild_name=str(project_cfg.get("discord_guild_name") or project_cfg.get("guild_name") or "").strip(),
+        )
+        if resolved:
+            return resolved
+    return ""
+
+
+def _resolve_discord_channel_name(channel_name: str, *, guild_id: str = "", guild_name: str = "") -> str:
+    """Resolve a configured Discord channel name such as ``#dev`` to an ID."""
+
+    wanted = _normalize_channel_name(channel_name)
+    if not wanted:
+        return ""
+    token = ""
+    try:
+        from tools.discord_tool import _discord_request, _get_bot_token
+
+        token = _get_bot_token() or ""
+    except Exception as exc:
+        log.debug("self-improvement Discord token lookup failed for channel name %s: %s", channel_name, exc)
+        return ""
+    if not token:
+        return ""
+
+    guild_ids: list[str] = []
+    if guild_id:
+        guild_ids = [guild_id]
+    else:
+        try:
+            guilds = _discord_request("GET", "/users/@me/guilds", token) or []
+        except Exception as exc:
+            log.debug("self-improvement Discord guild lookup failed for channel name %s: %s", channel_name, exc)
+            return ""
+        for guild in guilds if isinstance(guilds, list) else []:
+            if not isinstance(guild, dict):
+                continue
+            if guild_name and _normalize_channel_name(guild.get("name")) != _normalize_channel_name(guild_name):
+                continue
+            candidate = str(guild.get("id") or "").strip()
+            if candidate:
+                guild_ids.append(candidate)
+
+    matches: dict[str, str] = {}
+    for gid in guild_ids:
+        try:
+            channels = _discord_request("GET", f"/guilds/{gid}/channels", token) or []
+        except Exception as exc:
+            log.debug("self-improvement Discord channel lookup failed for guild %s: %s", gid, exc)
+            continue
+        for channel in channels if isinstance(channels, list) else []:
+            if not isinstance(channel, dict):
+                continue
+            if not _is_postable_discord_channel(channel):
+                continue
+            if _normalize_channel_name(channel.get("name")) != wanted:
+                continue
+            cid = str(channel.get("id") or "").strip()
+            if cid:
+                matches[cid] = gid
+    if len(matches) == 1:
+        return next(iter(matches))
+    if len(matches) > 1:
+        log.warning("self-improvement Discord channel name %s matched multiple channels: %s", channel_name, sorted(matches))
+    return ""
+
+
+def _normalize_channel_name(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("#"):
+        text = text[1:]
+    return re.sub(r"[^a-z0-9_-]+", "", text)
+
+
+def _is_postable_discord_channel(channel: dict[str, Any]) -> bool:
+    try:
+        channel_type = int(channel.get("type", 0))
+    except (TypeError, ValueError):
+        return False
+    # Discord text and announcement channels accept normal message posts.
+    return channel_type in {0, 5}
 
 
 def _mapped_project_channel_id(project_key: str) -> str:
