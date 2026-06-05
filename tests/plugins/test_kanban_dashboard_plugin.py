@@ -67,6 +67,72 @@ def client(kanban_home):
     return TestClient(app)
 
 
+def test_self_improvement_project_channel_can_resolve_configured_name(monkeypatch):
+    monkeypatch.setattr(
+        discord_publish,
+        "load_config_readonly",
+        lambda: {
+            "self_improvement": {
+                "projects": {
+                    "hermes": {
+                        "discord_channel_name": "#dev",
+                        "discord_guild_id": "guild-1",
+                    }
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(discord_publish, "_mapped_project_channel_id", lambda project: "")
+
+    from tools import discord_tool
+
+    def fake_request(method, path, token, params=None, body=None, timeout=15):
+        assert token == "bot-token"
+        assert method == "GET"
+        if path == "/guilds/guild-1/channels":
+            return [
+                {"id": "general-id", "name": "general", "type": 0},
+                {"id": "dev-id", "name": "dev", "type": 0},
+            ]
+        raise AssertionError(f"unexpected Discord request: {path}")
+
+    monkeypatch.setattr(discord_tool, "_get_bot_token", lambda: "bot-token")
+    monkeypatch.setattr(discord_tool, "_discord_request", fake_request)
+
+    assert discord_publish.configured_project_channel_id("hermes") == "dev-id"
+
+
+def test_self_improvement_project_channel_name_must_be_unambiguous(monkeypatch):
+    monkeypatch.setattr(
+        discord_publish,
+        "load_config_readonly",
+        lambda: {
+            "self_improvement": {
+                "projects": {
+                    "hermes": {"discord_channel_name": "dev"}
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(discord_publish, "_mapped_project_channel_id", lambda project: "")
+
+    from tools import discord_tool
+
+    def fake_request(method, path, token, params=None, body=None, timeout=15):
+        if path == "/users/@me/guilds":
+            return [{"id": "guild-1"}, {"id": "guild-2"}]
+        if path == "/guilds/guild-1/channels":
+            return [{"id": "dev-1", "name": "dev", "type": 0}]
+        if path == "/guilds/guild-2/channels":
+            return [{"id": "dev-2", "name": "#dev", "type": 0}]
+        raise AssertionError(f"unexpected Discord request: {path}")
+
+    monkeypatch.setattr(discord_tool, "_get_bot_token", lambda: "bot-token")
+    monkeypatch.setattr(discord_tool, "_discord_request", fake_request)
+
+    assert discord_publish.configured_project_channel_id("hermes") == ""
+
+
 # ---------------------------------------------------------------------------
 # GET /board on an empty DB
 # ---------------------------------------------------------------------------
