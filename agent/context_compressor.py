@@ -113,6 +113,9 @@ _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 # become another unbounded transcript copy after the LLM summarizer failed.
 _FALLBACK_SUMMARY_MAX_CHARS = 8_000
 _FALLBACK_TURN_MAX_CHARS = 700
+_EMERGENCY_SUMMARY_MAX_CHARS = 12_000
+_EMERGENCY_TOOL_RESULT_MAX_CHARS = 1_200
+_EMERGENCY_MIN_TAIL_MESSAGES = 3
 
 
 def _coerce_summary_ratio(value: Any) -> float:
@@ -938,6 +941,97 @@ class ContextCompressor(ContextEngine):
                 result[i] = {**msg, "tool_calls": new_tcs}
 
         return result, pruned
+
+    def emergency_shrink(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        target_tokens: int | None = None,
+    ) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+        """Make bounded deterministic progress after normal compression stalls.
+
+        This is intentionally narrower than normal summarizing compression: it
+        preserves message order, roles, tool-call pair structure, and the latest
+        user message, while compacting data that is safe to regenerate from the
+        live environment or already marked as a compaction handoff.
+        """
+        if not messages:
+            return messages, {"tool_results": 0, "summaries": 0}
+
+        stats = {"tool_results": 0, "summaries": 0}
+        result = [m.copy() if isinstance(m, dict) else m for m in messages]
+
+        protect_tail_tokens = max(
+            _LOCAL_FALLBACK_MIN_TAIL_TOKENS,
+            int((target_tokens or self.threshold_tokens) * 0.05),
+        )
+        result, pruned = self._prune_old_tool_results(
+            result,
+            protect_tail_count=_EMERGENCY_MIN_TAIL_MESSAGES,
+            protect_tail_tokens=protect_tail_tokens,
+        )
+        stats["tool_results"] += pruned
+
+        call_id_to_tool: Dict[str, tuple[str, str]] = {}
+        for msg in result:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls") or []:
+                name, args = _extract_tool_call_name_and_args(tc)
+                cid = _extract_tool_call_id(tc)
+                if cid:
+                    call_id_to_tool[cid] = (name, args)
+
+        last_user_idx = self._find_last_user_message_idx(result, 0)
+        for i, msg in enumerate(result):
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+
+            if self._is_context_summary_content(content):
+                text = _content_text_for_contains(content)
+                if len(text) > _EMERGENCY_SUMMARY_MAX_CHARS:
+                    head = text[: _EMERGENCY_SUMMARY_MAX_CHARS - 1200].rstrip()
+                    tail = text[-900:].lstrip()
+                    result[i] = {
+                        **msg,
+                        "content": (
+                            f"{head}\n\n...[older compaction summary shortened during "
+                            f"emergency context shrink]...\n\n{tail}"
+                        ),
+                    }
+                    stats["summaries"] += 1
+                continue
+
+            if msg.get("role") != "tool":
+                continue
+            if i >= last_user_idx >= 0:
+                # Never compact tool results that occurred after the latest
+                # user request; they may be the model's freshest evidence.
+                continue
+            if isinstance(content, list):
+                stripped = _strip_image_parts_from_parts(content)
+                if stripped is not None:
+                    result[i] = {**msg, "content": stripped}
+                    stats["tool_results"] += 1
+                continue
+            if isinstance(content, dict) and content.get("_multimodal"):
+                summary = content.get("text_summary") or "[screenshot removed to save context]"
+                result[i] = {**msg, "content": f"[screenshot removed] {summary[:200]}"}
+                stats["tool_results"] += 1
+                continue
+            if not isinstance(content, str) or len(content) <= _EMERGENCY_TOOL_RESULT_MAX_CHARS:
+                continue
+            call_id = msg.get("tool_call_id", "")
+            tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
+            result[i] = {**msg, "content": _summarize_tool_result(tool_name, tool_args, content)}
+            stats["tool_results"] += 1
+
+        if stats["tool_results"] or stats["summaries"]:
+            result = self._sanitize_tool_pairs(result)
+            result = _strip_historical_media(result)
+            return result, stats
+        return messages, stats
 
     # ------------------------------------------------------------------
     # Summarization

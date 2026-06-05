@@ -50,6 +50,20 @@ def _ra():
     return run_agent
 
 
+def _redact_browser_type_arguments(tool_name: str, arguments: Any) -> Any:
+    """Redact browser_type text in persisted tool-call arguments only."""
+    if tool_name != "browser_type" or not isinstance(arguments, str):
+        return arguments
+    try:
+        parsed = json.loads(arguments)
+    except (TypeError, ValueError):
+        return arguments
+    if not isinstance(parsed, dict) or "text" not in parsed:
+        return arguments
+    parsed = {**parsed, "text": "[REDACTED_BROWSER_INPUT]"}
+    return json.dumps(parsed, ensure_ascii=False)
+
+
 def estimate_request_context_tokens(api_payload: Any) -> int:
     """Estimate context/load tokens from an API payload, dict or messages list.
 
@@ -984,6 +998,10 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
             # sk-...'")`). (#19798)
             if isinstance(tc_dict["function"]["arguments"], str):
                 from agent.redact import redact_sensitive_text
+                tc_dict["function"]["arguments"] = _redact_browser_type_arguments(
+                    tool_call.function.name,
+                    tc_dict["function"]["arguments"],
+                )
                 tc_dict["function"]["arguments"] = redact_sensitive_text(
                     tc_dict["function"]["arguments"]
                 )

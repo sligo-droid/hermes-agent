@@ -227,6 +227,40 @@ def _compression_made_progress(
     return False
 
 
+def _emergency_shrink_context(
+    agent: Any,
+    messages: list[dict[str, Any]],
+    active_system_prompt: str | None,
+    *,
+    original_tokens: int | None,
+    target_tokens: int | None = None,
+) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
+    """Attempt a bounded deterministic shrink after normal compression stalls."""
+    shrink = getattr(getattr(agent, "context_compressor", None), "emergency_shrink", None)
+    if not callable(shrink):
+        return messages, 0, {}
+    try:
+        shrunken, stats = shrink(messages, target_tokens=target_tokens)
+    except Exception as exc:
+        logger.warning("Emergency context shrink failed: %s", exc)
+        return messages, 0, {"failed": 1}
+    if shrunken is messages:
+        return messages, 0, stats or {}
+    shrunken_tokens = _estimate_request_tokens_for_progress(
+        agent,
+        shrunken,
+        active_system_prompt,
+    )
+    if _compression_made_progress(
+        original_len=len(messages),
+        original_tokens=original_tokens,
+        messages=shrunken,
+        compressed_tokens=shrunken_tokens,
+    ):
+        return shrunken, shrunken_tokens, stats or {}
+    return messages, 0, stats or {}
+
+
 def _fmt_token_count(value: int | None) -> str:
     return f"{int(value or 0):,}"
 
@@ -889,7 +923,24 @@ def run_conversation(
                     messages=messages,
                     compressed_tokens=_next_preflight_tokens,
                 ):
-                    break  # Cannot compress further
+                    _shrunken_messages, _shrunken_tokens, _shrink_stats = _emergency_shrink_context(
+                        agent,
+                        messages,
+                        active_system_prompt,
+                        original_tokens=_orig_tokens,
+                        target_tokens=_compressor.threshold_tokens,
+                    )
+                    if _shrunken_tokens:
+                        logger.info(
+                            "Preflight emergency shrink reduced context estimate %s -> %s tokens (stats=%s)",
+                            f"{_orig_tokens:,}",
+                            f"{_shrunken_tokens:,}",
+                            _shrink_stats,
+                        )
+                        messages = _shrunken_messages
+                        _next_preflight_tokens = _shrunken_tokens
+                    else:
+                        break  # Cannot compress further
                 # Compression created a new session — clear the history
                 # reference so _flush_messages_to_session_db writes ALL
                 # compressed messages to the new session's SQLite, not
@@ -3303,17 +3354,53 @@ def run_conversation(
                         restart_with_compressed_messages = True
                         break
                     else:
+                        shrunken_messages, shrunken_tokens, shrink_stats = _emergency_shrink_context(
+                            agent,
+                            messages,
+                            active_system_prompt,
+                            original_tokens=original_tokens,
+                            target_tokens=(new_ctx or getattr(compressor, "threshold_tokens", None)),
+                        )
+                        if shrunken_tokens:
+                            messages = shrunken_messages
+                            agent._buffer_status(
+                                f"🗜️ Emergency context shrink reduced estimate "
+                                f"{_fmt_token_count(original_tokens)} → "
+                                f"{_fmt_token_count(shrunken_tokens)} tokens, retrying..."
+                            )
+                            logger.info(
+                                "%sEmergency context shrink made progress after normal compression stalled: "
+                                "%s -> %s tokens (stats=%s)",
+                                agent.log_prefix,
+                                f"{original_tokens:,}",
+                                f"{shrunken_tokens:,}",
+                                shrink_stats,
+                            )
+                            time.sleep(2)
+                            restart_with_compressed_messages = True
+                            break
                         # Can't compress further and already at minimum tier
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
-                        logger.error(f"{agent.log_prefix}Context length exceeded: {approx_tokens:,} tokens. Cannot compress further.")
+                        logger.error(
+                            "%sContext length exceeded: %s tokens. Normal compression and "
+                            "emergency shrink made no progress (estimated after compression: %s; stats=%s).",
+                            agent.log_prefix,
+                            f"{approx_tokens:,}",
+                            _fmt_token_count(compressed_tokens),
+                            shrink_stats,
+                        )
                         agent._persist_session(messages, conversation_history)
                         return {
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
-                            "error": f"Context length exceeded ({approx_tokens:,} tokens). Cannot compress further.",
+                            "error": (
+                                f"Context length exceeded ({approx_tokens:,} tokens). "
+                                "Normal compression and deterministic emergency shrink made no progress. "
+                                "Try /compress with a focus topic or /new to start a fresh conversation."
+                            ),
                             "partial": True,
                             "failed": True,
                             "compression_exhausted": True,

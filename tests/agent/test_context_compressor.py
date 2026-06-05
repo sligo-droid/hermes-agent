@@ -188,6 +188,47 @@ class TestCompress:
         # original content is present in either case.
         assert msgs[-2]["content"] in result[-2]["content"]
 
+    def test_emergency_shrink_compacts_large_tool_result_in_tail(self, compressor):
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "original ask"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"huge.log"}'},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "x" * 40_000},
+            {"role": "assistant", "content": "I saw the log."},
+            {"role": "user", "content": "latest ask must stay"},
+        ]
+
+        result, stats = compressor.emergency_shrink(msgs, target_tokens=10_000)
+
+        assert result is not msgs
+        assert stats["tool_results"] >= 1
+        assert result[-1] == msgs[-1]
+        assert len(result[3]["content"]) < 500
+        assert "huge.log" in result[3]["content"]
+
+    def test_emergency_shrink_shortens_oversized_context_summary(self, compressor):
+        summary = SUMMARY_PREFIX + "\n" + ("summary detail " * 2000)
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "assistant", "content": summary},
+            {"role": "user", "content": "latest ask"},
+        ]
+
+        result, stats = compressor.emergency_shrink(msgs, target_tokens=10_000)
+
+        assert stats["summaries"] == 1
+        assert result[1]["content"].startswith(SUMMARY_PREFIX)
+        assert len(result[1]["content"]) < len(summary)
+        assert result[-1] == msgs[-1]
+
 
 class TestGenerateSummaryNoneContent:
     """Regression: content=None (from tool-call-only assistant messages) must not crash."""

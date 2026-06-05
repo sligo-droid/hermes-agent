@@ -50,6 +50,7 @@ _DEFAULT_TIMEOUT = 30  # seconds per HTTP request
 _SNAPSHOT_MAX_CHARS = 80_000  # camofox paginates at this limit
 _vnc_url: Optional[str] = None  # cached from /health response
 _vnc_url_checked = False  # only probe once per process
+_BROWSER_INPUT_REDACTION = "[REDACTED_BROWSER_INPUT]"
 
 
 def get_camofox_url() -> str:
@@ -564,7 +565,7 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         )
         return json.dumps({
             "success": True,
-            "typed": text,
+            "typed": _BROWSER_INPUT_REDACTION,
             "element": clean_ref,
         })
     except Exception as e:
@@ -789,6 +790,5 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
         "note": "Console log capture is not available with the Camofox backend. "
                 "Use browser_snapshot or browser_vision to inspect page state.",
     })
-
 
 
