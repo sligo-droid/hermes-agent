@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import {
   AlertTriangle,
@@ -656,12 +656,33 @@ export default function CommandCenterPage() {
     () => snapshot?.work_items.filter((item) => item.source.kind === "self_improvement") ?? [],
     [snapshot],
   );
+  const visibleSelectableIds = useMemo(() => {
+    const visibleItems = {
+      overview: overviewItems,
+      inbox: inboxItems,
+      work: workItems,
+      archive: archivedItems,
+      recommendations,
+      runs: [],
+      sources: [],
+    }[activeView];
+    return visibleItems.map((item) => item.id);
+  }, [activeView, archivedItems, inboxItems, overviewItems, recommendations, workItems]);
   const sources = useMemo(() => snapshot?.sources ?? [], [snapshot]);
   const workItemsById = useMemo(() => new Map((snapshot?.work_items ?? []).map((item) => [item.id, item])), [snapshot]);
   const selectedItems = useMemo(() => [...selectedIds].map((id) => workItemsById.get(id)).filter((item): item is CommandCenterWorkItem => Boolean(item)), [selectedIds, workItemsById]);
+  const selectedVisibleCount = visibleSelectableIds.filter((id) => selectedIds.has(id)).length;
+  const allVisibleSelected = visibleSelectableIds.length > 0 && visibleSelectableIds.every((id) => selectedIds.has(id));
+  const someVisibleSelected = selectedVisibleCount > 0 && !allVisibleSelected;
   const selectionActive = selectedItems.length > 1;
+  const selectAllCheckboxRef = useRef<HTMLInputElement | null>(null);
   const multiSelectActionUnion = useMemo(() => actionSet(selectedItems, "union"), [selectedItems]);
   const multiSelectActionCommon = useMemo(() => actionSet(selectedItems, "common"), [selectedItems]);
+  useEffect(() => {
+    if (selectAllCheckboxRef.current) {
+      selectAllCheckboxRef.current.indeterminate = someVisibleSelected;
+    }
+  }, [someVisibleSelected]);
   const laneCounts = useMemo(() => ({
     overview: overviewItems.length,
     inbox: inboxItems.length + inboxSources.length,
@@ -679,6 +700,17 @@ export default function CommandCenterPage() {
     });
   }, []);
   const clearSelection = useCallback(() => setSelectedIds(new Set()), []);
+  const toggleAllVisible = useCallback(() => {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (allVisibleSelected) {
+        visibleSelectableIds.forEach((id) => next.delete(id));
+      } else {
+        visibleSelectableIds.forEach((id) => next.add(id));
+      }
+      return next;
+    });
+  }, [allVisibleSelected, visibleSelectableIds]);
   const runActionForItem = useCallback(async (kind: ActionKind, item: CommandCenterWorkItem, rejectReason?: string) => {
     const proposalId = item.decision?.proposal_id;
     const board = item.execution?.board;
@@ -757,10 +789,23 @@ export default function CommandCenterPage() {
         </Card>
       ) : (
         <section className="min-w-0">
-          {selectedItems.length > 0 && (
+          {(visibleSelectableIds.length > 0 || selectedItems.length > 0) && (
             <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-slate-300">
-              <span className="rounded-full border border-cyan-100/25 bg-cyan-100/10 px-3 py-1 font-semibold text-cyan-50">{selectedItems.length} selected</span>
-              <button className="rounded-full border border-white/10 px-3 py-1 font-semibold text-slate-300 transition hover:border-white/20 hover:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" onClick={clearSelection} type="button">Clear</button>
+              {visibleSelectableIds.length > 0 && (
+                <label className="inline-flex cursor-pointer items-center gap-2 rounded-full border border-white/10 px-3 py-1 font-semibold text-slate-300 transition hover:border-white/20 hover:bg-white/[0.06] focus-within:ring-2 focus-within:ring-white/20">
+                  <input
+                    ref={selectAllCheckboxRef}
+                    aria-label={allVisibleSelected ? "Clear visible selection" : "Select all visible work items"}
+                    checked={allVisibleSelected}
+                    className="h-3.5 w-3.5 rounded border-white/20 bg-slate-950 text-cyan-300 accent-cyan-300"
+                    onChange={toggleAllVisible}
+                    type="checkbox"
+                  />
+                  {allVisibleSelected ? "All visible selected" : "Select all"}
+                </label>
+              )}
+              {selectedItems.length > 0 && <span className="rounded-full border border-cyan-100/25 bg-cyan-100/10 px-3 py-1 font-semibold text-cyan-50">{selectedItems.length} selected</span>}
+              {selectedItems.length > 0 && <button className="rounded-full border border-white/10 px-3 py-1 font-semibold text-slate-300 transition hover:border-white/20 hover:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" onClick={clearSelection} type="button">Clear</button>}
             </div>
           )}
           {activeView === "overview" && (
