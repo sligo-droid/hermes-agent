@@ -92,6 +92,31 @@ def test_self_improvement_discord_channel_lookup_falls_back_to_project_mapping(m
     assert closed == [True, True]
 
 
+def test_self_improvement_discord_channel_lookup_falls_back_to_channel_cwd(monkeypatch):
+    monkeypatch.setattr(
+        discord_publish,
+        "load_config_readonly",
+        lambda: {
+            "self_improvement": {"projects": {"hermes": {}}},
+            "discord": {"channel_cwds": {"1504252294495998043": "/home/droid/hermes"}},
+        },
+    )
+
+    assert discord_publish.configured_project_channel_id("hermes") == "1504252294495998043"
+    assert discord_publish._project_context(
+        {"project": "hermes", "prong": "daily-retrospective"},
+        "1504252294495998043",
+    ) == {
+        "project_name": "hermes",
+        "project_path": "/home/droid/hermes",
+        "project_channel_id": "1504252294495998043",
+        "project_mapping_source": "configured_channel_cwd",
+        "project_mapping_resolved": True,
+        "self_improvement_project": "hermes",
+        "self_improvement_prong": "daily-retrospective",
+    }
+
+
 def test_self_improvement_discord_initial_reaction_url_encodes_unicode(monkeypatch):
     from tools import discord_tool
 

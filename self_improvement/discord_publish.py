@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 from hermes_cli.config import load_config_readonly
@@ -56,7 +57,34 @@ def configured_project_channel_id(project: object) -> str:
         value = str(project_cfg.get(key) or "").strip()
         if value:
             return value
-    return _mapped_project_channel_id(project_key)
+    mapped = _mapped_project_channel_id(project_key)
+    if mapped:
+        return mapped
+    channel_cwd = _channel_cwd_project_channel_id(project_key, cfg)
+    if channel_cwd:
+        return channel_cwd
+    return ""
+
+
+def _channel_cwd_project_channel_id(project_key: str, cfg: dict[str, Any]) -> str:
+    wanted = _normalize_project_key(project_key)
+    if not wanted:
+        return ""
+    discord_cfg = cfg.get("discord") if isinstance(cfg, dict) else None
+    channel_cwds = discord_cfg.get("channel_cwds") if isinstance(discord_cfg, dict) else None
+    if not isinstance(channel_cwds, dict):
+        return ""
+    matches: dict[str, str] = {}
+    for channel_id, cwd in channel_cwds.items():
+        if _normalize_project_key(Path(str(cwd or "")).name) == wanted:
+            value = str(channel_id or "").strip()
+            if value:
+                matches[value] = value
+    if len(matches) == 1:
+        return next(iter(matches.values()))
+    if len(matches) > 1:
+        log.debug("self-improvement project %s matches multiple Discord channel cwd entries: %s", project_key, sorted(matches))
+    return ""
 
 
 def _mapped_project_channel_id(project_key: str) -> str:
@@ -256,6 +284,8 @@ def _initial_request(card: dict[str, Any]) -> str:
 def _project_context(card: dict[str, Any], channel_id: str) -> dict[str, Any]:
     project = str(card.get("project") or "self-improvement").strip()
     mapping = _project_mapping_for_key(project)
+    if not mapping:
+        mapping = _channel_cwd_project_mapping(project, channel_id)
     context = {
         "project_name": str(mapping.get("project_name") or project),
         "project_path": mapping.get("project_path"),
@@ -267,6 +297,30 @@ def _project_context(card: dict[str, Any], channel_id: str) -> dict[str, Any]:
         "self_improvement_prong": str(card.get("prong") or ""),
     }
     return {key: value for key, value in context.items() if value is not None}
+
+
+def _channel_cwd_project_mapping(project_key: str, channel_id: str) -> dict[str, Any]:
+    try:
+        cfg = load_config_readonly()
+    except Exception as exc:
+        log.debug("self-improvement Discord channel cwd lookup failed: %s", exc)
+        return {}
+    discord_cfg = cfg.get("discord") if isinstance(cfg, dict) else None
+    channel_cwds = discord_cfg.get("channel_cwds") if isinstance(discord_cfg, dict) else None
+    if not isinstance(channel_cwds, dict):
+        return {}
+    cwd = channel_cwds.get(str(channel_id or ""))
+    if cwd is None:
+        return {}
+    project_path = str(cwd or "").strip()
+    if _normalize_project_key(Path(project_path).name) != _normalize_project_key(project_key):
+        return {}
+    return {
+        "project_name": str(project_key or Path(project_path).name),
+        "project_path": project_path,
+        "channel_id": str(channel_id or ""),
+        "source": "configured_channel_cwd",
+    }
 
 
 def _acceptance_criteria(card: dict[str, Any]) -> list[str]:
