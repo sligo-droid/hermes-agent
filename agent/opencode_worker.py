@@ -7,10 +7,12 @@ import os
 import queue
 import re
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -603,6 +605,8 @@ def _run_opencode_once(
         if cfg.get("isolated_config")
         else None
     )
+    run_nonce = f"hermes-{uuid.uuid4().hex[:12]}"
+    run_title = f"{title} [{run_nonce}]" if title else f"Hermes worker [{run_nonce}]"
     cmd = [
         binary_or_error,
         "run",
@@ -621,13 +625,14 @@ def _run_opencode_once(
         cmd.extend(["--model", str(cfg["model"])])
     if reasoning_level:
         cmd.extend(["--variant", reasoning_level])
-    if title:
-        cmd.extend(["--title", title])
+    cmd.extend(["--title", run_title])
     if cfg.get("dangerously_skip_permissions"):
         cmd.append("--dangerously-skip-permissions")
     if brief_path is not None:
         cmd.extend(["--file", str(brief_path)])
 
+    process_env = _opencode_process_env(config_home)
+    run_started_ms = int(time.time() * 1000)
     try:
         configured_startup_timeout = float(
             cfg.get("startup_timeout_seconds")
@@ -644,7 +649,7 @@ def _run_opencode_once(
             timeout=timeout,
             startup_timeout=startup_timeout,
             workdir=workdir,
-            env=_opencode_process_env(config_home),
+            env=process_env,
         )
     except Exception as exc:
         return OpenCodeRunResult(error=f"OpenCode {agent} run failed to start: {exc}")
@@ -690,10 +695,24 @@ def _run_opencode_once(
             else:
                 result.error = f"OpenCode {agent} run timed out after {timeout:g}s."
     if proc.returncode == 0 and result.error is None and not result.final_text.strip():
-        result.final_text = _load_final_text_from_export(
-            binary_or_error,
-            result.thread_id or _last_session_id(result.events),
-        )
+        session_id = result.thread_id or _last_session_id(result.events)
+        if (
+            not session_id
+            and not result.events
+            and not (proc.stdout or "").strip()
+            and not (proc.stderr or "").strip()
+        ):
+            session_id = _discover_recent_opencode_session_id(
+                env=process_env,
+                title_nonce=run_nonce,
+                workspace=workdir,
+                agent=agent,
+                model=str(cfg.get("model") or ""),
+                started_ms=run_started_ms,
+            )
+        if session_id:
+            result.thread_id = session_id
+            result.final_text = _load_final_text_from_export(binary_or_error, session_id)
     if proc.returncode != 0 and result.error is None:
         result.error = _classify_opencode_error(
             result.stdout,
@@ -882,6 +901,91 @@ def _load_final_text_from_export(binary: str, session_id: Optional[str]) -> str:
     if proc.returncode != 0:
         return ""
     return _parse_opencode_export_text(proc.stdout)
+
+
+def _discover_recent_opencode_session_id(
+    *,
+    env: Optional[dict[str, str]],
+    title_nonce: str,
+    workspace: str,
+    agent: str,
+    model: str,
+    started_ms: int,
+) -> Optional[str]:
+    """Find a just-created OpenCode session using safe session metadata only."""
+    if not title_nonce:
+        return None
+    db_path = _opencode_data_root(env) / "opencode" / "opencode.db"
+    if not db_path.is_file():
+        return None
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, title, directory, agent, model, time_created
+            FROM session
+            WHERE title LIKE ? AND time_created >= ?
+            ORDER BY time_created DESC
+            LIMIT 5
+            """,
+            (f"%{title_nonce}%", max(0, started_ms - 5000)),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+    matches: list[tuple[str, int]] = []
+    for session_id, title, directory, session_agent, session_model, created in rows:
+        if title_nonce not in str(title or ""):
+            continue
+        if directory and str(Path(str(directory)).expanduser()) != workspace:
+            continue
+        if session_agent and str(session_agent) != agent:
+            continue
+        if session_model and not _opencode_session_model_matches(str(session_model), model):
+            continue
+        try:
+            created_ms = int(created)
+        except (TypeError, ValueError):
+            created_ms = 0
+        matches.append((str(session_id), created_ms))
+
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item[1], reverse=True)
+    return matches[0][0]
+
+
+def _opencode_data_root(env: Optional[dict[str, str]]) -> Path:
+    source = env if env is not None else os.environ
+    xdg_data = source.get("XDG_DATA_HOME")
+    if xdg_data:
+        return Path(xdg_data).expanduser()
+    home = source.get("HOME") or str(Path.home())
+    return Path(home).expanduser() / ".local" / "share"
+
+
+def _opencode_session_model_matches(stored: str, requested: str) -> bool:
+    requested = (requested or "").strip()
+    if not requested:
+        return True
+    if stored == requested:
+        return True
+    try:
+        parsed = json.loads(stored)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    provider = str(parsed.get("providerID") or parsed.get("provider") or "").strip()
+    model_id = str(parsed.get("id") or parsed.get("model") or "").strip()
+    return bool(provider and model_id and requested == f"{provider}/{model_id}")
 
 
 def _parse_opencode_export_text(stdout: str) -> str:

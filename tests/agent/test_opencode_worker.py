@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +33,44 @@ def _process_result(stdout: str = "", stderr: str = "", returncode: int = 0, **o
     }
     data.update(overrides)
     return ow._OpenCodeProcessResult(**data)
+
+
+def _write_session_metadata(
+    data_home: Path,
+    *,
+    session_id: str,
+    title: str,
+    directory: Path,
+    agent: str = "build",
+    model: str = '{"id":"gpt-5.5","providerID":"hermes-codex","variant":"xhigh"}',
+    time_created: int = 1_700_000_000_000,
+):
+    db_path = data_home / "opencode" / "opencode.db"
+    db_path.parent.mkdir(parents=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE session (
+                id text PRIMARY KEY,
+                title text NOT NULL,
+                directory text NOT NULL,
+                agent text,
+                model text,
+                time_created integer NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO session (id, title, directory, agent, model, time_created)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, title, str(directory), agent, model, time_created),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def test_simple_task_runs_build_only(monkeypatch, tmp_path):
@@ -423,6 +462,106 @@ def test_sparse_json_output_recovers_final_text_from_export(monkeypatch, tmp_pat
     assert result.thread_id == "ses-export"
     export_calls = [cmd for cmd in calls if len(cmd) > 1 and cmd[1] == "export"]
     assert export_calls == [["/bin/opencode", "export", "ses-export"]]
+
+
+def test_no_output_success_recovers_final_text_from_discovered_session(monkeypatch, tmp_path):
+    calls = []
+    data_home = tmp_path / "data"
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+    monkeypatch.setattr(ow.time, "time", lambda: 1_700_000_000.0)
+
+    def fake_process(cmd, **kwargs):
+        calls.append(cmd)
+        title = _option(cmd, "--title")
+        assert title is not None
+        _write_session_metadata(
+            data_home,
+            session_id="ses-discovered",
+            title=title,
+            directory=tmp_path,
+            time_created=1_700_000_000_100,
+        )
+        assert kwargs.get("env") is not None
+        assert kwargs["env"]["XDG_DATA_HOME"] == str(data_home)
+        return _process_result(stdout="", stderr="", returncode=0)
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        if cmd[1] == "export":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "messages": [
+                            {
+                                "info": {"role": "assistant"},
+                                "parts": [{"type": "text", "text": "recovered final"}],
+                            }
+                        ]
+                    }
+                ),
+                stderr="",
+            )
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_process)
+    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+
+    result = ow.run_opencode_single_pass(
+        "say done",
+        str(tmp_path),
+        timeout=60,
+        agent="build",
+        reasoning_level="xhigh",
+        config=_cfg(opencode={"model": "hermes-codex/gpt-5.5"}),
+    )
+
+    assert result.error is None
+    assert result.final_text == "recovered final"
+    assert result.thread_id == "ses-discovered"
+    export_calls = [cmd for cmd in calls if len(cmd) > 1 and cmd[1] == "export"]
+    assert export_calls == [["/bin/opencode", "export", "ses-discovered"]]
+
+
+def test_no_output_success_without_matching_session_does_not_export(monkeypatch, tmp_path):
+    calls = []
+    data_home = tmp_path / "data"
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+    monkeypatch.setattr(ow.time, "time", lambda: 1_700_000_000.0)
+    _write_session_metadata(
+        data_home,
+        session_id="ses-other",
+        title="unrelated title",
+        directory=tmp_path,
+        time_created=1_700_000_000_100,
+    )
+
+    def fake_process(cmd, **_kwargs):
+        calls.append(cmd)
+        return _process_result(stdout="", stderr="", returncode=0)
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        raise AssertionError(f"export should not be called: {cmd}")
+
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_process)
+    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+
+    result = ow.run_opencode_single_pass(
+        "say done",
+        str(tmp_path),
+        timeout=60,
+        agent="build",
+        reasoning_level="xhigh",
+        config=_cfg(opencode={"model": "hermes-codex/gpt-5.5"}),
+    )
+
+    assert result.final_text == ""
+    assert result.thread_id is None
+    assert result.error == "OpenCode completed without producing final text."
+    assert [cmd for cmd in calls if len(cmd) > 1 and cmd[1] == "export"] == []
 
 
 def test_reasoning_levels_are_configurable_by_mode(monkeypatch, tmp_path):
