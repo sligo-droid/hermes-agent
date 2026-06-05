@@ -87,6 +87,15 @@ def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_pat
     assert "kanban_list" not in names
 
 
+def test_auto_heartbeat_interval_stays_below_stale_worker_threshold():
+    """Runtime-activity heartbeats must be comfortably faster than stale reclaim."""
+    from hermes_cli import kanban_db
+    import tools.kanban_tools as kanban_tools
+
+    assert kanban_tools._AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS == 10.0
+    assert kanban_tools._AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS < kanban_db._STALE_HEARTBEAT_GAP_SECONDS
+
+
 def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_path):
     """Task scope wins over profile config for board-routing tools.
 

@@ -228,13 +228,14 @@ def _connect(board: Optional[str] = None):
 # Constraints:
 #   - Best-effort: never raise. The agent loop must not care if the bridge
 #     fails (board missing, DB locked, etc.).
-#   - Rate-limited to one DB write per 60s per-process; runtime activity
-#     can tick on every chunk/tool result and we don't need that resolution.
+#   - Rate-limited to one DB write per 10s per-process; runtime activity
+#     can tick on every chunk/tool result and this must stay comfortably below
+#     the one-minute stale-worker Foreman threshold.
 #   - No-op outside dispatcher-spawned worker context (no ``HERMES_KANBAN_TASK``).
 #   - No durable note on these auto-heartbeats; that's reserved for the
 #     explicit tool which carries a model-supplied note.
 
-_AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
+_AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 10.0
 _auto_heartbeat_last_attempt: float = 0.0
 
 

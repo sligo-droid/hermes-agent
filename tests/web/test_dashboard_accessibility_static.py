@@ -27,7 +27,8 @@ def test_work_state_is_only_command_center_navigation_filter():
 
 def test_command_center_project_tabs_render_above_work_state_and_preserve_lanes():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
-    render_source = source.split("return (", 1)[-1]
+    page_source = source.split("export default function CommandCenterPage", 1)[1]
+    render_source = page_source.split("return (", 1)[1]
 
     assert "Command Center projects" in source
     assert "command-center-project-tabs" in source
@@ -40,13 +41,15 @@ def test_command_center_project_tabs_render_above_work_state_and_preserve_lanes(
     assert "Sligo operator navigation" not in source
 
 
-def test_command_center_worker_and_ticket_links_open_new_tabs():
+def test_command_center_worker_rows_and_ticket_links_open_new_tabs():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
 
-    worker_link_markers = source.count('href={item.execution.worker_url} rel="noopener noreferrer" target="_blank"')
-    ticket_link_markers = source.count('href={item.execution.task_url} rel="noopener noreferrer" target="_blank"')
-    assert worker_link_markers >= 2
-    assert ticket_link_markers >= 2
+    assert 'window.open(workerUrl, "_blank", "noopener,noreferrer")' in card_source
+    assert 'role={workerUrl ? "link" : undefined}' in card_source
+    assert 'tabIndex={workerUrl ? 0 : undefined}' in card_source
+    assert 'href={item.execution.worker_url}' not in card_source
+    assert 'href={item.execution.task_url} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank"' in card_source
 
 
 def test_command_center_archive_action_is_one_click_without_removing_other_prompts():
@@ -73,7 +76,7 @@ def test_command_center_archive_action_renders_last_in_row_rail():
 def test_command_center_row_actions_lock_during_refresh_settle():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
     card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
-    handle_source = source.split("const handleAction = useCallback", 1)[1].split("const selectedWorkId", 1)[0]
+    handle_source = source.split("const handleAction = useCallback", 1)[1].split("return (", 1)[0]
 
     assert "const ACTION_SETTLE_MS = 600" in source
     assert "const actionDisabled = (kind: ActionKind) => Boolean(activeAction) && !actionBusy(kind);" in card_source
@@ -85,17 +88,17 @@ def test_command_center_row_actions_lock_during_refresh_settle():
     assert "if (activeAction) return;" in handle_source
     assert "delayBeforeApplyMs: Math.max(0, ACTION_SETTLE_MS - (Date.now() - startedAt))" in handle_source
     assert "settleAfterApplyMs: ACTION_SETTLE_MS" in handle_source
-    assert "preserveMissingWorkItemId: item.id" in handle_source
+    assert "preserveMissingWorkItemId" not in source
 
 
-def test_command_center_worker_pill_has_no_workers_fallback():
+def test_command_center_worker_url_is_row_action_without_worker_button():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
     card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
-    detail_source = source.split("function DetailPanel", 1)[1].split("function KeyValue", 1)[0]
 
-    assert "item.execution?.worker_url || discordUrl ?" in card_source
-    assert "item.execution?.worker_url &&" in card_source
-    assert "item.execution?.worker_url &&" in detail_source
+    assert "const workerUrl = item.execution?.worker_url || null" in card_source
+    assert "Open worker board for" in card_source
+    assert "Worker <ExternalLink" not in card_source
+    assert "function DetailPanel" not in source
     assert 'href="/workers"' not in card_source
     assert 'to="/workers"' not in card_source
 
@@ -131,7 +134,7 @@ def test_command_center_discord_links_open_new_tabs():
     assert "discord_url" in source
     assert "discord_thread_url" in source
     assert "Open Discord source for" in source
-    assert 'href={discordUrl} rel="noopener noreferrer" target="_blank"' in source
+    assert 'href={discordUrl} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank"' in source
 
 
 def test_modal_behavior_traps_focus_and_restores_safely():

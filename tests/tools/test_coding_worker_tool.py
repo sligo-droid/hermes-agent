@@ -438,6 +438,7 @@ def test_delegate_does_not_add_skill_context_when_parent_has_no_loaded_skills(mo
         "agent.transports.codex_app_server_session.CodexAppServerSession",
         FakeSession,
     )
+    monkeypatch.setattr(cwt, "_load_general_coding_skill", lambda: None)
     parent = _parent(tmp_path)
     parent.ephemeral_system_prompt = "General non-skill instruction."
 

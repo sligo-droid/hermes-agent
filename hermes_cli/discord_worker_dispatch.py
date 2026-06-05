@@ -107,11 +107,27 @@ def _configured_dev_cap(value: object, max_workers_per_board: int) -> int:
     return min(1, max_workers_per_board)
 
 
+def _configured_stale_timeout(value: object = None) -> int:
+    if value is None:
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+            value = (cfg.get("kanban") or {}).get("dispatch_stale_timeout_seconds", 0)
+        except Exception:
+            value = 0
+    try:
+        return max(0, int(str(value or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _dispatch_board(
     board: str,
     *,
     max_spawn: int,
     failure_limit: int,
+    stale_timeout_seconds: int,
     spawn_fn: Optional[Callable],
 ) -> kanban_db.DispatchResult:
     conn = kanban_db.connect(board=board)
@@ -121,6 +137,7 @@ def _dispatch_board(
             board=board,
             max_spawn=max_spawn,
             failure_limit=failure_limit,
+            stale_timeout_seconds=stale_timeout_seconds,
             spawn_fn=spawn_fn,
             additional_spawnable_assignees=dwb.ROLE_ASSIGNEES,
         )
@@ -135,6 +152,7 @@ def dispatch_discord_worker_boards(
     max_workers_per_board: int = 2,
     max_dev_workers_per_board: Optional[int] = None,
     failure_limit: int = kanban_db.DEFAULT_FAILURE_LIMIT,
+    stale_timeout_seconds: Optional[int] = None,
     spawn_fn: Optional[Callable] = None,
 ) -> list[tuple[str, Optional[kanban_db.DispatchResult]]]:
     """Run one Discord worker-board dispatch pass.
@@ -147,6 +165,7 @@ def dispatch_discord_worker_boards(
     max_global_workers = _coerce_positive_int(max_global_workers, 8)
     max_workers_per_board = _coerce_positive_int(max_workers_per_board, 2)
     max_dev_workers_per_board = _configured_dev_cap(max_dev_workers_per_board, max_workers_per_board)
+    configured_stale_timeout = _configured_stale_timeout(stale_timeout_seconds)
     if spawn_fn is None:
         from hermes_cli.kanban_codex_workers import spawn_or_default
 
@@ -216,6 +235,7 @@ def dispatch_discord_worker_boards(
                 board,
                 max_spawn=max_spawn,
                 failure_limit=failure_limit,
+                stale_timeout_seconds=configured_stale_timeout,
                 spawn_fn=spawn_fn,
             )
             if result.spawned:

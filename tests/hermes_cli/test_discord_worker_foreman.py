@@ -174,7 +174,10 @@ def test_worker_errored_detector_uses_latest_failed_run_only():
 
 
 def test_stale_running_detector_flags_missing_and_old_heartbeat():
-    from hermes_cli.discord_worker_foreman import TaskSnapshot, detect_stale_running
+    from hermes_cli import discord_worker_foreman as foreman
+    from hermes_cli.discord_worker_foreman import RunSnapshot, TaskSnapshot, detect_stale_running
+
+    assert foreman.STALE_RUNNING_SECONDS == 30
 
     missing = TaskSnapshot(
         id="missing",
@@ -193,6 +196,24 @@ def test_stale_running_detector_flags_missing_and_old_heartbeat():
         created_at=1,
         started_at=10,
         last_heartbeat_at=1000,
+        latest_run=RunSnapshot(
+            id=7,
+            status="running",
+            outcome="",
+            started_at=10,
+            ended_at=None,
+            last_heartbeat_at=1000,
+            error="still running",
+        ),
+        sidecar={
+            "updated_at": 4900,
+            "events": [{"method": "item/completed"}],
+            "tool_trace": [
+                {"tool": "bash", "command": "token=abc123 /tmp/private"},
+                {"tool": "patch", "status": "done"},
+            ],
+            "result": {"error": "timeout with sk-abcdefghijklmnopqrstuvwxyz1234567890", "timed_out": True},
+        },
     )
     fresh = TaskSnapshot(
         id="fresh",
@@ -201,7 +222,7 @@ def test_stale_running_detector_flags_missing_and_old_heartbeat():
         status="running",
         created_at=1,
         started_at=10,
-        last_heartbeat_at=4500,
+        last_heartbeat_at=4970,
     )
     young_missing = TaskSnapshot(
         id="young-missing",
@@ -209,7 +230,7 @@ def test_stale_running_detector_flags_missing_and_old_heartbeat():
         assignee="dev",
         status="running",
         created_at=4500,
-        started_at=4900,
+        started_at=4970,
         last_heartbeat_at=None,
     )
 
@@ -219,6 +240,20 @@ def test_stale_running_detector_flags_missing_and_old_heartbeat():
     )
 
     assert [issue.task_id for issue in issues] == ["missing", "old"]
+    old_evidence = next(issue.evidence for issue in issues if issue.task_id == "old")
+    assert old_evidence["source_board"] == "discord-123"
+    assert old_evidence["source_task_id"] == "old"
+    assert old_evidence["source_public_board_url"] == "https://example.test/workers/123"
+    assert old_evidence["source_public_ticket_url"].endswith("/tickets/old")
+    assert old_evidence["latest_run_id"] == 7
+    assert old_evidence["latest_run_status"] == "running"
+    assert old_evidence["latest_run_error"] == "still running"
+    assert old_evidence["sidecar_updated_at"] == 4900
+    assert old_evidence["sidecar_event_count"] == 1
+    assert old_evidence["sidecar_timed_out"] is True
+    evidence_text = json.dumps(old_evidence)
+    assert "sk-abcdefghijklmnopqrstuvwxyz1234567890" not in evidence_text
+    assert "/tmp/private" not in evidence_text
 
 
 def test_coalesce_foreman_issues_suppresses_active_same_source_board(monkeypatch):
@@ -927,6 +962,66 @@ def test_collect_foreman_issues_reads_board_task_run_and_sidecar(monkeypatch, tm
     assert "/tmp/private" not in evidence_text
     assert "token=abc123" not in evidence_text
     assert plain_sk_token not in evidence_text
+
+
+def test_build_board_snapshot_refreshes_stale_run_summary(monkeypatch, tmp_path):
+    board = _discord_board(monkeypatch, tmp_path)
+    from hermes_cli import kanban_db
+    from hermes_cli import discord_worker_foreman as foreman
+
+    task_id = _create_done_task(board)
+    stale_summary = {
+        "board": board,
+        "generated_at": 1,
+        "goal_status": "active",
+        "phase": "planning",
+        "thread_state": "running",
+        "task_counts": {"running": 1},
+    }
+    refreshed_summary = {
+        "board": board,
+        "generated_at": 2,
+        "goal_status": "done",
+        "phase": "complete",
+        "thread_state": "done",
+        "task_counts": {"done": 1},
+    }
+    worker = _update_worker_meta(board, goal_status="done", phase="complete", updated_at=2)
+    monkeypatch.setattr(foreman, "read_board_run_summary", lambda _board: stale_summary)
+    monkeypatch.setattr(foreman, "persist_board_run_summary", lambda _board: refreshed_summary)
+    monkeypatch.setattr(foreman, "board_thread_state", lambda _board: "done")
+
+    snapshot = foreman._build_board_snapshot(board, worker)
+
+    assert snapshot.run_summary == refreshed_summary
+    assert [task.id for task in snapshot.tasks] == [task_id]
+
+
+def test_build_board_snapshot_reuses_fresh_run_summary(monkeypatch, tmp_path):
+    board = _discord_board(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_foreman as foreman
+
+    _create_done_task(board)
+    fresh_summary = {
+        "board": board,
+        "generated_at": 2,
+        "goal_status": "done",
+        "phase": "complete",
+        "thread_state": "done",
+        "task_counts": {"done": 1},
+    }
+    worker = _update_worker_meta(board, goal_status="done", phase="complete", updated_at=2)
+    monkeypatch.setattr(foreman, "read_board_run_summary", lambda _board: fresh_summary)
+    monkeypatch.setattr(
+        foreman,
+        "persist_board_run_summary",
+        lambda _board: (_ for _ in ()).throw(AssertionError("fresh summary should be reused")),
+    )
+    monkeypatch.setattr(foreman, "board_thread_state", lambda _board: "done")
+
+    snapshot = foreman._build_board_snapshot(board, worker)
+
+    assert snapshot.run_summary == fresh_summary
 
 
 def test_duplicate_resolved_db_paths_are_scanned_once(monkeypatch, tmp_path):
