@@ -2009,7 +2009,7 @@ DEFAULT_CONFIG = {
         # auto-reclaimed to ``ready`` on the next dispatcher tick. The
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
-        "dispatch_stale_timeout_seconds": 14400,
+        "dispatch_stale_timeout_seconds": 60,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

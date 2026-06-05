@@ -94,6 +94,55 @@ def _write_pool_auth(hermes_home: Path, entries: list[dict]) -> None:
     )
 
 
+def test_coding_worker_activity_heartbeat_rate_limits_and_uses_run_id(monkeypatch):
+    from hermes_cli import kanban_codex_worker as worker
+
+    calls: list[tuple[str, int | None]] = []
+
+    class Conn:
+        def close(self):
+            pass
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t1")
+    monkeypatch.setattr(worker.kanban_db, "connect", lambda board=None: Conn())
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "claimer-lock")
+    monkeypatch.setattr(
+        worker.kanban_db,
+        "heartbeat_claim",
+        lambda conn, task_id, claimer=None: calls.append(("claim", claimer)) or True,
+    )
+    monkeypatch.setattr(
+        worker.kanban_db,
+        "heartbeat_worker",
+        lambda conn, task_id, note=None, expected_run_id=None: calls.append(("worker", expected_run_id)) or True,
+    )
+    monkeypatch.setattr(worker.time, "monotonic", lambda: 100.0)
+    worker._last_activity_heartbeat_at.clear()
+
+    worker._heartbeat_worker_activity("t1", board="b1")
+    worker._heartbeat_worker_activity("t1", board="b1")
+
+    assert calls == [("claim", "claimer-lock"), ("worker", 42)]
+
+    worker._heartbeat_worker_activity("t1", board="b1", force=True)
+    assert calls == [
+        ("claim", "claimer-lock"),
+        ("worker", 42),
+        ("claim", "claimer-lock"),
+        ("worker", 42),
+    ]
+
+
+def test_coding_worker_activity_heartbeat_is_best_effort(monkeypatch):
+    from hermes_cli import kanban_codex_worker as worker
+
+    worker._last_activity_heartbeat_at.clear()
+    monkeypatch.setattr(worker.kanban_db, "connect", lambda board=None: (_ for _ in ()).throw(RuntimeError("db locked")))
+
+    worker._heartbeat_worker_activity("t1", board="b1", force=True)
+
+
 def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_workers as workers
     from hermes_cli import discord_worker_read

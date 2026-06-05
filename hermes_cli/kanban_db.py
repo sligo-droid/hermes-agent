@@ -118,7 +118,7 @@ DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 # bridges chunk-level liveness into ``last_heartbeat_at`` via #31752,
 # so any genuinely active worker keeps its heartbeat fresh as a side
 # effect of normal API traffic.
-DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60 * 60
+DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS = 60
 
 
 def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
@@ -3095,12 +3095,13 @@ def claim_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
+                   last_heartbeat_at = ?,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, now, task_id),
         )
         if cur.rowcount != 1:
             return None
@@ -3116,8 +3117,8 @@ def claim_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                last_heartbeat_at, started_at
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -3126,6 +3127,7 @@ def claim_task(
                 lock,
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
+                now,
                 now,
             ),
         )
@@ -3171,12 +3173,13 @@ def claim_review_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
+                   last_heartbeat_at = ?,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, now, task_id),
         )
         if cur.rowcount != 1:
             return None
@@ -3190,8 +3193,8 @@ def claim_review_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                last_heartbeat_at, started_at
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -3200,6 +3203,7 @@ def claim_review_task(
                 lock,
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
+                now,
                 now,
             ),
         )
@@ -3265,8 +3269,8 @@ def release_stale_claims(
 
     Backstop (#29747 gap 3): if the worker's PID is still alive but its
     ``last_heartbeat_at`` is stale by more than
-    ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (1h), the worker has
-    been making no observable progress and we reclaim anyway — even if
+    ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (60s by default), the worker
+    has been making no observable progress and we reclaim anyway — even if
     ``_pid_alive`` is still true. This catches the wedged-in-a-logic-loop
     case where the process is technically running but accomplishing
     nothing. ``_touch_activity`` (run_agent.py) bridges chunk-level
@@ -3282,23 +3286,27 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, worker_unit, claim_expires, last_heartbeat_at "
-        "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?",
+        "SELECT t.id, t.claim_lock, t.worker_pid, t.worker_unit, t.claim_expires, "
+        "       t.current_run_id, "
+        "       t.last_heartbeat_at, COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' AND t.claim_expires IS NOT NULL "
+        "  AND t.claim_expires < ?",
         (now,),
     ).fetchall()
     for row in stale:
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
         hb = row["last_heartbeat_at"]
-        # Heartbeat staleness backstop: if we have a heartbeat at all
-        # and it's older than the max-stale threshold, the worker is
-        # not making observable progress.  Reclaim instead of extending,
-        # even if the PID is still alive (it's likely in a logic loop).
+        # Heartbeat staleness backstop: old heartbeats, and legacy NULL
+        # heartbeats whose active run started too long ago, are not making
+        # observable progress. Reclaim instead of extending a live PID.
+        hb_anchor = hb if hb is not None else row["active_started_at"]
+        heartbeat_age = (now - int(hb_anchor)) if hb_anchor is not None else None
         heartbeat_stale = (
-            hb is not None
-            and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+            heartbeat_age is not None
+            and heartbeat_age > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         )
         if (
             host_local
@@ -3337,6 +3345,7 @@ def release_stale_claims(
                             if row["last_heartbeat_at"] is not None
                             else None
                         ),
+                        "heartbeat_age_seconds": heartbeat_age,
                     },
                     run_id=run_id,
                 )
@@ -3344,7 +3353,7 @@ def release_stale_claims(
 
         if host_local and row["worker_unit"]:
             unit_status = _systemd_unit_status(row["worker_unit"])
-            if unit_status.active:
+            if unit_status.active and not heartbeat_stale:
                 new_expires = now + _resolve_claim_ttl_seconds()
                 pid = unit_status.pid
                 with write_txn(conn):
@@ -3377,22 +3386,61 @@ def release_stale_claims(
                             if row["last_heartbeat_at"] is not None
                             else None
                         ),
+                        "heartbeat_age_seconds": heartbeat_age,
                     }
                     _append_event(
                         conn, row["id"], "claim_extended", payload, run_id=run_id,
                     )
                 continue
 
-        termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
-        )
+        payload = {
+            "stale_lock": row["claim_lock"],
+            "worker_pid": (
+                int(row["worker_pid"])
+                if row["worker_pid"] is not None else None
+            ),
+            "worker_unit": _normalize_systemd_unit_ref(row["worker_unit"]),
+            "claim_expires": int(row["claim_expires"]),
+            "last_heartbeat_at": (
+                int(row["last_heartbeat_at"])
+                if row["last_heartbeat_at"] is not None else None
+            ),
+            "now": now,
+            "host_local": host_local,
+            "heartbeat_stale": bool(heartbeat_stale),
+            "heartbeat_age_seconds": heartbeat_age,
+        }
         with write_txn(conn):
+            guard = conn.execute(
+                "UPDATE tasks SET claim_expires = claim_expires "
+                "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
+                "AND current_run_id IS ? "
+                "AND claim_expires IS NOT NULL AND claim_expires < ? "
+                "AND ((last_heartbeat_at IS NULL AND ? IS NULL) OR last_heartbeat_at = ?)",
+                (
+                    row["id"],
+                    row["claim_lock"],
+                    row["current_run_id"],
+                    now,
+                    row["last_heartbeat_at"],
+                    row["last_heartbeat_at"],
+                ),
+            )
+            if guard.rowcount != 1:
+                continue
+            termination = _terminate_reclaimed_worker(
+                row["worker_pid"],
+                row["claim_lock"],
+                worker_unit=row["worker_unit"],
+                signal_fn=signal_fn,
+            )
+            payload.update(termination)
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
+                "AND current_run_id IS ?",
+                (row["id"], row["claim_lock"], row["current_run_id"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -3400,25 +3448,8 @@ def release_stale_claims(
                 conn, row["id"],
                 outcome="reclaimed", status="reclaimed",
                 error=f"stale_lock={row['claim_lock']}",
-                metadata=termination,
+                metadata=payload,
             )
-            payload = {
-                "stale_lock": row["claim_lock"],
-                "worker_pid": (
-                    int(row["worker_pid"])
-                    if row["worker_pid"] is not None else None
-                ),
-                "worker_unit": _normalize_systemd_unit_ref(row["worker_unit"]),
-                "claim_expires": int(row["claim_expires"]),
-                "last_heartbeat_at": (
-                    int(row["last_heartbeat_at"])
-                    if row["last_heartbeat_at"] is not None else None
-                ),
-                "now": now,
-                "host_local": host_local,
-                "heartbeat_stale": bool(heartbeat_stale),
-            }
-            payload.update(termination)
             _append_event(
                 conn, row["id"], "reclaimed",
                 payload,
@@ -5393,11 +5424,9 @@ def enforce_max_runtime(
     return timed_out
 
 
-# Heartbeat staleness heartbeat gap — if a running task hasn't sent a
-# heartbeat in this many seconds it's considered inactive regardless of
-# the ``dispatch_stale_timeout_seconds`` threshold.  Hardcoded at 1 hour
-# to match the original spec (">4h started + no commits in 1h").
-_STALE_HEARTBEAT_GAP_SECONDS = 3600
+# Heartbeat staleness gap: foreman/dispatcher should surface stuck Discord
+# workers in about one minute at the default watcher cadence.
+_STALE_HEARTBEAT_GAP_SECONDS = 60
 
 
 def detect_stale_running(
@@ -5437,7 +5466,8 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.worker_pid, t.worker_unit, t.last_heartbeat_at, "
+        "       t.claim_lock, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -5455,41 +5485,61 @@ def detect_stale_running(
 
         last_hb = row["last_heartbeat_at"]
         hb_age = (now - int(last_hb)) if last_hb is not None else None
-        if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
+        if hb_age is not None and hb_age <= _STALE_HEARTBEAT_GAP_SECONDS:
             continue  # recent heartbeat → still alive
 
         pid = row["worker_pid"]
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
-        # Terminate the worker if it's still host-local.
-        termination = _terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn,
-        )
-
+        payload = {
+            "elapsed_seconds": int(elapsed),
+            "last_heartbeat_at": (
+                int(last_hb) if last_hb is not None else None
+            ),
+            "heartbeat_age_seconds": (
+                int(hb_age) if hb_age is not None else None
+            ),
+            "timeout_seconds": stale_timeout_seconds,
+            "pid": int(pid) if pid else None,
+            "worker_unit": _normalize_systemd_unit_ref(row["worker_unit"]),
+            "claim_lock": row["claim_lock"],
+        }
         with write_txn(conn):
+            guard = conn.execute(
+                "UPDATE tasks SET worker_pid = worker_pid "
+                "WHERE id = ? AND status = 'running' "
+                "AND claim_lock IS ? "
+                "AND current_run_id IS ? "
+                "AND ((last_heartbeat_at IS NULL AND ? IS NULL) OR last_heartbeat_at = ?)",
+                (
+                    tid,
+                    row["claim_lock"],
+                    row["current_run_id"],
+                    last_hb,
+                    last_hb,
+                ),
+            )
+            if guard.rowcount != 1:
+                continue
+            termination = _terminate_reclaimed_worker(
+                pid,
+                lock,
+                worker_unit=row["worker_unit"],
+                signal_fn=signal_fn,
+            )
+            payload.update(termination)
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL, "
                 "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running'",
-                (tid,),
+                "WHERE id = ? AND status = 'running' "
+                "AND claim_lock IS ? "
+                "AND current_run_id IS ?",
+                (tid, row["claim_lock"], row["current_run_id"]),
             )
             if cur.rowcount != 1:
                 continue
-
-            payload = {
-                "elapsed_seconds": int(elapsed),
-                "last_heartbeat_at": (
-                    int(last_hb) if last_hb is not None else None
-                ),
-                "heartbeat_age_seconds": (
-                    int(hb_age) if hb_age is not None else None
-                ),
-                "timeout_seconds": stale_timeout_seconds,
-                "pid": int(pid) if pid else None,
-            }
-            payload.update(termination)
 
             run_id = _end_run(
                 conn, tid,
@@ -5510,7 +5560,7 @@ def detect_stale_running(
         # is dispatcher-side detection of an absent heartbeat; the task is
         # going straight back to ``ready`` for re-dispatch. Counting it as
         # a worker failure would let two legitimately-long-running tasks
-        # (>4h without explicit heartbeat) trip the circuit breaker and
+        # (without explicit heartbeat) trip the circuit breaker and
         # auto-block, even though no worker actually failed. The 'stale'
         # event already lives in task_events for auditability; that's the
         # right surface for "this happened" without conflating with the

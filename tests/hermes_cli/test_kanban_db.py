@@ -518,6 +518,136 @@ def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
         assert "reclaimed" not in kinds
 
 
+def test_claim_seeds_task_and_run_heartbeat(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="seed heartbeat", assignee="a")
+        claimed = kb.claim_task(conn, task_id)
+
+        assert claimed is not None
+        assert claimed.last_heartbeat_at is not None
+        run = kb.latest_run(conn, task_id)
+        assert run is not None
+        assert run.last_heartbeat_at == claimed.last_heartbeat_at
+
+
+def test_review_claim_seeds_task_and_run_heartbeat(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review seed", assignee="a")
+        _set_task_status(conn, task_id, "review")
+
+        claimed = kb.claim_review_task(conn, task_id)
+
+        assert claimed is not None
+        assert claimed.last_heartbeat_at is not None
+        run = kb.latest_run(conn, task_id)
+        assert run is not None
+        assert run.last_heartbeat_at == claimed.last_heartbeat_at
+
+
+def test_stale_claim_with_legacy_null_heartbeat_old_started_reclaims_live_pid(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy null old", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, task_id, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, task_id, 12345)
+        old = int(time.time()) - 120
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, started_at = ?, last_heartbeat_at = NULL WHERE id = ?",
+            (int(time.time()) - 1, old, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ?, last_heartbeat_at = NULL WHERE task_id = ?",
+            (old, task_id),
+        )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+
+        assert reclaimed == 1
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_stale_claim_with_legacy_null_heartbeat_recent_started_extends_live_pid(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy null fresh", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, task_id, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, task_id, 12345)
+        recent = int(time.time()) - 30
+        old_expires = int(time.time()) - 1
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, started_at = ?, last_heartbeat_at = NULL WHERE id = ?",
+            (old_expires, recent, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ?, last_heartbeat_at = NULL WHERE task_id = ?",
+            (recent, task_id),
+        )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+
+        assert reclaimed == 0
+        task = kb.get_task(conn, task_id)
+        assert task.status == "running"
+        assert task.claim_expires > old_expires
+
+
+def test_stale_claim_heartbeat_stale_unit_is_stopped_after_cas(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="stale unit", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, task_id, claimer=f"{host}:worker")
+        kb._set_worker_handle(
+            conn,
+            task_id,
+            kb._SpawnHandle(unit="hermes-kanban-worker-default-t-stale.service"),
+        )
+        old_heartbeat = int(time.time()) - 120
+        old_expires = int(time.time()) - 1
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? WHERE id = ?",
+            (old_expires, old_heartbeat, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET claim_expires = ?, last_heartbeat_at = ? WHERE task_id = ?",
+            (old_expires, old_heartbeat, task_id),
+        )
+        monkeypatch.setattr(
+            _kb,
+            "_systemd_unit_status",
+            lambda _unit: _kb._SystemdUnitStatus(active=True, pid=24680),
+        )
+        stopped: list[str | None] = []
+
+        def fake_terminate(pid, claim_lock, *, worker_unit=None, signal_fn=None):
+            stopped.append(worker_unit)
+            task = kb.get_task(conn, task_id)
+            assert task is not None
+            assert task.status == "running"
+            return {"host_local": True, "unit_stop_attempted": True, "unit_stopped": True}
+
+        monkeypatch.setattr(_kb, "_terminate_reclaimed_worker", fake_terminate)
+
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+
+        assert reclaimed == 1
+        assert stopped == ["hermes-kanban-worker-default-t-stale.service"]
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
 def test_stale_claim_with_active_unit_extends_and_adopts_pid(
     kanban_home, monkeypatch,
 ):
@@ -3527,7 +3657,7 @@ def test_dispatch_review_does_not_claim_ready_tasks(
 # ---------------------------------------------------------------------------
 
 def test_detect_stale_returns_running_task_with_no_heartbeat(kanban_home, monkeypatch):
-    """A task running > timeout with zero heartbeats gets reclaimed as stale."""
+    """A task running >60s with zero heartbeats gets reclaimed as stale."""
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
@@ -3535,31 +3665,29 @@ def test_detect_stale_returns_running_task_with_no_heartbeat(kanban_home, monkey
         kb.claim_task(conn, t)
         kb._set_worker_pid(conn, t, os.getpid())
 
-        # Rewind started_at so the task appears to have been running for 5 hours.
-        five_hours_ago = int(time.time()) - (5 * 3600)
+        old_started = int(time.time()) - 120
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE tasks SET started_at = ? WHERE id = ?", (five_hours_ago, t)
+                "UPDATE tasks SET started_at = ?, last_heartbeat_at = NULL WHERE id = ?", (old_started, t)
             )
             conn.execute(
-                "UPDATE task_runs SET started_at = ? "
+                "UPDATE task_runs SET started_at = ?, last_heartbeat_at = NULL "
                 "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
-                (five_hours_ago, t),
+                (old_started, t),
             )
-        # No heartbeat set — last_heartbeat_at stays NULL.
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
         killed = []
         stale = kb.detect_stale_running(
-            conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: killed.append(s),
+            conn, stale_timeout_seconds=60, signal_fn=lambda p, s: killed.append(s),
         )
-        assert t in stale, "Task with no heartbeat for >4h should be reclaimed"
+        assert t in stale, "Task with no heartbeat for >60s should be reclaimed"
         task = kb.get_task(conn, t)
         assert task.status == "ready"
 
 
 def test_detect_stale_returns_task_with_stale_heartbeat(kanban_home, monkeypatch):
-    """A task running > timeout with a heartbeat older than 1h gets reclaimed."""
+    """A task running > timeout with a heartbeat older than 60s gets reclaimed."""
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
@@ -3567,26 +3695,26 @@ def test_detect_stale_returns_task_with_stale_heartbeat(kanban_home, monkeypatch
         kb.claim_task(conn, t)
         kb._set_worker_pid(conn, t, os.getpid())
 
-        five_hours_ago = int(time.time()) - (5 * 3600)
-        heartbeat_2h_ago = int(time.time()) - (2 * 3600)
+        old_started = int(time.time()) - 120
+        old_heartbeat = int(time.time()) - 90
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET started_at = ?, last_heartbeat_at = ? "
                 "WHERE id = ?",
-                (five_hours_ago, heartbeat_2h_ago, t),
+                (old_started, old_heartbeat, t),
             )
             conn.execute(
-                "UPDATE task_runs SET started_at = ? "
+                "UPDATE task_runs SET started_at = ?, last_heartbeat_at = ? "
                 "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
-                (five_hours_ago, t),
+                (old_started, old_heartbeat, t),
             )
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
         stale = kb.detect_stale_running(
-            conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: None,
+            conn, stale_timeout_seconds=60, signal_fn=lambda p, s: None,
         )
         assert t in stale, (
-            "Task with heartbeat >1h old and started >4h ago should be stale"
+            "Task with heartbeat >60s old and started >60s ago should be stale"
         )
         assert kb.get_task(conn, t).status == "ready"
 
@@ -3600,26 +3728,101 @@ def test_detect_stale_skips_task_with_recent_heartbeat(kanban_home, monkeypatch)
         kb.claim_task(conn, t)
         kb._set_worker_pid(conn, t, os.getpid())
 
-        five_hours_ago = int(time.time()) - (5 * 3600)
+        old_started = int(time.time()) - 120
         heartbeat_now = int(time.time())  # heartbeat just happened
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET started_at = ?, last_heartbeat_at = ? "
                 "WHERE id = ?",
-                (five_hours_ago, heartbeat_now, t),
+                (old_started, heartbeat_now, t),
             )
             conn.execute(
-                "UPDATE task_runs SET started_at = ? "
+                "UPDATE task_runs SET started_at = ?, last_heartbeat_at = ? "
                 "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
-                (five_hours_ago, t),
+                (old_started, heartbeat_now, t),
             )
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
         stale = kb.detect_stale_running(
-            conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: None,
+            conn, stale_timeout_seconds=60, signal_fn=lambda p, s: None,
         )
         assert stale == [], "Task with recent heartbeat should not be reclaimed"
         assert kb.get_task(conn, t).status == "running"
+
+
+def test_detect_stale_skips_heartbeat_at_exact_gap(kanban_home, monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    now = int(time.time())
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="boundary-hb", assignee="worker")
+        kb.claim_task(conn, t)
+        kb._set_worker_pid(conn, t, os.getpid())
+        old_started = now - 120
+        boundary_heartbeat = now - _kb._STALE_HEARTBEAT_GAP_SECONDS
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ?, last_heartbeat_at = ? WHERE id = ?",
+                (old_started, boundary_heartbeat, t),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ?, last_heartbeat_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (old_started, boundary_heartbeat, t),
+            )
+
+        monkeypatch.setattr(_kb.time, "time", lambda: now)
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        stale = kb.detect_stale_running(
+            conn, stale_timeout_seconds=60, signal_fn=lambda p, s: None,
+        )
+
+        assert stale == []
+        assert kb.get_task(conn, t).status == "running"
+
+
+def test_detect_stale_running_stops_unit_after_cas(kanban_home, monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="stale unit detect", assignee="worker")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_handle(
+            conn,
+            t,
+            kb._SpawnHandle(unit="hermes-kanban-worker-default-t-detect.service"),
+        )
+        old_started = int(time.time()) - 120
+        old_heartbeat = int(time.time()) - 90
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ?, last_heartbeat_at = ? WHERE id = ?",
+                (old_started, old_heartbeat, t),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ?, last_heartbeat_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (old_started, old_heartbeat, t),
+            )
+
+        stopped: list[str | None] = []
+
+        def fake_terminate(pid, claim_lock, *, worker_unit=None, signal_fn=None):
+            stopped.append(worker_unit)
+            task = kb.get_task(conn, t)
+            assert task is not None
+            assert task.status == "running"
+            return {"host_local": True, "unit_stop_attempted": True, "unit_stopped": True}
+
+        monkeypatch.setattr(_kb, "_terminate_reclaimed_worker", fake_terminate)
+
+        stale = kb.detect_stale_running(
+            conn, stale_timeout_seconds=60, signal_fn=lambda p, s: None,
+        )
+
+        assert stale == [t]
+        assert stopped == ["hermes-kanban-worker-default-t-detect.service"]
 
 
 def test_detect_stale_skips_recently_started_task(kanban_home, monkeypatch):
@@ -3631,23 +3834,22 @@ def test_detect_stale_skips_recently_started_task(kanban_home, monkeypatch):
         kb.claim_task(conn, t)
         kb._set_worker_pid(conn, t, os.getpid())
 
-        # Started only 1 hour ago — well within the 4h threshold.
-        one_hour_ago = int(time.time()) - 3600
+        recent_started = int(time.time()) - 30
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE tasks SET started_at = ? WHERE id = ?", (one_hour_ago, t)
+                "UPDATE tasks SET started_at = ?, last_heartbeat_at = NULL WHERE id = ?", (recent_started, t)
             )
             conn.execute(
-                "UPDATE task_runs SET started_at = ? "
+                "UPDATE task_runs SET started_at = ?, last_heartbeat_at = NULL "
                 "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
-                (one_hour_ago, t),
+                (recent_started, t),
             )
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
         stale = kb.detect_stale_running(
-            conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: None,
+            conn, stale_timeout_seconds=60, signal_fn=lambda p, s: None,
         )
-        assert stale == [], "Task started <4h ago should not be reclaimed"
+        assert stale == [], "Task started <60s ago should not be reclaimed"
         assert kb.get_task(conn, t).status == "running"
 
 
@@ -3701,7 +3903,7 @@ def test_detect_stale_skips_blocked_tasks(kanban_home, monkeypatch):
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
         stale = kb.detect_stale_running(
-            conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: None,
+            conn, stale_timeout_seconds=60, signal_fn=lambda p, s: None,
         )
         assert stale == [], "Blocked task should not be reclaimed by stale detection"
         assert kb.get_task(conn, t).status == "blocked"
@@ -3712,7 +3914,7 @@ def test_detect_stale_does_not_tick_failure_counter(kanban_home, monkeypatch):
 
     Stale detection is dispatcher-side absence-of-heartbeat detection,
     not a worker failure. Counting it as a failure would let two
-    legitimately-long-running tasks (>4h without explicit heartbeat) trip
+    legitimately-long-running tasks without explicit heartbeat trip
     the circuit breaker and auto-block at the default failure_limit=2,
     even though no worker actually failed. The 'stale' event in
     task_events is the right audit surface; the consecutive_failures
@@ -3725,15 +3927,15 @@ def test_detect_stale_does_not_tick_failure_counter(kanban_home, monkeypatch):
         kb.claim_task(conn, t)
         kb._set_worker_pid(conn, t, os.getpid())
 
-        five_hours_ago = int(time.time()) - (5 * 3600)
+        old_started = int(time.time()) - 120
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE tasks SET started_at = ? WHERE id = ?", (five_hours_ago, t)
+                "UPDATE tasks SET started_at = ?, last_heartbeat_at = NULL WHERE id = ?", (old_started, t)
             )
             conn.execute(
-                "UPDATE task_runs SET started_at = ? "
+                "UPDATE task_runs SET started_at = ?, last_heartbeat_at = NULL "
                 "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
-                (five_hours_ago, t),
+                (old_started, t),
             )
             # Counter starts at 0; assert that's our baseline.
             row = conn.execute(
@@ -3743,7 +3945,7 @@ def test_detect_stale_does_not_tick_failure_counter(kanban_home, monkeypatch):
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
         stale = kb.detect_stale_running(
-            conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: None,
+            conn, stale_timeout_seconds=60, signal_fn=lambda p, s: None,
         )
         assert t in stale, "Task should be reclaimed by stale detection"
 
