@@ -26,6 +26,21 @@ import { cn } from "@/lib/utils";
 
 type ViewKey = "overview" | "inbox" | "work" | "archive" | "runs" | "recommendations" | "sources";
 type ActionKind = "approve" | "reject" | "pause" | "resume" | "undo" | "archive";
+type ActiveAction = { id: string; kind: ActionKind };
+
+const ACTION_SETTLE_MS = 600;
+const ACTION_PROGRESS_LABELS: Record<ActionKind, string> = {
+  approve: "Approving",
+  reject: "Rejecting",
+  pause: "Pausing",
+  resume: "Resuming",
+  undo: "Requesting revert",
+  archive: "Archiving",
+};
+
+function waitForActionSettle(durationMs = ACTION_SETTLE_MS): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, durationMs));
+}
 
 declare global {
   interface Window {
@@ -229,13 +244,14 @@ function WorkItemCard({
   item,
   onAction,
 }: {
-  activeAction: { id: string; kind: ActionKind } | null;
+  activeAction: ActiveAction | null;
   item: CommandCenterWorkItem;
   onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
 }) {
   const proposalId = item.decision?.proposal_id;
   const rowBusy = activeAction?.id === item.id;
   const actionBusy = (kind: ActionKind) => rowBusy && activeAction?.kind === kind;
+  const actionDisabled = (kind: ActionKind) => Boolean(activeAction) && !actionBusy(kind);
   const canApproveReject = Boolean(proposalId && item.status === "proposed");
   const proposalCanArchive = Boolean(proposalId && ["queued", "running", "review", "blocked", "accepted", "paused"].includes(item.status));
   const canPause = Boolean(["queued", "running", "review", "accepted"].includes(item.status) && (proposalId || (item.execution?.pause_action && item.execution.board)) && !item.execution?.paused);
@@ -251,6 +267,7 @@ function WorkItemCard({
   return (
     <article
       aria-label={workerUrl ? `Open worker board for ${item.title}` : undefined}
+      aria-busy={rowBusy || undefined}
       className={cn(
         "command-center-card rounded-2xl border bg-[#08090a]/80 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.025)] transition",
         workerUrl ? "cursor-pointer border-white/10 hover:border-cyan-100/35 hover:bg-cyan-100/[0.045] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/35" : "border-white/10 hover:border-white/20 hover:bg-white/[0.03]",
@@ -292,12 +309,17 @@ function WorkItemCard({
               Ticket <ExternalLink className="h-3.5 w-3.5" /><span className="sr-only">opens in a new tab</span>
             </a>
           )}
-          {canApproveReject && <ActionButton busy={actionBusy("approve")} disabled={rowBusy} kind="approve" onClick={() => onAction("approve", item)} />}
-          {canApproveReject && <ActionButton busy={actionBusy("reject")} disabled={rowBusy} kind="reject" onClick={() => onAction("reject", item)} />}
-          {canResume && <ActionButton busy={actionBusy("resume")} disabled={rowBusy} kind="resume" onClick={() => onAction("resume", item)} />}
-          {canPause && <ActionButton busy={actionBusy("pause")} disabled={rowBusy} kind="pause" onClick={() => onAction("pause", item)} />}
-          {canUndo && <ActionButton busy={actionBusy("undo")} disabled={rowBusy} kind="undo" onClick={() => onAction("undo", item)} />}
-          {canArchive && <ActionButton busy={actionBusy("archive")} disabled={rowBusy} kind="archive" onClick={() => onAction("archive", item)} />}
+          {rowBusy && activeAction && (
+            <span className="inline-flex h-9 items-center gap-2 rounded-full border border-cyan-100/25 bg-cyan-100/10 px-3 text-xs font-semibold text-cyan-50" aria-live="polite">
+              <Spinner /> {ACTION_PROGRESS_LABELS[activeAction.kind]}…
+            </span>
+          )}
+          {canApproveReject && <ActionButton busy={actionBusy("approve")} disabled={actionDisabled("approve")} kind="approve" onClick={() => onAction("approve", item)} />}
+          {canApproveReject && <ActionButton busy={actionBusy("reject")} disabled={actionDisabled("reject")} kind="reject" onClick={() => onAction("reject", item)} />}
+          {canResume && <ActionButton busy={actionBusy("resume")} disabled={actionDisabled("resume")} kind="resume" onClick={() => onAction("resume", item)} />}
+          {canPause && <ActionButton busy={actionBusy("pause")} disabled={actionDisabled("pause")} kind="pause" onClick={() => onAction("pause", item)} />}
+          {canUndo && <ActionButton busy={actionBusy("undo")} disabled={actionDisabled("undo")} kind="undo" onClick={() => onAction("undo", item)} />}
+          {canArchive && <ActionButton busy={actionBusy("archive")} disabled={actionDisabled("archive")} kind="archive" onClick={() => onAction("archive", item)} />}
         </div>
       ) : null}
     </article>
@@ -354,7 +376,7 @@ function WorkList({
   items,
   onAction,
 }: {
-  activeAction: { id: string; kind: ActionKind } | null;
+  activeAction: ActiveAction | null;
   emptyLabel?: string;
   emptyMessage?: string;
   items: CommandCenterWorkItem[];
@@ -381,7 +403,7 @@ function OverviewWorkList({
   items,
   onAction,
 }: {
-  activeAction: { id: string; kind: ActionKind } | null;
+  activeAction: ActiveAction | null;
   emptyMessage?: string;
   items: CommandCenterWorkItem[];
   onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
@@ -420,14 +442,20 @@ export default function CommandCenterPage() {
   const [snapshot, setSnapshot] = useState<CommandCenterSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [activeAction, setActiveAction] = useState<{ id: string; kind: ActionKind } | null>(null);
+  const [activeAction, setActiveAction] = useState<ActiveAction | null>(null);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (options?: { delayBeforeApplyMs?: number; settleAfterApplyMs?: number }) => {
     setLoading(true);
     setError(null);
     try {
       const next = await api.getCommandCenterSnapshot({ includeArchived: true, recentRunLimitPerBoard: 25 });
+      if (options?.delayBeforeApplyMs) {
+        await waitForActionSettle(options.delayBeforeApplyMs);
+      }
       setSnapshot(next);
+      if (options?.settleAfterApplyMs) {
+        await waitForActionSettle(options.settleAfterApplyMs);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -493,6 +521,8 @@ export default function CommandCenterPage() {
     workers: metric(snapshot, "active_runs"),
   }), [archivedItems.length, inboxItems.length, inboxSources.length, overviewItems.length, snapshot, workItems.length]);
   const handleAction = useCallback(async (kind: ActionKind, item: CommandCenterWorkItem) => {
+    if (activeAction) return;
+    const startedAt = Date.now();
     const proposalId = item.decision?.proposal_id;
     const board = item.execution?.board;
     if (kind === "archive" && !proposalId && (!item.execution?.archiveable || !board || board === "default")) return;
@@ -520,13 +550,16 @@ export default function CommandCenterPage() {
         const reason = window.prompt("Reason for revert follow-up?", "Operator requested revert follow-up from Command Center.") || undefined;
         await api.requestSelfImprovementUndoFollowup(proposalId, reason);
       }
-      await refresh();
+      await refresh({
+        delayBeforeApplyMs: Math.max(0, ACTION_SETTLE_MS - (Date.now() - startedAt)),
+        settleAfterApplyMs: ACTION_SETTLE_MS,
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setActiveAction(null);
     }
-  }, [refresh]);
+  }, [activeAction, refresh]);
 
   return (
     <div className="flex flex-col gap-5">
