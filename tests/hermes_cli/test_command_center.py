@@ -175,7 +175,7 @@ def test_snapshot_rolls_named_discord_board_tasks_up_to_board_work_item(tmp_path
     assert item["execution"]["task_id"] is None
     assert item["execution"]["archiveable"] is True
     assert item["execution"]["archive_action"] == f"/api/plugins/kanban/boards/{board}"
-    assert item["execution"]["worker_url"] is None
+    assert item["execution"]["worker_url"] == f"/workers/{board}"
     assert not any(row["id"] == f"kanban:{board}:{task_id}" for row in snapshot["work_items"])
     assert source["kind"] == "discord_thread"
     assert snapshot["metrics"]["discord_origin"] == 1
@@ -409,7 +409,7 @@ def test_worker_board_url_rejects_top_level_public_worker_urls():
     assert command_center._worker_board_url(None, "https://hermes.sligolabs.com/workers/") is None
 
 
-def test_snapshot_worker_url_requires_started_execution_and_named_board(tmp_path, monkeypatch):
+def test_snapshot_worker_url_exposes_named_board_even_before_execution_starts(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     unstarted_board = "discord-worker-not-started"
     started_board = "discord-worker-started"
@@ -451,9 +451,33 @@ def test_snapshot_worker_url_requires_started_execution_and_named_board(tmp_path
     snapshot = command_center.build_command_center_snapshot()
     unstarted_item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{unstarted_board}")
     started_item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{started_board}")
-    assert unstarted_item["execution"]["worker_url"] is None
+    assert unstarted_item["execution"]["worker_url"] == f"/workers/{unstarted_board}"
     assert started_item["execution"]["worker_url"] == f"/workers/{started_board}"
     assert not any(item["id"] == f"kanban:default:{default_task_id}" for item in snapshot["work_items"])
+
+
+def test_snapshot_running_board_without_run_is_still_clickable_and_pauseable(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "discord-running-without-run"
+    kanban_db.write_board_metadata(board, name="Running Without Run")
+
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Running task without run row", board=board)
+        with conn:
+            conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (task_id,))
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+
+    assert item["status"] == "running"
+    assert item["execution"]["board"] == board
+    assert item["execution"]["pause_action"].endswith(f"/{board}/pause")
+    assert item["execution"]["resume_action"].endswith(f"/{board}/resume")
+    assert item["execution"]["archive_action"].endswith(f"/{board}")
+    assert item["execution"]["worker_url"] == f"/workers/{board}"
 
 
 def test_snapshot_skips_internal_default_board_foreman_tasks(tmp_path, monkeypatch):
