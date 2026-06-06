@@ -1074,8 +1074,9 @@ def test_discord_terminal_pr_refresh_requeues_summary_sync(tmp_path, monkeypatch
     worker = kb.read_board_metadata(board.slug)["discord_worker"]
     assert worker["terminal_summary_sync_pending"] is True
     assert worker["board_summary"]["pr"]["checks_status"] == "passed"
-    assert worker["board_summary"]["pr"]["merge_state"] == "MERGED"
+    assert worker["board_summary"]["pr"]["merge_state"] == "merged"
     assert worker["board_summary"]["pr"]["merge_commit"] == "abc123"
+    assert worker["board_summary"]["deployment_status"] == "done"
 
 
 def test_discord_stale_completion_notice_flag_keeps_terminal_target_until_cleared(tmp_path, monkeypatch):

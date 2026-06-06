@@ -66,7 +66,7 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 DEFAULT_REVIEW_LOOP_LIMIT = 5
 FOREMAN_REVIEW_LOOP_LIMIT = 3
-BOARD_RUN_SUMMARY_SCHEMA_VERSION = 2
+BOARD_RUN_SUMMARY_SCHEMA_VERSION = 3
 PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL = "after_review_approval"
 MERGE_POLICY_AUTO = "auto"
 MERGE_POLICY_MANUAL = "manual"
@@ -2782,15 +2782,59 @@ def _board_runtime_breakdown(
     }
 
 
+def _pr_merge_evidence_present(*, state: str, merged_at: str, merge_commit: str) -> bool:
+    return state.upper() == "MERGED" or bool(merged_at or merge_commit)
+
+
+def _normalized_pr_summary_merge_state(
+    *,
+    state: str,
+    merged_at: str,
+    merge_commit: str,
+    merge_state: str,
+) -> str:
+    raw = str(merge_state or "").strip()
+    raw_upper = raw.upper()
+    if _pr_merge_evidence_present(
+        state=state,
+        merged_at=merged_at,
+        merge_commit=merge_commit,
+    ) and raw_upper in {
+        "",
+        "UNKNOWN",
+        "MERGED",
+    }:
+        return "merged"
+    return raw or "unknown"
+
+
+def _deployment_summary_status(worker: dict[str, Any], pr: dict[str, Any]) -> str:
+    explicit = str(worker.get("deployment_status") or "").strip()
+    explicit_lower = explicit.lower()
+    if explicit and explicit_lower not in {"unknown", "not checked", "unchecked"}:
+        return explicit
+    checks_status = str(pr.get("checks_status") or "").strip().lower()
+    if (
+        str(pr.get("merge_state") or "").strip().lower() == "merged"
+        and checks_status in {"passed", "success"}
+        and not str(pr.get("blocker") or pr.get("error") or pr.get("status_error") or "").strip()
+    ):
+        return "done"
+    return explicit or "not checked"
+
+
 def _pr_summary(worker: dict[str, Any]) -> dict[str, Any]:
     checks_status = str(worker.get("pr_checks_status") or "").strip() or "not checked"
     state = str(worker.get("pr_state") or "").strip() or "unknown"
     merged_at = str(worker.get("pr_merged_at") or "").strip()
     merge_commit = str(worker.get("pr_merge_commit") or "").strip()
     merge_state = str(worker.get("pr_merge_state") or "").strip()
-    if not merge_state and (state.upper() == "MERGED" or merged_at or merge_commit):
-        merge_state = "merged"
-    merge_state = merge_state or "unknown"
+    merge_state = _normalized_pr_summary_merge_state(
+        state=state,
+        merged_at=merged_at,
+        merge_commit=merge_commit,
+        merge_state=merge_state,
+    )
     return {
         "url": str(worker.get("pr_url") or "").strip(),
         "number": str(worker.get("pr_number") or "").strip(),
@@ -2841,6 +2885,7 @@ def build_board_run_summary(board: str) -> dict[str, Any]:
         for task in sorted(tasks, key=_task_sort_timestamp, reverse=True)[:20]
     ]
     blocker = _latest_failure_or_blocker(worker, tasks, runs_by_task)
+    pr = _pr_summary(worker)
     summary = {
         "schema_version": BOARD_RUN_SUMMARY_SCHEMA_VERSION,
         "board": board,
@@ -2865,8 +2910,8 @@ def build_board_run_summary(board: str) -> dict[str, Any]:
             "loop_limit": _review_loop_limit_for_worker(worker),
             "final_verdict": _final_reviewer_verdict(tasks, runs_by_task),
         },
-        "pr": _pr_summary(worker),
-        "deployment_status": str(worker.get("deployment_status") or "").strip() or "not checked",
+        "pr": pr,
+        "deployment_status": _deployment_summary_status(worker, pr),
         "verification_commands": _verification_commands(tasks, runs_by_task),
         "final_response": {
             "text": str(worker.get("final_discord_response") or ""),
