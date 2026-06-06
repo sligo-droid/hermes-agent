@@ -304,6 +304,23 @@ def _recover_recorded_role_output_fresh(
     )
 
 
+def recover_recorded_role_outputs_for_running_tasks(conn: Any, *, board: Optional[str]) -> list[str]:
+    """Apply durable role results before dispatcher dead-PID crash accounting."""
+    rows = conn.execute(
+        "SELECT id, assignee, workspace_path FROM tasks "
+        "WHERE status = 'running' AND current_run_id IS NOT NULL"
+    ).fetchall()
+    recovered: list[str] = []
+    for row in rows:
+        role = str(row["assignee"] or "").strip().lower()
+        if role not in {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER, ROLE_FOREMAN}:
+            continue
+        workspace = str(row["workspace_path"] or os.getcwd())
+        if _recover_recorded_role_output_fresh(row["id"], role, board=board, workspace=workspace):
+            recovered.append(row["id"])
+    return recovered
+
+
 def _recorded_result_is_fresh_for_current_run(
     task_id: str,
     *,

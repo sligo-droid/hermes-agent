@@ -6593,6 +6593,13 @@ def dispatch_once(
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
+    if board:
+        try:
+            from hermes_cli.kanban_codex_worker import recover_recorded_role_outputs_for_running_tasks
+
+            recover_recorded_role_outputs_for_running_tasks(conn, board=board)
+        except Exception:
+            pass
     result.crashed = detect_crashed_workers(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the

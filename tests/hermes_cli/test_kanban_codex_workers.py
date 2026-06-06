@@ -1204,6 +1204,70 @@ def test_planner_and_reviewer_auto_remain_xhigh(monkeypatch):
     assert workers._role_runtime_settings("reviewer", {}, task)["reasoning"] == "xhigh"
 
 
+def test_dispatch_recovers_recorded_role_result_before_dead_pid_crash(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+    from hermes_cli.discord_worker_state import record_codex_worker_result
+
+    board = dwb.start_direct_goal(thread_id="recover-review", goal="Review completed result")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Review",
+            assignee=ROLE_REVIEWER,
+            tenant=board.slug,
+            workspace_kind="dir",
+            workspace_path=str(tmp_path / "repo"),
+        )
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+            (999_999_999, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
+            (999_999_999, claimed.current_run_id),
+        )
+        conn.commit()
+        record_codex_worker_result(
+            task_id,
+            board=board.slug,
+            result=SimpleNamespace(
+                backend="codex",
+                final_text=json.dumps(
+                    {
+                        "status": "approved",
+                        "summary": "Reviewer approved.",
+                        "findings": [],
+                        "new_tasks": [],
+                    }
+                ),
+                error=None,
+            ),
+        )
+        monkeypatch.setattr(kanban_db, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(kanban_db, "_classify_worker_exit", lambda _pid: ("unknown", None))
+
+        result = kanban_db.dispatch_once(conn, board=board.slug, max_spawn=0)
+        task = kanban_db.get_task(conn, task_id)
+        runs = kanban_db.list_runs(conn, task_id)
+    finally:
+        conn.close()
+
+    assert result.crashed == []
+    assert result.auto_blocked == []
+    assert task is not None
+    assert task.status == "done"
+    assert task.consecutive_failures == 0
+    assert task.last_failure_error is None
+    assert runs[-1].outcome == "completed"
+    assert runs[-1].summary == "Reviewer approved."
+
+
 def test_opencode_adaptive_dev_reasoning_does_not_override_raw_config(monkeypatch):
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli import config as config_mod
