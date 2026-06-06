@@ -52,6 +52,21 @@ def test_command_center_worker_rows_and_ticket_links_open_new_tabs():
     assert 'href={item.execution.task_url} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank"' in card_source
 
 
+def test_command_center_running_rows_have_live_indicator():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    styles = (ROOT / "web/src/index.css").read_text(encoding="utf-8")
+    card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
+
+    assert "function runningDescriptor" in source
+    assert "function RunningIndicator" in source
+    assert "const running = isRunningWorkItem(item);" in card_source
+    assert "command-center-card-running" in card_source
+    assert "Running work item:" in source
+    assert "command-center-running-chip" in source
+    assert "command-center-live-scan" in styles
+    assert ".sligo-light .command-center-card-running" in styles
+
+
 def test_command_center_archive_action_is_one_click_without_removing_other_prompts():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
     archive_branch = source.split('if (kind === "archive") {', 1)[1].split('} else if (proposalId && kind === "approve")', 1)[0]
@@ -65,12 +80,15 @@ def test_command_center_archive_action_is_one_click_without_removing_other_promp
 
 def test_command_center_archive_action_renders_last_in_row_rail():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    action_source = source.split("function availableActionKinds", 1)[1].split("function actionSet", 1)[0]
     row_rail = source.split('className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3"', 1)[1].split("</div>", 1)[0]
 
-    assert row_rail.index('kind="approve"') < row_rail.index('kind="reject"')
-    assert row_rail.index('kind="resume"') < row_rail.index('kind="archive"')
-    assert row_rail.index('kind="pause"') < row_rail.index('kind="archive"')
-    assert row_rail.index('kind="undo"') < row_rail.index('kind="archive"')
+    assert action_source.index('actions.push("approve", "reject")') < action_source.index('actions.push("archive")')
+    assert action_source.index('actions.push("resume")') < action_source.index('actions.push("archive")')
+    assert action_source.index('actions.push("pause")') < action_source.index('actions.push("archive")')
+    assert action_source.index('actions.push("undo")') < action_source.index('actions.push("archive")')
+    assert "actions.map((kind)" in row_rail
+    assert "kind={kind}" in row_rail
 
 
 def test_command_center_row_actions_lock_during_refresh_settle():
@@ -79,12 +97,12 @@ def test_command_center_row_actions_lock_during_refresh_settle():
     handle_source = source.split("const handleAction = useCallback", 1)[1].split("return (", 1)[0]
 
     assert "const ACTION_SETTLE_MS = 600" in source
-    assert "const actionDisabled = (kind: ActionKind) => Boolean(activeAction) && !actionBusy(kind);" in card_source
+    assert "const actionDisabled = (kind: ActionKind) => (Boolean(activeAction) && !actionBusy(kind)) || (selectionActive && (!selected || !multiSelectActionCommon.has(kind)));" in card_source
     assert "aria-busy={rowBusy || undefined}" in card_source
     assert "<div aria-busy={rowBusy}" in card_source
     assert "aria-live=\"polite\"" in card_source
-    for kind in ("approve", "reject", "resume", "pause", "undo", "archive"):
-        assert f'disabled={{actionDisabled("{kind}")}}' in card_source
+    assert "const disabled = actionDisabled(kind);" in card_source
+    assert "disabled={disabled}" in card_source
     assert "if (activeAction) return;" in handle_source
     assert "delayBeforeApplyMs: Math.max(0, ACTION_SETTLE_MS - (Date.now() - startedAt))" in handle_source
     assert "settleAfterApplyMs: ACTION_SETTLE_MS" in handle_source

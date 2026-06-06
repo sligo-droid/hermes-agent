@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import {
+  Activity,
   AlertTriangle,
   Archive,
   Check,
@@ -309,6 +310,30 @@ function SourceBadge({ source }: { source: CommandCenterSource }) {
   );
 }
 
+function runningDescriptor(item: CommandCenterWorkItem): string {
+  const activeRun = item.runs?.find(runIsActive);
+  const worker = item.execution?.worker_unit || activeRun?.worker_unit || item.execution?.worker_pid || activeRun?.worker_pid;
+  const runId = item.execution?.active_run_id ?? activeRun?.id;
+  if (worker && runId) return `${worker} / run ${runId}`;
+  if (worker) return String(worker);
+  if (runId) return `run ${runId}`;
+  return "active worker";
+}
+
+function RunningIndicator({ detail }: { detail: string }) {
+  return (
+    <span aria-label={`Running work item: ${detail}`} className="command-center-running-chip inline-flex h-7 max-w-full items-center gap-2 rounded-full border border-amber-100/35 bg-amber-200/15 px-2.5 text-[0.63rem] font-bold uppercase tracking-[0.16em] text-amber-50">
+      <span aria-hidden="true" className="relative flex h-2.5 w-2.5 shrink-0">
+        <span className="command-center-running-dot absolute inline-flex h-full w-full rounded-full bg-amber-200/80" />
+        <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-amber-100 shadow-[0_0_12px_rgba(251,191,36,0.8)]" />
+      </span>
+      <Activity aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
+      <span>Running</span>
+      <span className="hidden min-w-0 max-w-[12rem] truncate text-amber-100/70 sm:inline">{detail}</span>
+    </span>
+  );
+}
+
 function discordSourceUrl(source?: CommandCenterSource | null): string | null {
   if (!source || !["discord", "discord_thread"].includes(source.kind)) return null;
   const ref = source.ref || {};
@@ -343,6 +368,8 @@ function WorkItemCard({
   const singleActions = availableActionKinds(item);
   const actions = selected && selectionActive ? [...multiSelectActionUnion] : singleActions;
   const actionDisabled = (kind: ActionKind) => (Boolean(activeAction) && !actionBusy(kind)) || (selectionActive && (!selected || !multiSelectActionCommon.has(kind)));
+  const running = isRunningWorkItem(item);
+  const runningDetail = running ? runningDescriptor(item) : null;
   const disabledTitle = (kind: ActionKind) => {
     if (!selectionActive) return undefined;
     if (!selected) return "Clear selection before acting on this ticket";
@@ -360,9 +387,10 @@ function WorkItemCard({
       aria-label={workerUrl ? `Open worker board for ${item.title}` : undefined}
       aria-busy={rowBusy || undefined}
       className={cn(
-        "command-center-card rounded-2xl border bg-[#08090a]/80 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.025)] transition",
+        "command-center-card relative rounded-2xl border bg-[#08090a]/80 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.025)] transition",
         selected && "command-center-card-selected border-cyan-100/45 bg-cyan-100/[0.055]",
         workerUrl ? "cursor-pointer border-white/10 hover:border-cyan-100/35 hover:bg-cyan-100/[0.045] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/35" : "border-white/10 hover:border-white/20 hover:bg-white/[0.03]",
+        running && "command-center-card-running",
       )}
       onClick={workerUrl ? openWorker : undefined}
       onKeyDown={workerUrl ? (event) => {
@@ -388,6 +416,7 @@ function WorkItemCard({
           <div className="mb-2 flex flex-wrap items-center gap-2">
             <SourceBadge source={item.source} />
             <StatusPill value={item.status} />
+            {runningDetail && <RunningIndicator detail={runningDetail} />}
             {item.project && <span className="text-xs uppercase tracking-[0.16em] text-slate-500">{item.project}</span>}
           </div>
           <h3 className="text-base font-semibold leading-snug text-white">{item.title}</h3>
