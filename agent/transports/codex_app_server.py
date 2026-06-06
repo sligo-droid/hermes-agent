@@ -72,6 +72,10 @@ class CodexAppServerClient:
         codex_home: Optional[str] = None,
         extra_args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
+        cwd: Optional[str] = None,
+        scope_kind: str = "codex-app-server",
+        scope_purpose: str = "Codex app-server runtime",
+        scope_session_key: str = "",
     ) -> None:
         self._codex_bin = codex_bin
         explicit_env = env or {}
@@ -130,6 +134,26 @@ class CodexAppServerClient:
         cmd = [codex_bin, "app-server"] + app_server_args
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
         spawn_env.setdefault("RUST_LOG", "warn")
+        spawn_cwd = cwd or spawn_env.get("HERMES_KANBAN_WORKSPACE") or os.getcwd()
+        if not scope_session_key:
+            scope_session_key = spawn_env.get("HERMES_SESSION_KEY", "")
+        child_scope = None
+        try:
+            from hermes_cli.gateway_child_isolation import build_gateway_child_scope_argv
+
+            cmd, child_scope = build_gateway_child_scope_argv(
+                cmd,
+                env=spawn_env,
+                cwd=spawn_cwd,
+                kind=scope_kind,
+                purpose=scope_purpose,
+                command_label="codex-app-server",
+                session_key=scope_session_key,
+                pipe_stdio=True,
+            )
+        except Exception:
+            child_scope = None
+        self.child_scope_unit = child_scope.unit if child_scope is not None and child_scope.enabled else ""
 
         self._proc = subprocess.Popen(
             cmd,

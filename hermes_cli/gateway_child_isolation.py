@@ -14,6 +14,7 @@ from typing import Mapping, Optional, Sequence
 
 _GATEWAY_CHILD_ENV_EXACT = frozenset(
     {
+        "CODEX_HOME",
         "GH_CONFIG_DIR",
         "HOME",
         "HERMES_HOME",
@@ -23,6 +24,7 @@ _GATEWAY_CHILD_ENV_EXACT = frozenset(
         "LC_CTYPE",
         "PATH",
         "PYTHONPATH",
+        "RUST_LOG",
         "SHELL",
         "TERM",
         "TMPDIR",

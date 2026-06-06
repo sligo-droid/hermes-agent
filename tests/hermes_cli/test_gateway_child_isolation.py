@@ -8,7 +8,9 @@ def test_gateway_child_systemd_env_filters_secrets():
         "HERMES_HOME": "/home/droid/.hermes/profiles/discord",
         "HERMES_SESSION_KEY": "discord:123",
         "HERMES_PROJECT_PATH": "/repo",
+        "CODEX_HOME": "/tmp/codex-home",
         "PATH": "/usr/bin",
+        "RUST_LOG": "warn",
         "OPENAI_API_KEY": "secret",
         "ANTHROPIC_API_KEY": "secret",
         "SLACK_BOT_TOKEN": "secret",
@@ -19,7 +21,9 @@ def test_gateway_child_systemd_env_filters_secrets():
     assert out["HERMES_HOME"] == "/home/droid/.hermes/profiles/discord"
     assert out["HERMES_SESSION_KEY"] == "discord:123"
     assert out["HERMES_PROJECT_PATH"] == "/repo"
+    assert out["CODEX_HOME"] == "/tmp/codex-home"
     assert out["PATH"] == "/usr/bin"
+    assert out["RUST_LOG"] == "warn"
     assert "OPENAI_API_KEY" not in out
     assert "ANTHROPIC_API_KEY" not in out
     assert "SLACK_BOT_TOKEN" not in out

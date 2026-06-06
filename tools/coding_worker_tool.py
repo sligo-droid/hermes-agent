@@ -711,6 +711,9 @@ def delegate_coding_task(
                 ),
                 approval_callback=approval_callback,
                 on_event=_touch_codex_activity,
+                env={"HERMES_SESSION_KEY": getattr(parent_agent, "session_key", "")},
+                scope_kind="coding-worker",
+                scope_purpose="Codex coding worker plan pass",
             ) as session:
                 plan_turn = session.run_turn(
                     user_input=_plan_prompt(worker_prompt),
@@ -759,6 +762,9 @@ def delegate_coding_task(
             extra_args=_codex_reasoning_args(reasoning_level),
             approval_callback=approval_callback,
             on_event=_touch_codex_activity,
+            env={"HERMES_SESSION_KEY": getattr(parent_agent, "session_key", "")},
+            scope_kind="coding-worker",
+            scope_purpose="Codex coding worker build pass",
         ) as session:
             turn = session.run_turn(
                 user_input=build_prompt,
