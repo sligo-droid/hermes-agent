@@ -23,7 +23,7 @@ Canonical Sligo-host routes:
 - `/sligo` — overview
 - `/sligo/inbox` — proposals, parse failures, and blocked items needing operator attention
 - `/sligo/work` — accepted/queued/running/review/blocked work items
-- `/sligo/rejected` — rejected/declined intake when included in the current Work State lane
+- `/sligo/completed` — completed/shipped work items
 - `/sligo/archive` — archived/historical work items and board rollups
 - `/workers` and `/workers/<board>` — existing worker board execution pages
 
@@ -90,7 +90,7 @@ The Sligo shell in `web/src/App.tsx` provides the focused internal navigation fo
 
 Current UX intention is tracked in `docs/project-state.md`; update that file when the target changes. The durable contract here is:
 
-1. **Work State is the primary work navigation.** Overview, Inbox, Active/Work, Rejected when present, and Archive are states of the same Work Item ledger. Do not reintroduce separate primary tabs for recommendations, sources, runs, metrics, or status distributions.
+1. **Work State is the primary work navigation.** Overview, Inbox, Active/Work, Completed, and Archive are states of the same Work Item ledger. Do not reintroduce separate primary tabs for recommendations, sources, runs, metrics, or status distributions.
 2. **Project scoping is not a competing status model.** Hermes/PID project controls may filter the same ledger, but they should not create duplicate screens with different semantics.
 3. **Rows are Work Items or board-level rollups.** Proposed recommendations, intake/decision items, and named worker boards can render as rows. Individual Kanban tasks/tickets and accepted downstream proposal cards should stay inside board/detail surfaces unless they are promoted to canonical Work Items.
 4. **Worker links are execution artifacts.** Show a Worker link only after execution starts; point it directly to the board URL; never use bare `/workers` as a per-item destination.
