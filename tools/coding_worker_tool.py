@@ -6,6 +6,7 @@ The execution backend is selected by ``coding_worker.backend``.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -64,6 +65,20 @@ def _resolve_cwd(cwd: Optional[str], parent_agent: Any) -> str:
     if not path.is_absolute():
         path = Path(os.getcwd()) / path
     return str(path.resolve())
+
+
+def _call_opencode_task(run_opencode_task: Any, *args: Any, scope_session_key: str = "", **kwargs: Any) -> Any:
+    """Call the OpenCode backend with parent session scoping when supported."""
+    try:
+        parameters = inspect.signature(run_opencode_task).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "scope_session_key" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        kwargs["scope_session_key"] = scope_session_key
+    return run_opencode_task(*args, **kwargs)
 
 
 def _worker_project_context(workdir: str) -> str:
@@ -619,7 +634,8 @@ def delegate_coding_task(
                 pass
 
         started = time.monotonic()
-        result = run_opencode_task(
+        result = _call_opencode_task(
+            run_opencode_task,
             worker_prompt,
             workdir,
             timeout=timeout,

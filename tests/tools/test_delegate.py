@@ -2619,6 +2619,68 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         # Parent's callback slot is still empty (TLS isolates threads).
         self.assertIsNone(_get_approval_callback())
 
+    def test_delegate_task_reports_clear_error_during_interpreter_shutdown(self):
+        parent = _make_mock_parent()
+
+        with patch("tools.delegate_tool._interpreter_shutdown_in_progress", return_value=True):
+            result = json.loads(delegate_task(goal="late-turn system doctor check", parent_agent=parent))
+
+        self.assertIn("error", result)
+        self.assertIn("interpreter is shutting down", result["error"])
+
+    def test_run_single_child_reports_submit_shutdown_error(self):
+        from tools import delegate_tool
+
+        class FakeExecutor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def submit(self, *args, **kwargs):
+                raise RuntimeError("cannot schedule new futures after interpreter shutdown")
+
+            def shutdown(self, wait=False):
+                self.wait = wait
+
+        child = MagicMock()
+        child._delegate_role = "leaf"
+
+        with patch("tools.delegate_tool.ThreadPoolExecutor", FakeExecutor):
+            result = delegate_tool._run_single_child(
+                0,
+                "system-doctor delegated verification after compaction",
+                child=child,
+                parent_agent=_make_mock_parent(),
+            )
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("interpreter is shutting down", result["error"])
+        self.assertEqual(result["api_calls"], 0)
+
+    @patch("tools.delegate_tool._run_single_child")
+    def test_delegate_task_reports_batch_submit_shutdown_error(self, mock_run):
+        parent = _make_mock_parent()
+        tasks = [{"goal": "check A"}, {"goal": "check B"}]
+
+        class FakeExecutor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def submit(self, *args, **kwargs):
+                raise RuntimeError("cannot schedule new futures after interpreter shutdown")
+
+        with patch("tools.delegate_tool.ThreadPoolExecutor", FakeExecutor):
+            result = json.loads(delegate_task(tasks=tasks, parent_agent=parent))
+
+        self.assertIn("error", result)
+        self.assertIn("interpreter is shutting down", result["error"])
+        mock_run.assert_not_called()
+
 
 class TestFallbackModelInheritance(unittest.TestCase):
     """Subagents must inherit the parent's fallback provider chain."""

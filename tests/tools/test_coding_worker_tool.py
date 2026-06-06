@@ -605,6 +605,71 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
     assert activity_messages == ["OpenCode coding worker event: message: build"]
 
 
+def test_delegate_opencode_preserves_parent_scope_when_backend_supports_it(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    monkeypatch.setattr(ow, "load_coding_worker_backend", lambda: ow.BACKEND_OPENCODE)
+    parent = _parent(tmp_path)
+    seen = {}
+
+    def fake_run(prompt, workspace, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(
+            final_text="done",
+            error=None,
+            interrupted=False,
+            agents=["build"],
+            plan_text="",
+            thread_id="ses-build",
+            turn_id="ses-build",
+            tool_iterations=1,
+        )
+
+    monkeypatch.setattr(ow, "run_opencode_task", fake_run)
+
+    result = json.loads(cwt.delegate_coding_task(task="fix parser", parent_agent=parent))
+
+    assert result["success"] is True
+    assert seen["scope_session_key"] == "discord:123"
+
+
+def test_delegate_opencode_omits_parent_scope_for_legacy_backend(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    monkeypatch.setattr(ow, "load_coding_worker_backend", lambda: ow.BACKEND_OPENCODE)
+    seen = {}
+
+    def fake_legacy_run(prompt, workspace, *, timeout, context_for_classification, title, on_event):
+        seen.update(
+            timeout=timeout,
+            context_for_classification=context_for_classification,
+            title=title,
+            on_event=on_event,
+        )
+        return SimpleNamespace(
+            final_text="done",
+            error=None,
+            interrupted=False,
+            agents=["build"],
+            plan_text="",
+            thread_id="ses-build",
+            turn_id="ses-build",
+            tool_iterations=1,
+        )
+
+    monkeypatch.setattr(ow, "run_opencode_task", fake_legacy_run)
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="system-doctor delegated worker after compaction",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert seen["title"] == "Hermes delegated coding task"
+
+
 def test_delegate_includes_repo_state_preflight(monkeypatch, tmp_path):
     from agent import opencode_worker as ow
 
