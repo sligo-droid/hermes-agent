@@ -2040,6 +2040,9 @@ def test_foreman_role_prompt_and_guards_allow_repair_mutation(monkeypatch, tmp_p
     assert "Use Discord worker read/control broker access only when necessary" in prompt
     assert "not subject to the planner/dev/reviewer read-only" in prompt
     assert "Do not create code-change PRs" in prompt
+    assert "follow_up_proposals" in prompt
+    assert "Command Center self-improvement proposal/job" in prompt
+    assert "durable repo fix discovered during repair" in prompt
     assert "Keep secrets" in prompt
     assert "Do not call mutation helpers" not in prompt
     assert worker._role_pr_mutation_guard_env(ROLE_FOREMAN) == ({}, None)

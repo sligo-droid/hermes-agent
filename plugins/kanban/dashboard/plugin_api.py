@@ -678,6 +678,14 @@ def _repair_task_body(
             "- Prefer repairing task/board state over deleting evidence.",
             "- If a task is safely resumable, move it back to ready and mark dispatch dirty.",
             "- If the block is legitimate, leave it blocked with a clear explanation and next action.",
+            "",
+            "Post-repair root-cause follow-up:",
+            "- After fixing or unblocking the board, assess whether the stuck board reveals a durable or fundamental Hermes repository fix.",
+            "- Do not auto-apply repository code changes inside this repair unless they are directly required to unstick the board.",
+            "- If a durable repo fix appears warranted, create exactly one separate human-decision Command Center row as a proposed self-improvement card for `project: hermes` and `prong: system-doctor`.",
+            "- Use the existing self-improvement proposal path: persist a `self_improvement.proposal_run.v1` proposal run with `self_improvement.proposal_storage.ingest_proposal_output(...)`, not a new repair endpoint or ad hoc dashboard row.",
+            "- The proposed card must specify the repo fix for human approval and include title, summary/body, rationale, scope, and verification; its `kanban_task` should contain the implementation brief humans would approve into a follow-up job.",
+            "- Report any created follow-up proposal id/title/url in your final JSON `follow_up_proposals`; if no durable repo fix is needed, say so in verification.",
         ]
     )
 
