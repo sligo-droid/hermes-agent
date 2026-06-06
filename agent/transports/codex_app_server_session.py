@@ -207,6 +207,7 @@ class CodexAppServerSession:
         permission_profile: Optional[str] = None,
         extra_args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
+        replace_env: bool = False,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -217,6 +218,7 @@ class CodexAppServerSession:
         self._codex_home = codex_home
         self._extra_args = list(extra_args or [])
         self._env = dict(env or {})
+        self._replace_env = replace_env
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
@@ -253,6 +255,7 @@ class CodexAppServerSession:
                 codex_home=self._codex_home,
                 extra_args=self._extra_args,
                 env=self._env,
+                replace_env=self._replace_env,
             )
         self._client.initialize(
             client_name="hermes",
