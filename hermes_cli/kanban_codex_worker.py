@@ -879,7 +879,7 @@ def _apply_role_output(
         try:
             created = _create_planned_dev_tasks(conn, specs, created_by=ROLE_PLANNER)
             _merge_criteria(board, criteria)
-            completed = kanban_db.complete_task(
+            completed = _complete_role_task(
                 conn,
                 task_id,
                 summary=summary or f"Planned {len(created)} task(s).",
@@ -907,7 +907,7 @@ def _apply_role_output(
             criteria_assessment = payload.get("criteria_assessment")
             if isinstance(criteria_assessment, dict):
                 metadata["criteria_assessment"] = criteria_assessment
-            completed = kanban_db.complete_task(
+            completed = _complete_role_task(
                 conn,
                 task_id,
                 summary=summary or "Reviewer approved.",
@@ -940,7 +940,7 @@ def _apply_role_output(
                 "raw": payload,
                 "filtered_pr_lifecycle_tasks": pr_lifecycle_tasks,
             }
-            completed = kanban_db.complete_task(
+            completed = _complete_role_task(
                 conn,
                 task_id,
                 summary=summary or "Reviewer found only PR lifecycle follow-up; finalizing PR.",
@@ -963,7 +963,7 @@ def _apply_role_output(
             metadata = {"created_tasks": created, "raw": payload}
             if pr_lifecycle_tasks:
                 metadata["filtered_pr_lifecycle_tasks"] = pr_lifecycle_tasks
-            completed = kanban_db.complete_task(
+            completed = _complete_role_task(
                 conn,
                 task_id,
                 summary=summary or "Reviewer requested changes.",
@@ -992,7 +992,7 @@ def _apply_role_output(
         _update_phase(board, "blocked", goal_status="blocked")
         return
     _checkpoint_commit(workspace, task_id, summary)
-    kanban_db.complete_task(
+    completed = _complete_role_task(
         conn,
         task_id,
         summary=summary or "Dev task completed.",
@@ -1005,6 +1005,50 @@ def _apply_role_output(
         },
         expected_run_id=expected_run_id,
     )
+    if not completed:
+        raise RuntimeError("worker completed but Kanban task transition was rejected")
+
+
+def _complete_role_task(
+    conn: Any,
+    task_id: str,
+    *,
+    summary: str,
+    metadata: dict[str, Any],
+    expected_run_id: Optional[int],
+    created_cards: Optional[list[str]] = None,
+) -> bool:
+    completed = kanban_db.complete_task(
+        conn,
+        task_id,
+        summary=summary,
+        metadata=metadata,
+        created_cards=created_cards,
+        expected_run_id=expected_run_id,
+    )
+    if completed or expected_run_id is None:
+        return completed
+    if not _still_owns_claim(conn, task_id):
+        return False
+    return kanban_db.complete_task(
+        conn,
+        task_id,
+        summary=summary,
+        metadata=metadata,
+        created_cards=created_cards,
+        expected_run_id=None,
+    )
+
+
+def _still_owns_claim(conn: Any, task_id: str) -> bool:
+    lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK", "").strip()
+    if not lock:
+        return False
+    row = conn.execute(
+        "SELECT status, claim_lock FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    return bool(row and row["status"] == "running" and row["claim_lock"] == lock)
 
 
 def _string_list(value: Any) -> list[str]:

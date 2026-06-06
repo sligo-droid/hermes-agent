@@ -143,6 +143,94 @@ def test_coding_worker_activity_heartbeat_is_best_effort(monkeypatch):
     worker._heartbeat_worker_activity("t1", board="b1", force=True)
 
 
+def test_role_completion_recovers_when_run_pointer_rotates_but_claim_is_owned(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = "discord-race"
+    kanban_db.create_board(board, name="Race board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Dev ticket",
+            assignee="dev",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+        original_run_id = claimed.current_run_id
+        replacement = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
+            "claim_expires, started_at) VALUES (?, ?, 'running', ?, ?, ?)",
+            (task_id, "dev", claimed.claim_lock, claimed.claim_expires, int(time.time())),
+        )
+        conn.execute(
+            "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+            (replacement.lastrowid, task_id),
+        )
+        conn.commit()
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claimed.claim_lock)
+
+        completed = worker._complete_role_task(
+            conn,
+            task_id,
+            summary="Implemented in checkpoint commit.",
+            metadata={"raw": {"status": "completed"}},
+            expected_run_id=original_run_id,
+        )
+
+        task = kanban_db.get_task(conn, task_id)
+        latest = kanban_db.latest_run(conn, task_id)
+    finally:
+        conn.close()
+
+    assert completed is True
+    assert task is not None
+    assert task.status == "done"
+    assert latest is not None
+    assert latest.outcome == "completed"
+    assert latest.summary == "Implemented in checkpoint commit."
+
+
+def test_role_completion_does_not_recover_when_claim_is_not_owned(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = "discord-race-unowned"
+    kanban_db.create_board(board, name="Race board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Dev ticket", assignee="dev")
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+        conn.execute(
+            "UPDATE tasks SET current_run_id = current_run_id + 1 WHERE id = ?",
+            (task_id,),
+        )
+        conn.commit()
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "someone-else")
+
+        completed = worker._complete_role_task(
+            conn,
+            task_id,
+            summary="Should not complete.",
+            metadata={"raw": {"status": "completed"}},
+            expected_run_id=claimed.current_run_id,
+        )
+
+        task = kanban_db.get_task(conn, task_id)
+    finally:
+        conn.close()
+
+    assert completed is False
+    assert task is not None
+    assert task.status == "running"
+
+
 def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_workers as workers
     from hermes_cli import discord_worker_read
