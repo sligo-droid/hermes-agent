@@ -131,14 +131,29 @@ def main() -> int:
             workspace=workspace,
         ):
             return 0
+        if _recover_completed_role_output_fresh(
+            task_id,
+            role,
+            result,
+            board=board,
+            workspace=workspace,
+        ):
+            return 0
+        reason = f"{_backend_label(role, task)} worker failed: {exc}"
         try:
-            blocked = kanban_db.block_task(
-                conn,
-                task_id,
-                reason=f"{_backend_label(role, task)} worker failed: {exc}",
-            )
+            blocked = kanban_db.block_task(conn, task_id, reason=reason)
             if blocked:
                 return 0
+        except Exception:
+            pass
+        try:
+            fresh_conn = kanban_db.connect(board=board)
+            try:
+                blocked = kanban_db.block_task(fresh_conn, task_id, reason=reason)
+                if blocked:
+                    return 0
+            finally:
+                fresh_conn.close()
         except Exception:
             pass
         return 1
@@ -204,6 +219,42 @@ def _recover_completed_role_output(
     except Exception:
         return False
     return bool(task and task.status in {"done", "blocked", "scheduled", "archived"})
+
+
+def _recover_completed_role_output_fresh(
+    task_id: str,
+    role: str,
+    result: Any,
+    *,
+    board: Optional[str],
+    workspace: str,
+) -> bool:
+    """Retry terminal-result recording through a new SQLite connection.
+
+    The role worker keeps its first connection open while OpenCode/Codex runs.
+    If a later DB write fails because that connection is stale, locked, or
+    otherwise poisoned, the process must still preserve a valid model result
+    instead of exiting nonzero and letting the dispatcher report only
+    ``pid not alive``.
+    """
+    try:
+        fresh_conn = kanban_db.connect(board=board)
+    except Exception:
+        return False
+    try:
+        return _recover_completed_role_output(
+            fresh_conn,
+            task_id,
+            role,
+            result,
+            board=board,
+            workspace=workspace,
+        )
+    finally:
+        try:
+            fresh_conn.close()
+        except Exception:
+            pass
 
 
 def _build_prompt(conn: Any, task_id: str, role: str) -> str:
