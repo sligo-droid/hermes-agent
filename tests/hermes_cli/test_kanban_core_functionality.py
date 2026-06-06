@@ -3695,11 +3695,12 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
         _cfg_mod,
         "load_config",
         lambda: {
-            "kanban": {
-                "dispatch_in_gateway": True,
-                "dispatch_interval_seconds": 1,
-            }
-        },
+                "kanban": {
+                    "dispatch_in_gateway": True,
+                    "dispatch_interval_seconds": 1,
+                    "auto_decompose": False,
+                }
+            },
     )
     monkeypatch.setattr(
         _kb,
@@ -3713,7 +3714,8 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     )
     monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: corrupt_db)
 
-    calls = {"connect": 0, "to_thread": 0}
+    incidents = {}
+    calls = {"connect": 0, "to_thread": 0, "record": 0}
 
     def _connect(*args, **kwargs):
         calls["connect"] += 1
@@ -3743,6 +3745,21 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
         return None
 
     monkeypatch.setattr(_kb, "connect", _connect)
+    monkeypatch.setattr(_kb, "is_board_paused_for_corruption", lambda slug=None: incidents.get(slug))
+
+    def _record_incident(board, db_path, reason, *, backup_path=None, fingerprint=None):
+        calls["record"] += 1
+        incident = {
+            "pause_reason": "kanban_db_corruption",
+            "db_path": str(db_path),
+            "fingerprint": fingerprint,
+            "quarantine_path": str(backup_path) if backup_path is not None else None,
+            "reason": reason,
+        }
+        incidents[board] = incident
+        return incident
+
+    monkeypatch.setattr(_kb, "record_corrupt_board_incident", _record_incident)
     monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
     monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
 
@@ -3755,24 +3772,24 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
         )
 
     messages = [record.getMessage() for record in caplog.records]
-    assert sum("not a valid SQLite database" in msg for msg in messages) == 1
+    assert sum("database corruption incident" in msg for msg in messages) == 1
+    alert = next(msg for msg in messages if "database corruption incident" in msg)
+    assert _kb.DEFAULT_BOARD in alert
+    assert str(corrupt_db) in alert
+    assert "quarantine_path=" in alert
+    assert "reason=" in alert
+    assert "repair --board" in alert
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # First tick connect (dispatch) + two probes per `_has_ready_work` call
-    # (ready then review, both via _kb.connect). The second dispatch tick
-    # skips the dispatch connect because the corrupt board fingerprint is
-    # disabled, but the ready/review probes still each connect. PR f55d94a1e
-    # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
+    assert calls["connect"] == 1
+    assert calls["record"] == 1
 
 
-def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
+def test_gateway_dispatcher_retries_corrupt_board_after_content_change(
     monkeypatch, tmp_path, caplog
 ):
-    """A corrupt-looking board is retried after the quarantine TTL expires."""
+    """A corrupt-looking board is retried after its persisted fingerprint changes."""
     import asyncio
-    import inspect
     import logging
     import sqlite3
 
@@ -3789,11 +3806,12 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
         _cfg_mod,
         "load_config",
         lambda: {
-            "kanban": {
-                "dispatch_in_gateway": True,
-                "dispatch_interval_seconds": 1,
-            }
-        },
+                "kanban": {
+                    "dispatch_in_gateway": True,
+                    "dispatch_interval_seconds": 1,
+                    "auto_decompose": False,
+                }
+            },
     )
     monkeypatch.setattr(
         _kb,
@@ -3807,28 +3825,31 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
     )
     monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: corrupt_db)
 
-    real_monotonic = time.monotonic
-    time_values = iter([1000.0, 1001.0, 1301.0, 1301.0])
-
-    def _monotonic_for_gateway_dispatcher():
-        caller = inspect.currentframe().f_back  # type: ignore[union-attr]
-        code = caller.f_code if caller is not None else None
-        filename = code.co_filename if code is not None else ""
-        if filename.endswith("gateway/run.py"):
-            return next(time_values, 1301.0)
-        return real_monotonic()
-
-    monkeypatch.setattr("gateway.run.time.monotonic", _monotonic_for_gateway_dispatcher)
-
-    calls = {"tick": 0}
+    incidents = {}
+    calls = {"tick": 0, "connect": 0, "record": 0}
 
     def _connect(*args, **kwargs):
+        calls["connect"] += 1
         raise sqlite3.DatabaseError("file is not a database")
+
+    def _record_incident(board, db_path, reason, *, backup_path=None, fingerprint=None):
+        calls["record"] += 1
+        incident = {
+            "pause_reason": "kanban_db_corruption",
+            "db_path": str(db_path),
+            "fingerprint": fingerprint,
+            "quarantine_path": str(backup_path) if backup_path is not None else None,
+            "reason": reason,
+        }
+        incidents[board] = incident
+        return incident
 
     async def _to_thread(fn, *args, **kwargs):
         result = fn(*args, **kwargs)
         if getattr(fn, "__name__", "") == "_tick_once":
             calls["tick"] += 1
+            if calls["tick"] == 2:
+                corrupt_db.write_text("changed corrupt bytes", encoding="utf-8")
             if calls["tick"] >= 3:
                 runner._running = False
         return result
@@ -3837,6 +3858,8 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
         return None
 
     monkeypatch.setattr(_kb, "connect", _connect)
+    monkeypatch.setattr(_kb, "is_board_paused_for_corruption", lambda slug=None: incidents.get(slug))
+    monkeypatch.setattr(_kb, "record_corrupt_board_incident", _record_incident)
     monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
     monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
 
@@ -3849,9 +3872,11 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
         )
 
     messages = [record.getMessage() for record in caplog.records]
-    assert sum("not a valid SQLite database" in msg for msg in messages) == 2
-    assert any("database fingerprint unchanged" in msg for msg in messages)
+    assert sum("database corruption incident" in msg for msg in messages) == 2
+    assert any("database changed since corruption incident" in msg for msg in messages)
     assert calls["tick"] == 3
+    assert calls["connect"] == 3
+    assert calls["record"] == 2
 
 
 # ---------------------------------------------------------------------------

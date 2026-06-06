@@ -458,6 +458,39 @@ def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monke
     assert tid in adapter.sent[0]["text"]
 
 
+def test_kanban_notifier_skips_unchanged_corrupt_paused_board(tmp_path, monkeypatch, caplog):
+    import logging
+
+    db_path = tmp_path / "kanban.db"
+    db_path.write_text("not sqlite", encoding="utf-8")
+    fingerprint = kb._db_content_fingerprint(db_path)
+    monkeypatch.setattr(kb, "list_boards", lambda include_archived=False: [{"slug": "bad-board"}])
+    monkeypatch.setattr(kb, "kanban_db_path", lambda board=None: db_path)
+    monkeypatch.setattr(
+        kb,
+        "is_board_paused_for_corruption",
+        lambda board=None: {
+            "pause_reason": "kanban_db_corruption",
+            "db_path": str(db_path),
+            "fingerprint": fingerprint,
+            "quarantine_path": str(db_path.with_suffix(".db.corrupt.test.bak")),
+            "reason": "sqlite refused to open file",
+        },
+    )
+    connect = Mock(side_effect=AssertionError("paused corrupt board should not open"))
+    monkeypatch.setattr(kb, "connect", connect)
+
+    runner = _make_runner(RecordingAdapter())
+
+    with caplog.at_level(logging.DEBUG, logger="gateway.run"):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert connect.call_count == 0
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("paused for unchanged DB corruption" in msg for msg in messages)
+    assert not any("cannot open board" in msg for msg in messages)
+
+
 def test_discord_kanban_typing_watcher_pulses_running_thread(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb
