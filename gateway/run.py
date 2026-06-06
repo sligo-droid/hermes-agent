@@ -7990,10 +7990,27 @@ class GatewayRunner:
                         targets = []
                         reaction_targets = []
                     else:
-                        targets, reaction_targets = await asyncio.gather(
+                        collected = await asyncio.gather(
                             asyncio.to_thread(running_discord_thread_typing_targets),
                             asyncio.to_thread(thread_status_targets),
+                            return_exceptions=True,
                         )
+                        targets = []
+                        reaction_targets = []
+                        if isinstance(collected[0], Exception):
+                            logger.debug(
+                                "discord kanban typing: target collection failed",
+                                exc_info=(type(collected[0]), collected[0], collected[0].__traceback__),
+                            )
+                        else:
+                            targets = collected[0]
+                        if isinstance(collected[1], Exception):
+                            logger.debug(
+                                "discord kanban status: target collection failed",
+                                exc_info=(type(collected[1]), collected[1], collected[1].__traceback__),
+                            )
+                        else:
+                            reaction_targets = collected[1]
                     if callable(sender):
                         for target in targets:
                             thread_id = str(target.get("thread_id") or "").strip()

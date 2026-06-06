@@ -690,6 +690,51 @@ def test_discord_kanban_typing_watcher_pulses_running_notify_thread(tmp_path, mo
     ]
 
 
+def test_discord_kanban_typing_watcher_continues_status_sync_after_typing_collection_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(
+        thread_id="99031",
+        goal="Keep status sync independent",
+        chat_id="parent-99031",
+    )
+
+    monkeypatch.setattr(
+        dwb,
+        "running_discord_thread_typing_targets",
+        lambda: (_ for _ in ()).throw(RuntimeError("bad board")),
+    )
+    monkeypatch.setattr(
+        dwb,
+        "thread_status_targets",
+        lambda: [
+            {
+                "board": board.slug,
+                "thread_id": "99031",
+                "chat_id": "parent-99031",
+                "state": "active",
+                "reaction_state": "active",
+            }
+        ],
+    )
+
+    adapter = ReactionSyncAdapter()
+    runner = _make_discord_runner(adapter)
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert adapter.synced == [
+        {
+            "board": board.slug,
+            "thread_id": "99031",
+            "chat_id": "parent-99031",
+            "state": "active",
+            "reaction_state": "active",
+        }
+    ]
+
+
 def test_discord_kanban_typing_watcher_syncs_feature_summary(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb
