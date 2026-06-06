@@ -2844,6 +2844,21 @@ def test_latest_summary_skips_empty_string(kanban_home):
         assert kb.latest_summary(conn, t) == "real handoff"
 
 
+def test_latest_summary_uses_latest_error_when_no_summary(kanban_home):
+    """Crashed worker attempts should still provide a useful card summary."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="crashed", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, started_at, ended_at, "
+            "outcome, summary, error) VALUES (?, 'crashed', ?, ?, 'crashed', NULL, ?)",
+            (t, int(time.time()), int(time.time()) + 1, "pid 123 not alive"),
+        )
+        conn.commit()
+
+        assert kb.latest_summary(conn, t) == "pid 123 not alive"
+        assert kb.latest_summaries(conn, [t]) == {t: "pid 123 not alive"}
+
+
 def test_latest_summaries_batch_omits_tasks_without_summary(kanban_home):
     """``latest_summaries`` is the dashboard's N+1 escape hatch — it
     must return only entries for tasks that actually have a summary,
