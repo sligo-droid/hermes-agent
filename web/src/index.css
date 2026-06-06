@@ -422,9 +422,6 @@ code { font-size: 0.875rem; }
 .sligo-light .command-center-lane-selected .command-center-lane-value {
   color: rgb(8 51 68) !important;
 }
-.sligo-light .command-center-lane-selected .command-center-lane-detail {
-  color: rgb(51 65 85) !important;
-}
 .sligo-light .command-center-project-tabs {
   border-color: rgb(148 163 184 / 0.55) !important;
 }

@@ -232,11 +232,11 @@ function WorkStatePanel({
   search: string;
 }) {
   const lanes = [
-    { key: "overview", label: "Overview", href: "/sligo", value: laneCounts.overview, detail: "open ledger" },
-    { key: "inbox", label: "Inbox", href: "/sligo/inbox", value: laneCounts.inbox, detail: "needs decision" },
-    { key: "work", label: "Work", href: "/sligo/work", value: laneCounts.work, detail: "accepted / active" },
-    { key: "archive", label: "Archive", href: "/sligo/archive", value: laneCounts.archive, detail: "terminal / hidden" },
-    { key: "workers", label: "Workers", href: "/workers", value: laneCounts.workers, detail: "opens monitor", external: true },
+    { key: "overview", label: "Overview", href: "/sligo", value: laneCounts.overview },
+    { key: "inbox", label: "Inbox", href: "/sligo/inbox", value: laneCounts.inbox },
+    { key: "work", label: "Active", href: "/sligo/work", value: laneCounts.work },
+    { key: "archive", label: "Archive", href: "/sligo/archive", value: laneCounts.archive },
+    { key: "workers", label: "Kanban", href: "/workers", value: laneCounts.workers, external: true },
   ];
   const tileClass = (selected: boolean) => cn(
     "command-center-lane group rounded-2xl border px-3.5 py-3 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
@@ -246,7 +246,6 @@ function WorkStatePanel({
     <Card className="border-white/10 bg-white/[0.035]">
       <CardHeader className="gap-1">
         <CardTitle className="text-base text-white">Work State</CardTitle>
-        <p className="text-xs leading-5 text-slate-500">Use this as the Command Center map: lanes move between views, and Workers opens the execution monitor in a new tab.</p>
       </CardHeader>
       <CardContent>
         <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-5" aria-label="Command Center lanes">
@@ -256,7 +255,6 @@ function WorkStatePanel({
               <>
                 <span className="command-center-lane-value block text-xl font-semibold tracking-tight text-white">{lane.value}</span>
                 <span className="mt-1 block text-[0.68rem] font-semibold uppercase tracking-[0.16em]">{lane.label}</span>
-                <span className="command-center-lane-detail mt-1 block text-xs text-slate-500 transition group-hover:text-slate-400">{lane.detail}</span>
               </>
             );
             if (lane.external) {
@@ -1046,7 +1044,7 @@ export default function CommandCenterPage() {
           )}
           {activeView === "inbox" && (
             <>
-              <InboxList activeAction={activeAction} emptyMessage="Inbox is clear. Finished, blocked, and archiveable boards stay on Overview or Work." items={pagedInboxItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+              <InboxList activeAction={activeAction} emptyMessage="Inbox is clear. Finished, blocked, and archiveable boards stay on Overview or Active." items={pagedInboxItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
               <PaginationControls label="inbox" onPageChange={(page) => setPage("inbox", page)} page={pages.inbox} totalItems={pageTotals.inbox} />
             </>
           )}
