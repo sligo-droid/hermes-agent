@@ -14,6 +14,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -234,6 +235,10 @@ def test_command_center_repair_creates_idempotent_foreman_task(client):
     assert "self_improvement.proposal_storage.ingest_proposal_output" in repair_task["body"]
     assert "title, summary/body, rationale, scope, and verification" in repair_task["body"]
     assert first_body["worker_url"].endswith(f"/workers/{board}/tickets/{repair_task['id']}")
+
+    from hermes_cli import kanban_codex_workers as workers
+
+    assert workers._role_backend("foreman", "codex", SimpleNamespace(**repair_task)) == "opencode"
 
     board_rollup = client.post(f"/api/plugins/kanban/boards/{board}/repair", json={"title": "Board rollup"})
     assert board_rollup.status_code == 200, board_rollup.text

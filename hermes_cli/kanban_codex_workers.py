@@ -94,7 +94,17 @@ def _coding_backend(cfg: dict[str, Any]) -> str:
         return "codex"
 
 
-def _role_backend(role: str, configured_backend: str) -> str:
+def _task_forces_opencode(task: Any = None) -> bool:
+    if task is None:
+        return False
+    role = str(getattr(task, "assignee", "") or "").strip().lower()
+    created_by = str(getattr(task, "created_by", "") or "").strip().lower()
+    return role == ROLE_FOREMAN and created_by == "command-center-repair"
+
+
+def _role_backend(role: str, configured_backend: str, task: Any = None) -> str:
+    if _task_forces_opencode(task):
+        return "opencode"
     if configured_backend == "opencode" and role in _OPENCODE_ROLES:
         return "opencode"
     return "codex"
@@ -363,7 +373,7 @@ def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None
         return None
     cfg = _worker_config()
     configured_backend = _coding_backend(cfg)
-    backend = _role_backend(role, configured_backend)
+    backend = _role_backend(role, configured_backend, task)
     settings = _role_runtime_settings(role, cfg, task)
     log_settings = _role_log_settings(role, cfg, backend=backend, settings=settings)
     if backend == "opencode":
