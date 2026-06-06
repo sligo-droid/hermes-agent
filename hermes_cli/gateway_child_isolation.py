@@ -138,10 +138,11 @@ def build_gateway_child_scope_argv(
         "--collect",
         "--quiet",
     ]
-    if pipe_stdio:
-        args.append("--pipe")
+    # systemd-run rejects --pipe with --scope on common systemd versions. Scope
+    # units inherit this wrapper's stdio, so callers can still attach pipes to
+    # systemd-run and keep JSON-RPC/stdout behavior intact.
     if cwd and os.path.isdir(cwd):
-        args.extend(["--property", f"WorkingDirectory={cwd}"])
+        args.extend(["--working-directory", cwd])
     description = f"Hermes gateway child {kind}: {purpose}"[:200]
     args.extend(["--property", f"Description={description}"])
     for key, value in sorted(gateway_child_systemd_env(env or {}).items()):

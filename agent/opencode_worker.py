@@ -401,6 +401,7 @@ def run_opencode_task(
     config: Optional[dict[str, Any]] = None,
     worker_config: Optional[dict[str, Any]] = None,
     on_event: Optional[Callable[[dict[str, Any]], None]] = None,
+    scope_session_key: str = "",
 ) -> OpenCodeRunResult:
     cfg = load_opencode_config(config, worker_config=worker_config)
     needs_plan = (
@@ -431,6 +432,7 @@ def run_opencode_task(
             reasoning_level=cfg["complex_plan_reasoning_level"],
             title=title,
             on_event=_capture,
+            scope_session_key=scope_session_key,
         )
         if plan.error:
             plan.backend = BACKEND_OPENCODE
@@ -463,6 +465,7 @@ def run_opencode_task(
         ),
         title=title,
         on_event=_capture,
+        scope_session_key=scope_session_key,
     )
     build.backend = BACKEND_OPENCODE
     build.agents = agents
@@ -495,6 +498,7 @@ def run_opencode_single_pass(
     config: Optional[dict[str, Any]] = None,
     worker_config: Optional[dict[str, Any]] = None,
     on_event: Optional[Callable[[dict[str, Any]], None]] = None,
+    scope_session_key: str = "",
 ) -> OpenCodeRunResult:
     cfg = load_opencode_config(config, worker_config=worker_config)
     selected_agent = str(agent or cfg["build_agent"]).strip() or cfg["build_agent"]
@@ -516,6 +520,7 @@ def run_opencode_single_pass(
         reasoning_level=selected_reasoning,
         title=title,
         on_event=_capture,
+        scope_session_key=scope_session_key,
     )
     result.backend = BACKEND_OPENCODE
     result.agents = [selected_agent]
@@ -591,6 +596,7 @@ def _run_opencode_once(
     reasoning_level: str,
     title: str,
     on_event: Callable[[dict[str, Any]], None],
+    scope_session_key: str = "",
 ) -> OpenCodeRunResult:
     ok, binary_or_error = check_opencode_binary({"coding_worker": {"opencode": cfg}})
     if not ok:
@@ -650,6 +656,8 @@ def _run_opencode_once(
             startup_timeout=startup_timeout,
             workdir=workdir,
             env=process_env,
+            scope_session_key=scope_session_key,
+            scope_purpose=f"OpenCode coding worker {agent} pass",
         )
     except Exception as exc:
         return OpenCodeRunResult(error=f"OpenCode {agent} run failed to start: {exc}")
@@ -734,6 +742,8 @@ def _run_opencode_process(
     timeout: float,
     startup_timeout: float,
     env: Optional[dict[str, str]] = None,
+    scope_session_key: str = "",
+    scope_purpose: str = "OpenCode coding worker",
 ) -> _OpenCodeProcessResult:
     """Run OpenCode while watching for no-output startup stalls.
 
@@ -743,10 +753,27 @@ def _run_opencode_process(
     interactive prompt before JSON output starts.
     """
     started = time.monotonic()
+    popen_cmd = cmd
+    child_scope = None
+    try:
+        from hermes_cli.gateway_child_isolation import build_gateway_child_scope_argv
+
+        popen_cmd, child_scope = build_gateway_child_scope_argv(
+            cmd,
+            env=env or os.environ,
+            cwd=workdir,
+            kind="coding-worker",
+            purpose=scope_purpose,
+            command_label="opencode-run",
+            session_key=scope_session_key or os.environ.get("HERMES_SESSION_KEY", ""),
+            pipe_stdio=True,
+        )
+    except Exception:
+        child_scope = None
     try:
         proc = subprocess.Popen(
-            cmd,
-            cwd=workdir,
+            popen_cmd,
+            cwd=None if child_scope is not None and child_scope.enabled else workdir,
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,

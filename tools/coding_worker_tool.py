@@ -626,6 +626,7 @@ def delegate_coding_task(
             context_for_classification=classification_context,
             title="Hermes delegated coding task",
             on_event=_touch_opencode_activity,
+            scope_session_key=getattr(parent_agent, "session_key", ""),
         )
         duration = round(time.monotonic() - started, 2)
         success = bool(result.final_text) and not result.error and not result.interrupted

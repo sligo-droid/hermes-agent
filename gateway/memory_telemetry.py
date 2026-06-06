@@ -74,6 +74,13 @@ def _read_cmdline(pid_dir: Path) -> str:
     return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
 
 
+def _read_cgroup(pid_dir: Path) -> str:
+    try:
+        return _read_text(pid_dir / "cgroup")
+    except (FileNotFoundError, PermissionError, OSError, UnicodeError):
+        return ""
+
+
 def read_process_memory(pid: int, *, proc_root: Path = Path("/proc")) -> ProcessMemory | None:
     pid_dir = _proc_pid_dir(proc_root, pid)
     try:
@@ -180,7 +187,7 @@ def _run_systemctl(args: Sequence[str], *, timeout: float = 2.0) -> subprocess.C
 def _systemd_child_units(
     *,
     runner: Callable[..., subprocess.CompletedProcess[str]] = _run_systemctl,
-) -> tuple[list[tuple[str, int, str]], list[str]]:
+) -> tuple[list[tuple[str, int, str, str]], list[str]]:
     warnings: list[str] = []
     try:
         result = runner(
@@ -192,7 +199,7 @@ def _systemd_child_units(
     if result.returncode != 0:
         return [], []
 
-    units: list[tuple[str, int, str]] = []
+    units: list[tuple[str, int, str, str]] = []
     for line in result.stdout.splitlines():
         parts = line.split()
         if not parts or not parts[0].startswith(GATEWAY_CHILD_UNIT_PREFIX):
@@ -200,7 +207,17 @@ def _systemd_child_units(
         unit = parts[0]
         try:
             show = runner(
-                ["show", unit, "--no-pager", "--property", "MainPID,Description"],
+                [
+                    "show",
+                    unit,
+                    "--no-pager",
+                    "--property",
+                    "MainPID",
+                    "--property",
+                    "Description",
+                    "--property",
+                    "ControlGroup",
+                ],
                 timeout=2.0,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
@@ -213,9 +230,21 @@ def _systemd_child_units(
             pid = int(props.get("MainPID", "0") or "0")
         except (TypeError, ValueError):
             pid = 0
-        if pid > 0:
-            units.append((unit, pid, props.get("Description", "")))
+        if pid > 0 or props.get("ControlGroup"):
+            units.append((unit, pid, props.get("Description", ""), props.get("ControlGroup", "")))
     return units, warnings
+
+
+def _pids_in_cgroup(processes: Sequence[ProcessMemory], proc_root: Path, cgroup: str) -> list[int]:
+    cgroup = str(cgroup or "").strip()
+    if not cgroup:
+        return []
+    pids: list[int] = []
+    for proc in processes:
+        proc_cgroup = _read_cgroup(_proc_pid_dir(proc_root, proc.pid))
+        if cgroup in proc_cgroup:
+            pids.append(proc.pid)
+    return pids
 
 
 def collect_gateway_memory_telemetry(
@@ -234,8 +263,11 @@ def collect_gateway_memory_telemetry(
 
     units, systemd_warnings = _systemd_child_units(runner=systemctl_runner)
     warnings.extend(systemd_warnings)
-    for unit, pid, description in units:
-        proc = by_pid.get(pid) or read_process_memory(pid, proc_root=proc_root)
+    for unit, pid, description, cgroup in units:
+        if pid <= 0:
+            cgroup_pids = _pids_in_cgroup(processes, proc_root, cgroup)
+            pid = min(cgroup_pids) if cgroup_pids else 0
+        proc = by_pid.get(pid) or (read_process_memory(pid, proc_root=proc_root) if pid > 0 else None)
         if proc is None:
             continue
         label = description.removeprefix("Hermes gateway child ").strip(": ") or _label_for_process(proc)

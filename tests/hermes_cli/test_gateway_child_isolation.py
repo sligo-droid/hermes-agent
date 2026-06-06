@@ -56,8 +56,9 @@ def test_build_gateway_child_scope_argv_uses_transient_user_scope(monkeypatch, t
         "--unit",
         "hermes-gateway-child-terminal-discord-123-sleep-123456",
     ]
-    assert "--pipe" in argv
-    assert f"WorkingDirectory={tmp_path}" in argv
+    assert "--pipe" not in argv
+    assert "--working-directory" in argv
+    assert str(tmp_path) in argv
     assert "--setenv=HERMES_HOME=/home/droid/.hermes/profiles/discord" in argv
     assert "--setenv=HERMES_SESSION_KEY=discord:123" in argv
     assert all("OPENAI_API_KEY" not in part for part in argv)

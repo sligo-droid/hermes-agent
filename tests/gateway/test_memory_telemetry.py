@@ -17,6 +17,10 @@ def _write_proc(root: Path, pid: int, *, ppid: int, rss_kb: int, name: str, cmdl
     proc.joinpath("cmdline").write_bytes(cmdline.encode("utf-8") + b"\0")
 
 
+def _write_cgroup(root: Path, pid: int, cgroup: str) -> None:
+    (root / str(pid) / "cgroup").write_text(f"0::{cgroup}\n", encoding="utf-8")
+
+
 def _systemctl_empty(args, *, timeout=2.0):
     return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -48,6 +52,10 @@ def test_collects_systemd_child_scope_metadata(tmp_path):
                 stderr="",
             )
         assert args[:2] == ["show", "hermes-gateway-child-lsp-session-pyright-123.scope"]
+        assert "--property" in args
+        assert "MainPID" in args
+        assert "Description" in args
+        assert "ControlGroup" in args
         return SimpleNamespace(
             returncode=0,
             stdout="MainPID=200\nDescription=Hermes gateway child lsp: LSP server pyright\n",
@@ -93,6 +101,40 @@ def test_collects_codex_app_server_scope_as_child_helper_rss(tmp_path):
     assert child.kind == "codex"
     assert child.unit == "hermes-gateway-child-codex-app-server-discord-123-codex-app-server-999.scope"
     assert child.label == "codex-app-server: Codex app-server runtime"
+
+
+def test_collects_scope_process_from_cgroup_when_main_pid_absent(tmp_path):
+    proc = tmp_path / "proc"
+    cgroup = "/user.slice/user-1001.slice/app.slice/hermes-gateway-child-coding-worker-session-opencode.scope"
+    _write_proc(proc, 100, ppid=1, rss_kb=2048, name="python", cmdline="gateway")
+    _write_proc(proc, 201, ppid=1, rss_kb=32768, name="opencode", cmdline="opencode run")
+    _write_cgroup(proc, 201, cgroup)
+
+    def runner(args, *, timeout=2.0):
+        if args[0] == "list-units":
+            return SimpleNamespace(
+                returncode=0,
+                stdout="hermes-gateway-child-coding-worker-session-opencode.scope loaded active running x\n",
+                stderr="",
+            )
+        assert args[:2] == ["show", "hermes-gateway-child-coding-worker-session-opencode.scope"]
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "MainPID=0\n"
+                "Description=Hermes gateway child coding-worker: OpenCode coding worker\n"
+                f"ControlGroup={cgroup}\n"
+            ),
+            stderr="",
+        )
+
+    telemetry = mt.collect_gateway_memory_telemetry([100], proc_root=proc, systemctl_runner=runner)
+
+    child = telemetry.top_children[0]
+    assert child.pid == 201
+    assert child.kind == "coding"
+    assert child.rss_kb == 32768
+    assert child.unit == "hermes-gateway-child-coding-worker-session-opencode.scope"
 
 
 def test_systemd_child_scope_counts_descendant_rss(tmp_path):

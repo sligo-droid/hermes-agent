@@ -658,6 +658,7 @@ def _run_opencode(
                 reasoning_level=reasoning_level,
                 title=f"kanban {task_id}",
                 on_event=on_event,
+                scope_session_key=str(board or task_id or ""),
             )
         else:
             result = run_opencode_task(
@@ -669,6 +670,7 @@ def _run_opencode(
                 title=f"kanban {task_id}",
                 worker_config=_scheduled_opencode_worker_config(),
                 on_event=on_event,
+                scope_session_key=str(board or task_id or ""),
             )
     finally:
         _restore_environ(old_env)
