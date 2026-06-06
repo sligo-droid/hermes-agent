@@ -226,6 +226,79 @@ code { font-size: 0.875rem; }
   font-family: var(--theme-font-mono);
 }
 
+.command-center-card-running {
+  overflow: hidden;
+  border-color: rgb(251 191 36 / 0.52);
+  background: linear-gradient(135deg, rgb(251 191 36 / 0.13), rgb(8 9 10 / 0.84) 36%, rgb(34 211 238 / 0.08));
+  box-shadow: 0 0 34px rgb(251 191 36 / 0.12), inset 0 1px 0 rgb(255 255 255 / 0.06);
+}
+.command-center-card-running:hover {
+  border-color: rgb(252 211 77 / 0.72);
+  box-shadow: 0 0 42px rgb(251 191 36 / 0.17), inset 0 1px 0 rgb(255 255 255 / 0.08);
+}
+.command-center-card-running::before,
+.command-center-card-running::after {
+  content: '';
+  pointer-events: none;
+  position: absolute;
+  z-index: 0;
+}
+.command-center-card-running::before {
+  inset: 0 0 auto;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgb(251 191 36 / 0.2), rgb(103 232 249 / 0.92), rgb(251 191 36 / 0.2), transparent);
+  background-size: 240% 100%;
+  box-shadow: 0 0 18px rgb(103 232 249 / 0.35);
+}
+.command-center-card-running::after {
+  right: -5rem;
+  top: -8rem;
+  height: 18rem;
+  width: 18rem;
+  border-radius: 9999px;
+  background: radial-gradient(circle, rgb(251 191 36 / 0.18), transparent 66%);
+}
+.command-center-card-running > * {
+  position: relative;
+  z-index: 1;
+}
+.command-center-running-chip {
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.12), 0 0 18px rgb(251 191 36 / 0.14);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .command-center-card-running::before {
+    animation: command-center-live-scan 2.6s linear infinite;
+  }
+  .command-center-running-dot {
+    animation: command-center-live-pulse 1.45s ease-out infinite;
+  }
+}
+
+@keyframes command-center-live-scan {
+  from {
+    background-position: 120% 0;
+  }
+  to {
+    background-position: -120% 0;
+  }
+}
+
+@keyframes command-center-live-pulse {
+  0% {
+    opacity: 0.78;
+    transform: scale(0.72);
+  }
+  72% {
+    opacity: 0;
+    transform: scale(2.1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(2.1);
+  }
+}
+
 /* Scoped light mode for the Sligo Command Center shell only. */
 .sligo-light [class*="border-white/10"],
 .sligo-light [class*="border-white/15"] {
@@ -284,6 +357,24 @@ code { font-size: 0.875rem; }
   background-color: rgb(240 253 250 / 0.92) !important;
   border-color: rgb(6 182 212 / 0.68) !important;
   box-shadow: inset 0 0 0 1px rgb(14 116 144 / 0.14), 0 12px 28px rgb(15 23 42 / 0.08);
+}
+.sligo-light .command-center-card-running {
+  background: linear-gradient(135deg, rgb(254 243 199 / 0.96), rgb(255 255 255 / 0.9) 42%, rgb(207 250 254 / 0.82)) !important;
+  border-color: rgb(217 119 6 / 0.74) !important;
+  box-shadow: 0 14px 36px rgb(180 83 9 / 0.14), inset 0 0 0 1px rgb(217 119 6 / 0.14);
+}
+.sligo-light .command-center-card-running:hover {
+  border-color: rgb(180 83 9 / 0.86) !important;
+  box-shadow: 0 18px 44px rgb(180 83 9 / 0.18), inset 0 0 0 1px rgb(217 119 6 / 0.2);
+}
+.sligo-light .command-center-running-chip {
+  background-color: rgb(254 243 199 / 0.92) !important;
+  border-color: rgb(217 119 6 / 0.58) !important;
+  color: rgb(120 53 15) !important;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.9), 0 8px 18px rgb(180 83 9 / 0.12);
+}
+.sligo-light .command-center-running-chip [class*="text-amber-100"] {
+  color: rgb(146 64 14 / 0.78) !important;
 }
 .sligo-light .command-center-action-tooltip {
   background-color: rgb(255 255 255 / 0.98) !important;
