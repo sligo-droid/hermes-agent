@@ -2744,6 +2744,49 @@ def test_running_worker_thread_targets_returns_running_role_boards(monkeypatch, 
     assert other.slug not in {target["board"] for target in targets}
 
 
+def test_typing_targets_require_active_running_run(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    active = _make_discord_board("2403")
+    stale = _make_discord_board("2404")
+    queued = _make_discord_board("2405")
+    active_task = _create_ready_dev_task(active.slug)
+    stale_task = _create_ready_dev_task(stale.slug)
+    _create_ready_dev_task(queued.slug)
+    with kanban_db.connect_closing(board=active.slug) as conn:
+        kanban_db.claim_task(conn, active_task)
+    with kanban_db.connect_closing(board=stale.slug) as conn:
+        kanban_db.claim_task(conn, stale_task)
+        conn.execute(
+            "UPDATE task_runs SET status = 'crashed', ended_at = ? WHERE task_id = ?",
+            (int(time.time()), stale_task),
+        )
+
+    targets = dwb.running_discord_thread_typing_targets()
+
+    assert [target["board"] for target in targets] == [active.slug]
+
+
+def test_typing_targets_skip_blocked_board_with_stale_running_row(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = _make_discord_board("2406")
+    task_id = _create_ready_dev_task(board.slug)
+    with kanban_db.connect_closing(board=board.slug) as conn:
+        kanban_db.claim_task(conn, task_id)
+        conn.execute(
+            "UPDATE task_runs SET status = 'blocked', ended_at = ? WHERE task_id = ?",
+            (int(time.time()), task_id),
+        )
+    dwb._update_worker_meta(board.slug, {"goal_status": "blocked", "blocked_reason": "needs human"})
+
+    assert dwb.running_discord_thread_typing_targets() == []
+
+
 def test_typing_targets_skip_unopenable_board_and_keep_healthy_target(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

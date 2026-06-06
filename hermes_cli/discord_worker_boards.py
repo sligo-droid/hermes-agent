@@ -2316,6 +2316,7 @@ def source_task_reaction_state(board: str, task_id: str) -> Optional[str]:
         if task is None:
             return None
         latest = kanban_db.latest_run(conn, task_id)
+        active = kanban_db.active_run(conn, task_id)
 
     status = str(getattr(task, "status", "") or "").strip().lower()
     latest_status = str(getattr(latest, "status", "") or "").strip().lower() if latest else ""
@@ -2330,7 +2331,8 @@ def source_task_reaction_state(board: str, task_id: str) -> Optional[str]:
         if str(getattr(task, "last_failure_error", "") or "").strip():
             return "errored"
         return "blocked"
-    if status == "running" or (latest_status == "running" and getattr(latest, "ended_at", None) is None):
+    active_status = str(getattr(active, "status", "") or "").strip().lower() if active else ""
+    if status == "running" and active_status == "running":
         return "running"
     if status in {"triage", "todo", "scheduled", "ready", "review"}:
         return "active"
@@ -5156,7 +5158,15 @@ def running_worker_thread_targets() -> list[dict[str, Any]]:
                 row = conn.execute(
                     "SELECT COUNT(*) FROM tasks "
                     "WHERE status = 'running' AND lower(assignee) IN "
-                    f"({placeholders})",
+                    f"({placeholders}) "
+                    "AND current_run_id IS NOT NULL "
+                    "AND EXISTS ("
+                    "  SELECT 1 FROM task_runs r "
+                    "  WHERE r.id = tasks.current_run_id "
+                    "    AND r.task_id = tasks.id "
+                    "    AND r.status = 'running' "
+                    "    AND r.ended_at IS NULL"
+                    ")",
                     tuple(sorted(ROLE_ASSIGNEES)),
                 ).fetchone()
                 running = int(row[0] or 0) if row else 0
@@ -5223,7 +5233,10 @@ def running_notify_thread_targets() -> list[dict[str, Any]]:
                            n.thread_id AS thread_id
                       FROM tasks t
                       JOIN kanban_notify_subs n ON n.task_id = t.id
+                      JOIN task_runs r ON r.id = t.current_run_id AND r.task_id = t.id
                      WHERE t.status = 'running'
+                       AND r.status = 'running'
+                       AND r.ended_at IS NULL
                        AND lower(n.platform) = 'discord'
                        AND COALESCE(n.thread_id, '') != ''
                     """
