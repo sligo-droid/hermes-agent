@@ -1097,6 +1097,60 @@ class SessionDB:
             return None
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
 
+    def get_recent_compression_lineage(
+        self,
+        session_id: str,
+        *,
+        window_seconds: float = 600.0,
+        limit: int = 12,
+    ) -> List[Dict[str, Any]]:
+        """Return recent rows in the compression parent chain for ``session_id``.
+
+        This is intentionally scoped to compression-loop diagnostics.  It walks
+        ancestors from the current session toward the root and stops at the
+        first row outside ``window_seconds`` or at ``limit`` rows.  Callers use
+        the metadata to decide whether another compression rotation would only
+        create another empty continuation.
+        """
+        if not session_id:
+            return []
+        cutoff = time.time() - float(window_seconds)
+        rows: List[Dict[str, Any]] = []
+        current = session_id
+        seen = set()
+        with self._lock:
+            for _ in range(max(1, int(limit))):
+                if not current or current in seen:
+                    break
+                seen.add(current)
+                row = self._conn.execute(
+                    """SELECT id, parent_session_id, started_at, ended_at, end_reason,
+                              message_count, input_tokens, api_call_count
+                       FROM sessions WHERE id = ?""",
+                    (current,),
+                ).fetchone()
+                if row is None:
+                    break
+                item = dict(row) if isinstance(row, sqlite3.Row) else {
+                    "id": row[0],
+                    "parent_session_id": row[1],
+                    "started_at": row[2],
+                    "ended_at": row[3],
+                    "end_reason": row[4],
+                    "message_count": row[5],
+                    "input_tokens": row[6],
+                    "api_call_count": row[7],
+                }
+                rows.append(item)
+                started_at = float(item.get("started_at") or 0.0)
+                parent_id = item.get("parent_session_id")
+                if started_at and started_at < cutoff:
+                    break
+                if not parent_id:
+                    break
+                current = str(parent_id)
+        return rows
+
 
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         """Store the full assembled system prompt snapshot."""
