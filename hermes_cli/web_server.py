@@ -680,8 +680,16 @@ async def worker_ticket_console_api(request: Request, session_id: str, task_id: 
     try:
         from hermes_cli.discord_worker_boards import worker_ticket_console_for_session
 
+        payload = worker_ticket_console_for_session(session_id, task_id)
+        if isinstance(payload, dict):
+            payload["operator_console_text"] = worker_console_operator_text(payload)
+            payload["worker_log_tail"] = _worker_console_redact(
+                payload.get("worker_log_tail"),
+                max_chars=_WORKER_CONSOLE_OUTPUT_MAX_CHARS,
+            )
+            payload["codex_state"] = _worker_console_redact_state(payload.get("codex_state"))
         return JSONResponse(
-            worker_ticket_console_for_session(session_id, task_id),
+            payload,
             headers={"Cache-Control": "no-store"},
         )
     except KeyError:
@@ -4117,7 +4125,7 @@ def _worker_console_intro(snapshot: dict[str, Any], log_path: Path, state_path: 
         f"workspace: {workspace.get('path') or '-'}",
         f"worker log: {log_path}",
         f"backend state: {state_path}",
-        "stream: worker stdout/stderr plus raw OpenCode/Codex events",
+        "stream: readable Codex/OpenCode backend activity plus worker stdout/stderr",
         "",
     ]
     return _worker_console_bytes("\n".join(lines))
@@ -4189,6 +4197,366 @@ def _read_worker_console_state(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+_WORKER_CONSOLE_COMMAND_MAX_CHARS = 2000
+_WORKER_CONSOLE_TEXT_MAX_CHARS = 4000
+_WORKER_CONSOLE_OUTPUT_MAX_CHARS = 8000
+
+
+def _worker_console_redact(value: Any, *, max_chars: int = _WORKER_CONSOLE_TEXT_MAX_CHARS) -> str:
+    text = "" if value is None else str(value)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    try:
+        from agent.redact import redact_sensitive_text
+
+        text = redact_sensitive_text(text, force=True)
+    except Exception:
+        pass
+    if max_chars > 0 and len(text) > max_chars:
+        omitted = len(text) - max_chars
+        text = f"{text[:max_chars].rstrip()}\n... [{omitted} chars truncated]"
+    return text
+
+
+def _worker_console_scalar(value: Any, *, max_chars: int = 240) -> str:
+    return " ".join(_worker_console_redact(value, max_chars=max_chars).split())
+
+
+def _worker_console_redact_state(value: Any) -> Any:
+    if isinstance(value, str):
+        return _worker_console_redact(value, max_chars=_WORKER_CONSOLE_OUTPUT_MAX_CHARS)
+    if isinstance(value, list):
+        return [_worker_console_redact_state(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _worker_console_redact_state(item) for key, item in value.items()}
+    return value
+
+
+def _worker_console_event_params(event: dict[str, Any]) -> dict[str, Any]:
+    payload_obj = event.get("payload")
+    payload = payload_obj if isinstance(payload_obj, dict) else {}
+    params_obj = payload.get("params")
+    return params_obj if isinstance(params_obj, dict) else {}
+
+
+def _worker_console_item(event: dict[str, Any]) -> dict[str, Any]:
+    params = _worker_console_event_params(event)
+    item_obj = params.get("item")
+    return item_obj if isinstance(item_obj, dict) else {}
+
+
+def _worker_console_event_text(event: dict[str, Any], item: dict[str, Any]) -> str:
+    for key in ("delta", "text", "message", "content", "summary", "reasoning"):
+        value = item.get(key)
+        if isinstance(value, str) and value:
+            return value
+    params = _worker_console_event_params(event)
+    for key in ("delta", "text", "message", "content"):
+        value = params.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _worker_console_agent_label_and_text(event: dict[str, Any]) -> tuple[str, str]:
+    method = str(event.get("method") or "").strip()
+    item = _worker_console_item(event)
+    item_type = str(event.get("item_type") or item.get("type") or "").strip()
+    lower = f"{method} {item_type}".lower()
+    if not ("agentmessage" in lower or "reasoning" in lower or method in {"opencode/message"}):
+        return "", ""
+    label = "reasoning" if "reasoning" in lower else "agent message"
+    return label, _worker_console_event_text(event, item)
+
+
+def _worker_console_agent_text_summary(text: str) -> str:
+    """Summarize a completed agent message without dumping giant code blobs."""
+    stripped = str(text or "").strip()
+    if not stripped:
+        return ""
+    try:
+        parsed = json.loads(stripped)
+    except Exception:
+        return _worker_console_redact(stripped, max_chars=1200)
+    if not isinstance(parsed, dict):
+        return _worker_console_redact(stripped, max_chars=1200)
+    lines: list[str] = []
+    for key in ("status", "summary", "verdict", "outcome"):
+        value = parsed.get(key)
+        if isinstance(value, (str, int, float, bool)) and value not in ("", None):
+            lines.append(f"{key}: {_worker_console_scalar(value, max_chars=700)}")
+    findings = parsed.get("findings")
+    if isinstance(findings, list):
+        lines.append(f"findings: {len(findings)}")
+        for finding in findings[:5]:
+            lines.append(f"- {_worker_console_scalar(finding, max_chars=600)}")
+        if len(findings) > 5:
+            lines.append(f"... {len(findings) - 5} more finding(s)")
+    if not lines:
+        return _worker_console_redact(stripped, max_chars=1200)
+    return "\n".join(lines)
+
+
+def _worker_console_event_output(item: dict[str, Any]) -> str:
+    for key in ("aggregatedOutput", "output", "result", "error", "stderr", "stdout"):
+        value = item.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, (dict, list)):
+            try:
+                return json.dumps(value, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                return str(value)
+    return ""
+
+
+def _worker_console_status_bits(source: dict[str, Any], *keys: str) -> list[str]:
+    bits: list[str] = []
+    for key in keys:
+        value = source.get(key)
+        if value is None or value == "":
+            continue
+        label = "exit" if key == "exit_code" else key.replace("_", " ")
+        bits.append(f"{label}: {_worker_console_scalar(value, max_chars=120)}")
+    return bits
+
+
+def _format_worker_console_tool_trace_entry(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    tool = _worker_console_scalar(entry.get("tool") or entry.get("name") or "tool", max_chars=160)
+    status = _worker_console_scalar(entry.get("status") or "event", max_chars=80)
+    if str(entry.get("tool") or "") == "commandExecution" or entry.get("command"):
+        lines = [f"[command {status}]".rstrip()]
+        command = entry.get("command")
+        if command:
+            lines.append("$ " + _worker_console_redact(command, max_chars=_WORKER_CONSOLE_COMMAND_MAX_CHARS))
+        cwd = entry.get("cwd")
+        if cwd:
+            lines.append("cwd: " + _worker_console_scalar(cwd, max_chars=500))
+        bits = _worker_console_status_bits(entry, "exit_code", "duration_ms")
+        if bits:
+            lines.append("; ".join(bits))
+        output = entry.get("output") or entry.get("aggregatedOutput") or entry.get("result") or entry.get("error")
+        if output:
+            lines.append("output:")
+            lines.append(_worker_console_redact(output, max_chars=_WORKER_CONSOLE_OUTPUT_MAX_CHARS))
+        return "\n".join(lines).rstrip() + "\n"
+    name = _worker_console_scalar(entry.get("name") or entry.get("server") or tool, max_chars=240)
+    lines = [f"[tool {status}] {tool}" + (f" {name}" if name and name != tool else "")]
+    bits = _worker_console_status_bits(entry, "source", "server", "exit_code", "duration_ms")
+    if bits:
+        lines.append("; ".join(bits))
+    output = entry.get("output") or entry.get("result") or entry.get("error")
+    if output:
+        lines.append("result:")
+        lines.append(_worker_console_redact(output, max_chars=_WORKER_CONSOLE_OUTPUT_MAX_CHARS))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _format_worker_console_event(event: Any) -> str:
+    if not isinstance(event, dict):
+        return ""
+    method = str(event.get("method") or "backend event").strip() or "backend event"
+    item = _worker_console_item(event)
+    params = _worker_console_event_params(event)
+    item_type = str(event.get("item_type") or item.get("type") or "").strip()
+    lower = f"{method} {item_type}".lower()
+    agent_label, text = _worker_console_agent_label_and_text(event)
+    if agent_label:
+        completed = method.endswith("completed") or method == "item/completed"
+        if completed:
+            summary = _worker_console_agent_text_summary(text)
+            if summary:
+                return f"[{agent_label} completed]\n{summary}\n"
+            return f"[{agent_label} completed]\n"
+        if text:
+            return f"[{agent_label}]\n{_worker_console_redact(text, max_chars=_WORKER_CONSOLE_TEXT_MAX_CHARS)}\n"
+    if "commandexecution" in lower:
+        status = "completed" if method.endswith("completed") else "event"
+        trace_like = dict(item)
+        trace_like.setdefault("tool", "commandExecution")
+        trace_like.setdefault("status", status)
+        return _format_worker_console_tool_trace_entry(trace_like)
+    if "toolcall" in lower or "tool" in lower:
+        name = item.get("name") or item.get("tool") or item.get("server") or item_type or method
+        status = item.get("status") or ("completed" if method.endswith("completed") else "event")
+        lines = [f"[tool {_worker_console_scalar(status, max_chars=80)}] {_worker_console_scalar(name, max_chars=240)}"]
+        bits = _worker_console_status_bits(item, "server", "exit_code", "duration_ms")
+        if bits:
+            lines.append("; ".join(bits))
+        output = _worker_console_event_output(item)
+        if output:
+            lines.append("result:")
+            lines.append(_worker_console_redact(output, max_chars=_WORKER_CONSOLE_OUTPUT_MAX_CHARS))
+        return "\n".join(lines).rstrip() + "\n"
+    if "file" in lower:
+        path = item.get("path") or item.get("file") or item.get("filename")
+        kind = item.get("kind") or item.get("status") or method
+        return f"[file] {_worker_console_scalar(kind, max_chars=120)} {_worker_console_scalar(path or '', max_chars=800)}\n"
+    if "token" in lower:
+        usage = params.get("tokenUsage") if isinstance(params.get("tokenUsage"), dict) else {}
+        total = usage.get("total") if isinstance(usage.get("total"), dict) else {}
+        last = usage.get("last") if isinstance(usage.get("last"), dict) else {}
+        bits: list[str] = []
+        for prefix, source in (("total", total), ("last", last)):
+            if not isinstance(source, dict):
+                continue
+            if source.get("totalTokens") is not None:
+                bits.append(f"{prefix}={_worker_console_scalar(source.get('totalTokens'), max_chars=80)}")
+            if source.get("reasoningOutputTokens") is not None:
+                bits.append(f"{prefix}_reasoning={_worker_console_scalar(source.get('reasoningOutputTokens'), max_chars=80)}")
+        if usage.get("modelContextWindow") is not None:
+            bits.append(f"context={_worker_console_scalar(usage.get('modelContextWindow'), max_chars=80)}")
+        suffix = " " + " ".join(bits) if bits else ""
+        return f"[token usage]{suffix}\n"
+    if "ratelimit" in lower or "rate" in lower:
+        limits = params.get("rateLimits") if isinstance(params.get("rateLimits"), dict) else {}
+        bits = []
+        for key in ("limitId", "planType", "rateLimitReachedType"):
+            if limits.get(key) not in (None, ""):
+                bits.append(f"{key}={_worker_console_scalar(limits.get(key), max_chars=120)}")
+        for bucket in ("primary", "secondary"):
+            data = limits.get(bucket) if isinstance(limits.get(bucket), dict) else {}
+            if data.get("usedPercent") is not None:
+                bits.append(f"{bucket}={_worker_console_scalar(data.get('usedPercent'), max_chars=80)}%")
+        suffix = " " + " ".join(bits) if bits else ""
+        return f"[rate limits]{suffix}\n"
+    if "status" in lower:
+        status = params.get("status")
+        if isinstance(status, dict):
+            status = status.get("type") or status.get("status") or status
+        suffix = f" {_worker_console_scalar(status, max_chars=180)}" if status else ""
+        return f"[thread status]{suffix}\n"
+    if "turn" in lower:
+        turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+        bits = []
+        for key in ("status", "durationMs", "id"):
+            if turn.get(key) not in (None, ""):
+                bits.append(f"{key}={_worker_console_scalar(turn.get(key), max_chars=180)}")
+        if isinstance(turn.get("error"), dict):
+            message = turn["error"].get("message") or turn["error"].get("code")
+            if message:
+                bits.append(f"error={_worker_console_scalar(message, max_chars=240)}")
+        suffix = " " + " ".join(bits) if bits else ""
+        return f"[turn]{suffix}\n"
+    selected_fields: list[str] = []
+    for key in ("status", "type", "name", "tool", "server", "message", "error"):
+        value = item.get(key) if item else event.get(key)
+        if isinstance(value, (str, int, float, bool)) and value not in ("", None):
+            selected_fields.append(f"{key}={_worker_console_scalar(value, max_chars=180)}")
+    label = _worker_console_scalar(method, max_chars=180)
+    if item_type:
+        label += f" {_worker_console_scalar(item_type, max_chars=120)}"
+    suffix = " " + " ".join(selected_fields) if selected_fields else ""
+    return f"[{label}]{suffix}\n"
+
+
+def _format_worker_console_events(events: list[Any]) -> list[str]:
+    """Format one retained/delta batch, coalescing token-level text deltas."""
+    chunks: list[str] = []
+    current_label = ""
+    current_text: list[str] = []
+
+    def flush_agent_text() -> None:
+        nonlocal current_label, current_text
+        if not current_text:
+            return
+        text = "".join(current_text)
+        chunks.append(
+            f"[{current_label}]\n"
+            f"{_worker_console_redact(text, max_chars=_WORKER_CONSOLE_OUTPUT_MAX_CHARS)}\n"
+        )
+        current_label = ""
+        current_text = []
+
+    for event in events:
+        if isinstance(event, dict):
+            method = str(event.get("method") or "")
+            label, text = _worker_console_agent_label_and_text(event)
+            is_delta = method.endswith("/delta") or method.endswith("Delta") or method.endswith("delta")
+            if label and text and is_delta:
+                if current_text and current_label != label:
+                    flush_agent_text()
+                current_label = label
+                current_text.append(text)
+                continue
+        flush_agent_text()
+        line = _format_worker_console_event(event)
+        if line:
+            chunks.append(line)
+    flush_agent_text()
+    return chunks
+
+
+def _format_worker_console_result(result: Any) -> str:
+    if not isinstance(result, dict):
+        return ""
+    lines = ["[final result]"]
+    for key in ("status", "outcome", "provider", "model", "reasoning", "duration_ms"):
+        value = result.get(key)
+        if value not in (None, ""):
+            lines.append(f"{key}: {_worker_console_scalar(value, max_chars=240)}")
+    for key in ("summary", "content", "text", "error"):
+        value = result.get(key)
+        if value:
+            lines.append(f"{key}:")
+            lines.append(_worker_console_redact(value, max_chars=_WORKER_CONSOLE_OUTPUT_MAX_CHARS))
+            break
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _worker_console_state_text(
+    state: dict[str, Any],
+    *,
+    event_start: int = 0,
+    tool_trace_start: int = 0,
+    include_headers: bool = True,
+    include_result: bool = True,
+) -> str:
+    if not isinstance(state, dict) or not state:
+        return ""
+    chunks: list[str] = []
+    tool_trace = state.get("tool_trace") if isinstance(state.get("tool_trace"), list) else []
+    if tool_trace_start > len(tool_trace):
+        tool_trace_start = 0
+    new_trace = tool_trace[tool_trace_start:]
+    if new_trace:
+        if include_headers:
+            chunks.append("[tool trace] showing current retained tool window\n")
+        for entry in new_trace:
+            line = _format_worker_console_tool_trace_entry(entry)
+            if line:
+                chunks.append(line)
+    events = state.get("events") if isinstance(state.get("events"), list) else []
+    if event_start > len(events):
+        event_start = 0
+    new_events = events[event_start:]
+    truncated = int(state.get("truncated_events") or 0)
+    if include_headers and (new_events or truncated):
+        if truncated > 0:
+            chunks.append(f"[backend events] {truncated} older event(s) truncated; showing retained activity\n")
+        else:
+            chunks.append("[backend events] showing retained activity\n")
+    chunks.extend(_format_worker_console_events(new_events))
+    if include_result:
+        result_line = _format_worker_console_result(state.get("result"))
+        if result_line:
+            chunks.append(result_line)
+    return "\n".join(chunk.rstrip("\n") for chunk in chunks if chunk).rstrip() + ("\n" if chunks else "")
+
+
+def worker_console_operator_text(snapshot: dict[str, Any]) -> str:
+    """Readable, redacted backend activity for REST fallback rendering."""
+    state = snapshot.get("codex_state") if isinstance(snapshot.get("codex_state"), dict) else {}
+    text = _worker_console_state_text(state, include_headers=True, include_result=True)
+    if text:
+        return text
+    log_tail = snapshot.get("worker_log_tail")
+    if log_tail:
+        return "[worker log]\n" + _worker_console_redact(log_tail, max_chars=_WORKER_CONSOLE_OUTPUT_MAX_CHARS) + "\n"
+    return "[backend activity] waiting for Codex/OpenCode events\n"
+
+
 def _worker_console_json_line(label: str, value: Any) -> bytes:
     try:
         payload = json.dumps(value, ensure_ascii=False, sort_keys=True)
@@ -4202,34 +4570,50 @@ async def _send_worker_console_backend_updates(
     state_path: Path,
     *,
     event_cursor: int,
+    tool_trace_cursor: int,
     truncated_cursor: int,
     result_fingerprint: str,
-) -> tuple[int, int, str]:
+) -> tuple[int, int, int, str]:
     state = _read_worker_console_state(state_path)
     if not state:
-        return event_cursor, truncated_cursor, result_fingerprint
+        return event_cursor, tool_trace_cursor, truncated_cursor, result_fingerprint
 
     truncated = int(state.get("truncated_events") or 0)
     events = state.get("events") if isinstance(state.get("events"), list) else []
+    tool_trace = state.get("tool_trace") if isinstance(state.get("tool_trace"), list) else []
+    if len(tool_trace) < tool_trace_cursor:
+        await ws.send_bytes(
+            _worker_console_bytes(
+                "[tool trace] retention window changed; showing current tool window\n"
+            )
+        )
+        tool_trace_cursor = 0
+    elif tool_trace_cursor == 0 and tool_trace:
+        await ws.send_bytes(
+            _worker_console_bytes("[tool trace] showing current retained tool window\n")
+        )
+    for entry in tool_trace[tool_trace_cursor:]:
+        line = _format_worker_console_tool_trace_entry(entry)
+        if line:
+            await ws.send_bytes(_worker_console_bytes(line))
+    tool_trace_cursor = len(tool_trace)
+
     if truncated_cursor < 0:
         if truncated > 0:
             await ws.send_bytes(
                 _worker_console_bytes(
-                    "[backend events] showing current retained event window\n"
+                    f"[backend events] {truncated} older event(s) truncated; showing retained activity\n"
                 )
             )
     elif truncated != truncated_cursor or len(events) < event_cursor:
         await ws.send_bytes(
             _worker_console_bytes(
-                "[backend events] retention window changed; showing current event window\n"
+                "[backend events] retention window changed; showing current activity window\n"
             )
         )
         event_cursor = 0
-    for event in events[event_cursor:]:
-        method = "backend event"
-        if isinstance(event, dict) and event.get("method"):
-            method = str(event.get("method"))
-        await ws.send_bytes(_worker_console_json_line(method, event))
+    for line in _format_worker_console_events(events[event_cursor:]):
+        await ws.send_bytes(_worker_console_bytes(line))
     event_cursor = len(events)
     truncated_cursor = truncated
 
@@ -4240,9 +4624,11 @@ async def _send_worker_console_backend_updates(
         except Exception:
             fingerprint = str(result)
         if fingerprint != result_fingerprint:
-            await ws.send_bytes(_worker_console_json_line("backend result", result))
+            line = _format_worker_console_result(result)
+            if line:
+                await ws.send_bytes(_worker_console_bytes(line))
             result_fingerprint = fingerprint
-    return event_cursor, truncated_cursor, result_fingerprint
+    return event_cursor, tool_trace_cursor, truncated_cursor, result_fingerprint
 
 
 async def _stream_worker_console_log(
@@ -4253,30 +4639,33 @@ async def _stream_worker_console_log(
 ) -> None:
     await ws.send_bytes(_worker_console_intro(snapshot, log_path, state_path))
 
+    event_cursor = 0
+    tool_trace_cursor = 0
+    truncated_cursor = -1
+    result_fingerprint = ""
+    event_cursor, tool_trace_cursor, truncated_cursor, result_fingerprint = await _send_worker_console_backend_updates(
+        ws,
+        state_path,
+        event_cursor=event_cursor,
+        tool_trace_cursor=tool_trace_cursor,
+        truncated_cursor=truncated_cursor,
+        result_fingerprint=result_fingerprint,
+    )
+
     initial, offset, clipped = _read_worker_console_log_tail(log_path)
     if clipped:
         await ws.send_bytes(
             _worker_console_bytes(
-                f"[worker log] showing last {_WORKER_CONSOLE_INITIAL_TAIL_BYTES} bytes\n"
+                f"[worker stdout/stderr] showing last {_WORKER_CONSOLE_INITIAL_TAIL_BYTES} bytes\n"
             )
         )
     if initial:
+        await ws.send_bytes(_worker_console_bytes("[worker stdout/stderr]\n"))
         await ws.send_bytes(_worker_console_terminal_bytes(initial))
     else:
         await ws.send_bytes(
-            _worker_console_bytes("[worker log] waiting for worker output\n")
+            _worker_console_bytes("[worker stdout/stderr] waiting for worker output\n")
         )
-
-    event_cursor = 0
-    truncated_cursor = -1
-    result_fingerprint = ""
-    event_cursor, truncated_cursor, result_fingerprint = await _send_worker_console_backend_updates(
-        ws,
-        state_path,
-        event_cursor=event_cursor,
-        truncated_cursor=truncated_cursor,
-        result_fingerprint=result_fingerprint,
-    )
 
     while True:
         await asyncio.sleep(_WORKER_CONSOLE_POLL_SECONDS)
@@ -4287,10 +4676,11 @@ async def _stream_worker_console_log(
             )
         if delta:
             await ws.send_bytes(_worker_console_terminal_bytes(delta))
-        event_cursor, truncated_cursor, result_fingerprint = await _send_worker_console_backend_updates(
+        event_cursor, tool_trace_cursor, truncated_cursor, result_fingerprint = await _send_worker_console_backend_updates(
             ws,
             state_path,
             event_cursor=event_cursor,
+            tool_trace_cursor=tool_trace_cursor,
             truncated_cursor=truncated_cursor,
             result_fingerprint=result_fingerprint,
         )

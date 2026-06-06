@@ -68,7 +68,34 @@ def test_worker_console_api_accepts_gated_cookie_session(gated_app, tmp_path: Pa
         conn.close()
     log_path = kanban_db.worker_log_path(task.id, board=board.slug)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    kanban_db._append_worker_log_line(log_path, "operator console log line")
+    secret = "sk-testsecret1234567890"
+    kanban_db._append_worker_log_line(log_path, f"operator console log line {secret}")
+    from hermes_cli.discord_worker_state import codex_worker_state_path
+
+    state_path = codex_worker_state_path(task.id, board=board.slug)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "events": [
+                    {
+                        "method": "item/agentMessage/delta",
+                        "payload": {"params": {"item": {"type": "agentMessage", "delta": secret}}},
+                    }
+                ],
+                "tool_trace": [
+                    {
+                        "tool": "commandExecution",
+                        "command": "print secret",
+                        "status": "completed",
+                        "exit_code": 0,
+                        "output": secret,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     _logged_in(gated_app)
     resp = gated_app.get(
@@ -80,6 +107,11 @@ def test_worker_console_api_accepts_gated_cookie_session(gated_app, tmp_path: Pa
     assert data["task"]["id"] == task.id
     assert data["workspace"]["available"] is True
     assert "operator console log line" in data["worker_log_tail"]
+    serialized = json.dumps(data)
+    assert secret not in serialized
+    assert "[tool trace]" in data["operator_console_text"]
+    assert "[command completed]" in data["operator_console_text"]
+    assert "print secret" in data["operator_console_text"]
 
 
 def test_worker_console_log_accepts_gated_ws_ticket(gated_app, monkeypatch, tmp_path: Path):

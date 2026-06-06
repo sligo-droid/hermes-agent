@@ -2192,6 +2192,120 @@ skip_on_windows = pytest.mark.skipif(
 )
 
 
+def test_worker_console_backend_update_formats_readable_activity(tmp_path):
+    import asyncio
+
+    import hermes_cli.web_server as ws
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.frames: list[bytes] = []
+
+        async def send_bytes(self, data: bytes) -> None:
+            self.frames.append(data)
+
+    state_path = tmp_path / "worker.codex-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "tool_trace": [
+                    {
+                        "source": "codex",
+                        "tool": "commandExecution",
+                        "command": "/bin/bash -lc 'rg worker console'",
+                        "status": "completed",
+                        "exit_code": 0,
+                        "output": "command output ok sk-test-secret1234567890",
+                    }
+                ],
+                "events": [
+                    {
+                        "method": "item/agentMessage/delta",
+                        "payload": {"params": {"item": {"type": "agentMessage", "delta": "thinking text ok"}}},
+                    },
+                    {
+                        "method": "item/completed",
+                        "payload": {"params": {"item": {"type": "agentMessage"}}},
+                    },
+                    {
+                        "method": "thread/tokenUsage/updated",
+                        "payload": {
+                            "params": {
+                                "tokenUsage": {
+                                    "total": {"totalTokens": 123, "reasoningOutputTokens": 4},
+                                    "last": {"totalTokens": 5},
+                                    "modelContextWindow": 1000,
+                                }
+                            }
+                        },
+                    },
+                ],
+                "truncated_events": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake = FakeWebSocket()
+
+    cursors = asyncio.run(
+        ws._send_worker_console_backend_updates(
+            fake,
+            state_path,
+            event_cursor=0,
+            tool_trace_cursor=0,
+            truncated_cursor=-1,
+            result_fingerprint="",
+        )
+    )
+
+    text = b"".join(fake.frames).decode("utf-8", errors="replace")
+    assert cursors[:3] == (3, 1, 2)
+    assert "[tool trace]" in text
+    assert "[command completed]" in text
+    assert "/bin/bash -lc 'rg worker console'" in text
+    assert "exit: 0" in text
+    assert "command output ok" in text
+    assert "[agent message]" in text
+    assert "thinking text ok" in text
+    assert "[token usage] total=123 total_reasoning=4 last=5 context=1000" in text
+    assert "[item/agentMessage/delta] {" not in text
+    assert "sk-test-secret1234567890" not in text
+
+
+def test_worker_console_operator_text_formats_snapshot():
+    import hermes_cli.web_server as ws
+
+    payload = {
+        "worker_log_tail": "brief worker log",
+        "codex_state": {
+            "tool_trace": [
+                {
+                    "tool": "commandExecution",
+                    "command": "pwd",
+                    "status": "completed",
+                    "exit_code": 0,
+                    "output": "repo path ok",
+                }
+            ],
+            "events": [
+                {
+                    "method": "item/agentMessage/delta",
+                    "payload": {"params": {"item": {"type": "agentMessage", "delta": "agent says hi"}}},
+                }
+            ],
+        },
+    }
+
+    text = ws.worker_console_operator_text(payload)
+
+    assert "[tool trace]" in text
+    assert "[command completed]" in text
+    assert "repo path ok" in text
+    assert "[agent message]" in text
+    assert "agent says hi" in text
+    assert "[item/agentMessage/delta] {" not in text
+
+
 @skip_on_windows
 class TestPtyWebSocket:
     @pytest.fixture(autouse=True)

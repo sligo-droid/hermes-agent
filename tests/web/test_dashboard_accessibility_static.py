@@ -95,7 +95,7 @@ def test_command_center_archive_action_renders_last_in_row_rail():
     row_rail = source.split('className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3"', 1)[1].split("</div>", 1)[0]
 
     assert action_source.index('actions.push("approve", "reject")') < action_source.index('actions.push("archive")')
-    assert action_source.index('actions.push("resume")') < action_source.index('actions.push("archive")')
+    assert action_source.index('actions.push("replay")') < action_source.index('actions.push("archive")')
     assert action_source.index('actions.push("pause")') < action_source.index('actions.push("archive")')
     assert action_source.index('actions.push("undo")') < action_source.index('actions.push("archive")')
     assert "actions.map((kind)" in row_rail

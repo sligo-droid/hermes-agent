@@ -8,6 +8,7 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sqlite3
 import sys
@@ -392,6 +393,74 @@ def test_board_pause_resume_and_archive_stops_live_generic_board(client):
     conn.row_factory = sqlite3.Row
     try:
         assert kb.get_task(conn, task_id).status == "archived"
+    finally:
+        conn.close()
+
+
+def test_discord_worker_board_resume_replays_blocked_tickets(client):
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = "discord-replay-blocked"
+    meta = kb.write_board_metadata(board, name="Discord Replay Blocked")
+    meta.pop("db_path", None)
+    meta[dwb.DISCORD_WORKER_META_KEY] = {
+        "kind": "discord_worker_board",
+        "goal_status": "paused",
+        "phase": "paused",
+        "phase_before_pause": "dev",
+        "paused": True,
+        "paused_reason": "operator pause",
+    }
+    kb.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    conn = kb.connect(board=board)
+    try:
+        blocked_id = kb.create_task(conn, title="Blocked worker", board=board, initial_status="blocked")
+        scheduled_id = kb.create_task(conn, title="Scheduled worker", board=board)
+        assert kb.schedule_task(conn, scheduled_id, reason="waiting") is True
+        archived_id = kb.create_task(conn, title="Archived worker", board=board, initial_status="blocked")
+        kb.archive_task(conn, archived_id)
+        with conn:
+            conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                (blocked_id, "running", 100, None, None),
+            )
+            run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', current_run_id = ?, consecutive_failures = 2, last_failure_error = 'stale' WHERE id = ?",
+                (run_id, blocked_id),
+            )
+    finally:
+        conn.close()
+
+    resumed = client.post(f"/api/plugins/kanban/boards/{board}/resume")
+
+    assert resumed.status_code == 200, resumed.text
+    result = resumed.json()["result"]
+    assert result["resumed"] is True
+    assert set(result["replayed_task_ids"]) == {blocked_id, scheduled_id}
+    marker = dwb.dispatch_dirty_marker_path()
+    assert result["dispatch_dirty"] == str(marker)
+    assert marker.exists()
+    marker_payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert marker_payload["board"] == board
+    assert marker_payload["reason"] == "command-center-replay"
+    worker = kb.read_board_metadata(board)[dwb.DISCORD_WORKER_META_KEY]
+    assert worker["goal_status"] == "active"
+    assert worker["phase"] == "dev"
+    assert worker["paused"] is False
+    assert "paused_reason" not in worker
+    conn = kb.connect(board=board)
+    try:
+        blocked = kb.get_task(conn, blocked_id)
+        scheduled = kb.get_task(conn, scheduled_id)
+        archived = kb.get_task(conn, archived_id)
+        assert blocked.status == "ready"
+        assert blocked.current_run_id is None
+        assert blocked.consecutive_failures == 0
+        assert blocked.last_failure_error is None
+        assert scheduled.status == "ready"
+        assert archived.status == "archived"
+        assert kb.claim_task(conn, blocked_id) is not None
     finally:
         conn.close()
 

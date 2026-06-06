@@ -1861,12 +1861,7 @@ def self_improvement_proposal_resume_endpoint(proposal_id: str):
     if worker:
         from hermes_cli import discord_worker_boards as dwb
 
-        dwb.resume_board(board)
-        try:
-            dwb.mark_dispatch_dirty(board=board, reason="command-center-resumed")
-        except Exception:
-            pass
-        result = {"board": board, "resumed": True}
+        result = dwb.resume_board(board)
         conn = _conn(board=board)
     else:
         conn = _conn(board=_resolve_board(board))
@@ -2706,7 +2701,7 @@ def pause_board(slug: str, payload: ProposalFollowupBody | None = None):
 
 @router.post("/boards/{slug}/resume")
 def resume_board(slug: str):
-    """Resume a paused Command Center board."""
+    """Replay blocked Command Center board tickets while keeping /resume compatibility."""
     try:
         normed = kanban_db._normalize_board_slug(slug)
     except ValueError as exc:
@@ -2717,12 +2712,7 @@ def resume_board(slug: str):
     if worker:
         from hermes_cli import discord_worker_boards as dwb
 
-        dwb.resume_board(normed)
-        try:
-            dwb.mark_dispatch_dirty(board=normed, reason="command-center-resumed")
-        except Exception:
-            pass
-        result = {"board": normed, "resumed": True}
+        result = dwb.resume_board(normed)
     else:
         result = _resume_generic_board(normed)
     return {"result": result, "board": kanban_db.read_board_metadata(normed)}

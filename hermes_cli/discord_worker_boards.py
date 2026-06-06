@@ -1229,20 +1229,20 @@ def worker_ticket_console_for_session(session_id: str, task_id: str) -> dict[str
     """Return authenticated operator-console state for one worker ticket."""
     board = resolve_public_session_board(session_id)
     worker = _read_worker_meta(board)
-    return _worker_ticket_console_for_board(board, task_id, worker=worker)
+    try:
+        return _worker_ticket_console_for_board(board, task_id, worker=worker)
+    except KeyError:
+        return _worker_ticket_console_log_only_payload(board, task_id, worker=worker)
 
 
 def worker_ticket_console_log_for_session(session_id: str, task_id: str) -> dict[str, Any]:
     """Return paths and snapshot data for the authenticated operator log."""
     board = resolve_public_session_board(session_id)
     worker = _read_worker_meta(board)
-    task, runs, _events, current_run, codex_state = _ticket_console_parts(board, task_id)
-    return {
-        "board": board,
-        "task_id": str(task.id),
-        "log_path": str(kanban_db.worker_log_path(task.id, board=board)),
-        "state_path": str(codex_worker_state_path(task.id, board=board)),
-        "snapshot": _worker_ticket_console_payload(
+    try:
+        task, runs, _events, current_run, codex_state = _ticket_console_parts(board, task_id)
+        task_id = str(task.id)
+        snapshot = _worker_ticket_console_payload(
             board,
             task,
             runs=runs,
@@ -1250,7 +1250,16 @@ def worker_ticket_console_log_for_session(session_id: str, task_id: str) -> dict
             current_run=current_run,
             codex_state=codex_state,
             worker=worker,
-        ),
+        )
+    except KeyError:
+        task_id = str(task_id or "").strip()
+        snapshot = _worker_ticket_console_log_only_payload(board, task_id, worker=worker)
+    return {
+        "board": board,
+        "task_id": task_id,
+        "log_path": str(kanban_db.worker_log_path(task_id, board=board)),
+        "state_path": str(codex_worker_state_path(task_id, board=board)),
+        "snapshot": snapshot,
     }
 
 
@@ -1516,6 +1525,70 @@ def _worker_ticket_console_payload(
         "worker_log_tail": log_text or "",
         "codex_state": codex_state if isinstance(codex_state, dict) else {},
         "updated_at": _now(),
+    }
+
+
+def _worker_ticket_console_log_only_payload(
+    board: str,
+    task_id: str,
+    *,
+    worker: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        raise KeyError("unknown ticket")
+    log_path = kanban_db.worker_log_path(task_id, board=board)
+    state_path = codex_worker_state_path(task_id, board=board)
+    if not log_path.exists() and not state_path.exists():
+        raise KeyError("unknown ticket")
+    codex_state = _ticket_codex_state(task_id, board=board)
+    log_text = kanban_db.read_worker_log(
+        task_id,
+        tail_bytes=CODEX_STATE_LOG_TAIL_BYTES,
+        board=board,
+    )
+    return {
+        "board": board,
+        "worker": _public_worker_meta(worker or _read_worker_meta(board)),
+        "task": {
+            "id": task_id,
+            "title": f"Retained worker activity for {task_id}",
+            "body": "Task metadata is no longer present; showing retained worker log/state artifacts.",
+            "assignee": None,
+            "status": "log-only",
+            "priority": 0,
+            "created_by": None,
+            "created_at": None,
+            "started_at": None,
+            "completed_at": None,
+            "workspace_kind": "unknown",
+            "workspace_path": "",
+            "branch_name": None,
+            "result": None,
+            "claim_lock": None,
+            "claim_expires": None,
+            "worker_pid": None,
+            "last_failure_error": None,
+            "max_runtime_seconds": None,
+            "last_heartbeat_at": None,
+            "current_run_id": None,
+            "model_override": None,
+            "session_id": None,
+        },
+        "workspace": {
+            "path": "",
+            "kind": "unknown",
+            "available": False,
+        },
+        "backend": _worker_state_backend(codex_state),
+        "current_run": None,
+        "runs": [],
+        "events": [],
+        "worker_log_path": str(log_path),
+        "worker_log_tail": log_text or "",
+        "codex_state": codex_state if isinstance(codex_state, dict) else {},
+        "updated_at": _now(),
+        "log_only": True,
     }
 
 
@@ -4640,10 +4713,50 @@ def pause_board(board: str, *, reason: str = "user-paused") -> None:
         pass
 
 
-def resume_board(board: str) -> None:
+def resume_board(board: str) -> dict[str, Any]:
+    """Replay a Discord worker board by moving blocked tickets back to dispatchable work."""
     worker = _read_worker_meta(board)
-    worker.update({"goal_status": "active", "phase": worker.get("phase_before_pause") or "planning", "paused": False})
+    replayed_task_ids: list[str] = []
+    conn = kanban_db.connect(board=board)
+    try:
+        for task in kanban_db.list_tasks(conn, include_archived=False):
+            if getattr(task, "status", None) not in {"blocked", "scheduled"}:
+                continue
+            before_status = str(getattr(task, "status", "") or "")
+            if kanban_db.move_task_status(
+                conn,
+                task.id,
+                "ready",
+                source="command-center-replay",
+            ):
+                after = kanban_db.get_task(conn, task.id)
+                if after and after.status != before_status:
+                    replayed_task_ids.append(task.id)
+    finally:
+        conn.close()
+    phase = worker.get("phase_before_pause") or worker.get("phase")
+    if not phase or phase in {"paused", "cancelled", "intake"}:
+        phase = "dev"
+    worker.update(
+        {
+            "goal_status": "active",
+            "phase": phase,
+            "paused": False,
+            "paused_reason": _DELETE_META,
+        }
+    )
     _update_worker_meta(board, worker)
+    dispatch_dirty: str | None = None
+    try:
+        dispatch_dirty = str(mark_dispatch_dirty(board=board, reason="command-center-replay"))
+    except Exception:
+        pass
+    return {
+        "board": board,
+        "resumed": True,
+        "replayed_task_ids": replayed_task_ids,
+        "dispatch_dirty": dispatch_dirty,
+    }
 
 
 def start_board(board: str) -> None:

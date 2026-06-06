@@ -10,10 +10,12 @@ underlying proposal/Kanban/Discord lifecycles.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -38,6 +40,7 @@ _PROJECT_ALIASES = {
     "#dev": "hermes",
     "pid": "pid",
 }
+_ARCHIVED_BOARD_DIR_RE = re.compile(r"^(?P<slug>.+)-(?P<timestamp>\d{9,})(?:-\d+)?$")
 
 
 def _normalize_project_key(value: Any) -> str | None:
@@ -137,6 +140,76 @@ def _epoch_or_none(value: Any) -> int | None:
         return int(parsed.timestamp())
     except (TypeError, ValueError):
         return None
+
+
+def _archived_board_slug_and_timestamp(path: Path) -> tuple[str, int | None]:
+    match = _ARCHIVED_BOARD_DIR_RE.match(path.name)
+    if not match:
+        return path.name, None
+    return match.group("slug"), int(match.group("timestamp"))
+
+
+def _read_archived_board_metadata(path: Path) -> dict[str, Any] | None:
+    """Return metadata for a board moved under ``boards/_archived``.
+
+    Archived boards are stored as ``_archived/<slug>-<timestamp>/``. The
+    normal ``kanban_db.read_board_metadata(slug)`` path cannot read them because
+    it resolves only active board directories, so the Command Center has to read
+    the moved directory directly to make Archive a real historical ledger.
+    """
+
+    if not path.is_dir():
+        return None
+    has_db = (path / "kanban.db").exists()
+    has_meta = (path / "board.json").exists()
+    if not (has_db or has_meta):
+        return None
+
+    inferred_slug, archived_at = _archived_board_slug_and_timestamp(path)
+    raw: dict[str, Any] = {}
+    if has_meta:
+        try:
+            parsed = json.loads((path / "board.json").read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                raw = parsed
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raw = {}
+
+    slug = str(raw.get("slug") or inferred_slug).strip() or inferred_slug
+    meta: dict[str, Any] = {
+        "slug": slug,
+        "name": raw.get("name") or slug,
+        "description": raw.get("description") or "",
+        "icon": raw.get("icon") or "",
+        "color": raw.get("color") or "",
+        "default_workdir": raw.get("default_workdir"),
+        "created_at": raw.get("created_at"),
+    }
+    meta.update(raw)
+    meta["slug"] = slug
+    meta["archived"] = True
+    meta["archive_dir"] = path.name
+    meta["archive_path"] = str(path)
+    meta["archive_id"] = f"archive:{path.name}"
+    meta["archived_at"] = raw.get("archived_at") or archived_at or int(path.stat().st_mtime)
+    meta["db_path"] = str(path / "kanban.db")
+    return meta
+
+
+def _archived_board_metadata() -> list[dict[str, Any]]:
+    archive_root = kanban_db.boards_root() / "_archived"
+    if not archive_root.is_dir():
+        return []
+    entries: list[dict[str, Any]] = []
+    for child in sorted(archive_root.iterdir(), key=lambda p: p.name.lower()):
+        meta = _read_archived_board_metadata(child)
+        if meta is not None:
+            entries.append(meta)
+    return entries
+
+
+def _board_identity(board: str, board_meta: dict[str, Any]) -> str:
+    return str(board_meta.get("archive_id") or board)
 
 
 def _json_loads(value: Any, default: Any) -> Any:
@@ -430,6 +503,7 @@ def _is_internal_discord_foreman_task(task: dict[str, Any]) -> bool:
 def _source_from_task_board(board: str, board_meta: dict[str, Any]) -> dict[str, Any]:
     worker = _board_worker_meta(board_meta)
     project = _project_from_board(board, board_meta)
+    source_identity = _board_identity(board, board_meta)
     if _is_discord_board(board, board_meta):
         ref = {
             "board": board,
@@ -442,13 +516,13 @@ def _source_from_task_board(board: str, board_meta: dict[str, Any]) -> dict[str,
         }
         ref.update(_discord_urls(ref))
         return _with_project({
-            "id": f"source:discord:{board}",
+            "id": f"source:discord:{source_identity}",
             "kind": "discord",
             "label": "Discord worker thread",
             "ref": ref,
         }, project)
     return _with_project({
-        "id": f"source:kanban-board:{board}",
+        "id": f"source:kanban-board:{source_identity}",
         "kind": "kanban_board",
         "label": "Kanban board",
         "ref": {"board": board},
@@ -496,6 +570,7 @@ def _execution_from_board(
 ) -> dict[str, Any]:
     worker = _board_worker_meta(board_meta)
     public_url = worker.get("public_url") if isinstance(worker, dict) else None
+    archived = bool(board_meta.get("archived"))
     active_run = next((run for run in runs if _is_active_run(run)), None)
     paused = bool(
         worker.get("paused")
@@ -511,15 +586,15 @@ def _execution_from_board(
         "task_id": None,
         "task_status": None,
         "task_url": None,
-        "worker_url": _worker_board_url(board, public_url),
+        "worker_url": None if archived else _worker_board_url(board, public_url),
         "console_url": None,
         "active_run_id": active_run.get("id") if active_run else None,
         "pause_action": f"/api/plugins/kanban/boards/{quote(board, safe='')}/pause",
         "resume_action": f"/api/plugins/kanban/boards/{quote(board, safe='')}/resume",
         "archive_action": f"/api/plugins/kanban/boards/{quote(board, safe='')}",
         "paused": paused,
-        "resumable": board != kanban_db.DEFAULT_BOARD and not bool(board_meta.get("archived")) and resumable,
-        "archiveable": board != kanban_db.DEFAULT_BOARD and not bool(board_meta.get("archived")),
+        "resumable": board != kanban_db.DEFAULT_BOARD and not archived and resumable,
+        "archiveable": board != kanban_db.DEFAULT_BOARD and not archived,
         "task_counts": _task_status_counts(tasks),
         "run_count": len(runs),
     }
@@ -684,7 +759,7 @@ def _board_work_item(
     ) or _project_from_board(board, board_meta, tasks)
     created_candidates = [task.get("created_at") for task in tasks if task.get("created_at")]
     updated_candidates = [task.get("completed_at") or task.get("started_at") or task.get("created_at") for task in tasks]
-    latest_updated = max((_epoch_or_none(value) or 0 for value in updated_candidates), default=0) or board_meta.get("created_at")
+    latest_updated = board_meta.get("archived_at") or max((_epoch_or_none(value) or 0 for value in updated_candidates), default=0) or board_meta.get("created_at")
     proposal_source = proposal_action_context.get("source") if proposal_action_context else None
     decision = {"needed": False}
     if proposal_action_context:
@@ -700,7 +775,7 @@ def _board_work_item(
                 }
             )
     return {
-        "id": f"kanban-board:{board}",
+        "id": f"kanban-board:{_board_identity(board, board_meta)}",
         "title": _board_title(board, board_meta, proposal_action_context),
         "summary": _board_summary(board_meta, tasks, proposal_action_context),
         "body_preview": proposal_action_context.get("body_preview") if proposal_action_context else None,
@@ -814,6 +889,7 @@ def _source_from_proposal_run(run: dict[str, Any]) -> dict[str, Any]:
 def _source_from_discord_board(board: str, board_meta: dict[str, Any]) -> dict[str, Any]:
     worker = _board_worker_meta(board_meta)
     project = _project_from_board(board, board_meta)
+    source_identity = _board_identity(board, board_meta)
     ref = {
         "board": board,
         "thread_id": worker.get("thread_id") or worker.get("chat_id"),
@@ -825,14 +901,14 @@ def _source_from_discord_board(board: str, board_meta: dict[str, Any]) -> dict[s
     }
     ref.update(_discord_urls(ref))
     return _with_project({
-        "id": f"source:discord:{board}",
+        "id": f"source:discord:{source_identity}",
         "kind": "discord_thread",
         "label": "Discord worker thread",
         "title": worker.get("summary_title") or worker.get("root_goal") or worker.get("initial_request") or board_meta.get("name") or board,
-        "status": worker.get("goal_status") or worker.get("phase") or "active",
+        "status": "archived" if board_meta.get("archived") else worker.get("goal_status") or worker.get("phase") or "active",
         "bucket": "sources",
         "created_at": worker.get("created_at") or board_meta.get("created_at"),
-        "updated_at": worker.get("updated_at") or board_meta.get("created_at"),
+        "updated_at": board_meta.get("archived_at") or worker.get("updated_at") or board_meta.get("created_at"),
         "ref": ref,
     }, project)
 
@@ -894,24 +970,33 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
         sources.append(_source_from_proposal_run(run))
 
     boards = kanban_db.list_boards(include_archived=include_archived)
+    if include_archived:
+        boards.extend(_archived_board_metadata())
     for board_meta in boards:
         board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
         if _is_discord_board(board, board_meta):
             sources.append(_source_from_discord_board(board, board_meta))
         try:
-            kanban_db.init_db(board=board)
-            conn = kanban_db.connect(board=board)
+            db_path = board_meta.get("db_path")
+            if board_meta.get("archive_path") and db_path:
+                archive_db_path = Path(str(db_path))
+                if not archive_db_path.exists():
+                    raise FileNotFoundError(str(archive_db_path))
+                conn = kanban_db.connect(db_path=archive_db_path)
+            else:
+                kanban_db.init_db(board=board)
+                conn = kanban_db.connect(board=board)
         except Exception as exc:
             sources.append(
                 {
-                    "id": f"source:kanban-board-error:{board}",
+                    "id": f"source:kanban-board-error:{_board_identity(board, board_meta)}",
                     "kind": "kanban_board",
                     "label": "Kanban board",
                     "title": board_meta.get("name") or board,
                     "status": "error",
                     "bucket": "inbox",
                     "created_at": board_meta.get("created_at"),
-                    "updated_at": board_meta.get("created_at"),
+                    "updated_at": board_meta.get("archived_at") or board_meta.get("created_at"),
                     "ref": {"board": board, "error": str(exc)},
                 }
             )
