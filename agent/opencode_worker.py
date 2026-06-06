@@ -400,6 +400,7 @@ def run_opencode_task(
     title: str = "",
     config: Optional[dict[str, Any]] = None,
     worker_config: Optional[dict[str, Any]] = None,
+    env: Optional[dict[str, str]] = None,
     on_event: Optional[Callable[[dict[str, Any]], None]] = None,
     scope_session_key: str = "",
 ) -> OpenCodeRunResult:
@@ -431,6 +432,7 @@ def run_opencode_task(
             agent=cfg["plan_agent"],
             reasoning_level=cfg["complex_plan_reasoning_level"],
             title=title,
+            env=env,
             on_event=_capture,
             scope_session_key=scope_session_key,
         )
@@ -464,6 +466,7 @@ def run_opencode_task(
             else cfg["simple_build_reasoning_level"]
         ),
         title=title,
+        env=env,
         on_event=_capture,
         scope_session_key=scope_session_key,
     )
@@ -497,6 +500,7 @@ def run_opencode_single_pass(
     title: str = "",
     config: Optional[dict[str, Any]] = None,
     worker_config: Optional[dict[str, Any]] = None,
+    env: Optional[dict[str, str]] = None,
     on_event: Optional[Callable[[dict[str, Any]], None]] = None,
     scope_session_key: str = "",
 ) -> OpenCodeRunResult:
@@ -519,6 +523,7 @@ def run_opencode_single_pass(
         agent=selected_agent,
         reasoning_level=selected_reasoning,
         title=title,
+        env=env,
         on_event=_capture,
         scope_session_key=scope_session_key,
     )
@@ -595,6 +600,7 @@ def _run_opencode_once(
     agent: str,
     reasoning_level: str,
     title: str,
+    env: Optional[dict[str, str]],
     on_event: Callable[[dict[str, Any]], None],
     scope_session_key: str = "",
 ) -> OpenCodeRunResult:
@@ -637,7 +643,7 @@ def _run_opencode_once(
     if brief_path is not None:
         cmd.extend(["--file", str(brief_path)])
 
-    process_env = _opencode_process_env(config_home)
+    process_env = _opencode_process_env(config_home, env=env)
     run_started_ms = int(time.time() * 1000)
     try:
         configured_startup_timeout = float(
@@ -1097,12 +1103,17 @@ def _write_worker_config(model: str) -> Path:
     return root
 
 
-def _opencode_process_env(config_home: Optional[Path]) -> Optional[dict[str, str]]:
-    if config_home is None:
+def _opencode_process_env(
+    config_home: Optional[Path],
+    *,
+    env: Optional[dict[str, str]] = None,
+) -> Optional[dict[str, str]]:
+    if env is None and config_home is None:
         return None
-    env = os.environ.copy()
-    env["XDG_CONFIG_HOME"] = str(config_home)
-    return env
+    process_env = dict(env) if env is not None else os.environ.copy()
+    if config_home is not None:
+        process_env["XDG_CONFIG_HOME"] = str(config_home)
+    return process_env
 
 
 def _plan_prompt(prompt: str) -> str:

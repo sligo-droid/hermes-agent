@@ -287,6 +287,50 @@ class TestSpawnEnvIsolation:
 
         assert captured["env"].get("GH_CONFIG_DIR") == str(gh_dir)
 
+    def test_spawn_env_can_replace_parent_environment(self, monkeypatch):
+        """Replacement mode prevents selected parent variables leaking to Codex."""
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
+        monkeypatch.setenv("HERMES_KANBAN_DB", "/live/kanban.db")
+        monkeypatch.setenv("HOME", "/users/alice")
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["env"] = kwargs.get("env", {}).copy()
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+        client = cas.CodexAppServerClient(
+            codex_bin="codex",
+            env={"HOME": "/child", "PATH": "/bin"},
+            replace_env=True,
+        )
+        client._closed = True
+
+        assert captured["env"].get("HOME") == "/child"
+        assert captured["env"].get("PATH") == "/bin"
+        assert "HERMES_KANBAN_DB" not in captured["env"]
+
     def test_kanban_worker_adds_only_kanban_writable_root(self, monkeypatch):
         """Codex-runtime Kanban workers need to write board state outside
         their scratch/worktree workspace, but should not fall back to
@@ -385,6 +429,57 @@ class TestSpawnEnvIsolation:
         client._closed = True
 
         assert "sandbox_workspace_write.network_access=true" in captured["cmd"]
+
+    def test_kanban_worker_network_access_without_live_control_env(self, monkeypatch):
+        """Sanitized role-worker env still enables workspace-write + network."""
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                captured["env"] = kwargs.get("env", {}).copy()
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
+        monkeypatch.setenv("HERMES_KANBAN_DB", "/live/kanban.db")
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+        client = cas.CodexAppServerClient(
+            codex_bin="codex",
+            env={
+                "PATH": "/bin",
+                "HERMES_CODEX_WORKER_NETWORK_ACCESS": "1",
+                "HERMES_KANBAN_WORKSPACE": "/users/alice/workspaces/project-smoke",
+            },
+            replace_env=True,
+        )
+        client._closed = True
+
+        cmd = captured["cmd"]
+        assert "HERMES_KANBAN_DB" not in captured["env"]
+        assert 'sandbox_mode="workspace-write"' in cmd
+        assert 'sandbox_workspace_write.writable_roots=["/users/alice/workspaces/project-smoke"]' in cmd
+        assert "sandbox_workspace_write.network_access=true" in cmd
+        assert not any("/live/kanban.db" in arg for arg in cmd)
 
     def test_spawn_wraps_codex_app_server_in_gateway_child_scope(self, monkeypatch, tmp_path):
         import subprocess

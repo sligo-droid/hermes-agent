@@ -1,15 +1,21 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import {
+  Activity,
   AlertTriangle,
   Archive,
   Check,
+  CheckCircle2,
+  Circle,
+  CircleDashed,
+  CircleDot,
+  Clock3,
   ExternalLink,
   Inbox,
   PauseCircle,
+  RefreshCw,
   RotateCcw,
-  PlayCircle,
-  Send,
+  Wrench,
   X,
 } from "lucide-react";
 import { Badge } from "@nous-research/ui/ui/components/badge";
@@ -25,22 +31,49 @@ import type {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-type ViewKey = "overview" | "inbox" | "work" | "archive" | "runs" | "recommendations" | "sources";
-type ActionKind = "approve" | "reject" | "pause" | "resume" | "undo" | "archive";
+type ViewKey = "overview" | "inbox" | "work" | "rejected" | "archive" | "runs" | "recommendations" | "sources";
+type PaginatedViewKey = "overview" | "inbox" | "work" | "rejected" | "archive";
+type ActionKind = "approve" | "reject" | "pause" | "replay" | "repair" | "undo" | "archive";
 type ActiveAction = { ids: string[]; kind: ActionKind };
+type InboxPageItem = { type: "work"; item: CommandCenterWorkItem } | { type: "source"; source: CommandCenterSource };
+type VisualStatus = "proposed" | "queued" | "running" | "review" | "blocked" | "mega_blocked" | "paused" | "shipped" | "rejected" | "archived" | "unknown";
+type CommandCenterPagination = { project: string; pages: Record<PaginatedViewKey, number> };
 
 const ACTION_SETTLE_MS = 600;
+const COMMAND_CENTER_PAGE_SIZE = 20;
+const ARCHIVE_VIEW_ITEM_LIMIT = 100;
+const DEFAULT_REJECT_REASON = "Operator rejected from Command Center.";
 const ACTION_PROGRESS_LABELS: Record<ActionKind, string> = {
   approve: "Approving",
   reject: "Rejecting",
   pause: "Pausing",
-  resume: "Resuming",
+  replay: "Replaying",
+  repair: "Repairing",
   undo: "Requesting revert",
   archive: "Archiving",
 };
 
 function waitForActionSettle(durationMs = ACTION_SETTLE_MS): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, durationMs));
+}
+
+function pageCount(totalItems: number): number {
+  return Math.max(1, Math.ceil(totalItems / COMMAND_CENTER_PAGE_SIZE));
+}
+
+function pageSlice<T>(items: T[], page: number): T[] {
+  const start = (page - 1) * COMMAND_CENTER_PAGE_SIZE;
+  return items.slice(start, start + COMMAND_CENTER_PAGE_SIZE);
+}
+
+function pageRange(page: number, totalItems: number): { from: number; to: number } {
+  if (totalItems <= 0) return { from: 0, to: 0 };
+  const from = (page - 1) * COMMAND_CENTER_PAGE_SIZE + 1;
+  return { from, to: Math.min(totalItems, from + COMMAND_CENTER_PAGE_SIZE - 1) };
+}
+
+function clampPage(page: number, totalItems: number): number {
+  return Math.min(Math.max(1, page), pageCount(totalItems));
 }
 
 declare global {
@@ -53,6 +86,7 @@ function viewFromPath(pathname: string): ViewKey {
   const normalized = pathname.replace(/\/+$/, "") || "/";
   if (normalized.includes("/inbox")) return "inbox";
   if (normalized.includes("/work")) return "work";
+  if (normalized.includes("/rejected")) return "rejected";
   if (normalized.includes("/archive")) return "archive";
   if (normalized.includes("/runs")) return "runs";
   if (normalized.includes("/recommendations")) return "recommendations";
@@ -67,28 +101,61 @@ function formatTime(value?: string | number | null): string {
   return date.toLocaleString();
 }
 
-function statusTone(status?: string | null): string {
+function visualStatusKey(status?: string | null, active = false): VisualStatus {
+  if (active) return "running";
   const normalized = String(status || "unknown").toLowerCase();
-  if (["proposed", "parse_failed"].includes(normalized)) return "border-cyan-200/45 bg-cyan-300/10 text-cyan-100";
-  if (["queued", "accepted"].includes(normalized)) return "border-blue-200/35 bg-blue-400/10 text-blue-100";
-  if (["running", "review"].includes(normalized)) return "border-amber-200/45 bg-amber-300/10 text-amber-100";
-  if (["blocked", "missing", "error"].includes(normalized)) return "border-red-300/45 bg-red-400/10 text-red-100";
-  if (["shipped", "done"].includes(normalized)) return "border-emerald-300/45 bg-emerald-400/10 text-emerald-100";
-  if (["rejected", "archived"].includes(normalized)) return "border-slate-400/30 bg-slate-400/10 text-slate-300";
-  return "border-slate-400/25 bg-slate-400/10 text-slate-200";
+  if (["proposed", "parse_failed"].includes(normalized)) return "proposed";
+  if (["queued", "accepted"].includes(normalized)) return "queued";
+  if (normalized === "running") return "running";
+  if (normalized === "review") return "review";
+  if (normalized === "mega_blocked") return "mega_blocked";
+  if (["blocked", "missing", "error"].includes(normalized)) return "blocked";
+  if (normalized === "paused") return "paused";
+  if (["shipped", "done"].includes(normalized)) return "shipped";
+  if (normalized === "rejected") return "rejected";
+  if (normalized === "archived") return "archived";
+  return "unknown";
 }
 
-function StatusPill({ value }: { value?: string | null }) {
+const STATUS_VISUALS = {
+  proposed: { label: "Proposed", icon: CircleDot, className: "command-center-status-proposed" },
+  queued: { label: "Queued", icon: Clock3, className: "command-center-status-queued" },
+  running: { label: "Running", icon: Activity, className: "command-center-status-running" },
+  review: { label: "Review", icon: CircleDashed, className: "command-center-status-review" },
+  blocked: { label: "Blocked", icon: AlertTriangle, className: "command-center-status-blocked" },
+  mega_blocked: { label: "MEGA BLOCKED", icon: AlertTriangle, className: "command-center-status-mega-blocked" },
+  paused: { label: "Paused", icon: PauseCircle, className: "command-center-status-paused" },
+  shipped: { label: "Shipped", icon: CheckCircle2, className: "command-center-status-shipped" },
+  rejected: { label: "Rejected", icon: X, className: "command-center-status-archived" },
+  archived: { label: "Archived", icon: Archive, className: "command-center-status-archived" },
+  unknown: { label: "Unknown", icon: Circle, className: "command-center-status-unknown" },
+} satisfies Record<VisualStatus, { label: string; icon: typeof Activity; className: string }>;
+
+function StatusGlyph({ active = false, detail, value }: { active?: boolean; detail?: string | null; value?: string | null }) {
+  const status = visualStatusKey(value, active);
+  const visual = STATUS_VISUALS[status];
+  const Icon = visual.icon;
+  const accessibleLabel = detail ? `${visual.label}: ${detail}` : visual.label;
   return (
-    <Badge className={cn("w-fit border px-2 py-0.5 text-[0.66rem] uppercase tracking-[0.16em]", statusTone(value))}>
-      {value || "unknown"}
-    </Badge>
+    <span aria-label={`Status: ${accessibleLabel}`} className={cn("command-center-status-indicator", visual.className)} title={accessibleLabel}>
+      <Icon aria-hidden="true" className="h-3.5 w-3.5" />
+      <span className="sr-only">Status: {accessibleLabel}</span>
+    </span>
   );
 }
 
-function metric(snapshot: CommandCenterSnapshot | null, key: keyof CommandCenterSnapshot["metrics"]): number {
-  const value = snapshot?.metrics?.[key];
-  return typeof value === "number" ? value : 0;
+function StatusRail({ status }: { status: VisualStatus }) {
+  return <span aria-hidden="true" className={cn("command-center-status-rail", STATUS_VISUALS[status].className)} />;
+}
+
+function RunningMeter() {
+  return (
+    <span aria-hidden="true" className="command-center-live-meter">
+      <span />
+      <span />
+      <span />
+    </span>
+  );
 }
 
 function isInboxItem(item: CommandCenterWorkItem): boolean {
@@ -100,7 +167,11 @@ function isWorkItem(item: CommandCenterWorkItem): boolean {
 }
 
 function isArchivedItem(item: CommandCenterWorkItem): boolean {
-  return item.status === "archived" || item.status === "rejected";
+  return item.status === "archived";
+}
+
+function isRejectedItem(item: CommandCenterWorkItem): boolean {
+  return item.status === "rejected";
 }
 
 function isRunningWorkItem(item: CommandCenterWorkItem): boolean {
@@ -138,11 +209,13 @@ function availableActionKinds(item: CommandCenterWorkItem): ActionKind[] {
   const canResume = Boolean((item.status === "paused" || item.execution?.paused || item.execution?.resumable) && (proposalId || (item.execution?.resume_action && item.execution.board)) && item.status !== "archived");
   const canUndo = Boolean(proposalId && item.status === "shipped");
   const canArchive = Boolean((item.execution?.archiveable && item.execution.board && item.execution.board !== "default" && item.id.startsWith("kanban-board:")) || proposalCanArchive);
+  const canRepair = Boolean(item.status === "blocked" && item.execution?.board && item.execution?.repair_action && item.execution?.repairable !== false && !item.execution?.repair_task_id);
   const actions: ActionKind[] = [];
   if (canApproveReject) actions.push("approve", "reject");
-  if (canResume) actions.push("resume");
+  if (canResume) actions.push("replay");
   if (canPause) actions.push("pause");
   if (canUndo) actions.push("undo");
+  if (canRepair) actions.push("repair");
   if (canArchive) actions.push("archive");
   return actions;
 }
@@ -160,15 +233,15 @@ function WorkStatePanel({
   search,
 }: {
   activeView: ViewKey;
-  laneCounts: { overview: number; inbox: number; work: number; archive: number; workers: number };
+  laneCounts: { overview: number; inbox: number; work: number; rejected: number; archive: number };
   search: string;
 }) {
   const lanes = [
-    { key: "overview", label: "Overview", href: "/sligo", value: laneCounts.overview, detail: "open ledger" },
-    { key: "inbox", label: "Inbox", href: "/sligo/inbox", value: laneCounts.inbox, detail: "needs decision" },
-    { key: "work", label: "Work", href: "/sligo/work", value: laneCounts.work, detail: "accepted / active" },
-    { key: "archive", label: "Archive", href: "/sligo/archive", value: laneCounts.archive, detail: "terminal / hidden" },
-    { key: "workers", label: "Workers", href: "/workers", value: laneCounts.workers, detail: "opens monitor", external: true },
+    { key: "overview", label: "Overview", href: "/sligo", value: laneCounts.overview },
+    { key: "inbox", label: "Inbox", href: "/sligo/inbox", value: laneCounts.inbox },
+    { key: "work", label: "Active", href: "/sligo/work", value: laneCounts.work },
+    { key: "rejected", label: "Rejected", href: "/sligo/rejected", value: laneCounts.rejected },
+    { key: "archive", label: "Archive", href: "/sligo/archive", value: laneCounts.archive },
   ];
   const tileClass = (selected: boolean) => cn(
     "command-center-lane group rounded-2xl border px-3.5 py-3 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
@@ -178,27 +251,17 @@ function WorkStatePanel({
     <Card className="border-white/10 bg-white/[0.035]">
       <CardHeader className="gap-1">
         <CardTitle className="text-base text-white">Work State</CardTitle>
-        <p className="text-xs leading-5 text-slate-500">Use this as the Command Center map: lanes move between views, and Workers opens the execution monitor in a new tab.</p>
       </CardHeader>
       <CardContent>
         <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-5" aria-label="Command Center lanes">
           {lanes.map((lane) => {
-            const selected = !lane.external && activeView === lane.key;
+            const selected = activeView === lane.key;
             const content = (
               <>
                 <span className="command-center-lane-value block text-xl font-semibold tracking-tight text-white">{lane.value}</span>
                 <span className="mt-1 block text-[0.68rem] font-semibold uppercase tracking-[0.16em]">{lane.label}</span>
-                <span className="command-center-lane-detail mt-1 block text-xs text-slate-500 transition group-hover:text-slate-400">{lane.detail}</span>
               </>
             );
-            if (lane.external) {
-              return (
-                <a className={tileClass(selected)} href={lane.href} key={lane.key} rel="noopener noreferrer" target="_blank">
-                  {content}
-                  <span className="sr-only">opens in a new tab</span>
-                </a>
-              );
-            }
             return (
               <Link className={tileClass(selected)} key={lane.key} to={{ pathname: lane.href, search }}>
                 {content}
@@ -220,33 +283,37 @@ function ProjectTabs({
   pathname: string;
   projects: CommandCenterProject[];
 }) {
-  if (!projects.length) return null;
   const tabSearch = (project: string) => {
     const params = new URLSearchParams();
     params.set("project", project);
     return `?${params.toString()}`;
   };
   return (
-    <nav aria-label="Command Center projects" className="command-center-project-tabs flex border-b border-white/10">
-      {projects.map((project) => {
-        const selected = currentProject === project.key;
-        return (
-          <Link
-            aria-current={selected ? "page" : undefined}
-            className={cn(
-              "command-center-project-tab relative -mb-px border-b-2 px-4 py-2 text-sm font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
-              selected
-                ? "command-center-project-tab-selected border-cyan-200 bg-cyan-100/[0.08] text-cyan-50"
-                : "border-transparent text-slate-400 hover:border-cyan-100/35 hover:bg-white/[0.035] hover:text-slate-100",
-            )}
-            key={project.key}
-            to={{ pathname, search: tabSearch(project.key) }}
-          >
-            <span>{project.label}</span>
-          </Link>
-        );
-      })}
-    </nav>
+    <div className="command-center-project-tab-row flex flex-wrap items-center justify-between gap-2 border-b border-white/10">
+      <nav aria-label="Command Center projects" className="command-center-project-tabs flex flex-wrap">
+        {projects.map((project) => {
+          const selected = currentProject === project.key;
+          return (
+            <Link
+              aria-current={selected ? "page" : undefined}
+              className={cn(
+                "command-center-project-tab relative -mb-px border-b-2 px-4 py-2 text-sm font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
+                selected
+                  ? "command-center-project-tab-selected border-cyan-200 bg-cyan-100/[0.08] text-cyan-50"
+                  : "border-transparent text-slate-400 hover:border-cyan-100/35 hover:bg-white/[0.035] hover:text-slate-100",
+              )}
+              key={project.key}
+              to={{ pathname, search: tabSearch(project.key) }}
+            >
+              <span>{project.label}</span>
+            </Link>
+          );
+        })}
+      </nav>
+      <a className="inline-flex items-center gap-1.5 rounded-full border border-white/10 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.14em] text-slate-300 transition hover:border-cyan-100/35 hover:bg-cyan-100/[0.055] hover:text-cyan-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40" href="/workers" rel="noopener noreferrer" target="_blank">
+        Kanban <ExternalLink className="h-3.5 w-3.5" /><span aria-hidden="true">↗</span><span className="sr-only">opens in a new tab</span>
+      </a>
+    </div>
   );
 }
 
@@ -268,7 +335,8 @@ function ActionButton({
     approve: { label: "Approve", icon: Check, className: "border-emerald-200/70 bg-emerald-400 text-emerald-950 hover:bg-emerald-300 focus-visible:ring-emerald-100/75" },
     reject: { label: "Reject", icon: X, className: "border-red-200/75 bg-red-500 text-white hover:bg-red-400 focus-visible:ring-red-100/75", strong: true },
     pause: { label: "Pause", icon: PauseCircle, className: "border-orange-200/70 bg-orange-400 text-orange-950 hover:bg-orange-300 focus-visible:ring-orange-100/75", strong: true },
-    resume: { label: "Resume", icon: PlayCircle, className: "border-emerald-200/70 bg-emerald-400 text-emerald-950 hover:bg-emerald-300 focus-visible:ring-emerald-100/75", strong: true },
+    replay: { label: "Replay", icon: RefreshCw, className: "border-emerald-200/70 bg-emerald-400 text-emerald-950 hover:bg-emerald-300 focus-visible:ring-emerald-100/75", strong: true },
+    repair: { label: "Repair", icon: Wrench, className: "border-amber-200/70 bg-amber-300 text-amber-950 hover:bg-amber-200 focus-visible:ring-amber-100/75", strong: true },
     undo: { label: "Revert", icon: RotateCcw, className: "border-sky-200/65 bg-sky-400 text-sky-950 hover:bg-sky-300 focus-visible:ring-sky-100/75" },
     archive: { label: "Archive board", icon: Archive, className: "border-violet-200/60 bg-violet-400 text-violet-950 hover:bg-violet-300 focus-visible:ring-violet-100/75" },
   }[kind];
@@ -309,6 +377,22 @@ function SourceBadge({ source }: { source: CommandCenterSource }) {
   );
 }
 
+function runningDescriptor(item: CommandCenterWorkItem): string {
+  const activeRun = item.runs?.find(runIsActive);
+  const worker = item.execution?.worker_unit || activeRun?.worker_unit || item.execution?.worker_pid || activeRun?.worker_pid;
+  const runId = item.execution?.active_run_id ?? activeRun?.id;
+  if (worker && runId) return `${worker} / run ${runId}`;
+  if (worker) return String(worker);
+  if (runId) return `run ${runId}`;
+  return "active worker";
+}
+
+function runDescriptor(run: CommandCenterRun): string {
+  const worker = run.worker_unit || run.worker_pid;
+  if (worker) return `${worker} / run ${run.id}`;
+  return `run ${run.id}`;
+}
+
 function discordSourceUrl(source?: CommandCenterSource | null): string | null {
   if (!source || !["discord", "discord_thread"].includes(source.kind)) return null;
   const ref = source.ref || {};
@@ -328,6 +412,7 @@ function WorkItemCard({
   onToggleSelected,
   selected,
   selectionActive,
+  showActions = true,
 }: {
   activeAction: ActiveAction | null;
   item: CommandCenterWorkItem;
@@ -337,12 +422,17 @@ function WorkItemCard({
   onToggleSelected: (id: string) => void;
   selected: boolean;
   selectionActive: boolean;
+  showActions?: boolean;
 }) {
   const rowBusy = Boolean(activeAction?.ids.includes(item.id));
   const actionBusy = (kind: ActionKind) => rowBusy && activeAction?.kind === kind;
   const singleActions = availableActionKinds(item);
   const actions = selected && selectionActive ? [...multiSelectActionUnion] : singleActions;
   const actionDisabled = (kind: ActionKind) => (Boolean(activeAction) && !actionBusy(kind)) || (selectionActive && (!selected || !multiSelectActionCommon.has(kind)));
+  const running = isRunningWorkItem(item);
+  const runningDetail = running ? runningDescriptor(item) : null;
+  const visualStatus = visualStatusKey(item.status, running);
+  const repairBlocked = item.status === "mega_blocked" || Boolean(item.execution?.repair_blocked);
   const disabledTitle = (kind: ActionKind) => {
     if (!selectionActive) return undefined;
     if (!selected) return "Clear selection before acting on this ticket";
@@ -360,9 +450,11 @@ function WorkItemCard({
       aria-label={workerUrl ? `Open worker board for ${item.title}` : undefined}
       aria-busy={rowBusy || undefined}
       className={cn(
-        "command-center-card rounded-2xl border bg-[#08090a]/80 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.025)] transition",
+        "command-center-card relative overflow-hidden rounded-2xl border bg-[#08090a]/80 p-4 pl-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.025)] transition",
         selected && "command-center-card-selected border-cyan-100/45 bg-cyan-100/[0.055]",
         workerUrl ? "cursor-pointer border-white/10 hover:border-cyan-100/35 hover:bg-cyan-100/[0.045] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/35" : "border-white/10 hover:border-white/20 hover:bg-white/[0.03]",
+        running && "command-center-card-running",
+        repairBlocked && "command-center-card-mega-blocked",
       )}
       onClick={workerUrl ? openWorker : undefined}
       onKeyDown={workerUrl ? (event) => {
@@ -374,6 +466,7 @@ function WorkItemCard({
       role={workerUrl ? "link" : undefined}
       tabIndex={workerUrl ? 0 : undefined}
     >
+      <StatusRail status={visualStatus} />
       <div className="flex items-start justify-between gap-3">
         <input
           aria-label={`Select ${item.title || item.id}`}
@@ -387,7 +480,8 @@ function WorkItemCard({
         <div className="min-w-0 flex-1 text-left">
           <div className="mb-2 flex flex-wrap items-center gap-2">
             <SourceBadge source={item.source} />
-            <StatusPill value={item.status} />
+            <StatusGlyph active={running} detail={runningDetail || item.status_detail} value={item.status} />
+            {running && <RunningMeter />}
             {item.project && <span className="text-xs uppercase tracking-[0.16em] text-slate-500">{item.project}</span>}
           </div>
           <h3 className="text-base font-semibold leading-snug text-white">{item.title}</h3>
@@ -403,6 +497,16 @@ function WorkItemCard({
       <div className="mt-3 block w-full text-left">
         <p className="text-sm leading-6 text-slate-300">{item.summary || item.body_preview || "No summary yet."}</p>
       </div>
+      {repairBlocked ? (
+        <div className="command-center-mega-blocked-banner mt-3 rounded-xl border px-3 py-2 text-left" role="status">
+          <span className="text-xs font-black uppercase tracking-[0.18em]">Repair blocked</span>
+          <p className="mt-1 text-xs leading-5">
+            Worker board is blocked and its Command Center repair task is also blocked
+            {item.execution?.repair_task_id ? ` (${item.execution.repair_task_id})` : ""}.
+            {item.execution?.repair_status_detail ? ` ${item.execution.repair_status_detail}` : ""}
+          </p>
+        </div>
+      ) : null}
       <div aria-busy={rowBusy} className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3">
         {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && (
           <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/[0.07] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" href={item.execution.task_url} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank">
@@ -414,7 +518,7 @@ function WorkItemCard({
             <Spinner /> {ACTION_PROGRESS_LABELS[activeAction.kind]}…
           </span>
         )}
-        {actions.map((kind) => {
+        {showActions && actions.map((kind) => {
           const disabled = actionDisabled(kind);
           return (
             <ActionButton
@@ -440,7 +544,7 @@ function SourceCard({ source }: { source: CommandCenterSource }) {
     <article className="command-center-card rounded-2xl border border-white/10 bg-slate-950/45 p-4 text-left transition hover:border-cyan-100/35">
       <div className="flex flex-wrap items-center gap-2">
         <Badge className="border-white/10 bg-white/[0.055] text-slate-300">{source.label}</Badge>
-        <StatusPill value={source.status} />
+        <StatusGlyph value={source.status} />
       </div>
       <div className="mt-3 text-sm font-semibold text-white">{source.title || source.id}</div>
       <div className="mt-2 text-xs text-slate-500">Updated {formatTime(source.updated_at || source.created_at)}</div>
@@ -456,7 +560,7 @@ function RunCard({ run }: { run: CommandCenterRun }) {
   return (
     <article className="command-center-card rounded-2xl border border-white/10 bg-slate-950/45 p-4 text-left transition hover:border-cyan-100/35">
       <div className="flex flex-wrap items-center gap-2">
-        <StatusPill value={active ? "running" : run.outcome || run.status} />
+        <StatusGlyph active={active} detail={active ? runDescriptor(run) : run.error} value={active ? "running" : run.outcome || run.status} />
         {run.board && <Badge className="border-white/10 bg-white/[0.055] text-slate-300">{run.board}</Badge>}
       </div>
       <div className="mt-3 text-sm font-semibold text-white">{run.task_title || run.task_id}</div>
@@ -478,6 +582,48 @@ function EmptyState({ label, message }: { label: string; message?: string }) {
   );
 }
 
+function PaginationControls({
+  label,
+  page,
+  totalItems,
+  onPageChange,
+}: {
+  label: string;
+  page: number;
+  totalItems: number;
+  onPageChange: (page: number) => void;
+}) {
+  if (totalItems <= 0) return null;
+  const totalPages = pageCount(totalItems);
+  const range = pageRange(page, totalItems);
+  return (
+    <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-white/10 bg-white/[0.035] px-3 py-2 text-xs text-slate-400">
+      <span>{range.from > 0 ? `Showing ${range.from}-${range.to} of ${totalItems}` : "Showing 0 of 0"}</span>
+      <div className="flex items-center gap-2">
+        <button
+          aria-label={`Previous ${label} page`}
+          className="rounded-full border border-white/10 px-3 py-1 font-semibold text-slate-300 transition hover:border-white/20 hover:bg-white/[0.06] disabled:cursor-not-allowed disabled:opacity-45"
+          disabled={page <= 1}
+          onClick={() => onPageChange(page - 1)}
+          type="button"
+        >
+          Previous
+        </button>
+        <span className="font-semibold text-slate-300">Page {page} of {totalPages}</span>
+        <button
+          aria-label={`Next ${label} page`}
+          className="rounded-full border border-white/10 px-3 py-1 font-semibold text-slate-300 transition hover:border-white/20 hover:bg-white/[0.06] disabled:cursor-not-allowed disabled:opacity-45"
+          disabled={page >= totalPages}
+          onClick={() => onPageChange(page + 1)}
+          type="button"
+        >
+          Next
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function WorkList({
   activeAction,
   emptyLabel,
@@ -489,6 +635,7 @@ function WorkList({
   onToggleSelected,
   selectedIds,
   selectionActive,
+  showActions,
 }: {
   activeAction: ActiveAction | null;
   emptyLabel?: string;
@@ -500,11 +647,12 @@ function WorkList({
   onToggleSelected: (id: string) => void;
   selectedIds: Set<string>;
   selectionActive: boolean;
+  showActions?: boolean;
 }) {
   if (!items.length) return <EmptyState label={emptyLabel || "work items"} message={emptyMessage} />;
   return (
     <div className="grid gap-3">
-      {[...items].sort(workItemViewSort).map((item) => (
+      {items.map((item) => (
         <WorkItemCard
           activeAction={activeAction}
           item={item}
@@ -515,7 +663,51 @@ function WorkList({
           onToggleSelected={onToggleSelected}
           selected={selectedIds.has(item.id)}
           selectionActive={selectionActive}
+          showActions={showActions}
         />
+      ))}
+    </div>
+  );
+}
+
+function InboxList({
+  activeAction,
+  emptyMessage,
+  items,
+  multiSelectActionCommon,
+  multiSelectActionUnion,
+  onAction,
+  onToggleSelected,
+  selectedIds,
+  selectionActive,
+}: {
+  activeAction: ActiveAction | null;
+  emptyMessage?: string;
+  items: InboxPageItem[];
+  multiSelectActionCommon: Set<ActionKind>;
+  multiSelectActionUnion: Set<ActionKind>;
+  onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
+  onToggleSelected: (id: string) => void;
+  selectedIds: Set<string>;
+  selectionActive: boolean;
+}) {
+  if (!items.length) return <EmptyState label="pending decisions" message={emptyMessage} />;
+  return (
+    <div className="grid gap-3">
+      {items.map((entry) => entry.type === "work" ? (
+        <WorkItemCard
+          activeAction={activeAction}
+          item={entry.item}
+          key={`work:${entry.item.id}`}
+          multiSelectActionCommon={multiSelectActionCommon}
+          multiSelectActionUnion={multiSelectActionUnion}
+          onAction={onAction}
+          onToggleSelected={onToggleSelected}
+          selected={selectedIds.has(entry.item.id)}
+          selectionActive={selectionActive}
+        />
+      ) : (
+        <SourceCard key={`source:${entry.source.id}`} source={entry.source} />
       ))}
     </div>
   );
@@ -587,6 +779,17 @@ export default function CommandCenterPage() {
   const [loading, setLoading] = useState(true);
   const [activeAction, setActiveAction] = useState<ActiveAction | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [pagination, setPagination] = useState<CommandCenterPagination>(() => ({
+    project: selectedProject,
+    pages: { overview: 1, inbox: 1, work: 1, rejected: 1, archive: 1 },
+  }));
+  const requestedPages = pagination.project === selectedProject ? pagination.pages : {
+    overview: 1,
+    inbox: 1,
+    work: 1,
+    rejected: 1,
+    archive: 1,
+  };
 
   const refresh = useCallback(async (options?: { delayBeforeApplyMs?: number; settleAfterApplyMs?: number }) => {
     setLoading(true);
@@ -640,7 +843,11 @@ export default function CommandCenterPage() {
     [snapshot],
   );
   const archivedItems = useMemo(
-    () => snapshot?.work_items.filter(isArchivedItem) ?? [],
+    () => (snapshot?.work_items.filter(isArchivedItem) ?? []).sort(workItemViewSort).slice(0, ARCHIVE_VIEW_ITEM_LIMIT),
+    [snapshot],
+  );
+  const rejectedItems = useMemo(
+    () => (snapshot?.work_items.filter(isRejectedItem) ?? []).sort(workItemViewSort),
     [snapshot],
   );
   const overviewItems = useMemo(() => {
@@ -652,22 +859,57 @@ export default function CommandCenterPage() {
     });
     return merged.sort(workItemViewSort);
   }, [inboxItems, workItems]);
+  const sortedInboxItems = useMemo(() => [...inboxItems].sort(workItemViewSort), [inboxItems]);
+  const sortedWorkItems = useMemo(() => [...workItems].sort(workItemViewSort), [workItems]);
+  const inboxPageItems = useMemo<InboxPageItem[]>(() => [
+    ...sortedInboxItems.map((item) => ({ type: "work" as const, item })),
+    ...inboxSources.map((source) => ({ type: "source" as const, source })),
+  ], [inboxSources, sortedInboxItems]);
+  const pageTotals = useMemo<Record<PaginatedViewKey, number>>(() => ({
+    overview: overviewItems.length,
+    inbox: inboxPageItems.length,
+    work: sortedWorkItems.length,
+    rejected: rejectedItems.length,
+    archive: archivedItems.length,
+  }), [archivedItems.length, inboxPageItems.length, overviewItems.length, rejectedItems.length, sortedWorkItems.length]);
+  const pages = useMemo<Record<PaginatedViewKey, number>>(() => ({
+    overview: clampPage(requestedPages.overview, pageTotals.overview),
+    inbox: clampPage(requestedPages.inbox, pageTotals.inbox),
+    work: clampPage(requestedPages.work, pageTotals.work),
+    rejected: clampPage(requestedPages.rejected, pageTotals.rejected),
+    archive: clampPage(requestedPages.archive, pageTotals.archive),
+  }), [pageTotals.archive, pageTotals.inbox, pageTotals.overview, pageTotals.rejected, pageTotals.work, requestedPages.archive, requestedPages.inbox, requestedPages.overview, requestedPages.rejected, requestedPages.work]);
+  const pagedOverviewItems = useMemo(() => pageSlice(overviewItems, pages.overview), [overviewItems, pages.overview]);
+  const pagedInboxItems = useMemo(() => pageSlice(inboxPageItems, pages.inbox), [inboxPageItems, pages.inbox]);
+  const pagedWorkItems = useMemo(() => pageSlice(sortedWorkItems, pages.work), [pages.work, sortedWorkItems]);
+  const pagedRejectedItems = useMemo(() => pageSlice(rejectedItems, pages.rejected), [pages.rejected, rejectedItems]);
+  const pagedArchivedItems = useMemo(() => pageSlice(archivedItems, pages.archive), [archivedItems, pages.archive]);
+  const setPage = useCallback((view: PaginatedViewKey, page: number) => {
+    setPagination((current) => ({
+      project: selectedProject,
+      pages: {
+        ...(current.project === selectedProject ? current.pages : { overview: 1, inbox: 1, work: 1, rejected: 1, archive: 1 }),
+        [view]: clampPage(page, pageTotals[view]),
+      },
+    }));
+  }, [pageTotals, selectedProject]);
   const recommendations = useMemo(
     () => snapshot?.work_items.filter((item) => item.source.kind === "self_improvement") ?? [],
     [snapshot],
   );
   const visibleSelectableIds = useMemo(() => {
     const visibleItems = {
-      overview: overviewItems,
-      inbox: inboxItems,
-      work: workItems,
-      archive: archivedItems,
+      overview: pagedOverviewItems,
+      inbox: pagedInboxItems.filter((entry) => entry.type === "work").map((entry) => entry.item),
+      work: pagedWorkItems,
+      rejected: pagedRejectedItems,
+      archive: pagedArchivedItems,
       recommendations,
       runs: [],
       sources: [],
     }[activeView];
     return visibleItems.map((item) => item.id);
-  }, [activeView, archivedItems, inboxItems, overviewItems, recommendations, workItems]);
+  }, [activeView, pagedArchivedItems, pagedInboxItems, pagedOverviewItems, pagedRejectedItems, pagedWorkItems, recommendations]);
   const sources = useMemo(() => snapshot?.sources ?? [], [snapshot]);
   const workItemsById = useMemo(() => new Map((snapshot?.work_items ?? []).map((item) => [item.id, item])), [snapshot]);
   const selectedItems = useMemo(() => [...selectedIds].map((id) => workItemsById.get(id)).filter((item): item is CommandCenterWorkItem => Boolean(item)), [selectedIds, workItemsById]);
@@ -687,9 +929,9 @@ export default function CommandCenterPage() {
     overview: overviewItems.length,
     inbox: inboxItems.length + inboxSources.length,
     work: workItems.length,
+    rejected: rejectedItems.length,
     archive: archivedItems.length,
-    workers: metric(snapshot, "active_runs"),
-  }), [archivedItems.length, inboxItems.length, inboxSources.length, overviewItems.length, snapshot, workItems.length]);
+  }), [archivedItems.length, inboxItems.length, inboxSources.length, overviewItems.length, rejectedItems.length, workItems.length]);
   const projectSearch = useMemo(() => `?project=${encodeURIComponent(selectedProject)}`, [selectedProject]);
   const toggleSelected = useCallback((id: string) => {
     setSelectedIds((current) => {
@@ -725,9 +967,17 @@ export default function CommandCenterPage() {
     } else if (kind === "pause") {
       if (proposalId) await api.pauseSelfImprovementProposal(proposalId);
       else if (board) await api.pauseKanbanBoard(board);
-    } else if (kind === "resume") {
+    } else if (kind === "replay") {
       if (proposalId) await api.resumeSelfImprovementProposal(proposalId);
-      else if (board) await api.resumeKanbanBoard(board);
+      else if (board) await api.replayKanbanBoard(board);
+    } else if (kind === "repair" && board) {
+      await api.repairKanbanBoard(board, {
+        task_id: item.execution?.task_id || null,
+        work_item_id: item.id,
+        title: item.title,
+        status: item.status,
+        detail: item.status_detail || item.summary || item.body_preview || null,
+      });
     } else if (proposalId && kind === "undo") {
       const reason = window.prompt("Reason for revert follow-up?", "Operator requested revert follow-up from Command Center.") || undefined;
       await api.requestSelfImprovementUndoFollowup(proposalId, reason);
@@ -739,8 +989,7 @@ export default function CommandCenterPage() {
     if (targetItems.length > 1 && !multiSelectActionCommon.has(kind)) return;
     const startedAt = Date.now();
     if (targetItems.some((targetItem) => !availableActionKinds(targetItem).includes(kind))) return;
-    const rejectReason = kind === "reject" ? window.prompt("Reject reason for future prong feedback?", "Not worth doing right now.") : undefined;
-    if (kind === "reject" && !rejectReason) return;
+    const rejectReason = kind === "reject" ? DEFAULT_REJECT_REASON : undefined;
     setActiveAction({ ids: targetItems.map((targetItem) => targetItem.id), kind });
     setError(null);
     try {
@@ -809,16 +1058,35 @@ export default function CommandCenterPage() {
             </div>
           )}
           {activeView === "overview" && (
-            <OverviewWorkList activeAction={activeAction} emptyMessage="No recent decisions, worker boards, or active work yet." items={overviewItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+            <>
+              <OverviewWorkList activeAction={activeAction} emptyMessage="No recent decisions, worker boards, or active work yet." items={pagedOverviewItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+              <PaginationControls label="overview" onPageChange={(page) => setPage("overview", page)} page={pages.overview} totalItems={pageTotals.overview} />
+            </>
           )}
           {activeView === "inbox" && (
-            <div className="grid gap-4">
-              <WorkList activeAction={activeAction} emptyLabel="pending decisions" emptyMessage="Inbox is clear. Finished, blocked, and archiveable boards stay on Overview or Work." items={inboxItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
-              {inboxSources.map((source) => <SourceCard key={source.id} source={source} />)}
-            </div>
+            <>
+              <InboxList activeAction={activeAction} emptyMessage="Inbox is clear. Finished, blocked, and archiveable boards stay on Overview or Active." items={pagedInboxItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+              <PaginationControls label="inbox" onPageChange={(page) => setPage("inbox", page)} page={pages.inbox} totalItems={pageTotals.inbox} />
+            </>
           )}
-          {activeView === "work" && <WorkList activeAction={activeAction} emptyMessage="No active or recently shipped work is visible." items={workItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />}
-          {activeView === "archive" && <WorkList activeAction={activeAction} emptyLabel="archived items" emptyMessage="Archived worker boards and work items will appear here." items={archivedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />}
+          {activeView === "work" && (
+            <>
+              <WorkList activeAction={activeAction} emptyMessage="No active or recently shipped work is visible." items={pagedWorkItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+              <PaginationControls label="work" onPageChange={(page) => setPage("work", page)} page={pages.work} totalItems={pageTotals.work} />
+            </>
+          )}
+          {activeView === "rejected" && (
+            <>
+              <WorkList activeAction={activeAction} emptyLabel="rejected items" emptyMessage="Rejected work items will appear here." items={pagedRejectedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} showActions={false} />
+              <PaginationControls label="rejected" onPageChange={(page) => setPage("rejected", page)} page={pages.rejected} totalItems={pageTotals.rejected} />
+            </>
+          )}
+          {activeView === "archive" && (
+            <>
+              <WorkList activeAction={activeAction} emptyLabel="archived items" emptyMessage="Archived worker boards and work items will appear here." items={pagedArchivedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} showActions={false} />
+              <PaginationControls label="archive" onPageChange={(page) => setPage("archive", page)} page={pages.archive} totalItems={pageTotals.archive} />
+            </>
+          )}
           {activeView === "recommendations" && <WorkList activeAction={activeAction} emptyLabel="recommendations" emptyMessage="No self-improvement recommendations are waiting." items={recommendations} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />}
           {activeView === "runs" && (
             <div className="grid gap-3">
@@ -837,12 +1105,6 @@ export default function CommandCenterPage() {
         </section>
       )}
 
-      <Card className="border-white/10 bg-white/[0.035]">
-        <CardContent className="flex flex-col gap-3 py-4 text-xs leading-5 text-slate-500 sm:flex-row sm:items-center sm:justify-between">
-          <span>{snapshot?.summary || "Sources create work items; workers move them forward."}</span>
-          <span>Generated {formatTime(snapshot?.generated_at)} · <Send className="inline h-3 w-3" /> Worker-board work rolls up board-level execution.</span>
-        </CardContent>
-      </Card>
     </div>
   );
 }

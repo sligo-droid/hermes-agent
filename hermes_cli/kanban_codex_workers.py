@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from hermes_cli.discord_worker_boards import ROLE_ASSIGNEES, ROLE_DEV, ROLE_PLANNER, ROLE_REVIEWER
+from hermes_cli.discord_worker_boards import ROLE_ASSIGNEES, ROLE_DEV, ROLE_FOREMAN, ROLE_PLANNER, ROLE_REVIEWER
 
 _OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV}
 _SENSITIVE_ENV_FRAGMENTS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "ACCESS_KEY")
@@ -36,14 +36,37 @@ _WORKER_CONTAINER_ENV_KEYS = {"PYTHONPATH", "HOME"}
 _ROLE_DEFAULT_REASONING = {
     "planner": "xhigh",
     "dev": "medium",
+    "foreman": "xhigh",
     "reviewer": "xhigh",
 }
 _VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh"}
 _AUTO_RUNTIME = "auto"
+_WORKER_SCRIPT = Path("hermes_cli") / "kanban_codex_worker.py"
+_CONTAINER_WORKER_SCRIPT = "/hermes/hermes_cli/kanban_codex_worker.py"
 
 
 def _repo_root() -> Path:
+    """Return the Hermes runtime source root for worker imports.
+
+    Role workers execute with their project worktree as cwd. For Hermes
+    self-improvement tasks that worktree is also a Hermes checkout, so Python's
+    default import path can otherwise shadow the canonical runtime checkout.
+    Prefer the source root that owns the current venv interpreter, then fall
+    back to this module's location for non-worktree installs.
+    """
+    try:
+        venv_dir = Path(sys.executable).resolve().parent.parent
+        if venv_dir.name in {".venv", "venv"}:
+            runtime_root = venv_dir.parent
+            if (runtime_root / "hermes_cli").is_dir():
+                return runtime_root
+    except OSError:
+        pass
     return Path(__file__).resolve().parent.parent
+
+
+def _host_worker_cmd() -> list[str]:
+    return [sys.executable, str(_repo_root() / _WORKER_SCRIPT)]
 
 
 def _worker_config() -> dict[str, Any]:
@@ -71,7 +94,17 @@ def _coding_backend(cfg: dict[str, Any]) -> str:
         return "codex"
 
 
-def _role_backend(role: str, configured_backend: str) -> str:
+def _task_forces_opencode(task: Any = None) -> bool:
+    if task is None:
+        return False
+    role = str(getattr(task, "assignee", "") or "").strip().lower()
+    created_by = str(getattr(task, "created_by", "") or "").strip().lower()
+    return role == ROLE_FOREMAN and created_by == "command-center-repair"
+
+
+def _role_backend(role: str, configured_backend: str, task: Any = None) -> str:
+    if _task_forces_opencode(task):
+        return "opencode"
     if configured_backend == "opencode" and role in _OPENCODE_ROLES:
         return "opencode"
     return "codex"
@@ -145,7 +178,7 @@ def _is_auto(value: Any) -> bool:
 
 
 def _adaptive_reasoning(role: str, task: Any = None) -> str:
-    if role in {ROLE_PLANNER, ROLE_REVIEWER}:
+    if role in {ROLE_PLANNER, ROLE_REVIEWER, ROLE_FOREMAN}:
         return "xhigh"
     if role != ROLE_DEV:
         return _ROLE_DEFAULT_REASONING.get(role, "medium")
@@ -337,7 +370,7 @@ def _redacted_command(cmd: list[str], env: dict[str, str]) -> str:
 
 
 def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None) -> Optional[Any]:
-    """Spawn a Codex worker for planner/dev/reviewer tasks.
+    """Spawn a coding worker for planner/dev/reviewer/foreman tasks.
 
     Returns the host-side subprocess pid or systemd unit handle so the existing
     Kanban crash detector can observe the worker lifecycle. Durable state lives
@@ -348,7 +381,7 @@ def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None
         return None
     cfg = _worker_config()
     configured_backend = _coding_backend(cfg)
-    backend = _role_backend(role, configured_backend)
+    backend = _role_backend(role, configured_backend, task)
     settings = _role_runtime_settings(role, cfg, task)
     log_settings = _role_log_settings(role, cfg, backend=backend, settings=settings)
     if backend == "opencode":
@@ -443,7 +476,7 @@ def _spawn_host_worker(
     if gh_config_dir:
         env["GH_CONFIG_DIR"] = gh_config_dir
 
-    cmd = [sys.executable, "-m", "hermes_cli.kanban_codex_worker"]
+    cmd = _host_worker_cmd()
     return _spawn_logged_process(
         task,
         cmd,
@@ -535,7 +568,7 @@ def _spawn_docker_worker(
     for key in env:
         if _forward_env_to_worker_container(key):
             cmd.extend(["-e", key])
-    cmd.extend([image, "python", "-m", "hermes_cli.kanban_codex_worker"])
+    cmd.extend([image, "python", _CONTAINER_WORKER_SCRIPT])
 
     return _spawn_logged_process(
         task,

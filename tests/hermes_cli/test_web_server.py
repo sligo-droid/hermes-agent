@@ -2192,6 +2192,173 @@ skip_on_windows = pytest.mark.skipif(
 )
 
 
+def test_worker_console_backend_update_formats_readable_activity(tmp_path):
+    import asyncio
+
+    import hermes_cli.web_server as ws
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.frames: list[bytes] = []
+
+        async def send_bytes(self, data: bytes) -> None:
+            self.frames.append(data)
+
+    state_path = tmp_path / "worker.codex-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "tool_trace": [
+                    {
+                        "source": "codex",
+                        "tool": "commandExecution",
+                        "command": "/bin/bash -lc 'rg worker console'",
+                        "status": "completed",
+                        "exit_code": 0,
+                        "output": "1: def noisy_code_dump():\n2:     return 'command output ok sk-test-secret1234567890'",
+                    }
+                ],
+                "events": [
+                    {
+                        "method": "item/agentMessage/delta",
+                        "payload": {"params": {"item": {"type": "agentMessage", "delta": "thinking text ok"}}},
+                    },
+                    {
+                        "method": "item/completed",
+                        "payload": {"params": {"item": {"type": "agentMessage"}}},
+                    },
+                    {
+                        "method": "item/completed",
+                        "payload": {
+                            "params": {
+                                "item": {
+                                    "type": "commandExecution",
+                                    "command": "nl -ba tests/tools/test_mcp_tool.py",
+                                    "exitCode": 0,
+                                    "aggregatedOutput": "1: def backend_code_dump():\n2:     return 'backend output ok'",
+                                }
+                            }
+                        },
+                    },
+                    {
+                        "method": "thread/tokenUsage/updated",
+                        "payload": {
+                            "params": {
+                                "tokenUsage": {
+                                    "total": {"totalTokens": 123, "reasoningOutputTokens": 4},
+                                    "last": {"totalTokens": 5},
+                                    "modelContextWindow": 1000,
+                                }
+                            }
+                        },
+                    },
+                ],
+                "truncated_events": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake = FakeWebSocket()
+
+    cursors = asyncio.run(
+        ws._send_worker_console_backend_updates(
+            fake,
+            state_path,
+            event_cursor=0,
+            tool_trace_cursor=0,
+            truncated_cursor=-1,
+            result_fingerprint="",
+        )
+    )
+
+    text = b"".join(fake.frames).decode("utf-8", errors="replace")
+    assert cursors[:3] == (4, 1, 2)
+    assert "[tool trace]" in text
+    assert "[command completed]" in text
+    assert "/bin/bash -lc 'rg worker console'" in text
+    assert "exit: 0" in text
+    assert "output: hidden (2 lines," in text
+    assert "successful stdout/stderr omitted" in text
+    assert "noisy_code_dump" not in text
+    assert "command output ok" not in text
+    assert "nl -ba tests/tools/test_mcp_tool.py" in text
+    assert "backend_code_dump" not in text
+    assert "backend output ok" not in text
+    assert "[agent message]" in text
+    assert "thinking text ok" in text
+    assert "[token usage] total=123 total_reasoning=4 last=5 context=1000" in text
+    assert "[item/agentMessage/delta] {" not in text
+    assert "sk-test-secret1234567890" not in text
+
+
+def test_worker_console_operator_text_formats_snapshot():
+    import hermes_cli.web_server as ws
+
+    payload = {
+        "worker_log_tail": "brief worker log",
+        "codex_state": {
+            "tool_trace": [
+                {
+                    "tool": "commandExecution",
+                    "command": "pwd",
+                    "status": "completed",
+                    "exit_code": 0,
+                    "output": "1: def repo_path_ok():\n2:     return 'repo path ok'",
+                }
+            ],
+            "events": [
+                {
+                    "method": "item/agentMessage/delta",
+                    "payload": {"params": {"item": {"type": "agentMessage", "delta": "agent says hi"}}},
+                }
+            ],
+        },
+    }
+
+    text = ws.worker_console_operator_text(payload)
+
+    assert "[tool trace]" in text
+    assert "[command completed]" in text
+    assert "$ pwd" in text
+    assert "exit: 0" in text
+    assert "output: hidden (2 lines," in text
+    assert "repo_path_ok" not in text
+    assert "repo path ok" not in text
+    assert "[agent message]" in text
+    assert "agent says hi" in text
+    assert "[item/agentMessage/delta] {" not in text
+
+
+def test_worker_console_operator_text_preserves_failure_snippet():
+    import hermes_cli.web_server as ws
+
+    payload = {
+        "codex_state": {
+            "tool_trace": [
+                {
+                    "tool": "commandExecution",
+                    "command": "python failing.py",
+                    "status": "completed",
+                    "exit_code": 1,
+                    "output": "Traceback (most recent call last):\nRuntimeError: focused failure sk-test-secret1234567890\n"
+                    + "hidden tail\n" * 300,
+                }
+            ]
+        }
+    }
+
+    text = ws.worker_console_operator_text(payload)
+
+    assert "[command completed]" in text
+    assert "$ python failing.py" in text
+    assert "exit: 1" in text
+    assert "output snippet (" in text
+    assert "Traceback (most recent call last)" in text
+    assert "RuntimeError: focused failure" in text
+    assert "sk-test-secret1234567890" not in text
+    assert "chars truncated" in text
+
+
 @skip_on_windows
 class TestPtyWebSocket:
     @pytest.fixture(autouse=True)
@@ -2354,7 +2521,7 @@ class TestPtyWebSocket:
                     break
                 if frame:
                     buf += frame
-                if b"worker-console-log-ok" in buf and b"backend-event-ok" in buf:
+                if b"worker-console-log-ok" in buf and b"output: hidden" in buf:
                     break
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write("worker-console-later-ok\n")
@@ -2397,14 +2564,15 @@ class TestPtyWebSocket:
                     break
                 if frame:
                     buf += frame
-                if b"worker-console-later-ok" in buf and b"backend-event-later-ok" in buf:
+                if b"worker-console-later-ok" in buf and buf.count(b"output: hidden") >= 2:
                     break
 
         assert captured == {"session_id": "sess-1", "task_id": "t_1"}
         assert b"worker-console-log-ok" in buf
-        assert b"backend-event-ok" in buf
+        assert b"backend-event-ok" not in buf
         assert b"worker-console-later-ok" in buf
-        assert b"backend-event-later-ok" in buf
+        assert b"backend-event-later-ok" not in buf
+        assert b"output: hidden" in buf
 
     def test_worker_console_pty_rejects_bad_token(self, monkeypatch):
         monkeypatch.setattr(

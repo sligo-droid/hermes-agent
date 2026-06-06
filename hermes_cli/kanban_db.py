@@ -502,6 +502,16 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
     return meta
 
 
+def _discord_worker_worktree_path(board_meta: dict[str, Any]) -> Optional[str]:
+    worker = board_meta.get("discord_worker")
+    if not isinstance(worker, dict) or worker.get("kind") != "discord_worker_board":
+        return None
+    path = str(worker.get("worktree_path") or "").strip()
+    if not path:
+        return None
+    return path
+
+
 def write_board_metadata(
     board: Optional[str],
     *,
@@ -2093,20 +2103,28 @@ def create_task(
 
     now = int(time.time())
 
-    # Resolve workspace_path from board-level default_workdir when the
-    # caller did not specify one explicitly. Board defaults represent
-    # persistent project checkouts, so only persistent workspace kinds may
-    # inherit them. Scratch workspaces are auto-deleted on completion and
-    # must stay under the per-board scratch root created by
-    # ``resolve_workspace``; inheriting ``default_workdir`` for a scratch
-    # task would point cleanup at the user's source tree (#28818). The
-    # containment guard in ``_cleanup_workspace`` is the safety rail, but
-    # we also stop the bad state from being created in the first place.
+    if workspace_path is not None and workspace_kind in {"dir", "worktree"}:
+        workspace_path = str(workspace_path).strip() or None
+
+    # Resolve workspace_path from board-level metadata when the caller did
+    # not specify one explicitly. Discord worker boards own a dedicated
+    # worktree and that must win over generic board defaults; the default may
+    # be the checkout running the dashboard/gateway, while worker jobs need the
+    # isolated board worktree. Generic boards keep the older default_workdir
+    # inheritance. Scratch workspaces are auto-deleted on completion and must
+    # stay under the per-board scratch root created by ``resolve_workspace``;
+    # inheriting a persistent checkout for a scratch task would point cleanup
+    # at the user's source tree (#28818). The containment guard in
+    # ``_cleanup_workspace`` is the safety rail, but we also stop the bad state
+    # from being created in the first place.
     if workspace_path is None and workspace_kind in {"dir", "worktree"}:
         board_slug = board if board else get_current_board()
         board_meta = read_board_metadata(board_slug)
+        worker_worktree = _discord_worker_worktree_path(board_meta)
         board_default = board_meta.get("default_workdir")
-        if board_default:
+        if workspace_kind == "dir" and worker_worktree:
+            workspace_path = worker_worktree
+        elif board_default:
             workspace_path = str(board_default)
 
     # Retry once on the extremely unlikely id collision.
@@ -4771,9 +4789,13 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         return p
     if kind == "dir":
         if not task.workspace_path:
-            raise ValueError(
-                f"task {task.id} has workspace_kind=dir but no workspace_path"
-            )
+            board_meta = read_board_metadata(board if board else get_current_board())
+            worker_worktree = _discord_worker_worktree_path(board_meta)
+            if not worker_worktree:
+                raise ValueError(
+                    f"task {task.id} has workspace_kind=dir but no workspace_path"
+                )
+            task.workspace_path = worker_worktree
         p = Path(task.workspace_path).expanduser()
         if not p.is_absolute():
             raise ValueError(
@@ -8137,40 +8159,46 @@ def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
 
 
 def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Return the latest non-null ``task_runs.summary`` for ``task_id``.
+    """Return the latest card-worthy run summary for ``task_id``.
 
-    The kanban-worker skill writes its handoff to ``task_runs.summary``
-    via ``complete_task(summary=...)``; ``tasks.result`` is left empty
-    unless the caller passes ``result=`` explicitly. Dashboards and CLI
-    "show" views need this value to surface what a worker actually did
-    — without it, ``tasks.result`` is NULL and the task looks like a
-    no-op even when the run completed.
+    The kanban-worker skill writes successful handoffs to
+    ``task_runs.summary`` via ``complete_task(summary=...)``;
+    ``tasks.result`` is left empty unless the caller passes ``result=``
+    explicitly. Crashed or killed worker attempts may not have a
+    summary, but they do usually have ``task_runs.error``. Dashboards and
+    CLI "show" views need either value to explain what happened instead
+    of rendering an apparently blank/no-op ticket.
 
-    Picks the most recent run by ``ended_at`` (falling back to ``id``
-    for ties or unfinished rows). Returns None if no run has a summary.
+    Picks the most recent run with a non-empty summary or error by
+    ``ended_at`` (falling back to ``id`` for ties or unfinished rows).
+    Returns None if no run has either field populated.
     """
     row = conn.execute(
-        "SELECT summary FROM task_runs "
-        "WHERE task_id = ? AND summary IS NOT NULL AND summary != '' "
+        "SELECT summary, error FROM task_runs "
+        "WHERE task_id = ? "
+        "AND ((summary IS NOT NULL AND summary != '') "
+        "OR (error IS NOT NULL AND error != '')) "
         "ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return row["summary"] if row else None
+    if not row:
+        return None
+    return row["summary"] or row["error"]
 
 
 def latest_summaries(
     conn: sqlite3.Connection, task_ids: Iterable[str]
 ) -> dict[str, str]:
-    """Batch-fetch latest non-null summaries for a list of task ids.
+    """Batch-fetch latest non-empty summaries/errors for task ids.
 
     Used by the dashboard board endpoint to attach ``latest_summary`` to
     every card in a single SQL query, avoiding the N+1 pattern of
     calling :func:`latest_summary` per task. Returns a dict mapping
-    ``task_id`` → summary string, omitting tasks with no summary.
+    ``task_id`` → summary/error string, omitting tasks with neither.
 
-    Approach: a window function picks the newest non-null-summary row
-    per ``task_id``; works against SQLite ≥ 3.25 (default on every
-    supported platform).
+    Approach: a window function picks the newest row with a non-empty
+    summary or error per ``task_id``; works against SQLite ≥ 3.25
+    (default on every supported platform).
     """
     ids = list(task_ids)
     if not ids:
@@ -8178,17 +8206,18 @@ def latest_summaries(
     placeholders = ",".join("?" for _ in ids)
     rows = conn.execute(
         f"""
-        SELECT task_id, summary FROM (
-            SELECT task_id, summary,
+        SELECT task_id, summary, error FROM (
+            SELECT task_id, summary, error,
                    ROW_NUMBER() OVER (
                        PARTITION BY task_id
                        ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
                    ) AS rn
               FROM task_runs
              WHERE task_id IN ({placeholders})
-               AND summary IS NOT NULL AND summary != ''
+               AND ((summary IS NOT NULL AND summary != '')
+                    OR (error IS NOT NULL AND error != ''))
         ) WHERE rn = 1
         """,
         ids,
     ).fetchall()
-    return {r["task_id"]: r["summary"] for r in rows}
+    return {r["task_id"]: r["summary"] or r["error"] for r in rows}

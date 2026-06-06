@@ -181,6 +181,51 @@ def test_snapshot_rolls_named_discord_board_tasks_up_to_board_work_item(tmp_path
     assert snapshot["metrics"]["discord_origin"] == 1
 
 
+def test_snapshot_archive_includes_moved_archived_worker_boards(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "discord-archived-feature-thread"
+    meta = kanban_db.write_board_metadata(board, name="Archived Feature Thread")
+    meta.pop("db_path", None)
+    meta[command_center.DISCORD_WORKER_META_KEY] = {
+        "guild_id": "111",
+        "thread_id": "222",
+        "source_message_id": "333",
+        "project_context": {"project_name": "Hermes"},
+    }
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Archived worker", board=board)
+        with conn:
+            conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200, task_id))
+            conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                (task_id, "done", 100, 200, "done"),
+            )
+    finally:
+        conn.close()
+    archived_result = kanban_db.remove_board(board)
+
+    default_snapshot = command_center.build_command_center_snapshot(include_archived=False, project="hermes")
+    archived_snapshot = command_center.build_command_center_snapshot(include_archived=True, project="hermes")
+
+    assert Path(archived_result["new_path"]).exists()
+    assert not any(item.get("execution", {}).get("board") == board for item in default_snapshot["work_items"])
+    item = next(item for item in archived_snapshot["work_items"] if item.get("execution", {}).get("board") == board)
+    source = next(source for source in archived_snapshot["sources"] if source["id"] == item["source"]["id"])
+    run = next(run for run in archived_snapshot["runs"] if run["board"] == board and run["task_id"] == task_id)
+
+    assert item["id"].startswith(f"kanban-board:archive:{board}-")
+    assert item["status"] == "archived"
+    assert item["project"] == "hermes"
+    assert item["execution"]["archiveable"] is False
+    assert item["execution"]["worker_url"] is None
+    assert item["source"]["ref"]["discord_url"] == "https://discord.com/channels/111/222/333"
+    assert source["status"] == "archived"
+    assert run["outcome"] == "done"
+    assert archived_snapshot["metrics"]["archived"] == 1
+
+
 def test_snapshot_exposes_project_tabs_and_filters_hermes_dev_intake(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     hermes_board = "discord-hermes-dev"
@@ -478,6 +523,98 @@ def test_snapshot_running_board_without_run_is_still_clickable_and_pauseable(tmp
     assert item["execution"]["resume_action"].endswith(f"/{board}/resume")
     assert item["execution"]["archive_action"].endswith(f"/{board}")
     assert item["execution"]["worker_url"] == f"/workers/{board}"
+
+
+def test_snapshot_blocked_board_repair_metadata_suppresses_existing_ticket(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "blocked-repair-board"
+    kanban_db.write_board_metadata(board, name="Blocked Repair Board")
+    conn = kanban_db.connect(board=board)
+    try:
+        blocked_task_id = kanban_db.create_task(
+            conn,
+            title="Blocked task",
+            assignee="dev",
+            initial_status="blocked",
+        )
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+    assert item["status"] == "blocked"
+    assert item["execution"]["repair_action"].endswith(f"/{board}/repair")
+    assert item["execution"]["repairable"] is True
+    assert "repair_task_id" not in item["execution"]
+
+    conn = kanban_db.connect(board=board)
+    try:
+        repair_task_id = kanban_db.create_task(
+            conn,
+            title="Repair blocked board",
+            assignee="foreman",
+            created_by="command-center-repair",
+            priority=1_000_000,
+            idempotency_key=command_center.command_center_repair_idempotency_key(board, blocked_task_id),
+        )
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+    assert item["execution"]["repairable"] is False
+    assert item["status"] == "blocked"
+    assert item["execution"]["repair_task_id"] == repair_task_id
+    assert item["execution"]["repair_task_status"] == "ready"
+    assert item["execution"]["repair_worker_url"].endswith(f"/workers/{board}/tickets/{repair_task_id}")
+
+    conn = kanban_db.connect(board=board)
+    try:
+        kanban_db.complete_task(conn, repair_task_id, summary="old repair done")
+        kanban_db.set_status_direct(conn, blocked_task_id, "blocked")
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+    assert item["execution"]["repairable"] is True
+    assert "repair_task_id" not in item["execution"]
+
+
+def test_snapshot_blocked_board_with_blocked_repair_is_mega_blocked(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "mega-blocked-repair-board"
+    kanban_db.write_board_metadata(board, name="Mega Blocked Repair Board")
+    conn = kanban_db.connect(board=board)
+    try:
+        blocked_task_id = kanban_db.create_task(
+            conn,
+            title="Blocked task",
+            assignee="dev",
+            initial_status="blocked",
+        )
+        repair_task_id = kanban_db.create_task(
+            conn,
+            title="Repair blocked board",
+            assignee="foreman",
+            created_by="command-center-repair",
+            priority=1_000_000,
+            idempotency_key=command_center.command_center_repair_idempotency_key(board, blocked_task_id),
+        )
+        kanban_db.set_status_direct(conn, repair_task_id, "blocked")
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+
+    assert item["status"] == "mega_blocked"
+    assert item["status_detail"] == "repair_blocked"
+    assert item["execution"]["repairable"] is False
+    assert item["execution"]["repair_task_id"] == repair_task_id
+    assert item["execution"]["repair_task_status"] == "blocked"
+    assert item["execution"]["repair_blocked"] is True
+    assert item["execution"]["repair_status_detail"] == "Active Command Center repair task is blocked."
 
 
 def test_snapshot_skips_internal_default_board_foreman_tasks(tmp_path, monkeypatch):

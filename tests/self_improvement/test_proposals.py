@@ -92,6 +92,64 @@ def test_self_improvement_discord_channel_lookup_falls_back_to_project_mapping(m
     assert closed == [True, True]
 
 
+def test_self_improvement_project_context_falls_back_to_channel_cwd(monkeypatch, tmp_path):
+    project = tmp_path / "hermes"
+    project.mkdir()
+
+    monkeypatch.setattr(
+        discord_publish,
+        "load_config_readonly",
+        lambda: {
+            "self_improvement": {"projects": {"hermes": {}}},
+            "discord": {"channel_cwds": {"12345": str(project)}},
+        },
+    )
+    monkeypatch.setattr(discord_publish, "_project_mapping_for_key", lambda _project: {})
+
+    assert discord_publish._project_context(
+        {"project": "hermes", "prong": "daily-retrospective"},
+        "12345",
+    ) == {
+        "project_name": "hermes",
+        "project_path": str(project.resolve()),
+        "project_channel_id": "12345",
+        "project_mapping_source": "configured_channel_cwd",
+        "project_mapping_resolved": True,
+        "self_improvement_project": "hermes",
+        "self_improvement_prong": "daily-retrospective",
+    }
+
+
+def test_self_improvement_project_context_uses_channel_cwd_when_mapping_has_no_path(monkeypatch, tmp_path):
+    project = tmp_path / "hermes"
+    project.mkdir()
+
+    monkeypatch.setattr(
+        discord_publish,
+        "load_config_readonly",
+        lambda: {"discord": {"channel_cwds": {"12345": str(project)}}},
+    )
+    monkeypatch.setattr(
+        discord_publish,
+        "_project_mapping_for_key",
+        lambda _project: {
+            "project_name": "Hermes",
+            "channel_id": "12345",
+            "source": "session_project_mapping",
+        },
+    )
+
+    assert discord_publish._project_context({"project": "hermes"}, "12345") == {
+        "project_name": "hermes",
+        "project_path": str(project.resolve()),
+        "project_channel_id": "12345",
+        "project_mapping_source": "configured_channel_cwd",
+        "project_mapping_resolved": True,
+        "self_improvement_project": "hermes",
+        "self_improvement_prong": "",
+    }
+
+
 def test_self_improvement_discord_initial_reaction_url_encodes_unicode(monkeypatch):
     from tools import discord_tool
 

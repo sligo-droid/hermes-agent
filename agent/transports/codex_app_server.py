@@ -72,6 +72,7 @@ class CodexAppServerClient:
         codex_home: Optional[str] = None,
         extra_args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
+        replace_env: bool = False,
         cwd: Optional[str] = None,
         scope_kind: str = "codex-app-server",
         scope_purpose: str = "Codex app-server runtime",
@@ -79,8 +80,8 @@ class CodexAppServerClient:
     ) -> None:
         self._codex_bin = codex_bin
         explicit_env = env or {}
-        spawn_env = os.environ.copy()
-        if env:
+        spawn_env = dict(env) if replace_env and env is not None else os.environ.copy()
+        if env and not replace_env:
             spawn_env.update(env)
         if codex_home:
             spawn_env["CODEX_HOME"] = codex_home
@@ -94,29 +95,32 @@ class CodexAppServerClient:
             pass
 
         app_server_args = list(extra_args or [])
-        # Kanban workers must be able to write both their project workspace
-        # and their handoff/status back to the board DB. Keep the Codex
-        # sandbox on, but add those paths as writable roots.
-        if spawn_env.get("HERMES_KANBAN_TASK"):
+        # Kanban role workers launch coding backends with live board control
+        # variables scrubbed, so sandbox setup must not depend on those vars.
+        if spawn_env.get("HERMES_KANBAN_TASK") or spawn_env.get(
+            "HERMES_CODEX_WORKER_NETWORK_ACCESS"
+        ):
             kanban_db = spawn_env.get("HERMES_KANBAN_DB")
-            kanban_root = (
-                os.path.dirname(kanban_db)
-                if kanban_db
-                else spawn_env.get(
-                    "HERMES_KANBAN_ROOT",
-                    os.path.join(
-                        spawn_env.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
-                        "kanban",
-                    ),
+            writable_roots = []
+            if kanban_db or spawn_env.get("HERMES_KANBAN_TASK"):
+                kanban_root = (
+                    os.path.dirname(kanban_db)
+                    if kanban_db
+                    else spawn_env.get(
+                        "HERMES_KANBAN_ROOT",
+                        os.path.join(
+                            spawn_env.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+                            "kanban",
+                        ),
+                    )
                 )
-            )
+                writable_roots.append(kanban_root)
             network_access = (
                 "true"
                 if explicit_env.get("HERMES_CODEX_WORKER_NETWORK_ACCESS", "").strip().lower()
                 in {"1", "true", "yes", "on"}
                 else "false"
             )
-            writable_roots = [kanban_root]
             workspace = spawn_env.get("HERMES_KANBAN_WORKSPACE")
             if workspace and os.path.isabs(workspace) and workspace not in writable_roots:
                 writable_roots.append(workspace)
