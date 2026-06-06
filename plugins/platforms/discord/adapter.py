@@ -7085,6 +7085,20 @@ class DiscordAdapter(BasePlatformAdapter):
             raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
         return self._discord_channel_id_set(raw)
 
+    def _discord_channel_cwd_root_channel_ids(self) -> set[str]:
+        """Return root channels configured through ``discord.channel_cwds``.
+
+        ``channel_cwds`` channels are valid Discord entrypoints even when they
+        are not present in the persisted project-mapping DB yet.  Root-channel
+        missed-mention recovery must watch them too, otherwise mentions posted
+        during a gateway restart can be skipped before the normal on_message
+        path has a chance to record a recovery watermark.
+        """
+        raw = self.config.extra.get("channel_cwds")
+        if not isinstance(raw, dict):
+            return set()
+        return {str(channel_id).strip() for channel_id in raw if str(channel_id).strip()}
+
     def _discord_project_mapping_root_channel_ids(self) -> set[str]:
         """Return root project channels known to Hermes' Discord project map.
 
@@ -7129,6 +7143,7 @@ class DiscordAdapter(BasePlatformAdapter):
         allowed = self._discord_allowed_channel_ids()
         if allowed and "*" not in allowed:
             ids.update(allowed)
+        ids.update(self._discord_channel_cwd_root_channel_ids())
         ids.update(self._discord_project_mapping_root_channel_ids())
         ids.update(ch for ch in self._discord_free_response_channels() if ch != "*")
         ids.update(ch for ch in self._discord_feature_request_channels() if ch != "*")
