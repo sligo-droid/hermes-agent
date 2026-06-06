@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
+from pathlib import Path
 from typing import Callable, Optional
 
 from hermes_cli import discord_worker_boards as dwb
@@ -10,6 +12,74 @@ from hermes_cli import kanban_db
 
 
 logger = logging.getLogger(__name__)
+
+
+def _paused_corrupt_incident(board: str) -> Optional[dict]:
+    try:
+        incident = kanban_db.is_board_paused_for_corruption(board)
+    except Exception:
+        return None
+    if not incident:
+        return None
+    db_path = Path(str(incident.get("db_path") or kanban_db.kanban_db_path(board)))
+    try:
+        fingerprint = kanban_db._db_content_fingerprint(db_path)
+    except Exception:
+        fingerprint = None
+    if incident.get("fingerprint") == fingerprint:
+        return incident
+    logger.info(
+        "kanban dispatcher: Discord worker board %s database changed since corruption incident; retrying",
+        board,
+    )
+    return None
+
+
+def _is_corrupt_board_db_error(exc: Exception) -> bool:
+    if isinstance(exc, kanban_db.KanbanDbCorruptError):
+        return True
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    msg = str(exc).lower()
+    return "file is not a database" in msg or "database disk image is malformed" in msg
+
+
+def _record_corrupt_board(board: str, exc: Exception) -> Optional[dict]:
+    incident = getattr(exc, "incident", None)
+    if isinstance(incident, dict):
+        return incident
+    db_path = kanban_db.kanban_db_path(board)
+    try:
+        resolved = db_path.resolve()
+    except OSError:
+        resolved = db_path
+    try:
+        fingerprint = kanban_db._db_content_fingerprint(resolved)
+    except Exception:
+        fingerprint = None
+    return kanban_db.record_corrupt_board_incident(
+        board,
+        resolved,
+        str(getattr(exc, "reason", None) or exc),
+        backup_path=getattr(exc, "backup_path", None),
+        fingerprint=fingerprint,
+    )
+
+
+def _log_corrupt_board_incident(board: str, incident: Optional[dict], exc: Exception) -> None:
+    incident = incident or {}
+    logger.error(
+        "kanban dispatcher: Discord worker board %s database corruption incident; "
+        "db_path=%s quarantine_path=%s reason=%s. Dispatch is paused for this "
+        "board while the DB fingerprint is unchanged. Repair guidance: restore "
+        "a known-good backup or run `hermes kanban repair --board %s`, then "
+        "retry after integrity checks pass.",
+        board,
+        incident.get("db_path") or str(kanban_db.kanban_db_path(board)),
+        incident.get("quarantine_path") or getattr(exc, "backup_path", None) or "<unavailable>",
+        incident.get("reason") or getattr(exc, "reason", None) or str(exc),
+        board,
+    )
 
 
 def _coerce_positive_int(value: object, default: int) -> int:
@@ -178,6 +248,13 @@ def dispatch_discord_worker_boards(
     ready_roles_by_board: dict[str, dict[str, int]] = {}
 
     for board in boards:
+        if _paused_corrupt_incident(board):
+            logger.debug(
+                "kanban dispatcher: Discord worker board %s paused for unchanged DB corruption; skipping dispatch",
+                board,
+            )
+            out.append((board, None))
+            continue
         try:
             if not dwb.is_discord_worker_board(board):
                 continue
@@ -196,12 +273,23 @@ def dispatch_discord_worker_boards(
             running_roles_by_board[board] = running_role_counts(board)
             ready_roles_by_board[board] = _ready_role_counts(board)
             eligible.append(board)
-        except Exception:
+        except Exception as exc:
+            if _is_corrupt_board_db_error(exc):
+                _log_corrupt_board_incident(board, _record_corrupt_board(board, exc), exc)
+                out.append((board, None))
+                continue
             logger.exception("kanban dispatcher: Discord worker prep failed on board %s", board)
             out.append((board, None))
 
     remaining_global_slots = max(0, max_global_workers - sum(running_by_board.values()))
     for board in eligible:
+        if _paused_corrupt_incident(board):
+            logger.debug(
+                "kanban dispatcher: Discord worker board %s paused for unchanged DB corruption; skipping dispatch",
+                board,
+            )
+            out.append((board, None))
+            continue
         if dwb.is_paused_or_cancelled(board):
             out.append((board, None))
             continue
@@ -241,7 +329,11 @@ def dispatch_discord_worker_boards(
             if result.spawned:
                 remaining_global_slots = max(0, remaining_global_slots - len(result.spawned))
             out.append((board, result))
-        except Exception:
+        except Exception as exc:
+            if _is_corrupt_board_db_error(exc):
+                _log_corrupt_board_incident(board, _record_corrupt_board(board, exc), exc)
+                out.append((board, None))
+                continue
             logger.exception("kanban dispatcher: Discord worker tick failed on board %s", board)
             out.append((board, None))
 

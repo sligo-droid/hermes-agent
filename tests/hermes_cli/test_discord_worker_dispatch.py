@@ -289,3 +289,66 @@ def test_discord_worker_dispatch_reviewer_lane_is_singleton(monkeypatch, tmp_pat
 
     assert spawned == [(dwb.ROLE_REVIEWER, board.slug)]
     assert sum(len(result.spawned) for _board, result in results if result is not None) == 1
+
+
+def test_discord_worker_dispatch_records_corrupt_open_once_then_skips(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    import logging
+    import sqlite3
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
+
+    board = "discord-corrupt-dispatch"
+    db_path = tmp_path / "kanban.db"
+    db_path.write_text("not sqlite", encoding="utf-8")
+    incidents = {}
+    calls = {"connect": 0, "record": 0, "dispatch": 0}
+
+    monkeypatch.setattr(dwb, "is_discord_worker_board", lambda candidate: candidate == board)
+    monkeypatch.setattr(dwb, "reconcile_board", lambda candidate: None)
+    monkeypatch.setattr(dwb, "ensure_code_island_for_board", lambda candidate: True)
+    monkeypatch.setattr(dwb, "is_executable_worker_board", lambda candidate: True)
+    monkeypatch.setattr(dwb, "is_paused_or_cancelled", lambda candidate: False)
+    monkeypatch.setattr(kanban_db, "kanban_db_path", lambda candidate=None: db_path)
+    monkeypatch.setattr(kanban_db, "is_board_paused_for_corruption", lambda candidate=None: incidents.get(candidate))
+
+    def connect(*args, **kwargs):
+        calls["connect"] += 1
+        raise sqlite3.DatabaseError("file is not a database")
+
+    def record_incident(candidate, db_path_arg, reason, *, backup_path=None, fingerprint=None):
+        calls["record"] += 1
+        incident = {
+            "pause_reason": "kanban_db_corruption",
+            "db_path": str(db_path_arg),
+            "fingerprint": fingerprint,
+            "quarantine_path": str(backup_path) if backup_path is not None else None,
+            "reason": reason,
+        }
+        incidents[candidate] = incident
+        return incident
+
+    def dispatch_once(*args, **kwargs):
+        calls["dispatch"] += 1
+        return kanban_db.DispatchResult()
+
+    monkeypatch.setattr(kanban_db, "connect", connect)
+    monkeypatch.setattr(kanban_db, "record_corrupt_board_incident", record_incident)
+    monkeypatch.setattr(kanban_db, "dispatch_once", dispatch_once)
+
+    with caplog.at_level(logging.DEBUG, logger="hermes_cli.discord_worker_dispatch"):
+        first = dispatch_discord_worker_boards([board], spawn_fn=lambda *args, **kwargs: 999)
+        second = dispatch_discord_worker_boards([board], spawn_fn=lambda *args, **kwargs: 999)
+
+    assert first == [(board, None)]
+    assert second == [(board, None)]
+    assert calls == {"connect": 1, "record": 1, "dispatch": 0}
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum("Discord worker board discord-corrupt-dispatch database corruption incident" in msg for msg in messages) == 1
+    assert any("paused for unchanged DB corruption" in msg for msg in messages)
+    assert not any(record.exc_info for record in caplog.records)

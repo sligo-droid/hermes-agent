@@ -1061,6 +1061,65 @@ def test_duplicate_resolved_db_paths_are_scanned_once(monkeypatch, tmp_path):
     assert seen == ["discord-1"]
 
 
+def test_collect_board_snapshots_records_corrupt_open_once_then_skips(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    import logging
+    import sqlite3
+
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_foreman as foreman
+
+    board = "discord-corrupt-foreman"
+    db_path = tmp_path / "kanban.db"
+    db_path.write_text("not sqlite", encoding="utf-8")
+    worker = {"kind": "discord_worker_board", "thread_id": "1"}
+    incidents = {}
+    calls = {"connect": 0, "record": 0}
+
+    monkeypatch.setattr(
+        foreman.kanban_db,
+        "list_boards",
+        lambda include_archived=False: [{"slug": board, "discord_worker": worker}],
+    )
+    monkeypatch.setattr(foreman.kanban_db, "kanban_db_path", lambda board=None: db_path)
+    monkeypatch.setattr(
+        foreman.kanban_db,
+        "is_board_paused_for_corruption",
+        lambda candidate=None: incidents.get(candidate),
+    )
+
+    def connect(*args, **kwargs):
+        calls["connect"] += 1
+        raise sqlite3.DatabaseError("file is not a database")
+
+    def record_incident(candidate, db_path_arg, reason, *, backup_path=None, fingerprint=None):
+        calls["record"] += 1
+        incident = {
+            "pause_reason": "kanban_db_corruption",
+            "db_path": str(db_path_arg),
+            "fingerprint": fingerprint,
+            "quarantine_path": str(backup_path) if backup_path is not None else None,
+            "reason": reason,
+        }
+        incidents[candidate] = incident
+        return incident
+
+    monkeypatch.setattr(foreman.kanban_db, "connect", connect)
+    monkeypatch.setattr(foreman.kanban_db, "record_corrupt_board_incident", record_incident)
+
+    with caplog.at_level(logging.DEBUG, logger="hermes_cli.discord_worker_foreman"):
+        assert foreman.collect_board_snapshots() == []
+        assert foreman.collect_board_snapshots() == []
+
+    assert calls == {"connect": 1, "record": 1}
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum("discord foreman: board discord-corrupt-foreman database corruption incident" in msg for msg in messages) == 1
+    assert not any(record.exc_info for record in caplog.records)
+
+
 def test_collect_board_snapshots_skips_foreman_generated_boards(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_foreman as foreman
