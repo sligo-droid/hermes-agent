@@ -3288,6 +3288,9 @@ class GatewayRunner:
         except Exception:
             pass
 
+    def _refresh_active_agent_runtime_status(self) -> None:
+        self._update_runtime_status("draining" if getattr(self, "_draining", False) else "running")
+
     def _update_platform_runtime_status(
         self,
         platform: str,
@@ -10345,6 +10348,7 @@ class GatewayRunner:
         # same session — corrupting the transcript.
         self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
         self._running_agents_ts[_quick_key] = time.time()
+        self._refresh_active_agent_runtime_status()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
@@ -18725,10 +18729,13 @@ class GatewayRunner:
             session_key, run_generation
         ):
             return False
+        had_running_agent = session_key in self._running_agents
         self._running_agents.pop(session_key, None)
         self._running_agents_ts.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
+        if had_running_agent:
+            self._refresh_active_agent_runtime_status()
         return True
 
     def _clear_session_boundary_security_state(self, session_key: str) -> None:
