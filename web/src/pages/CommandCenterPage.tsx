@@ -586,7 +586,7 @@ function PaginationControls({
   const totalPages = pageCount(totalItems);
   const range = pageRange(page, totalItems);
   return (
-    <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-white/10 bg-white/[0.035] px-3 py-2 text-xs text-slate-400">
+    <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-white/10 bg-white/[0.035] px-3 py-2 text-xs text-slate-400">
       <span>{range.from > 0 ? `Showing ${range.from}-${range.to} of ${totalItems}` : "Showing 0 of 0"}</span>
       <div className="flex items-center gap-2">
         <button
@@ -1040,26 +1040,26 @@ export default function CommandCenterPage() {
           )}
           {activeView === "overview" && (
             <>
-              <PaginationControls label="overview" onPageChange={(page) => setPage("overview", page)} page={pages.overview} totalItems={pageTotals.overview} />
               <OverviewWorkList activeAction={activeAction} emptyMessage="No recent decisions, worker boards, or active work yet." items={pagedOverviewItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+              <PaginationControls label="overview" onPageChange={(page) => setPage("overview", page)} page={pages.overview} totalItems={pageTotals.overview} />
             </>
           )}
           {activeView === "inbox" && (
             <>
-              <PaginationControls label="inbox" onPageChange={(page) => setPage("inbox", page)} page={pages.inbox} totalItems={pageTotals.inbox} />
               <InboxList activeAction={activeAction} emptyMessage="Inbox is clear. Finished, blocked, and archiveable boards stay on Overview or Work." items={pagedInboxItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+              <PaginationControls label="inbox" onPageChange={(page) => setPage("inbox", page)} page={pages.inbox} totalItems={pageTotals.inbox} />
             </>
           )}
           {activeView === "work" && (
             <>
-              <PaginationControls label="work" onPageChange={(page) => setPage("work", page)} page={pages.work} totalItems={pageTotals.work} />
               <WorkList activeAction={activeAction} emptyMessage="No active or recently shipped work is visible." items={pagedWorkItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+              <PaginationControls label="work" onPageChange={(page) => setPage("work", page)} page={pages.work} totalItems={pageTotals.work} />
             </>
           )}
           {activeView === "archive" && (
             <>
-              <PaginationControls label="archive" onPageChange={(page) => setPage("archive", page)} page={pages.archive} totalItems={pageTotals.archive} />
               <WorkList activeAction={activeAction} emptyLabel="archived items" emptyMessage="Archived worker boards and work items will appear here." items={pagedArchivedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} showActions={false} />
+              <PaginationControls label="archive" onPageChange={(page) => setPage("archive", page)} page={pages.archive} totalItems={pageTotals.archive} />
             </>
           )}
           {activeView === "recommendations" && <WorkList activeAction={activeAction} emptyLabel="recommendations" emptyMessage="No self-improvement recommendations are waiting." items={recommendations} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />}
