@@ -2168,8 +2168,10 @@ def test_worker_ticket_console_returns_operator_state_and_log_paths(monkeypatch,
         "kind": "dir",
         "available": True,
     }
-    assert "sk-proj-console-visible" in data["worker_log_tail"]
-    assert "sk-proj-console-event" in rendered
+    assert "operator log" in data["worker_log_tail"]
+    assert "raw event" in rendered
+    assert "sk-proj-console-visible" not in rendered
+    assert "sk-proj-console-event" not in rendered
     assert stream["log_path"] == str(log_path)
     assert stream["state_path"].endswith(f"{task.id}.codex-state.json")
     assert stream["snapshot"]["workspace"]["path"] == str(workspace)

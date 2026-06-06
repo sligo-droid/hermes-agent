@@ -5,6 +5,11 @@ import {
   AlertTriangle,
   Archive,
   Check,
+  CheckCircle2,
+  Circle,
+  CircleDashed,
+  CircleDot,
+  Clock3,
   ExternalLink,
   Inbox,
   PauseCircle,
@@ -29,6 +34,7 @@ import { cn } from "@/lib/utils";
 type ViewKey = "overview" | "inbox" | "work" | "archive" | "runs" | "recommendations" | "sources";
 type ActionKind = "approve" | "reject" | "pause" | "resume" | "undo" | "archive";
 type ActiveAction = { ids: string[]; kind: ActionKind };
+type VisualStatus = "proposed" | "queued" | "running" | "review" | "blocked" | "paused" | "shipped" | "archived" | "unknown";
 
 const ACTION_SETTLE_MS = 600;
 const ACTION_PROGRESS_LABELS: Record<ActionKind, string> = {
@@ -68,22 +74,56 @@ function formatTime(value?: string | number | null): string {
   return date.toLocaleString();
 }
 
-function statusTone(status?: string | null): string {
+function visualStatusKey(status?: string | null, active = false): VisualStatus {
+  if (active) return "running";
   const normalized = String(status || "unknown").toLowerCase();
-  if (["proposed", "parse_failed"].includes(normalized)) return "border-cyan-200/45 bg-cyan-300/10 text-cyan-100";
-  if (["queued", "accepted"].includes(normalized)) return "border-blue-200/35 bg-blue-400/10 text-blue-100";
-  if (["running", "review"].includes(normalized)) return "border-amber-200/45 bg-amber-300/10 text-amber-100";
-  if (["blocked", "missing", "error"].includes(normalized)) return "border-red-300/45 bg-red-400/10 text-red-100";
-  if (["shipped", "done"].includes(normalized)) return "border-emerald-300/45 bg-emerald-400/10 text-emerald-100";
-  if (["rejected", "archived"].includes(normalized)) return "border-slate-400/30 bg-slate-400/10 text-slate-300";
-  return "border-slate-400/25 bg-slate-400/10 text-slate-200";
+  if (["proposed", "parse_failed"].includes(normalized)) return "proposed";
+  if (["queued", "accepted"].includes(normalized)) return "queued";
+  if (normalized === "running") return "running";
+  if (normalized === "review") return "review";
+  if (["blocked", "missing", "error"].includes(normalized)) return "blocked";
+  if (normalized === "paused") return "paused";
+  if (["shipped", "done"].includes(normalized)) return "shipped";
+  if (["rejected", "archived"].includes(normalized)) return "archived";
+  return "unknown";
 }
 
-function StatusPill({ value }: { value?: string | null }) {
+const STATUS_VISUALS = {
+  proposed: { label: "Proposed", icon: CircleDot, className: "command-center-status-proposed" },
+  queued: { label: "Queued", icon: Clock3, className: "command-center-status-queued" },
+  running: { label: "Running", icon: Activity, className: "command-center-status-running" },
+  review: { label: "Review", icon: CircleDashed, className: "command-center-status-review" },
+  blocked: { label: "Blocked", icon: AlertTriangle, className: "command-center-status-blocked" },
+  paused: { label: "Paused", icon: PauseCircle, className: "command-center-status-paused" },
+  shipped: { label: "Shipped", icon: CheckCircle2, className: "command-center-status-shipped" },
+  archived: { label: "Archived", icon: Archive, className: "command-center-status-archived" },
+  unknown: { label: "Unknown", icon: Circle, className: "command-center-status-unknown" },
+} satisfies Record<VisualStatus, { label: string; icon: typeof Activity; className: string }>;
+
+function StatusGlyph({ active = false, detail, value }: { active?: boolean; detail?: string | null; value?: string | null }) {
+  const status = visualStatusKey(value, active);
+  const visual = STATUS_VISUALS[status];
+  const Icon = visual.icon;
+  const accessibleLabel = detail ? `${visual.label}: ${detail}` : visual.label;
   return (
-    <Badge className={cn("w-fit border px-2 py-0.5 text-[0.66rem] uppercase tracking-[0.16em]", statusTone(value))}>
-      {value || "unknown"}
-    </Badge>
+    <span aria-label={`Status: ${accessibleLabel}`} className={cn("command-center-status-indicator", visual.className)} title={accessibleLabel}>
+      <Icon aria-hidden="true" className="h-3.5 w-3.5" />
+      <span className="sr-only">Status: {accessibleLabel}</span>
+    </span>
+  );
+}
+
+function StatusRail({ status }: { status: VisualStatus }) {
+  return <span aria-hidden="true" className={cn("command-center-status-rail", STATUS_VISUALS[status].className)} />;
+}
+
+function RunningMeter() {
+  return (
+    <span aria-hidden="true" className="command-center-live-meter">
+      <span />
+      <span />
+      <span />
+    </span>
   );
 }
 
@@ -320,18 +360,10 @@ function runningDescriptor(item: CommandCenterWorkItem): string {
   return "active worker";
 }
 
-function RunningIndicator({ detail }: { detail: string }) {
-  return (
-    <span aria-label={`Running work item: ${detail}`} className="command-center-running-chip inline-flex h-7 max-w-full items-center gap-2 rounded-full border border-amber-100/35 bg-amber-200/15 px-2.5 text-[0.63rem] font-bold uppercase tracking-[0.16em] text-amber-50">
-      <span aria-hidden="true" className="relative flex h-2.5 w-2.5 shrink-0">
-        <span className="command-center-running-dot absolute inline-flex h-full w-full rounded-full bg-amber-200/80" />
-        <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-amber-100 shadow-[0_0_12px_rgba(251,191,36,0.8)]" />
-      </span>
-      <Activity aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
-      <span>Running</span>
-      <span className="hidden min-w-0 max-w-[12rem] truncate text-amber-100/70 sm:inline">{detail}</span>
-    </span>
-  );
+function runDescriptor(run: CommandCenterRun): string {
+  const worker = run.worker_unit || run.worker_pid;
+  if (worker) return `${worker} / run ${run.id}`;
+  return `run ${run.id}`;
 }
 
 function discordSourceUrl(source?: CommandCenterSource | null): string | null {
@@ -370,6 +402,7 @@ function WorkItemCard({
   const actionDisabled = (kind: ActionKind) => (Boolean(activeAction) && !actionBusy(kind)) || (selectionActive && (!selected || !multiSelectActionCommon.has(kind)));
   const running = isRunningWorkItem(item);
   const runningDetail = running ? runningDescriptor(item) : null;
+  const visualStatus = visualStatusKey(item.status, running);
   const disabledTitle = (kind: ActionKind) => {
     if (!selectionActive) return undefined;
     if (!selected) return "Clear selection before acting on this ticket";
@@ -387,7 +420,7 @@ function WorkItemCard({
       aria-label={workerUrl ? `Open worker board for ${item.title}` : undefined}
       aria-busy={rowBusy || undefined}
       className={cn(
-        "command-center-card relative rounded-2xl border bg-[#08090a]/80 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.025)] transition",
+        "command-center-card relative overflow-hidden rounded-2xl border bg-[#08090a]/80 p-4 pl-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.025)] transition",
         selected && "command-center-card-selected border-cyan-100/45 bg-cyan-100/[0.055]",
         workerUrl ? "cursor-pointer border-white/10 hover:border-cyan-100/35 hover:bg-cyan-100/[0.045] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/35" : "border-white/10 hover:border-white/20 hover:bg-white/[0.03]",
         running && "command-center-card-running",
@@ -402,6 +435,7 @@ function WorkItemCard({
       role={workerUrl ? "link" : undefined}
       tabIndex={workerUrl ? 0 : undefined}
     >
+      <StatusRail status={visualStatus} />
       <div className="flex items-start justify-between gap-3">
         <input
           aria-label={`Select ${item.title || item.id}`}
@@ -415,8 +449,8 @@ function WorkItemCard({
         <div className="min-w-0 flex-1 text-left">
           <div className="mb-2 flex flex-wrap items-center gap-2">
             <SourceBadge source={item.source} />
-            <StatusPill value={item.status} />
-            {runningDetail && <RunningIndicator detail={runningDetail} />}
+            <StatusGlyph active={running} detail={runningDetail || item.status_detail} value={item.status} />
+            {running && <RunningMeter />}
             {item.project && <span className="text-xs uppercase tracking-[0.16em] text-slate-500">{item.project}</span>}
           </div>
           <h3 className="text-base font-semibold leading-snug text-white">{item.title}</h3>
@@ -469,7 +503,7 @@ function SourceCard({ source }: { source: CommandCenterSource }) {
     <article className="command-center-card rounded-2xl border border-white/10 bg-slate-950/45 p-4 text-left transition hover:border-cyan-100/35">
       <div className="flex flex-wrap items-center gap-2">
         <Badge className="border-white/10 bg-white/[0.055] text-slate-300">{source.label}</Badge>
-        <StatusPill value={source.status} />
+        <StatusGlyph value={source.status} />
       </div>
       <div className="mt-3 text-sm font-semibold text-white">{source.title || source.id}</div>
       <div className="mt-2 text-xs text-slate-500">Updated {formatTime(source.updated_at || source.created_at)}</div>
@@ -485,7 +519,7 @@ function RunCard({ run }: { run: CommandCenterRun }) {
   return (
     <article className="command-center-card rounded-2xl border border-white/10 bg-slate-950/45 p-4 text-left transition hover:border-cyan-100/35">
       <div className="flex flex-wrap items-center gap-2">
-        <StatusPill value={active ? "running" : run.outcome || run.status} />
+        <StatusGlyph active={active} detail={active ? runDescriptor(run) : run.error} value={active ? "running" : run.outcome || run.status} />
         {run.board && <Badge className="border-white/10 bg-white/[0.055] text-slate-300">{run.board}</Badge>}
       </div>
       <div className="mt-3 text-sm font-semibold text-white">{run.task_title || run.task_id}</div>
