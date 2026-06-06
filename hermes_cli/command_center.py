@@ -306,9 +306,13 @@ def _with_repair_metadata(execution: dict[str, Any], *, status: str, tasks: list
     execution["repairable"] = repair_task is None
     if repair_task:
         repair_task_id = str(repair_task.get("id") or "")
+        repair_task_status = str(repair_task.get("status") or "").lower()
         execution["repair_task_id"] = repair_task_id
         execution["repair_task_status"] = repair_task.get("status")
         execution["repair_worker_url"] = _worker_ticket_url(repair_task_id, board=board) if repair_task_id else None
+        if repair_task_status in _BLOCKED_TASK_STATUSES:
+            execution["repair_blocked"] = True
+            execution["repair_status_detail"] = "Active Command Center repair task is blocked."
     return execution
 
 
@@ -751,6 +755,10 @@ def _board_work_item(
     proposal_action_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     canonical_status, status_detail = _canonical_status_from_board(tasks, board_meta=board_meta, runs=runs)
+    execution = _execution_from_board(board=board, board_meta=board_meta, tasks=tasks, runs=runs)
+    if canonical_status == "blocked" and execution.get("repair_blocked"):
+        canonical_status = "mega_blocked"
+        status_detail = "repair_blocked"
     source = _source_from_task_board(board, board_meta)
     project = (
         _normalize_project_key(proposal_action_context.get("project"))
@@ -789,7 +797,7 @@ def _board_work_item(
         "updated_at": latest_updated,
         "source": proposal_source if isinstance(proposal_source, dict) else source,
         "decision": decision,
-        "execution": _execution_from_board(board=board, board_meta=board_meta, tasks=tasks, runs=runs),
+        "execution": execution,
         "runs": runs,
         "artifacts": proposal_action_context.get("artifacts") if proposal_action_context else _artifacts_from_task_and_board({}, board_meta),
         "source_excerpts": proposal_action_context.get("source_excerpts") if proposal_action_context else [],
