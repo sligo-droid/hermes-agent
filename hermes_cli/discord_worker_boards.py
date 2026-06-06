@@ -66,6 +66,7 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 DEFAULT_REVIEW_LOOP_LIMIT = 5
 FOREMAN_REVIEW_LOOP_LIMIT = 3
+BOARD_RUN_SUMMARY_SCHEMA_VERSION = 2
 PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL = "after_review_approval"
 MERGE_POLICY_AUTO = "auto"
 MERGE_POLICY_MANUAL = "manual"
@@ -1199,6 +1200,17 @@ def _public_board_snapshot_for_board(board: str) -> dict[str, Any]:
     public_url = public_session_board_url(session_id)
     if public_url:
         public_worker["public_url"] = public_url
+    board_summary = read_board_run_summary(board)
+    if not board_summary:
+        try:
+            state = board_thread_state(board)
+        except Exception:
+            state = ""
+        if state in {"done", "blocked", "errored"}:
+            try:
+                board_summary = build_board_run_summary(board)
+            except Exception:
+                board_summary = {}
     return {
         "board": board,
         "name": _worker_board_name(worker, metadata, board),
@@ -1209,7 +1221,7 @@ def _public_board_snapshot_for_board(board: str) -> dict[str, Any]:
         "counts": counts,
         "running": running,
         "runtime": runtime,
-        "board_summary": read_board_run_summary(board),
+        "board_summary": board_summary,
         "tasks": rows,
     }
 
@@ -2546,6 +2558,43 @@ def _run_sort_timestamp(run: Any) -> int:
     )
 
 
+def _normalized_review_verdict_status(value: Any) -> str:
+    status = re.sub(r"[\s-]+", "_", str(value or "").strip().lower())
+    aliases = {
+        "approve": "approved",
+        "approved": "approved",
+        "pass": "approved",
+        "passed": "approved",
+        "ok": "approved",
+        "clean": "approved",
+        "changes_requested": "changes_requested",
+        "change_requested": "changes_requested",
+        "needs_changes": "changes_requested",
+        "needs_revision": "changes_requested",
+        "needs_fix": "changes_requested",
+        "fix_required": "changes_requested",
+        "blocked": "blocked",
+        "rejected": "rejected",
+    }
+    return aliases.get(status, "")
+
+
+def _review_verdict_status_from_metadata(metadata: dict[str, Any]) -> str:
+    for key in ("raw", "parsed"):
+        payload = metadata.get(key)
+        if not isinstance(payload, dict):
+            continue
+        for status_key in ("status", "verdict", "decision"):
+            status = _normalized_review_verdict_status(payload.get(status_key))
+            if status:
+                return status
+    for status_key in ("verdict", "decision", "review_status", "status"):
+        status = _normalized_review_verdict_status(metadata.get(status_key))
+        if status:
+            return status
+    return ""
+
+
 def _final_reviewer_verdict(tasks: list[Any], runs_by_task: dict[str, list[Any]]) -> dict[str, str]:
     reviewer_tasks = [
         task for task in tasks
@@ -2554,8 +2603,7 @@ def _final_reviewer_verdict(tasks: list[Any], runs_by_task: dict[str, list[Any]]
     for task in sorted(reviewer_tasks, key=_task_sort_timestamp, reverse=True):
         for run in sorted(runs_by_task.get(getattr(task, "id", ""), []), key=_run_sort_timestamp, reverse=True):
             metadata = getattr(run, "metadata", None) if isinstance(getattr(run, "metadata", None), dict) else {}
-            raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
-            status = str(raw.get("status") or "").strip().lower()
+            status = _review_verdict_status_from_metadata(metadata)
             if status:
                 return {
                     "status": status,
@@ -2715,15 +2763,21 @@ def _board_runtime_breakdown(
 
 def _pr_summary(worker: dict[str, Any]) -> dict[str, Any]:
     checks_status = str(worker.get("pr_checks_status") or "").strip() or "not checked"
-    merge_state = str(worker.get("pr_merge_state") or "").strip() or "unknown"
+    state = str(worker.get("pr_state") or "").strip() or "unknown"
+    merged_at = str(worker.get("pr_merged_at") or "").strip()
+    merge_commit = str(worker.get("pr_merge_commit") or "").strip()
+    merge_state = str(worker.get("pr_merge_state") or "").strip()
+    if not merge_state and (state.upper() == "MERGED" or merged_at or merge_commit):
+        merge_state = "merged"
+    merge_state = merge_state or "unknown"
     return {
         "url": str(worker.get("pr_url") or "").strip(),
         "number": str(worker.get("pr_number") or "").strip(),
         "error": str(worker.get("pr_error") or "").strip(),
         "status_error": str(worker.get("pr_status_error") or "").strip(),
-        "state": str(worker.get("pr_state") or "").strip() or "unknown",
-        "merged_at": str(worker.get("pr_merged_at") or "").strip(),
-        "merge_commit": str(worker.get("pr_merge_commit") or "").strip(),
+        "state": state,
+        "merged_at": merged_at,
+        "merge_commit": merge_commit,
         "merge_state": merge_state,
         "mergeable": worker.get("pr_mergeable") if worker.get("pr_mergeable") is not None else "unknown",
         "is_draft": worker.get("pr_is_draft") if worker.get("pr_is_draft") is not None else "unknown",
@@ -2767,13 +2821,14 @@ def build_board_run_summary(board: str) -> dict[str, Any]:
     ]
     blocker = _latest_failure_or_blocker(worker, tasks, runs_by_task)
     summary = {
-        "schema_version": 1,
+        "schema_version": BOARD_RUN_SUMMARY_SCHEMA_VERSION,
         "board": board,
         "generated_at": _now(),
         "thread_id": str(worker.get("thread_id") or ""),
         "chat_id": str(worker.get("chat_id") or worker.get("thread_id") or ""),
         "title": _worker_generated_title(worker) or _fallback_feature_title(worker),
         "root_goal": str(worker.get("root_goal") or worker.get("initial_request") or ""),
+        "outcome": _clean_feature_summary_text(worker.get("concise_outcome"), max_chars=420, default=""),
         "goal_status": _clean_summary_value(worker.get("goal_status")),
         "phase": _clean_summary_value(worker.get("phase")),
         "thread_state": board_thread_state(board),
@@ -2862,6 +2917,16 @@ def record_final_discord_response(
         logger.debug("Failed to refresh Discord board run summary for %s", board, exc_info=True)
 
 
+def _is_current_board_run_summary(summary: dict[str, Any], board: str) -> bool:
+    if not isinstance(summary, dict) or summary.get("board") != board:
+        return False
+    try:
+        schema_version = int(summary.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        schema_version = 0
+    return schema_version >= BOARD_RUN_SUMMARY_SCHEMA_VERSION
+
+
 def read_board_run_summary(board: str) -> dict[str, Any]:
     """Return the indexed persisted run summary, if the current run has one."""
     worker = _read_worker_meta(board)
@@ -2869,14 +2934,18 @@ def read_board_run_summary(board: str) -> dict[str, Any]:
     if not indexed_at:
         return {}
     embedded = worker.get("board_summary") if isinstance(worker.get("board_summary"), dict) else {}
-    if embedded and embedded.get("board") == board and embedded.get("generated_at") == indexed_at:
+    if (
+        embedded
+        and embedded.get("generated_at") == indexed_at
+        and _is_current_board_run_summary(embedded, board)
+    ):
         return dict(embedded)
     path = Path(str(worker.get("board_summary_path") or board_run_summary_path(board)))
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return dict(embedded) if embedded else {}
-    if isinstance(loaded, dict) and loaded.get("board") == board:
+        return {}
+    if _is_current_board_run_summary(loaded, board):
         return loaded
     return {}
 
@@ -2901,6 +2970,29 @@ def _format_run_outcomes(run_counts: dict[str, Any]) -> str:
     return ", ".join(bits) or "none"
 
 
+def _review_verdict_display_status(verdict: dict[str, Any]) -> str:
+    status = str(verdict.get("status") or "").strip() or "unknown"
+    if status != "unknown":
+        return status
+    summary = str(verdict.get("summary") or "").strip().lower()
+    if summary.startswith("approved"):
+        return "approved"
+    if summary.startswith("changes requested") or summary.startswith("change requested"):
+        return "changes_requested"
+    if summary:
+        return "recorded"
+    return "unknown"
+
+
+def _review_line(review: dict[str, Any], verdict: dict[str, Any]) -> str:
+    status = _review_verdict_display_status(verdict)
+    line = f"Review: {review.get('loop_count') or 0}/{review.get('loop_limit') or 'unknown'}; final verdict: {status}"
+    note = _clean_feature_summary_text(verdict.get("summary"), max_chars=260, default="")
+    if note:
+        line = f"{line} — {note}"
+    return line
+
+
 def render_board_run_summary_text(summary: dict[str, Any]) -> str:
     """Render deterministic terminal-board facts for Discord and diagnostics."""
     pr = summary.get("pr") if isinstance(summary.get("pr"), dict) else {}
@@ -2917,9 +3009,10 @@ def render_board_run_summary_text(summary: dict[str, Any]) -> str:
         f"PR: {pr_ref}",
         f"PR merge: {merge}; checks: {checks}",
         f"Deployment: {summary.get('deployment_status') or 'not checked'}",
+        *([f"Outcome: {summary.get('outcome')}"] if summary.get("outcome") else []),
         f"Tasks: {_format_summary_counts(summary.get('task_counts') if isinstance(summary.get('task_counts'), dict) else {})}",
         f"Runs: total={(summary.get('run_counts') or {}).get('total', 0) if isinstance(summary.get('run_counts'), dict) else 0}; outcomes: {_format_run_outcomes(summary.get('run_counts') if isinstance(summary.get('run_counts'), dict) else {})}",
-        f"Review: {review.get('loop_count') or 0}/{review.get('loop_limit') or 'unknown'}; final verdict: {verdict.get('status') or 'unknown'}",
+        _review_line(review, verdict),
     ]
     blocker = str(summary.get("blocked_reason") or pr.get("blocker") or "").strip()
     if blocker:
@@ -4703,6 +4796,12 @@ def status_line(board: str) -> str:
     persisted_summary = read_board_run_summary(board)
     if persisted_summary:
         return render_board_run_summary_text(persisted_summary)
+    if worker.get("kind") == "discord_worker_board":
+        try:
+            if board_thread_state(board) in {"done", "blocked", "errored"}:
+                return render_board_run_summary_text(build_board_run_summary(board))
+        except Exception:
+            pass
     conn = kanban_db.connect(board=board)
     try:
         counts = kanban_db.board_stats(conn).get("by_status", {})
