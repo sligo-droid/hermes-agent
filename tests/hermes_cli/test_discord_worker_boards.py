@@ -2270,7 +2270,8 @@ def test_worker_ticket_console_serves_retained_log_when_task_row_missing(monkeyp
     assert "retained worker log line" in data["worker_log_tail"]
     assert "[command completed]" in data["operator_console_text"]
     assert "python -m retained" in data["operator_console_text"]
-    assert "retained command output" in data["operator_console_text"]
+    assert "output: hidden" in data["operator_console_text"]
+    assert "retained command output" not in data["operator_console_text"]
     assert stream["log_path"] == str(log_path)
     assert stream["snapshot"]["task"]["status"] == "log-only"
 
