@@ -45,6 +45,7 @@ _CHURN_RECENT_COMPRESSION_LIMIT = 3
 _CHURN_ZERO_MESSAGE_LIMIT = 2
 _CHURN_LARGE_INPUT_TOKENS = 100_000
 _CHURN_SIMILAR_TOKEN_RATIO = 0.90
+_CHURN_PROGRESS_MESSAGE_LIMIT = 2
 
 
 class CompressionChurnError(RuntimeError):
@@ -321,6 +322,37 @@ def _largest_message_candidate(messages: list) -> dict[str, Any]:
     return candidate
 
 
+def _lineage_row_input_tokens(row: dict[str, Any]) -> int:
+    return int(row.get("input_tokens") or 0)
+
+
+def _lineage_row_message_count(row: dict[str, Any]) -> int:
+    return int(row.get("message_count") or 0)
+
+
+def _lineage_row_has_durable_progress(row: dict[str, Any]) -> bool:
+    # Message rows are the durable transcript progress signal.  Tiny counts can
+    # be synthetic continuation metadata, so require more than a trivial amount.
+    return _lineage_row_message_count(row) > _CHURN_PROGRESS_MESSAGE_LIMIT
+
+
+def _lineage_row_similar_to_current(row: dict[str, Any], current_tokens: int) -> bool:
+    row_tokens = _lineage_row_input_tokens(row)
+    if row_tokens <= 0 or current_tokens <= 0:
+        return False
+    lower = current_tokens * _CHURN_SIMILAR_TOKEN_RATIO
+    upper = current_tokens / _CHURN_SIMILAR_TOKEN_RATIO
+    return lower <= row_tokens <= upper
+
+
+def _lineage_row_no_progress(row: dict[str, Any], *, current_tokens: int) -> bool:
+    return (
+        _lineage_row_message_count(row) == 0
+        or _lineage_row_similar_to_current(row, current_tokens)
+        or not _lineage_row_has_durable_progress(row)
+    )
+
+
 def _compression_churn_details(
     agent: Any,
     messages: list,
@@ -349,12 +381,21 @@ def _compression_churn_details(
 
     current = lineage[0]
     ancestors = lineage[1:]
-    recent_compression_parents = [row for row in ancestors if row.get("end_reason") == "compression"]
+    lineage_token_baseline = int(original_tokens or compressed_tokens or _lineage_row_input_tokens(current) or 0)
+    no_progress_lineage = [
+        row for row in lineage
+        if row.get("parent_session_id")
+        and _lineage_row_no_progress(row, current_tokens=lineage_token_baseline)
+    ]
+    recent_compression_parents = [
+        row for row in ancestors
+        if row.get("end_reason") == "compression"
+        and _lineage_row_no_progress(row, current_tokens=lineage_token_baseline)
+    ]
     zero_message_compression_children = [
         row for row in lineage
-        if int(row.get("message_count") or 0) == 0
+        if _lineage_row_message_count(row) == 0
         and row.get("parent_session_id")
-        and int(row.get("api_call_count") or 0) == 0
     ]
     large_zero_message_children = [
         row for row in zero_message_compression_children
@@ -367,8 +408,7 @@ def _compression_churn_details(
     )
     current_is_empty_child = bool(
         current.get("parent_session_id")
-        and int(current.get("message_count") or 0) == 0
-        and int(current.get("api_call_count") or 0) == 0
+        and _lineage_row_message_count(current) == 0
     )
 
     reasons: list[str] = []
@@ -393,6 +433,7 @@ def _compression_churn_details(
         "recent_window_seconds": _CHURN_WINDOW_SECONDS,
         "recent_session_count": len(lineage),
         "recent_compression_parent_count": len(recent_compression_parents),
+        "no_progress_lineage_count": len(no_progress_lineage),
         "zero_message_child_count": len(zero_message_compression_children),
         "large_zero_message_child_count": len(large_zero_message_children),
         "original_tokens": int(original_tokens or 0),
@@ -621,7 +662,7 @@ def compress_context(
     if not force:
         _churn_details = _compression_churn_details(
             agent,
-            compressed,
+            messages,
             original_tokens=approx_tokens,
             compressed_tokens=_compressed_est,
         )
