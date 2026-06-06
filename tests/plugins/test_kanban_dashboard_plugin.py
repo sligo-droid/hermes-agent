@@ -465,6 +465,86 @@ def test_board_pause_resume_and_archive_stops_live_generic_board(client):
         conn.close()
 
 
+def _write_discord_worker_metadata(board: str, worker: dict[str, object]) -> None:
+    from hermes_cli import discord_worker_boards as dwb
+
+    meta = kb.write_board_metadata(board, name=board.replace("-", " ").title())
+    meta.pop("db_path", None)
+    meta[dwb.DISCORD_WORKER_META_KEY] = {
+        "kind": "discord_worker_board",
+        "thread_id": board,
+        "source_message_id": board,
+        **worker,
+    }
+    kb.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+
+
+def test_archive_completed_discord_worker_waits_for_terminal_reaction_sync(client, monkeypatch):
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = "discord-archive-unsynced"
+    _write_discord_worker_metadata(board, {"goal_status": "done", "phase": "complete"})
+    marker_reasons = []
+    monkeypatch.setattr(dwb, "mark_dispatch_dirty", lambda board, reason: marker_reasons.append((board, reason)))
+
+    archived = client.delete(f"/api/plugins/kanban/boards/{board}")
+
+    assert archived.status_code == 409, archived.text
+    assert kb.board_dir(board).exists()
+    worker = kb.read_board_metadata(board)[dwb.DISCORD_WORKER_META_KEY]
+    assert worker["goal_status"] == "done"
+    assert worker["phase"] == "complete"
+    assert worker.get("cancelled") is not True
+    assert marker_reasons == [(board, "archive-waiting-for-terminal-reaction-sync")]
+
+
+def test_archive_synced_completed_discord_worker_does_not_cancel(client, monkeypatch):
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = "discord-archive-synced"
+    _write_discord_worker_metadata(board, {"goal_status": "done", "phase": "complete"})
+    dwb.mark_thread_status_synced(board, reaction=True)
+    monkeypatch.setattr(
+        dwb,
+        "stop_board_execution",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("completed board should not be stopped")),
+    )
+
+    archived = client.delete(f"/api/plugins/kanban/boards/{board}")
+
+    assert archived.status_code == 200, archived.text
+    assert archived.json()["result"]["action"] == "archived"
+    archived_path = Path(archived.json()["result"]["new_path"])
+    worker = json.loads((archived_path / "board.json").read_text(encoding="utf-8"))[dwb.DISCORD_WORKER_META_KEY]
+    assert worker["goal_status"] == "done"
+    assert worker["phase"] == "complete"
+    assert worker.get("cancelled") is not True
+
+
+def test_archive_nonterminal_discord_worker_stops_then_waits_for_reaction_sync(client, monkeypatch):
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = "discord-archive-running"
+    _write_discord_worker_metadata(board, {"goal_status": "active", "phase": "dev"})
+    marker_reasons = []
+    monkeypatch.setattr(dwb, "mark_dispatch_dirty", lambda board, reason: marker_reasons.append((board, reason)))
+
+    archived = client.delete(f"/api/plugins/kanban/boards/{board}")
+
+    assert archived.status_code == 409, archived.text
+    assert kb.board_dir(board).exists()
+    worker = kb.read_board_metadata(board)[dwb.DISCORD_WORKER_META_KEY]
+    assert worker["goal_status"] == "cancelled"
+    assert worker["phase"] == "cancelled"
+    assert worker["cancelled"] is True
+    assert worker["terminal_reaction_sync_pending"] is True
+    assert marker_reasons == [
+        (board, "terminal-summary-metadata-updated"),
+        (board, "archived-from-command-center"),
+        (board, "archive-waiting-for-terminal-reaction-sync"),
+    ]
+
+
 def test_discord_worker_board_resume_replays_blocked_tickets(client):
     from hermes_cli import discord_worker_boards as dwb
 
