@@ -12,7 +12,7 @@ The Command Center uses one read-only ledger model:
 
 This keeps self-improvement and Discord as intake/provenance, not competing boards. Worker boards remain the execution monitor and ticket detail surface.
 
-Project tabs at the top of the Command Center scope this same ledger by project. The tabs are populated from project metadata in the snapshot, not hard-coded per view. Current projects are Hermes (`#dev`) and PID. Filtering by project keeps Sources as intake, Work Items as the status ledger, and worker boards/Kanban task runs as child execution artifacts.
+Project scoping controls select this same ledger by project. The controls are populated from project metadata in the snapshot, not hard-coded per view. Current projects are Hermes (`#dev`) and PID. Filtering by project keeps Sources as intake, Work Items as the status ledger, and worker boards/Kanban task runs as child execution artifacts.
 
 This code change only adds project/read-model support. Live Hermes recommendation cron jobs still need their `self_improvement_proposal.project` and `self_improvement_proposal.prong` fields updated by the operator/parent agent; the Command Center code does not mutate live cron jobs.
 
@@ -23,10 +23,15 @@ Canonical Sligo-host routes:
 - `/sligo` — overview
 - `/sligo/inbox` — proposals, parse failures, and blocked items needing operator attention
 - `/sligo/work` — accepted/queued/running/review/blocked work items
+- `/sligo/rejected` — rejected/declined intake when included in the current Work State lane
+- `/sligo/archive` — archived/historical work items and board rollups
+- `/workers` and `/workers/<board>` — existing worker board execution pages
+
+Compatibility/diagnostic routes may still render through the same page, but they should not become a second primary navigation model:
+
 - `/sligo/runs` — worker execution attempts across boards
 - `/sligo/recommendations` — self-improvement recommendations as a source-filtered work view
 - `/sligo/sources` — source audit/provenance view
-- `/workers` and `/workers/<board>` — existing worker board execution pages
 
 Compatibility aliases:
 
@@ -80,6 +85,17 @@ Important invariants:
 `web/src/pages/CommandCenterPage.tsx` renders all Command Center views. The old page modules are compatibility wrappers that export this page so stale imports cannot resurrect the previous UI.
 
 The Sligo shell in `web/src/App.tsx` provides the focused internal navigation for `sligo.sligolabs.com`. The combined/local dashboard can still surface Command Center links, but Hermes-host Sligo routes redirect to the Sligo host.
+
+## UX Contract
+
+Current UX intention is tracked in `docs/project-state.md`; update that file when the target changes. The durable contract here is:
+
+1. **Work State is the primary work navigation.** Overview, Inbox, Active/Work, Rejected when present, and Archive are states of the same Work Item ledger. Do not reintroduce separate primary tabs for recommendations, sources, runs, metrics, or status distributions.
+2. **Project scoping is not a competing status model.** Hermes/PID project controls may filter the same ledger, but they should not create duplicate screens with different semantics.
+3. **Rows are Work Items or board-level rollups.** Proposed recommendations, intake/decision items, and named worker boards can render as rows. Individual Kanban tasks/tickets and accepted downstream proposal cards should stay inside board/detail surfaces unless they are promoted to canonical Work Items.
+4. **Worker links are execution artifacts.** Show a Worker link only after execution starts; point it directly to the board URL; never use bare `/workers` as a per-item destination.
+5. **Archive is historical, not a live-board filter.** Archived board rows can be listed from `boards/_archived/`, but they should not expose live-board actions or look like active execution.
+6. **UI chrome stays quiet.** Use one shell header/refresh area, one Work State lane, a left work list, and a right detail/audit pane. Avoid duplicate refresh rows, KPI cards, status bars, and stale `Operator Surface` copy.
 
 ## Feature Requests Without Worker Boards
 
