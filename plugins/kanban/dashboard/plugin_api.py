@@ -807,6 +807,10 @@ def _discord_worker_board_status(worker: dict[str, Any]) -> str:
     return phase
 
 
+def _discord_worker_board_is_terminal(worker: dict[str, Any]) -> bool:
+    return _discord_worker_board_status(worker) in {"done", "blocked", "cancelled"}
+
+
 def _pause_generic_task(conn: sqlite3.Connection, task_id: str, *, reason: str) -> bool:
     task = kanban_db.get_task(conn, task_id)
     if task is None or task.status in {"done", "archived"}:
@@ -2875,7 +2879,21 @@ def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete
             if worker:
                 from hermes_cli import discord_worker_boards as dwb
 
-                dwb.stop_board_execution(normed, reason="archived-from-command-center")
+                terminal_before_archive = _discord_worker_board_is_terminal(worker)
+                if terminal_before_archive and dwb.board_has_unsynced_terminal_reaction(normed):
+                    dwb.mark_dispatch_dirty(board=normed, reason="archive-waiting-for-terminal-reaction-sync")
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Discord worker terminal reaction has not synced yet; retry archive after sync",
+                    )
+                if not terminal_before_archive:
+                    dwb.stop_board_execution(normed, reason="archived-from-command-center")
+                    if dwb.board_has_unsynced_terminal_reaction(normed):
+                        dwb.mark_dispatch_dirty(board=normed, reason="archive-waiting-for-terminal-reaction-sync")
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Discord worker terminal reaction has not synced yet; retry archive after sync",
+                        )
             else:
                 _stop_generic_board_for_archive(normed, reason="archived-from-command-center")
         res = kanban_db.remove_board(slug, archive=not delete)

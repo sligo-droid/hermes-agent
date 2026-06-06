@@ -3288,6 +3288,9 @@ class GatewayRunner:
         except Exception:
             pass
 
+    def _refresh_active_agent_runtime_status(self) -> None:
+        self._update_runtime_status("draining" if getattr(self, "_draining", False) else "running")
+
     def _update_platform_runtime_status(
         self,
         platform: str,
@@ -4417,6 +4420,24 @@ class GatewayRunner:
             event.message_id = str(item.get("message_id"))
             if getattr(event.source, "message_id", None) is None:
                 event.source.message_id = event.message_id
+
+    def _discord_work_item_id_for_event(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> Optional[str]:
+        work_item_id = getattr(event, "work_item_id", None)
+        if work_item_id or getattr(event.source, "platform", None) != Platform.DISCORD:
+            return str(work_item_id) if work_item_id else None
+        try:
+            work_id = self._ledger().id_for_event(event, session_key)
+            item = self._ledger().get(str(work_id)) if work_id else None
+        except Exception:
+            return None
+        if not isinstance(item, dict):
+            return None
+        self._hydrate_discord_resume_event_from_work_item(event, item)
+        return str(item.get("id") or work_id or "") or None
 
     def _schedule_resume_pending_sessions(self) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
@@ -7990,10 +8011,27 @@ class GatewayRunner:
                         targets = []
                         reaction_targets = []
                     else:
-                        targets, reaction_targets = await asyncio.gather(
+                        collected = await asyncio.gather(
                             asyncio.to_thread(running_discord_thread_typing_targets),
                             asyncio.to_thread(thread_status_targets),
+                            return_exceptions=True,
                         )
+                        targets = []
+                        reaction_targets = []
+                        if isinstance(collected[0], Exception):
+                            logger.debug(
+                                "discord kanban typing: target collection failed",
+                                exc_info=(type(collected[0]), collected[0], collected[0].__traceback__),
+                            )
+                        else:
+                            targets = collected[0]
+                        if isinstance(collected[1], Exception):
+                            logger.debug(
+                                "discord kanban status: target collection failed",
+                                exc_info=(type(collected[1]), collected[1], collected[1].__traceback__),
+                            )
+                        else:
+                            reaction_targets = collected[1]
                     if callable(sender):
                         for target in targets:
                             thread_id = str(target.get("thread_id") or "").strip()
@@ -8337,6 +8375,34 @@ class GatewayRunner:
             )
 
             timeout = self._restart_drain_timeout
+
+            def _cron_tick_active() -> bool:
+                try:
+                    from cron.scheduler import is_tick_running
+                    return bool(is_tick_running())
+                except Exception as _e:
+                    logger.debug("Cron tick running check failed during shutdown: %s", _e)
+                    return False
+
+            if self._restart_requested and _cron_tick_active():
+                _cron_wait_started_at = time.monotonic()
+                logger.info(
+                    "Gateway restart requested while a cron tick is active; waiting up to %.1fs for cron to finish.",
+                    timeout,
+                )
+                while _cron_tick_active() and (time.monotonic() - _cron_wait_started_at) < timeout:
+                    self._update_runtime_status("draining")
+                    await asyncio.sleep(1.0)
+                if _cron_tick_active():
+                    logger.warning(
+                        "Gateway restart proceeding after %.1fs with cron tick still active.",
+                        time.monotonic() - _cron_wait_started_at,
+                    )
+                else:
+                    logger.info(
+                        "Gateway restart cron wait completed at +%.2fs.",
+                        _phase_elapsed(),
+                    )
 
             _drain_started_at = time.monotonic()
             active_agents, timed_out = await self._drain_active_agents(timeout)
@@ -10310,6 +10376,7 @@ class GatewayRunner:
         # same session — corrupting the transcript.
         self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
         self._running_agents_ts[_quick_key] = time.time()
+        self._refresh_active_agent_runtime_status()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
@@ -11381,7 +11448,7 @@ class GatewayRunner:
             await self.hooks.emit("agent:start", hook_ctx)
 
             # Run the agent
-            work_item_id = getattr(event, "work_item_id", None)
+            work_item_id = self._discord_work_item_id_for_event(event, session_key)
             if work_item_id and source.platform == Platform.DISCORD:
                 try:
                     self._ledger().mark_agent_running(
@@ -11541,7 +11608,7 @@ class GatewayRunner:
             if _footer_line and response and not agent_result.get("already_sent"):
                 response = f"{response}\n\n{_footer_line}"
 
-            work_item_id = getattr(event, "work_item_id", None)
+            work_item_id = self._discord_work_item_id_for_event(event, session_key)
             if work_item_id and source.platform == Platform.DISCORD:
                 try:
                     title = None
@@ -14375,15 +14442,17 @@ class GatewayRunner:
         final_response: str,
         agent_result: Optional[Dict[str, Any]],
     ) -> None:
-        feature_summary = getattr(event, "feature_summary", None)
-        project_summary = getattr(event, "project_summary", None)
-        if source.platform != Platform.DISCORD or (not feature_summary and not project_summary):
+        if source.platform != Platform.DISCORD:
             return
         adapter = self.adapters.get(Platform.DISCORD)
         if not adapter or not hasattr(adapter, "register_post_delivery_callback"):
             return
         status = self._discord_summary_status(agent_result)
-        work_item_id = getattr(event, "work_item_id", None)
+        work_item_id = self._discord_work_item_id_for_event(event, session_key)
+        feature_summary = getattr(event, "feature_summary", None)
+        project_summary = getattr(event, "project_summary", None)
+        if not feature_summary and not project_summary:
+            return
         status = self._discord_ledger_summary_status(work_item_id, status)
 
         async def _deliver():
@@ -18688,10 +18757,13 @@ class GatewayRunner:
             session_key, run_generation
         ):
             return False
+        had_running_agent = session_key in self._running_agents
         self._running_agents.pop(session_key, None)
         self._running_agents_ts.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
+        if had_running_agent:
+            self._refresh_active_agent_runtime_status()
         return True
 
     def _clear_session_boundary_security_state(self, session_key: str) -> None:

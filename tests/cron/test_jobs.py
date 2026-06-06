@@ -14,10 +14,14 @@ from cron.jobs import (
     get_job,
     list_jobs,
     update_job,
+    trigger_job,
     pause_job,
     resume_job,
     remove_job,
     mark_job_run,
+    mark_manual_run_finished,
+    mark_manual_run_started,
+    reconcile_manual_runs,
     advance_next_run,
     get_due_jobs,
     save_job_output,
@@ -991,3 +995,62 @@ class TestSaveJobOutput:
         with pytest.raises(ValueError, match="output path"):
             save_job_output(str(tmp_cron_dir / "outside"), "# Results")
         assert not (tmp_cron_dir / "outside").exists()
+
+
+class TestManualRunMetadata:
+    def test_trigger_job_persists_manual_run_metadata(self, tmp_cron_dir):
+        job = create_job(prompt="run now", schedule="every 1h", deliver="local")
+
+        triggered = trigger_job(job["id"])
+
+        assert triggered is not None
+        manual = triggered["manual_run"]
+        assert manual["run_id"]
+        assert manual["state"] == "queued"
+        assert manual["requested_at"] == triggered["next_run_at"]
+        assert manual["pid"] is None
+        assert manual["output_path"] is None
+
+    def test_manual_run_lifecycle_marks_running_and_finished(self, tmp_cron_dir):
+        job = create_job(prompt="run now", schedule="every 1h", deliver="local")
+        triggered = trigger_job(job["id"])
+        run_id = triggered["manual_run"]["run_id"]
+
+        mark_manual_run_started(job["id"], run_id, 12345)
+        running = get_job(job["id"])["manual_run"]
+        assert running["state"] == "running"
+        assert running["pid"] == 12345
+
+        mark_manual_run_finished(job["id"], run_id, success=True, output_path="/tmp/out.md")
+        finished = get_job(job["id"])["manual_run"]
+        assert finished["state"] == "completed"
+        assert finished["pid"] is None
+        assert finished["output_path"] == "/tmp/out.md"
+        assert finished["error"] is None
+
+    def test_reconcile_manual_runs_preserves_live_pid(self, tmp_cron_dir):
+        job = create_job(prompt="run now", schedule="every 1h", deliver="local")
+        triggered = trigger_job(job["id"])
+        run_id = triggered["manual_run"]["run_id"]
+        mark_manual_run_started(job["id"], run_id, 12345)
+
+        repaired = reconcile_manual_runs(pid_exists=lambda pid: pid == 12345)
+
+        assert repaired == 0
+        manual = get_job(job["id"])["manual_run"]
+        assert manual["state"] == "running"
+        assert manual["pid"] == 12345
+
+    def test_reconcile_manual_runs_marks_missing_run_interrupted(self, tmp_cron_dir):
+        job = create_job(prompt="run now", schedule="every 1h", deliver="local")
+        triggered = trigger_job(job["id"])
+        run_id = triggered["manual_run"]["run_id"]
+        mark_manual_run_started(job["id"], run_id, 12345)
+
+        repaired = reconcile_manual_runs(pid_exists=lambda _pid: False)
+
+        assert repaired == 1
+        manual = get_job(job["id"])["manual_run"]
+        assert manual["state"] == "interrupted"
+        assert manual["pid"] is None
+        assert "interrupted" in manual["error"]

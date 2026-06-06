@@ -40,6 +40,7 @@ import os
 import socket as _socket
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -665,6 +666,8 @@ try:
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
     )
+    from cron.jobs import reconcile_manual_runs as _cron_reconcile_manual_runs
+    from cron.scheduler import tick as _cron_tick
     _CRON_AVAILABLE = True
 except ImportError:
     _cron_list = None
@@ -675,6 +678,8 @@ except ImportError:
     _cron_pause = None
     _cron_resume = None
     _cron_trigger = None
+    _cron_reconcile_manual_runs = None
+    _cron_tick = None
 
 
 class APIServerAdapter(BasePlatformAdapter):
@@ -3272,6 +3277,13 @@ class APIServerAdapter(BasePlatformAdapter):
             job = _cron_trigger(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
+            if _cron_tick is not None:
+                threading.Thread(
+                    target=_cron_tick,
+                    kwargs={"verbose": False},
+                    name=f"cron-manual-run-{job_id}",
+                    daemon=False,
+                ).start()
             return web.json_response({"job": job})
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
@@ -4086,6 +4098,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
+            if _cron_reconcile_manual_runs is not None:
+                _cron_reconcile_manual_runs()
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             assert self._app is not None

@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from contextlib import contextmanager
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -43,6 +44,24 @@ from hermes_cli.config import load_config, _expand_env_vars
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+_tick_state_lock = threading.Lock()
+_active_tick_count = 0
+
+
+def is_tick_running() -> bool:
+    """Return true while this process is executing a scheduler tick."""
+    with _tick_state_lock:
+        return _active_tick_count > 0
+
+
+def _set_tick_running(running: bool) -> None:
+    global _active_tick_count
+    with _tick_state_lock:
+        if running:
+            _active_tick_count += 1
+        else:
+            _active_tick_count = max(0, _active_tick_count - 1)
 
 
 _GITHUB_PR_URL_RE = re.compile(
@@ -226,7 +245,14 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import (
+    advance_next_run,
+    get_due_jobs,
+    mark_job_run,
+    mark_manual_run_finished,
+    mark_manual_run_started,
+    save_job_output,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -2207,6 +2233,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             lock_fd.close()
         return 0
 
+    _set_tick_running(True)
     try:
         due_jobs = get_due_jobs()
 
@@ -2251,10 +2278,22 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark."""
+            manual_run = job.get("manual_run") if isinstance(job.get("manual_run"), dict) else None
+            manual_run_id = manual_run.get("run_id") if manual_run and manual_run.get("state") == "queued" else None
+            if manual_run_id:
+                mark_manual_run_started(job["id"], manual_run_id, os.getpid())
             try:
                 success, output, final_response, error = run_job(job)
 
                 output_file = save_job_output(job["id"], output)
+                if manual_run_id:
+                    mark_manual_run_finished(
+                        job["id"],
+                        manual_run_id,
+                        success=success,
+                        output_path=str(output_file),
+                        error=error,
+                    )
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
                 _ingest_self_improvement_proposal_output(job, output, Path(output_file), final_response)
@@ -2297,6 +2336,13 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
             except Exception as e:
                 logger.error("Error processing job %s: %s", job['id'], e)
+                if manual_run_id:
+                    mark_manual_run_finished(
+                        job["id"],
+                        manual_run_id,
+                        success=False,
+                        error=str(e),
+                    )
                 mark_job_run(job["id"], False, str(e))
                 return False
 
@@ -2350,6 +2396,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
         return sum(_results)
     finally:
+        _set_tick_running(False)
         if fcntl:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)

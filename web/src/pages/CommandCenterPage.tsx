@@ -333,7 +333,7 @@ function ActionButton({
     pause: { label: "Pause", icon: PauseCircle, className: "border-orange-200/70 bg-orange-400 text-orange-950 hover:bg-orange-300 focus-visible:ring-orange-100/75", strong: true },
     replay: { label: "Replay", icon: RefreshCw, className: "border-emerald-200/70 bg-emerald-400 text-emerald-950 hover:bg-emerald-300 focus-visible:ring-emerald-100/75", strong: true },
     repair: { label: "Repair", icon: Wrench, className: "border-amber-200/70 bg-amber-300 text-amber-950 hover:bg-amber-200 focus-visible:ring-amber-100/75", strong: true },
-    undo: { label: "Revert", icon: RotateCcw, className: "border-sky-200/65 bg-sky-400 text-sky-950 hover:bg-sky-300 focus-visible:ring-sky-100/75" },
+    undo: { label: "Revert", icon: RotateCcw, className: "border-red-200/75 bg-red-500 text-white hover:bg-red-400 focus-visible:ring-red-100/75", strong: true },
     archive: { label: "Archive", icon: Archive, className: "border-violet-200/60 bg-violet-400 text-violet-950 hover:bg-violet-300 focus-visible:ring-violet-100/75" },
   }[kind];
   const Icon = config.icon;

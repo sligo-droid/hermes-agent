@@ -437,6 +437,15 @@ class GatewayWorkLedger:
             return False
         item["status"] = "agent_running"
         item["updated_at"] = self._now()
+        for key in (
+            "agent_done_at",
+            "completion_gate",
+            "final_response",
+            "result_message_id",
+            "summary_status",
+            "summary_updated_at",
+        ):
+            item.pop(key, None)
         if session_id:
             item["session_id"] = str(session_id)
         self._write(data)

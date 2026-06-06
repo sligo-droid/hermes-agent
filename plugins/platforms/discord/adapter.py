@@ -1902,6 +1902,16 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("[%s] Failed to read Discord kanban board state: %s", self.name, exc)
             return None
 
+    def _kanban_target_reaction_state(self, target: Dict[str, Any]) -> Optional[str]:
+        state = str(target.get("state") or "").strip() or None
+        reaction_state = str(target.get("reaction_state") or "").strip() or None
+        if reaction_state == "foreman":
+            return reaction_state
+        if state in {"done", "blocked", "errored"}:
+            return state
+        source_state = self._feature_source_task_reaction_state(target)
+        return source_state or reaction_state or state
+
     def _feature_kanban_summary_snapshot(
         self,
         handle: Optional[Dict[str, Any]],
@@ -1972,11 +1982,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 if str(candidate.get("thread_id") or "").strip() != thread_id:
                     continue
                 saw_target = True
-                candidate_state = self._feature_source_task_reaction_state(candidate)
-                if candidate_state is None:
-                    candidate_state = str(
-                        candidate.get("reaction_state") or candidate.get("state") or ""
-                    ).strip() or None
+                candidate_state = self._kanban_target_reaction_state(candidate)
                 if candidate_state in {"active", "running", "blocked", "errored", "foreman"}:
                     return candidate_state
             return None if not saw_target else "done"
@@ -2014,10 +2020,7 @@ class DiscordAdapter(BasePlatformAdapter):
             for candidate in thread_status_targets():
                 if str(candidate.get("thread_id") or "").strip() != thread_id:
                     continue
-                state = self._feature_source_task_reaction_state(candidate)
-                if state is None:
-                    state = str(candidate.get("reaction_state") or candidate.get("state") or "").strip() or None
-                states.append(state)
+                states.append(self._kanban_target_reaction_state(candidate))
             return self._aggregate_thread_reaction_state(states, fallback)
         except Exception as exc:
             logger.debug("[%s] Failed to aggregate Discord thread reaction state: %s", self.name, exc)
@@ -3906,9 +3909,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def sync_kanban_thread_reaction(self, target: Dict[str, Any]) -> Optional[str]:
         """Synchronize a Discord worker thread's origin-message reaction."""
-        state = self._feature_source_task_reaction_state(target)
-        if state is None:
-            state = str(target.get("reaction_state") or target.get("state") or "").strip() or None
+        state = self._kanban_target_reaction_state(target)
         if state is None:
             slug = str(target.get("board") or "").strip()
             if slug:
@@ -7085,6 +7086,20 @@ class DiscordAdapter(BasePlatformAdapter):
             raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
         return self._discord_channel_id_set(raw)
 
+    def _discord_channel_cwd_root_channel_ids(self) -> set[str]:
+        """Return root channels configured through ``discord.channel_cwds``.
+
+        ``channel_cwds`` channels are valid Discord entrypoints even when they
+        are not present in the persisted project-mapping DB yet.  Root-channel
+        missed-mention recovery must watch them too, otherwise mentions posted
+        during a gateway restart can be skipped before the normal on_message
+        path has a chance to record a recovery watermark.
+        """
+        raw = self.config.extra.get("channel_cwds")
+        if not isinstance(raw, dict):
+            return set()
+        return {str(channel_id).strip() for channel_id in raw if str(channel_id).strip()}
+
     def _discord_project_mapping_root_channel_ids(self) -> set[str]:
         """Return root project channels known to Hermes' Discord project map.
 
@@ -7129,6 +7144,7 @@ class DiscordAdapter(BasePlatformAdapter):
         allowed = self._discord_allowed_channel_ids()
         if allowed and "*" not in allowed:
             ids.update(allowed)
+        ids.update(self._discord_channel_cwd_root_channel_ids())
         ids.update(self._discord_project_mapping_root_channel_ids())
         ids.update(ch for ch in self._discord_free_response_channels() if ch != "*")
         ids.update(ch for ch in self._discord_feature_request_channels() if ch != "*")

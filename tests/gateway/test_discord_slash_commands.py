@@ -1074,6 +1074,19 @@ def test_relevant_root_channels_include_persisted_recovery_state(adapter):
     assert adapter._discord_relevant_root_channel_ids() == ["1504252294495998043"]
 
 
+def test_relevant_root_channels_include_channel_cwds(adapter):
+    adapter.config.extra["channel_cwds"] = {"1504252294495998043": "/home/droid/hermes"}
+    adapter._discord_allowed_channel_ids = MagicMock(return_value=set())
+    adapter._discord_project_mapping_root_channel_ids = MagicMock(return_value=set())
+    adapter._discord_free_response_channels = MagicMock(return_value=set())
+    adapter._discord_feature_request_channels = MagicMock(return_value=set())
+    adapter._discord_no_thread_channel_ids = MagicMock(return_value=set())
+    adapter._discord_ignored_channel_ids = MagicMock(return_value=set())
+    adapter._read_discord_root_mention_recovery_state = MagicMock(return_value={"channels": {}})
+
+    assert adapter._discord_relevant_root_channel_ids() == ["1504252294495998043"]
+
+
 def test_record_root_channel_seen_message_records_unconfigured_bot_mention(adapter):
     channel = _FakeTextChannel(channel_id=1504252294495998043)
     message = _fake_message(channel, content="<@99999> please help", author_id=123)
