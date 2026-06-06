@@ -4200,6 +4200,7 @@ def _read_worker_console_state(path: Path) -> dict[str, Any]:
 _WORKER_CONSOLE_COMMAND_MAX_CHARS = 2000
 _WORKER_CONSOLE_TEXT_MAX_CHARS = 4000
 _WORKER_CONSOLE_OUTPUT_MAX_CHARS = 8000
+_WORKER_CONSOLE_ERROR_SNIPPET_MAX_CHARS = 1200
 
 
 def _worker_console_redact(value: Any, *, max_chars: int = _WORKER_CONSOLE_TEXT_MAX_CHARS) -> str:
@@ -4309,6 +4310,58 @@ def _worker_console_event_output(item: dict[str, Any]) -> str:
     return ""
 
 
+def _worker_console_output_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return str(value)
+    return "" if value is None else str(value)
+
+
+def _worker_console_output_stats(value: Any) -> tuple[str, int, int]:
+    text = _worker_console_output_text(value).replace("\r\n", "\n").replace("\r", "\n")
+    if not text:
+        return "", 0, 0
+    lines = len(text.splitlines()) or 1
+    return text, lines, len(text.encode("utf-8", errors="replace"))
+
+
+def _worker_console_output_stats_label(lines: int, bytes_count: int) -> str:
+    line_label = "line" if lines == 1 else "lines"
+    byte_label = "byte" if bytes_count == 1 else "bytes"
+    return f"{lines} {line_label}, {bytes_count} {byte_label}"
+
+
+def _worker_console_entry_failed(source: dict[str, Any]) -> bool:
+    for key in ("exit_code", "exitCode"):
+        value = source.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return int(value) != 0
+        except Exception:
+            return str(value).strip() not in {"0", "success", "completed"}
+    if source.get("error") not in (None, ""):
+        return True
+    status = str(source.get("status") or source.get("state") or "").strip().lower()
+    return any(marker in status for marker in ("fail", "error", "cancel", "timeout"))
+
+
+def _worker_console_append_output_signal(lines: list[str], source: dict[str, Any], value: Any, *, label: str) -> None:
+    text, line_count, byte_count = _worker_console_output_stats(value)
+    if not text:
+        return
+    stats = _worker_console_output_stats_label(line_count, byte_count)
+    if _worker_console_entry_failed(source):
+        lines.append(f"{label} snippet ({stats}):")
+        lines.append(_worker_console_redact(text, max_chars=_WORKER_CONSOLE_ERROR_SNIPPET_MAX_CHARS))
+        return
+    lines.append(f"{label}: hidden ({stats}; successful stdout/stderr omitted)")
+
+
 def _worker_console_status_bits(source: dict[str, Any], *keys: str) -> list[str]:
     bits: list[str] = []
     for key in keys:
@@ -4338,8 +4391,7 @@ def _format_worker_console_tool_trace_entry(entry: Any) -> str:
             lines.append("; ".join(bits))
         output = entry.get("output") or entry.get("aggregatedOutput") or entry.get("result") or entry.get("error")
         if output:
-            lines.append("output:")
-            lines.append(_worker_console_redact(output, max_chars=_WORKER_CONSOLE_OUTPUT_MAX_CHARS))
+            _worker_console_append_output_signal(lines, entry, output, label="output")
         return "\n".join(lines).rstrip() + "\n"
     name = _worker_console_scalar(entry.get("name") or entry.get("server") or tool, max_chars=240)
     lines = [f"[tool {status}] {tool}" + (f" {name}" if name and name != tool else "")]
@@ -4348,8 +4400,7 @@ def _format_worker_console_tool_trace_entry(entry: Any) -> str:
         lines.append("; ".join(bits))
     output = entry.get("output") or entry.get("result") or entry.get("error")
     if output:
-        lines.append("result:")
-        lines.append(_worker_console_redact(output, max_chars=_WORKER_CONSOLE_OUTPUT_MAX_CHARS))
+        _worker_console_append_output_signal(lines, entry, output, label="result")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -4376,6 +4427,10 @@ def _format_worker_console_event(event: Any) -> str:
         trace_like = dict(item)
         trace_like.setdefault("tool", "commandExecution")
         trace_like.setdefault("status", status)
+        if "exit_code" not in trace_like and item.get("exitCode") is not None:
+            trace_like["exit_code"] = item.get("exitCode")
+        if "duration_ms" not in trace_like and item.get("durationMs") is not None:
+            trace_like["duration_ms"] = item.get("durationMs")
         return _format_worker_console_tool_trace_entry(trace_like)
     if "toolcall" in lower or "tool" in lower:
         name = item.get("name") or item.get("tool") or item.get("server") or item_type or method
@@ -4386,8 +4441,7 @@ def _format_worker_console_event(event: Any) -> str:
             lines.append("; ".join(bits))
         output = _worker_console_event_output(item)
         if output:
-            lines.append("result:")
-            lines.append(_worker_console_redact(output, max_chars=_WORKER_CONSOLE_OUTPUT_MAX_CHARS))
+            _worker_console_append_output_signal(lines, item, output, label="result")
         return "\n".join(lines).rstrip() + "\n"
     if "file" in lower:
         path = item.get("path") or item.get("file") or item.get("filename")
