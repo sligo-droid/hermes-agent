@@ -1272,6 +1272,7 @@ def test_terminal_summary_infers_merged_pr_and_recovered_reviewer_status(monkeyp
             "pr_url": "https://github.com/acme/hermes/pull/42",
             "pr_number": "42",
             "pr_state": "MERGED",
+            "pr_merge_state": "UNKNOWN",
             "pr_merged_at": "2026-06-01T17:35:13Z",
             "pr_merge_commit": "abc123",
             "pr_checks_status": "success",
@@ -1283,8 +1284,10 @@ def test_terminal_summary_infers_merged_pr_and_recovered_reviewer_status(monkeyp
 
     assert summary["schema_version"] == dwb.BOARD_RUN_SUMMARY_SCHEMA_VERSION
     assert summary["pr"]["merge_state"] == "merged"
+    assert summary["deployment_status"] == "done"
     assert summary["review"]["final_verdict"]["status"] == "approved"
     assert "PR merge: merged; checks: success" in text
+    assert "Deployment: done" in text
     assert "Outcome: Done. PR #42 merged after recovered reviewer approval." in text
     assert "Review: 1/5; final verdict: approved — Approved. Recovered sidecar result" in text
 
