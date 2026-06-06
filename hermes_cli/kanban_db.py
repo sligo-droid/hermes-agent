@@ -1211,10 +1211,18 @@ class KanbanDbCorruptError(RuntimeError):
     original path and the timestamped backup we made before refusing.
     """
 
-    def __init__(self, db_path: Path, backup_path: Optional[Path], reason: str):
+    def __init__(
+        self,
+        db_path: Path,
+        backup_path: Optional[Path],
+        reason: str,
+        *,
+        incident: Optional[dict[str, Any]] = None,
+    ):
         self.db_path = db_path
         self.backup_path = backup_path
         self.reason = reason
+        self.incident = incident
         backup_str = str(backup_path) if backup_path is not None else "<backup failed>"
         super().__init__(
             f"Refusing to open corrupt kanban DB at {db_path}: {reason}. "
@@ -1222,7 +1230,41 @@ class KanbanDbCorruptError(RuntimeError):
         )
 
 
-def _backup_corrupt_db(path: Path) -> Optional[Path]:
+def _db_content_fingerprint(path: Path) -> Optional[str]:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _read_db_sidecars(path: Path) -> dict[str, bytes]:
+    sidecars: dict[str, bytes] = {}
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return sidecars
+    parent = resolved.parent
+    for suffix in ("-wal", "-shm"):
+        sidecar = parent / (resolved.name + suffix)
+        if sidecar.parent != parent or not sidecar.exists():
+            continue
+        try:
+            sidecars[suffix] = sidecar.read_bytes()
+        except OSError:
+            continue
+    return sidecars
+
+
+def _backup_corrupt_db(
+    path: Path,
+    fingerprint: Optional[str] = None,
+    *,
+    sidecar_bytes: Optional[dict[str, bytes]] = None,
+) -> Optional[Path]:
     """Copy a corrupt DB (and its WAL/SHM sidecars) to a content-addressed backup.
 
     The backup filename is deterministic in the main DB's sha256, so repeated
@@ -1245,14 +1287,10 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     resolved = path.resolve()
     parent = resolved.parent
     base_name = resolved.name  # basename only
-    digest = hashlib.sha256()
-    try:
-        with resolved.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except OSError:
+    fingerprint = fingerprint or _db_content_fingerprint(resolved)
+    if not fingerprint:
         return None
-    token = digest.hexdigest()[:16]
+    token = fingerprint[:16]
     candidate = parent / f"{base_name}.corrupt.{token}.bak"
     # Defensive: candidate must still be inside parent after construction.
     if candidate.parent != parent:
@@ -1262,21 +1300,262 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
             shutil.copy2(resolved, candidate)
         except OSError:
             return None
+    sidecar_bytes = sidecar_bytes or {}
     for suffix in ("-wal", "-shm"):
         sidecar = parent / (base_name + suffix)
-        if sidecar.parent != parent or not sidecar.exists():
+        if sidecar.parent != parent or (not sidecar.exists() and suffix not in sidecar_bytes):
             continue
         sidecar_backup = parent / (candidate.name + suffix)
         if sidecar_backup.parent != parent or sidecar_backup.exists():
             continue
         try:
-            shutil.copy2(sidecar, sidecar_backup)
+            if suffix in sidecar_bytes:
+                sidecar_backup.write_bytes(sidecar_bytes[suffix])
+            else:
+                shutil.copy2(sidecar, sidecar_backup)
         except OSError:
             pass
     return candidate
 
 
-def _guard_existing_db_is_healthy(path: Path) -> None:
+def _board_for_db_path(path: Path, board: Optional[str]) -> Optional[str]:
+    if board is not None:
+        return _normalize_board_slug(board) or DEFAULT_BOARD
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return None
+    for slug in (get_current_board(), DEFAULT_BOARD):
+        try:
+            if kanban_db_path(slug).resolve() == resolved:
+                return slug
+        except OSError:
+            continue
+    try:
+        root = boards_root().resolve()
+        rel = resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    if len(rel.parts) >= 2 and rel.parts[1] == "kanban.db":
+        try:
+            return _normalize_board_slug(rel.parts[0])
+        except ValueError:
+            return None
+    return None
+
+
+def _write_board_metadata_raw(board: str, meta: dict[str, Any]) -> dict[str, Any]:
+    path = board_metadata_path(board)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    to_write = dict(meta)
+    to_write.pop("db_path", None)
+    path.write_text(
+        json.dumps(to_write, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    to_write["db_path"] = str(kanban_db_path(board))
+    return to_write
+
+
+def record_corrupt_board_incident(
+    board: Optional[str],
+    db_path: Path,
+    reason: str,
+    *,
+    backup_path: Optional[Path] = None,
+    fingerprint: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Persist a board-scoped corruption pause readable without opening SQLite."""
+    slug = _board_for_db_path(db_path, board)
+    if not slug:
+        return None
+    try:
+        resolved = db_path.resolve()
+    except OSError:
+        resolved = db_path
+    fingerprint = fingerprint or _db_content_fingerprint(resolved)
+    now = int(time.time())
+    meta = read_board_metadata(slug)
+    previous = meta.get("corruption_incident")
+    first_seen = now
+    if isinstance(previous, dict) and previous.get("fingerprint") == fingerprint:
+        first_seen = int(previous.get("first_seen") or now)
+        backup_path = backup_path or (
+            Path(str(previous["quarantine_path"]))
+            if previous.get("quarantine_path") else None
+        )
+    incident = {
+        "status": "paused",
+        "repair_status": "not_attempted",
+        "pause_reason": "kanban_db_corruption",
+        "db_path": str(resolved),
+        "fingerprint": fingerprint,
+        "quarantine_path": str(backup_path) if backup_path is not None else None,
+        "reason": str(reason),
+        "first_seen": first_seen,
+        "last_seen": now,
+    }
+    meta["paused"] = True
+    meta["pause_reason"] = "kanban_db_corruption"
+    meta["corruption_incident"] = incident
+    _write_board_metadata_raw(slug, meta)
+    return incident
+
+
+def is_board_paused_for_corruption(board: Optional[str] = None) -> Optional[dict[str, Any]]:
+    meta = read_board_metadata(board)
+    incident = meta.get("corruption_incident")
+    if meta.get("paused") is True and isinstance(incident, dict):
+        if incident.get("pause_reason") == "kanban_db_corruption":
+            return incident
+    return None
+
+
+def clear_corrupt_board_incident(
+    board: Optional[str] = None,
+    *,
+    fingerprint: Optional[str] = None,
+) -> bool:
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    meta = read_board_metadata(slug)
+    incident = meta.get("corruption_incident")
+    if not isinstance(incident, dict):
+        return False
+    if fingerprint is not None and incident.get("fingerprint") != fingerprint:
+        return False
+    meta.pop("corruption_incident", None)
+    if meta.get("pause_reason") == "kanban_db_corruption":
+        meta.pop("pause_reason", None)
+    if meta.get("paused") is True:
+        meta["paused"] = False
+    _write_board_metadata_raw(slug, meta)
+    return True
+
+
+def _integrity_check_db(path: Path) -> str:
+    conn = _sqlite_connect(path)
+    try:
+        row = conn.execute("PRAGMA integrity_check").fetchone()
+    finally:
+        conn.close()
+    return str(row[0] if row else "<no row>")
+
+
+def _is_index_only_integrity_failure(message: str) -> bool:
+    text = message.lower()
+    if not text or text == "ok":
+        return False
+    index_markers = (
+        "missing from index",
+        "row not in index",
+        "wrong # of entries in index",
+        "non-unique entry in index",
+    )
+    data_markers = (
+        "malformed",
+        "database disk image is malformed",
+        "btree",
+        "page ",
+        "freelist",
+        "overflow",
+    )
+    return any(marker in text for marker in index_markers) and not any(
+        marker in text for marker in data_markers
+    )
+
+
+def _known_good_backup_candidates(path: Path) -> list[Path]:
+    parent = path.resolve().parent
+    names = [
+        f"{path.name}.known-good.*.bak",
+        f"{path.name}.backup.*.bak",
+        f"{path.name}.good.*.bak",
+    ]
+    candidates: list[Path] = []
+    for pattern in names:
+        candidates.extend(p for p in parent.glob(pattern) if p.is_file())
+    return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def repair_corrupt_board(board: Optional[str] = None) -> dict[str, Any]:
+    """Attempt conservative self-heal for a paused corrupt board."""
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    incident = is_board_paused_for_corruption(slug)
+    path = kanban_db_path(slug)
+    fingerprint = _db_content_fingerprint(path)
+    result: dict[str, Any] = {
+        "board": slug,
+        "db_path": str(path.resolve()),
+        "status": "failed",
+        "action": None,
+        "reason": None,
+        "incident": incident,
+    }
+    if incident and incident.get("fingerprint") and fingerprint != incident.get("fingerprint"):
+        result["reason"] = "db fingerprint changed since incident was recorded"
+        return result
+    try:
+        check = _integrity_check_db(path)
+    except sqlite3.OperationalError as exc:
+        result["reason"] = f"sqlite operational error: {exc}"
+        return result
+    except sqlite3.DatabaseError as exc:
+        check = f"sqlite refused to open file: {exc}"
+    if check.lower() == "ok":
+        clear_corrupt_board_incident(slug, fingerprint=fingerprint)
+        result.update({"status": "repaired", "action": "already_valid", "reason": "integrity_check ok"})
+        return result
+    if _is_index_only_integrity_failure(check):
+        try:
+            conn = _sqlite_connect(path)
+            try:
+                conn.execute("REINDEX")
+                conn.commit()
+                after = conn.execute("PRAGMA integrity_check").fetchone()
+            finally:
+                conn.close()
+            after_check = str(after[0] if after else "<no row>")
+        except sqlite3.DatabaseError as exc:
+            after_check = f"REINDEX failed: {exc}"
+        if after_check.lower() == "ok":
+            clear_corrupt_board_incident(slug, fingerprint=fingerprint)
+            result.update({"status": "repaired", "action": "reindex", "reason": "integrity_check ok after REINDEX"})
+            return result
+        result["reason"] = after_check
+        return result
+    for candidate in _known_good_backup_candidates(path):
+        try:
+            if _integrity_check_db(candidate).lower() != "ok":
+                continue
+        except sqlite3.DatabaseError:
+            continue
+        before = _backup_corrupt_db(path, fingerprint=fingerprint)
+        try:
+            shutil.copy2(candidate, path)
+        except OSError as exc:
+            result["reason"] = f"restore failed: {exc}"
+            return result
+        try:
+            restored_check = _integrity_check_db(path)
+        except sqlite3.DatabaseError as exc:
+            restored_check = str(exc)
+        if restored_check.lower() == "ok":
+            clear_corrupt_board_incident(slug, fingerprint=fingerprint)
+            result.update({
+                "status": "repaired",
+                "action": "restore_known_good_backup",
+                "reason": "integrity_check ok after restore",
+                "backup_path": str(candidate),
+                "pre_restore_quarantine_path": str(before) if before else None,
+            })
+            return result
+        result["reason"] = f"restored backup failed integrity_check: {restored_check}"
+        return result
+    result["reason"] = check
+    return result
+
+
+def _guard_existing_db_is_healthy(path: Path, *, board: Optional[str] = None) -> None:
     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
 
     Opens the probe in read/write mode so SQLite can recover or
@@ -1314,15 +1593,12 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         return
     if str(resolved) in _INITIALIZED_PATHS:
         return
+    sidecar_bytes = _read_db_sidecars(resolved)
     reason: Optional[str] = None
     try:
-        probe = _sqlite_connect(resolved)
-        try:
-            row = probe.execute("PRAGMA integrity_check").fetchone()
-        finally:
-            probe.close()
-        if not row or (row[0] or "").lower() != "ok":
-            reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
+        check = _integrity_check_db(resolved)
+        if check.lower() != "ok":
+            reason = f"integrity_check returned {check!r}"
     except sqlite3.OperationalError:
         # Lock contention, busy, transient IO — not corruption. Let it propagate.
         raise
@@ -1330,8 +1606,16 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
         return
-    backup = _backup_corrupt_db(resolved)
-    raise KanbanDbCorruptError(resolved, backup, reason)
+    fingerprint = _db_content_fingerprint(resolved)
+    backup = _backup_corrupt_db(resolved, fingerprint=fingerprint, sidecar_bytes=sidecar_bytes)
+    incident = record_corrupt_board_incident(
+        board,
+        resolved,
+        reason,
+        backup_path=backup,
+        fingerprint=fingerprint,
+    )
+    raise KanbanDbCorruptError(resolved, backup, reason, incident=incident)
 
 
 def connect(
@@ -1369,7 +1653,7 @@ def connect(
         # Full integrity probe — catches corruption past the header (malformed
         # pages, broken internal metadata). Cached per-path after first success
         # via _INITIALIZED_PATHS so it only runs once per process per path.
-        _guard_existing_db_is_healthy(path)
+        _guard_existing_db_is_healthy(path, board=board)
         resolved = str(path.resolve())
         conn = _sqlite_connect(path)
         try:
@@ -1761,7 +2045,7 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, max_runtime_seconds INTEGER,"
+        " worker_pid INTEGER, worker_unit TEXT, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
