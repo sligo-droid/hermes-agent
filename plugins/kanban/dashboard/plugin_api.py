@@ -748,6 +748,21 @@ def _discord_worker_meta(board: str | None) -> dict[str, Any]:
     return worker
 
 
+def _dashboard_worker_workspace(board_meta: dict[str, Any] | None, *candidates: Any) -> dict[str, str | None]:
+    """Return safe workspace args for dashboard-created worker tasks."""
+    meta = board_meta if isinstance(board_meta, dict) else {}
+    worker = meta.get(DISCORD_WORKER_META_KEY)
+    paths: list[Any] = []
+    if isinstance(worker, dict):
+        paths.extend([worker.get("worktree_path"), worker.get("project_path")])
+    paths.extend([meta.get("default_workdir"), meta.get("project_path"), *candidates])
+    for value in paths:
+        path = str(value or "").strip()
+        if path and Path(path).expanduser().is_absolute():
+            return {"workspace_kind": "dir", "workspace_path": path}
+    return {"workspace_kind": "scratch", "workspace_path": None}
+
+
 def _discord_worker_board_status(worker: dict[str, Any]) -> str:
     status = str(worker.get("goal_status") or "").strip().lower()
     phase = str(worker.get("phase") or "").strip().lower()
@@ -1712,6 +1727,13 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
         task_id = task.id
     else:
         board = _resolve_board(str(task_payload.get("board") or "") or None)
+        workspace = _dashboard_worker_workspace(
+            kanban_db.read_board_metadata(board),
+            task_payload.get("workspace_path"),
+            task_payload.get("project_path"),
+            card.get("workspace_path"),
+            card.get("project_path"),
+        )
         conn = _conn(board=board)
         try:
             task_id = kanban_db.create_task(
@@ -1720,7 +1742,8 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
                 body=_proposal_task_body(card),
                 assignee=str(task_payload.get("assignee") or "dev"),
                 created_by="self-improvement",
-                workspace_kind="dir",
+                workspace_kind=workspace["workspace_kind"],
+                workspace_path=workspace["workspace_path"],
                 tenant=str(task_payload.get("tenant") or card.get("project") or "self-improvement"),
                 priority=_proposal_priority(card.get("priority")),
                 idempotency_key=idempotency_key,
@@ -1905,6 +1928,12 @@ def self_improvement_proposal_undo_followup_endpoint(proposal_id: str, payload: 
         if task.status != "done":
             raise HTTPException(status_code=409, detail="downstream task is not fully implemented")
         idempotency_key = f"self-improvement:{proposal_id}:undo-followup"
+        workspace = _dashboard_worker_workspace(
+            kanban_db.read_board_metadata(board),
+            task.workspace_path,
+            card.get("workspace_path"),
+            card.get("project_path"),
+        )
         followup_id = kanban_db.create_task(
             conn,
             title=f"Review undo path for: {card.get('title') or proposal_id}",
@@ -1919,7 +1948,8 @@ def self_improvement_proposal_undo_followup_endpoint(proposal_id: str, payload: 
             ),
             assignee="dev",
             created_by="self-improvement",
-            workspace_kind="dir",
+            workspace_kind=workspace["workspace_kind"],
+            workspace_path=workspace["workspace_path"],
             tenant=str(card.get("project") or "self-improvement"),
             priority=2,
             idempotency_key=idempotency_key,
@@ -2743,6 +2773,7 @@ def repair_board(slug: str, payload: BoardRepairBody | None = None):
             task_id = task.id
         else:
             create_key = _repair_attempt_idempotency_key(conn, idempotency_key)
+            workspace = _dashboard_worker_workspace(board_meta)
             task_id = kanban_db.create_task(
                 conn,
                 title=f"Repair blocked board: {payload.title or board_meta.get('name') or normed}",
@@ -2755,7 +2786,8 @@ def repair_board(slug: str, payload: BoardRepairBody | None = None):
                 ),
                 assignee=ROLE_FOREMAN,
                 created_by=command_center.COMMAND_CENTER_REPAIR_CREATED_BY,
-                workspace_kind="dir",
+                workspace_kind=workspace["workspace_kind"],
+                workspace_path=workspace["workspace_path"],
                 tenant=str(board_meta.get("project") or board_meta.get("tenant") or normed),
                 priority=command_center.COMMAND_CENTER_REPAIR_PRIORITY,
                 idempotency_key=create_key,
