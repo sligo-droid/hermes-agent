@@ -2178,6 +2178,53 @@ def test_worker_ticket_console_returns_operator_state_and_log_paths(monkeypatch,
     assert stream["snapshot"]["task"]["id"] == task.id
 
 
+def test_worker_ticket_console_serves_retained_log_when_task_row_missing(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    board = dwb.set_goal(thread_id="8187", goal="Inspect retained operator console")
+    missing_task_id = "t_missing42"
+    log_path = kanban_db.worker_log_path(missing_task_id, board=board.slug)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    kanban_db._append_worker_log_line(log_path, "retained worker log line")
+    dwb.record_codex_worker_event(
+        missing_task_id,
+        board=board.slug,
+        event={
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "commandExecution",
+                    "command": "python -m retained",
+                    "status": "completed",
+                    "exit_code": 0,
+                    "aggregatedOutput": "retained command output",
+                }
+            },
+        },
+    )
+
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    resp = client.get(f"/api/workers/8187/tickets/{missing_task_id}/console")
+    stream = dwb.worker_ticket_console_log_for_session("8187", missing_task_id)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["task"]["id"] == missing_task_id
+    assert data["task"]["status"] == "log-only"
+    assert data["log_only"] is True
+    assert "retained worker log line" in data["worker_log_tail"]
+    assert "[command completed]" in data["operator_console_text"]
+    assert "python -m retained" in data["operator_console_text"]
+    assert "retained command output" in data["operator_console_text"]
+    assert stream["log_path"] == str(log_path)
+    assert stream["snapshot"]["task"]["status"] == "log-only"
+
+
 def test_worker_ticket_terminal_labels_opencode_state(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from fastapi.testclient import TestClient
