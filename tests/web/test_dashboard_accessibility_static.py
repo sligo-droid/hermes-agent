@@ -114,6 +114,7 @@ def test_command_center_proposal_archive_action_uses_halt_flow():
 
 def test_command_center_completed_lane_is_separate_and_paginated():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    completed_branch = source.split('activeView === "completed"', 1)[1].split('activeView === "archive"', 1)[0]
 
     assert 'type ViewKey = "overview" | "inbox" | "work" | "completed" | "archive"' in source
     assert 'type PaginatedViewKey = "overview" | "inbox" | "work" | "completed" | "archive";' in source
@@ -127,6 +128,21 @@ def test_command_center_completed_lane_is_separate_and_paginated():
     assert 'activeView === "completed"' in source
     assert 'setPage("completed", page)' in source
     assert '<PaginationControls label="completed"' in source
+    assert 'showActions={false}' not in completed_branch
+    assert 'items={pagedCompletedItems}' in completed_branch
+
+
+def test_command_center_completed_lane_preserves_revert_and_archive_buttons():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    action_source = source.split("function availableActionKinds", 1)[1].split("function actionSet", 1)[0]
+    completed_branch = source.split('activeView === "completed"', 1)[1].split('activeView === "archive"', 1)[0]
+
+    assert 'const canUndo = Boolean(proposalId && item.decision?.undo_followup_action && isCompletedItem(item));' in action_source
+    assert 'actions.push("undo")' in action_source
+    assert 'actions.push("archive")' in action_source
+    assert action_source.index('actions.push("undo")') < action_source.index('actions.push("archive")')
+    assert 'showActions={false}' not in completed_branch
+    assert 'showActions={false}' in source.split('activeView === "archive"', 1)[1]
 
 
 def test_command_center_archive_action_renders_last_in_row_rail():
