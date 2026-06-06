@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 from agent.transports.codex_app_server_session import CodexAppServerSession
@@ -139,6 +140,13 @@ def main() -> int:
             workspace=workspace,
         ):
             return 0
+        if _recover_recorded_role_output_fresh(
+            task_id,
+            role,
+            board=board,
+            workspace=workspace,
+        ):
+            return 0
         reason = f"{_backend_label(role, task)} worker failed: {exc}"
         try:
             blocked = kanban_db.block_task(conn, task_id, reason=reason)
@@ -255,6 +263,84 @@ def _recover_completed_role_output_fresh(
             fresh_conn.close()
         except Exception:
             pass
+
+
+def _recover_recorded_role_output_fresh(
+    task_id: str,
+    role: str,
+    *,
+    board: Optional[str],
+    workspace: str,
+) -> bool:
+    """Recover a role result that was persisted before an exception escaped.
+
+    OpenCode/Codex result sidecars are written before the Kanban terminal
+    transition. If an exception occurs between those two points, ``main()`` may
+    enter its handler before the local ``result`` variable is assigned. The
+    sidecar is then the only durable source of the valid worker JSON.
+    """
+    try:
+        from hermes_cli.discord_worker_state import read_codex_worker_state
+
+        state = read_codex_worker_state(task_id, board=board)
+    except Exception:
+        return False
+    result_data = state.get("result") if isinstance(state, dict) else None
+    if not isinstance(result_data, dict):
+        return False
+    if result_data.get("error"):
+        return False
+    final_text = str(result_data.get("final_text") or "").strip()
+    if not final_text:
+        return False
+    if not _recorded_result_is_fresh_for_current_run(task_id, board=board, state=state):
+        return False
+    return _recover_completed_role_output_fresh(
+        task_id,
+        role,
+        SimpleNamespace(final_text=final_text, error=None),
+        board=board,
+        workspace=workspace,
+    )
+
+
+def _recorded_result_is_fresh_for_current_run(
+    task_id: str,
+    *,
+    board: Optional[str],
+    state: dict[str, Any],
+) -> bool:
+    try:
+        updated_at = int(state.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        updated_at = 0
+    try:
+        conn = kanban_db.connect(board=board)
+    except Exception:
+        return False
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            return False
+        if task.status in {"done", "blocked", "scheduled", "archived"}:
+            return True
+        if task.status not in {"running", "ready"}:
+            return False
+        if not task.current_run_id:
+            return True
+        row = conn.execute(
+            "SELECT started_at FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(task.current_run_id), task_id),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            started_at = int(row["started_at"] or 0)
+        except (TypeError, ValueError):
+            started_at = 0
+        return bool(updated_at and started_at and updated_at >= started_at)
+    finally:
+        conn.close()
 
 
 def _build_prompt(conn: Any, task_id: str, role: str) -> str:
