@@ -1987,6 +1987,7 @@ DEFAULT_CONFIG = {
             "roles": {
                 "planner": {"reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
                 "dev": {"reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 3600},
+                "foreman": {"reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
                 "reviewer": {"reasoning": "auto", "service_tier": "auto", "max_runtime_seconds": 1800},
             },
         },

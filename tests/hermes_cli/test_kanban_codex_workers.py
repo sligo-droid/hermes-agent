@@ -914,6 +914,7 @@ def test_role_extra_args_default_reasoning_by_role(monkeypatch):
 
     assert worker._role_extra_args("planner")[1] == 'model_reasoning_effort="xhigh"'
     assert worker._role_extra_args("reviewer")[1] == 'model_reasoning_effort="xhigh"'
+    assert worker._role_extra_args("foreman")[1] == 'model_reasoning_effort="xhigh"'
     assert worker._role_extra_args("dev")[1] == 'model_reasoning_effort="medium"'
 
 
@@ -2007,6 +2008,111 @@ def test_worker_prompt_mentions_discord_read_helper(monkeypatch, tmp_path):
     assert "python -m hermes_cli.discord_worker_read fetch-messages" in prompt
     assert "python -m hermes_cli.discord_worker_read update-board" not in prompt
     assert "python -m hermes_cli.discord_worker_read discord-request" not in prompt
+
+
+def test_foreman_role_prompt_and_guards_allow_repair_mutation(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_FOREMAN
+
+    board = "foreman-repair-board"
+    kanban_db.create_board(board, name="Foreman Repair Board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Repair blocked board",
+            body="Recover blocked worker-board tickets.",
+            assignee=ROLE_FOREMAN,
+            created_by="command-center-repair",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        prompt = worker._build_prompt(conn, task_id, ROLE_FOREMAN)
+    finally:
+        conn.close()
+
+    assert "You are the Discord Kanban foreman worker" in prompt
+    assert "safely mutate Kanban board/task state" in prompt
+    assert "mark dispatch dirty" in prompt
+    assert "retry, unblock, close, reassign" in prompt
+    assert "Use Discord worker read/control broker access only when necessary" in prompt
+    assert "not subject to the planner/dev/reviewer read-only" in prompt
+    assert "Do not create code-change PRs" in prompt
+    assert "Keep secrets" in prompt
+    assert "Do not call mutation helpers" not in prompt
+    assert worker._role_pr_mutation_guard_env(ROLE_FOREMAN) == ({}, None)
+    assert worker._role_read_only_discord_env(ROLE_FOREMAN) == {}
+
+
+def test_foreman_runtime_defaults_to_xhigh_normal():
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_codex_workers as workers
+    from hermes_cli.discord_worker_boards import ROLE_FOREMAN
+
+    os.environ.pop("HERMES_CODEX_WORKER_REASONING", None)
+    os.environ.pop("HERMES_CODEX_WORKER_SERVICE_TIER", None)
+    settings = workers._role_runtime_settings(ROLE_FOREMAN, {}, None)
+
+    assert settings["reasoning"] == "xhigh"
+    assert settings["service_tier"] == "normal"
+    assert worker._worker_reasoning_effort(ROLE_FOREMAN) == "xhigh"
+
+
+def test_foreman_completed_output_completes_repair_task_without_dev_checkpoint(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_FOREMAN
+
+    board = "foreman-output-board"
+    kanban_db.create_board(board, name="Foreman Output Board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Repair blocked board",
+            assignee=ROLE_FOREMAN,
+            created_by="command-center-repair",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+        checkpoint_calls: list[tuple[str, str, str]] = []
+        monkeypatch.setattr(worker, "_checkpoint_commit", lambda workspace, task_id, summary: checkpoint_calls.append((workspace, task_id, summary)))
+        payload = {
+            "status": "completed",
+            "summary": "Recovered board.",
+            "actions": ["unblocked t1", "marked dispatch dirty"],
+            "verification": ["dispatch picked t1"],
+            "changed_tasks": [{"id": "t1", "action": "unblock", "status": "ready"}],
+        }
+
+        worker._apply_role_output(
+            conn,
+            task_id,
+            ROLE_FOREMAN,
+            payload,
+            board=board,
+            workspace=str(tmp_path),
+            expected_run_id=claimed.current_run_id,
+        )
+        task = kanban_db.get_task(conn, task_id)
+        run = kanban_db.latest_run(conn, task_id)
+    finally:
+        conn.close()
+
+    assert checkpoint_calls == []
+    assert task is not None
+    assert task.status == "done"
+    assert run is not None
+    assert run.outcome == "completed"
+    assert run.metadata["raw"] == payload
+    assert run.metadata["actions"] == payload["actions"]
+    assert run.metadata["verification"] == payload["verification"]
+    assert run.metadata["changed_tasks"] == payload["changed_tasks"]
 
 
 def test_run_codex_records_app_server_state(monkeypatch, tmp_path):

@@ -14,7 +14,8 @@ REVIEW_LOOP_CONTINUE_EXTRA_LOOPS = 5
 ROLE_PLANNER = "planner"
 ROLE_DEV = "dev"
 ROLE_REVIEWER = "reviewer"
-ROLE_ASSIGNEES = frozenset({ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER})
+ROLE_FOREMAN = "foreman"
+ROLE_ASSIGNEES = frozenset({ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER, ROLE_FOREMAN})
 DEV_TICKET_BODY_GUIDANCE = (
     "Each dev ticket body must be a detailed, self-contained implementation brief "
     "that opens with Goal, Success means, and Stop when, followed by Scope, "

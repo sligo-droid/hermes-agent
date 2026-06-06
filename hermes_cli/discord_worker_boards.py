@@ -41,6 +41,7 @@ from hermes_cli.discord_worker_roles import (
     REVIEW_LOOP_LIMIT_BLOCKED_REASON,
     ROLE_ASSIGNEES,
     ROLE_DEV,
+    ROLE_FOREMAN,
     ROLE_PLANNER,
     ROLE_REVIEWER,
     TERMINAL_GOAL_STATUSES,

@@ -102,6 +102,23 @@ def test_command_center_archive_action_renders_last_in_row_rail():
     assert "kind={kind}" in row_rail
 
 
+def test_command_center_repair_action_wiring_and_footer_removed():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    api_source = (ROOT / "web/src/lib/api.ts").read_text(encoding="utf-8")
+    action_source = source.split("function availableActionKinds", 1)[1].split("function actionSet", 1)[0]
+
+    assert "Wrench" in source
+    assert 'repair: "Repairing"' in source
+    assert 'repair: { label: "Repair", icon: Wrench' in source
+    assert 'actions.push("repair")' in action_source
+    assert 'api.repairKanbanBoard(board' in source
+    assert 'repair_action?: string | null;' in api_source
+    assert '/boards/${encodeURIComponent(slug)}/repair' in api_source
+    assert "Worker-board work rolls up" not in source
+    assert "snapshot?.summary" not in source
+    assert "Send" not in source
+
+
 def test_command_center_row_actions_lock_during_refresh_settle():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
     card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
