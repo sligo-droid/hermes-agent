@@ -306,6 +306,35 @@ def _check_s6_supervision(issues: list[str]) -> None:
     )
 
 
+def _check_gateway_memory_telemetry() -> None:
+    """Surface gateway vs isolated child RSS without making doctor fail."""
+    try:
+        from gateway.memory_telemetry import (
+            collect_gateway_memory_telemetry,
+            format_gateway_memory_lines,
+        )
+        from hermes_cli.gateway import get_gateway_runtime_snapshot
+    except Exception as exc:
+        check_warn("Gateway memory telemetry", f"(could not import helpers: {exc})")
+        return
+
+    try:
+        snapshot = get_gateway_runtime_snapshot()
+        pids = tuple(pid for pid in snapshot.gateway_pids if pid > 0)
+        if not pids:
+            check_info("Gateway memory telemetry unavailable (gateway not running)")
+            return
+        telemetry = collect_gateway_memory_telemetry(pids)
+        lines = format_gateway_memory_lines(telemetry)
+    except Exception as exc:
+        check_warn("Gateway memory telemetry", f"(could not collect: {exc})")
+        return
+
+    check_ok("Gateway memory telemetry", f"({telemetry.source})")
+    for line in lines:
+        check_info(line)
+
+
 def _check_gateway_service_linger(issues: list[str]) -> None:
     """Warn when a systemd user gateway service will stop after logout.
 
@@ -1091,6 +1120,9 @@ def run_doctor(args):
 
     _check_gateway_service_linger(issues)
     _check_s6_supervision(issues)
+
+    _section("Gateway Memory")
+    _check_gateway_memory_telemetry()
 
     if sys.platform != "win32":
         _section("Command Installation")
