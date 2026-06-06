@@ -102,13 +102,15 @@ def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
     corrupt = home / "kanban.db"
     corrupt.write_bytes(b"SQLit" + bytes.fromhex("17 03 03 00 13") + b"x" * 32)
 
-    with pytest.raises(sqlite3.DatabaseError) as exc_info:
+    with pytest.raises(kb.KanbanDbCorruptError) as exc_info:
         kb.connect(board="default")
 
-    msg = str(exc_info.value)
+    msg = exc_info.value.reason
     assert "file is not a database" in msg
     assert "TLS record header detected at byte offset 5" in msg
     assert "53 51 4c 69 74 17 03 03 00 13" in msg
+    assert exc_info.value.backup_path is not None
+    assert exc_info.value.backup_path.read_bytes() == corrupt.read_bytes()
 
 
 def test_board_metadata_non_utf8_bytes_fall_back_to_synthesized_metadata(kanban_home):
@@ -4227,6 +4229,61 @@ def test_corrupt_board_incident_records_pause_and_reuses_quarantine(kanban_home)
     meta = kb.read_board_metadata(board)
     assert meta["paused"] is True
     assert meta["pause_reason"] == "kanban_db_corruption"
+
+
+def test_invalid_header_board_incident_records_pause_and_reuses_quarantine(kanban_home):
+    board = "invalid-header-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    original = b"not sqlite\x00" * 32
+    db_path.write_bytes(original)
+    (db_path.parent / "kanban.db-wal").write_bytes(b"invalid wal bytes")
+    (db_path.parent / "kanban.db-shm").write_bytes(b"invalid shm bytes")
+
+    paths: set[Path] = set()
+    for _ in range(5):
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+        with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+            kb.connect(board=board)
+        assert "invalid SQLite header" in excinfo.value.reason
+        assert excinfo.value.incident is not None
+        assert excinfo.value.incident["quarantine_path"] is not None
+        paths.add(excinfo.value.backup_path)
+
+    assert len(paths) == 1
+    (backup,) = paths
+    assert backup is not None
+    assert backup.read_bytes() == original
+    assert db_path.read_bytes() == original
+    assert (backup.parent / (backup.name + "-wal")).read_bytes() == b"invalid wal bytes"
+    assert (backup.parent / (backup.name + "-shm")).read_bytes() == b"invalid shm bytes"
+    assert list(db_path.parent.glob("kanban.db.corrupt.*.bak")) == [backup]
+
+    incident = kb.is_board_paused_for_corruption(board)
+    assert incident is not None
+    assert incident["db_path"] == str(db_path.resolve())
+    assert incident["quarantine_path"] == str(backup)
+    assert incident["pause_reason"] == "kanban_db_corruption"
+
+
+def test_init_db_board_refuses_invalid_header_with_board_incident(kanban_home):
+    board = "invalid-init-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    original = b"bad sqlite header"
+    db_path.write_bytes(original)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+        kb.init_db(board=board)
+
+    assert "invalid SQLite header" in excinfo.value.reason
+    assert excinfo.value.backup_path is not None
+    assert excinfo.value.backup_path.read_bytes() == original
+    assert db_path.read_bytes() == original
+    incident = kb.is_board_paused_for_corruption(board)
+    assert incident is not None
+    assert incident["quarantine_path"] == str(excinfo.value.backup_path)
 
 
 def test_repair_corrupt_board_reindex_success_clears_incident(kanban_home, monkeypatch):

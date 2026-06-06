@@ -1175,31 +1175,31 @@ def _looks_like_tls_record_at(data: bytes, offset: int) -> bool:
     )
 
 
-def _validate_sqlite_header(path: Path) -> None:
-    """Fail early with an actionable error for non-SQLite Kanban DB files."""
+def _invalid_sqlite_header_reason(path: Path) -> Optional[str]:
+    """Return an actionable corruption reason for non-SQLite Kanban DB files."""
     try:
         stat = path.stat()
     except FileNotFoundError:
-        return
+        return None
     except OSError:
-        return
+        return None
     if stat.st_size == 0:
-        return
+        return None
     try:
         with path.open("rb") as handle:
             head = handle.read(64)
     except OSError:
-        return
+        return None
     if head.startswith(_SQLITE_HEADER):
-        return
+        return None
     signature = ""
     if head.startswith(b"SQLit") and _looks_like_tls_record_at(head, 5):
         signature = " (TLS record header detected at byte offset 5)"
     elif _looks_like_tls_record_at(head, 0):
         signature = " (TLS record header detected at byte offset 0)"
-    raise sqlite3.DatabaseError(
-        "file is not a database: invalid SQLite header for "
-        f"{path}{signature}; first_32={head[:32].hex(' ')}"
+    return (
+        "sqlite refused to open file: file is not a database: invalid SQLite "
+        f"header for {path}{signature}; first_32={head[:32].hex(' ')}"
     )
 
 
@@ -1441,6 +1441,33 @@ def _integrity_check_db(path: Path) -> str:
     return str(row[0] if row else "<no row>")
 
 
+def _raise_corrupt_existing_db(
+    path: Path,
+    reason: str,
+    *,
+    board: Optional[str] = None,
+    sidecar_bytes: Optional[dict[str, bytes]] = None,
+) -> None:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    fingerprint = _db_content_fingerprint(resolved)
+    backup = _backup_corrupt_db(
+        resolved,
+        fingerprint=fingerprint,
+        sidecar_bytes=sidecar_bytes,
+    )
+    incident = record_corrupt_board_incident(
+        board,
+        resolved,
+        reason,
+        backup_path=backup,
+        fingerprint=fingerprint,
+    )
+    raise KanbanDbCorruptError(resolved, backup, reason, incident=incident)
+
+
 def _is_index_only_integrity_failure(message: str) -> bool:
     text = message.lower()
     if not text or text == "ok":
@@ -1606,16 +1633,7 @@ def _guard_existing_db_is_healthy(path: Path, *, board: Optional[str] = None) ->
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
         return
-    fingerprint = _db_content_fingerprint(resolved)
-    backup = _backup_corrupt_db(resolved, fingerprint=fingerprint, sidecar_bytes=sidecar_bytes)
-    incident = record_corrupt_board_incident(
-        board,
-        resolved,
-        reason,
-        backup_path=backup,
-        fingerprint=fingerprint,
-    )
-    raise KanbanDbCorruptError(resolved, backup, reason, incident=incident)
+    _raise_corrupt_existing_db(resolved, reason, board=board, sidecar_bytes=sidecar_bytes)
 
 
 def connect(
@@ -1649,7 +1667,9 @@ def connect(
     with _cross_process_init_lock(path):
         # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
         # and other invalid-header cases without opening a sqlite connection.
-        _validate_sqlite_header(path)
+        invalid_header_reason = _invalid_sqlite_header_reason(path)
+        if invalid_header_reason is not None:
+            _raise_corrupt_existing_db(path, invalid_header_reason, board=board)
         # Full integrity probe — catches corruption past the header (malformed
         # pages, broken internal metadata). Cached per-path after first success
         # via _INITIALIZED_PATHS so it only runs once per process per path.
@@ -1755,7 +1775,7 @@ def init_db(
     # schema + migration pass unconditionally.
     with _INIT_LOCK:
         _INITIALIZED_PATHS.discard(resolved)
-    with contextlib.closing(connect(path)):
+    with contextlib.closing(connect(path, board=board)):
         pass
     return path
 
