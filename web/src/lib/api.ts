@@ -356,6 +356,11 @@ export const api = {
       `/api/plugins/kanban/boards/${encodeURIComponent(slug)}/resume`,
       { method: "POST" },
     ),
+  replayKanbanBoard: (slug: string) =>
+    fetchJSON<{ result: Record<string, unknown>; board: Record<string, unknown> }>(
+      `/api/plugins/kanban/boards/${encodeURIComponent(slug)}/resume`,
+      { method: "POST" },
+    ),
 
   // Self-improvement proposal board
   getSelfImprovementProposals: () =>

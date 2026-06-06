@@ -4639,10 +4639,50 @@ def pause_board(board: str, *, reason: str = "user-paused") -> None:
         pass
 
 
-def resume_board(board: str) -> None:
+def resume_board(board: str) -> dict[str, Any]:
+    """Replay a Discord worker board by moving blocked tickets back to dispatchable work."""
     worker = _read_worker_meta(board)
-    worker.update({"goal_status": "active", "phase": worker.get("phase_before_pause") or "planning", "paused": False})
+    replayed_task_ids: list[str] = []
+    conn = kanban_db.connect(board=board)
+    try:
+        for task in kanban_db.list_tasks(conn, include_archived=False):
+            if getattr(task, "status", None) not in {"blocked", "scheduled"}:
+                continue
+            before_status = str(getattr(task, "status", "") or "")
+            if kanban_db.move_task_status(
+                conn,
+                task.id,
+                "ready",
+                source="command-center-replay",
+            ):
+                after = kanban_db.get_task(conn, task.id)
+                if after and after.status != before_status:
+                    replayed_task_ids.append(task.id)
+    finally:
+        conn.close()
+    phase = worker.get("phase_before_pause") or worker.get("phase")
+    if not phase or phase in {"paused", "cancelled", "intake"}:
+        phase = "dev"
+    worker.update(
+        {
+            "goal_status": "active",
+            "phase": phase,
+            "paused": False,
+            "paused_reason": _DELETE_META,
+        }
+    )
     _update_worker_meta(board, worker)
+    dispatch_dirty: str | None = None
+    try:
+        dispatch_dirty = str(mark_dispatch_dirty(board=board, reason="command-center-replay"))
+    except Exception:
+        pass
+    return {
+        "board": board,
+        "resumed": True,
+        "replayed_task_ids": replayed_task_ids,
+        "dispatch_dirty": dispatch_dirty,
+    }
 
 
 def start_board(board: str) -> None:
