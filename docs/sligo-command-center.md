@@ -37,6 +37,7 @@ Compatibility aliases:
 
 - `/command-center` renders the Command Center overview.
 - `/self-improvement` renders the recommendations view.
+- Legacy `/sligo/rejected` links redirect to `/sligo/completed`.
 - Hermes-host requests for Sligo-specific routes redirect to `sligo.sligolabs.com` so `hermes.sligolabs.com` can stay focused on the classic native dashboard.
 
 ## Backend Read Model
