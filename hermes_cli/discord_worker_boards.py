@@ -489,6 +489,7 @@ def _clear_terminal_summary_fields(worker: dict[str, Any]) -> None:
         "board_summary_updated_at",
         "terminal_completion_message_pending",
         "terminal_completion_message_sent_at",
+        "terminal_completion_message_id",
         "terminal_summary_message_sent_at",
         "terminal_summary_sync_pending",
         "terminal_reaction_sync_pending",
@@ -3337,7 +3338,13 @@ def mark_thread_status_synced(
     summary: bool = False,
     completion_message: bool = False,
 ) -> None:
-    """Clear one-shot terminal Discord thread sync flags for a board."""
+    """Clear one-shot terminal Discord thread sync flags for a board.
+
+    ``completion_message`` only acknowledges that a pending completion notice no
+    longer needs delivery (stale/unsupported targets). Successful sends should
+    call :func:`mark_thread_completion_notice_sent` so there is durable proof
+    that the user-visible completion message actually went out.
+    """
     if not board or not (reaction or summary or completion_message):
         return
     metadata = kanban_db.read_board_metadata(board)
@@ -3362,6 +3369,35 @@ def mark_thread_status_synced(
     if not changed:
         return
     worker["updated_at"] = _now()
+    metadata[DISCORD_WORKER_META_KEY] = worker
+    metadata.pop("db_path", None)
+    atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
+
+
+def mark_thread_completion_notice_sent(
+    board: str,
+    *,
+    message_id: Optional[str] = None,
+) -> None:
+    """Record durable proof that a terminal completion notice was sent."""
+    if not board:
+        return
+    metadata = kanban_db.read_board_metadata(board)
+    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    if worker.get("kind") != "discord_worker_board":
+        return
+    changed = worker.pop("terminal_completion_message_pending", None) is not None
+    now = _now()
+    if worker.get("terminal_completion_message_sent_at") != now:
+        worker["terminal_completion_message_sent_at"] = now
+        changed = True
+    cleaned_message_id = str(message_id or "").strip()
+    if cleaned_message_id and worker.get("terminal_completion_message_id") != cleaned_message_id:
+        worker["terminal_completion_message_id"] = cleaned_message_id
+        changed = True
+    if not changed:
+        return
+    worker["updated_at"] = now
     metadata[DISCORD_WORKER_META_KEY] = worker
     metadata.pop("db_path", None)
     atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)

@@ -75,6 +75,29 @@ def _resolve_safe_cwd(cwd: str) -> str:
 # Hermes-internal env vars that should NOT leak into terminal subprocesses.
 _HERMES_PROVIDER_ENV_FORCE_PREFIX = "_HERMES_FORCE_"
 
+# Kanban task/board routing vars are process-control state for the agent
+# itself, not ambient shell configuration. If they leak into terminal commands
+# run by a dispatcher-spawned worker, any nested ``hermes``/Python process can
+# accidentally open and write the live board DB instead of its own isolated test
+# or scratch DB. We strip only routing/scope vars here; tunables such as
+# HERMES_KANBAN_BUSY_TIMEOUT_MS remain inheritable.
+_HERMES_KANBAN_CONTROL_ENV_VARS = frozenset({
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_BOARD",
+    "HERMES_KANBAN_HOME",
+    "HERMES_KANBAN_ROOT",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_BRANCH",
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_CLAIM_LOCK",
+})
+
+
+def _is_blocked_hermes_control_env(key: str) -> bool:
+    return key in _HERMES_KANBAN_CONTROL_ENV_VARS
+
 # Hermes-managed AWS *inference* credentials for ``auth_type="aws_sdk"``
 # providers (Bedrock).  Scoped DELIBERATELY NARROW: this lists only the
 # Bedrock-specific bearer token, which is a Hermes inference secret exactly
@@ -226,13 +249,19 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
+        if _is_blocked_hermes_control_env(key):
+            continue
         if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
             sanitized[key] = value
 
     for key, value in (extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
+            if _is_blocked_hermes_control_env(real_key):
+                continue
             sanitized[real_key] = value
+        elif _is_blocked_hermes_control_env(key):
+            continue
         elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
             sanitized[key] = value
 
@@ -325,7 +354,11 @@ def _make_run_env(env: dict) -> dict:
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
+            if _is_blocked_hermes_control_env(real_key):
+                continue
             run_env[real_key] = v
+        elif _is_blocked_hermes_control_env(k):
+            continue
         elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
             run_env[k] = v
     existing_path = run_env.get("PATH", "")

@@ -237,6 +237,38 @@ class TestMakeRunEnvHomeInjection:
         assert "GH_TOKEN" not in result
         assert "GITHUB_TOKEN" not in result
 
+    def test_strips_kanban_routing_env_from_terminal_run_env(self, tmp_path, monkeypatch):
+        """Terminal commands must not inherit a worker's live board DB scope."""
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        control_values = {
+            "HERMES_KANBAN_DB": str(tmp_path / "live" / "kanban.db"),
+            "HERMES_KANBAN_BOARD": "discord-1512698251977949295",
+            "HERMES_KANBAN_HOME": str(tmp_path / "kanban-home"),
+            "HERMES_KANBAN_ROOT": str(tmp_path / "legacy-root"),
+            "HERMES_KANBAN_WORKSPACES_ROOT": str(tmp_path / "workspaces"),
+            "HERMES_KANBAN_WORKSPACE": str(tmp_path / "workspace"),
+            "HERMES_KANBAN_BRANCH": "fix/live-board",
+            "HERMES_KANBAN_TASK": "t_live",
+            "HERMES_KANBAN_RUN_ID": "42",
+            "HERMES_KANBAN_CLAIM_LOCK": "claim-live",
+        }
+        for key, value in control_values.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("HERMES_KANBAN_BUSY_TIMEOUT_MS", "12345")
+        monkeypatch.setenv("_HERMES_FORCE_HERMES_KANBAN_DB", str(tmp_path / "forced" / "kanban.db"))
+        monkeypatch.setenv("_HERMES_FORCE_HERMES_KANBAN_BOARD", "forced-board")
+
+        from tools.environments.local import _make_run_env
+        result = _make_run_env({
+            "HERMES_KANBAN_BOARD": "attempted-extra",
+            "_HERMES_FORCE_HERMES_KANBAN_TASK": "forced-task",
+        })
+
+        for key in control_values:
+            assert key not in result
+        assert result["HERMES_KANBAN_BUSY_TIMEOUT_MS"] == "12345"
+
 
 # ---------------------------------------------------------------------------
 # _sanitize_subprocess_env() injection
@@ -316,6 +348,38 @@ class TestSanitizeSubprocessEnvHomeInjection:
         assert result["GH_CONFIG_DIR"] == str(gh_dir)
         assert "GH_TOKEN" not in result
         assert "GITHUB_TOKEN" not in result
+
+    def test_strips_kanban_routing_env_from_background_env(self, tmp_path, monkeypatch):
+        control_values = {
+            "HERMES_KANBAN_DB": str(tmp_path / "live" / "kanban.db"),
+            "HERMES_KANBAN_BOARD": "discord-1512698251977949295",
+            "HERMES_KANBAN_HOME": str(tmp_path / "kanban-home"),
+            "HERMES_KANBAN_ROOT": str(tmp_path / "legacy-root"),
+            "HERMES_KANBAN_WORKSPACES_ROOT": str(tmp_path / "workspaces"),
+            "HERMES_KANBAN_WORKSPACE": str(tmp_path / "workspace"),
+            "HERMES_KANBAN_BRANCH": "fix/live-board",
+            "HERMES_KANBAN_TASK": "t_live",
+            "HERMES_KANBAN_RUN_ID": "42",
+            "HERMES_KANBAN_CLAIM_LOCK": "claim-live",
+        }
+        base_env = {
+            "PATH": "/usr/bin",
+            "HERMES_KANBAN_BUSY_TIMEOUT_MS": "12345",
+            "_HERMES_FORCE_HERMES_KANBAN_DB": str(tmp_path / "forced" / "kanban.db"),
+            **control_values,
+        }
+        extra_env = {
+            "HERMES_KANBAN_BOARD": "attempted-extra",
+            "_HERMES_FORCE_HERMES_KANBAN_TASK": "forced-task",
+        }
+        monkeypatch.setenv("HERMES_KANBAN_BUSY_TIMEOUT_MS", "12345")
+
+        from tools.environments.local import _sanitize_subprocess_env
+        result = _sanitize_subprocess_env(base_env, extra_env)
+
+        for key in control_values:
+            assert key not in result
+        assert result["HERMES_KANBAN_BUSY_TIMEOUT_MS"] == "12345"
 
 
 # ---------------------------------------------------------------------------

@@ -1269,6 +1269,23 @@ def _read_db_sidecars(path: Path) -> dict[str, bytes]:
     return sidecars
 
 
+def _remove_db_sidecars(path: Path) -> None:
+    """Remove WAL/SHM sidecars that no longer match a replaced main DB."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    parent = resolved.parent
+    for suffix in ("-wal", "-shm"):
+        sidecar = parent / (resolved.name + suffix)
+        if sidecar.parent != parent:
+            continue
+        try:
+            sidecar.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _backup_corrupt_db(
     path: Path,
     fingerprint: Optional[str] = None,
@@ -1325,6 +1342,76 @@ def _backup_corrupt_db(
                 shutil.copy2(sidecar, sidecar_backup)
         except OSError:
             pass
+    return candidate
+
+
+def _record_known_good_backup(
+    path: Path,
+    *,
+    max_backups: int = 5,
+) -> Optional[Path]:
+    """Persist a consistent known-good copy for future corruption repair.
+
+    Corrupt-board repair can be lossy when SQLite cannot read even the schema
+    page. After any successful self-heal, keep a small rolling set of verified
+    SQLite backups so a later catastrophic page overwrite can restore the last
+    healthy state instead of marooning the board.
+    """
+    resolved = path.resolve()
+    if not resolved.exists() or resolved.stat().st_size <= 0:
+        return None
+    parent = resolved.parent
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    candidate = parent / f"{resolved.name}.known-good.{stamp}.bak"
+    if candidate.parent != parent:
+        return None
+    tmp = parent / f"{candidate.name}.tmp"
+    source: sqlite3.Connection | None = None
+    target: sqlite3.Connection | None = None
+    try:
+        tmp.unlink(missing_ok=True)
+        source = _sqlite_connect(resolved)
+        target = _sqlite_connect(tmp)
+        source.backup(target)
+        target.close()
+        target = None
+        source.close()
+        source = None
+        if _integrity_check_db(tmp).lower() != "ok":
+            tmp.unlink(missing_ok=True)
+            return None
+        tmp.replace(candidate)
+    except Exception:
+        _log.debug("failed to record known-good Kanban DB backup for %s", resolved, exc_info=True)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    finally:
+        if source is not None:
+            try:
+                source.close()
+            except Exception:
+                pass
+        if target is not None:
+            try:
+                target.close()
+            except Exception:
+                pass
+    try:
+        backups = sorted(
+            parent.glob(f"{resolved.name}.known-good.*.bak"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in backups[max_backups:]:
+            try:
+                stale.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
     return candidate
 
 
@@ -1501,6 +1588,50 @@ def _is_index_only_integrity_failure(message: str) -> bool:
     )
 
 
+def _try_reindex_existing_db(
+    path: Path,
+    check: str,
+    *,
+    sidecar_bytes: Optional[dict[str, bytes]] = None,
+) -> tuple[bool, Optional[str]]:
+    """Attempt in-place REINDEX for index-only integrity failures.
+
+    SQLite can report pure index drift such as ``row N missing from index`` or
+    ``wrong # of entries in index`` while table pages remain readable. That
+    should not permanently pause a board or strand role-worker outputs: REINDEX
+    is the narrow, SQLite-native repair. Data-page corruption still fails
+    closed through the normal quarantine path.
+    """
+    if not _is_index_only_integrity_failure(check):
+        return False, None
+    _backup_corrupt_db(path, sidecar_bytes=sidecar_bytes)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _sqlite_connect(path)
+        conn.execute("REINDEX")
+        conn.commit()
+    except sqlite3.OperationalError:
+        raise
+    except sqlite3.DatabaseError as exc:
+        return False, f"REINDEX failed: {exc}"
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    try:
+        after = _integrity_check_db(path)
+    except sqlite3.OperationalError:
+        raise
+    except sqlite3.DatabaseError as exc:
+        return False, f"REINDEX integrity_check failed: {exc}"
+    if after.lower() == "ok":
+        _record_known_good_backup(path)
+        return True, None
+    return False, f"REINDEX did not repair integrity_check: {after}"
+
+
 def _known_good_backup_candidates(path: Path) -> list[Path]:
     parent = path.resolve().parent
     names = [
@@ -1619,7 +1750,13 @@ def repair_corrupt_board(board: Optional[str] = None) -> dict[str, Any]:
             result["reason"] = f"sqlite refused to open file: {exc}"
             return result
         if check.lower() == "ok":
-            result.update({"status": "repaired", "action": "already_valid", "reason": "integrity_check ok"})
+            known_good = _record_known_good_backup(path)
+            result.update({
+                "status": "repaired",
+                "action": "already_valid",
+                "reason": "integrity_check ok",
+                "known_good_backup_path": str(known_good) if known_good else None,
+            })
             return result
         result["reason"] = check
         return result
@@ -1635,7 +1772,13 @@ def repair_corrupt_board(board: Optional[str] = None) -> dict[str, Any]:
         check = f"sqlite refused to open file: {exc}"
     if check.lower() == "ok":
         clear_corrupt_board_incident(slug, fingerprint=fingerprint)
-        result.update({"status": "repaired", "action": "already_valid", "reason": "integrity_check ok"})
+        known_good = _record_known_good_backup(path)
+        result.update({
+            "status": "repaired",
+            "action": "already_valid",
+            "reason": "integrity_check ok",
+            "known_good_backup_path": str(known_good) if known_good else None,
+        })
         return result
     if _is_index_only_integrity_failure(check):
         try:
@@ -1651,7 +1794,13 @@ def repair_corrupt_board(board: Optional[str] = None) -> dict[str, Any]:
             after_check = f"REINDEX failed: {exc}"
         if after_check.lower() == "ok":
             clear_corrupt_board_incident(slug, fingerprint=fingerprint)
-            result.update({"status": "repaired", "action": "reindex", "reason": "integrity_check ok after REINDEX"})
+            known_good = _record_known_good_backup(path)
+            result.update({
+                "status": "repaired",
+                "action": "reindex",
+                "reason": "integrity_check ok after REINDEX",
+                "known_good_backup_path": str(known_good) if known_good else None,
+            })
             return result
         result["reason"] = after_check
         if "locked" in after_check.lower() or "busy" in after_check.lower():
@@ -1665,6 +1814,7 @@ def repair_corrupt_board(board: Optional[str] = None) -> dict[str, Any]:
         before = _backup_corrupt_db(path, fingerprint=fingerprint)
         try:
             shutil.copy2(candidate, path)
+            _remove_db_sidecars(path)
         except OSError as exc:
             result["reason"] = f"restore failed: {exc}"
             return result
@@ -1674,12 +1824,14 @@ def repair_corrupt_board(board: Optional[str] = None) -> dict[str, Any]:
             restored_check = str(exc)
         if restored_check.lower() == "ok":
             clear_corrupt_board_incident(slug, fingerprint=fingerprint)
+            known_good = _record_known_good_backup(path)
             result.update({
                 "status": "repaired",
                 "action": "restore_known_good_backup",
                 "reason": "integrity_check ok after restore",
                 "backup_path": str(candidate),
                 "pre_restore_quarantine_path": str(before) if before else None,
+                "known_good_backup_path": str(known_good) if known_good else None,
             })
             return result
         result["reason"] = f"restored backup failed integrity_check: {restored_check}"
@@ -1689,11 +1841,7 @@ def repair_corrupt_board(board: Optional[str] = None) -> dict[str, Any]:
         before = _backup_corrupt_db(path, fingerprint=fingerprint)
         try:
             shutil.copy2(salvage, path)
-            for suffix in ("-wal", "-shm"):
-                try:
-                    path.with_name(path.name + suffix).unlink(missing_ok=True)
-                except OSError:
-                    pass
+            _remove_db_sidecars(path)
         except OSError as exc:
             result["reason"] = f"salvage replace failed: {exc}"
             return result
@@ -1708,11 +1856,13 @@ def repair_corrupt_board(board: Optional[str] = None) -> dict[str, Any]:
             salvaged_check = str(exc)
         if salvaged_check.lower() == "ok":
             clear_corrupt_board_incident(slug, fingerprint=fingerprint)
+            known_good = _record_known_good_backup(path)
             result.update({
                 "status": "repaired",
                 "action": "salvage_readable_tables",
                 "reason": "integrity_check ok after readable-table salvage",
                 "pre_restore_quarantine_path": str(before) if before else None,
+                "known_good_backup_path": str(known_good) if known_good else None,
             })
             return result
         result["reason"] = f"salvaged DB failed integrity_check: {salvaged_check}"
@@ -1760,11 +1910,26 @@ def _guard_existing_db_is_healthy(path: Path, *, board: Optional[str] = None) ->
     if str(resolved) in _INITIALIZED_PATHS:
         return
     sidecar_bytes = _read_db_sidecars(resolved)
+    fingerprint_before_repair = _db_content_fingerprint(resolved)
     reason: Optional[str] = None
     try:
         check = _integrity_check_db(resolved)
         if check.lower() != "ok":
-            reason = f"integrity_check returned {check!r}"
+            repaired, repair_reason = _try_reindex_existing_db(
+                resolved,
+                check,
+                sidecar_bytes=sidecar_bytes,
+            )
+            if repaired:
+                slug = _board_for_db_path(resolved, board)
+                if slug:
+                    clear_corrupt_board_incident(slug, fingerprint=fingerprint_before_repair)
+                return
+            reason = (
+                f"integrity_check returned {check!r}"
+                if not repair_reason
+                else f"integrity_check returned {check!r}; {repair_reason}"
+            )
     except sqlite3.OperationalError:
         # Lock contention, busy, transient IO — not corruption. Let it propagate.
         raise

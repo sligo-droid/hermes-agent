@@ -7999,7 +7999,6 @@ class GatewayRunner:
                 ):
                     try:
                         from hermes_cli.discord_worker_boards import (
-                            mark_thread_status_synced,
                             running_discord_thread_typing_targets,
                             thread_status_targets,
                         )
@@ -8149,10 +8148,9 @@ class GatewayRunner:
                             if sent:
                                 continue
                             continue
-                        await asyncio.to_thread(
-                            mark_thread_status_synced,
+                        logger.debug(
+                            "discord kanban completion notice: adapter lacks sender; keeping pending flag for board %s",
                             board,
-                            completion_message=True,
                         )
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:

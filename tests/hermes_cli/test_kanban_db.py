@@ -4362,6 +4362,143 @@ def test_repair_corrupt_board_reindex_success_clears_incident(kanban_home, monke
     assert kb.is_board_paused_for_corruption(board) is None
 
 
+def test_connect_auto_reindexes_index_only_integrity_failure(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    conn = kb.connect(db_path=db_path)
+    try:
+        task_id = kb.create_task(conn, title="preserve me")
+    finally:
+        conn.close()
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    checks = iter(["wrong # of entries in index idx_events_run", "ok", "ok"])
+    real_integrity = kb._integrity_check_db
+    real_connect = kb._sqlite_connect
+    reindex_calls: list[str] = []
+
+    class ReindexConn:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args, **kwargs):
+            if str(sql).strip().upper() == "REINDEX":
+                reindex_calls.append(str(sql))
+                return self.inner.execute("SELECT 1")
+            return self.inner.execute(sql, *args, **kwargs)
+
+        def executescript(self, sql):
+            return self.inner.executescript(sql)
+
+        def executemany(self, sql, params):
+            return self.inner.executemany(sql, params)
+
+        def commit(self):
+            return self.inner.commit()
+
+        def close(self):
+            return self.inner.close()
+
+        @property
+        def row_factory(self):
+            return self.inner.row_factory
+
+        @row_factory.setter
+        def row_factory(self, value):
+            self.inner.row_factory = value
+
+    def fake_integrity(path):
+        if Path(path) == db_path:
+            return next(checks)
+        return real_integrity(path)
+
+    monkeypatch.setattr(kb, "_integrity_check_db", fake_integrity)
+    monkeypatch.setattr(kb, "_sqlite_connect", lambda path: ReindexConn(real_connect(path)))
+
+    conn = kb.connect(db_path=db_path)
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.title == "preserve me"
+    finally:
+        conn.close()
+
+    assert reindex_calls == ["REINDEX"]
+    backups = list(tmp_path.glob("kanban.db.corrupt.*.bak"))
+    assert len(backups) == 1
+    assert kb._integrity_check_db(db_path) == "ok"
+
+
+def test_connect_auto_reindex_clears_recorded_index_incident(kanban_home, monkeypatch):
+    board = "auto-reindex-clears-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    conn = kb.connect(board=board)
+    try:
+        kb.create_task(conn, title="preserve during auto reindex")
+    finally:
+        conn.close()
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    fingerprint = kb._db_content_fingerprint(db_path)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "integrity_check returned 'wrong # of entries in index idx_events_run'",
+        backup_path=db_path.with_suffix(".corrupt.bak"),
+        fingerprint=fingerprint,
+    )
+    monkeypatch.setattr(kb, "_integrity_check_db", lambda path: "wrong # of entries in index idx_events_run")
+    monkeypatch.setattr(kb, "_try_reindex_existing_db", lambda path, check, **kwargs: (True, None))
+
+    conn = kb.connect(board=board)
+    try:
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+    assert kb.is_board_paused_for_corruption(board) is None
+
+
+def test_connect_index_only_reindex_failure_still_pauses_board(kanban_home, monkeypatch):
+    board = "auto-reindex-fails-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    conn = kb.connect(board=board)
+    try:
+        kb.create_task(conn, title="preserve before failed reindex")
+    finally:
+        conn.close()
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    real_connect = kb._sqlite_connect
+
+    class ReindexFailsConn:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args, **kwargs):
+            if str(sql).strip().upper() == "REINDEX":
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return self.inner.execute(sql, *args, **kwargs)
+
+        def close(self):
+            return self.inner.close()
+
+    monkeypatch.setattr(
+        kb,
+        "_integrity_check_db",
+        lambda path: "wrong # of entries in index idx_events_run",
+    )
+    monkeypatch.setattr(kb, "_sqlite_connect", lambda path: ReindexFailsConn(real_connect(path)))
+
+    with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+        kb.connect(board=board)
+
+    assert "REINDEX failed" in excinfo.value.reason
+    assert excinfo.value.backup_path is not None
+    assert excinfo.value.backup_path.exists()
+    incident = kb.is_board_paused_for_corruption(board)
+    assert incident is not None
+    assert incident["pause_reason"] == "kanban_db_corruption"
+
+
 def test_repair_corrupt_board_salvages_after_reindex_malformed_failure(kanban_home, monkeypatch):
     board = "salvage-after-reindex-board"
     kb.create_board(board)
@@ -4453,12 +4590,20 @@ def test_repair_corrupt_board_restores_latest_known_good_backup(kanban_home):
     board = "restore-board"
     kb.create_board(board)
     db_path = kb.kanban_db_path(board)
-    with kb.connect(board=board) as conn:
+    conn = kb.connect(board=board)
+    try:
         kb.create_task(conn, title="from backup")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
     backup = db_path.parent / "kanban.db.known-good.2.bak"
     shutil.copy2(db_path, backup)
     original_fingerprint = kb._db_content_fingerprint(db_path)
     _write_corrupt_db(db_path)
+    stale_wal = db_path.with_name(db_path.name + "-wal")
+    stale_shm = db_path.with_name(db_path.name + "-shm")
+    stale_wal.write_bytes(b"stale wal sidecar for corrupt main db")
+    stale_shm.write_bytes(b"stale shm sidecar for corrupt main db")
     corrupt_fingerprint = kb._db_content_fingerprint(db_path)
     assert corrupt_fingerprint != original_fingerprint
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
@@ -4475,6 +4620,8 @@ def test_repair_corrupt_board_restores_latest_known_good_backup(kanban_home):
     assert result["status"] == "repaired"
     assert result["action"] == "restore_known_good_backup"
     assert result["backup_path"] == str(backup)
+    assert not stale_wal.exists() or stale_wal.read_bytes() != b"stale wal sidecar for corrupt main db"
+    assert not stale_shm.exists() or stale_shm.read_bytes() != b"stale shm sidecar for corrupt main db"
     assert kb.is_board_paused_for_corruption(board) is None
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     with kb.connect(board=board) as conn:
