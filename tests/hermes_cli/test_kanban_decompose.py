@@ -151,6 +151,35 @@ def test_decompose_uses_explicit_board_without_env(kanban_home, monkeypatch):
     assert default_root is None
 
 
+def test_list_triage_ids_closes_connections(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship a feature", triage=True)
+
+    real_connect_closing = kb.connect_closing
+    counts = {"opens": 0, "closes": 0}
+
+    class CountingConnectClosing:
+        def __init__(self, *args, **kwargs):
+            self._inner = real_connect_closing(*args, **kwargs)
+
+        def __enter__(self):
+            counts["opens"] += 1
+            return self._inner.__enter__()
+
+        def __exit__(self, exc_type, exc, tb):
+            try:
+                return self._inner.__exit__(exc_type, exc, tb)
+            finally:
+                counts["closes"] += 1
+
+    monkeypatch.setattr(decomp.kb, "connect_closing", CountingConnectClosing)
+
+    for _ in range(5):
+        assert decomp.list_triage_ids() == [tid]
+
+    assert counts == {"opens": 5, "closes": 5}
+
+
 def test_decompose_fanout_false_assigns_default_when_unassigned(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="just one thing", triage=True)
