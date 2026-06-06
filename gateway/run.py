@@ -5637,6 +5637,9 @@ class GatewayRunner:
                     except Exception:
                         boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
                     seen_db_paths: set[str] = set()
+                    def _board_db_path(slug: str) -> Path:
+                        return Path(str(_kb.kanban_db_path(slug))).expanduser().resolve()
+
                     def _paused_corrupt_incident(slug: str) -> Optional[dict]:
                         try:
                             incident = _kb.is_board_paused_for_corruption(slug)
@@ -5652,6 +5655,52 @@ class GatewayRunner:
                         if incident.get("fingerprint") == fingerprint:
                             return incident
                         return None
+
+                    def _is_corrupt_board_db_error(exc: Exception) -> bool:
+                        corrupt_guard_error = getattr(_kb, "KanbanDbCorruptError", None)
+                        if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
+                            return True
+                        if not isinstance(exc, sqlite3.DatabaseError):
+                            return False
+                        msg = str(exc).lower()
+                        return (
+                            "file is not a database" in msg
+                            or "database disk image is malformed" in msg
+                        )
+
+                    def _record_corrupt_board(slug: str, exc: Exception) -> Optional[dict]:
+                        incident = getattr(exc, "incident", None)
+                        if isinstance(incident, dict):
+                            return incident
+                        try:
+                            db_path = _board_db_path(slug)
+                            fingerprint = _kb._db_content_fingerprint(db_path)
+                        except Exception:
+                            db_path = Path(str(_kb.kanban_db_path(slug)))
+                            fingerprint = None
+                        return _kb.record_corrupt_board_incident(
+                            slug,
+                            db_path,
+                            str(getattr(exc, "reason", None) or exc),
+                            backup_path=getattr(exc, "backup_path", None),
+                            fingerprint=fingerprint,
+                        )
+
+                    def _log_corrupt_board_incident(slug: str, incident: Optional[dict], exc: Exception) -> None:
+                        incident = incident or {}
+                        logger.error(
+                            "kanban notifier: board %s database corruption incident; "
+                            "db_path=%s quarantine_path=%s reason=%s. Notification "
+                            "polling is paused for this board while the DB fingerprint "
+                            "is unchanged. Repair guidance: restore a known-good backup "
+                            "or run `hermes kanban repair --board %s`, then retry after "
+                            "integrity checks pass.",
+                            slug,
+                            incident.get("db_path") or str(_kb.kanban_db_path(slug)),
+                            incident.get("quarantine_path") or getattr(exc, "backup_path", None) or "<unavailable>",
+                            incident.get("reason") or getattr(exc, "reason", None) or str(exc),
+                            slug,
+                        )
 
                     for board_meta in boards:
                         slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
@@ -5676,6 +5725,9 @@ class GatewayRunner:
                         try:
                             conn = _kb.connect(board=slug)
                         except Exception as exc:
+                            if _is_corrupt_board_db_error(exc):
+                                _log_corrupt_board_incident(slug, _record_corrupt_board(slug, exc), exc)
+                                continue
                             logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
                             continue
                         try:

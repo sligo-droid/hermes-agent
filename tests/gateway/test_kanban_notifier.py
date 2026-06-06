@@ -491,6 +491,59 @@ def test_kanban_notifier_skips_unchanged_corrupt_paused_board(tmp_path, monkeypa
     assert not any("cannot open board" in msg for msg in messages)
 
 
+def test_kanban_notifier_records_corrupt_open_once_then_skips(tmp_path, monkeypatch, caplog):
+    import logging
+    import sqlite3
+
+    db_path = tmp_path / "kanban.db"
+    db_path.write_text("not sqlite", encoding="utf-8")
+    incidents = {}
+    calls = {"connect": 0, "record": 0}
+
+    monkeypatch.setattr(kb, "list_boards", lambda include_archived=False: [{"slug": "bad-board"}])
+    monkeypatch.setattr(kb, "kanban_db_path", lambda board=None: db_path)
+    monkeypatch.setattr(kb, "is_board_paused_for_corruption", lambda board=None: incidents.get(board))
+
+    def connect(*args, **kwargs):
+        calls["connect"] += 1
+        raise sqlite3.DatabaseError("file is not a database")
+
+    def record_incident(board, db_path_arg, reason, *, backup_path=None, fingerprint=None):
+        calls["record"] += 1
+        incident = {
+            "pause_reason": "kanban_db_corruption",
+            "db_path": str(db_path_arg),
+            "fingerprint": fingerprint,
+            "quarantine_path": str(backup_path) if backup_path is not None else None,
+            "reason": reason,
+        }
+        incidents[board] = incident
+        return incident
+
+    monkeypatch.setattr(kb, "connect", connect)
+    monkeypatch.setattr(kb, "record_corrupt_board_incident", record_incident)
+
+    runner = _make_runner(RecordingAdapter())
+
+    with caplog.at_level(logging.DEBUG, logger="gateway.run"):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+        runner._running = True
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum("kanban notifier: board bad-board database corruption incident" in msg for msg in messages) == 1
+    alert = next(msg for msg in messages if "database corruption incident" in msg)
+    assert "bad-board" in alert
+    assert str(db_path) in alert
+    assert "quarantine_path=" in alert
+    assert "reason=" in alert
+    assert "repair --board bad-board" in alert
+    assert any("paused for unchanged DB corruption" in msg for msg in messages)
+    assert not any("cannot open board" in msg for msg in messages)
+    assert not any(record.exc_info for record in caplog.records)
+    assert calls == {"connect": 1, "record": 1}
+
+
 def test_discord_kanban_typing_watcher_pulses_running_thread(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb
