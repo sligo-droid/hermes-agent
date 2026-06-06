@@ -477,6 +477,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit JSON (structured) instead of the default human table",
     )
 
+    # --- repair (board corruption recovery) ---
+    p_repair = sub.add_parser(
+        "repair",
+        help="Safely repair a board paused for database corruption",
+    )
+    p_repair.add_argument("--json", action="store_true", help="Emit JSON output")
+
     # --- foreman (Discord worker board scanner) ---
     p_foreman = sub.add_parser(
         "foreman",
@@ -921,12 +928,13 @@ def kanban_command(args: argparse.Namespace) -> int:
     # HERMES_HOME. Previously only `init` and `daemon` triggered
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
-    try:
-        kb.init_db()
-    except Exception as exc:
-        print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
-        _restore_board_env()
-        return 1
+    if action != "repair":
+        try:
+            kb.init_db()
+        except Exception as exc:
+            print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
+            _restore_board_env()
+            return 1
 
     handlers = {
         "init":     _cmd_init,
@@ -940,6 +948,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "reassign": _cmd_reassign,
         "diagnostics": _cmd_diagnostics,
         "diag":     _cmd_diagnostics,
+        "repair":   _cmd_repair,
         "foreman":  _cmd_foreman,
         "link":     _cmd_link,
         "unlink":   _cmd_unlink,
@@ -1313,6 +1322,27 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
         count_str = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "(idle)"
         print(f"{entry['name']:20s}  {on_disk:8s}  {count_str}")
     return 0
+
+
+def _cmd_repair(args: argparse.Namespace) -> int:
+    result = kb.repair_corrupt_board()
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(f"Kanban repair for board {result.get('board')!r}:")
+        print(f"  Status: {result.get('status')}")
+        print(f"  Action: {result.get('action') or 'none'}")
+        if result.get("reason"):
+            print(f"  Reason: {result['reason']}")
+        if result.get("db_path"):
+            print(f"  DB path: {result['db_path']}")
+        if result.get("backup_path"):
+            print(f"  Restored backup: {result['backup_path']}")
+        if result.get("pre_restore_quarantine_path"):
+            print(f"  Pre-restore quarantine: {result['pre_restore_quarantine_path']}")
+        if result.get("status") == "failed":
+            print("  Board remains paused; inspect backups before manual recovery.")
+    return 0 if result.get("status") == "repaired" else 1
 
 
 def _cmd_create(args: argparse.Namespace) -> int:

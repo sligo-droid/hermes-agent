@@ -4385,6 +4385,49 @@ def test_repair_corrupt_board_failed_repair_stays_paused(kanban_home, monkeypatc
     assert kb.is_board_paused_for_corruption(board) is not None
 
 
+def test_repair_corrupt_board_skips_invalid_backup_and_stays_paused(kanban_home):
+    board = "invalid-backup-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    _write_corrupt_db(db_path)
+    fingerprint = kb._db_content_fingerprint(db_path)
+    invalid_backup = db_path.parent / "kanban.db.known-good.1.bak"
+    _write_corrupt_db(invalid_backup)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "integrity_check returned 'database disk image is malformed'",
+        backup_path=kb._backup_corrupt_db(db_path, fingerprint=fingerprint),
+        fingerprint=fingerprint,
+    )
+
+    result = kb.repair_corrupt_board(board)
+
+    assert result["status"] == "failed"
+    assert result["action"] is None
+    assert kb.is_board_paused_for_corruption(board) is not None
+
+
+def test_repair_corrupt_board_already_valid_clears_incident(kanban_home):
+    board = "already-valid-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    fingerprint = kb._db_content_fingerprint(db_path)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "manual restore completed",
+        fingerprint=fingerprint,
+    )
+
+    result = kb.repair_corrupt_board(board)
+
+    assert result["status"] == "repaired"
+    assert result["action"] == "already_valid"
+    assert kb.is_board_paused_for_corruption(board) is None
+
+
 def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
     """A transient lock during the probe must not produce a .corrupt backup
     and must not be reported as :class:`KanbanDbCorruptError`. Raw sqlite

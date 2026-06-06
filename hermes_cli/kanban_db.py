@@ -1506,7 +1506,8 @@ def _known_good_backup_candidates(path: Path) -> list[Path]:
 
 def repair_corrupt_board(board: Optional[str] = None) -> dict[str, Any]:
     """Attempt conservative self-heal for a paused corrupt board."""
-    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    slug = _normalize_board_slug(board) if board is not None else get_current_board()
+    slug = slug or DEFAULT_BOARD
     incident = is_board_paused_for_corruption(slug)
     path = kanban_db_path(slug)
     fingerprint = _db_content_fingerprint(path)
@@ -1518,6 +1519,20 @@ def repair_corrupt_board(board: Optional[str] = None) -> dict[str, Any]:
         "reason": None,
         "incident": incident,
     }
+    if not incident:
+        try:
+            check = _integrity_check_db(path)
+        except sqlite3.OperationalError as exc:
+            result["reason"] = f"sqlite operational error: {exc}"
+            return result
+        except sqlite3.DatabaseError as exc:
+            result["reason"] = f"sqlite refused to open file: {exc}"
+            return result
+        if check.lower() == "ok":
+            result.update({"status": "repaired", "action": "already_valid", "reason": "integrity_check ok"})
+            return result
+        result["reason"] = check
+        return result
     if incident and incident.get("fingerprint") and fingerprint != incident.get("fingerprint"):
         result["reason"] = "db fingerprint changed since incident was recorded"
         return result

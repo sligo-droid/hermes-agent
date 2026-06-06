@@ -173,6 +173,56 @@ def test_run_slash_dispatch_dry_run_counts(kanban_home):
     assert "Spawned:" in out
 
 
+def test_run_slash_repair_reindex_success_human_and_json(kanban_home, monkeypatch):
+    board = "cli-reindex-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    fingerprint = kb._db_content_fingerprint(db_path)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "integrity_check returned 'row 1 missing from index idx_tasks_status'",
+        backup_path=db_path.with_suffix(".corrupt.bak"),
+        fingerprint=fingerprint,
+    )
+    checks = iter([
+        "row 1 missing from index idx_tasks_status",
+        "row 1 missing from index idx_tasks_status",
+        "ok",
+    ])
+    real_connect = kb._sqlite_connect
+
+    class ReindexConn:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args, **kwargs):
+            if str(sql).strip().upper() == "REINDEX":
+                return self.inner.execute("SELECT 1")
+            return self.inner.execute(sql, *args, **kwargs)
+
+        def commit(self):
+            return self.inner.commit()
+
+        def close(self):
+            return self.inner.close()
+
+    monkeypatch.setattr(kb, "_integrity_check_db", lambda path: next(checks))
+    monkeypatch.setattr(kb, "_sqlite_connect", lambda path: ReindexConn(real_connect(path)))
+
+    out = kc.run_slash(f"--board {board} repair")
+
+    assert "Status: repaired" in out
+    assert "Action: reindex" in out
+    assert kb.is_board_paused_for_corruption(board) is None
+
+    monkeypatch.setattr(kb, "_integrity_check_db", lambda path: "ok")
+    out = kc.run_slash(f"--board {board} repair --json")
+    payload = json.loads(out)
+    assert payload["status"] == "repaired"
+    assert payload["action"] == "already_valid"
+
+
 def test_run_slash_context_output_format(kanban_home):
     out = kc.run_slash("create 'tech spec' --assignee alice --body 'write an RFC'")
     import re
