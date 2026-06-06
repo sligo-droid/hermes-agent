@@ -35,6 +35,7 @@ from hermes_cli.discord_worker_boards import (
 )
 
 _OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV}
+_COMMAND_CENTER_REPAIR_CREATED_BY = "command-center-repair"
 _CODEX_AUTH_RETRY_LIMIT = 2
 _PR_GUARDED_ROLES = {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER}
 _GH_PR_MUTATING_SUBCOMMANDS = {
@@ -89,6 +90,7 @@ def main() -> int:
     if not task_id or role not in {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER, ROLE_FOREMAN}:
         return 2
 
+    task = None
     conn = kanban_db.connect(board=board)
     try:
         task = kanban_db.get_task(conn, task_id)
@@ -120,7 +122,7 @@ def main() -> int:
         return 0
     except Exception as exc:
         try:
-            kanban_db.block_task(conn, task_id, reason=f"{_backend_label(role)} worker failed: {exc}")
+            kanban_db.block_task(conn, task_id, reason=f"{_backend_label(role, task)} worker failed: {exc}")
         except Exception:
             pass
         return 1
@@ -419,13 +421,23 @@ def _configured_backend() -> str:
         return "codex"
 
 
-def _backend_label(role: str) -> str:
-    if _role_uses_opencode(role):
+def _backend_label(role: str, task: Any = None) -> str:
+    if _role_uses_opencode(role, task):
         return "OpenCode"
     return "Codex"
 
 
-def _role_uses_opencode(role: str) -> bool:
+def _task_forces_opencode(task: Any = None) -> bool:
+    if task is None:
+        return False
+    role = str(getattr(task, "assignee", "") or "").strip().lower()
+    created_by = str(getattr(task, "created_by", "") or "").strip().lower()
+    return role == ROLE_FOREMAN and created_by == _COMMAND_CENTER_REPAIR_CREATED_BY
+
+
+def _role_uses_opencode(role: str, task: Any = None) -> bool:
+    if _task_forces_opencode(task):
+        return True
     return role in _OPENCODE_ROLES and _configured_backend() == "opencode"
 
 
@@ -543,7 +555,7 @@ def _run_role_backend(
     task_id: str,
     board: Optional[str],
 ):
-    if _role_uses_opencode(role):
+    if _role_uses_opencode(role, task):
         return _run_opencode(prompt, workspace, role, task=task, task_id=task_id, board=board)
     return _run_codex(prompt, workspace, role, task_id=task_id, board=board)
 
