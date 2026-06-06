@@ -1173,6 +1173,125 @@ def test_persisted_board_run_summary_drives_terminal_surfaces(monkeypatch, tmp_p
     assert "PR merge: CLEAN; checks: passed" in html
 
 
+def test_terminal_summary_infers_merged_pr_and_recovered_reviewer_status(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(dwb, "_now", lambda: 250)
+    board = dwb.start_direct_goal(thread_id="5164b", goal="Ship recovered terminal summary")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        review_id = kanban_db.create_task(
+            conn,
+            title="Review recovered implementation",
+            assignee=dwb.ROLE_REVIEWER,
+            tenant=board.slug,
+        )
+        claimed_review = kanban_db.claim_task(conn, review_id)
+        assert claimed_review is not None
+        kanban_db.complete_task(
+            conn,
+            review_id,
+            summary="Approved. Recovered sidecar result was verified and merged.",
+            metadata={
+                "recovered_from": "worker.codex-state.json",
+                "status": "approved",
+                "parsed": {
+                    "status": "approved",
+                    "summary": "Approved. Recovered sidecar result was verified and merged.",
+                },
+            },
+            expected_run_id=claimed_review.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "concise_outcome": "Done. PR #42 merged after recovered reviewer approval.",
+            "review_loop_count": 1,
+            "pr_url": "https://github.com/acme/hermes/pull/42",
+            "pr_number": "42",
+            "pr_state": "MERGED",
+            "pr_merged_at": "2026-06-01T17:35:13Z",
+            "pr_merge_commit": "abc123",
+            "pr_checks_status": "success",
+        },
+    )
+
+    summary = dwb.persist_board_run_summary(board.slug)
+    text = dwb.render_board_run_summary_text(summary)
+
+    assert summary["schema_version"] == dwb.BOARD_RUN_SUMMARY_SCHEMA_VERSION
+    assert summary["pr"]["merge_state"] == "merged"
+    assert summary["review"]["final_verdict"]["status"] == "approved"
+    assert "PR merge: merged; checks: success" in text
+    assert "Outcome: Done. PR #42 merged after recovered reviewer approval." in text
+    assert "Review: 1/5; final verdict: approved — Approved. Recovered sidecar result" in text
+
+
+def test_terminal_summary_ignores_stale_schema_sidecar_for_completed_board(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(dwb, "_now", lambda: 260)
+    board = dwb.start_direct_goal(thread_id="5164c", goal="Refresh stale terminal summary")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Planner completed",
+            assignee=dwb.ROLE_PLANNER,
+            tenant=board.slug,
+        )
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+        kanban_db.complete_task(
+            conn,
+            task_id,
+            summary="Planner completed.",
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "pr_url": "https://github.com/acme/hermes/pull/43",
+            "pr_state": "MERGED",
+            "pr_merged_at": "2026-06-01T17:35:13Z",
+            "pr_checks_status": "success",
+        },
+    )
+    stale = {
+        "schema_version": 1,
+        "board": board.slug,
+        "generated_at": 260,
+        "pr": {"url": "https://github.com/acme/hermes/pull/43", "merge_state": "unknown", "checks_status": "success"},
+    }
+    dwb.board_run_summary_path(board.slug).write_text(json.dumps(stale), encoding="utf-8")
+    metadata = kanban_db.read_board_metadata(board.slug)
+    worker = metadata["discord_worker"]
+    worker["board_summary"] = stale
+    worker["board_summary_path"] = str(dwb.board_run_summary_path(board.slug))
+    worker["board_summary_updated_at"] = 260
+    metadata["discord_worker"] = worker
+    kanban_db.board_metadata_path(board.slug).write_text(json.dumps(metadata), encoding="utf-8")
+
+    assert dwb.read_board_run_summary(board.slug) == {}
+    html = dwb.render_public_session_board_html("5164c")
+
+    assert "PR merge: merged; checks: success" in html
+    assert "PR merge: unknown" not in html
+
+
 def test_board_surfaces_crashed_ticket_error_summary(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
