@@ -419,10 +419,30 @@ def _terminal_worker_reaction_state(worker: dict[str, Any]) -> str:
     return ""
 
 
+def _terminal_reaction_synced_state(worker: dict[str, Any]) -> str:
+    return str(worker.get("terminal_reaction_synced_state") or "").strip().lower()
+
+
 def _is_terminal_worker_meta(worker: dict[str, Any]) -> bool:
     status = str(worker.get("goal_status") or "").strip().lower()
     phase = str(worker.get("phase") or "").strip().lower()
     return bool(worker.get("cancelled") or status in TERMINAL_GOAL_STATUSES or phase == "complete")
+
+
+def board_has_unsynced_terminal_reaction(board: str) -> bool:
+    """Return whether a terminal Discord worker board still needs reaction sync."""
+    worker = _read_worker_meta(board)
+    if worker.get("kind") != "discord_worker_board" or not _is_terminal_worker_meta(worker):
+        return False
+    try:
+        reaction_state = board_thread_reaction_state(board)
+    except Exception:
+        reaction_state = ""
+    if reaction_state not in {"done", "blocked", "errored"}:
+        return False
+    if worker.get("terminal_reaction_sync_pending"):
+        return True
+    return _terminal_reaction_synced_state(worker) != reaction_state
 
 
 def _update_worker_meta(board: str, updates: dict[str, Any]) -> dict[str, Any]:
@@ -472,6 +492,7 @@ def _clear_terminal_summary_fields(worker: dict[str, Any]) -> None:
         "terminal_summary_message_sent_at",
         "terminal_summary_sync_pending",
         "terminal_reaction_sync_pending",
+        "terminal_reaction_synced_state",
     ):
         worker[key] = _DELETE_META
 
@@ -3230,22 +3251,41 @@ def thread_status_targets() -> list[dict[str, Any]]:
                     continue
                 raise
         visible_state = state if state in {"done", "blocked", "errored"} else source_state or state
+        is_terminal_worker = _is_terminal_worker_meta(worker)
         terminal_completion_message_pending = bool(worker.get("terminal_completion_message_pending"))
         terminal_sync_pending = bool(
             worker.get("terminal_reaction_sync_pending")
             or worker.get("terminal_summary_sync_pending")
             or terminal_completion_message_pending
         )
+        reaction_state = ""
+        terminal_reaction_sync_needed = False
+        if is_terminal_worker and state in {"done", "blocked", "errored"}:
+            try:
+                reaction_state = board_thread_reaction_state(board)
+            except Exception as exc:
+                if _is_skippable_board_db_error(exc):
+                    _log_skipped_board_target(board, exc, source="discord thread status reaction state")
+                    continue
+                raise
+            terminal_reaction_sync_needed = (
+                reaction_state in {"done", "blocked", "errored"}
+                and reaction_state != _terminal_reaction_synced_state(worker)
+            )
         if (
             visible_state not in {"active", "running"}
             and not source_state
-            and not (state in {"done", "blocked", "errored"} and terminal_sync_pending)
+            and not (
+                is_terminal_worker
+                and state in {"done", "blocked", "errored"}
+                and (terminal_sync_pending or terminal_reaction_sync_needed)
+            )
             and board not in active_foreman_sources
         ):
             continue
         if source_state and state not in {"done", "blocked", "errored"}:
             reaction_state = source_state
-        else:
+        elif not reaction_state:
             try:
                 reaction_state = board_thread_reaction_state(board)
             except Exception as exc:
@@ -3305,8 +3345,16 @@ def mark_thread_status_synced(
     if worker.get("kind") != "discord_worker_board":
         return
     changed = False
-    if reaction and worker.pop("terminal_reaction_sync_pending", None) is not None:
-        changed = True
+    if reaction:
+        if worker.pop("terminal_reaction_sync_pending", None) is not None:
+            changed = True
+        try:
+            reaction_state = board_thread_reaction_state(board)
+        except Exception:
+            reaction_state = ""
+        if reaction_state in {"done", "blocked", "errored"} and _terminal_reaction_synced_state(worker) != reaction_state:
+            worker["terminal_reaction_synced_state"] = reaction_state
+            changed = True
     if summary and worker.pop("terminal_summary_sync_pending", None) is not None:
         changed = True
     if completion_message and worker.pop("terminal_completion_message_pending", None) is not None:
