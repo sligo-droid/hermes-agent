@@ -2241,11 +2241,8 @@ def _active_role_count_across_boards() -> int:
         worker = _read_worker_meta(board)
         if worker.get("kind") != "discord_worker_board":
             continue
-        conn = kanban_db.connect(board=board)
-        try:
+        with kanban_db.connect_closing(board=board) as conn:
             total += len(_running_ticket_snapshot(conn))
-        finally:
-            conn.close()
     return total
 
 
@@ -2260,8 +2257,7 @@ def board_thread_state(board: str) -> str:
         or worker.get("goal_status") == "blocked"
     )
 
-    conn = kanban_db.connect(board=board)
-    try:
+    with kanban_db.connect_closing(board=board) as conn:
         tasks = kanban_db.list_tasks(conn, include_archived=False)
         if tasks:
             blocked_tasks = [task for task in tasks if task.status == "blocked"]
@@ -2282,8 +2278,6 @@ def board_thread_state(board: str) -> str:
             if any(task.status == "running" for task in tasks):
                 return "running"
             return "active"
-    finally:
-        conn.close()
 
     if is_terminal:
         return "done"
@@ -2304,13 +2298,10 @@ def board_thread_reaction_state(board: str) -> str:
     if state != "active":
         return state
 
-    conn = kanban_db.connect(board=board)
-    try:
+    with kanban_db.connect_closing(board=board) as conn:
         tasks = kanban_db.list_tasks(conn, include_archived=False)
         if any(getattr(task, "started_at", None) or getattr(task, "completed_at", None) for task in tasks):
             return "running"
-    finally:
-        conn.close()
     return "active"
 
 
@@ -2981,15 +2972,12 @@ def feature_summary_snapshot(board: str) -> dict[str, Any]:
     if worker.get("kind") != "discord_worker_board":
         raise KeyError("unknown Discord worker board")
 
-    conn = kanban_db.connect(board=board)
-    try:
+    with kanban_db.connect_closing(board=board) as conn:
         tasks = kanban_db.list_tasks(conn, include_archived=False)
         summaries = kanban_db.latest_summaries(conn, [t.id for t in tasks])
         counts = kanban_db.board_stats(conn).get("by_status", {})
         running = _running_ticket_snapshot(conn)
         runs_by_task = {t.id: kanban_db.list_runs(conn, t.id) for t in tasks}
-    finally:
-        conn.close()
 
     state = board_thread_state(board)
     terminal_summary = read_board_run_summary(board)
@@ -3062,18 +3050,48 @@ def thread_status_targets() -> list[dict[str, Any]]:
         if _worker_source_message_too_old(worker):
             _clear_stale_terminal_sync_flags(board, worker)
             continue
+        if _paused_corrupt_incident(board):
+            logger.debug(
+                "discord thread status targets: board %s paused for unchanged DB corruption; skipping",
+                board,
+            )
+            continue
         try:
             summary = feature_summary_snapshot(board)
-        except Exception:
-            summary = {"state": board_thread_state(board)}
-        state = summary.get("state") or board_thread_state(board)
+        except Exception as exc:
+            if _is_skippable_board_db_error(exc):
+                _log_skipped_board_target(board, exc, source="discord thread status feature summary")
+                continue
+            try:
+                summary = {"state": board_thread_state(board)}
+            except Exception as state_exc:
+                if _is_skippable_board_db_error(state_exc):
+                    _log_skipped_board_target(board, state_exc, source="discord thread status state fallback")
+                    continue
+                raise
+        state = summary.get("state")
+        if not state:
+            try:
+                state = board_thread_state(board)
+            except Exception as exc:
+                if _is_skippable_board_db_error(exc):
+                    _log_skipped_board_target(board, exc, source="discord thread status board state")
+                    continue
+                raise
         source_context = _worker_source_task_context(worker)
         source_state = None
         if source_context.get("source_board") and source_context.get("source_task_id"):
-            source_state = source_task_reaction_state(
-                source_context["source_board"],
-                source_context["source_task_id"],
-            )
+            source_board = source_context["source_board"]
+            try:
+                source_state = source_task_reaction_state(
+                    source_board,
+                    source_context["source_task_id"],
+                )
+            except Exception as exc:
+                if _is_skippable_board_db_error(exc):
+                    _log_skipped_board_target(source_board, exc, source="discord thread status source task")
+                    continue
+                raise
         visible_state = source_state or state
         terminal_completion_message_pending = bool(worker.get("terminal_completion_message_pending"))
         terminal_sync_pending = bool(
@@ -3088,7 +3106,16 @@ def thread_status_targets() -> list[dict[str, Any]]:
             and board not in active_foreman_sources
         ):
             continue
-        reaction_state = source_state or board_thread_reaction_state(board)
+        if source_state:
+            reaction_state = source_state
+        else:
+            try:
+                reaction_state = board_thread_reaction_state(board)
+            except Exception as exc:
+                if _is_skippable_board_db_error(exc):
+                    _log_skipped_board_target(board, exc, source="discord thread status reaction state")
+                    continue
+                raise
         target = {
             "board": board,
             "thread_id": thread_id,
