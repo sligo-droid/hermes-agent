@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-06 15:32 UTC
+Last updated: 2026-06-06 15:40 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -15,9 +15,9 @@ This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork
 
 | Area | State | Evidence |
 | --- | --- | --- |
-| Main branch | verified | `/home/droid/hermes` on `main...origin/main` at `15b529090` (`fix: add Kanban corruption repair flow (#319)`) when this file was created. |
-| Open PRs | verified | `gh pr list --state open --limit 20` returned no rows when this file was created. |
-| Repo-state transition | implemented | This repo now has `docs/project-state.md`, `docs/context.md`, and `docs/decisions/0001-repo-backed-project-state.md`; `AGENTS.md` routes workers here. |
+| Main branch | verified | `/home/droid/hermes` was fast-forwarded to `origin/main` after PR #320 merged (`aa988915a docs: add Hermes repo project state (#320)`). |
+| Open PRs | verified | `gh pr list --state open --limit 10` returned no rows after PR #320 merged. |
+| Repo-state transition | merged | PR #320 added `docs/project-state.md`, `docs/context.md`, and `docs/decisions/0001-repo-backed-project-state.md`; `AGENTS.md` now routes workers here. |
 | Command Center model | merged | `docs/sligo-command-center.md` records the Work Item / Source / Worker Run model and Hermes/PID project tabs. Live runtime must still be smoked separately when code changes. |
 | Skills boundary | in_progress | Installed default-profile pointers were patched for `hermes-agent`, `hermes-operations`, and `general-coding/references/operator-command-center-ui.md`; broader trimming remains ongoing. |
 
