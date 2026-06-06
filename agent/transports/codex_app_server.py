@@ -74,6 +74,7 @@ class CodexAppServerClient:
         env: Optional[dict[str, str]] = None,
     ) -> None:
         self._codex_bin = codex_bin
+        explicit_env = env or {}
         spawn_env = os.environ.copy()
         if env:
             spawn_env.update(env)
@@ -107,7 +108,7 @@ class CodexAppServerClient:
             )
             network_access = (
                 "true"
-                if spawn_env.get("HERMES_CODEX_WORKER_NETWORK_ACCESS", "").strip().lower()
+                if explicit_env.get("HERMES_CODEX_WORKER_NETWORK_ACCESS", "").strip().lower()
                 in {"1", "true", "yes", "on"}
                 else "false"
             )

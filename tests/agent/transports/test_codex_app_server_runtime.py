@@ -327,6 +327,7 @@ class TestSpawnEnvIsolation:
             "HERMES_KANBAN_WORKSPACE",
             "/users/alice/workspaces/project-smoke",
         )
+        monkeypatch.setenv("HERMES_CODEX_WORKER_NETWORK_ACCESS", "1")
 
         client = cas.CodexAppServerClient(codex_bin="codex")
         client._closed = True
@@ -340,3 +341,11 @@ class TestSpawnEnvIsolation:
         )
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
+
+        captured.clear()
+        client = cas.CodexAppServerClient(
+            codex_bin="codex", env={"HERMES_CODEX_WORKER_NETWORK_ACCESS": "1"}
+        )
+        client._closed = True
+
+        assert "sandbox_workspace_write.network_access=true" in captured["cmd"]
