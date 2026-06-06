@@ -181,6 +181,51 @@ def test_snapshot_rolls_named_discord_board_tasks_up_to_board_work_item(tmp_path
     assert snapshot["metrics"]["discord_origin"] == 1
 
 
+def test_snapshot_archive_includes_moved_archived_worker_boards(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "discord-archived-feature-thread"
+    meta = kanban_db.write_board_metadata(board, name="Archived Feature Thread")
+    meta.pop("db_path", None)
+    meta[command_center.DISCORD_WORKER_META_KEY] = {
+        "guild_id": "111",
+        "thread_id": "222",
+        "source_message_id": "333",
+        "project_context": {"project_name": "Hermes"},
+    }
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Archived worker", board=board)
+        with conn:
+            conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200, task_id))
+            conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                (task_id, "done", 100, 200, "done"),
+            )
+    finally:
+        conn.close()
+    archived_result = kanban_db.remove_board(board)
+
+    default_snapshot = command_center.build_command_center_snapshot(include_archived=False, project="hermes")
+    archived_snapshot = command_center.build_command_center_snapshot(include_archived=True, project="hermes")
+
+    assert Path(archived_result["new_path"]).exists()
+    assert not any(item.get("execution", {}).get("board") == board for item in default_snapshot["work_items"])
+    item = next(item for item in archived_snapshot["work_items"] if item.get("execution", {}).get("board") == board)
+    source = next(source for source in archived_snapshot["sources"] if source["id"] == item["source"]["id"])
+    run = next(run for run in archived_snapshot["runs"] if run["board"] == board and run["task_id"] == task_id)
+
+    assert item["id"].startswith(f"kanban-board:archive:{board}-")
+    assert item["status"] == "archived"
+    assert item["project"] == "hermes"
+    assert item["execution"]["archiveable"] is False
+    assert item["execution"]["worker_url"] is None
+    assert item["source"]["ref"]["discord_url"] == "https://discord.com/channels/111/222/333"
+    assert source["status"] == "archived"
+    assert run["outcome"] == "done"
+    assert archived_snapshot["metrics"]["archived"] == 1
+
+
 def test_snapshot_exposes_project_tabs_and_filters_hermes_dev_intake(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     hermes_board = "discord-hermes-dev"
