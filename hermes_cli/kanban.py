@@ -482,6 +482,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "repair",
         help="Safely repair a board paused for database corruption",
     )
+    p_repair.add_argument(
+        "--board",
+        default=argparse.SUPPRESS,
+        metavar="<slug>",
+        help="Board slug to repair; equivalent to `hermes kanban --board <slug> repair`.",
+    )
     p_repair.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- foreman (Discord worker board scanner) ---
