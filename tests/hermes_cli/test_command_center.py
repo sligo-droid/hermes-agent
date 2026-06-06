@@ -432,6 +432,42 @@ def test_snapshot_board_rollups_include_running_and_blocked_statuses(tmp_path, m
     assert blocked_item["status"] == "blocked"
 
 
+def test_snapshot_completed_discord_worker_board_is_shipped_not_active(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "discord-1512532369897160735"
+    meta = kanban_db.write_board_metadata(board, name="Completed Worker Board")
+    meta[command_center.DISCORD_WORKER_META_KEY] = {
+        "kind": "discord_worker_board",
+        "thread_id": "1512532369897160735",
+        "guild_id": "111",
+        "source_message_id": "1512532369897160735",
+        "goal_status": "done",
+        "phase": "complete",
+        "public_url": "https://sligo.sligolabs.com/workers/1512532369897160735",
+    }
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Completed worker", board=board, initial_status="running")
+        with conn:
+            conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (task_id,))
+            conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                (task_id, "done", 100, 200, "done"),
+            )
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+
+    assert item["status"] == "shipped"
+    assert item["execution"]["task_counts"] == {"running": 1}
+    assert snapshot["metrics"]["active_runs"] == 0
+    assert snapshot["metrics"]["active_work"] == 0
+    assert snapshot["metrics"]["shipped"] == 1
+
+
 def test_worker_board_url_rejects_top_level_public_worker_urls():
     board = "discord-worker-board"
 

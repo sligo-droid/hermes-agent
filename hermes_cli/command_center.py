@@ -364,10 +364,13 @@ def _canonical_status_from_board(
     goal_status = str(worker.get("goal_status") or "").lower()
     if board_meta.get("archived"):
         return "archived", "archived"
+    phase = str(worker.get("phase") or "").lower()
+    if goal_status in {"done", "shipped", "complete", "completed"} or phase == "complete":
+        return "shipped", goal_status or phase or "done"
     counts = _task_status_counts(tasks)
     if counts.get("running", 0) or any(_is_active_run(run) for run in runs or []):
         return "running", "running"
-    if board_meta.get("command_center_paused") or worker.get("paused") or goal_status == "paused" or str(worker.get("phase") or "").lower() == "paused":
+    if board_meta.get("command_center_paused") or worker.get("paused") or goal_status == "paused" or phase == "paused":
         return "paused", str(worker.get("paused_reason") or "paused")
     if counts.get("blocked", 0):
         return "blocked", "blocked"
@@ -378,8 +381,6 @@ def _canonical_status_from_board(
     active_tasks = [task for task in tasks if str(task.get("status") or "").lower() != "archived"]
     if active_tasks and all(str(task.get("status") or "").lower() == "done" for task in active_tasks):
         return "shipped", goal_status or "done"
-    if goal_status in {"done", "shipped", "complete", "completed"}:
-        return "shipped", goal_status
     return "accepted", goal_status or "board"
 
 
@@ -1167,7 +1168,12 @@ def _metrics(
         by_status[status] = by_status.get(status, 0) + 1
         source_kind = str((item.get("source") or {}).get("kind") or "unknown")
         by_source[source_kind] = by_source.get(source_kind, 0) + 1
-    active_runs = [run for run in runs if _is_active_run(run)]
+    terminal_boards = {
+        str((item.get("execution") or {}).get("board") or "")
+        for item in work_items
+        if item.get("status") in {"shipped", "archived"}
+    }
+    active_runs = [run for run in runs if _is_active_run(run) and str(run.get("board") or "") not in terminal_boards]
     return {
         "total_work_items": len(work_items),
         "inbox": sum(1 for item in work_items if _is_inbox_work_item(item))
