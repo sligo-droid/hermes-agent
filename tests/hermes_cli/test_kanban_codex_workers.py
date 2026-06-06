@@ -421,6 +421,80 @@ def test_role_worker_recovers_completed_json_with_fresh_connection_after_poisone
     assert latest.summary == "Dev finished with valid JSON."
 
 
+def test_role_worker_recovers_recorded_json_when_backend_raises_after_recording(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+
+    board = "discord-worker-recorded-recover-result"
+    kanban_db.create_board(board, name="Recorded recovery board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Dev",
+            assignee=ROLE_DEV,
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+    finally:
+        conn.close()
+
+    payload = {
+        "status": "completed",
+        "summary": "Dev result was recorded before cleanup failed.",
+        "changed_files": ["hermes_cli/kanban_codex_worker.py"],
+        "tests": [],
+        "handoff": {
+            "changed_files": ["hermes_cli/kanban_codex_worker.py"],
+            "tests": [],
+            "verification": [],
+            "preview": {"url": "", "command": "", "status": "not_run"},
+            "smoke_routes": [],
+            "known_warnings": [],
+            "notes": "",
+        },
+        "blocker": None,
+        "pr_ready": False,
+    }
+
+    def backend_records_then_raises(*args, **kwargs):
+        result = SimpleNamespace(
+            final_text=json.dumps(payload),
+            error=None,
+            backend="opencode",
+            exit_code=0,
+        )
+        worker.record_codex_worker_result(task_id, board=board, result=result)
+        raise RuntimeError("post-result cleanup failed")
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_CODEX_WORKER_ROLE", ROLE_DEV)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(worker, "_build_prompt", lambda _conn, _task_id, _role: "prompt")
+    monkeypatch.setattr(worker, "_run_role_backend", backend_records_then_raises)
+    monkeypatch.setattr(worker, "_checkpoint_commit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "mark_dispatch_dirty", lambda **_kwargs: None)
+
+    assert worker.main() == 0
+
+    conn = kanban_db.connect(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        latest = kanban_db.latest_run(conn, task_id)
+    finally:
+        conn.close()
+    assert task is not None
+    assert task.status == "done"
+    assert latest is not None
+    assert latest.outcome == "completed"
+    assert latest.summary == "Dev result was recorded before cleanup failed."
+
+
 def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_workers as workers
     from hermes_cli import discord_worker_read
