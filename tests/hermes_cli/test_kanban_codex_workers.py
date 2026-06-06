@@ -280,7 +280,7 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     pid = workers.spawn_codex_worker(task, str(workspace), board=board.slug)
 
     assert pid == 4321
-    assert captured["cmd"][1:] == ["-m", "hermes_cli.kanban_codex_worker"]
+    assert captured["cmd"] == workers._host_worker_cmd()
     assert captured["cwd"] == str(workspace.resolve())
     assert captured["env"]["HERMES_CODEX_WORKER_ROLE"] == "planner"
     assert captured["env"]["HERMES_CODEX_WORKER_REASONING"] == "xhigh"
@@ -297,6 +297,45 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     assert captured["env"].get("HERMES_CODEX_WORKER_CREDENTIAL_ID") != "parent-cred"
     assert captured["env"]["GH_CONFIG_DIR"] == str(gh_dir)
     assert captured["start_new_session"] is True
+
+
+def test_codex_role_worker_pythonpath_prefers_runtime_venv_owner(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    runtime_root = tmp_path / "canonical-hermes"
+    project_worktree = tmp_path / "workspaces" / "hermes-discord-old-branch"
+    (runtime_root / "hermes_cli").mkdir(parents=True)
+    (project_worktree / "hermes_cli").mkdir(parents=True)
+    python = runtime_root / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(project_worktree))
+    captured = {}
+
+    class Proc:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, cwd, stdout, stderr, env, start_new_session):
+        captured.update({"cmd": cmd, "cwd": cwd, "env": env})
+        return Proc()
+
+    monkeypatch.setattr(workers.sys, "executable", str(python))
+    monkeypatch.setattr(workers, "_worker_config", lambda: {"codex_home_root": str(tmp_path / "homes")})
+    monkeypatch.setattr(workers, "_write_minimal_codex_home", lambda path: None)
+    monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
+
+    pid = workers.spawn_codex_worker(task, str(project_worktree), board=board.slug)
+
+    assert pid == 4321
+    pythonpath = captured["env"]["PYTHONPATH"].split(os.pathsep)
+    assert pythonpath[0] == str(runtime_root)
+    assert str(project_worktree) in pythonpath[1:]
+    assert captured["cwd"] == str(project_worktree.resolve())
 
 
 def test_codex_role_worker_uses_systemd_worker_handle_when_enabled(monkeypatch, tmp_path):
@@ -351,7 +390,7 @@ def test_codex_role_worker_uses_systemd_worker_handle_when_enabled(monkeypatch, 
     assert isinstance(handle, kanban_db._SpawnHandle)
     assert handle.pid == 2468
     assert handle.unit == f"{captured['unit_name']}.service"
-    assert captured["cmd"][1:] == ["-m", "hermes_cli.kanban_codex_worker"]
+    assert captured["cmd"] == workers._host_worker_cmd()
     assert captured["workspace"] == str(workspace.resolve())
     assert captured["env"]["HERMES_CODEX_WORKER_ROLE"] == "planner"
     assert captured["env"]["HERMES_CODING_WORKER_BACKEND"] == "codex"
@@ -392,6 +431,32 @@ def test_systemd_worker_env_keeps_role_worker_runtime_keys(monkeypatch, tmp_path
     assert filtered["CODEX_HOME"] == str(tmp_path / "codex-home")
     assert "DISCORD_BOT_TOKEN" not in filtered
     assert "OPENAI_API_KEY" not in filtered
+
+
+def test_repo_root_falls_back_to_imported_checkout_outside_venv(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+
+    python = tmp_path / "python"
+    python.write_text("", encoding="utf-8")
+    monkeypatch.setattr(workers.sys, "executable", str(python))
+
+    assert workers._repo_root() == Path(workers.__file__).resolve().parent.parent
+
+
+def test_host_worker_cmd_uses_absolute_runtime_script(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+
+    runtime_root = tmp_path / "canonical-hermes"
+    (runtime_root / "hermes_cli").mkdir(parents=True)
+    python = runtime_root / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+    monkeypatch.setattr(workers.sys, "executable", str(python))
+
+    assert workers._host_worker_cmd() == [
+        str(python),
+        str(runtime_root / "hermes_cli" / "kanban_codex_worker.py"),
+    ]
 
 
 def test_codex_role_worker_falls_back_to_direct_spawn_when_systemd_launch_fails(monkeypatch, tmp_path):
@@ -1148,6 +1213,44 @@ def test_docker_runner_mounts_gh_config_read_only(monkeypatch, tmp_path):
     assert "-e" in captured["cmd"]
     assert "GH_CONFIG_DIR" in captured["cmd"]
     assert "GH_CONFIG_DIR=/gh-config" not in captured["cmd"]
+
+
+def test_docker_runner_uses_absolute_runtime_script(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    captured = {}
+
+    class Proc:
+        pid = 9876
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, cwd, stdout, stderr, env, start_new_session):
+        captured.update({"cmd": cmd, "env": env, "cwd": cwd})
+        return Proc()
+
+    monkeypatch.setattr(
+        workers,
+        "_worker_config",
+        lambda: {
+            "runner": "docker",
+            "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
+            "codex_home_root": str(tmp_path / "homes"),
+        },
+    )
+    monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
+
+    workers.spawn_codex_worker(task, str(tmp_path / "repo"), board=board.slug)
+
+    assert captured["cmd"][-3:] == [
+        "ghcr.io/nousresearch/hermes-codex-worker:latest",
+        "python",
+        "/hermes/hermes_cli/kanban_codex_worker.py",
+    ]
+    assert captured["env"]["PYTHONPATH"] == "/hermes"
 
 
 def test_docker_runner_forwards_public_frontend_env_only(monkeypatch, tmp_path):
