@@ -38,6 +38,7 @@ type WorkerConsoleSnapshot = {
   worker_log_path: string;
   worker_log_tail: string;
   codex_state: unknown;
+  operator_console_text?: string;
   updated_at: number;
 };
 
@@ -89,11 +90,14 @@ function snapshotConsoleText(snapshot: WorkerConsoleSnapshot, reason: string): s
     `stream: ${reason}`,
     "",
   ];
-  const log = snapshot.worker_log_tail?.trimEnd();
-  if (log) {
-    lines.push(log);
+  const activity = snapshot.operator_console_text?.trimEnd();
+  if (activity) {
+    lines.push(activity);
+  } else if (snapshot.worker_log_tail?.trimEnd()) {
+    lines.push("[worker log]");
+    lines.push(snapshot.worker_log_tail.trimEnd());
   } else {
-    lines.push("[worker log] waiting for worker output");
+    lines.push("[backend activity] waiting for Codex/OpenCode events");
   }
   return `${lines.join("\r\n")}\r\n`;
 }
@@ -176,7 +180,7 @@ export default function WorkerConsolePage() {
     const term = termRef.current;
     if (!snapshot || !term || streamReceivedRef.current) return;
     if (terminalStatus === "connected") return;
-    const marker = `${snapshot.updated_at}:${snapshot.worker_log_tail.length}:${terminalStatus}`;
+    const marker = `${snapshot.updated_at}:${snapshot.operator_console_text?.length || 0}:${snapshot.worker_log_tail.length}:${terminalStatus}`;
     if (fallbackSnapshotRef.current === marker) return;
     fallbackSnapshotRef.current = marker;
     writeSnapshotFallback(
@@ -215,7 +219,7 @@ export default function WorkerConsolePage() {
     streamReceivedRef.current = false;
     fallbackSnapshotRef.current = "";
     if (snapshotRef.current) {
-      fallbackSnapshotRef.current = `${snapshotRef.current.updated_at}:${snapshotRef.current.worker_log_tail.length}:connecting`;
+      fallbackSnapshotRef.current = `${snapshotRef.current.updated_at}:${snapshotRef.current.operator_console_text?.length || 0}:${snapshotRef.current.worker_log_tail.length}:connecting`;
       writeSnapshotFallback(term, snapshotRef.current, "REST snapshot while websocket connects");
     }
 
@@ -301,7 +305,13 @@ export default function WorkerConsolePage() {
   const logText = snapshot?.worker_log_tail?.trim()
     ? snapshot.worker_log_tail
     : "(no worker log captured yet)";
-  const codexJson = snapshot ? JSON.stringify(snapshot.codex_state || {}, null, 2) : "{}";
+  const codexState = snapshot?.codex_state && typeof snapshot.codex_state === "object"
+    ? (snapshot.codex_state as Record<string, unknown>)
+    : {};
+  const toolTraceCount = Array.isArray(codexState.tool_trace) ? codexState.tool_trace.length : 0;
+  const backendEventCount = Array.isArray(codexState.events) ? codexState.events.length : 0;
+  const truncatedEvents = typeof codexState.truncated_events === "number" ? codexState.truncated_events : 0;
+  const hasResult = Boolean(codexState.result);
   const run = snapshot?.current_run;
 
   return (
@@ -355,7 +365,7 @@ export default function WorkerConsolePage() {
       <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,1fr)_390px]">
         <section className="flex min-h-[520px] min-w-0 flex-col overflow-hidden rounded-lg border border-current/20 bg-black/70">
           <div className="flex items-center justify-between border-b border-current/15 px-3 py-2 text-xs text-text-secondary">
-            <span>OpenCode/Codex worker log (read-only)</span>
+            <span>Codex/OpenCode backend activity (read-only)</span>
             <span>{snapshot?.workspace.available ? snapshot.workspace.path : "workspace unavailable"}</span>
           </div>
           <div ref={hostRef} className="min-h-0 flex-1 p-2" />
@@ -391,13 +401,20 @@ export default function WorkerConsolePage() {
             </pre>
           </section>
 
-          <section className="max-h-64 overflow-hidden rounded-lg border border-current/20 bg-background-base/70">
+          <section className="rounded-lg border border-current/20 bg-background-base/70 p-3">
             <div className="border-b border-current/15 px-3 py-2 text-sm font-bold text-midground">
-              Backend state
+              Backend activity metadata
             </div>
-            <pre className="max-h-48 overflow-auto p-3 text-xs leading-relaxed text-text-secondary whitespace-pre-wrap">
-              {codexJson}
-            </pre>
+            <dl className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs text-text-secondary">
+              <dt>retained events</dt>
+              <dd>{backendEventCount}</dd>
+              <dt>truncated events</dt>
+              <dd>{truncatedEvents}</dd>
+              <dt>tool trace</dt>
+              <dd>{toolTraceCount}</dd>
+              <dt>result</dt>
+              <dd>{hasResult ? "captured" : "pending"}</dd>
+            </dl>
           </section>
         </aside>
       </div>
