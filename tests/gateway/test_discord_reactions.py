@@ -553,6 +553,51 @@ async def test_kanban_thread_reaction_prefers_explicit_reaction_state(adapter):
 
 
 @pytest.mark.asyncio
+async def test_kanban_thread_reaction_explicit_foreman_wins_over_stale_source_done(
+    adapter,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import kanban_db
+
+    conn = kanban_db.connect(board=kanban_db.DEFAULT_BOARD)
+    try:
+        source_task = kanban_db.create_task(conn, title="Default intake", assignee="default")
+        claimed = kanban_db.claim_task(conn, source_task)
+        assert claimed is not None
+        kanban_db.complete_task(conn, source_task, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+
+    message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="✅", me=True)],
+    )
+    thread = SimpleNamespace(id=123, starter_message=message)
+    adapter._resolve_summary_channel = AsyncMock(return_value=thread)
+
+    synced = await adapter.sync_kanban_thread_reaction(
+        {
+            "board": "discord-123",
+            "thread_id": "123",
+            "state": "done",
+            "reaction_state": "foreman",
+            "source_board": kanban_db.DEFAULT_BOARD,
+            "source_task_id": source_task,
+        }
+    )
+
+    assert synced == "foreman"
+    assert [call.args for call in message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="🔨",
+    )
+    message.add_reaction.assert_awaited_once_with("🔨")
+
+
+@pytest.mark.asyncio
 async def test_kanban_thread_reaction_repairs_summary_embed_and_source_op(adapter):
     op_message = SimpleNamespace(
         id=111,

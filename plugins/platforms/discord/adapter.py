@@ -1904,10 +1904,12 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _kanban_target_reaction_state(self, target: Dict[str, Any]) -> Optional[str]:
         state = str(target.get("state") or "").strip() or None
+        reaction_state = str(target.get("reaction_state") or "").strip() or None
+        if reaction_state == "foreman":
+            return reaction_state
         if state in {"done", "blocked", "errored"}:
             return state
         source_state = self._feature_source_task_reaction_state(target)
-        reaction_state = str(target.get("reaction_state") or "").strip() or None
         return source_state or reaction_state or state
 
     def _feature_kanban_summary_snapshot(

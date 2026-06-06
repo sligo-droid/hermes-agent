@@ -2270,7 +2270,7 @@ def board_thread_state(board: str) -> str:
                     return "errored"
             if blocked_tasks:
                 return "blocked"
-            if all(task.status == "done" for task in tasks):
+            if is_terminal and all(task.status == "done" for task in tasks):
                 return "done"
             if any(task.status == "running" for task in tasks):
                 return "running"

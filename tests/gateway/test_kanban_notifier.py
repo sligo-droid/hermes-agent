@@ -790,7 +790,7 @@ def test_discord_kanban_typing_watcher_skips_completed_status_sync(tmp_path, mon
     assert adapter.synced == []
 
 
-def test_discord_completed_worker_board_reaction_stays_done_with_stale_active_metadata(tmp_path, monkeypatch):
+def test_discord_completed_worker_board_reaction_stays_done_with_stale_active_source_metadata(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb
 
@@ -807,7 +807,22 @@ def test_discord_completed_worker_board_reaction_stays_done_with_stale_active_me
         kb.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
     finally:
         conn.close()
-    dwb._update_worker_meta(board.slug, {"goal_status": "running", "phase": "running"})
+    source_conn = kb.connect()
+    try:
+        source_task_id = kb.create_task(source_conn, title="Source task still active")
+        with source_conn:
+            source_conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (source_task_id,))
+    finally:
+        source_conn.close()
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "source_board": kb.DEFAULT_BOARD,
+            "source_task_id": source_task_id,
+        },
+    )
 
     assert dwb.board_thread_state(board.slug) == "done"
     assert dwb.board_thread_reaction_state(board.slug) == "done"
