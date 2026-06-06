@@ -261,6 +261,29 @@ class LSPClient:
         cmd = self._command
         if sys.platform == "win32":
             cmd = self._win_wrap_cmd(cmd)
+        child_scope = None
+        try:
+            from gateway.session_context import get_session_env
+            from hermes_cli.gateway_child_isolation import build_gateway_child_scope_argv
+
+            wrapped, child_scope = build_gateway_child_scope_argv(
+                cmd,
+                env=env,
+                cwd=self._cwd,
+                kind="lsp",
+                purpose=f"LSP server {self.server_id}",
+                command_label=self.server_id,
+                session_key=get_session_env("HERMES_SESSION_KEY", ""),
+            )
+            if child_scope.enabled:
+                cmd = wrapped
+                logger.debug(
+                    "Launching LSP server '%s' in gateway child scope %s",
+                    self.server_id,
+                    child_scope.unit,
+                )
+        except Exception as exc:
+            logger.debug("LSP gateway child scope wrapping unavailable: %s", exc)
 
         try:
             self._proc = await asyncio.create_subprocess_exec(
