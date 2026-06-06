@@ -2856,6 +2856,88 @@ def test_typing_targets_do_not_open_paused_corrupt_board(monkeypatch, tmp_path):
     assert dwb.running_discord_thread_typing_targets() == []
 
 
+def test_thread_status_targets_skip_unopenable_board_and_keep_healthy_target(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    healthy = _make_discord_board("2411")
+    broken = _make_discord_board("2412")
+
+    real_connect_closing = kanban_db.connect_closing
+
+    def fake_connect_closing(db_path=None, *, board=None):
+        if board == broken.slug:
+            raise sqlite3.DatabaseError("file is not a database")
+        return real_connect_closing(db_path=db_path, board=board)
+
+    monkeypatch.setattr(kanban_db, "connect_closing", fake_connect_closing)
+
+    targets = dwb.thread_status_targets()
+
+    assert [target["board"] for target in targets] == [healthy.slug]
+    assert targets[0]["thread_id"] == "2411"
+    assert targets[0]["state"] == "active"
+
+
+def test_thread_status_targets_do_not_open_paused_corrupt_board(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    _make_discord_board("2413")
+    incident = {"pause_reason": "kanban_db_corruption", "fingerprint": "same"}
+
+    monkeypatch.setattr(kanban_db, "is_board_paused_for_corruption", lambda board=None: incident)
+    monkeypatch.setattr(kanban_db, "_db_content_fingerprint", lambda _path: "same")
+
+    def fail_connect(*_args, **_kwargs):
+        raise AssertionError("paused corrupt board should not be opened")
+
+    monkeypatch.setattr(kanban_db, "connect_closing", fail_connect)
+
+    assert dwb.thread_status_targets() == []
+
+
+def test_thread_status_helpers_use_closing_connections(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = _make_discord_board("2414")
+    real_connect_closing = kanban_db.connect_closing
+    opened = 0
+    closed = 0
+
+    class CountingContext:
+        def __init__(self, context):
+            self._context = context
+            self._conn = None
+
+        def __enter__(self):
+            nonlocal opened
+            opened += 1
+            self._conn = self._context.__enter__()
+            return self._conn
+
+        def __exit__(self, exc_type, exc, tb):
+            nonlocal closed
+            closed += 1
+            return self._context.__exit__(exc_type, exc, tb)
+
+    def counted_connect_closing(db_path=None, *, board=None):
+        return CountingContext(real_connect_closing(db_path=db_path, board=board))
+
+    monkeypatch.setattr(kanban_db, "connect_closing", counted_connect_closing)
+
+    assert dwb.board_thread_state(board.slug) == "active"
+    assert dwb.board_thread_reaction_state(board.slug) == "active"
+    assert dwb.feature_summary_snapshot(board.slug)["board"] == board.slug
+
+    assert opened == closed
+    assert opened > 0
+
+
 def test_typing_target_enumeration_uses_closing_connections(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
