@@ -126,7 +126,7 @@ const CHAT_NAV_ITEM: NavItem = {
 
 const WORKERS_NAV_ITEM: NavItem = {
   path: "/workers",
-  label: "Workers",
+  label: "Kanban",
   icon: Wrench,
   reloadDocument: true,
 };
@@ -162,6 +162,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/sligo": CommandCenterPage,
   "/sligo/inbox": CommandCenterPage,
   "/sligo/work": CommandCenterPage,
+  "/sligo/rejected": CommandCenterPage,
   "/sligo/archive": CommandCenterPage,
   "/sligo/runs": CommandCenterPage,
   "/sligo/recommendations": CommandCenterPage,
@@ -175,6 +176,7 @@ const HERMES_HOST_REDIRECT_ROUTES: Record<string, ComponentType> = {
   "/sligo": HermesToSligoRedirect,
   "/sligo/inbox": HermesToSligoRedirect,
   "/sligo/work": HermesToSligoRedirect,
+  "/sligo/rejected": HermesToSligoRedirect,
   "/sligo/archive": HermesToSligoRedirect,
   "/sligo/runs": HermesToSligoRedirect,
   "/sligo/recommendations": HermesToSligoRedirect,
@@ -189,6 +191,7 @@ const SLIGO_ROUTES: Record<string, ComponentType> = {
   "/sligo": CommandCenterPage,
   "/sligo/inbox": CommandCenterPage,
   "/sligo/work": CommandCenterPage,
+  "/sligo/rejected": CommandCenterPage,
   "/sligo/archive": CommandCenterPage,
   "/sligo/runs": CommandCenterPage,
   "/sligo/recommendations": CommandCenterPage,
@@ -612,11 +615,12 @@ export default function App() {
       const commandCenterTabs = [
         { path: "/sligo", label: "Overview" },
         { path: "/sligo/inbox", label: "Inbox" },
-        { path: "/sligo/work", label: "Work" },
+        { path: "/sligo/work", label: "Active" },
+        { path: "/sligo/rejected", label: "Rejected" },
         { path: "/sligo/archive", label: "Archive" },
         { path: "/command-center", label: "Overview" },
         { path: "/self-improvement", label: "Overview" },
-        { path: "/workers", label: "Workers" },
+        { path: "/workers", label: "Kanban" },
       ];
       if (dashboardSurface === "sligo") {
         return [{ path: "/", label: "Overview" }, ...commandCenterTabs];

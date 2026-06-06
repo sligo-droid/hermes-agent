@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
-from hermes_cli.config import load_config_readonly
+from hermes_cli.config import cfg_get, load_config_readonly
 
 log = logging.getLogger(__name__)
 
@@ -345,6 +346,10 @@ def _initial_request(card: dict[str, Any]) -> str:
 def _project_context(card: dict[str, Any], channel_id: str) -> dict[str, Any]:
     project = str(card.get("project") or "self-improvement").strip()
     mapping = _project_mapping_for_key(project)
+    if not mapping or not str(mapping.get("project_path") or "").strip():
+        channel_mapping = _project_mapping_for_channel(channel_id)
+        if channel_mapping:
+            mapping = {**mapping, **channel_mapping}
     context = {
         "project_name": str(mapping.get("project_name") or project),
         "project_path": mapping.get("project_path"),
@@ -356,6 +361,34 @@ def _project_context(card: dict[str, Any], channel_id: str) -> dict[str, Any]:
         "self_improvement_prong": str(card.get("prong") or ""),
     }
     return {key: value for key, value in context.items() if value is not None}
+
+
+def _project_mapping_for_channel(channel_id: object) -> dict[str, Any]:
+    channel = str(channel_id or "").strip()
+    if not channel:
+        return {}
+    try:
+        cfg = load_config_readonly()
+    except Exception as exc:
+        log.debug("self-improvement Discord channel mapping lookup failed: %s", exc)
+        return {}
+    raw = cfg_get(cfg if isinstance(cfg, dict) else {}, "discord", "channel_cwds", default={})
+    if not isinstance(raw, dict):
+        return {}
+    configured = raw.get(channel) or raw.get(str(channel))
+    if not configured:
+        return {}
+    project_path = Path(str(configured)).expanduser()
+    if not project_path.is_absolute() or not project_path.is_dir():
+        return {}
+    project_path = project_path.resolve()
+    return {
+        "project_key": project_path.name,
+        "project_name": project_path.name,
+        "project_path": str(project_path),
+        "source": "configured_channel_cwd",
+        "channel_id": channel,
+    }
 
 
 def _acceptance_criteria(card: dict[str, Any]) -> list[str]:

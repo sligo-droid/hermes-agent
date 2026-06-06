@@ -9,37 +9,7 @@ import { cn } from "@/lib/utils";
 import { ArrowLeft, ExternalLink, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
-
-type WorkerConsoleSnapshot = {
-  board: string;
-  backend: "codex" | "opencode" | string;
-  task: {
-    id: string;
-    title: string;
-    status: string;
-    assignee?: string | null;
-    worker_pid?: number | null;
-    current_run_id?: number | null;
-  };
-  workspace: {
-    path: string;
-    kind: string;
-    available: boolean;
-  };
-  current_run?: {
-    id?: number | null;
-    status?: string | null;
-    outcome?: string | null;
-    worker_pid?: number | null;
-    started_at?: number | null;
-    last_heartbeat_at?: number | null;
-  } | null;
-  events: unknown[];
-  worker_log_path: string;
-  worker_log_tail: string;
-  codex_state: unknown;
-  updated_at: number;
-};
+import { snapshotConsoleText, type WorkerConsoleSnapshot } from "./workerConsoleTerminal";
 
 function workerPath(sessionId: string, taskId?: string, suffix = ""): string {
   const base = `/workers/${encodeURIComponent(sessionId)}`;
@@ -68,34 +38,6 @@ function buildConsoleWsUrl(
 function formatTimestamp(value?: number | null): string {
   if (!value) return "-";
   return new Date(value * 1000).toLocaleString();
-}
-
-function terminalSafeLine(value: unknown): string {
-  return String(value ?? "-").replace(/\r/g, " ").replace(/\n/g, " ");
-}
-
-function snapshotConsoleText(snapshot: WorkerConsoleSnapshot, reason: string): string {
-  const run = snapshot.current_run;
-  const lines = [
-    "Hermes worker console (read-only)",
-    `ticket: ${terminalSafeLine(snapshot.task.id)}`,
-    `title: ${terminalSafeLine(snapshot.task.title)}`,
-    `status: ${terminalSafeLine(snapshot.task.status)}`,
-    `backend: ${terminalSafeLine(snapshot.backend || "unknown")}`,
-    `run: ${terminalSafeLine(run?.id || snapshot.task.current_run_id || "-")}`,
-    `pid: ${terminalSafeLine(run?.worker_pid || snapshot.task.worker_pid || "-")}`,
-    `workspace: ${terminalSafeLine(snapshot.workspace.path || "-")}`,
-    `worker log: ${terminalSafeLine(snapshot.worker_log_path || "-")}`,
-    `stream: ${reason}`,
-    "",
-  ];
-  const log = snapshot.worker_log_tail?.trimEnd();
-  if (log) {
-    lines.push(log);
-  } else {
-    lines.push("[worker log] waiting for worker output");
-  }
-  return `${lines.join("\r\n")}\r\n`;
 }
 
 function writeSnapshotFallback(
@@ -176,7 +118,7 @@ export default function WorkerConsolePage() {
     const term = termRef.current;
     if (!snapshot || !term || streamReceivedRef.current) return;
     if (terminalStatus === "connected") return;
-    const marker = `${snapshot.updated_at}:${snapshot.worker_log_tail.length}:${terminalStatus}`;
+    const marker = `${snapshot.updated_at}:${snapshot.operator_console_text?.length || 0}:${snapshot.worker_log_tail.length}:${terminalStatus}`;
     if (fallbackSnapshotRef.current === marker) return;
     fallbackSnapshotRef.current = marker;
     writeSnapshotFallback(
@@ -215,7 +157,7 @@ export default function WorkerConsolePage() {
     streamReceivedRef.current = false;
     fallbackSnapshotRef.current = "";
     if (snapshotRef.current) {
-      fallbackSnapshotRef.current = `${snapshotRef.current.updated_at}:${snapshotRef.current.worker_log_tail.length}:connecting`;
+      fallbackSnapshotRef.current = `${snapshotRef.current.updated_at}:${snapshotRef.current.operator_console_text?.length || 0}:${snapshotRef.current.worker_log_tail.length}:connecting`;
       writeSnapshotFallback(term, snapshotRef.current, "REST snapshot while websocket connects");
     }
 
@@ -301,7 +243,13 @@ export default function WorkerConsolePage() {
   const logText = snapshot?.worker_log_tail?.trim()
     ? snapshot.worker_log_tail
     : "(no worker log captured yet)";
-  const codexJson = snapshot ? JSON.stringify(snapshot.codex_state || {}, null, 2) : "{}";
+  const codexState = snapshot?.codex_state && typeof snapshot.codex_state === "object"
+    ? (snapshot.codex_state as Record<string, unknown>)
+    : {};
+  const toolTraceCount = Array.isArray(codexState.tool_trace) ? codexState.tool_trace.length : 0;
+  const backendEventCount = Array.isArray(codexState.events) ? codexState.events.length : 0;
+  const truncatedEvents = typeof codexState.truncated_events === "number" ? codexState.truncated_events : 0;
+  const hasResult = Boolean(codexState.result);
   const run = snapshot?.current_run;
 
   return (
@@ -355,7 +303,7 @@ export default function WorkerConsolePage() {
       <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,1fr)_390px]">
         <section className="flex min-h-[520px] min-w-0 flex-col overflow-hidden rounded-lg border border-current/20 bg-black/70">
           <div className="flex items-center justify-between border-b border-current/15 px-3 py-2 text-xs text-text-secondary">
-            <span>OpenCode/Codex worker log (read-only)</span>
+            <span>Codex/OpenCode backend activity (read-only)</span>
             <span>{snapshot?.workspace.available ? snapshot.workspace.path : "workspace unavailable"}</span>
           </div>
           <div ref={hostRef} className="min-h-0 flex-1 p-2" />
@@ -391,13 +339,20 @@ export default function WorkerConsolePage() {
             </pre>
           </section>
 
-          <section className="max-h-64 overflow-hidden rounded-lg border border-current/20 bg-background-base/70">
+          <section className="rounded-lg border border-current/20 bg-background-base/70 p-3">
             <div className="border-b border-current/15 px-3 py-2 text-sm font-bold text-midground">
-              Backend state
+              Backend activity metadata
             </div>
-            <pre className="max-h-48 overflow-auto p-3 text-xs leading-relaxed text-text-secondary whitespace-pre-wrap">
-              {codexJson}
-            </pre>
+            <dl className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs text-text-secondary">
+              <dt>retained events</dt>
+              <dd>{backendEventCount}</dd>
+              <dt>truncated events</dt>
+              <dd>{truncatedEvents}</dd>
+              <dt>tool trace</dt>
+              <dd>{toolTraceCount}</dd>
+              <dt>result</dt>
+              <dd>{hasResult ? "captured" : "pending"}</dd>
+            </dl>
           </section>
         </aside>
       </div>

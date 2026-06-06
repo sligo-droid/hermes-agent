@@ -9,20 +9,23 @@ def test_work_state_is_only_command_center_navigation_filter():
     assert "function WorkStatePanel" in source
     assert "function ProjectTabs" in source
     assert "Issue Pulse" not in source
-    work_state_source = source.split("function WorkStatePanel", 1)[1].split("function ActionButton", 1)[0]
+    work_state_source = source.split("function WorkStatePanel", 1)[1].split("function ProjectTabs", 1)[0]
     assert "Work State" in work_state_source
     assert "Command Center lanes" in work_state_source
-    for lane in ("Overview", "Inbox", "Work", "Archive", "Workers"):
+    for lane in ("Overview", "Inbox", "Active", "Rejected", "Archive"):
         assert lane in work_state_source
+    lane_order = [work_state_source.index(f'label: "{lane}"') for lane in ("Overview", "Inbox", "Active", "Rejected", "Archive")]
+    assert lane_order == sorted(lane_order)
     assert "Work states by status" not in source
     assert "onSelectStatus" not in source
     assert "activeStatus" not in source
     assert "status bar" not in source.lower()
     assert "role=\"list\"" not in work_state_source
     assert "<button" not in work_state_source
-    assert 'href={lane.href} key={lane.key} rel="noopener noreferrer" target="_blank"' in work_state_source
+    assert 'key: "workers"' not in work_state_source
+    assert 'href="/workers"' not in work_state_source
     assert 'if (normalized.includes("/runs")) return "runs";' in source
-    assert "opens in a new tab" in work_state_source
+    assert 'if (normalized.includes("/rejected")) return "rejected";' in source
 
 
 def test_command_center_project_tabs_render_above_work_state_and_preserve_lanes():
@@ -32,9 +35,13 @@ def test_command_center_project_tabs_render_above_work_state_and_preserve_lanes(
 
     assert "Command Center projects" in source
     assert "command-center-project-tabs" in source
+    assert "command-center-project-tab-row" in source
     assert "projects={snapshot?.projects ?? []}" in source
     assert "to={{ pathname, search: tabSearch(project.key) }}" in source
     assert "to={{ pathname: lane.href, search }}" in source
+    assert 'href="/workers" rel="noopener noreferrer" target="_blank"' in source
+    assert "Kanban <ExternalLink" in source
+    assert "opens in a new tab" in source.split("function ProjectTabs", 1)[1].split("function ActionButton", 1)[0]
     assert render_source.index("<ProjectTabs") < render_source.index("<WorkStatePanel")
     for forbidden in ("Operator Surface", "KPI", "status distribution"):
         assert forbidden not in source
@@ -52,6 +59,32 @@ def test_command_center_worker_rows_and_ticket_links_open_new_tabs():
     assert 'href={item.execution.task_url} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank"' in card_source
 
 
+def test_command_center_rows_use_visual_status_indicators_without_visible_status_labels():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    styles = (ROOT / "web/src/index.css").read_text(encoding="utf-8")
+    card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
+
+    assert "function StatusPill" not in source
+    assert "function RunningIndicator" not in source
+    assert "function StatusGlyph" in source
+    assert "function StatusRail" in source
+    assert "function runningDescriptor" in source
+    assert "const running = isRunningWorkItem(item);" in card_source
+    assert "command-center-card-running" in card_source
+    assert "<StatusRail status={visualStatus} />" in card_source
+    assert "command-center-status-rail" in source
+    assert "{running && <RunningMeter />}" in card_source
+    assert "command-center-live-meter" in source
+    assert "<StatusPill" not in source
+    assert "<span>Running</span>" not in source
+    assert "{value || \"unknown\"}" not in source
+    assert "aria-label={`Status:" in source
+    assert "command-center-status-breathe" in styles
+    assert "command-center-running-chip" not in styles
+    assert ".sligo-light .command-center-card-running" in styles
+    assert ".sligo-light .command-center-status-running.command-center-status-indicator" in styles
+
+
 def test_command_center_archive_action_is_one_click_without_removing_other_prompts():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
     archive_branch = source.split('if (kind === "archive") {', 1)[1].split('} else if (proposalId && kind === "approve")', 1)[0]
@@ -59,18 +92,68 @@ def test_command_center_archive_action_is_one_click_without_removing_other_promp
     assert "window.confirm" not in archive_branch
     assert "archiveKanbanBoard" in archive_branch
     assert "haltSelfImprovementProposal" in archive_branch
-    assert 'window.prompt("Reject reason for future prong feedback?"' in source
+    assert 'window.prompt("Reject reason for future prong feedback?"' not in source
     assert 'window.prompt("Reason for revert follow-up?"' in source
+
+
+def test_command_center_reject_action_is_one_click_and_uses_default_reason():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    handle_source = source.split("const handleAction = useCallback", 1)[1].split("return (", 1)[0]
+    run_action_source = source.split("const runActionForItem = useCallback", 1)[1].split("const handleAction = useCallback", 1)[0]
+
+    assert 'const DEFAULT_REJECT_REASON = "Operator rejected from Command Center.";' in source
+    assert 'window.prompt("Reject reason for future prong feedback?"' not in source
+    assert 'const rejectReason = kind === "reject" ? DEFAULT_REJECT_REASON : undefined;' in handle_source
+    assert "if (kind === \"reject\" && !rejectReason) return;" not in handle_source
+    assert "await api.rejectSelfImprovementProposal(proposalId, rejectReason);" in run_action_source
+    assert "targetItems" in handle_source
+
+
+def test_command_center_rejected_lane_is_separate_and_paginated():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+
+    assert 'type ViewKey = "overview" | "inbox" | "work" | "rejected" | "archive"' in source
+    assert 'type PaginatedViewKey = "overview" | "inbox" | "work" | "rejected" | "archive";' in source
+    assert 'function isRejectedItem(item: CommandCenterWorkItem): boolean' in source
+    assert 'return item.status === "archived";' in source
+    assert 'return item.status === "rejected";' in source
+    assert 'if (normalized === "rejected") return "rejected";' in source
+    assert 'rejected: { label: "Rejected", icon: X' in source
+    assert 'rejected: rejectedItems.length' in source
+    assert 'const pagedRejectedItems = useMemo(() => pageSlice(rejectedItems, pages.rejected)' in source
+    assert 'activeView === "rejected"' in source
+    assert 'setPage("rejected", page)' in source
+    assert '<PaginationControls label="rejected"' in source
 
 
 def test_command_center_archive_action_renders_last_in_row_rail():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    action_source = source.split("function availableActionKinds", 1)[1].split("function actionSet", 1)[0]
     row_rail = source.split('className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3"', 1)[1].split("</div>", 1)[0]
 
-    assert row_rail.index('kind="approve"') < row_rail.index('kind="reject"')
-    assert row_rail.index('kind="resume"') < row_rail.index('kind="archive"')
-    assert row_rail.index('kind="pause"') < row_rail.index('kind="archive"')
-    assert row_rail.index('kind="undo"') < row_rail.index('kind="archive"')
+    assert action_source.index('actions.push("approve", "reject")') < action_source.index('actions.push("archive")')
+    assert action_source.index('actions.push("replay")') < action_source.index('actions.push("archive")')
+    assert action_source.index('actions.push("pause")') < action_source.index('actions.push("archive")')
+    assert action_source.index('actions.push("undo")') < action_source.index('actions.push("archive")')
+    assert "actions.map((kind)" in row_rail
+    assert "kind={kind}" in row_rail
+
+
+def test_command_center_repair_action_wiring_and_footer_removed():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    api_source = (ROOT / "web/src/lib/api.ts").read_text(encoding="utf-8")
+    action_source = source.split("function availableActionKinds", 1)[1].split("function actionSet", 1)[0]
+
+    assert "Wrench" in source
+    assert 'repair: "Repairing"' in source
+    assert 'repair: { label: "Repair", icon: Wrench' in source
+    assert 'actions.push("repair")' in action_source
+    assert 'api.repairKanbanBoard(board' in source
+    assert 'repair_action?: string | null;' in api_source
+    assert '/boards/${encodeURIComponent(slug)}/repair' in api_source
+    assert "Worker-board work rolls up" not in source
+    assert "snapshot?.summary" not in source
+    assert "Send" not in source
 
 
 def test_command_center_row_actions_lock_during_refresh_settle():
@@ -79,12 +162,12 @@ def test_command_center_row_actions_lock_during_refresh_settle():
     handle_source = source.split("const handleAction = useCallback", 1)[1].split("return (", 1)[0]
 
     assert "const ACTION_SETTLE_MS = 600" in source
-    assert "const actionDisabled = (kind: ActionKind) => Boolean(activeAction) && !actionBusy(kind);" in card_source
+    assert "const actionDisabled = (kind: ActionKind) => (Boolean(activeAction) && !actionBusy(kind)) || (selectionActive && (!selected || !multiSelectActionCommon.has(kind)));" in card_source
     assert "aria-busy={rowBusy || undefined}" in card_source
     assert "<div aria-busy={rowBusy}" in card_source
     assert "aria-live=\"polite\"" in card_source
-    for kind in ("approve", "reject", "resume", "pause", "undo", "archive"):
-        assert f'disabled={{actionDisabled("{kind}")}}' in card_source
+    assert "const disabled = actionDisabled(kind);" in card_source
+    assert "disabled={disabled}" in card_source
     assert "if (activeAction) return;" in handle_source
     assert "delayBeforeApplyMs: Math.max(0, ACTION_SETTLE_MS - (Date.now() - startedAt))" in handle_source
     assert "settleAfterApplyMs: ACTION_SETTLE_MS" in handle_source
@@ -110,6 +193,14 @@ def test_sligo_shell_has_no_duplicate_top_tab_navigation():
     assert "Sligo operator navigation" not in shell_source
     assert "<SligoNavLink" not in shell_source
     assert "Refresh Command Center" in shell_source
+
+
+def test_sligo_rejected_route_is_registered():
+    source = (ROOT / "web/src/App.tsx").read_text(encoding="utf-8")
+
+    assert '"/sligo/rejected": CommandCenterPage' in source
+    assert '"/sligo/rejected": HermesToSligoRedirect' in source
+    assert '{ path: "/sligo/rejected", label: "Rejected" }' in source
 
 
 def test_sligo_shell_refresh_feedback_and_light_toggle():

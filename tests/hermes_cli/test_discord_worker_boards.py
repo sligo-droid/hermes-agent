@@ -1172,6 +1172,56 @@ def test_persisted_board_run_summary_drives_terminal_surfaces(monkeypatch, tmp_p
     assert "PR merge: CLEAN; checks: passed" in html
 
 
+def test_board_surfaces_crashed_ticket_error_summary(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(dwb, "_now", lambda: 300)
+    board = dwb.set_goal(thread_id="5165", goal="Crash visibly")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, started_at, ended_at, "
+            "outcome, summary, error, metadata) "
+            "VALUES (?, 'crashed', ?, ?, 'crashed', NULL, ?, ?)",
+            (
+                task.id,
+                100,
+                120,
+                "pid 123 not alive",
+                json.dumps({"pid": 123, "unit": "worker.service"}),
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='blocked', last_failure_error=? WHERE id=?",
+            ("pid 123 not alive", task.id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    snapshot = dwb.public_board_snapshot_for_session("5165")
+    card = next(item for item in snapshot["tasks"] if item["id"] == task.id)
+    assert card["latest_summary"] == "pid 123 not alive"
+
+    summary = dwb.persist_board_run_summary(board.slug)
+    summary_task = next(item for item in summary["latest_tasks"] if item["id"] == task.id)
+    assert summary_task["latest_summary"] == "pid 123 not alive"
+    assert summary["blocked_reason"] == "pid 123 not alive"
+    assert summary["pr"]["state"] == "unknown"
+    assert summary["deployment_status"] == "not checked"
+    assert summary["final_response"]["text"] == ""
+
+    state = dwb.ticket_state_for_session("5165", task.id)
+    assert state["current_run"]["error"] == "pid 123 not alive"
+    assert state["current_run"]["metadata"]["pid"] == 123
+    terminal = dwb.ticket_terminal_feed_for_session("5165", task.id)
+    assert terminal["current_run"]["error"] == "pid 123 not alive"
+    assert terminal["current_run"]["metadata"]["pid"] == 123
+
+
 def test_new_goal_clears_stale_terminal_summary_and_pr(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -2168,12 +2218,62 @@ def test_worker_ticket_console_returns_operator_state_and_log_paths(monkeypatch,
         "kind": "dir",
         "available": True,
     }
-    assert "sk-proj-console-visible" in data["worker_log_tail"]
-    assert "sk-proj-console-event" in rendered
+    assert "operator log" in data["worker_log_tail"]
+    assert "raw event" in rendered
+    assert "sk-proj-console-visible" not in rendered
+    assert "sk-proj-console-event" not in rendered
     assert stream["log_path"] == str(log_path)
     assert stream["state_path"].endswith(f"{task.id}.codex-state.json")
     assert stream["snapshot"]["workspace"]["path"] == str(workspace)
     assert stream["snapshot"]["task"]["id"] == task.id
+
+
+def test_worker_ticket_console_serves_retained_log_when_task_row_missing(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from fastapi.testclient import TestClient
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+    board = dwb.set_goal(thread_id="8187", goal="Inspect retained operator console")
+    missing_task_id = "t_missing42"
+    log_path = kanban_db.worker_log_path(missing_task_id, board=board.slug)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    kanban_db._append_worker_log_line(log_path, "retained worker log line")
+    dwb.record_codex_worker_event(
+        missing_task_id,
+        board=board.slug,
+        event={
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "commandExecution",
+                    "command": "python -m retained",
+                    "status": "completed",
+                    "exit_code": 0,
+                    "aggregatedOutput": "retained command output",
+                }
+            },
+        },
+    )
+
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    resp = client.get(f"/api/workers/8187/tickets/{missing_task_id}/console")
+    stream = dwb.worker_ticket_console_log_for_session("8187", missing_task_id)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["task"]["id"] == missing_task_id
+    assert data["task"]["status"] == "log-only"
+    assert data["log_only"] is True
+    assert "retained worker log line" in data["worker_log_tail"]
+    assert "[command completed]" in data["operator_console_text"]
+    assert "python -m retained" in data["operator_console_text"]
+    assert "output: hidden" in data["operator_console_text"]
+    assert "retained command output" not in data["operator_console_text"]
+    assert stream["log_path"] == str(log_path)
+    assert stream["snapshot"]["task"]["status"] == "log-only"
 
 
 def test_worker_ticket_terminal_labels_opencode_state(monkeypatch, tmp_path):

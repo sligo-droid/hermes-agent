@@ -250,18 +250,24 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
-def test_discord_worker_dir_task_inherits_board_worktree_path(kanban_home, tmp_path):
-    board = "discord-12345"
-    worktree = tmp_path / "hermes-discord-12345"
+def _write_discord_worker_meta(board: str, *, worktree_path: str, default_workdir: str | None = None) -> None:
     kb.create_board(board)
     meta_path = kb.board_metadata_path(board)
     meta = kb.read_board_metadata(board)
     meta.pop("db_path", None)
+    if default_workdir is not None:
+        meta["default_workdir"] = default_workdir
     meta["discord_worker"] = {
         "kind": "discord_worker_board",
-        "worktree_path": str(worktree),
+        "worktree_path": worktree_path,
     }
     meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+
+def test_discord_worker_dir_task_inherits_board_worktree_path(kanban_home, tmp_path):
+    board = "discord-12345"
+    worktree = tmp_path / "hermes-discord-12345"
+    _write_discord_worker_meta(board, worktree_path=str(worktree))
 
     with kb.connect(board=board) as conn:
         task_id = kb.create_task(
@@ -277,18 +283,33 @@ def test_discord_worker_dir_task_inherits_board_worktree_path(kanban_home, tmp_p
     assert task.workspace_path == str(worktree)
 
 
+def test_discord_worker_dir_task_worktree_wins_over_default_workdir(kanban_home, tmp_path):
+    board = "discord-default-workdir"
+    worktree = tmp_path / "hermes-discord-default"
+    runtime_default = tmp_path / "canonical-checkout"
+    _write_discord_worker_meta(
+        board,
+        worktree_path=str(worktree),
+        default_workdir=str(runtime_default),
+    )
+
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="repair",
+            workspace_kind="dir",
+            board=board,
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    assert task.workspace_path == str(worktree)
+
+
 def test_resolve_workspace_uses_discord_worker_worktree_for_legacy_dir_task(kanban_home, tmp_path):
     board = "discord-legacy"
     worktree = tmp_path / "hermes-discord-legacy"
-    kb.create_board(board)
-    meta_path = kb.board_metadata_path(board)
-    meta = kb.read_board_metadata(board)
-    meta.pop("db_path", None)
-    meta["discord_worker"] = {
-        "kind": "discord_worker_board",
-        "worktree_path": str(worktree),
-    }
-    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    _write_discord_worker_meta(board, worktree_path=str(worktree))
 
     with kb.connect(board=board) as conn:
         task_id = kb.create_task(
@@ -312,15 +333,7 @@ def test_dispatch_uses_discord_worker_worktree_for_legacy_dir_task(
 ):
     board = "discord-dispatch"
     worktree = tmp_path / "hermes-discord-dispatch"
-    kb.create_board(board)
-    meta_path = kb.board_metadata_path(board)
-    meta = kb.read_board_metadata(board)
-    meta.pop("db_path", None)
-    meta["discord_worker"] = {
-        "kind": "discord_worker_board",
-        "worktree_path": str(worktree),
-    }
-    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    _write_discord_worker_meta(board, worktree_path=str(worktree))
     spawns = []
 
     def fake_spawn(task, workspace):
@@ -343,6 +356,7 @@ def test_dispatch_uses_discord_worker_worktree_for_legacy_dir_task(
 
     assert result.auto_blocked == []
     assert spawns == [(task_id, str(worktree))]
+    assert task is not None
     assert task.workspace_path == str(worktree)
     assert task.status == "running"
 
@@ -652,27 +666,27 @@ def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
         assert "reclaimed" not in kinds
 
 
-def test_claim_seeds_task_and_run_heartbeat(kanban_home):
+def test_claim_leaves_task_and_run_heartbeat_unset_until_worker_reports(kanban_home):
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="seed heartbeat", assignee="a")
+        task_id = kb.create_task(conn, title="await heartbeat", assignee="a")
         claimed = kb.claim_task(conn, task_id)
 
         assert claimed is not None
-        assert claimed.last_heartbeat_at is not None
+        assert claimed.last_heartbeat_at is None
         run = kb.latest_run(conn, task_id)
         assert run is not None
         assert run.last_heartbeat_at == claimed.last_heartbeat_at
 
 
-def test_review_claim_seeds_task_and_run_heartbeat(kanban_home):
+def test_review_claim_leaves_task_and_run_heartbeat_unset_until_worker_reports(kanban_home):
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="review seed", assignee="a")
+        task_id = kb.create_task(conn, title="review await heartbeat", assignee="a")
         _set_task_status(conn, task_id, "review")
 
         claimed = kb.claim_review_task(conn, task_id)
 
         assert claimed is not None
-        assert claimed.last_heartbeat_at is not None
+        assert claimed.last_heartbeat_at is None
         run = kb.latest_run(conn, task_id)
         assert run is not None
         assert run.last_heartbeat_at == claimed.last_heartbeat_at
@@ -2960,6 +2974,21 @@ def test_latest_summary_skips_empty_string(kanban_home):
         )
         conn.commit()
         assert kb.latest_summary(conn, t) == "real handoff"
+
+
+def test_latest_summary_uses_latest_error_when_no_summary(kanban_home):
+    """Crashed worker attempts should still provide a useful card summary."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="crashed", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, started_at, ended_at, "
+            "outcome, summary, error) VALUES (?, 'crashed', ?, ?, 'crashed', NULL, ?)",
+            (t, int(time.time()), int(time.time()) + 1, "pid 123 not alive"),
+        )
+        conn.commit()
+
+        assert kb.latest_summary(conn, t) == "pid 123 not alive"
+        assert kb.latest_summaries(conn, [t]) == {t: "pid 123 not alive"}
 
 
 def test_latest_summaries_batch_omits_tasks_without_summary(kanban_home):

@@ -8,11 +8,13 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sqlite3
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -188,6 +190,152 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_command_center_repair_creates_idempotent_foreman_task(client):
+    board = "repair-action-board"
+    kb.write_board_metadata(board, name="Repair Action Board")
+    conn = kb.connect(board=board)
+    try:
+        blocked_task_id = kb.create_task(
+            conn,
+            title="Blocked worker ticket",
+            assignee="dev",
+            initial_status="blocked",
+        )
+    finally:
+        conn.close()
+
+    payload = {
+        "task_id": blocked_task_id,
+        "work_item_id": f"kanban-board:{board}",
+        "title": "Blocked worker ticket",
+        "status": "blocked",
+        "detail": "worker stalled",
+    }
+    first = client.post(f"/api/plugins/kanban/boards/{board}/repair", json=payload)
+    assert first.status_code == 200, first.text
+    first_body = first.json()
+    assert first_body["created"] is True
+    repair_task = first_body["task"]
+    assert repair_task["status"] == "ready"
+    assert repair_task["assignee"] == "foreman"
+    assert repair_task["created_by"] == "command-center-repair"
+    assert repair_task["priority"] == 1_000_000
+    assert repair_task["max_runtime_seconds"] == 1800
+    assert repair_task["idempotency_key"] == f"command-center-repair:{board}:{blocked_task_id}"
+    assert "Use the foreman profile/role" in repair_task["body"]
+    assert "Post-repair root-cause follow-up" in repair_task["body"]
+    assert "durable or fundamental Hermes repository fix" in repair_task["body"]
+    assert "Do not auto-apply repository code changes" in repair_task["body"]
+    assert "directly required to unstick the board" in repair_task["body"]
+    assert "exactly one separate human-decision Command Center row" in repair_task["body"]
+    assert "proposed self-improvement card" in repair_task["body"]
+    assert "project: hermes" in repair_task["body"]
+    assert "prong: system-doctor" in repair_task["body"]
+    assert "self_improvement.proposal_run.v1" in repair_task["body"]
+    assert "self_improvement.proposal_storage.ingest_proposal_output" in repair_task["body"]
+    assert "title, summary/body, rationale, scope, and verification" in repair_task["body"]
+    assert first_body["worker_url"].endswith(f"/workers/{board}/tickets/{repair_task['id']}")
+
+    from hermes_cli import kanban_codex_workers as workers
+
+    assert workers._role_backend("foreman", "codex", SimpleNamespace(**repair_task)) == "opencode"
+
+    board_rollup = client.post(f"/api/plugins/kanban/boards/{board}/repair", json={"title": "Board rollup"})
+    assert board_rollup.status_code == 200, board_rollup.text
+    board_rollup_body = board_rollup.json()
+    assert board_rollup_body["created"] is False
+    assert board_rollup_body["task"]["id"] == repair_task["id"]
+
+    second = client.post(f"/api/plugins/kanban/boards/{board}/repair", json=payload)
+    assert second.status_code == 200, second.text
+    second_body = second.json()
+    assert second_body["created"] is False
+    assert second_body["task"]["id"] == repair_task["id"]
+
+    conn = kb.connect(board=board)
+    try:
+        assert kb.complete_task(conn, repair_task["id"], summary="repair complete") is True
+    finally:
+        conn.close()
+
+    third = client.post(f"/api/plugins/kanban/boards/{board}/repair", json=payload)
+    assert third.status_code == 200, third.text
+    third_body = third.json()
+    assert third_body["created"] is True
+    assert third_body["task"]["id"] != repair_task["id"]
+    assert third_body["task"]["status"] == "ready"
+    assert third_body["task"]["assignee"] == "foreman"
+    assert third_body["task"]["idempotency_key"].startswith(f"command-center-repair:{board}:{blocked_task_id}:")
+
+    fourth = client.post(f"/api/plugins/kanban/boards/{board}/repair", json=payload)
+    assert fourth.status_code == 200, fourth.text
+    fourth_body = fourth.json()
+    assert fourth_body["created"] is False
+    assert fourth_body["task"]["id"] == third_body["task"]["id"]
+
+    conn = kb.connect(board=board)
+    try:
+        repair_tasks = [
+            task for task in kb.list_tasks(conn, include_archived=False)
+            if task.created_by == "command-center-repair"
+        ]
+    finally:
+        conn.close()
+    assert [task.id for task in repair_tasks] == [repair_task["id"], third_body["task"]["id"]]
+
+
+def test_command_center_repair_uses_discord_worker_worktree(client):
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = "discord-repair-worktree"
+    worker_path = "/tmp/hermes-test-worker-worktree"
+    meta = kb.write_board_metadata(board, name="Discord Repair Worktree")
+    meta.pop("db_path", None)
+    meta[dwb.DISCORD_WORKER_META_KEY] = {
+        "kind": "discord_worker_board",
+        "worktree_path": worker_path,
+        "project_path": "/tmp/hermes-test-project",
+    }
+    kb.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+
+    response = client.post(f"/api/plugins/kanban/boards/{board}/repair", json={"title": "Board rollup"})
+
+    assert response.status_code == 200, response.text
+    task = response.json()["task"]
+    assert task["created_by"] == "command-center-repair"
+    assert task["workspace_kind"] == "dir"
+    assert task["workspace_path"] == worker_path
+
+
+def test_command_center_repair_inherits_source_task_workspace(client):
+    board = "repair-source-workspace"
+    workspace_path = "/tmp/hermes-test-source-worktree"
+    kb.write_board_metadata(board, name="Repair Source Workspace")
+    conn = kb.connect(board=board)
+    try:
+        blocked_task_id = kb.create_task(
+            conn,
+            title="Blocked worker ticket",
+            assignee="dev",
+            workspace_kind="dir",
+            workspace_path=workspace_path,
+            initial_status="blocked",
+        )
+    finally:
+        conn.close()
+
+    response = client.post(
+        f"/api/plugins/kanban/boards/{board}/repair",
+        json={"task_id": blocked_task_id, "title": "Blocked worker ticket"},
+    )
+
+    assert response.status_code == 200, response.text
+    task = response.json()["task"]
+    assert task["created_by"] == "command-center-repair"
+    assert task["workspace_kind"] == "dir"
+    assert task["workspace_path"] == workspace_path
+
+
 def test_self_improvement_approve_is_idempotent_and_audited(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
@@ -317,6 +465,74 @@ def test_board_pause_resume_and_archive_stops_live_generic_board(client):
         conn.close()
 
 
+def test_discord_worker_board_resume_replays_blocked_tickets(client):
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = "discord-replay-blocked"
+    meta = kb.write_board_metadata(board, name="Discord Replay Blocked")
+    meta.pop("db_path", None)
+    meta[dwb.DISCORD_WORKER_META_KEY] = {
+        "kind": "discord_worker_board",
+        "goal_status": "paused",
+        "phase": "paused",
+        "phase_before_pause": "dev",
+        "paused": True,
+        "paused_reason": "operator pause",
+    }
+    kb.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    conn = kb.connect(board=board)
+    try:
+        blocked_id = kb.create_task(conn, title="Blocked worker", board=board, initial_status="blocked")
+        scheduled_id = kb.create_task(conn, title="Scheduled worker", board=board)
+        assert kb.schedule_task(conn, scheduled_id, reason="waiting") is True
+        archived_id = kb.create_task(conn, title="Archived worker", board=board, initial_status="blocked")
+        kb.archive_task(conn, archived_id)
+        with conn:
+            conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                (blocked_id, "running", 100, None, None),
+            )
+            run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', current_run_id = ?, consecutive_failures = 2, last_failure_error = 'stale' WHERE id = ?",
+                (run_id, blocked_id),
+            )
+    finally:
+        conn.close()
+
+    resumed = client.post(f"/api/plugins/kanban/boards/{board}/resume")
+
+    assert resumed.status_code == 200, resumed.text
+    result = resumed.json()["result"]
+    assert result["resumed"] is True
+    assert set(result["replayed_task_ids"]) == {blocked_id, scheduled_id}
+    marker = dwb.dispatch_dirty_marker_path()
+    assert result["dispatch_dirty"] == str(marker)
+    assert marker.exists()
+    marker_payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert marker_payload["board"] == board
+    assert marker_payload["reason"] == "command-center-replay"
+    worker = kb.read_board_metadata(board)[dwb.DISCORD_WORKER_META_KEY]
+    assert worker["goal_status"] == "active"
+    assert worker["phase"] == "dev"
+    assert worker["paused"] is False
+    assert "paused_reason" not in worker
+    conn = kb.connect(board=board)
+    try:
+        blocked = kb.get_task(conn, blocked_id)
+        scheduled = kb.get_task(conn, scheduled_id)
+        archived = kb.get_task(conn, archived_id)
+        assert blocked.status == "ready"
+        assert blocked.current_run_id is None
+        assert blocked.consecutive_failures == 0
+        assert blocked.last_failure_error is None
+        assert scheduled.status == "ready"
+        assert archived.status == "archived"
+        assert kb.claim_task(conn, blocked_id) is not None
+    finally:
+        conn.close()
+
+
 def test_self_improvement_undo_followup_for_done_task_is_idempotent(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
@@ -339,6 +555,29 @@ def test_self_improvement_undo_followup_for_done_task_is_idempotent(client):
     audit = proposal_storage.list_audit_events(card["proposal_id"])
     assert audit[-1]["action"] == "undo_followup_requested"
     assert audit[-1]["metadata"]["followup_task_id"] == first.json()["task"]["id"]
+
+
+def test_self_improvement_undo_followup_inherits_completed_task_workspace(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    assert approved.status_code == 200, approved.text
+    task_id = approved.json()["task"]["id"]
+    workspace_path = "/tmp/hermes-test-self-improvement"
+    conn = kb.connect()
+    try:
+        with conn:
+            conn.execute("UPDATE tasks SET workspace_kind = 'dir', workspace_path = ? WHERE id = ?", (workspace_path, task_id))
+        kb.complete_task(conn, task_id, summary="implemented")
+    finally:
+        conn.close()
+
+    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/undo-followup")
+
+    assert response.status_code == 200, response.text
+    followup = response.json()["task"]
+    assert followup["workspace_kind"] == "dir"
+    assert followup["workspace_path"] == workspace_path
 
 
 def test_self_improvement_approve_creates_task_on_discord_thread_board(client, monkeypatch):
@@ -508,9 +747,34 @@ def test_self_improvement_approve_falls_back_without_discord_channel(client, mon
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
         task = kb.get_task(conn, response.json()["task"]["id"])
         assert task is not None
-        assert task.workspace_kind == "dir"
+        assert task.workspace_kind == "scratch"
         assert task.workspace_path is None
         assert task.max_runtime_seconds is None
+    finally:
+        conn.close()
+
+
+def test_self_improvement_approve_ignores_board_default_workdir_for_worker_jobs(client, monkeypatch):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    kb.write_board_metadata("default", default_workdir=str(Path(__file__).resolve().parents[2]))
+
+    monkeypatch.setattr(discord_publish, "configured_project_channel_id", lambda project: "")
+    monkeypatch.setattr(
+        discord_publish,
+        "publish_approved_proposal",
+        lambda card_arg, *, channel_id, existing=None: (_ for _ in ()).throw(AssertionError("should not publish")),
+    )
+
+    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+
+    assert response.status_code == 200, response.text
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, response.json()["task"]["id"])
+        assert task is not None
+        assert task.workspace_kind == "scratch"
+        assert task.workspace_path is None
     finally:
         conn.close()
 

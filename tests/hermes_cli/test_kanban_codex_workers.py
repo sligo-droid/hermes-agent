@@ -143,6 +143,358 @@ def test_coding_worker_activity_heartbeat_is_best_effort(monkeypatch):
     worker._heartbeat_worker_activity("t1", board="b1", force=True)
 
 
+def test_role_completion_recovers_when_run_pointer_rotates_but_claim_is_owned(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = "discord-race"
+    kanban_db.create_board(board, name="Race board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Dev ticket",
+            assignee="dev",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+        original_run_id = claimed.current_run_id
+        replacement = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
+            "claim_expires, started_at) VALUES (?, ?, 'running', ?, ?, ?)",
+            (task_id, "dev", claimed.claim_lock, claimed.claim_expires, int(time.time())),
+        )
+        conn.execute(
+            "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+            (replacement.lastrowid, task_id),
+        )
+        conn.commit()
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claimed.claim_lock)
+
+        completed = worker._complete_role_task(
+            conn,
+            task_id,
+            summary="Implemented in checkpoint commit.",
+            metadata={"raw": {"status": "completed"}},
+            expected_run_id=original_run_id,
+        )
+
+        task = kanban_db.get_task(conn, task_id)
+        latest = kanban_db.latest_run(conn, task_id)
+    finally:
+        conn.close()
+
+    assert completed is True
+    assert task is not None
+    assert task.status == "done"
+    assert latest is not None
+    assert latest.outcome == "completed"
+    assert latest.summary == "Implemented in checkpoint commit."
+
+
+def test_role_completion_does_not_recover_when_claim_is_not_owned(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = "discord-race-unowned"
+    kanban_db.create_board(board, name="Race board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Dev ticket", assignee="dev")
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+        conn.execute(
+            "UPDATE tasks SET current_run_id = current_run_id + 1 WHERE id = ?",
+            (task_id,),
+        )
+        conn.commit()
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "someone-else")
+
+        completed = worker._complete_role_task(
+            conn,
+            task_id,
+            summary="Should not complete.",
+            metadata={"raw": {"status": "completed"}},
+            expected_run_id=claimed.current_run_id,
+        )
+
+        task = kanban_db.get_task(conn, task_id)
+    finally:
+        conn.close()
+
+    assert completed is False
+    assert task is not None
+    assert task.status == "running"
+
+
+def test_role_worker_exits_zero_after_recording_backend_blocker(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+
+    board = "discord-worker-error"
+    kanban_db.create_board(board, name="Worker error board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Review", assignee=ROLE_REVIEWER)
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_CODEX_WORKER_ROLE", ROLE_REVIEWER)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(worker, "_build_prompt", lambda _conn, _task_id, _role: "prompt")
+    monkeypatch.setattr(
+        worker,
+        "_run_role_backend",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("backend exploded")),
+    )
+    monkeypatch.setattr(worker, "mark_dispatch_dirty", lambda **_kwargs: None)
+
+    assert worker.main() == 0
+
+    conn = kanban_db.connect(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        latest = kanban_db.latest_run(conn, task_id)
+    finally:
+        conn.close()
+    assert task is not None
+    assert task.status == "blocked"
+    assert latest is not None
+    assert latest.outcome == "blocked"
+    assert "backend exploded" in (latest.summary or "")
+
+
+def test_role_worker_recovers_completed_json_after_transient_apply_failure(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+
+    board = "discord-worker-recover-result"
+    kanban_db.create_board(board, name="Worker recovery board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Review", assignee=ROLE_REVIEWER)
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+    finally:
+        conn.close()
+
+    payload = {
+        "status": "blocked",
+        "summary": "Reviewer could not finish.",
+        "findings": [],
+        "new_tasks": [],
+        "criteria_assessment": {},
+        "blocker": "Need operator input.",
+    }
+    real_apply = worker._apply_role_output
+    calls = {"count": 0}
+
+    def flaky_apply(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("transient sqlite lock after result")
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_CODEX_WORKER_ROLE", ROLE_REVIEWER)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(worker, "_build_prompt", lambda _conn, _task_id, _role: "prompt")
+    monkeypatch.setattr(
+        worker,
+        "_run_role_backend",
+        lambda *args, **kwargs: SimpleNamespace(final_text=json.dumps(payload), error=None),
+    )
+    monkeypatch.setattr(worker, "_apply_role_output", flaky_apply)
+    monkeypatch.setattr(worker, "mark_dispatch_dirty", lambda **_kwargs: None)
+
+    assert worker.main() == 0
+    assert calls["count"] == 2
+
+    conn = kanban_db.connect(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        latest = kanban_db.latest_run(conn, task_id)
+    finally:
+        conn.close()
+    assert task is not None
+    assert task.status == "blocked"
+    assert latest is not None
+    assert latest.outcome == "blocked"
+    assert latest.summary == "Need operator input."
+
+
+def test_role_worker_recovers_completed_json_with_fresh_connection_after_poisoned_conn(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+
+    board = "discord-worker-fresh-recover-result"
+    kanban_db.create_board(board, name="Fresh recovery board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Dev",
+            assignee=ROLE_DEV,
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+    finally:
+        conn.close()
+
+    payload = {
+        "status": "completed",
+        "summary": "Dev finished with valid JSON.",
+        "changed_files": ["hermes_cli/kanban_codex_worker.py"],
+        "tests": [
+            {
+                "command": "scripts/run_tests.sh tests/hermes_cli/test_kanban_codex_workers.py",
+                "result": "passed",
+                "output": "ok",
+            }
+        ],
+        "handoff": {
+            "changed_files": ["hermes_cli/kanban_codex_worker.py"],
+            "tests": [],
+            "verification": [],
+            "preview": {"url": "", "command": "", "status": "not_run"},
+            "smoke_routes": [],
+            "known_warnings": [],
+            "notes": "",
+        },
+        "blocker": None,
+        "pr_ready": False,
+    }
+    real_apply = worker._apply_role_output
+    calls = {"count": 0}
+
+    def poison_first_connection(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            args[0].close()
+            raise RuntimeError("sqlite connection died after model result")
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_CODEX_WORKER_ROLE", ROLE_DEV)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(worker, "_build_prompt", lambda _conn, _task_id, _role: "prompt")
+    monkeypatch.setattr(
+        worker,
+        "_run_role_backend",
+        lambda *args, **kwargs: SimpleNamespace(final_text=json.dumps(payload), error=None),
+    )
+    monkeypatch.setattr(worker, "_apply_role_output", poison_first_connection)
+    monkeypatch.setattr(worker, "_checkpoint_commit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "mark_dispatch_dirty", lambda **_kwargs: None)
+
+    assert worker.main() == 0
+    assert calls["count"] == 2
+
+    conn = kanban_db.connect(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        latest = kanban_db.latest_run(conn, task_id)
+    finally:
+        conn.close()
+    assert task is not None
+    assert task.status == "done"
+    assert latest is not None
+    assert latest.outcome == "completed"
+    assert latest.summary == "Dev finished with valid JSON."
+
+
+def test_role_worker_recovers_recorded_json_when_backend_raises_after_recording(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+
+    board = "discord-worker-recorded-recover-result"
+    kanban_db.create_board(board, name="Recorded recovery board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Dev",
+            assignee=ROLE_DEV,
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+    finally:
+        conn.close()
+
+    payload = {
+        "status": "completed",
+        "summary": "Dev result was recorded before cleanup failed.",
+        "changed_files": ["hermes_cli/kanban_codex_worker.py"],
+        "tests": [],
+        "handoff": {
+            "changed_files": ["hermes_cli/kanban_codex_worker.py"],
+            "tests": [],
+            "verification": [],
+            "preview": {"url": "", "command": "", "status": "not_run"},
+            "smoke_routes": [],
+            "known_warnings": [],
+            "notes": "",
+        },
+        "blocker": None,
+        "pr_ready": False,
+    }
+
+    def backend_records_then_raises(*args, **kwargs):
+        result = SimpleNamespace(
+            final_text=json.dumps(payload),
+            error=None,
+            backend="opencode",
+            exit_code=0,
+        )
+        worker.record_codex_worker_result(task_id, board=board, result=result)
+        raise RuntimeError("post-result cleanup failed")
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_CODEX_WORKER_ROLE", ROLE_DEV)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(worker, "_build_prompt", lambda _conn, _task_id, _role: "prompt")
+    monkeypatch.setattr(worker, "_run_role_backend", backend_records_then_raises)
+    monkeypatch.setattr(worker, "_checkpoint_commit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "mark_dispatch_dirty", lambda **_kwargs: None)
+
+    assert worker.main() == 0
+
+    conn = kanban_db.connect(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        latest = kanban_db.latest_run(conn, task_id)
+    finally:
+        conn.close()
+    assert task is not None
+    assert task.status == "done"
+    assert latest is not None
+    assert latest.outcome == "completed"
+    assert latest.summary == "Dev result was recorded before cleanup failed."
+
+
 def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_workers as workers
     from hermes_cli import discord_worker_read
@@ -192,7 +544,7 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     pid = workers.spawn_codex_worker(task, str(workspace), board=board.slug)
 
     assert pid == 4321
-    assert captured["cmd"][1:] == ["-m", "hermes_cli.kanban_codex_worker"]
+    assert captured["cmd"] == workers._host_worker_cmd()
     assert captured["cwd"] == str(workspace.resolve())
     assert captured["env"]["HERMES_CODEX_WORKER_ROLE"] == "planner"
     assert captured["env"]["HERMES_CODEX_WORKER_REASONING"] == "xhigh"
@@ -209,6 +561,45 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     assert captured["env"].get("HERMES_CODEX_WORKER_CREDENTIAL_ID") != "parent-cred"
     assert captured["env"]["GH_CONFIG_DIR"] == str(gh_dir)
     assert captured["start_new_session"] is True
+
+
+def test_codex_role_worker_pythonpath_prefers_runtime_venv_owner(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    runtime_root = tmp_path / "canonical-hermes"
+    project_worktree = tmp_path / "workspaces" / "hermes-discord-old-branch"
+    (runtime_root / "hermes_cli").mkdir(parents=True)
+    (project_worktree / "hermes_cli").mkdir(parents=True)
+    python = runtime_root / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(project_worktree))
+    captured = {}
+
+    class Proc:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, cwd, stdout, stderr, env, start_new_session):
+        captured.update({"cmd": cmd, "cwd": cwd, "env": env})
+        return Proc()
+
+    monkeypatch.setattr(workers.sys, "executable", str(python))
+    monkeypatch.setattr(workers, "_worker_config", lambda: {"codex_home_root": str(tmp_path / "homes")})
+    monkeypatch.setattr(workers, "_write_minimal_codex_home", lambda path: None)
+    monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
+
+    pid = workers.spawn_codex_worker(task, str(project_worktree), board=board.slug)
+
+    assert pid == 4321
+    pythonpath = captured["env"]["PYTHONPATH"].split(os.pathsep)
+    assert pythonpath[0] == str(runtime_root)
+    assert str(project_worktree) in pythonpath[1:]
+    assert captured["cwd"] == str(project_worktree.resolve())
 
 
 def test_codex_role_worker_uses_systemd_worker_handle_when_enabled(monkeypatch, tmp_path):
@@ -263,7 +654,7 @@ def test_codex_role_worker_uses_systemd_worker_handle_when_enabled(monkeypatch, 
     assert isinstance(handle, kanban_db._SpawnHandle)
     assert handle.pid == 2468
     assert handle.unit == f"{captured['unit_name']}.service"
-    assert captured["cmd"][1:] == ["-m", "hermes_cli.kanban_codex_worker"]
+    assert captured["cmd"] == workers._host_worker_cmd()
     assert captured["workspace"] == str(workspace.resolve())
     assert captured["env"]["HERMES_CODEX_WORKER_ROLE"] == "planner"
     assert captured["env"]["HERMES_CODING_WORKER_BACKEND"] == "codex"
@@ -304,6 +695,32 @@ def test_systemd_worker_env_keeps_role_worker_runtime_keys(monkeypatch, tmp_path
     assert filtered["CODEX_HOME"] == str(tmp_path / "codex-home")
     assert "DISCORD_BOT_TOKEN" not in filtered
     assert "OPENAI_API_KEY" not in filtered
+
+
+def test_repo_root_falls_back_to_imported_checkout_outside_venv(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+
+    python = tmp_path / "python"
+    python.write_text("", encoding="utf-8")
+    monkeypatch.setattr(workers.sys, "executable", str(python))
+
+    assert workers._repo_root() == Path(workers.__file__).resolve().parent.parent
+
+
+def test_host_worker_cmd_uses_absolute_runtime_script(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+
+    runtime_root = tmp_path / "canonical-hermes"
+    (runtime_root / "hermes_cli").mkdir(parents=True)
+    python = runtime_root / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+    monkeypatch.setattr(workers.sys, "executable", str(python))
+
+    assert workers._host_worker_cmd() == [
+        str(python),
+        str(runtime_root / "hermes_cli" / "kanban_codex_worker.py"),
+    ]
 
 
 def test_codex_role_worker_falls_back_to_direct_spawn_when_systemd_launch_fails(monkeypatch, tmp_path):
@@ -634,6 +1051,53 @@ def test_planner_worker_env_carries_effective_opencode_backend(monkeypatch, tmp_
     assert "scheduled OpenCode role worker: role=planner reasoning=xhigh mode=normal" in log
 
 
+def test_command_center_repair_foreman_schedules_opencode_with_codex_config(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+    from hermes_cli import kanban_db
+    from agent import opencode_worker as ow
+
+    _home(monkeypatch, tmp_path)
+    board = "repair-opencode-board"
+    kanban_db.create_board(board, name="Repair OpenCode Board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Repair blocked board",
+            assignee="foreman",
+            created_by="command-center-repair",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        task = kanban_db.claim_task(conn, task_id)
+    finally:
+        conn.close()
+    assert task is not None
+    captured = {}
+
+    class Proc:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, cwd, stdout, stderr, env, start_new_session):
+        captured.update({"env": env})
+        return Proc()
+
+    monkeypatch.setattr(workers, "_worker_config", lambda: {"backend": "codex"})
+    monkeypatch.setattr(ow, "check_opencode_binary", lambda: (True, "/bin/opencode"))
+    monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
+
+    workers.spawn_codex_worker(task, str(tmp_path), board=board)
+
+    assert captured["env"]["HERMES_CODING_WORKER_BACKEND"] == "opencode"
+    log = kanban_db.read_worker_log(task.id, board=board)
+    assert log is not None
+    assert "scheduled OpenCode role worker: role=foreman reasoning=xhigh mode=normal" in log
+
+
 def test_role_extra_args_use_scheduled_runtime_env(monkeypatch):
     from hermes_cli import kanban_codex_worker as worker
 
@@ -761,6 +1225,7 @@ def test_role_extra_args_default_reasoning_by_role(monkeypatch):
 
     assert worker._role_extra_args("planner")[1] == 'model_reasoning_effort="xhigh"'
     assert worker._role_extra_args("reviewer")[1] == 'model_reasoning_effort="xhigh"'
+    assert worker._role_extra_args("foreman")[1] == 'model_reasoning_effort="xhigh"'
     assert worker._role_extra_args("dev")[1] == 'model_reasoning_effort="medium"'
 
 
@@ -887,6 +1352,66 @@ def test_planner_role_uses_opencode_plan_agent(monkeypatch, tmp_path):
     assert calls[0][2]["reasoning_level"] == "xhigh"
 
 
+def test_opencode_role_receives_sanitized_env(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+    from agent import opencode_worker as ow
+
+    control_values = {
+        "HERMES_KANBAN_DB": str(tmp_path / "live" / "kanban.db"),
+        "HERMES_KANBAN_BOARD": "discord-1512532369897160735",
+        "HERMES_KANBAN_WORKSPACES_ROOT": str(tmp_path / "workspaces"),
+        "HERMES_KANBAN_TASK": "task-1",
+        "HERMES_KANBAN_RUN_ID": "run-1",
+        "HERMES_KANBAN_CLAIM_LOCK": "claim-1",
+        "HERMES_KANBAN_ROOT": str(tmp_path / "kanban-root"),
+    }
+    for key, value in control_values.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("HERMES_CODING_WORKER_BACKEND", "opencode")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("OPENAI_API_KEY", "credential-survives")
+    monkeypatch.setattr(worker, "record_codex_worker_result", lambda *args, **kwargs: None)
+    calls = []
+
+    def fake_run(prompt, workspace, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            final_text='{"status":"completed","summary":"ok","changed_files":[],"tests":[]}',
+            error=None,
+            interrupted=False,
+            timed_out=False,
+            should_retire=False,
+            tool_iterations=1,
+            thread_id="ses-build",
+            turn_id="ses-build",
+            backend="opencode",
+            agents=["build"],
+            plan_text="",
+            exit_code=0,
+        )
+
+    monkeypatch.setattr(ow, "run_opencode_task", fake_run)
+
+    result = worker._run_role_backend(
+        "prompt",
+        str(tmp_path),
+        ROLE_DEV,
+        task=SimpleNamespace(id="t_dev", title="Fix bug", body="Fix parser bug"),
+        task_id="t_dev",
+        board=None,
+    )
+
+    child_env = calls[0]["env"]
+    assert result.backend == "opencode"
+    for key in control_values:
+        assert key not in child_env
+        assert os.environ[key] == control_values[key]
+    assert child_env["HERMES_HOME"] == str(tmp_path / "hermes-home")
+    assert child_env["OPENAI_API_KEY"] == "credential-survives"
+    assert child_env["HERMES_DISCORD_WORKER_READ_ONLY"] == "1"
+
+
 def test_reviewer_role_does_not_use_opencode_backend(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli.discord_worker_boards import ROLE_REVIEWER
@@ -914,6 +1439,57 @@ def test_reviewer_role_does_not_use_opencode_backend(monkeypatch, tmp_path):
     )
 
     assert result.error is None
+
+
+def test_command_center_repair_foreman_runtime_uses_opencode_without_global_backend(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_FOREMAN
+    from agent import opencode_worker as ow
+
+    monkeypatch.setenv("HERMES_CODING_WORKER_BACKEND", "codex")
+    monkeypatch.setattr(worker, "record_codex_worker_result", lambda *args, **kwargs: None)
+    calls = []
+
+    def fake_run(prompt, workspace, **kwargs):
+        calls.append((prompt, workspace, kwargs))
+        return SimpleNamespace(
+            final_text=(
+                '{"status":"completed","summary":"ok",'
+                '"actions":[],"verification":[],"changed_tasks":[]}'
+            ),
+            error=None,
+            interrupted=False,
+            timed_out=False,
+            should_retire=False,
+            tool_iterations=1,
+            thread_id="ses-repair",
+            turn_id="ses-repair",
+            backend="opencode",
+            agents=["build"],
+            plan_text="",
+            exit_code=0,
+        )
+
+    monkeypatch.setattr(ow, "run_opencode_task", fake_run)
+
+    result = worker._run_role_backend(
+        "prompt",
+        str(tmp_path),
+        ROLE_FOREMAN,
+        task=SimpleNamespace(
+            id="t_repair",
+            title="Repair blocked board",
+            body="Recover board",
+            assignee=ROLE_FOREMAN,
+            created_by="command-center-repair",
+        ),
+        task_id="t_repair",
+        board=None,
+    )
+
+    assert result.backend == "opencode"
+    assert calls
+    assert calls[0][2]["force_plan"] is False
 
 
 def test_opencode_planner_output_creates_dev_ticket(monkeypatch, tmp_path):
@@ -1060,6 +1636,44 @@ def test_docker_runner_mounts_gh_config_read_only(monkeypatch, tmp_path):
     assert "-e" in captured["cmd"]
     assert "GH_CONFIG_DIR" in captured["cmd"]
     assert "GH_CONFIG_DIR=/gh-config" not in captured["cmd"]
+
+
+def test_docker_runner_uses_absolute_runtime_script(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    captured = {}
+
+    class Proc:
+        pid = 9876
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, cwd, stdout, stderr, env, start_new_session):
+        captured.update({"cmd": cmd, "env": env, "cwd": cwd})
+        return Proc()
+
+    monkeypatch.setattr(
+        workers,
+        "_worker_config",
+        lambda: {
+            "runner": "docker",
+            "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
+            "codex_home_root": str(tmp_path / "homes"),
+        },
+    )
+    monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
+
+    workers.spawn_codex_worker(task, str(tmp_path / "repo"), board=board.slug)
+
+    assert captured["cmd"][-3:] == [
+        "ghcr.io/nousresearch/hermes-codex-worker:latest",
+        "python",
+        "/hermes/hermes_cli/kanban_codex_worker.py",
+    ]
+    assert captured["env"]["PYTHONPATH"] == "/hermes"
 
 
 def test_docker_runner_forwards_public_frontend_env_only(monkeypatch, tmp_path):
@@ -1758,6 +2372,114 @@ def test_worker_prompt_mentions_discord_read_helper(monkeypatch, tmp_path):
     assert "python -m hermes_cli.discord_worker_read discord-request" not in prompt
 
 
+def test_foreman_role_prompt_and_guards_allow_repair_mutation(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_FOREMAN
+
+    board = "foreman-repair-board"
+    kanban_db.create_board(board, name="Foreman Repair Board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Repair blocked board",
+            body="Recover blocked worker-board tickets.",
+            assignee=ROLE_FOREMAN,
+            created_by="command-center-repair",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        prompt = worker._build_prompt(conn, task_id, ROLE_FOREMAN)
+    finally:
+        conn.close()
+
+    assert "You are the Discord Kanban foreman worker" in prompt
+    assert "safely mutate Kanban board/task state" in prompt
+    assert "mark dispatch dirty" in prompt
+    assert "retry, unblock, close, reassign" in prompt
+    assert "Use Discord worker read/control broker access only when necessary" in prompt
+    assert "not subject to the planner/dev/reviewer read-only" in prompt
+    assert "Do not create code-change PRs" in prompt
+    assert "follow_up_proposals" in prompt
+    assert "Command Center self-improvement proposal/job" in prompt
+    assert "durable repo fix discovered during repair" in prompt
+    assert "Keep secrets" in prompt
+    assert "Do not call mutation helpers" not in prompt
+    assert worker._role_pr_mutation_guard_env(ROLE_FOREMAN) == ({}, None)
+    assert worker._role_read_only_discord_env(ROLE_FOREMAN) == {}
+
+
+def test_foreman_runtime_defaults_to_xhigh_normal():
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_codex_workers as workers
+    from hermes_cli.discord_worker_boards import ROLE_FOREMAN
+
+    os.environ.pop("HERMES_CODEX_WORKER_REASONING", None)
+    os.environ.pop("HERMES_CODEX_WORKER_SERVICE_TIER", None)
+    settings = workers._role_runtime_settings(ROLE_FOREMAN, {}, None)
+
+    assert settings["reasoning"] == "xhigh"
+    assert settings["service_tier"] == "normal"
+    assert worker._worker_reasoning_effort(ROLE_FOREMAN) == "xhigh"
+
+
+def test_foreman_completed_output_completes_repair_task_without_dev_checkpoint(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_FOREMAN
+
+    board = "foreman-output-board"
+    kanban_db.create_board(board, name="Foreman Output Board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Repair blocked board",
+            assignee=ROLE_FOREMAN,
+            created_by="command-center-repair",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+        checkpoint_calls: list[tuple[str, str, str]] = []
+        monkeypatch.setattr(worker, "_checkpoint_commit", lambda workspace, task_id, summary: checkpoint_calls.append((workspace, task_id, summary)))
+        payload = {
+            "status": "completed",
+            "summary": "Recovered board.",
+            "actions": ["unblocked t1", "marked dispatch dirty"],
+            "verification": ["dispatch picked t1"],
+            "changed_tasks": [{"id": "t1", "action": "unblock", "status": "ready"}],
+        }
+
+        worker._apply_role_output(
+            conn,
+            task_id,
+            ROLE_FOREMAN,
+            payload,
+            board=board,
+            workspace=str(tmp_path),
+            expected_run_id=claimed.current_run_id,
+        )
+        task = kanban_db.get_task(conn, task_id)
+        run = kanban_db.latest_run(conn, task_id)
+    finally:
+        conn.close()
+
+    assert checkpoint_calls == []
+    assert task is not None
+    assert task.status == "done"
+    assert run is not None
+    assert run.outcome == "completed"
+    assert run.metadata["raw"] == payload
+    assert run.metadata["actions"] == payload["actions"]
+    assert run.metadata["verification"] == payload["verification"]
+    assert run.metadata["changed_tasks"] == payload["changed_tasks"]
+
+
 def test_run_codex_records_app_server_state(monkeypatch, tmp_path):
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_codex_worker as worker
@@ -1821,6 +2543,102 @@ def test_run_codex_records_app_server_state(monkeypatch, tmp_path):
     assert state["events"][0]["item_type"] == "commandExecution"
     assert "/home/droid/secret" not in rendered
     assert "[REDACTED_PATH]" in rendered
+
+
+def test_kanban_backend_child_env_scrubs_control_vars_without_mutating_role_env(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+
+    control_values = {
+        "HERMES_KANBAN_DB": str(tmp_path / "live" / "kanban.db"),
+        "HERMES_KANBAN_BOARD": "discord-1512532369897160735",
+        "HERMES_KANBAN_WORKSPACES_ROOT": str(tmp_path / "workspaces"),
+        "HERMES_KANBAN_TASK": "task-1",
+        "HERMES_KANBAN_RUN_ID": "run-1",
+        "HERMES_KANBAN_CLAIM_LOCK": "claim-1",
+        "HERMES_KANBAN_ROOT": str(tmp_path / "kanban-root"),
+    }
+    for key, value in control_values.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
+    monkeypatch.setenv("OPENAI_API_KEY", "credential-survives")
+    monkeypatch.setenv("VITE_PUBLIC_URL", "https://example.test")
+
+    child_env = worker._backend_child_env({"HERMES_DISABLE_MCP": "1"})
+
+    for key in control_values:
+        assert key not in child_env
+        assert os.environ[key] == control_values[key]
+    assert child_env["HERMES_HOME"] == str(tmp_path / "hermes-home")
+    assert child_env["PATH"] == "/usr/local/bin:/usr/bin"
+    assert child_env["OPENAI_API_KEY"] == "credential-survives"
+    assert child_env["VITE_PUBLIC_URL"] == "https://example.test"
+    assert child_env["HERMES_DISABLE_MCP"] == "1"
+
+
+def test_run_codex_passes_sanitized_replacement_env_to_app_server(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    control_values = {
+        "HERMES_KANBAN_DB": str(tmp_path / "live" / "kanban.db"),
+        "HERMES_KANBAN_BOARD": board.slug,
+        "HERMES_KANBAN_WORKSPACES_ROOT": str(tmp_path / "workspaces"),
+        "HERMES_KANBAN_TASK": task.id,
+        "HERMES_KANBAN_RUN_ID": "run-1",
+        "HERMES_KANBAN_CLAIM_LOCK": "claim-1",
+        "HERMES_KANBAN_ROOT": str(tmp_path / "kanban-root"),
+    }
+    for key, value in control_values.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("OPENAI_API_KEY", "credential-survives")
+    monkeypatch.setattr(worker, "record_codex_worker_result", lambda *args, **kwargs: None)
+    sessions = []
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            sessions.append(kwargs)
+
+        def run_turn(self, prompt, turn_timeout):
+            return SimpleNamespace(
+                final_text='{"status":"approved","summary":"ok","findings":[]}',
+                error=None,
+                interrupted=False,
+                timed_out=False,
+                should_retire=False,
+                tool_iterations=1,
+                turn_id="turn-1",
+                thread_id="thread-1",
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(worker, "CodexAppServerSession", FakeSession)
+
+    result = worker._run_codex(
+        "prompt",
+        str(workspace),
+        ROLE_REVIEWER,
+        task_id=task.id,
+        board=board.slug,
+    )
+
+    child_env = sessions[0]["env"]
+    assert result.turn_id == "turn-1"
+    assert sessions[0]["replace_env"] is True
+    for key in control_values:
+        assert key not in child_env
+        assert os.environ[key] == control_values[key]
+    assert child_env["HERMES_HOME"] == str(tmp_path / "hermes-home")
+    assert child_env["OPENAI_API_KEY"] == "credential-survives"
+    assert child_env["HERMES_DISCORD_WORKER_READ_ONLY"] == "1"
+    assert child_env["HERMES_KANBAN_WORKSPACE"] == str(workspace)
+    assert child_env["HERMES_DISABLE_MCP"] == "1"
 
 
 def test_run_codex_retries_auth_failure_with_next_pool_credential(monkeypatch, tmp_path):

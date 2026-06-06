@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 from agent.transports.codex_app_server_session import CodexAppServerSession
@@ -22,6 +23,7 @@ from hermes_cli.discord_worker_boards import (
     MERGE_POLICY_NEVER,
     PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL,
     ROLE_DEV,
+    ROLE_FOREMAN,
     ROLE_PLANNER,
     ROLE_REVIEWER,
     VALID_MERGE_POLICIES,
@@ -34,6 +36,7 @@ from hermes_cli.discord_worker_boards import (
 )
 
 _OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV}
+_COMMAND_CENTER_REPAIR_CREATED_BY = "command-center-repair"
 _CODEX_AUTH_RETRY_LIMIT = 2
 _PR_GUARDED_ROLES = {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER}
 _GH_PR_MUTATING_SUBCOMMANDS = {
@@ -66,6 +69,17 @@ _CODE_CHANGE_SIGNAL_RE = re.compile(
     re.IGNORECASE,
 )
 _KANBAN_ACTIVITY_HEARTBEAT_INTERVAL_SECONDS = 10
+KANBAN_CONTROL_ENV_VARS = frozenset(
+    {
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_RUN_ID",
+        "HERMES_KANBAN_CLAIM_LOCK",
+        "HERMES_KANBAN_ROOT",
+    }
+)
 _last_activity_heartbeat_at: dict[tuple[str, str], float] = {}
 
 
@@ -74,9 +88,11 @@ def main() -> int:
     board = os.environ.get("HERMES_KANBAN_BOARD", "").strip() or None
     role = os.environ.get("HERMES_CODEX_WORKER_ROLE", "").strip().lower()
     workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip() or os.getcwd()
-    if not task_id or role not in {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER}:
+    if not task_id or role not in {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER, ROLE_FOREMAN}:
         return 2
 
+    task = None
+    result: Any = None
     conn = kanban_db.connect(board=board)
     try:
         task = kanban_db.get_task(conn, task_id)
@@ -107,8 +123,45 @@ def main() -> int:
         )
         return 0
     except Exception as exc:
+        if _recover_completed_role_output(
+            conn,
+            task_id,
+            role,
+            result,
+            board=board,
+            workspace=workspace,
+        ):
+            return 0
+        if _recover_completed_role_output_fresh(
+            task_id,
+            role,
+            result,
+            board=board,
+            workspace=workspace,
+        ):
+            return 0
+        if _recover_recorded_role_output_fresh(
+            task_id,
+            role,
+            board=board,
+            workspace=workspace,
+        ):
+            return 0
+        reason = f"{_backend_label(role, task)} worker failed: {exc}"
         try:
-            kanban_db.block_task(conn, task_id, reason=f"{_backend_label(role)} worker failed: {exc}")
+            blocked = kanban_db.block_task(conn, task_id, reason=reason)
+            if blocked:
+                return 0
+        except Exception:
+            pass
+        try:
+            fresh_conn = kanban_db.connect(board=board)
+            try:
+                blocked = kanban_db.block_task(fresh_conn, task_id, reason=reason)
+                if blocked:
+                    return 0
+            finally:
+                fresh_conn.close()
         except Exception:
             pass
         return 1
@@ -121,6 +174,175 @@ def main() -> int:
                 pass
 
 
+def _recover_completed_role_output(
+    conn: Any,
+    task_id: str,
+    role: str,
+    result: Any,
+    *,
+    board: Optional[str],
+    workspace: str,
+) -> bool:
+    """Apply an already-produced role JSON after cleanup/transient failures.
+
+    A Codex role worker can finish the model turn and record a valid JSON
+    result, then fail while tearing down the app-server or while the first DB
+    write attempt hits a transient lock. In that case the worker process must
+    not exit nonzero and let the dispatcher overwrite the useful verdict with
+    ``pid not alive``. Try one narrow recovery pass; if it cannot record a
+    terminal Kanban transition, the caller falls back to a normal blocked task.
+    """
+    if result is None or getattr(result, "error", None):
+        return False
+    final_text = str(getattr(result, "final_text", "") or "").strip()
+    if not final_text:
+        return False
+    try:
+        task = kanban_db.get_task(conn, task_id)
+    except Exception:
+        return False
+    if task is None:
+        return False
+    if task.status in {"done", "blocked", "scheduled", "archived"}:
+        return True
+    if task.status not in {"running", "ready"}:
+        return False
+    try:
+        payload = _parse_json(final_text)
+        if board and is_cancelled(board):
+            return True
+        _apply_role_output(
+            conn,
+            task_id,
+            role,
+            payload,
+            board=board,
+            workspace=workspace,
+            expected_run_id=task.current_run_id,
+        )
+    except Exception:
+        return False
+    try:
+        task = kanban_db.get_task(conn, task_id)
+    except Exception:
+        return False
+    return bool(task and task.status in {"done", "blocked", "scheduled", "archived"})
+
+
+def _recover_completed_role_output_fresh(
+    task_id: str,
+    role: str,
+    result: Any,
+    *,
+    board: Optional[str],
+    workspace: str,
+) -> bool:
+    """Retry terminal-result recording through a new SQLite connection.
+
+    The role worker keeps its first connection open while OpenCode/Codex runs.
+    If a later DB write fails because that connection is stale, locked, or
+    otherwise poisoned, the process must still preserve a valid model result
+    instead of exiting nonzero and letting the dispatcher report only
+    ``pid not alive``.
+    """
+    try:
+        fresh_conn = kanban_db.connect(board=board)
+    except Exception:
+        return False
+    try:
+        return _recover_completed_role_output(
+            fresh_conn,
+            task_id,
+            role,
+            result,
+            board=board,
+            workspace=workspace,
+        )
+    finally:
+        try:
+            fresh_conn.close()
+        except Exception:
+            pass
+
+
+def _recover_recorded_role_output_fresh(
+    task_id: str,
+    role: str,
+    *,
+    board: Optional[str],
+    workspace: str,
+) -> bool:
+    """Recover a role result that was persisted before an exception escaped.
+
+    OpenCode/Codex result sidecars are written before the Kanban terminal
+    transition. If an exception occurs between those two points, ``main()`` may
+    enter its handler before the local ``result`` variable is assigned. The
+    sidecar is then the only durable source of the valid worker JSON.
+    """
+    try:
+        from hermes_cli.discord_worker_state import read_codex_worker_state
+
+        state = read_codex_worker_state(task_id, board=board)
+    except Exception:
+        return False
+    result_data = state.get("result") if isinstance(state, dict) else None
+    if not isinstance(result_data, dict):
+        return False
+    if result_data.get("error"):
+        return False
+    final_text = str(result_data.get("final_text") or "").strip()
+    if not final_text:
+        return False
+    if not _recorded_result_is_fresh_for_current_run(task_id, board=board, state=state):
+        return False
+    return _recover_completed_role_output_fresh(
+        task_id,
+        role,
+        SimpleNamespace(final_text=final_text, error=None),
+        board=board,
+        workspace=workspace,
+    )
+
+
+def _recorded_result_is_fresh_for_current_run(
+    task_id: str,
+    *,
+    board: Optional[str],
+    state: dict[str, Any],
+) -> bool:
+    try:
+        updated_at = int(state.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        updated_at = 0
+    try:
+        conn = kanban_db.connect(board=board)
+    except Exception:
+        return False
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            return False
+        if task.status in {"done", "blocked", "scheduled", "archived"}:
+            return True
+        if task.status not in {"running", "ready"}:
+            return False
+        if not task.current_run_id:
+            return True
+        row = conn.execute(
+            "SELECT started_at FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(task.current_run_id), task_id),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            started_at = int(row["started_at"] or 0)
+        except (TypeError, ValueError):
+            started_at = 0
+        return bool(updated_at and started_at and updated_at >= started_at)
+    finally:
+        conn.close()
+
+
 def _build_prompt(conn: Any, task_id: str, role: str) -> str:
     context = (
         _build_reviewer_context(conn, task_id)
@@ -130,16 +352,7 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
     outcome = _role_outcome_frame(role)
     schema = _schema_instructions(role)
     git = _git_summary(os.environ.get("HERMES_KANBAN_WORKSPACE", "") or os.getcwd())
-    discord_access = (
-        "Discord and board control access:\n"
-        "- Planner/dev/reviewer workers are read-only for normal Discord access. "
-        "The finalizer/operator owns board and Discord mutation.\n"
-        "- You may inspect Discord message context with "
-        "`python -m hermes_cli.discord_worker_read fetch-message --channel-id <id> --message-id <id>`.\n"
-        "- You may inspect recent thread/channel history with "
-        "`python -m hermes_cli.discord_worker_read fetch-messages --channel-id <id> --limit 25`.\n"
-        "- Do not call mutation helpers such as Discord REST writes, board updates, task status changes, or summary syncs from this role.\n\n"
-    )
+    discord_access = _discord_access_prompt(role)
     frontend_smoke = (
         "Frontend preview smoke contract:\n"
         "- If you start a frontend preview server, every smoke probe must use the exact host:port you started.\n"
@@ -290,6 +503,18 @@ def _role_outcome_frame(role: str) -> str:
             "- criteria_assessment maps each criterion to evidence or a gap.\n"
             "Stop when: Return the JSON review verdict."
         )
+    if role == ROLE_FOREMAN:
+        return (
+            "Outcome frame:\n"
+            "Goal: Repair a blocked Command Center worker-board ticket without creating code-change PR work.\n"
+            "Success means:\n"
+            "- The JSON status is completed, blocked, or checkpoint.\n"
+            "- actions, verification, and changed_tasks describe every safe Kanban board/task mutation performed.\n"
+            "- Stuck worker-board tickets are retried, unblocked, closed, reassigned, or left blocked only when safe and explained.\n"
+            "- Dispatch is marked dirty when repair actions should wake the dispatcher.\n"
+            "- Secrets and credentials stay redacted from summaries and metadata.\n"
+            "Stop when: Return the JSON repair result."
+        )
     return (
         "Outcome frame:\n"
         "Goal: Complete the assigned Kanban ticket or produce a checkpoint/blocker with evidence.\n"
@@ -312,6 +537,11 @@ def _pr_policy_prompt_note(role: str) -> str:
         return (
             "PR lifecycle policy: Do not create new dev tickets for pure PR chores such as git push, gh pr create/view/checks, updating a PR, or waiting on checks. "
             "If the implementation satisfies the goal and only PR lifecycle work remains, approve it; Hermes finalizes the PR deterministically.\n"
+        )
+    if role == ROLE_FOREMAN:
+        return (
+            "PR lifecycle policy: Do not create code-change PRs, push branches, or merge. "
+            "This repair role may safely mutate Kanban board/task state to recover stuck worker-board tickets.\n"
         )
     return (
         "PR lifecycle policy: Do not run git push, gh pr create, gh pr merge, or other remote/PR mutation commands. "
@@ -347,6 +577,17 @@ def _schema_instructions(role: str) -> str:
             "When requesting changes, each new_tasks body must be a self-contained follow-up brief that opens with Goal, Success means, and Stop when. "
             "Do not emit new_tasks for pure PR lifecycle chores: git push, gh pr create/view/checks, updating an existing PR, waiting on checks, or merging."
         )
+    if role == ROLE_FOREMAN:
+        return (
+            'Schema: {"status":"completed|blocked|checkpoint","summary":"...",'
+            '"actions":["..."],"verification":["..."],"changed_tasks":[{"id":"...","action":"...","status":"..."}],'
+            '"follow_up_proposals":[{"id":"...","title":"...","url":"...","reason":"..."}],'
+            '"blocker":null} '
+            "Record every Kanban repair action in actions and changed_tasks. "
+            "If you create a Command Center self-improvement proposal/job for a durable repo fix discovered during repair, report it in optional follow_up_proposals; otherwise use an empty list or omit it. "
+            "Use blocked only when repair cannot safely proceed and blocker explains the next human/operator action. "
+            "Never include secrets, raw credentials, or unredacted tokens in the JSON."
+        )
     return (
         'Schema: {"status":"completed|blocked|checkpoint","summary":"...","changed_files":["..."],'
         '"tests":[{"command":"...","result":"passed|failed|not_run","output":"..."}],'
@@ -355,6 +596,27 @@ def _schema_instructions(role: str) -> str:
         '"smoke_routes":["..."],"known_warnings":["..."],"notes":"..."},"blocker":null,"pr_ready":false} '
         "Always include handoff so reviewers can audit the exact changed files, checks, preview URL/command, smoke routes, warnings, and notes. "
         "Never push to a remote branch and never create, update, or merge a PR; stop after local code and verification."
+    )
+
+
+def _discord_access_prompt(role: str) -> str:
+    if role == ROLE_FOREMAN:
+        return (
+            "Discord and board control access:\n"
+            "- Foreman repair workers are not subject to the planner/dev/reviewer read-only Discord or PR-mutation restrictions.\n"
+            "- You may inspect and safely mutate Kanban board/task state to recover blocked worker-board tickets: mark dispatch dirty, retry, unblock, close, reassign, or leave blocked with a clear explanation when safe.\n"
+            "- Use Discord worker read/control broker access only when necessary to inspect context or coordinate recovery; keep Discord writes minimal and operator-safe.\n"
+            "- Keep secrets, credentials, tokens, and private environment values redacted in all summaries, actions, and metadata.\n\n"
+        )
+    return (
+        "Discord and board control access:\n"
+        "- Planner/dev/reviewer workers are read-only for normal Discord access. "
+        "The finalizer/operator owns board and Discord mutation.\n"
+        "- You may inspect Discord message context with "
+        "`python -m hermes_cli.discord_worker_read fetch-message --channel-id <id> --message-id <id>`.\n"
+        "- You may inspect recent thread/channel history with "
+        "`python -m hermes_cli.discord_worker_read fetch-messages --channel-id <id> --limit 25`.\n"
+        "- Do not call mutation helpers such as Discord REST writes, board updates, task status changes, or summary syncs from this role.\n\n"
     )
 
 
@@ -367,13 +629,23 @@ def _configured_backend() -> str:
         return "codex"
 
 
-def _backend_label(role: str) -> str:
-    if _role_uses_opencode(role):
+def _backend_label(role: str, task: Any = None) -> str:
+    if _role_uses_opencode(role, task):
         return "OpenCode"
     return "Codex"
 
 
-def _role_uses_opencode(role: str) -> bool:
+def _task_forces_opencode(task: Any = None) -> bool:
+    if task is None:
+        return False
+    role = str(getattr(task, "assignee", "") or "").strip().lower()
+    created_by = str(getattr(task, "created_by", "") or "").strip().lower()
+    return role == ROLE_FOREMAN and created_by == _COMMAND_CENTER_REPAIR_CREATED_BY
+
+
+def _role_uses_opencode(role: str, task: Any = None) -> bool:
+    if _task_forces_opencode(task):
+        return True
     return role in _OPENCODE_ROLES and _configured_backend() == "opencode"
 
 
@@ -463,6 +735,17 @@ def _role_read_only_discord_env(role: str) -> dict[str, str]:
     }
 
 
+def _backend_child_env(extra: Optional[dict[str, str]] = None) -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in KANBAN_CONTROL_ENV_VARS
+    }
+    if extra:
+        env.update(extra)
+    return env
+
+
 def _restore_environ(old_values: dict[str, Optional[str]]) -> None:
     for key, old in old_values.items():
         if old is None:
@@ -480,7 +763,7 @@ def _run_role_backend(
     task_id: str,
     board: Optional[str],
 ):
-    if _role_uses_opencode(role):
+    if _role_uses_opencode(role, task):
         return _run_opencode(prompt, workspace, role, task=task, task_id=task_id, board=board)
     return _run_codex(prompt, workspace, role, task_id=task_id, board=board)
 
@@ -507,16 +790,20 @@ def _run_codex(
     try:
         attempt = 0
         while True:
-            worker_env = {
-                "HERMES_DISABLE_MCP": "1",
-                "HERMES_CODEX_WORKER_NETWORK_ACCESS": "1",
-                **runtime_env,
-            }
+            worker_env = _backend_child_env(
+                {
+                    "HERMES_DISABLE_MCP": "1",
+                    "HERMES_CODEX_WORKER_NETWORK_ACCESS": "1",
+                    "HERMES_KANBAN_WORKSPACE": workspace,
+                    **runtime_env,
+                }
+            )
             session = CodexAppServerSession(
                 cwd=workspace,
                 codex_home=os.environ.get("CODEX_HOME"),
                 extra_args=extra_args,
                 env=worker_env,
+                replace_env=True,
                 on_event=on_event,
             )
             try:
@@ -657,6 +944,7 @@ def _run_opencode(
                 agent=cfg["plan_agent"],
                 reasoning_level=reasoning_level,
                 title=f"kanban {task_id}",
+                env=_backend_child_env(runtime_env),
                 on_event=on_event,
             )
         else:
@@ -668,6 +956,7 @@ def _run_opencode(
                 force_plan=False,
                 title=f"kanban {task_id}",
                 worker_config=_scheduled_opencode_worker_config(),
+                env=_backend_child_env(runtime_env),
                 on_event=on_event,
             )
     finally:
@@ -781,7 +1070,7 @@ def _worker_reasoning_effort(role: str) -> str:
     effort = str(os.environ.get("HERMES_CODEX_WORKER_REASONING") or "").strip().lower()
     if effort in {"minimal", "low", "medium", "high", "xhigh"}:
         return effort
-    if role in {ROLE_PLANNER, ROLE_REVIEWER}:
+    if role in {ROLE_PLANNER, ROLE_REVIEWER, ROLE_FOREMAN}:
         return "xhigh"
     return "medium"
 
@@ -802,6 +1091,8 @@ def _attach_scheduled_runtime(result: Any, role: str) -> None:
                 name = "plan"
             elif role == ROLE_REVIEWER:
                 name = "review"
+            elif role == ROLE_FOREMAN:
+                name = "repair"
             setattr(
                 result,
                 "run_profile",
@@ -826,6 +1117,8 @@ def _attach_scheduled_runtime(result: Any, role: str) -> None:
 def _role_timeout(role: str) -> float:
     if role == ROLE_DEV:
         return float(os.environ.get("HERMES_CODEX_DEV_TIMEOUT", "3600"))
+    if role == ROLE_FOREMAN:
+        return float(os.environ.get("HERMES_CODEX_FOREMAN_TIMEOUT", "1800"))
     return float(os.environ.get("HERMES_CODEX_PLANNER_REVIEWER_TIMEOUT", "1800"))
 
 
@@ -879,7 +1172,7 @@ def _apply_role_output(
         try:
             created = _create_planned_dev_tasks(conn, specs, created_by=ROLE_PLANNER)
             _merge_criteria(board, criteria)
-            completed = kanban_db.complete_task(
+            completed = _complete_role_task(
                 conn,
                 task_id,
                 summary=summary or f"Planned {len(created)} task(s).",
@@ -907,7 +1200,7 @@ def _apply_role_output(
             criteria_assessment = payload.get("criteria_assessment")
             if isinstance(criteria_assessment, dict):
                 metadata["criteria_assessment"] = criteria_assessment
-            completed = kanban_db.complete_task(
+            completed = _complete_role_task(
                 conn,
                 task_id,
                 summary=summary or "Reviewer approved.",
@@ -940,7 +1233,7 @@ def _apply_role_output(
                 "raw": payload,
                 "filtered_pr_lifecycle_tasks": pr_lifecycle_tasks,
             }
-            completed = kanban_db.complete_task(
+            completed = _complete_role_task(
                 conn,
                 task_id,
                 summary=summary or "Reviewer found only PR lifecycle follow-up; finalizing PR.",
@@ -963,7 +1256,7 @@ def _apply_role_output(
             metadata = {"created_tasks": created, "raw": payload}
             if pr_lifecycle_tasks:
                 metadata["filtered_pr_lifecycle_tasks"] = pr_lifecycle_tasks
-            completed = kanban_db.complete_task(
+            completed = _complete_role_task(
                 conn,
                 task_id,
                 summary=summary or "Reviewer requested changes.",
@@ -980,6 +1273,35 @@ def _apply_role_output(
         _update_phase(board, "dev", goal_status="active")
         return
 
+    if role == ROLE_FOREMAN:
+        metadata = _foreman_metadata(payload)
+        if status == "blocked":
+            kanban_db.block_task(
+                conn,
+                task_id,
+                reason=payload.get("blocker") or summary,
+                expected_run_id=expected_run_id,
+            )
+            return
+        if status == "checkpoint":
+            kanban_db.schedule_task(
+                conn,
+                task_id,
+                reason=summary or "Foreman repair checkpoint.",
+                expected_run_id=expected_run_id,
+            )
+            return
+        completed = _complete_role_task(
+            conn,
+            task_id,
+            summary=summary or "Foreman repair completed.",
+            metadata=metadata,
+            expected_run_id=expected_run_id,
+        )
+        if not completed:
+            raise RuntimeError("foreman completed but Kanban task transition was rejected")
+        return
+
     if status == "blocked":
         blocked = kanban_db.block_task(
             conn,
@@ -992,7 +1314,7 @@ def _apply_role_output(
         _update_phase(board, "blocked", goal_status="blocked")
         return
     _checkpoint_commit(workspace, task_id, summary)
-    kanban_db.complete_task(
+    completed = _complete_role_task(
         conn,
         task_id,
         summary=summary or "Dev task completed.",
@@ -1005,6 +1327,64 @@ def _apply_role_output(
         },
         expected_run_id=expected_run_id,
     )
+    if not completed:
+        raise RuntimeError("worker completed but Kanban task transition was rejected")
+
+
+def _foreman_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"raw": payload}
+    actions = payload.get("actions")
+    if isinstance(actions, list):
+        metadata["actions"] = actions
+    verification = payload.get("verification")
+    if isinstance(verification, list):
+        metadata["verification"] = verification
+    changed_tasks = payload.get("changed_tasks")
+    if isinstance(changed_tasks, list):
+        metadata["changed_tasks"] = changed_tasks
+    return metadata
+
+
+def _complete_role_task(
+    conn: Any,
+    task_id: str,
+    *,
+    summary: str,
+    metadata: dict[str, Any],
+    expected_run_id: Optional[int],
+    created_cards: Optional[list[str]] = None,
+) -> bool:
+    completed = kanban_db.complete_task(
+        conn,
+        task_id,
+        summary=summary,
+        metadata=metadata,
+        created_cards=created_cards,
+        expected_run_id=expected_run_id,
+    )
+    if completed or expected_run_id is None:
+        return completed
+    if not _still_owns_claim(conn, task_id):
+        return False
+    return kanban_db.complete_task(
+        conn,
+        task_id,
+        summary=summary,
+        metadata=metadata,
+        created_cards=created_cards,
+        expected_run_id=None,
+    )
+
+
+def _still_owns_claim(conn: Any, task_id: str) -> bool:
+    lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK", "").strip()
+    if not lock:
+        return False
+    row = conn.execute(
+        "SELECT status, claim_lock FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    return bool(row and row["status"] == "running" and row["claim_lock"] == lock)
 
 
 def _string_list(value: Any) -> list[str]:

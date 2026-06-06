@@ -370,6 +370,67 @@ def test_create_foreman_master_task_uses_configurable_board_and_reuses(monkeypat
     assert task.status == "ready"
     assert task.tenant == "discord-123"
     assert "<foreman-metadata>" in (task.body or "")
+
+
+def test_create_foreman_master_task_uses_source_worker_worktree(monkeypatch, tmp_path):
+    source_board = _discord_board(monkeypatch, tmp_path, slug="discord-123")
+    worktree = tmp_path / "workspaces" / "hermes-discord-123"
+    _update_worker_meta(source_board, worktree_path=str(worktree), project_path=str(Path(__file__).resolve().parents[2]))
+    from hermes_cli import kanban_db
+    from hermes_cli import discord_worker_foreman as foreman
+
+    created = foreman.create_foreman_master_task(_alert_issue(), master_board="ops", assignee="default")
+
+    conn = kanban_db.connect(board="ops")
+    try:
+        task = kanban_db.get_task(conn, created["task_id"])
+    finally:
+        conn.close()
+    assert task is not None
+    assert task.workspace_kind == "dir"
+    assert task.workspace_path == str(worktree)
+
+
+def test_create_foreman_master_task_uses_foreman_generated_source_worktree(monkeypatch, tmp_path):
+    source_board = _discord_board(monkeypatch, tmp_path, slug="discord-123")
+    worktree = tmp_path / "workspaces" / "hermes-foreman-discord-123"
+    _update_worker_meta(
+        source_board,
+        initial_request="Foreman escalation: recover blocked board",
+        worktree_path=str(worktree),
+        project_path=str(Path(__file__).resolve().parents[2]),
+    )
+    from hermes_cli import kanban_db
+    from hermes_cli import discord_worker_foreman as foreman
+
+    created = foreman.create_foreman_master_task(_alert_issue(), master_board="ops", assignee="default")
+
+    conn = kanban_db.connect(board="ops")
+    try:
+        task = kanban_db.get_task(conn, created["task_id"])
+    finally:
+        conn.close()
+    assert task is not None
+    assert task.workspace_kind == "dir"
+    assert task.workspace_path == str(worktree)
+
+
+def test_create_foreman_master_task_never_uses_runtime_checkout(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_db
+    from hermes_cli import discord_worker_foreman as foreman
+
+    issue = _alert_issue(evidence={"source_board": "discord-123", "source_task_id": "t1", "workspace_path": str(Path(__file__).resolve().parents[2])})
+    created = foreman.create_foreman_master_task(issue, master_board="ops", assignee="default")
+
+    conn = kanban_db.connect(board="ops")
+    try:
+        task = kanban_db.get_task(conn, created["task_id"])
+    finally:
+        conn.close()
+    assert task is not None
+    assert task.workspace_kind == "scratch"
+    assert task.workspace_path is None
     assert foreman.active_master_foreman_source_boards(master_board="ops") == {"discord-123"}
 
 
