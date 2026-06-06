@@ -4362,6 +4362,93 @@ def test_repair_corrupt_board_reindex_success_clears_incident(kanban_home, monke
     assert kb.is_board_paused_for_corruption(board) is None
 
 
+def test_repair_corrupt_board_salvages_after_reindex_malformed_failure(kanban_home, monkeypatch):
+    board = "salvage-after-reindex-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    conn = kb.connect(board=board)
+    try:
+        task_id = kb.create_task(conn, title="running reviewer", assignee="reviewer")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        conn.execute(
+            "INSERT INTO task_events(task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'heartbeat', '{}', ?)",
+            (task_id, claimed.current_run_id, int(time.time())),
+        )
+    finally:
+        conn.close()
+    fingerprint = kb._db_content_fingerprint(db_path)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "integrity_check returned 'wrong # of entries in index idx_events_run'",
+        backup_path=db_path.with_suffix(".db.corrupt.test.bak"),
+        fingerprint=fingerprint,
+    )
+    integrity_checks = iter(["wrong # of entries in index idx_events_run", "ok"])
+    original_integrity = kb._integrity_check_db
+    original_connect = kb._sqlite_connect
+
+    class ReindexMalformedConn:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args, **kwargs):
+            if str(sql).strip().upper() == "REINDEX":
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return self.inner.execute(sql, *args, **kwargs)
+
+        def executescript(self, sql):
+            return self.inner.executescript(sql)
+
+        def executemany(self, sql, params):
+            return self.inner.executemany(sql, params)
+
+        def commit(self):
+            return self.inner.commit()
+
+        def close(self):
+            return self.inner.close()
+
+        @property
+        def row_factory(self):
+            return self.inner.row_factory
+
+        @row_factory.setter
+        def row_factory(self, value):
+            self.inner.row_factory = value
+
+    def fake_integrity(path):
+        if Path(path) == db_path:
+            return next(integrity_checks)
+        return original_integrity(path)
+
+    def fake_connect(path):
+        inner = original_connect(path)
+        if Path(path) == db_path:
+            return ReindexMalformedConn(inner)
+        return inner
+
+    monkeypatch.setattr(kb, "_integrity_check_db", fake_integrity)
+    monkeypatch.setattr(kb, "_sqlite_connect", fake_connect)
+
+    result = kb.repair_corrupt_board(board)
+
+    assert result["status"] == "repaired"
+    assert result["action"] == "salvage_readable_tables"
+    assert result["reason"] == "integrity_check ok after readable-table salvage"
+    assert kb.is_board_paused_for_corruption(board) is None
+    conn = kb.connect(board=board)
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        run = kb.latest_run(conn, task_id)
+        assert run is not None
+        assert run.status == "running"
+    finally:
+        conn.close()
+
 def test_repair_corrupt_board_restores_latest_known_good_backup(kanban_home):
     board = "restore-board"
     kb.create_board(board)

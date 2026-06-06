@@ -680,6 +680,43 @@ def record_rejection(
         conn.close()
 
 
+def record_archive(
+    proposal_id: str,
+    *,
+    actor: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    init_db(db_path)
+    now = utc_now()
+    conn = connect(db_path)
+    try:
+        with conn:
+            row = conn.execute("SELECT * FROM proposal_cards WHERE proposal_id = ?", (proposal_id,)).fetchone()
+            if not row:
+                raise KeyError(proposal_id)
+            conn.execute(
+                """
+                UPDATE proposal_cards
+                SET status = 'archived', rejected_reason = NULL, archived_at = ?, updated_at = ?
+                WHERE proposal_id = ?
+                """,
+                (now, now, proposal_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO proposal_audit_events(proposal_id, action, actor, metadata_json, created_at)
+                VALUES (?, 'archived', ?, ?, ?)
+                """,
+                (proposal_id, actor, _json_dumps(metadata or {}), now),
+            )
+        card = get_card(proposal_id, db_path=db_path)
+        assert card is not None
+        return card
+    finally:
+        conn.close()
+
+
 def list_audit_events(proposal_id: str, *, db_path: Path | None = None) -> list[dict[str, Any]]:
     init_db(db_path)
     conn = connect(db_path)

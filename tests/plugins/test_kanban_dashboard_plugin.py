@@ -396,6 +396,33 @@ def test_self_improvement_halt_archives_in_flight_task_and_audits(client):
     assert audit[-1]["metadata"]["previous_status"] == "ready"
 
 
+def test_self_improvement_archive_handles_unapproved_proposal(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+
+    archived = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/archive")
+
+    assert archived.status_code == 200, archived.text
+    assert archived.json()["card"]["status"] == "archived"
+    assert archived.json()["card"]["archived_at"]
+    assert proposal_storage.grouped_cards()["projects"] == []
+    listed = proposal_storage.list_cards(include_archived=True)["cards"]
+    assert listed[0]["status"] == "archived"
+    audit = proposal_storage.list_audit_events(card["proposal_id"])
+    assert audit[-1]["action"] == "archived"
+
+
+def test_self_improvement_archive_rejects_approved_proposal(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    assert approved.status_code == 200, approved.text
+
+    archived = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/archive")
+
+    assert archived.status_code == 409, archived.text
+
+
 def test_self_improvement_pause_resume_is_repeatable_and_audited(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]

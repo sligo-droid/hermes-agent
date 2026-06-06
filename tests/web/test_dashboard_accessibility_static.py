@@ -91,6 +91,7 @@ def test_command_center_archive_action_is_one_click_without_removing_other_promp
 
     assert "window.confirm" not in archive_branch
     assert "archiveKanbanBoard" in archive_branch
+    assert "archiveSelfImprovementProposal" in archive_branch
     assert "haltSelfImprovementProposal" in archive_branch
     assert 'window.prompt("Reject reason for future prong feedback?"' not in source
     assert 'window.prompt("Reason for revert follow-up?"' in source
@@ -106,6 +107,7 @@ def test_command_center_proposal_archive_action_uses_halt_flow():
     assert 'window.prompt("Reject reason for future prong feedback?"' not in source
     assert 'rejectReason' not in handle_source
     assert 'await api.rejectSelfImprovementProposal' not in run_action_source
+    assert 'else if (proposalId && item.status === "proposed") await api.archiveSelfImprovementProposal(proposalId);' in run_action_source
     assert 'else if (proposalId) await api.haltSelfImprovementProposal(proposalId);' in run_action_source
     assert "targetItems" in handle_source
 

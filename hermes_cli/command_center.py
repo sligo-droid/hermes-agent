@@ -385,7 +385,9 @@ def _canonical_status_from_board(
 
 def _canonical_status_from_proposal(card: dict[str, Any], task: dict[str, Any] | None) -> tuple[str, str]:
     status = str(card.get("status") or "").lower()
-    if status == "rejected" or card.get("archived_at"):
+    if status == "archived" or (card.get("archived_at") and status != "rejected"):
+        return "archived", status or "archived"
+    if status == "rejected":
         return "rejected", status or "rejected"
     if card.get("kanban_task_id"):
         return _canonical_status_from_task(task)
@@ -675,7 +677,7 @@ def _proposal_work_item(
             "reject_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/reject",
             "pause_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/pause",
             "resume_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/resume",
-            "archive_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/halt",
+            "archive_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/archive" if canonical_status == "proposed" else f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/halt",
         },
         "execution": execution,
         "runs": runs,

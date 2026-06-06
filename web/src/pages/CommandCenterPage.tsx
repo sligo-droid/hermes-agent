@@ -954,6 +954,7 @@ export default function CommandCenterPage() {
     const board = item.execution?.board;
     if (kind === "archive") {
       if (board && board !== "default") await api.archiveKanbanBoard(board);
+      else if (proposalId && item.status === "proposed") await api.archiveSelfImprovementProposal(proposalId);
       else if (proposalId) await api.haltSelfImprovementProposal(proposalId);
     } else if (proposalId && kind === "approve") {
       await api.approveSelfImprovementProposal(proposalId);

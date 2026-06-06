@@ -3879,6 +3879,67 @@ def test_gateway_dispatcher_retries_corrupt_board_after_content_change(
     assert calls["record"] == 2
 
 
+def test_repair_corrupt_board_salvages_readable_task_tables(monkeypatch, tmp_path):
+    import sqlite3
+
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
+    board = "salvage-board"
+    _kb.create_board(board, name="Salvage Board")
+    conn = _kb.connect(board=board)
+    try:
+        task_id = _kb.create_task(conn, title="running reviewer", assignee="reviewer")
+        claimed = _kb.claim_task(conn, task_id)
+        assert claimed is not None
+        conn.execute("INSERT INTO task_events(task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'heartbeat', '{}', ?)", (task_id, claimed.current_run_id, int(time.time())))
+    finally:
+        conn.close()
+
+    db_path = _kb.kanban_db_path(board)
+    original_integrity = _kb._integrity_check_db
+    original_backup = _kb._backup_corrupt_db
+    corrupt_fingerprint = _kb._db_content_fingerprint(db_path)
+
+    def fake_integrity(path):
+        if Path(path) == db_path and _kb._db_content_fingerprint(Path(path)) == corrupt_fingerprint:
+            return "*** in database main ***\nTree 20 page 20 cell 1: 2nd reference to page 39"
+        return original_integrity(path)
+
+    def fake_backup(path, fingerprint=None, *, sidecar_bytes=None):
+        backup = Path(str(path) + ".corrupt.test.bak")
+        backup.write_bytes(Path(path).read_bytes())
+        return backup
+
+    monkeypatch.setattr(_kb, "_integrity_check_db", fake_integrity)
+    monkeypatch.setattr(_kb, "_backup_corrupt_db", fake_backup)
+    _kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "integrity_check returned '*** in database main ***\\nTree 20 page 20 cell 1: 2nd reference to page 39'",
+        backup_path=db_path.with_suffix(".db.corrupt.test.bak"),
+        fingerprint=corrupt_fingerprint,
+    )
+
+    result = _kb.repair_corrupt_board(board)
+
+    assert result["status"] == "repaired"
+    assert result["action"] == "salvage_readable_tables"
+    assert _kb.is_board_paused_for_corruption(board) is None
+    repaired = sqlite3.connect(db_path)
+    repaired.row_factory = sqlite3.Row
+    try:
+        assert repaired.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        task = _kb.get_task(repaired, task_id)
+        assert task is not None
+        assert task.status == "running"
+        run = _kb.latest_run(repaired, task_id)
+        assert run is not None
+        assert run.status == "running"
+    finally:
+        repaired.close()
+
+
 # ---------------------------------------------------------------------------
 # Hallucination gate (created_cards verify + prose scan)
 # ---------------------------------------------------------------------------
