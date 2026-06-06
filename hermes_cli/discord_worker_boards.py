@@ -1607,7 +1607,18 @@ def _ticket_workspace_path(task: Any, *, board: str) -> str:
 def _public_terminal_run(run: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     if not run:
         return None
-    keys = ("id", "status", "outcome", "worker_pid", "started_at", "last_heartbeat_at", "ended_at")
+    keys = (
+        "id",
+        "status",
+        "outcome",
+        "worker_pid",
+        "started_at",
+        "last_heartbeat_at",
+        "ended_at",
+        "summary",
+        "error",
+        "metadata",
+    )
     return {key: run.get(key) for key in keys}
 
 
@@ -1731,7 +1742,9 @@ def _terminal_event_line(event: Any) -> str:
     if kind in {"reclaimed", "archived", "scheduled", "promoted", "assigned"}:
         return f"[{created}] {kind}"
     if kind in {"spawn_failed", "crashed", "timed_out", "gave_up"}:
-        return f"[{created}] {kind.replace('_', ' ')}"
+        reason = _safe_terminal_text(payload.get("error") if isinstance(payload, dict) else "")
+        label = kind.replace("_", " ")
+        return f"[{created}] {label}: {reason}" if reason else f"[{created}] {label}"
     return ""
 
 

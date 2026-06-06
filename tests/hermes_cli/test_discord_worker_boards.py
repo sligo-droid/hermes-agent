@@ -1172,6 +1172,56 @@ def test_persisted_board_run_summary_drives_terminal_surfaces(monkeypatch, tmp_p
     assert "PR merge: CLEAN; checks: passed" in html
 
 
+def test_board_surfaces_crashed_ticket_error_summary(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(dwb, "_now", lambda: 300)
+    board = dwb.set_goal(thread_id="5165", goal="Crash visibly")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, started_at, ended_at, "
+            "outcome, summary, error, metadata) "
+            "VALUES (?, 'crashed', ?, ?, 'crashed', NULL, ?, ?)",
+            (
+                task.id,
+                100,
+                120,
+                "pid 123 not alive",
+                json.dumps({"pid": 123, "unit": "worker.service"}),
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='blocked', last_failure_error=? WHERE id=?",
+            ("pid 123 not alive", task.id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    snapshot = dwb.public_board_snapshot_for_session("5165")
+    card = next(item for item in snapshot["tasks"] if item["id"] == task.id)
+    assert card["latest_summary"] == "pid 123 not alive"
+
+    summary = dwb.persist_board_run_summary(board.slug)
+    summary_task = next(item for item in summary["latest_tasks"] if item["id"] == task.id)
+    assert summary_task["latest_summary"] == "pid 123 not alive"
+    assert summary["blocked_reason"] == "pid 123 not alive"
+    assert summary["pr"]["state"] == "unknown"
+    assert summary["deployment_status"] == "not checked"
+    assert summary["final_response"]["text"] == ""
+
+    state = dwb.ticket_state_for_session("5165", task.id)
+    assert state["current_run"]["error"] == "pid 123 not alive"
+    assert state["current_run"]["metadata"]["pid"] == 123
+    terminal = dwb.ticket_terminal_feed_for_session("5165", task.id)
+    assert terminal["current_run"]["error"] == "pid 123 not alive"
+    assert terminal["current_run"]["metadata"]["pid"] == 123
+
+
 def test_new_goal_clears_stale_terminal_summary_and_pr(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

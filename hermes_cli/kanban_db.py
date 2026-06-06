@@ -8137,40 +8137,46 @@ def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
 
 
 def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Return the latest non-null ``task_runs.summary`` for ``task_id``.
+    """Return the latest card-worthy run summary for ``task_id``.
 
-    The kanban-worker skill writes its handoff to ``task_runs.summary``
-    via ``complete_task(summary=...)``; ``tasks.result`` is left empty
-    unless the caller passes ``result=`` explicitly. Dashboards and CLI
-    "show" views need this value to surface what a worker actually did
-    — without it, ``tasks.result`` is NULL and the task looks like a
-    no-op even when the run completed.
+    The kanban-worker skill writes successful handoffs to
+    ``task_runs.summary`` via ``complete_task(summary=...)``;
+    ``tasks.result`` is left empty unless the caller passes ``result=``
+    explicitly. Crashed or killed worker attempts may not have a
+    summary, but they do usually have ``task_runs.error``. Dashboards and
+    CLI "show" views need either value to explain what happened instead
+    of rendering an apparently blank/no-op ticket.
 
-    Picks the most recent run by ``ended_at`` (falling back to ``id``
-    for ties or unfinished rows). Returns None if no run has a summary.
+    Picks the most recent run with a non-empty summary or error by
+    ``ended_at`` (falling back to ``id`` for ties or unfinished rows).
+    Returns None if no run has either field populated.
     """
     row = conn.execute(
-        "SELECT summary FROM task_runs "
-        "WHERE task_id = ? AND summary IS NOT NULL AND summary != '' "
+        "SELECT summary, error FROM task_runs "
+        "WHERE task_id = ? "
+        "AND ((summary IS NOT NULL AND summary != '') "
+        "OR (error IS NOT NULL AND error != '')) "
         "ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return row["summary"] if row else None
+    if not row:
+        return None
+    return row["summary"] or row["error"]
 
 
 def latest_summaries(
     conn: sqlite3.Connection, task_ids: Iterable[str]
 ) -> dict[str, str]:
-    """Batch-fetch latest non-null summaries for a list of task ids.
+    """Batch-fetch latest non-empty summaries/errors for task ids.
 
     Used by the dashboard board endpoint to attach ``latest_summary`` to
     every card in a single SQL query, avoiding the N+1 pattern of
     calling :func:`latest_summary` per task. Returns a dict mapping
-    ``task_id`` → summary string, omitting tasks with no summary.
+    ``task_id`` → summary/error string, omitting tasks with neither.
 
-    Approach: a window function picks the newest non-null-summary row
-    per ``task_id``; works against SQLite ≥ 3.25 (default on every
-    supported platform).
+    Approach: a window function picks the newest row with a non-empty
+    summary or error per ``task_id``; works against SQLite ≥ 3.25
+    (default on every supported platform).
     """
     ids = list(task_ids)
     if not ids:
@@ -8178,17 +8184,18 @@ def latest_summaries(
     placeholders = ",".join("?" for _ in ids)
     rows = conn.execute(
         f"""
-        SELECT task_id, summary FROM (
-            SELECT task_id, summary,
+        SELECT task_id, summary, error FROM (
+            SELECT task_id, summary, error,
                    ROW_NUMBER() OVER (
                        PARTITION BY task_id
                        ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
                    ) AS rn
               FROM task_runs
              WHERE task_id IN ({placeholders})
-               AND summary IS NOT NULL AND summary != ''
+               AND ((summary IS NOT NULL AND summary != '')
+                    OR (error IS NOT NULL AND error != ''))
         ) WHERE rn = 1
         """,
         ids,
     ).fetchall()
-    return {r["task_id"]: r["summary"] for r in rows}
+    return {r["task_id"]: r["summary"] or r["error"] for r in rows}
