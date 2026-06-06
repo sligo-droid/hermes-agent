@@ -309,4 +309,7 @@ def test_cron_proposal_guidance_requests_json_and_no_kanban_mutation():
     assert "`critical`, `major`, `minor`, or `info`" in guidance
     assert "deterministic string `idempotency_key`" in guidance
     assert "source_excerpts` as objects with a `text` field" in guidance
+    assert "card `summary` <= 500 chars" in guidance
+    assert "card `body` <= 6000 chars" in guidance
+    assert "`kanban_task.body` <= 6000 chars" in guidance
     assert "Do not put audit notes" in guidance

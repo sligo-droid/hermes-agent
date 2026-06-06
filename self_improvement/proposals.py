@@ -278,7 +278,9 @@ def build_cron_proposal_guidance(
         "Each card needs `proposal_id` or a deterministic string `idempotency_key` (not an object), `title`, `summary`, `body`, `rationale`, "
         "`priority` as one of `critical`, `high`, `medium`, or `low` (do not use P0/P1/P2 labels), optional `severity` as one of "
         "`critical`, `major`, `minor`, or `info` (do not use high/medium/low severity labels), "
-        "`source_excerpts` as objects with a `text` field, `status: proposed`, `created_at`, and `kanban_task` with enough title/body detail to construct a later Kanban task."
+        "`source_excerpts` as objects with a `text` field, `status: proposed`, `created_at`, and `kanban_task` with enough title/body detail to construct a later Kanban task. "
+        "Hard length limits: card `title` <= 140 chars, card `summary` <= 500 chars, card `body` <= 6000 chars, card `rationale` <= 2000 chars, "
+        "each `source_excerpts[].text` <= 2000 chars, `kanban_task.title` <= 140 chars, and `kanban_task.body` <= 6000 chars. Keep summaries short; put detail in `body` and excerpts."
     )
     feedback_cfg = _self_improvement_config(config).get("feedback_context", {})
     if not isinstance(feedback_cfg, dict) or feedback_cfg.get("enabled", True):
