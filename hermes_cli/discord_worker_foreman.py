@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -26,6 +28,9 @@ from hermes_cli.discord_worker_roles import (
 )
 from hermes_cli.discord_worker_state import read_codex_worker_state
 from utils import atomic_json_write
+
+
+logger = logging.getLogger(__name__)
 
 
 # Foreman scans every 30s by default. Flag no-progress workers after 30s so
@@ -161,6 +166,74 @@ _ALLOWED_RENDER_EVIDENCE_KEYS = frozenset(
 )
 _SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2, "critical": 3}
 _TERMINAL_THREAD_STATES = frozenset({"blocked", "errored", "done", "archived", "cancelled"})
+
+
+def _paused_corrupt_incident(board: str) -> Optional[dict[str, Any]]:
+    try:
+        incident = kanban_db.is_board_paused_for_corruption(board)
+    except Exception:
+        return None
+    if not incident:
+        return None
+    db_path = Path(str(incident.get("db_path") or kanban_db.kanban_db_path(board)))
+    try:
+        fingerprint = kanban_db._db_content_fingerprint(db_path)
+    except Exception:
+        fingerprint = None
+    if incident.get("fingerprint") == fingerprint:
+        return incident
+    return None
+
+
+def _is_corrupt_board_db_error(exc: Exception) -> bool:
+    if isinstance(exc, kanban_db.KanbanDbCorruptError):
+        return True
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    msg = str(exc).lower()
+    return "file is not a database" in msg or "database disk image is malformed" in msg
+
+
+def _record_corrupt_board(board: str, exc: Exception) -> Optional[dict[str, Any]]:
+    incident = getattr(exc, "incident", None)
+    if isinstance(incident, dict):
+        return incident
+    db_path = kanban_db.kanban_db_path(board)
+    try:
+        resolved = db_path.resolve()
+    except OSError:
+        resolved = db_path
+    try:
+        fingerprint = kanban_db._db_content_fingerprint(resolved)
+    except Exception:
+        fingerprint = None
+    return kanban_db.record_corrupt_board_incident(
+        board,
+        resolved,
+        str(getattr(exc, "reason", None) or exc),
+        backup_path=getattr(exc, "backup_path", None),
+        fingerprint=fingerprint,
+    )
+
+
+def _log_corrupt_board_incident(
+    board: str,
+    incident: Optional[dict[str, Any]],
+    exc: Exception,
+) -> None:
+    incident = incident or {}
+    logger.error(
+        "discord foreman: board %s database corruption incident; "
+        "db_path=%s quarantine_path=%s reason=%s. Foreman polling is paused "
+        "for this board while the DB fingerprint is unchanged. Repair guidance: "
+        "restore a known-good backup or run `hermes kanban repair --board %s`, "
+        "then retry after integrity checks pass.",
+        board,
+        incident.get("db_path") or str(kanban_db.kanban_db_path(board)),
+        incident.get("quarantine_path") or getattr(exc, "backup_path", None) or "<unavailable>",
+        incident.get("reason") or getattr(exc, "reason", None) or str(exc),
+        board,
+    )
 
 
 @dataclass(frozen=True)
@@ -985,14 +1058,26 @@ def collect_board_snapshots(*, foreman_generated_only: bool = False) -> list[Boa
         if db_path in seen_db_paths:
             continue
         seen_db_paths.add(db_path)
-        snapshots.append(
-            _build_board_snapshot(
+        if _paused_corrupt_incident(board):
+            logger.debug(
+                "discord foreman: board %s paused for unchanged DB corruption; skipping poll",
                 board,
-                worker,
-                archived=bool(meta.get("archived")),
-                created_at=_coerce_optional_int(meta.get("created_at")),
             )
-        )
+            continue
+        try:
+            snapshots.append(
+                _build_board_snapshot(
+                    board,
+                    worker,
+                    archived=bool(meta.get("archived")),
+                    created_at=_coerce_optional_int(meta.get("created_at")),
+                )
+            )
+        except Exception as exc:
+            if _is_corrupt_board_db_error(exc):
+                _log_corrupt_board_incident(board, _record_corrupt_board(board, exc), exc)
+                continue
+            raise
     return snapshots
 
 

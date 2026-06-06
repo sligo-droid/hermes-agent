@@ -5637,6 +5637,71 @@ class GatewayRunner:
                     except Exception:
                         boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
                     seen_db_paths: set[str] = set()
+                    def _board_db_path(slug: str) -> Path:
+                        return Path(str(_kb.kanban_db_path(slug))).expanduser().resolve()
+
+                    def _paused_corrupt_incident(slug: str) -> Optional[dict]:
+                        try:
+                            incident = _kb.is_board_paused_for_corruption(slug)
+                        except Exception:
+                            return None
+                        if not incident:
+                            return None
+                        db_path = Path(str(incident.get("db_path") or _kb.kanban_db_path(slug)))
+                        try:
+                            fingerprint = _kb._db_content_fingerprint(db_path)
+                        except Exception:
+                            fingerprint = None
+                        if incident.get("fingerprint") == fingerprint:
+                            return incident
+                        return None
+
+                    def _is_corrupt_board_db_error(exc: Exception) -> bool:
+                        corrupt_guard_error = getattr(_kb, "KanbanDbCorruptError", None)
+                        if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
+                            return True
+                        if not isinstance(exc, sqlite3.DatabaseError):
+                            return False
+                        msg = str(exc).lower()
+                        return (
+                            "file is not a database" in msg
+                            or "database disk image is malformed" in msg
+                        )
+
+                    def _record_corrupt_board(slug: str, exc: Exception) -> Optional[dict]:
+                        incident = getattr(exc, "incident", None)
+                        if isinstance(incident, dict):
+                            return incident
+                        try:
+                            db_path = _board_db_path(slug)
+                            fingerprint = _kb._db_content_fingerprint(db_path)
+                        except Exception:
+                            db_path = Path(str(_kb.kanban_db_path(slug)))
+                            fingerprint = None
+                        return _kb.record_corrupt_board_incident(
+                            slug,
+                            db_path,
+                            str(getattr(exc, "reason", None) or exc),
+                            backup_path=getattr(exc, "backup_path", None),
+                            fingerprint=fingerprint,
+                        )
+
+                    def _log_corrupt_board_incident(slug: str, incident: Optional[dict], exc: Exception) -> None:
+                        incident = incident or {}
+                        logger.error(
+                            "kanban notifier: board %s database corruption incident; "
+                            "db_path=%s quarantine_path=%s reason=%s. Notification "
+                            "polling is paused for this board while the DB fingerprint "
+                            "is unchanged. Repair guidance: restore a known-good backup "
+                            "or run `hermes kanban repair --board %s`, then retry after "
+                            "integrity checks pass.",
+                            slug,
+                            incident.get("db_path") or str(_kb.kanban_db_path(slug)),
+                            incident.get("quarantine_path") or getattr(exc, "backup_path", None) or "<unavailable>",
+                            incident.get("reason") or getattr(exc, "reason", None) or str(exc),
+                            slug,
+                        )
+
                     for board_meta in boards:
                         slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
                         db_path = board_meta.get("db_path")
@@ -5651,9 +5716,18 @@ class GatewayRunner:
                             )
                             continue
                         seen_db_paths.add(resolved_db_path)
+                        if _paused_corrupt_incident(slug):
+                            logger.debug(
+                                "kanban notifier: board %s paused for unchanged DB corruption; skipping poll",
+                                slug,
+                            )
+                            continue
                         try:
                             conn = _kb.connect(board=slug)
                         except Exception as exc:
+                            if _is_corrupt_board_db_error(exc):
+                                _log_corrupt_board_incident(slug, _record_corrupt_board(slug, exc), exc)
+                                continue
                             logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
                             continue
                         try:
@@ -6351,15 +6425,7 @@ class GatewayRunner:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
-        # Avoid hot-looping corrupt-looking board DBs, but do not suppress
-        # same-fingerprint retries forever: transient WAL/open races can
-        # surface as "database disk image is malformed" for one tick.
-        CORRUPT_BOARD_RETRY_AFTER_SECONDS = 300
-        disabled_corrupt_boards: dict[
-            str, tuple[tuple[str, int | None, int | None], float]
-        ] = {}
-
-        def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
+        def _board_db_identity(slug: str) -> tuple[str, int | None, int | None]:
             path = _kb.kanban_db_path(slug)
             try:
                 resolved = str(path.expanduser().resolve())
@@ -6370,6 +6436,65 @@ class GatewayRunner:
             except OSError:
                 return (resolved, None, None)
             return (resolved, stat.st_mtime_ns, stat.st_size)
+
+        def _board_db_fingerprint(slug: str) -> tuple[str, str | None]:
+            identity = _board_db_identity(slug)
+            try:
+                fingerprint = _kb._db_content_fingerprint(Path(identity[0]))
+            except Exception:
+                fingerprint = None
+            return (identity[0], fingerprint)
+
+        def _paused_corrupt_incident(slug: str) -> Optional[dict]:
+            try:
+                incident = _kb.is_board_paused_for_corruption(slug)
+            except Exception:
+                return None
+            if not incident:
+                return None
+            incident_db = Path(str(incident.get("db_path") or _kb.kanban_db_path(slug)))
+            try:
+                current_fingerprint = _kb._db_content_fingerprint(incident_db)
+            except Exception:
+                current_fingerprint = None
+            if incident.get("fingerprint") == current_fingerprint:
+                return incident
+            logger.info(
+                "kanban dispatcher: board %s database changed since corruption incident; retrying health checks",
+                slug,
+            )
+            return None
+
+        def _record_corrupt_board(slug: str, exc: Exception) -> Optional[dict]:
+            fingerprint = _board_db_fingerprint(slug)
+            incident = getattr(exc, "incident", None)
+            if not isinstance(incident, dict):
+                backup_path = getattr(exc, "backup_path", None)
+                reason = getattr(exc, "reason", None) or str(exc)
+                incident = _kb.record_corrupt_board_incident(
+                    slug,
+                    Path(fingerprint[0]),
+                    str(reason),
+                    backup_path=backup_path,
+                    fingerprint=fingerprint[1],
+                )
+            return incident
+
+        def _log_corrupt_board_incident(slug: str, incident: Optional[dict], exc: Exception) -> None:
+            incident = incident or {}
+            logger.error(
+                "kanban dispatcher: board %s database corruption incident; "
+                "db_path=%s quarantine_path=%s reason=%s. Dispatch and notifier "
+                "polling are paused for this board while the DB fingerprint is "
+                "unchanged. Repair guidance: restore a known-good backup or run "
+                "`hermes kanban repair --board %s`, then retry after integrity "
+                "checks pass.",
+                slug,
+                incident.get("db_path") or _board_db_fingerprint(slug)[0],
+                incident.get("quarantine_path") or getattr(exc, "backup_path", None) or "<unavailable>",
+                incident.get("reason") or getattr(exc, "reason", None) or str(exc),
+                slug,
+            )
 
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
             corrupt_guard_error = getattr(_kb, "KanbanDbCorruptError", None)
@@ -6393,29 +6518,12 @@ class GatewayRunner:
             connection handle or accidentally claim across each other.
             """
             conn = None
-            fingerprint = _board_db_fingerprint(slug)
-            disabled_entry = disabled_corrupt_boards.get(slug)
-            if disabled_entry is not None:
-                disabled_fingerprint, disabled_at = disabled_entry
-                age = time.monotonic() - disabled_at
-                if (
-                    disabled_fingerprint == fingerprint
-                    and age < CORRUPT_BOARD_RETRY_AFTER_SECONDS
-                ):
-                    return None
-                if disabled_fingerprint == fingerprint:
-                    logger.info(
-                        "kanban dispatcher: board %s database fingerprint unchanged "
-                        "after %.0fs quarantine; retrying dispatch",
-                        slug,
-                        age,
-                    )
-                else:
-                    logger.info(
-                        "kanban dispatcher: board %s database changed; retrying dispatch",
-                        slug,
-                    )
-                disabled_corrupt_boards.pop(slug, None)
+            if _paused_corrupt_incident(slug):
+                logger.debug(
+                    "kanban dispatcher: board %s paused for unchanged DB corruption; skipping dispatch",
+                    slug,
+                )
+                return None
             try:
                 conn = _kb.connect(board=slug)
                 # `connect()` runs the schema + idempotent migration on
@@ -6454,31 +6562,13 @@ class GatewayRunner:
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
-                    disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
-                    logger.error(
-                        "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; pausing dispatch for this board until "
-                        "the file changes, the gateway restarts, or the "
-                        "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
-                        slug,
-                        fingerprint[0],
-                    )
+                    _log_corrupt_board_incident(slug, _record_corrupt_board(slug, exc), exc)
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
             except Exception as exc:
                 if _is_corrupt_board_db_error(exc):
-                    disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
-                    logger.error(
-                        "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; pausing dispatch for this board until "
-                        "the file changes, the gateway restarts, or the "
-                        "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
-                        slug,
-                        fingerprint[0],
-                    )
+                    _log_corrupt_board_incident(slug, _record_corrupt_board(slug, exc), exc)
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
@@ -6507,7 +6597,7 @@ class GatewayRunner:
 
                 for b in boards:
                     slug = b.get("slug") or _kb.DEFAULT_BOARD
-                    if _dwb.is_discord_worker_board(slug):
+                    if _dwb.is_discord_worker_board(slug) and not _paused_corrupt_incident(slug):
                         discord_slugs.append(slug)
             except Exception:
                 logger.debug("kanban dispatcher: Discord board detection failed", exc_info=True)
@@ -6579,6 +6669,8 @@ class GatewayRunner:
                 discord_running_total = 0
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                if _paused_corrupt_incident(slug):
+                    continue
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
@@ -6639,6 +6731,8 @@ class GatewayRunner:
             details: list[str] = []
             for b in boards:
                 slug = str(b.get("slug") or _kb.DEFAULT_BOARD)
+                if _paused_corrupt_incident(slug):
+                    continue
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
@@ -6748,6 +6842,8 @@ class GatewayRunner:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 if attempted >= auto_decompose_per_tick:
                     break
+                if _paused_corrupt_incident(slug):
+                    continue
                 try:
                     from hermes_cli import discord_worker_boards as _dwb
                     if _dwb.is_discord_worker_board(slug):

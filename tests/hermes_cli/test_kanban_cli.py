@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -171,6 +172,128 @@ def test_run_slash_dispatch_dry_run_counts(kanban_home):
     kc.run_slash("create 'b' --assignee bob")
     out = kc.run_slash("dispatch --dry-run")
     assert "Spawned:" in out
+
+
+def test_run_slash_repair_reindex_success_human_and_json(kanban_home, monkeypatch):
+    board = "cli-reindex-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    fingerprint = kb._db_content_fingerprint(db_path)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "integrity_check returned 'row 1 missing from index idx_tasks_status'",
+        backup_path=db_path.with_suffix(".corrupt.bak"),
+        fingerprint=fingerprint,
+    )
+    checks = iter([
+        "row 1 missing from index idx_tasks_status",
+        "row 1 missing from index idx_tasks_status",
+        "ok",
+    ])
+    real_connect = kb._sqlite_connect
+
+    class ReindexConn:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args, **kwargs):
+            if str(sql).strip().upper() == "REINDEX":
+                return self.inner.execute("SELECT 1")
+            return self.inner.execute(sql, *args, **kwargs)
+
+        def commit(self):
+            return self.inner.commit()
+
+        def close(self):
+            return self.inner.close()
+
+    monkeypatch.setattr(kb, "_integrity_check_db", lambda path: next(checks))
+    monkeypatch.setattr(kb, "_sqlite_connect", lambda path: ReindexConn(real_connect(path)))
+
+    out = kc.run_slash(f"--board {board} repair")
+
+    assert "Status: repaired" in out
+    assert "Action: reindex" in out
+    assert kb.is_board_paused_for_corruption(board) is None
+
+    monkeypatch.setattr(kb, "_integrity_check_db", lambda path: "ok")
+    out = kc.run_slash(f"--board {board} repair --json")
+    payload = json.loads(out)
+    assert payload["status"] == "repaired"
+    assert payload["action"] == "already_valid"
+
+
+def test_run_slash_repair_accepts_alert_board_flag_order(kanban_home):
+    board = "cli-alert-order-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    fingerprint = kb._db_content_fingerprint(db_path)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "manual restore completed",
+        fingerprint=fingerprint,
+    )
+
+    out = kc.run_slash(f"repair --board {board}")
+
+    assert "Status: repaired" in out
+    assert "Action: already_valid" in out
+    assert kb.is_board_paused_for_corruption(board) is None
+
+
+def test_run_slash_repair_restores_known_good_backup_json(kanban_home):
+    board = "cli-restore-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    with kb.connect(board=board) as conn:
+        kb.create_task(conn, title="from cli backup")
+    backup = db_path.parent / "kanban.db.known-good.1.bak"
+    shutil.copy2(db_path, backup)
+    db_path.write_bytes(b"not a sqlite database")
+    fingerprint = kb._db_content_fingerprint(db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "integrity_check returned 'database disk image is malformed'",
+        backup_path=kb._backup_corrupt_db(db_path, fingerprint=fingerprint),
+        fingerprint=fingerprint,
+    )
+
+    out = kc.run_slash(f"repair --board {board} --json")
+    payload = json.loads(out)
+
+    assert payload["status"] == "repaired"
+    assert payload["action"] == "restore_known_good_backup"
+    assert payload["backup_path"] == str(backup)
+    assert kb.is_board_paused_for_corruption(board) is None
+
+
+def test_run_slash_repair_rejects_invalid_backup_and_stays_paused(kanban_home):
+    board = "cli-invalid-backup-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    db_path.write_bytes(b"not a sqlite database")
+    fingerprint = kb._db_content_fingerprint(db_path)
+    invalid_backup = db_path.parent / "kanban.db.known-good.1.bak"
+    invalid_backup.write_bytes(b"also not sqlite")
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "integrity_check returned 'database disk image is malformed'",
+        backup_path=kb._backup_corrupt_db(db_path, fingerprint=fingerprint),
+        fingerprint=fingerprint,
+    )
+
+    out = kc.run_slash(f"repair --board {board}")
+
+    assert "Status: failed" in out
+    assert "Action: none" in out
+    assert "Board remains paused" in out
+    assert kb.is_board_paused_for_corruption(board) is not None
 
 
 def test_run_slash_context_output_format(kanban_home):

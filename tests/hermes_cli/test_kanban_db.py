@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import time
@@ -101,13 +102,15 @@ def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
     corrupt = home / "kanban.db"
     corrupt.write_bytes(b"SQLit" + bytes.fromhex("17 03 03 00 13") + b"x" * 32)
 
-    with pytest.raises(sqlite3.DatabaseError) as exc_info:
+    with pytest.raises(kb.KanbanDbCorruptError) as exc_info:
         kb.connect(board="default")
 
-    msg = str(exc_info.value)
+    msg = exc_info.value.reason
     assert "file is not a database" in msg
     assert "TLS record header detected at byte offset 5" in msg
     assert "53 51 4c 69 74 17 03 03 00 13" in msg
+    assert exc_info.value.backup_path is not None
+    assert exc_info.value.backup_path.read_bytes() == corrupt.read_bytes()
 
 
 def test_board_metadata_non_utf8_bytes_fall_back_to_synthesized_metadata(kanban_home):
@@ -663,27 +666,27 @@ def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
         assert "reclaimed" not in kinds
 
 
-def test_claim_seeds_task_and_run_heartbeat(kanban_home):
+def test_claim_leaves_task_and_run_heartbeat_unset_until_worker_reports(kanban_home):
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="seed heartbeat", assignee="a")
+        task_id = kb.create_task(conn, title="await heartbeat", assignee="a")
         claimed = kb.claim_task(conn, task_id)
 
         assert claimed is not None
-        assert claimed.last_heartbeat_at is not None
+        assert claimed.last_heartbeat_at is None
         run = kb.latest_run(conn, task_id)
         assert run is not None
         assert run.last_heartbeat_at == claimed.last_heartbeat_at
 
 
-def test_review_claim_seeds_task_and_run_heartbeat(kanban_home):
+def test_review_claim_leaves_task_and_run_heartbeat_unset_until_worker_reports(kanban_home):
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="review seed", assignee="a")
+        task_id = kb.create_task(conn, title="review await heartbeat", assignee="a")
         _set_task_status(conn, task_id, "review")
 
         claimed = kb.claim_review_task(conn, task_id)
 
         assert claimed is not None
-        assert claimed.last_heartbeat_at is not None
+        assert claimed.last_heartbeat_at is None
         run = kb.latest_run(conn, task_id)
         assert run is not None
         assert run.last_heartbeat_at == claimed.last_heartbeat_at
@@ -4222,6 +4225,236 @@ def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
     assert second_backup is not None
     assert second_backup != backup
     assert second_backup.exists()
+
+
+def test_corrupt_board_incident_records_pause_and_reuses_quarantine(kanban_home):
+    board = "corrupt-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    original = _write_corrupt_db(db_path)
+    (db_path.parent / "kanban.db-wal").write_bytes(b"wal bytes")
+    (db_path.parent / "kanban.db-shm").write_bytes(b"shm bytes")
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    paths: set[Path] = set()
+    for _ in range(3):
+        with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+            kb.connect(board=board)
+        assert excinfo.value.incident is not None
+        paths.add(excinfo.value.backup_path)
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    assert len(paths) == 1
+    (backup,) = paths
+    assert backup.read_bytes() == original
+    assert (backup.parent / (backup.name + "-wal")).read_bytes() == b"wal bytes"
+    assert (backup.parent / (backup.name + "-shm")).read_bytes() == b"shm bytes"
+
+    incident = kb.is_board_paused_for_corruption(board)
+    assert incident is not None
+    assert incident["db_path"] == str(db_path.resolve())
+    assert incident["quarantine_path"] == str(backup)
+    assert incident["pause_reason"] == "kanban_db_corruption"
+    meta = kb.read_board_metadata(board)
+    assert meta["paused"] is True
+    assert meta["pause_reason"] == "kanban_db_corruption"
+
+
+def test_invalid_header_board_incident_records_pause_and_reuses_quarantine(kanban_home):
+    board = "invalid-header-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    original = b"not sqlite\x00" * 32
+    db_path.write_bytes(original)
+    (db_path.parent / "kanban.db-wal").write_bytes(b"invalid wal bytes")
+    (db_path.parent / "kanban.db-shm").write_bytes(b"invalid shm bytes")
+
+    paths: set[Path] = set()
+    for _ in range(5):
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+        with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+            kb.connect(board=board)
+        assert "invalid SQLite header" in excinfo.value.reason
+        assert excinfo.value.incident is not None
+        assert excinfo.value.incident["quarantine_path"] is not None
+        paths.add(excinfo.value.backup_path)
+
+    assert len(paths) == 1
+    (backup,) = paths
+    assert backup is not None
+    assert backup.read_bytes() == original
+    assert db_path.read_bytes() == original
+    assert (backup.parent / (backup.name + "-wal")).read_bytes() == b"invalid wal bytes"
+    assert (backup.parent / (backup.name + "-shm")).read_bytes() == b"invalid shm bytes"
+    assert list(db_path.parent.glob("kanban.db.corrupt.*.bak")) == [backup]
+
+    incident = kb.is_board_paused_for_corruption(board)
+    assert incident is not None
+    assert incident["db_path"] == str(db_path.resolve())
+    assert incident["quarantine_path"] == str(backup)
+    assert incident["pause_reason"] == "kanban_db_corruption"
+
+
+def test_init_db_board_refuses_invalid_header_with_board_incident(kanban_home):
+    board = "invalid-init-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    original = b"bad sqlite header"
+    db_path.write_bytes(original)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+        kb.init_db(board=board)
+
+    assert "invalid SQLite header" in excinfo.value.reason
+    assert excinfo.value.backup_path is not None
+    assert excinfo.value.backup_path.read_bytes() == original
+    assert db_path.read_bytes() == original
+    incident = kb.is_board_paused_for_corruption(board)
+    assert incident is not None
+    assert incident["quarantine_path"] == str(excinfo.value.backup_path)
+
+
+def test_repair_corrupt_board_reindex_success_clears_incident(kanban_home, monkeypatch):
+    board = "reindex-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    fingerprint = kb._db_content_fingerprint(db_path)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "integrity_check returned 'row 1 missing from index idx_tasks_status'",
+        backup_path=db_path.with_suffix(".corrupt.bak"),
+        fingerprint=fingerprint,
+    )
+    checks = iter([
+        "row 1 missing from index idx_tasks_status",
+        "row 1 missing from index idx_tasks_status",
+        "ok",
+    ])
+    real_connect = kb._sqlite_connect
+
+    class ReindexConn:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def execute(self, sql, *args, **kwargs):
+            if str(sql).strip().upper() == "REINDEX":
+                return self.inner.execute("SELECT 1")
+            return self.inner.execute(sql, *args, **kwargs)
+
+        def commit(self):
+            return self.inner.commit()
+
+        def close(self):
+            return self.inner.close()
+
+    def fake_integrity(path):
+        return next(checks)
+
+    monkeypatch.setattr(kb, "_integrity_check_db", fake_integrity)
+    monkeypatch.setattr(kb, "_sqlite_connect", lambda path: ReindexConn(real_connect(path)))
+
+    result = kb.repair_corrupt_board(board)
+
+    assert result["status"] == "repaired"
+    assert result["action"] == "reindex"
+    assert kb.is_board_paused_for_corruption(board) is None
+
+
+def test_repair_corrupt_board_restores_latest_known_good_backup(kanban_home):
+    board = "restore-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    with kb.connect(board=board) as conn:
+        kb.create_task(conn, title="from backup")
+    backup = db_path.parent / "kanban.db.known-good.2.bak"
+    shutil.copy2(db_path, backup)
+    original_fingerprint = kb._db_content_fingerprint(db_path)
+    _write_corrupt_db(db_path)
+    corrupt_fingerprint = kb._db_content_fingerprint(db_path)
+    assert corrupt_fingerprint != original_fingerprint
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "integrity_check returned 'database disk image is malformed'",
+        backup_path=kb._backup_corrupt_db(db_path, fingerprint=corrupt_fingerprint),
+        fingerprint=corrupt_fingerprint,
+    )
+
+    result = kb.repair_corrupt_board(board)
+
+    assert result["status"] == "repaired"
+    assert result["action"] == "restore_known_good_backup"
+    assert result["backup_path"] == str(backup)
+    assert kb.is_board_paused_for_corruption(board) is None
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(board=board) as conn:
+        assert [task.title for task in kb.list_tasks(conn)] == ["from backup"]
+
+
+def test_repair_corrupt_board_failed_repair_stays_paused(kanban_home, monkeypatch):
+    board = "failed-repair-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    fingerprint = kb._db_content_fingerprint(db_path)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "integrity_check returned 'database disk image is malformed'",
+        fingerprint=fingerprint,
+    )
+    monkeypatch.setattr(kb, "_integrity_check_db", lambda path: "database disk image is malformed")
+
+    result = kb.repair_corrupt_board(board)
+
+    assert result["status"] == "failed"
+    assert result["action"] is None
+    assert kb.is_board_paused_for_corruption(board) is not None
+
+
+def test_repair_corrupt_board_skips_invalid_backup_and_stays_paused(kanban_home):
+    board = "invalid-backup-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    _write_corrupt_db(db_path)
+    fingerprint = kb._db_content_fingerprint(db_path)
+    invalid_backup = db_path.parent / "kanban.db.known-good.1.bak"
+    _write_corrupt_db(invalid_backup)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "integrity_check returned 'database disk image is malformed'",
+        backup_path=kb._backup_corrupt_db(db_path, fingerprint=fingerprint),
+        fingerprint=fingerprint,
+    )
+
+    result = kb.repair_corrupt_board(board)
+
+    assert result["status"] == "failed"
+    assert result["action"] is None
+    assert kb.is_board_paused_for_corruption(board) is not None
+
+
+def test_repair_corrupt_board_already_valid_clears_incident(kanban_home):
+    board = "already-valid-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    fingerprint = kb._db_content_fingerprint(db_path)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "manual restore completed",
+        fingerprint=fingerprint,
+    )
+
+    result = kb.repair_corrupt_board(board)
+
+    assert result["status"] == "repaired"
+    assert result["action"] == "already_valid"
+    assert kb.is_board_paused_for_corruption(board) is None
 
 
 def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
