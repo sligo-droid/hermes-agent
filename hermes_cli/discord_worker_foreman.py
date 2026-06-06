@@ -865,14 +865,15 @@ def create_foreman_master_task(
                 "source_task_id": source_task,
                 "idempotency_key": idempotency_key,
             }
+        workspace = _foreman_master_workspace(issue)
         task_id = kanban_db.create_task(
             conn,
             title=_foreman_master_task_title(issue),
             body=render_foreman_master_task_body(issue),
             assignee=owner,
             created_by=FOREMAN_MASTER_TASK_CREATED_BY,
-            workspace_kind="dir",
-            workspace_path=str(_repo_root()),
+            workspace_kind=workspace["workspace_kind"],
+            workspace_path=workspace["workspace_path"],
             tenant=source_board or None,
             priority=100,
             idempotency_key=idempotency_key,
@@ -1509,14 +1510,21 @@ def _board_blocker_task(snapshot: BoardSnapshot) -> Optional[TaskSnapshot]:
 
 
 def _discord_worker_meta_for_source_board(board: str) -> Optional[dict[str, Any]]:
+    worker = _discord_worker_meta_for_workspace(board)
+    if worker is None:
+        return None
+    if _is_foreman_generated_board(worker):
+        return None
+    return worker
+
+
+def _discord_worker_meta_for_workspace(board: str) -> Optional[dict[str, Any]]:
     try:
         metadata = kanban_db.read_board_metadata(board)
     except Exception:
         return None
     worker = metadata.get(DISCORD_WORKER_META_KEY)
     if not isinstance(worker, dict) or worker.get("kind") != "discord_worker_board":
-        return None
-    if _is_foreman_generated_board(worker):
         return None
     return dict(worker)
 
@@ -2123,6 +2131,66 @@ def _repo_root() -> Path:
 def _issue_source_task_id(issue: ForemanIssue) -> str:
     evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
     return str(evidence.get("source_task_id") or issue.task_id or "").strip()
+
+
+def _is_runtime_checkout_path(path: str) -> bool:
+    try:
+        candidate = Path(path).expanduser().resolve(strict=False)
+        root = _repo_root().resolve(strict=False)
+    except Exception:
+        return False
+    return candidate == root or root in candidate.parents
+
+
+def _safe_foreman_workspace_path(value: Any) -> str:
+    path = str(value or "").strip()
+    if not path:
+        return ""
+    expanded = Path(path).expanduser()
+    if not expanded.is_absolute() or _is_runtime_checkout_path(path):
+        return ""
+    return path
+
+
+def _source_task_workspace_path(source_board: str, source_task: str) -> str:
+    if not source_board or not source_task:
+        return ""
+    conn = None
+    try:
+        conn = kanban_db.connect(board=source_board)
+        task = kanban_db.get_task(conn, source_task)
+    except Exception:
+        return ""
+    finally:
+        if conn is not None:
+            conn.close()
+    if task is None or str(task.workspace_kind or "") != "dir":
+        return ""
+    return _safe_foreman_workspace_path(task.workspace_path)
+
+
+def _foreman_master_workspace(issue: ForemanIssue) -> dict[str, Any]:
+    """Return isolated workspace args for master-board Foreman tasks.
+
+    The gateway/foreman code often runs from the canonical checkout. Recovery
+    tasks still need to operate from the source worker board's code island, not
+    from the runtime checkout that created the alert.
+    """
+    source_board = _issue_source_board(issue)
+    worker = _discord_worker_meta_for_workspace(source_board) if source_board else None
+    if worker:
+        path = _safe_foreman_workspace_path(worker.get("worktree_path"))
+        if path:
+            return {"workspace_kind": "dir", "workspace_path": path}
+    source_task_path = _source_task_workspace_path(source_board, _issue_source_task_id(issue))
+    if source_task_path:
+        return {"workspace_kind": "dir", "workspace_path": source_task_path}
+    evidence = issue.evidence if isinstance(issue.evidence, dict) else {}
+    for key in ("worktree_path", "workspace_path"):
+        path = _safe_foreman_workspace_path(evidence.get(key))
+        if path:
+            return {"workspace_kind": "dir", "workspace_path": path}
+    return {"workspace_kind": "scratch", "workspace_path": None}
 
 
 def _foreman_master_task_title(issue: ForemanIssue) -> str:

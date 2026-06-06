@@ -502,6 +502,16 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
     return meta
 
 
+def _discord_worker_worktree_path(board_meta: dict[str, Any]) -> Optional[str]:
+    worker = board_meta.get("discord_worker")
+    if not isinstance(worker, dict) or worker.get("kind") != "discord_worker_board":
+        return None
+    path = str(worker.get("worktree_path") or "").strip()
+    if not path:
+        return None
+    return path
+
+
 def write_board_metadata(
     board: Optional[str],
     *,
@@ -2093,20 +2103,28 @@ def create_task(
 
     now = int(time.time())
 
-    # Resolve workspace_path from board-level default_workdir when the
-    # caller did not specify one explicitly. Board defaults represent
-    # persistent project checkouts, so only persistent workspace kinds may
-    # inherit them. Scratch workspaces are auto-deleted on completion and
-    # must stay under the per-board scratch root created by
-    # ``resolve_workspace``; inheriting ``default_workdir`` for a scratch
-    # task would point cleanup at the user's source tree (#28818). The
-    # containment guard in ``_cleanup_workspace`` is the safety rail, but
-    # we also stop the bad state from being created in the first place.
+    if workspace_path is not None and workspace_kind in {"dir", "worktree"}:
+        workspace_path = str(workspace_path).strip() or None
+
+    # Resolve workspace_path from board-level metadata when the caller did
+    # not specify one explicitly. Discord worker boards own a dedicated
+    # worktree and that must win over generic board defaults; the default may
+    # be the checkout running the dashboard/gateway, while worker jobs need the
+    # isolated board worktree. Generic boards keep the older default_workdir
+    # inheritance. Scratch workspaces are auto-deleted on completion and must
+    # stay under the per-board scratch root created by ``resolve_workspace``;
+    # inheriting a persistent checkout for a scratch task would point cleanup
+    # at the user's source tree (#28818). The containment guard in
+    # ``_cleanup_workspace`` is the safety rail, but we also stop the bad state
+    # from being created in the first place.
     if workspace_path is None and workspace_kind in {"dir", "worktree"}:
         board_slug = board if board else get_current_board()
         board_meta = read_board_metadata(board_slug)
+        worker_worktree = _discord_worker_worktree_path(board_meta)
         board_default = board_meta.get("default_workdir")
-        if board_default:
+        if workspace_kind == "dir" and worker_worktree:
+            workspace_path = worker_worktree
+        elif board_default:
             workspace_path = str(board_default)
 
     # Retry once on the extremely unlikely id collision.
@@ -4771,9 +4789,13 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         return p
     if kind == "dir":
         if not task.workspace_path:
-            raise ValueError(
-                f"task {task.id} has workspace_kind=dir but no workspace_path"
-            )
+            board_meta = read_board_metadata(board if board else get_current_board())
+            worker_worktree = _discord_worker_worktree_path(board_meta)
+            if not worker_worktree:
+                raise ValueError(
+                    f"task {task.id} has workspace_kind=dir but no workspace_path"
+                )
+            task.workspace_path = worker_worktree
         p = Path(task.workspace_path).expanduser()
         if not p.is_absolute():
             raise ValueError(
