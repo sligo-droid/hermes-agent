@@ -104,6 +104,7 @@ class ProcessSession:
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
+    child_scope_unit: str = ""                   # transient systemd scope for gateway-owned children
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
@@ -497,6 +498,26 @@ class ProcessRegistry:
             except (OSError, ProcessLookupError, PermissionError):
                 pass
 
+    @staticmethod
+    def _terminate_child_scope(unit: str) -> bool:
+        """Best-effort stop for a transient systemd scope."""
+        if not unit or _IS_WINDOWS:
+            return False
+        try:
+            systemctl = shutil.which("systemctl")
+            if not systemctl:
+                return False
+            proc = subprocess.run(
+                [systemctl, "--user", "kill", unit, "--signal=SIGTERM"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+            return proc.returncode == 0
+        except Exception:
+            return False
+
     # ----- Spawn -----
 
     @staticmethod
@@ -591,10 +612,26 @@ class ProcessRegistry:
         # stdout is a pipe, hiding output from process(action="poll")).
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
+        popen_cmd = [user_shell, "-lic", f"set +m; {command}"]
+        child_scope = None
+        try:
+            from hermes_cli.gateway_child_isolation import build_gateway_child_scope_argv
+
+            popen_cmd, child_scope = build_gateway_child_scope_argv(
+                popen_cmd,
+                env=bg_env,
+                cwd=session.cwd or "",
+                kind="terminal",
+                purpose="background terminal process",
+                command_label=command.split()[0] if command.split() else "command",
+                session_key=session_key,
+            )
+        except Exception as exc:
+            logger.debug("Gateway child scope wrapping unavailable: %s", exc)
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
         proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {command}"],
+            popen_cmd,
             text=True,
             cwd=session.cwd,
             env=bg_env,
@@ -609,6 +646,8 @@ class ProcessRegistry:
 
         session.process = proc
         session.pid = proc.pid
+        if child_scope is not None and child_scope.enabled:
+            session.child_scope_unit = child_scope.unit
 
         try:
             # Start output reader thread
@@ -1001,6 +1040,8 @@ class ProcessRegistry:
         if session.detached:
             result["detached"] = True
             result["note"] = "Process recovered after restart -- output history unavailable"
+        if session.child_scope_unit:
+            result["child_scope_unit"] = session.child_scope_unit
         return result
 
     def read_log(self, session_id: str, offset: int = 0, limit: int = 200) -> dict:
@@ -1125,6 +1166,8 @@ class ProcessRegistry:
 
         # Kill via PTY, Popen (local), or env execute (non-local)
         try:
+            if session.child_scope_unit:
+                self._terminate_child_scope(session.child_scope_unit)
             if session._pty:
                 # PTY process -- terminate via ptyprocess
                 try:
@@ -1365,6 +1408,7 @@ class ProcessRegistry:
                             "command": s.command,
                             "pid": s.pid,
                             "pid_scope": s.pid_scope,
+                            "child_scope_unit": s.child_scope_unit,
                             "cwd": s.cwd,
                             "started_at": s.started_at,
                             "task_id": s.task_id,
@@ -1430,6 +1474,7 @@ class ProcessRegistry:
                     session_key=entry.get("session_key", ""),
                     pid=pid,
                     pid_scope=pid_scope,
+                    child_scope_unit=entry.get("child_scope_unit", ""),
                     cwd=entry.get("cwd"),
                     started_at=entry.get("started_at", time.time()),
                     detached=True,  # Can't read output, but can report status + kill
