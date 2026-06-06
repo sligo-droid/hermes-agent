@@ -91,6 +91,7 @@ def main() -> int:
         return 2
 
     task = None
+    result: Any = None
     conn = kanban_db.connect(board=board)
     try:
         task = kanban_db.get_task(conn, task_id)
@@ -121,8 +122,23 @@ def main() -> int:
         )
         return 0
     except Exception as exc:
+        if _recover_completed_role_output(
+            conn,
+            task_id,
+            role,
+            result,
+            board=board,
+            workspace=workspace,
+        ):
+            return 0
         try:
-            kanban_db.block_task(conn, task_id, reason=f"{_backend_label(role, task)} worker failed: {exc}")
+            blocked = kanban_db.block_task(
+                conn,
+                task_id,
+                reason=f"{_backend_label(role, task)} worker failed: {exc}",
+            )
+            if blocked:
+                return 0
         except Exception:
             pass
         return 1
@@ -133,6 +149,61 @@ def main() -> int:
                 mark_dispatch_dirty(board=board, reason=f"{role}-worker-finished")
             except Exception:
                 pass
+
+
+def _recover_completed_role_output(
+    conn: Any,
+    task_id: str,
+    role: str,
+    result: Any,
+    *,
+    board: Optional[str],
+    workspace: str,
+) -> bool:
+    """Apply an already-produced role JSON after cleanup/transient failures.
+
+    A Codex role worker can finish the model turn and record a valid JSON
+    result, then fail while tearing down the app-server or while the first DB
+    write attempt hits a transient lock. In that case the worker process must
+    not exit nonzero and let the dispatcher overwrite the useful verdict with
+    ``pid not alive``. Try one narrow recovery pass; if it cannot record a
+    terminal Kanban transition, the caller falls back to a normal blocked task.
+    """
+    if result is None or getattr(result, "error", None):
+        return False
+    final_text = str(getattr(result, "final_text", "") or "").strip()
+    if not final_text:
+        return False
+    try:
+        task = kanban_db.get_task(conn, task_id)
+    except Exception:
+        return False
+    if task is None:
+        return False
+    if task.status in {"done", "blocked", "scheduled", "archived"}:
+        return True
+    if task.status not in {"running", "ready"}:
+        return False
+    try:
+        payload = _parse_json(final_text)
+        if board and is_cancelled(board):
+            return True
+        _apply_role_output(
+            conn,
+            task_id,
+            role,
+            payload,
+            board=board,
+            workspace=workspace,
+            expected_run_id=task.current_run_id,
+        )
+    except Exception:
+        return False
+    try:
+        task = kanban_db.get_task(conn, task_id)
+    except Exception:
+        return False
+    return bool(task and task.status in {"done", "blocked", "scheduled", "archived"})
 
 
 def _build_prompt(conn: Any, task_id: str, role: str) -> str:

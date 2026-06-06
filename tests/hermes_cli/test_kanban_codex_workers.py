@@ -231,6 +231,111 @@ def test_role_completion_does_not_recover_when_claim_is_not_owned(monkeypatch, t
     assert task.status == "running"
 
 
+def test_role_worker_exits_zero_after_recording_backend_blocker(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+
+    board = "discord-worker-error"
+    kanban_db.create_board(board, name="Worker error board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Review", assignee=ROLE_REVIEWER)
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_CODEX_WORKER_ROLE", ROLE_REVIEWER)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(worker, "_build_prompt", lambda _conn, _task_id, _role: "prompt")
+    monkeypatch.setattr(
+        worker,
+        "_run_role_backend",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("backend exploded")),
+    )
+    monkeypatch.setattr(worker, "mark_dispatch_dirty", lambda **_kwargs: None)
+
+    assert worker.main() == 0
+
+    conn = kanban_db.connect(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        latest = kanban_db.latest_run(conn, task_id)
+    finally:
+        conn.close()
+    assert task is not None
+    assert task.status == "blocked"
+    assert latest is not None
+    assert latest.outcome == "blocked"
+    assert "backend exploded" in (latest.summary or "")
+
+
+def test_role_worker_recovers_completed_json_after_transient_apply_failure(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+
+    board = "discord-worker-recover-result"
+    kanban_db.create_board(board, name="Worker recovery board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Review", assignee=ROLE_REVIEWER)
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+    finally:
+        conn.close()
+
+    payload = {
+        "status": "blocked",
+        "summary": "Reviewer could not finish.",
+        "findings": [],
+        "new_tasks": [],
+        "criteria_assessment": {},
+        "blocker": "Need operator input.",
+    }
+    real_apply = worker._apply_role_output
+    calls = {"count": 0}
+
+    def flaky_apply(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("transient sqlite lock after result")
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_CODEX_WORKER_ROLE", ROLE_REVIEWER)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(worker, "_build_prompt", lambda _conn, _task_id, _role: "prompt")
+    monkeypatch.setattr(
+        worker,
+        "_run_role_backend",
+        lambda *args, **kwargs: SimpleNamespace(final_text=json.dumps(payload), error=None),
+    )
+    monkeypatch.setattr(worker, "_apply_role_output", flaky_apply)
+    monkeypatch.setattr(worker, "mark_dispatch_dirty", lambda **_kwargs: None)
+
+    assert worker.main() == 0
+    assert calls["count"] == 2
+
+    conn = kanban_db.connect(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        latest = kanban_db.latest_run(conn, task_id)
+    finally:
+        conn.close()
+    assert task is not None
+    assert task.status == "blocked"
+    assert latest is not None
+    assert latest.outcome == "blocked"
+    assert latest.summary == "Need operator input."
+
+
 def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_workers as workers
     from hermes_cli import discord_worker_read
