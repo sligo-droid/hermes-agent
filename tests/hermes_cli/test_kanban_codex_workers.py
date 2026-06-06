@@ -1040,6 +1040,66 @@ def test_planner_role_uses_opencode_plan_agent(monkeypatch, tmp_path):
     assert calls[0][2]["reasoning_level"] == "xhigh"
 
 
+def test_opencode_role_receives_sanitized_env(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+    from agent import opencode_worker as ow
+
+    control_values = {
+        "HERMES_KANBAN_DB": str(tmp_path / "live" / "kanban.db"),
+        "HERMES_KANBAN_BOARD": "discord-1512532369897160735",
+        "HERMES_KANBAN_WORKSPACES_ROOT": str(tmp_path / "workspaces"),
+        "HERMES_KANBAN_TASK": "task-1",
+        "HERMES_KANBAN_RUN_ID": "run-1",
+        "HERMES_KANBAN_CLAIM_LOCK": "claim-1",
+        "HERMES_KANBAN_ROOT": str(tmp_path / "kanban-root"),
+    }
+    for key, value in control_values.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("HERMES_CODING_WORKER_BACKEND", "opencode")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("OPENAI_API_KEY", "credential-survives")
+    monkeypatch.setattr(worker, "record_codex_worker_result", lambda *args, **kwargs: None)
+    calls = []
+
+    def fake_run(prompt, workspace, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            final_text='{"status":"completed","summary":"ok","changed_files":[],"tests":[]}',
+            error=None,
+            interrupted=False,
+            timed_out=False,
+            should_retire=False,
+            tool_iterations=1,
+            thread_id="ses-build",
+            turn_id="ses-build",
+            backend="opencode",
+            agents=["build"],
+            plan_text="",
+            exit_code=0,
+        )
+
+    monkeypatch.setattr(ow, "run_opencode_task", fake_run)
+
+    result = worker._run_role_backend(
+        "prompt",
+        str(tmp_path),
+        ROLE_DEV,
+        task=SimpleNamespace(id="t_dev", title="Fix bug", body="Fix parser bug"),
+        task_id="t_dev",
+        board=None,
+    )
+
+    child_env = calls[0]["env"]
+    assert result.backend == "opencode"
+    for key in control_values:
+        assert key not in child_env
+        assert os.environ[key] == control_values[key]
+    assert child_env["HERMES_HOME"] == str(tmp_path / "hermes-home")
+    assert child_env["OPENAI_API_KEY"] == "credential-survives"
+    assert child_env["HERMES_DISCORD_WORKER_READ_ONLY"] == "1"
+
+
 def test_reviewer_role_does_not_use_opencode_backend(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli.discord_worker_boards import ROLE_REVIEWER
@@ -2012,6 +2072,102 @@ def test_run_codex_records_app_server_state(monkeypatch, tmp_path):
     assert state["events"][0]["item_type"] == "commandExecution"
     assert "/home/droid/secret" not in rendered
     assert "[REDACTED_PATH]" in rendered
+
+
+def test_kanban_backend_child_env_scrubs_control_vars_without_mutating_role_env(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+
+    control_values = {
+        "HERMES_KANBAN_DB": str(tmp_path / "live" / "kanban.db"),
+        "HERMES_KANBAN_BOARD": "discord-1512532369897160735",
+        "HERMES_KANBAN_WORKSPACES_ROOT": str(tmp_path / "workspaces"),
+        "HERMES_KANBAN_TASK": "task-1",
+        "HERMES_KANBAN_RUN_ID": "run-1",
+        "HERMES_KANBAN_CLAIM_LOCK": "claim-1",
+        "HERMES_KANBAN_ROOT": str(tmp_path / "kanban-root"),
+    }
+    for key, value in control_values.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
+    monkeypatch.setenv("OPENAI_API_KEY", "credential-survives")
+    monkeypatch.setenv("VITE_PUBLIC_URL", "https://example.test")
+
+    child_env = worker._backend_child_env({"HERMES_DISABLE_MCP": "1"})
+
+    for key in control_values:
+        assert key not in child_env
+        assert os.environ[key] == control_values[key]
+    assert child_env["HERMES_HOME"] == str(tmp_path / "hermes-home")
+    assert child_env["PATH"] == "/usr/local/bin:/usr/bin"
+    assert child_env["OPENAI_API_KEY"] == "credential-survives"
+    assert child_env["VITE_PUBLIC_URL"] == "https://example.test"
+    assert child_env["HERMES_DISABLE_MCP"] == "1"
+
+
+def test_run_codex_passes_sanitized_replacement_env_to_app_server(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    control_values = {
+        "HERMES_KANBAN_DB": str(tmp_path / "live" / "kanban.db"),
+        "HERMES_KANBAN_BOARD": board.slug,
+        "HERMES_KANBAN_WORKSPACES_ROOT": str(tmp_path / "workspaces"),
+        "HERMES_KANBAN_TASK": task.id,
+        "HERMES_KANBAN_RUN_ID": "run-1",
+        "HERMES_KANBAN_CLAIM_LOCK": "claim-1",
+        "HERMES_KANBAN_ROOT": str(tmp_path / "kanban-root"),
+    }
+    for key, value in control_values.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("OPENAI_API_KEY", "credential-survives")
+    monkeypatch.setattr(worker, "record_codex_worker_result", lambda *args, **kwargs: None)
+    sessions = []
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            sessions.append(kwargs)
+
+        def run_turn(self, prompt, turn_timeout):
+            return SimpleNamespace(
+                final_text='{"status":"approved","summary":"ok","findings":[]}',
+                error=None,
+                interrupted=False,
+                timed_out=False,
+                should_retire=False,
+                tool_iterations=1,
+                turn_id="turn-1",
+                thread_id="thread-1",
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(worker, "CodexAppServerSession", FakeSession)
+
+    result = worker._run_codex(
+        "prompt",
+        str(workspace),
+        ROLE_REVIEWER,
+        task_id=task.id,
+        board=board.slug,
+    )
+
+    child_env = sessions[0]["env"]
+    assert result.turn_id == "turn-1"
+    assert sessions[0]["replace_env"] is True
+    for key in control_values:
+        assert key not in child_env
+        assert os.environ[key] == control_values[key]
+    assert child_env["HERMES_HOME"] == str(tmp_path / "hermes-home")
+    assert child_env["OPENAI_API_KEY"] == "credential-survives"
+    assert child_env["HERMES_DISCORD_WORKER_READ_ONLY"] == "1"
+    assert child_env["HERMES_KANBAN_WORKSPACE"] == str(workspace)
+    assert child_env["HERMES_DISABLE_MCP"] == "1"
 
 
 def test_run_codex_retries_auth_failure_with_next_pool_credential(monkeypatch, tmp_path):

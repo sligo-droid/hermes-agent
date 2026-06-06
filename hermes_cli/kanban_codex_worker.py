@@ -66,6 +66,17 @@ _CODE_CHANGE_SIGNAL_RE = re.compile(
     re.IGNORECASE,
 )
 _KANBAN_ACTIVITY_HEARTBEAT_INTERVAL_SECONDS = 10
+KANBAN_CONTROL_ENV_VARS = frozenset(
+    {
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_RUN_ID",
+        "HERMES_KANBAN_CLAIM_LOCK",
+        "HERMES_KANBAN_ROOT",
+    }
+)
 _last_activity_heartbeat_at: dict[tuple[str, str], float] = {}
 
 
@@ -463,6 +474,17 @@ def _role_read_only_discord_env(role: str) -> dict[str, str]:
     }
 
 
+def _backend_child_env(extra: Optional[dict[str, str]] = None) -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in KANBAN_CONTROL_ENV_VARS
+    }
+    if extra:
+        env.update(extra)
+    return env
+
+
 def _restore_environ(old_values: dict[str, Optional[str]]) -> None:
     for key, old in old_values.items():
         if old is None:
@@ -507,16 +529,20 @@ def _run_codex(
     try:
         attempt = 0
         while True:
-            worker_env = {
-                "HERMES_DISABLE_MCP": "1",
-                "HERMES_CODEX_WORKER_NETWORK_ACCESS": "1",
-                **runtime_env,
-            }
+            worker_env = _backend_child_env(
+                {
+                    "HERMES_DISABLE_MCP": "1",
+                    "HERMES_CODEX_WORKER_NETWORK_ACCESS": "1",
+                    "HERMES_KANBAN_WORKSPACE": workspace,
+                    **runtime_env,
+                }
+            )
             session = CodexAppServerSession(
                 cwd=workspace,
                 codex_home=os.environ.get("CODEX_HOME"),
                 extra_args=extra_args,
                 env=worker_env,
+                replace_env=True,
                 on_event=on_event,
             )
             try:
@@ -657,6 +683,7 @@ def _run_opencode(
                 agent=cfg["plan_agent"],
                 reasoning_level=reasoning_level,
                 title=f"kanban {task_id}",
+                env=_backend_child_env(runtime_env),
                 on_event=on_event,
             )
         else:
@@ -668,6 +695,7 @@ def _run_opencode(
                 force_plan=False,
                 title=f"kanban {task_id}",
                 worker_config=_scheduled_opencode_worker_config(),
+                env=_backend_child_env(runtime_env),
                 on_event=on_event,
             )
     finally:
