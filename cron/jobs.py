@@ -854,6 +854,8 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    run_id = uuid.uuid4().hex[:12]
+    now = _hermes_now().isoformat()
     return update_job(
         job["id"],
         {
@@ -861,9 +863,120 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             "state": "scheduled",
             "paused_at": None,
             "paused_reason": None,
-            "next_run_at": _hermes_now().isoformat(),
+            "next_run_at": now,
+            "manual_run": {
+                "run_id": run_id,
+                "requested_at": now,
+                "state": "queued",
+                "started_at": None,
+                "pid": None,
+                "output_path": None,
+                "error": None,
+            },
         },
     )
+
+
+def mark_manual_run_started(job_id: str, run_id: str, pid: int) -> None:
+    """Persist that a manually-triggered cron run is actively executing."""
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            manual = job.get("manual_run") or {}
+            if manual.get("run_id") != run_id:
+                return
+            manual.update(
+                {
+                    "state": "running",
+                    "started_at": manual.get("started_at") or _hermes_now().isoformat(),
+                    "pid": pid,
+                    "error": None,
+                }
+            )
+            job["manual_run"] = manual
+            save_jobs(jobs)
+            return
+
+
+def mark_manual_run_finished(
+    job_id: str,
+    run_id: str,
+    *,
+    success: bool,
+    output_path: Optional[str] = None,
+    error: Optional[str] = None,
+) -> None:
+    """Persist the terminal status for the current manual cron run, if any."""
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            manual = job.get("manual_run") or {}
+            if manual.get("run_id") != run_id:
+                return
+            manual.update(
+                {
+                    "state": "completed" if success else "error",
+                    "finished_at": _hermes_now().isoformat(),
+                    "output_path": str(output_path) if output_path else manual.get("output_path"),
+                    "error": error,
+                    "pid": None,
+                }
+            )
+            job["manual_run"] = manual
+            save_jobs(jobs)
+            return
+
+
+def reconcile_manual_runs(pid_exists=None) -> int:
+    """Repair in-flight manual run records after a scheduler/gateway restart."""
+    if pid_exists is None:
+        pid_exists = _pid_exists
+    repaired = 0
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        for job in jobs:
+            manual = job.get("manual_run")
+            if not isinstance(manual, dict):
+                continue
+            state = manual.get("state")
+            if state not in {"queued", "running"}:
+                continue
+            pid = manual.get("pid")
+            if state == "running" and pid:
+                try:
+                    if pid_exists(int(pid)):
+                        continue
+                except (TypeError, ValueError, OSError):
+                    pass
+            manual.update(
+                {
+                    "state": "interrupted",
+                    "finished_at": _hermes_now().isoformat(),
+                    "error": "Manual cron run was interrupted before completion or lost during restart.",
+                    "pid": None,
+                }
+            )
+            job["manual_run"] = manual
+            repaired += 1
+        if repaired:
+            save_jobs(jobs)
+    return repaired
+
+
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def remove_job(job_id: str) -> bool:

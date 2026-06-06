@@ -7,9 +7,37 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
+import cron.scheduler as scheduler
 from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+class TestTickState:
+    def test_tick_running_flag_wraps_successful_tick(self, monkeypatch):
+        seen = []
+
+        def fake_get_due_jobs():
+            seen.append(scheduler.is_tick_running())
+            return []
+
+        monkeypatch.setattr(scheduler, "get_due_jobs", fake_get_due_jobs)
+
+        assert scheduler.is_tick_running() is False
+        assert scheduler.tick(verbose=False) == 0
+        assert seen == [True]
+        assert scheduler.is_tick_running() is False
+
+    def test_tick_running_flag_resets_after_exception(self, monkeypatch):
+        def boom():
+            assert scheduler.is_tick_running() is True
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(scheduler, "get_due_jobs", boom)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            scheduler.tick(verbose=False)
+        assert scheduler.is_tick_running() is False
 
 
 class TestResolveOrigin:

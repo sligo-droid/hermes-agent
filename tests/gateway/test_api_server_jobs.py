@@ -11,6 +11,7 @@ Covers:
 """
 
 import logging
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -487,12 +488,46 @@ class TestRunJob:
                 f"{_MOD}._CRON_AVAILABLE", True
             ), patch(
                 f"{_MOD}._cron_trigger", mock_trigger
+            ), patch(
+                f"{_MOD}._cron_tick", None
             ):
                 resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["job"] == triggered_job
                 mock_trigger.assert_called_once_with(VALID_JOB_ID)
+
+    @pytest.mark.asyncio
+    async def test_run_job_starts_durable_tick_thread(self, adapter, monkeypatch):
+        """Manual API trigger starts a non-daemon tick outside request lifetime."""
+        app = _create_app(adapter)
+        started: dict = {}
+
+        class FakeThread:
+            def __init__(self, *, target, kwargs, name, daemon):
+                started.update({"target": target, "kwargs": kwargs, "name": name, "daemon": daemon})
+
+            def start(self):
+                started["started"] = True
+
+        monkeypatch.setattr(threading, "Thread", FakeThread)
+        triggered_job = {**SAMPLE_JOB, "manual_run": {"state": "queued", "run_id": "run123"}}
+        mock_trigger = MagicMock(return_value=triggered_job)
+        mock_tick = MagicMock()
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_trigger", mock_trigger
+            ), patch(f"{_MOD}._cron_tick", mock_tick):
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["job"] == triggered_job
+
+        assert started["started"] is True
+        assert started["target"] is mock_tick
+        assert started["kwargs"] == {"verbose": False}
+        assert started["daemon"] is False
+        assert VALID_JOB_ID in started["name"]
 
 
 # ---------------------------------------------------------------------------
