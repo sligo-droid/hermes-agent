@@ -222,6 +222,17 @@ def test_command_center_repair_creates_idempotent_foreman_task(client):
     assert repair_task["max_runtime_seconds"] == 1800
     assert repair_task["idempotency_key"] == f"command-center-repair:{board}:{blocked_task_id}"
     assert "Use the foreman profile/role" in repair_task["body"]
+    assert "Post-repair root-cause follow-up" in repair_task["body"]
+    assert "durable or fundamental Hermes repository fix" in repair_task["body"]
+    assert "Do not auto-apply repository code changes" in repair_task["body"]
+    assert "directly required to unstick the board" in repair_task["body"]
+    assert "exactly one separate human-decision Command Center row" in repair_task["body"]
+    assert "proposed self-improvement card" in repair_task["body"]
+    assert "project: hermes" in repair_task["body"]
+    assert "prong: system-doctor" in repair_task["body"]
+    assert "self_improvement.proposal_run.v1" in repair_task["body"]
+    assert "self_improvement.proposal_storage.ingest_proposal_output" in repair_task["body"]
+    assert "title, summary/body, rationale, scope, and verification" in repair_task["body"]
     assert first_body["worker_url"].endswith(f"/workers/{board}/tickets/{repair_task['id']}")
 
     board_rollup = client.post(f"/api/plugins/kanban/boards/{board}/repair", json={"title": "Board rollup"})

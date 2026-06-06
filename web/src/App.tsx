@@ -126,7 +126,7 @@ const CHAT_NAV_ITEM: NavItem = {
 
 const WORKERS_NAV_ITEM: NavItem = {
   path: "/workers",
-  label: "Workers",
+  label: "Kanban",
   icon: Wrench,
   reloadDocument: true,
 };
@@ -612,11 +612,11 @@ export default function App() {
       const commandCenterTabs = [
         { path: "/sligo", label: "Overview" },
         { path: "/sligo/inbox", label: "Inbox" },
-        { path: "/sligo/work", label: "Work" },
+        { path: "/sligo/work", label: "Active" },
         { path: "/sligo/archive", label: "Archive" },
         { path: "/command-center", label: "Overview" },
         { path: "/self-improvement", label: "Overview" },
-        { path: "/workers", label: "Workers" },
+        { path: "/workers", label: "Kanban" },
       ];
       if (dashboardSurface === "sligo") {
         return [{ path: "/", label: "Overview" }, ...commandCenterTabs];
