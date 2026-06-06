@@ -2270,10 +2270,7 @@ def board_thread_state(board: str) -> str:
                     return "errored"
             if blocked_tasks:
                 return "blocked"
-            if (
-                all(task.status == "done" for task in tasks)
-                and is_terminal
-            ):
+            if is_terminal and all(task.status == "done" for task in tasks):
                 return "done"
             if any(task.status == "running" for task in tasks):
                 return "running"
@@ -3094,7 +3091,7 @@ def thread_status_targets() -> list[dict[str, Any]]:
                     _log_skipped_board_target(source_board, exc, source="discord thread status source task")
                     continue
                 raise
-        visible_state = source_state or state
+        visible_state = state if state in {"done", "blocked", "errored"} else source_state or state
         terminal_completion_message_pending = bool(worker.get("terminal_completion_message_pending"))
         terminal_sync_pending = bool(
             worker.get("terminal_reaction_sync_pending")
@@ -3108,7 +3105,7 @@ def thread_status_targets() -> list[dict[str, Any]]:
             and board not in active_foreman_sources
         ):
             continue
-        if source_state:
+        if source_state and state not in {"done", "blocked", "errored"}:
             reaction_state = source_state
         else:
             try:

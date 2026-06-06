@@ -835,6 +835,84 @@ def test_discord_kanban_typing_watcher_skips_completed_status_sync(tmp_path, mon
     assert adapter.synced == []
 
 
+def test_discord_completed_worker_board_reaction_stays_done_with_stale_active_source_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(
+        thread_id="1512532369897160735",
+        goal="Quarantine and self-heal Kanban SQLite corruption instead of log-storming",
+        chat_id="parent-1512532369897160735",
+    )
+    conn = kb.connect(board=board.slug)
+    try:
+        task = kb.list_tasks(conn, include_archived=False)[0]
+        claimed = kb.claim_task(conn, task.id)
+        assert claimed is not None
+        kb.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+    source_conn = kb.connect()
+    try:
+        source_task_id = kb.create_task(source_conn, title="Source task still active")
+        with source_conn:
+            source_conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (source_task_id,))
+    finally:
+        source_conn.close()
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "source_board": kb.DEFAULT_BOARD,
+            "source_task_id": source_task_id,
+        },
+    )
+
+    assert dwb.board_thread_state(board.slug) == "done"
+    assert dwb.board_thread_reaction_state(board.slug) == "done"
+
+
+def test_discord_completed_worker_board_reaction_ignores_stale_active_source_task(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    source_conn = kb.connect()
+    try:
+        source_task_id = kb.create_task(source_conn, title="Source task still active")
+        with source_conn:
+            source_conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (source_task_id,))
+    finally:
+        source_conn.close()
+
+    board = dwb.set_goal(
+        thread_id="1512532369897160735",
+        goal=f"Completed worker with stale source\n- Board: {kb.DEFAULT_BOARD}\n- Task: {source_task_id}",
+        chat_id="parent-1512532369897160735",
+    )
+    conn = kb.connect(board=board.slug)
+    try:
+        task = kb.list_tasks(conn, include_archived=False)[0]
+        claimed = kb.claim_task(conn, task.id)
+        assert claimed is not None
+        kb.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_reaction_sync_pending": True,
+            "terminal_summary_sync_pending": True,
+        },
+    )
+
+    target = next(target for target in dwb.thread_status_targets() if target["board"] == board.slug)
+    assert target["state"] == "done"
+    assert target.get("reaction_state", target["state"]) == "done"
+
+
 def test_discord_status_targets_keep_source_thread_hammer_during_active_foreman(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb

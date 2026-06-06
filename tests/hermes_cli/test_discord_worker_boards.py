@@ -472,8 +472,8 @@ def test_thread_status_targets_use_source_task_state_for_foreman_board(monkeypat
     dwb._update_worker_meta(
         board.slug,
         {
-            "goal_status": "done",
-            "phase": "complete",
+            "goal_status": "active",
+            "phase": "running",
             "summary_message_id": "333",
             "source_message_id": "111",
         },
