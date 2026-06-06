@@ -1058,6 +1058,10 @@ def collect_board_snapshots(*, foreman_generated_only: bool = False) -> list[Boa
             continue
         seen_db_paths.add(db_path)
         if _paused_corrupt_incident(board):
+            logger.debug(
+                "discord foreman: board %s paused for unchanged DB corruption; skipping poll",
+                board,
+            )
             continue
         try:
             snapshots.append(

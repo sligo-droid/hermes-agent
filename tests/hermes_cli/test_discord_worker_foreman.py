@@ -1117,6 +1117,7 @@ def test_collect_board_snapshots_records_corrupt_open_once_then_skips(
     assert calls == {"connect": 1, "record": 1}
     messages = [record.getMessage() for record in caplog.records]
     assert sum("discord foreman: board discord-corrupt-foreman database corruption incident" in msg for msg in messages) == 1
+    assert any("paused for unchanged DB corruption" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
 
 
