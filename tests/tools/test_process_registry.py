@@ -18,6 +18,27 @@ from tools.process_registry import (
 )
 
 
+class _FakeProcess:
+    pid = 4321
+
+    def poll(self):
+        return None
+
+    def kill(self):
+        pass
+
+    def wait(self, timeout=None):
+        return 0
+
+
+class _FakePipe:
+    def readline(self):
+        return ""
+
+    def close(self):
+        pass
+
+
 @pytest.fixture()
 def registry():
     """Create a fresh ProcessRegistry."""
@@ -99,6 +120,59 @@ class TestGetAndPoll:
         result = registry.poll(s.id)
         assert result["status"] == "exited"
         assert result["exit_code"] == 0
+
+
+class TestGatewayChildScopeLaunch:
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only systemd scope wrapping")
+    def test_spawn_local_wraps_background_command_in_gateway_child_scope(self, registry, tmp_path, monkeypatch):
+        captured = {}
+
+        def fake_build(command, **kwargs):
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+            from hermes_cli.gateway_child_isolation import GatewayChildScope
+
+            return ["/usr/bin/systemd-run", "--user", "--scope", "--", *command], GatewayChildScope(
+                enabled=True,
+                unit="hermes-gateway-child-terminal-test.scope",
+                kind="terminal",
+                purpose="background terminal process",
+                command_label="sleep",
+                workspace=str(tmp_path),
+                session_key="session-a",
+            )
+
+        monkeypatch.setattr(
+            "hermes_cli.gateway_child_isolation.build_gateway_child_scope_argv",
+            fake_build,
+        )
+        monkeypatch.setattr(
+            "tools.process_registry._find_shell",
+            lambda: "/bin/bash",
+        )
+        def fake_popen(args, **kwargs):
+            captured["popen"] = (args, kwargs)
+            return _FakeProcess()
+
+        monkeypatch.setattr("tools.process_registry.subprocess.Popen", fake_popen)
+        monkeypatch.setattr(
+            "tools.process_registry.ProcessRegistry._reader_loop",
+            lambda self, session: None,
+        )
+
+        session = registry.spawn_local(
+            "sleep 60",
+            cwd=str(tmp_path),
+            session_key="session-a",
+            env_vars={"OPENAI_API_KEY": "secret"},
+        )
+
+        assert session.child_scope_unit == "hermes-gateway-child-terminal-test.scope"
+        assert captured["command"] == ["/bin/bash", "-lic", "set +m; sleep 60"]
+        assert captured["kwargs"]["kind"] == "terminal"
+        assert captured["kwargs"]["session_key"] == "session-a"
+        assert captured["popen"][0][:4] == ["/usr/bin/systemd-run", "--user", "--scope", "--"]
+        assert registry.poll(session.id)["child_scope_unit"] == "hermes-gateway-child-terminal-test.scope"
 
 
 # =========================================================================

@@ -118,8 +118,8 @@ def _role_runtime_settings(
     roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
     role_cfg = roles.get(role) if isinstance(roles.get(role), dict) else {}
 
-    raw_reasoning = _first_configured_value(
-        os.getenv("HERMES_CODEX_WORKER_REASONING"),
+    raw_reasoning = _config_value_with_auto_env(
+        "HERMES_CODEX_WORKER_REASONING",
         role_cfg.get("reasoning"),
     )
     reasoning_source = "explicit" if raw_reasoning is not None else "adaptive"
@@ -131,8 +131,8 @@ def _role_runtime_settings(
             reasoning = _ROLE_DEFAULT_REASONING.get(role, "medium")
             reasoning_source = "default"
 
-    raw_tier = _first_configured_value(
-        os.getenv("HERMES_CODEX_WORKER_SERVICE_TIER"),
+    raw_tier = _config_value_with_auto_env(
+        "HERMES_CODEX_WORKER_SERVICE_TIER",
         role_cfg.get("service_tier"),
         role_cfg.get("mode"),
         role_cfg.get("fast"),
@@ -163,6 +163,14 @@ def _first_configured_value(*values: Any) -> Any:
             continue
         return value
     return None
+
+
+def _config_value_with_auto_env(env_key: str, *values: Any) -> Any:
+    configured = _first_configured_value(*values)
+    if configured is not None and not _is_auto(configured):
+        return configured
+    env_value = _first_configured_value(os.getenv(env_key))
+    return env_value if env_value is not None else configured
 
 
 def _is_auto(value: Any) -> bool:

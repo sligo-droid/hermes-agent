@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from agent.transports.codex_app_server_session import TurnResult
 from tools import coding_worker_tool as cwt
 
@@ -43,10 +45,18 @@ class FakeSession:
         )
 
 
+@pytest.fixture(autouse=True)
+def _default_codex_backend(monkeypatch):
+    from agent import opencode_worker as ow
+
+    monkeypatch.setattr(ow, "load_coding_worker_backend", lambda: "codex")
+
+
 def _parent(tmp_path, api_mode="chat_completions"):
     return SimpleNamespace(
         api_mode=api_mode,
         session_cwd=str(tmp_path),
+        session_key="discord:123",
         _touch_activity=lambda message: None,
     )
 
@@ -121,6 +131,9 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     assert result["summary"] == "Changed src/app.py and ran pytest."
     assert result["cwd"] == str(tmp_path)
     assert FakeSession.instances[0].kwargs["cwd"] == str(tmp_path)
+    assert FakeSession.instances[0].kwargs["env"] == {"HERMES_SESSION_KEY": "discord:123"}
+    assert FakeSession.instances[0].kwargs["scope_kind"] == "coding-worker"
+    assert FakeSession.instances[0].kwargs["scope_purpose"] == "Codex coding worker build pass"
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
         'model_reasoning_effort="medium"',

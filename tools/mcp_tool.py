@@ -1374,6 +1374,30 @@ class MCPServerTask:
 
         safe_env = _build_safe_env(user_env)
         command, safe_env = _resolve_stdio_command(command, safe_env)
+        child_scope = None
+        try:
+            from gateway.session_context import get_session_env
+            from hermes_cli.gateway_child_isolation import build_gateway_child_scope_argv
+
+            wrapped, child_scope = build_gateway_child_scope_argv(
+                [command],
+                env=safe_env,
+                cwd=get_session_env("HERMES_SESSION_CWD", ""),
+                kind="mcp-stdio",
+                purpose=f"MCP stdio server {self.name}",
+                command_label=self.name,
+                session_key=get_session_env("HERMES_SESSION_KEY", ""),
+            )
+            if child_scope.enabled:
+                command = wrapped[0]
+                args = [*wrapped[1:], *args]
+                logger.debug(
+                    "Launching MCP server '%s' in gateway child scope %s",
+                    self.name,
+                    child_scope.unit,
+                )
+        except Exception as exc:
+            logger.debug("MCP gateway child scope wrapping unavailable: %s", exc)
 
         # Check package against OSV malware database before spawning
         from tools.osv_check import check_package_for_malware

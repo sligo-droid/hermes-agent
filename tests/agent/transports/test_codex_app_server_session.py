@@ -115,6 +115,27 @@ def make_session(client: FakeClient, **kwargs) -> CodexAppServerSession:
     )
 
 
+def test_ensure_started_passes_cwd_to_app_server_client(tmp_path):
+    captured = {}
+    client = FakeClient()
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return client
+
+    session = CodexAppServerSession(
+        cwd=str(tmp_path),
+        env={"HERMES_SESSION_KEY": "discord:123"},
+        client_factory=factory,
+    )
+
+    assert session.ensure_started() == "thread-fake-001"
+    assert captured["cwd"] == str(tmp_path)
+    assert captured["env"] == {"HERMES_SESSION_KEY": "discord:123"}
+    assert captured["scope_kind"] == "codex-app-server"
+    assert captured["scope_purpose"] == "Codex app-server runtime"
+
+
 # ---- choice mapping ----
 
 class TestApprovalChoiceMapping:

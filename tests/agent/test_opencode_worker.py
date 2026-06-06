@@ -806,6 +806,70 @@ def test_opencode_process_closes_stdin(monkeypatch, tmp_path):
     assert popen_kwargs["stdin"] == ow.subprocess.DEVNULL
 
 
+def test_process_wraps_opencode_run_in_gateway_child_scope(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_build(command, **kwargs):
+        captured["command"] = list(command)
+        captured["kwargs"] = kwargs
+        from hermes_cli.gateway_child_isolation import GatewayChildScope
+
+        return ["/usr/bin/systemd-run", "--user", "--scope", "--", *command], GatewayChildScope(
+            enabled=True,
+            unit="hermes-gateway-child-coding-worker-session-opencode-run.scope",
+            kind="coding-worker",
+            purpose="OpenCode coding worker build pass",
+            command_label="opencode-run",
+            workspace=str(tmp_path),
+            session_key="discord:123",
+        )
+
+    class FakeProcess:
+        stdout = io.StringIO("")
+        stderr = io.StringIO("")
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["popen_kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "hermes_cli.gateway_child_isolation.build_gateway_child_scope_argv",
+        fake_build,
+    )
+    monkeypatch.setattr(ow.subprocess, "Popen", fake_popen)
+
+    result = ow._run_opencode_process(
+        ["opencode", "run", "brief"],
+        workdir=str(tmp_path),
+        timeout=5,
+        startup_timeout=0,
+        env={"HERMES_SESSION_KEY": "discord:123", "OPENAI_API_KEY": "secret"},
+        scope_session_key="discord:123",
+        scope_purpose="OpenCode coding worker build pass",
+    )
+
+    assert result.returncode == 0
+    assert captured["command"] == ["opencode", "run", "brief"]
+    assert captured["kwargs"]["kind"] == "coding-worker"
+    assert captured["kwargs"]["purpose"] == "OpenCode coding worker build pass"
+    assert captured["kwargs"]["command_label"] == "opencode-run"
+    assert captured["kwargs"]["session_key"] == "discord:123"
+    assert captured["kwargs"]["cwd"] == str(tmp_path)
+    assert captured["kwargs"]["pipe_stdio"] is True
+    assert captured["cmd"][:4] == ["/usr/bin/systemd-run", "--user", "--scope", "--"]
+    assert captured["cmd"][-3:] == ["opencode", "run", "brief"]
+    assert captured["popen_kwargs"]["cwd"] is None
+    assert captured["popen_kwargs"]["stdin"] == ow.subprocess.DEVNULL
+
+
 def test_process_startup_timeout_kills_no_output_child(tmp_path):
     result = ow._run_opencode_process(
         [sys.executable, "-c", "import time; time.sleep(5)"],

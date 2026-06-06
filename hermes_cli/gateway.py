@@ -2797,6 +2797,10 @@ def systemd_status(deep: bool = False, system: bool = False, full: bool = False)
             print(f"  {line}")
 
     unit_props = _read_systemd_unit_properties(system=system)
+    service_pid = _systemd_main_pid_from_props(unit_props)
+    memory_pids = (service_pid,) if service_pid else ()
+    _print_gateway_memory(memory_pids)
+
     active_state = unit_props.get("ActiveState", "")
     sub_state = unit_props.get("SubState", "")
     exec_main_status = unit_props.get("ExecMainStatus", "")
@@ -3159,7 +3163,9 @@ def launchd_status(deep: bool = False):
         print("✗ Gateway service is not loaded")
         print("  Service definition exists locally but launchd has not loaded it.")
         print("  Run: hermes gateway start")
-    
+
+    _print_gateway_memory(tuple(find_gateway_pids()))
+
     if deep:
         log_file = get_hermes_home() / "logs" / "gateway.log"
         if log_file.exists():
@@ -3902,6 +3908,32 @@ def _runtime_health_lines() -> list[str]:
         lines.append(f"⚠ Last shutdown reason: {exit_reason}")
 
     return lines
+
+
+def _gateway_memory_lines(pids: tuple[int, ...] | list[int]) -> list[str]:
+    """Return compact gateway/child RSS lines for operator status output."""
+    if not pids:
+        return []
+    try:
+        from gateway.memory_telemetry import (
+            collect_gateway_memory_telemetry,
+            format_gateway_memory_lines,
+        )
+
+        telemetry = collect_gateway_memory_telemetry(pids)
+        return format_gateway_memory_lines(telemetry)
+    except Exception:
+        return []
+
+
+def _print_gateway_memory(pids: tuple[int, ...] | list[int]) -> None:
+    lines = _gateway_memory_lines(pids)
+    if not lines:
+        return
+    print()
+    print("Gateway memory:")
+    for line in lines:
+        print(f"  {line}")
 
 
 def _setup_standard_platform(platform: dict):
@@ -5680,6 +5712,7 @@ def _gateway_command_inner(args):
                     print("Recent gateway health:")
                     for line in runtime_lines:
                         print(f"  {line}")
+                _print_gateway_memory(tuple(pids))
                 print()
                 if is_termux():
                     print("Termux note:")

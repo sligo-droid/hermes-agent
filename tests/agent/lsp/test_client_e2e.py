@@ -11,6 +11,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -123,6 +124,77 @@ async def test_client_shutdown_idempotent(tmp_path: Path):
     await client.start()
     await client.shutdown()
     await client.shutdown()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_client_spawn_wraps_lsp_in_gateway_child_scope(tmp_path: Path, monkeypatch):
+    captured = {}
+
+    class FakeProc:
+        returncode = None
+        stdin = SimpleNamespace(is_closing=lambda: False)
+        stdout = SimpleNamespace(readexactly=None)
+        stderr = SimpleNamespace(readline=lambda: b"")
+
+        def terminate(self):
+            self.returncode = -15
+
+        async def wait(self):
+            return self.returncode
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    def fake_create_task(coro):
+        coro.close()
+        return SimpleNamespace(done=lambda: True)
+
+    def fake_build(command, **kwargs):
+        captured["command"] = command
+        captured["build_kwargs"] = kwargs
+        from hermes_cli.gateway_child_isolation import GatewayChildScope
+
+        return ["/usr/bin/systemd-run", "--user", "--scope", "--", *command], GatewayChildScope(
+            enabled=True,
+            unit="hermes-gateway-child-lsp-pyright.scope",
+            kind="lsp",
+            purpose="LSP server pyright",
+            command_label="pyright",
+            workspace=str(tmp_path),
+            session_key="discord:123",
+        )
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": "discord:123" if name == "HERMES_SESSION_KEY" else default,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.gateway_child_isolation.build_gateway_child_scope_argv",
+        fake_build,
+    )
+
+    client = LSPClient(
+        server_id="pyright",
+        workspace_root=str(tmp_path),
+        command=["pyright-langserver", "--stdio"],
+        env={"OPENAI_API_KEY": "secret"},
+        cwd=str(tmp_path),
+    )
+    await client._spawn()
+
+    assert captured["command"] == ["pyright-langserver", "--stdio"]
+    assert captured["build_kwargs"]["kind"] == "lsp"
+    assert captured["build_kwargs"]["purpose"] == "LSP server pyright"
+    assert captured["build_kwargs"]["command_label"] == "pyright"
+    assert captured["build_kwargs"]["session_key"] == "discord:123"
+    assert captured["args"][:4] == ("/usr/bin/systemd-run", "--user", "--scope", "--")
+    assert captured["args"][-2:] == ("pyright-langserver", "--stdio")
+    assert captured["kwargs"]["cwd"] == str(tmp_path)
+    assert captured["kwargs"]["env"]["OPENAI_API_KEY"] == "secret"
 
 
 @pytest.mark.asyncio
