@@ -533,6 +533,153 @@ def test_terminal_to_terminal_meta_update_marks_discord_reaction_pending(monkeyp
     assert target["terminal_summary_sync_pending"] is True
 
 
+def test_terminal_reaction_without_synced_marker_is_status_target(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(thread_id="78031", goal="Converge stale terminal reaction")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        claimed = kanban_db.claim_task(conn, task.id)
+        assert claimed is not None
+        kanban_db.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "summary_message_id": "333",
+            "source_message_id": "111",
+        },
+    )
+    metadata = kanban_db.read_board_metadata(board.slug)
+    worker = metadata["discord_worker"]
+    worker.pop("terminal_reaction_sync_pending", None)
+    worker.pop("terminal_summary_sync_pending", None)
+    worker.pop("terminal_completion_message_pending", None)
+    worker.pop("terminal_reaction_synced_state", None)
+    dwb._write_metadata(board.slug, metadata)
+
+    target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
+
+    assert target["state"] == "done"
+    assert target["terminal_reaction_sync_pending"] is False
+    assert dwb.board_has_unsynced_terminal_reaction(board.slug) is True
+
+
+def test_mark_thread_status_synced_stores_terminal_reaction_marker(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(thread_id="78032", goal="Remember terminal reaction convergence")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        claimed = kanban_db.claim_task(conn, task.id)
+        assert claimed is not None
+        kanban_db.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+        },
+    )
+    metadata = kanban_db.read_board_metadata(board.slug)
+    worker = metadata["discord_worker"]
+    worker.pop("terminal_reaction_sync_pending", None)
+    worker.pop("terminal_summary_sync_pending", None)
+    worker.pop("terminal_completion_message_pending", None)
+    worker.pop("terminal_reaction_synced_state", None)
+    dwb._write_metadata(board.slug, metadata)
+
+    dwb.mark_thread_status_synced(board.slug, reaction=True)
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["terminal_reaction_synced_state"] == "done"
+    assert [item for item in dwb.thread_status_targets() if item["board"] == board.slug] == []
+    assert dwb.board_has_unsynced_terminal_reaction(board.slug) is False
+
+
+def test_terminal_reaction_marker_mismatch_resyncs_new_state(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(thread_id="78033", goal="Resync terminal reaction state change")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        claimed = kanban_db.claim_task(conn, task.id)
+        assert claimed is not None
+        kanban_db.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+        },
+    )
+    metadata = kanban_db.read_board_metadata(board.slug)
+    worker = metadata["discord_worker"]
+    worker.pop("terminal_reaction_sync_pending", None)
+    worker.pop("terminal_summary_sync_pending", None)
+    worker.pop("terminal_completion_message_pending", None)
+    worker["terminal_reaction_synced_state"] = "blocked"
+    dwb._write_metadata(board.slug, metadata)
+
+    target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
+
+    assert target["state"] == "done"
+    assert dwb.board_has_unsynced_terminal_reaction(board.slug) is True
+
+
+def test_active_and_blocked_terminal_reaction_targets_are_preserved(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    active_board = dwb.set_goal(thread_id="78034", goal="Keep active reaction target")
+    active_target = next(item for item in dwb.thread_status_targets() if item["board"] == active_board.slug)
+    assert active_target["state"] == "active"
+
+    blocked_board = dwb.set_goal(thread_id="78035", goal="Keep blocked reaction target")
+    conn = kanban_db.connect(board=blocked_board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        claimed = kanban_db.claim_task(conn, task.id)
+        assert claimed is not None
+        kanban_db.block_task(conn, task.id, reason="needs input", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+    dwb._update_worker_meta(
+        blocked_board.slug,
+        {
+            "goal_status": "blocked",
+            "phase": "blocked",
+        },
+    )
+    metadata = kanban_db.read_board_metadata(blocked_board.slug)
+    worker = metadata["discord_worker"]
+    worker.pop("terminal_reaction_sync_pending", None)
+    worker.pop("terminal_summary_sync_pending", None)
+    worker.pop("terminal_completion_message_pending", None)
+    worker.pop("terminal_reaction_synced_state", None)
+    dwb._write_metadata(blocked_board.slug, metadata)
+
+    blocked_target = next(item for item in dwb.thread_status_targets() if item["board"] == blocked_board.slug)
+    assert blocked_target["state"] == "blocked"
+
+
 def test_terminal_phase_complete_with_stale_blocker_marks_discord_reaction_pending(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
