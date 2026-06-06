@@ -1039,6 +1039,64 @@ async def test_auto_thread_creates_thread_and_redirects(adapter, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_auto_thread_mark_failure_logs_and_continues_intake(adapter, monkeypatch, caplog):
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+
+    thread = SimpleNamespace(id=999, name="Hello")
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+    adapter._threads = SimpleNamespace(mark=MagicMock(side_effect=OSError(24, "Too many open files")))
+    captured_events = []
+
+    async def capture_handle(event):
+        captured_events.append(event)
+
+    adapter.handle_message = capture_handle
+
+    await adapter._handle_message(_fake_message(_FakeTextChannel(), content="Build a deploy dashboard"))
+
+    assert len(captured_events) == 1
+    assert captured_events[0].source.thread_id == "999"
+    assert "registry persistence failed" in caplog.text
+
+
+def test_relevant_root_channels_include_persisted_recovery_state(adapter):
+    adapter._discord_allowed_channel_ids = MagicMock(return_value=set())
+    adapter._discord_project_mapping_root_channel_ids = MagicMock(return_value=set())
+    adapter._discord_free_response_channels = MagicMock(return_value=set())
+    adapter._discord_feature_request_channels = MagicMock(return_value=set())
+    adapter._discord_no_thread_channel_ids = MagicMock(return_value=set())
+    adapter._discord_ignored_channel_ids = MagicMock(return_value=set())
+    adapter._read_discord_root_mention_recovery_state = MagicMock(
+        return_value={"channels": {"1504252294495998043": {"last_seen_message_id": "1"}}}
+    )
+
+    assert adapter._discord_relevant_root_channel_ids() == ["1504252294495998043"]
+
+
+def test_record_root_channel_seen_message_records_unconfigured_bot_mention(adapter):
+    channel = _FakeTextChannel(channel_id=1504252294495998043)
+    message = _fake_message(channel, content="<@99999> please help", author_id=123)
+    message.mentions = [adapter._client.user]
+    adapter._discord_allowed_channel_ids = MagicMock(return_value=set())
+    adapter._discord_project_mapping_root_channel_ids = MagicMock(return_value=set())
+    adapter._discord_free_response_channels = MagicMock(return_value=set())
+    adapter._discord_feature_request_channels = MagicMock(return_value=set())
+    adapter._discord_no_thread_channel_ids = MagicMock(return_value=set())
+    adapter._discord_ignored_channel_ids = MagicMock(return_value=set())
+    adapter._read_discord_root_mention_recovery_state = MagicMock(return_value={"channels": {}})
+    adapter._update_discord_root_channel_recovery_watermark = MagicMock()
+
+    adapter._record_discord_root_channel_seen_message(message)
+
+    adapter._update_discord_root_channel_recovery_watermark.assert_called_once()
+    assert adapter._update_discord_root_channel_recovery_watermark.call_args.args[:2] == (
+        "1504252294495998043",
+        "12345",
+    )
+
+
+@pytest.mark.asyncio
 async def test_auto_thread_enabled_by_default_slash_commands(adapter, monkeypatch):
     """Without DISCORD_AUTO_THREAD env var, auto-threading is enabled (default: true)."""
     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -2741,6 +2742,161 @@ def test_running_worker_thread_targets_returns_running_role_boards(monkeypatch, 
         }
     ]
     assert other.slug not in {target["board"] for target in targets}
+
+
+def test_typing_targets_skip_unopenable_board_and_keep_healthy_target(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    healthy = _make_discord_board("2405")
+    broken = _make_discord_board("2406")
+    healthy_task = _create_ready_dev_task(healthy.slug)
+    _create_ready_dev_task(broken.slug)
+    with kanban_db.connect_closing(board=healthy.slug) as conn:
+        kanban_db.claim_task(conn, healthy_task)
+
+    real_connect_closing = kanban_db.connect_closing
+
+    def fake_connect_closing(db_path=None, *, board=None):
+        if board == broken.slug:
+            raise OSError("too many open files")
+        return real_connect_closing(db_path=db_path, board=board)
+
+    monkeypatch.setattr(kanban_db, "connect_closing", fake_connect_closing)
+
+    assert dwb.running_worker_thread_targets() == [
+        {
+            "board": healthy.slug,
+            "thread_id": "2405",
+            "chat_id": "2405",
+            "running": 1,
+        }
+    ]
+    assert dwb.running_discord_thread_typing_targets() == [
+        {
+            "board": healthy.slug,
+            "thread_id": "2405",
+            "chat_id": "2405",
+            "running": 1,
+        }
+    ]
+
+
+def test_notify_targets_skip_corrupt_board_and_keep_healthy_target(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    healthy = _make_discord_board("2407")
+    broken = _make_discord_board("2408")
+    task_id = _create_ready_dev_task(healthy.slug)
+    _create_ready_dev_task(broken.slug)
+    with kanban_db.connect_closing(board=healthy.slug) as conn:
+        kanban_db.claim_task(conn, task_id)
+        kanban_db.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="discord",
+            chat_id="parent-2407",
+            thread_id="thread-2407",
+        )
+
+    real_connect_closing = kanban_db.connect_closing
+
+    def fake_connect_closing(db_path=None, *, board=None):
+        if board == broken.slug:
+            raise sqlite3.DatabaseError("file is not a database")
+        return real_connect_closing(db_path=db_path, board=board)
+
+    monkeypatch.setattr(kanban_db, "connect_closing", fake_connect_closing)
+    monkeypatch.setattr(dwb, "running_worker_thread_targets", lambda: [])
+
+    assert dwb.running_notify_thread_targets() == [
+        {
+            "board": healthy.slug,
+            "task_id": task_id,
+            "thread_id": "thread-2407",
+            "chat_id": "parent-2407",
+            "running": 1,
+            "source": "notify_sub",
+        }
+    ]
+    assert dwb.running_discord_thread_typing_targets() == [
+        {
+            "board": healthy.slug,
+            "task_id": task_id,
+            "thread_id": "thread-2407",
+            "chat_id": "parent-2407",
+            "running": 1,
+            "source": "notify_sub",
+        }
+    ]
+
+
+def test_typing_targets_do_not_open_paused_corrupt_board(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    paused = _make_discord_board("2409")
+    _create_ready_dev_task(paused.slug)
+    incident = {"pause_reason": "kanban_db_corruption", "fingerprint": "same"}
+
+    monkeypatch.setattr(kanban_db, "is_board_paused_for_corruption", lambda board=None: incident)
+    monkeypatch.setattr(kanban_db, "_db_content_fingerprint", lambda _path: "same")
+
+    def fail_connect(*_args, **_kwargs):
+        raise AssertionError("paused corrupt board should not be opened")
+
+    monkeypatch.setattr(kanban_db, "connect_closing", fail_connect)
+
+    assert dwb.running_worker_thread_targets() == []
+    assert dwb.running_notify_thread_targets() == []
+    assert dwb.running_discord_thread_typing_targets() == []
+
+
+def test_typing_target_enumeration_uses_closing_connections(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = _make_discord_board("2410")
+    task_id = _create_ready_dev_task(board.slug)
+    with kanban_db.connect_closing(board=board.slug) as conn:
+        kanban_db.claim_task(conn, task_id)
+
+    real_connect_closing = kanban_db.connect_closing
+    opened = 0
+    closed = 0
+
+    class CountingContext:
+        def __init__(self, context):
+            self._context = context
+            self._conn = None
+
+        def __enter__(self):
+            nonlocal opened
+            opened += 1
+            self._conn = self._context.__enter__()
+            return self._conn
+
+        def __exit__(self, exc_type, exc, tb):
+            nonlocal closed
+            closed += 1
+            return self._context.__exit__(exc_type, exc, tb)
+
+    def counted_connect_closing(db_path=None, *, board=None):
+        return CountingContext(real_connect_closing(db_path=db_path, board=board))
+
+    monkeypatch.setattr(kanban_db, "connect_closing", counted_connect_closing)
+
+    for _ in range(3):
+        targets = dwb.running_discord_thread_typing_targets()
+        assert targets[0]["board"] == board.slug
+
+    assert opened == closed
+    assert opened > 0
 
 
 def test_discord_worker_dispatch_spawns_across_two_boards(monkeypatch, tmp_path):
