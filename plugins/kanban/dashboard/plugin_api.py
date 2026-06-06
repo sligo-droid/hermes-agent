@@ -1863,6 +1863,21 @@ def self_improvement_proposal_halt_endpoint(proposal_id: str, payload: ProposalF
     return {"card": _self_improvement_card_with_downstream(proposal_storage.get_card(proposal_id)), "task": _task_dict(next_task) if next_task else None}
 
 
+@router.post("/self-improvement/proposals/{proposal_id}/archive")
+def self_improvement_proposal_archive_endpoint(proposal_id: str):
+    card = proposal_storage.get_card(proposal_id)
+    if card is None:
+        raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")
+    if card.get("kanban_task_id") or card.get("status") == "approved":
+        raise HTTPException(status_code=409, detail="approved proposals must be halted or archived through their downstream worker")
+    archived = proposal_storage.record_archive(
+        proposal_id,
+        actor=_proposal_actor(),
+        metadata={"source": "command-center"},
+    )
+    return {"card": _self_improvement_card_with_downstream(archived)}
+
+
 @router.post("/self-improvement/proposals/{proposal_id}/pause")
 def self_improvement_proposal_pause_endpoint(proposal_id: str, payload: ProposalFollowupBody | None = None):
     card = proposal_storage.get_card(proposal_id)

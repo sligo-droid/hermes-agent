@@ -1514,6 +1514,86 @@ def _known_good_backup_candidates(path: Path) -> list[Path]:
     return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
+def _salvage_corrupt_board_db(path: Path) -> Optional[Path]:
+    """Build a replacement DB from tables still readable in a corrupt DB.
+
+    This is intentionally lossy and conservative: it only runs after REINDEX
+    and known-good restore fail, and it keeps the original corrupt file backed
+    up before replacement. A board with readable ``tasks``/``task_runs`` should
+    be recoverable enough for the dispatcher to finish stale role-output or PID
+    recovery instead of staying permanently paused because an auxiliary table
+    such as ``task_events`` has a damaged page.
+    """
+
+    parent = path.resolve().parent
+    tmp = parent / f"{path.name}.salvage.tmp"
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        return None
+    source: sqlite3.Connection | None = None
+    target: sqlite3.Connection | None = None
+    try:
+        source = _sqlite_connect(path)
+        target = _sqlite_connect(tmp)
+        source.row_factory = sqlite3.Row
+        target.row_factory = sqlite3.Row
+        target.executescript(SCHEMA_SQL)
+        _migrate_add_optional_columns(target)
+        salvage_tables = (
+            "tasks",
+            "task_links",
+            "task_comments",
+            "task_events",
+            "task_runs",
+            "task_attachments",
+            "kanban_notify_subs",
+        )
+        copied_any = False
+        for table in salvage_tables:
+            try:
+                source_cols = [row["name"] for row in source.execute(f"PRAGMA table_info({table})")]
+                target_cols = {row["name"] for row in target.execute(f"PRAGMA table_info({table})")}
+                cols = [col for col in source_cols if col in target_cols]
+                if not cols:
+                    continue
+                rows = source.execute(f"SELECT {', '.join(cols)} FROM {table}").fetchall()
+            except sqlite3.DatabaseError:
+                continue
+            placeholders = ", ".join("?" for _ in cols)
+            target.executemany(
+                f"INSERT OR IGNORE INTO {table} ({', '.join(cols)}) VALUES ({placeholders})",
+                [tuple(row[col] for col in cols) for row in rows],
+            )
+            copied_any = copied_any or bool(rows)
+        target.commit()
+    except sqlite3.DatabaseError:
+        tmp.unlink(missing_ok=True)
+        return None
+    finally:
+        if source is not None:
+            try:
+                source.close()
+            except Exception:
+                pass
+        if target is not None:
+            try:
+                target.close()
+            except Exception:
+                pass
+    if not copied_any:
+        tmp.unlink(missing_ok=True)
+        return None
+    try:
+        if _integrity_check_db(tmp).lower() != "ok":
+            tmp.unlink(missing_ok=True)
+            return None
+    except sqlite3.DatabaseError:
+        tmp.unlink(missing_ok=True)
+        return None
+    return tmp
+
+
 def repair_corrupt_board(board: Optional[str] = None) -> dict[str, Any]:
     """Attempt conservative self-heal for a paused corrupt board."""
     slug = _normalize_board_slug(board) if board is not None else get_current_board()
@@ -1574,7 +1654,8 @@ def repair_corrupt_board(board: Optional[str] = None) -> dict[str, Any]:
             result.update({"status": "repaired", "action": "reindex", "reason": "integrity_check ok after REINDEX"})
             return result
         result["reason"] = after_check
-        return result
+        if "locked" in after_check.lower() or "busy" in after_check.lower():
+            return result
     for candidate in _known_good_backup_candidates(path):
         try:
             if _integrity_check_db(candidate).lower() != "ok":
@@ -1602,6 +1683,39 @@ def repair_corrupt_board(board: Optional[str] = None) -> dict[str, Any]:
             })
             return result
         result["reason"] = f"restored backup failed integrity_check: {restored_check}"
+        return result
+    salvage = _salvage_corrupt_board_db(path)
+    if salvage is not None:
+        before = _backup_corrupt_db(path, fingerprint=fingerprint)
+        try:
+            shutil.copy2(salvage, path)
+            for suffix in ("-wal", "-shm"):
+                try:
+                    path.with_name(path.name + suffix).unlink(missing_ok=True)
+                except OSError:
+                    pass
+        except OSError as exc:
+            result["reason"] = f"salvage replace failed: {exc}"
+            return result
+        finally:
+            try:
+                salvage.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            salvaged_check = _integrity_check_db(path)
+        except sqlite3.DatabaseError as exc:
+            salvaged_check = str(exc)
+        if salvaged_check.lower() == "ok":
+            clear_corrupt_board_incident(slug, fingerprint=fingerprint)
+            result.update({
+                "status": "repaired",
+                "action": "salvage_readable_tables",
+                "reason": "integrity_check ok after readable-table salvage",
+                "pre_restore_quarantine_path": str(before) if before else None,
+            })
+            return result
+        result["reason"] = f"salvaged DB failed integrity_check: {salvaged_check}"
         return result
     result["reason"] = check
     return result
@@ -6560,10 +6674,12 @@ def dispatch_once(
 
     Steps:
       1. Reclaim stale running tasks (TTL expired).
-      2. Reclaim stale running tasks (no recent heartbeat).
-      3. Reclaim crashed running tasks (host-local PID no longer alive).
-      3. Promote todo -> ready where all parents are done.
-      4. For each ready task with an assignee, atomically claim and call
+      2. Apply durable role-worker sidecar results while the matching current
+         run is still intact.
+      3. Reclaim stale running tasks (no recent heartbeat).
+      4. Reclaim crashed running tasks (host-local PID no longer alive).
+      5. Promote todo -> ready where all parents are done.
+      6. For each ready task with an assignee, atomically claim and call
          ``spawn_fn(task, workspace_path, board) -> Optional[int]``. The
          return value (if any) is recorded as ``worker_pid`` so subsequent
          ticks can detect crashes before the TTL expires.
@@ -6590,9 +6706,6 @@ def dispatch_once(
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
-    result.stale = detect_stale_running(
-        conn, stale_timeout_seconds=stale_timeout_seconds,
-    )
     if board:
         try:
             from hermes_cli.kanban_codex_worker import recover_recorded_role_outputs_for_running_tasks
@@ -6600,6 +6713,9 @@ def dispatch_once(
             recover_recorded_role_outputs_for_running_tasks(conn, board=board)
         except Exception:
             pass
+    result.stale = detect_stale_running(
+        conn, stale_timeout_seconds=stale_timeout_seconds,
+    )
     result.crashed = detect_crashed_workers(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the

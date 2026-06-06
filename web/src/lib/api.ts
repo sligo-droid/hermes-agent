@@ -403,6 +403,11 @@ export const api = {
         body: JSON.stringify({ reason: reason || undefined }),
       },
     ),
+  archiveSelfImprovementProposal: (proposalId: string) =>
+    fetchJSON<SelfImprovementProposalActionResponse>(
+      `/api/plugins/kanban/self-improvement/proposals/${encodeURIComponent(proposalId)}/archive`,
+      { method: "POST" },
+    ),
   pauseSelfImprovementProposal: (proposalId: string) =>
     fetchJSON<SelfImprovementProposalActionResponse>(
       `/api/plugins/kanban/self-improvement/proposals/${encodeURIComponent(proposalId)}/pause`,

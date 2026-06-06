@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-06 18:08 UTC
+Last updated: 2026-06-06 21:03 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -18,7 +18,7 @@ This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork
 | Main branch | verified | `/home/droid/hermes` was fast-forwarded to `origin/main` after PR #320 merged (`aa988915a docs: add Hermes repo project state (#320)`). |
 | Open PRs | verified | `gh pr list --state open --limit 10` returned no rows after PR #320 merged. |
 | Repo-state transition | merged | PR #320 added `docs/project-state.md`, `docs/context.md`, and `docs/decisions/0001-repo-backed-project-state.md`; `AGENTS.md` now routes workers here. |
-| Command Center model | merged | `docs/sligo-command-center.md` records the Work Item / Source / Worker Run model, Hermes/PID project scoping, and current UX contract. Live runtime must still be smoked separately when code changes. |
+| Command Center model | merged | `docs/sligo-command-center.md` records the Work Item / Source / Worker Run model, Hermes/PID project scoping, and current UX contract. The primary lanes are Overview, Inbox, Active, Completed, and Archive. Live runtime must still be smoked separately when code changes. |
 | Skills boundary | in_progress | Installed default-profile pointers were patched for `hermes-agent`, `hermes-operations`, and `general-coding/references/operator-command-center-ui.md`; intention-setting material should keep moving into this repo state/doc set. |
 
 Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `merged`, `deployed`, `verified`, `superseded`.
@@ -44,7 +44,7 @@ This is product intention, so it belongs in repo state/docs, not in a skill. If 
 - **Rows are Work Items:** show proposed recommendations, decision/intake items, and board-level worker rollups. Do not show individual Kanban task/ticket rows or accepted downstream proposal rows without a canonical Work Item/board rollup.
 - **Board execution stays child-level:** worker boards, Kanban tasks, task runs, PRs, logs, and deploys are execution artifacts attached to Work Items, not a competing ledger.
 - **Layout target:** Sligo shell header with one refresh/control area; left work list plus right detail/audit pane; source/status chips before title; created-date footer; active/running work visibly above quieter proposed/non-running work.
-- **Action target:** compact icon row actions with real affordances. Archive is one-click for archiveable non-default boards; pause/replay/cancel/revert/approve/reject are shown only when source and lifecycle state make them real.
+- **Action target:** compact icon row actions with real affordances. Proposed items show Approve plus Archive; Archive uses the existing halt/archive flow for unapproved proposals and is one-click for archiveable non-default boards. Pause/replay/cancel/revert are shown only when source and lifecycle state make them real.
 - **Worker/source links:** show a Worker pill only after execution starts, point it directly to the worker board URL, and never use bare `/workers` as a per-item destination. Show direct Discord source/thread links when metadata exists.
 - **Archive target:** Archive is a historical ledger, including boards moved under `boards/_archived/`; archived rows are not actionable as live worker boards.
 

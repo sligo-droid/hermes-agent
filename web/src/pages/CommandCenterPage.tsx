@@ -16,7 +16,6 @@ import {
   RefreshCw,
   RotateCcw,
   Wrench,
-  X,
 } from "lucide-react";
 import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@nous-research/ui/ui/components/card";
@@ -31,9 +30,9 @@ import type {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-type ViewKey = "overview" | "inbox" | "work" | "rejected" | "archive" | "runs" | "recommendations" | "sources";
-type PaginatedViewKey = "overview" | "inbox" | "work" | "rejected" | "archive";
-type ActionKind = "approve" | "reject" | "pause" | "replay" | "repair" | "undo" | "archive";
+type ViewKey = "overview" | "inbox" | "work" | "completed" | "archive" | "runs" | "recommendations" | "sources";
+type PaginatedViewKey = "overview" | "inbox" | "work" | "completed" | "archive";
+type ActionKind = "approve" | "pause" | "replay" | "repair" | "undo" | "archive";
 type ActiveAction = { ids: string[]; kind: ActionKind };
 type InboxPageItem = { type: "work"; item: CommandCenterWorkItem } | { type: "source"; source: CommandCenterSource };
 type VisualStatus = "proposed" | "queued" | "running" | "review" | "blocked" | "mega_blocked" | "paused" | "shipped" | "rejected" | "archived" | "unknown";
@@ -42,10 +41,8 @@ type CommandCenterPagination = { project: string; pages: Record<PaginatedViewKey
 const ACTION_SETTLE_MS = 600;
 const COMMAND_CENTER_PAGE_SIZE = 20;
 const ARCHIVE_VIEW_ITEM_LIMIT = 100;
-const DEFAULT_REJECT_REASON = "Operator rejected from Command Center.";
 const ACTION_PROGRESS_LABELS: Record<ActionKind, string> = {
   approve: "Approving",
-  reject: "Rejecting",
   pause: "Pausing",
   replay: "Replaying",
   repair: "Repairing",
@@ -86,7 +83,7 @@ function viewFromPath(pathname: string): ViewKey {
   const normalized = pathname.replace(/\/+$/, "") || "/";
   if (normalized.includes("/inbox")) return "inbox";
   if (normalized.includes("/work")) return "work";
-  if (normalized.includes("/rejected")) return "rejected";
+  if (normalized.includes("/completed") || normalized.includes("/rejected")) return "completed";
   if (normalized.includes("/archive")) return "archive";
   if (normalized.includes("/runs")) return "runs";
   if (normalized.includes("/recommendations")) return "recommendations";
@@ -126,7 +123,7 @@ const STATUS_VISUALS = {
   mega_blocked: { label: "MEGA BLOCKED", icon: AlertTriangle, className: "command-center-status-mega-blocked" },
   paused: { label: "Paused", icon: PauseCircle, className: "command-center-status-paused" },
   shipped: { label: "Shipped", icon: CheckCircle2, className: "command-center-status-shipped" },
-  rejected: { label: "Rejected", icon: X, className: "command-center-status-archived" },
+  rejected: { label: "Archived", icon: Archive, className: "command-center-status-archived" },
   archived: { label: "Archived", icon: Archive, className: "command-center-status-archived" },
   unknown: { label: "Unknown", icon: Circle, className: "command-center-status-unknown" },
 } satisfies Record<VisualStatus, { label: string; icon: typeof Activity; className: string }>;
@@ -163,15 +160,15 @@ function isInboxItem(item: CommandCenterWorkItem): boolean {
 }
 
 function isWorkItem(item: CommandCenterWorkItem): boolean {
-  return item.status !== "proposed" && item.status !== "rejected" && item.status !== "archived";
+  return item.status !== "proposed" && item.status !== "rejected" && item.status !== "archived" && !isCompletedItem(item);
 }
 
 function isArchivedItem(item: CommandCenterWorkItem): boolean {
   return item.status === "archived";
 }
 
-function isRejectedItem(item: CommandCenterWorkItem): boolean {
-  return item.status === "rejected";
+function isCompletedItem(item: CommandCenterWorkItem): boolean {
+  return ["shipped", "done"].includes(item.status);
 }
 
 function isRunningWorkItem(item: CommandCenterWorkItem): boolean {
@@ -211,7 +208,7 @@ function availableActionKinds(item: CommandCenterWorkItem): ActionKind[] {
   const canArchive = Boolean((item.execution?.archiveable && item.execution.board && item.execution.board !== "default" && item.id.startsWith("kanban-board:")) || proposalCanArchive);
   const canRepair = Boolean(item.status === "blocked" && item.execution?.board && item.execution?.repair_action && item.execution?.repairable !== false && !item.execution?.repair_task_id);
   const actions: ActionKind[] = [];
-  if (canApproveReject) actions.push("approve", "reject");
+  if (canApproveReject) actions.push("approve", "archive");
   if (canResume) actions.push("replay");
   if (canPause) actions.push("pause");
   if (canUndo) actions.push("undo");
@@ -233,14 +230,14 @@ function WorkStatePanel({
   search,
 }: {
   activeView: ViewKey;
-  laneCounts: { overview: number; inbox: number; work: number; rejected: number; archive: number };
+  laneCounts: { overview: number; inbox: number; work: number; completed: number; archive: number };
   search: string;
 }) {
   const lanes = [
     { key: "overview", label: "Overview", href: "/sligo", value: laneCounts.overview },
     { key: "inbox", label: "Inbox", href: "/sligo/inbox", value: laneCounts.inbox },
     { key: "work", label: "Active", href: "/sligo/work", value: laneCounts.work },
-    { key: "rejected", label: "Rejected", href: "/sligo/rejected", value: laneCounts.rejected },
+    { key: "completed", label: "Completed", href: "/sligo/completed", value: laneCounts.completed },
     { key: "archive", label: "Archive", href: "/sligo/archive", value: laneCounts.archive },
   ];
   const tileClass = (selected: boolean) => cn(
@@ -333,12 +330,11 @@ function ActionButton({
   const tooltipId = useId();
   const config = {
     approve: { label: "Approve", icon: Check, className: "border-emerald-200/70 bg-emerald-400 text-emerald-950 hover:bg-emerald-300 focus-visible:ring-emerald-100/75" },
-    reject: { label: "Reject", icon: X, className: "border-red-200/75 bg-red-500 text-white hover:bg-red-400 focus-visible:ring-red-100/75", strong: true },
     pause: { label: "Pause", icon: PauseCircle, className: "border-orange-200/70 bg-orange-400 text-orange-950 hover:bg-orange-300 focus-visible:ring-orange-100/75", strong: true },
     replay: { label: "Replay", icon: RefreshCw, className: "border-emerald-200/70 bg-emerald-400 text-emerald-950 hover:bg-emerald-300 focus-visible:ring-emerald-100/75", strong: true },
     repair: { label: "Repair", icon: Wrench, className: "border-amber-200/70 bg-amber-300 text-amber-950 hover:bg-amber-200 focus-visible:ring-amber-100/75", strong: true },
     undo: { label: "Revert", icon: RotateCcw, className: "border-red-200/75 bg-red-500 text-white hover:bg-red-400 focus-visible:ring-red-100/75", strong: true },
-    archive: { label: "Archive board", icon: Archive, className: "border-violet-200/60 bg-violet-400 text-violet-950 hover:bg-violet-300 focus-visible:ring-violet-100/75" },
+    archive: { label: "Archive", icon: Archive, className: "border-violet-200/60 bg-violet-400 text-violet-950 hover:bg-violet-300 focus-visible:ring-violet-100/75" },
   }[kind];
   const Icon = config.icon;
   return (
@@ -781,13 +777,13 @@ export default function CommandCenterPage() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [pagination, setPagination] = useState<CommandCenterPagination>(() => ({
     project: selectedProject,
-    pages: { overview: 1, inbox: 1, work: 1, rejected: 1, archive: 1 },
+    pages: { overview: 1, inbox: 1, work: 1, completed: 1, archive: 1 },
   }));
   const requestedPages = pagination.project === selectedProject ? pagination.pages : {
     overview: 1,
     inbox: 1,
     work: 1,
-    rejected: 1,
+    completed: 1,
     archive: 1,
   };
 
@@ -846,8 +842,8 @@ export default function CommandCenterPage() {
     () => (snapshot?.work_items.filter(isArchivedItem) ?? []).sort(workItemViewSort).slice(0, ARCHIVE_VIEW_ITEM_LIMIT),
     [snapshot],
   );
-  const rejectedItems = useMemo(
-    () => (snapshot?.work_items.filter(isRejectedItem) ?? []).sort(workItemViewSort),
+  const completedItems = useMemo(
+    () => (snapshot?.work_items.filter(isCompletedItem) ?? []).sort(workItemViewSort),
     [snapshot],
   );
   const overviewItems = useMemo(() => {
@@ -869,26 +865,26 @@ export default function CommandCenterPage() {
     overview: overviewItems.length,
     inbox: inboxPageItems.length,
     work: sortedWorkItems.length,
-    rejected: rejectedItems.length,
+    completed: completedItems.length,
     archive: archivedItems.length,
-  }), [archivedItems.length, inboxPageItems.length, overviewItems.length, rejectedItems.length, sortedWorkItems.length]);
+  }), [archivedItems.length, completedItems.length, inboxPageItems.length, overviewItems.length, sortedWorkItems.length]);
   const pages = useMemo<Record<PaginatedViewKey, number>>(() => ({
     overview: clampPage(requestedPages.overview, pageTotals.overview),
     inbox: clampPage(requestedPages.inbox, pageTotals.inbox),
     work: clampPage(requestedPages.work, pageTotals.work),
-    rejected: clampPage(requestedPages.rejected, pageTotals.rejected),
+    completed: clampPage(requestedPages.completed, pageTotals.completed),
     archive: clampPage(requestedPages.archive, pageTotals.archive),
-  }), [pageTotals.archive, pageTotals.inbox, pageTotals.overview, pageTotals.rejected, pageTotals.work, requestedPages.archive, requestedPages.inbox, requestedPages.overview, requestedPages.rejected, requestedPages.work]);
+  }), [pageTotals.archive, pageTotals.completed, pageTotals.inbox, pageTotals.overview, pageTotals.work, requestedPages.archive, requestedPages.completed, requestedPages.inbox, requestedPages.overview, requestedPages.work]);
   const pagedOverviewItems = useMemo(() => pageSlice(overviewItems, pages.overview), [overviewItems, pages.overview]);
   const pagedInboxItems = useMemo(() => pageSlice(inboxPageItems, pages.inbox), [inboxPageItems, pages.inbox]);
   const pagedWorkItems = useMemo(() => pageSlice(sortedWorkItems, pages.work), [pages.work, sortedWorkItems]);
-  const pagedRejectedItems = useMemo(() => pageSlice(rejectedItems, pages.rejected), [pages.rejected, rejectedItems]);
+  const pagedCompletedItems = useMemo(() => pageSlice(completedItems, pages.completed), [completedItems, pages.completed]);
   const pagedArchivedItems = useMemo(() => pageSlice(archivedItems, pages.archive), [archivedItems, pages.archive]);
   const setPage = useCallback((view: PaginatedViewKey, page: number) => {
     setPagination((current) => ({
       project: selectedProject,
       pages: {
-        ...(current.project === selectedProject ? current.pages : { overview: 1, inbox: 1, work: 1, rejected: 1, archive: 1 }),
+        ...(current.project === selectedProject ? current.pages : { overview: 1, inbox: 1, work: 1, completed: 1, archive: 1 }),
         [view]: clampPage(page, pageTotals[view]),
       },
     }));
@@ -902,14 +898,14 @@ export default function CommandCenterPage() {
       overview: pagedOverviewItems,
       inbox: pagedInboxItems.filter((entry) => entry.type === "work").map((entry) => entry.item),
       work: pagedWorkItems,
-      rejected: pagedRejectedItems,
+      completed: pagedCompletedItems,
       archive: pagedArchivedItems,
       recommendations,
       runs: [],
       sources: [],
     }[activeView];
     return visibleItems.map((item) => item.id);
-  }, [activeView, pagedArchivedItems, pagedInboxItems, pagedOverviewItems, pagedRejectedItems, pagedWorkItems, recommendations]);
+  }, [activeView, pagedArchivedItems, pagedCompletedItems, pagedInboxItems, pagedOverviewItems, pagedWorkItems, recommendations]);
   const sources = useMemo(() => snapshot?.sources ?? [], [snapshot]);
   const workItemsById = useMemo(() => new Map((snapshot?.work_items ?? []).map((item) => [item.id, item])), [snapshot]);
   const selectedItems = useMemo(() => [...selectedIds].map((id) => workItemsById.get(id)).filter((item): item is CommandCenterWorkItem => Boolean(item)), [selectedIds, workItemsById]);
@@ -929,9 +925,9 @@ export default function CommandCenterPage() {
     overview: overviewItems.length,
     inbox: inboxItems.length + inboxSources.length,
     work: workItems.length,
-    rejected: rejectedItems.length,
+    completed: completedItems.length,
     archive: archivedItems.length,
-  }), [archivedItems.length, inboxItems.length, inboxSources.length, overviewItems.length, rejectedItems.length, workItems.length]);
+  }), [archivedItems.length, completedItems.length, inboxItems.length, inboxSources.length, overviewItems.length, workItems.length]);
   const projectSearch = useMemo(() => `?project=${encodeURIComponent(selectedProject)}`, [selectedProject]);
   const toggleSelected = useCallback((id: string) => {
     setSelectedIds((current) => {
@@ -953,17 +949,15 @@ export default function CommandCenterPage() {
       return next;
     });
   }, [allVisibleSelected, visibleSelectableIds]);
-  const runActionForItem = useCallback(async (kind: ActionKind, item: CommandCenterWorkItem, rejectReason?: string) => {
+  const runActionForItem = useCallback(async (kind: ActionKind, item: CommandCenterWorkItem) => {
     const proposalId = item.decision?.proposal_id;
     const board = item.execution?.board;
     if (kind === "archive") {
       if (board && board !== "default") await api.archiveKanbanBoard(board);
+      else if (proposalId && item.status === "proposed") await api.archiveSelfImprovementProposal(proposalId);
       else if (proposalId) await api.haltSelfImprovementProposal(proposalId);
     } else if (proposalId && kind === "approve") {
       await api.approveSelfImprovementProposal(proposalId);
-    } else if (proposalId && kind === "reject") {
-      if (!rejectReason) return;
-      await api.rejectSelfImprovementProposal(proposalId, rejectReason);
     } else if (kind === "pause") {
       if (proposalId) await api.pauseSelfImprovementProposal(proposalId);
       else if (board) await api.pauseKanbanBoard(board);
@@ -989,12 +983,11 @@ export default function CommandCenterPage() {
     if (targetItems.length > 1 && !multiSelectActionCommon.has(kind)) return;
     const startedAt = Date.now();
     if (targetItems.some((targetItem) => !availableActionKinds(targetItem).includes(kind))) return;
-    const rejectReason = kind === "reject" ? DEFAULT_REJECT_REASON : undefined;
     setActiveAction({ ids: targetItems.map((targetItem) => targetItem.id), kind });
     setError(null);
     try {
       for (const targetItem of targetItems) {
-        await runActionForItem(kind, targetItem, rejectReason || undefined);
+        await runActionForItem(kind, targetItem);
       }
       await refresh({
         delayBeforeApplyMs: Math.max(0, ACTION_SETTLE_MS - (Date.now() - startedAt)),
@@ -1075,10 +1068,10 @@ export default function CommandCenterPage() {
               <PaginationControls label="work" onPageChange={(page) => setPage("work", page)} page={pages.work} totalItems={pageTotals.work} />
             </>
           )}
-          {activeView === "rejected" && (
+          {activeView === "completed" && (
             <>
-              <WorkList activeAction={activeAction} emptyLabel="rejected items" emptyMessage="Rejected work items will appear here." items={pagedRejectedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} showActions={false} />
-              <PaginationControls label="rejected" onPageChange={(page) => setPage("rejected", page)} page={pages.rejected} totalItems={pageTotals.rejected} />
+              <WorkList activeAction={activeAction} emptyLabel="completed items" emptyMessage="Completed and shipped work items will appear here." items={pagedCompletedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} showActions={false} />
+              <PaginationControls label="completed" onPageChange={(page) => setPage("completed", page)} page={pages.completed} totalItems={pageTotals.completed} />
             </>
           )}
           {activeView === "archive" && (

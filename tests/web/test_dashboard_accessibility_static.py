@@ -12,9 +12,9 @@ def test_work_state_is_only_command_center_navigation_filter():
     work_state_source = source.split("function WorkStatePanel", 1)[1].split("function ProjectTabs", 1)[0]
     assert "Work State" in work_state_source
     assert "Command Center lanes" in work_state_source
-    for lane in ("Overview", "Inbox", "Active", "Rejected", "Archive"):
+    for lane in ("Overview", "Inbox", "Active", "Completed", "Archive"):
         assert lane in work_state_source
-    lane_order = [work_state_source.index(f'label: "{lane}"') for lane in ("Overview", "Inbox", "Active", "Rejected", "Archive")]
+    lane_order = [work_state_source.index(f'label: "{lane}"') for lane in ("Overview", "Inbox", "Active", "Completed", "Archive")]
     assert lane_order == sorted(lane_order)
     assert "Work states by status" not in source
     assert "onSelectStatus" not in source
@@ -25,7 +25,7 @@ def test_work_state_is_only_command_center_navigation_filter():
     assert 'key: "workers"' not in work_state_source
     assert 'href="/workers"' not in work_state_source
     assert 'if (normalized.includes("/runs")) return "runs";' in source
-    assert 'if (normalized.includes("/rejected")) return "rejected";' in source
+    assert 'if (normalized.includes("/completed") || normalized.includes("/rejected")) return "completed";' in source
 
 
 def test_command_center_project_tabs_render_above_work_state_and_preserve_lanes():
@@ -91,39 +91,42 @@ def test_command_center_archive_action_is_one_click_without_removing_other_promp
 
     assert "window.confirm" not in archive_branch
     assert "archiveKanbanBoard" in archive_branch
+    assert "archiveSelfImprovementProposal" in archive_branch
     assert "haltSelfImprovementProposal" in archive_branch
     assert 'window.prompt("Reject reason for future prong feedback?"' not in source
     assert 'window.prompt("Reason for revert follow-up?"' in source
 
 
-def test_command_center_reject_action_is_one_click_and_uses_default_reason():
+def test_command_center_proposal_archive_action_uses_halt_flow():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
     handle_source = source.split("const handleAction = useCallback", 1)[1].split("return (", 1)[0]
     run_action_source = source.split("const runActionForItem = useCallback", 1)[1].split("const handleAction = useCallback", 1)[0]
 
-    assert 'const DEFAULT_REJECT_REASON = "Operator rejected from Command Center.";' in source
+    assert 'type ActionKind = "approve" | "pause" | "replay" | "repair" | "undo" | "archive";' in source
+    assert 'if (canApproveReject) actions.push("approve", "archive");' in source
     assert 'window.prompt("Reject reason for future prong feedback?"' not in source
-    assert 'const rejectReason = kind === "reject" ? DEFAULT_REJECT_REASON : undefined;' in handle_source
-    assert "if (kind === \"reject\" && !rejectReason) return;" not in handle_source
-    assert "await api.rejectSelfImprovementProposal(proposalId, rejectReason);" in run_action_source
+    assert 'rejectReason' not in handle_source
+    assert 'await api.rejectSelfImprovementProposal' not in run_action_source
+    assert 'else if (proposalId && item.status === "proposed") await api.archiveSelfImprovementProposal(proposalId);' in run_action_source
+    assert 'else if (proposalId) await api.haltSelfImprovementProposal(proposalId);' in run_action_source
     assert "targetItems" in handle_source
 
 
-def test_command_center_rejected_lane_is_separate_and_paginated():
+def test_command_center_completed_lane_is_separate_and_paginated():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
 
-    assert 'type ViewKey = "overview" | "inbox" | "work" | "rejected" | "archive"' in source
-    assert 'type PaginatedViewKey = "overview" | "inbox" | "work" | "rejected" | "archive";' in source
-    assert 'function isRejectedItem(item: CommandCenterWorkItem): boolean' in source
+    assert 'type ViewKey = "overview" | "inbox" | "work" | "completed" | "archive"' in source
+    assert 'type PaginatedViewKey = "overview" | "inbox" | "work" | "completed" | "archive";' in source
+    assert 'function isCompletedItem(item: CommandCenterWorkItem): boolean' in source
     assert 'return item.status === "archived";' in source
-    assert 'return item.status === "rejected";' in source
-    assert 'if (normalized === "rejected") return "rejected";' in source
-    assert 'rejected: { label: "Rejected", icon: X' in source
-    assert 'rejected: rejectedItems.length' in source
-    assert 'const pagedRejectedItems = useMemo(() => pageSlice(rejectedItems, pages.rejected)' in source
-    assert 'activeView === "rejected"' in source
-    assert 'setPage("rejected", page)' in source
-    assert '<PaginationControls label="rejected"' in source
+    assert 'return ["shipped", "done"].includes(item.status);' in source
+    assert 'if (normalized.includes("/completed") || normalized.includes("/rejected")) return "completed";' in source
+    assert 'shipped: { label: "Shipped", icon: CheckCircle2' in source
+    assert 'completed: completedItems.length' in source
+    assert 'const pagedCompletedItems = useMemo(() => pageSlice(completedItems, pages.completed)' in source
+    assert 'activeView === "completed"' in source
+    assert 'setPage("completed", page)' in source
+    assert '<PaginationControls label="completed"' in source
 
 
 def test_command_center_archive_action_renders_last_in_row_rail():
@@ -131,7 +134,7 @@ def test_command_center_archive_action_renders_last_in_row_rail():
     action_source = source.split("function availableActionKinds", 1)[1].split("function actionSet", 1)[0]
     row_rail = source.split('className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3"', 1)[1].split("</div>", 1)[0]
 
-    assert action_source.index('actions.push("approve", "reject")') < action_source.index('actions.push("archive")')
+    assert action_source.index('actions.push("approve", "archive")') < action_source.index('actions.push("archive")')
     assert action_source.index('actions.push("replay")') < action_source.index('actions.push("archive")')
     assert action_source.index('actions.push("pause")') < action_source.index('actions.push("archive")')
     assert action_source.index('actions.push("undo")') < action_source.index('actions.push("archive")')
@@ -195,12 +198,14 @@ def test_sligo_shell_has_no_duplicate_top_tab_navigation():
     assert "Refresh Command Center" in shell_source
 
 
-def test_sligo_rejected_route_is_registered():
+def test_sligo_completed_route_is_registered_with_rejected_redirect():
     source = (ROOT / "web/src/App.tsx").read_text(encoding="utf-8")
 
-    assert '"/sligo/rejected": CommandCenterPage' in source
+    assert '"/sligo/completed": CommandCenterPage' in source
+    assert '"/sligo/rejected": () => <RootRedirect to="/sligo/completed" />' in source
     assert '"/sligo/rejected": HermesToSligoRedirect' in source
-    assert '{ path: "/sligo/rejected", label: "Rejected" }' in source
+    assert '{ path: "/sligo/completed", label: "Completed" }' in source
+    assert '{ path: "/sligo/rejected", label: "Rejected" }' not in source
 
 
 def test_sligo_shell_refresh_feedback_and_light_toggle():
