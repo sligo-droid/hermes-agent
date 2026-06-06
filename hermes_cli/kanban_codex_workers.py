@@ -40,10 +40,32 @@ _ROLE_DEFAULT_REASONING = {
 }
 _VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh"}
 _AUTO_RUNTIME = "auto"
+_WORKER_SCRIPT = Path("hermes_cli") / "kanban_codex_worker.py"
+_CONTAINER_WORKER_SCRIPT = "/hermes/hermes_cli/kanban_codex_worker.py"
 
 
 def _repo_root() -> Path:
+    """Return the Hermes runtime source root for worker imports.
+
+    Role workers execute with their project worktree as cwd. For Hermes
+    self-improvement tasks that worktree is also a Hermes checkout, so Python's
+    default import path can otherwise shadow the canonical runtime checkout.
+    Prefer the source root that owns the current venv interpreter, then fall
+    back to this module's location for non-worktree installs.
+    """
+    try:
+        venv_dir = Path(sys.executable).resolve().parent.parent
+        if venv_dir.name in {".venv", "venv"}:
+            runtime_root = venv_dir.parent
+            if (runtime_root / "hermes_cli").is_dir():
+                return runtime_root
+    except OSError:
+        pass
     return Path(__file__).resolve().parent.parent
+
+
+def _host_worker_cmd() -> list[str]:
+    return [sys.executable, str(_repo_root() / _WORKER_SCRIPT)]
 
 
 def _worker_config() -> dict[str, Any]:
@@ -435,7 +457,7 @@ def _spawn_host_worker(
     if gh_config_dir:
         env["GH_CONFIG_DIR"] = gh_config_dir
 
-    cmd = [sys.executable, "-m", "hermes_cli.kanban_codex_worker"]
+    cmd = _host_worker_cmd()
     return _spawn_logged_process(
         task,
         cmd,
@@ -527,7 +549,7 @@ def _spawn_docker_worker(
     for key in env:
         if _forward_env_to_worker_container(key):
             cmd.extend(["-e", key])
-    cmd.extend([image, "python", "-m", "hermes_cli.kanban_codex_worker"])
+    cmd.extend([image, "python", _CONTAINER_WORKER_SCRIPT])
 
     return _spawn_logged_process(
         task,
