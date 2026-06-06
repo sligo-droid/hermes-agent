@@ -2377,21 +2377,30 @@ def create_task(
 
     now = int(time.time())
 
-    # Resolve workspace_path from board-level default_workdir when the
-    # caller did not specify one explicitly. Board defaults represent
-    # persistent project checkouts, so only persistent workspace kinds may
-    # inherit them. Scratch workspaces are auto-deleted on completion and
-    # must stay under the per-board scratch root created by
-    # ``resolve_workspace``; inheriting ``default_workdir`` for a scratch
-    # task would point cleanup at the user's source tree (#28818). The
-    # containment guard in ``_cleanup_workspace`` is the safety rail, but
-    # we also stop the bad state from being created in the first place.
+    if workspace_path is not None and workspace_kind in {"dir", "worktree"}:
+        workspace_path = str(workspace_path).strip() or None
+
+    # Resolve workspace_path from board-level metadata when the caller did
+    # not specify one explicitly. Board defaults represent persistent project
+    # checkouts, so only persistent workspace kinds may inherit them. Scratch
+    # workspaces are auto-deleted on completion and must stay under the
+    # per-board scratch root created by ``resolve_workspace``; inheriting a
+    # persistent checkout for a scratch task would point cleanup at the user's
+    # source tree (#28818). The containment guard in ``_cleanup_workspace`` is
+    # the safety rail, but we also stop the bad state from being created in the
+    # first place.
     if workspace_path is None and workspace_kind in {"dir", "worktree"}:
         board_slug = board if board else get_current_board()
         board_meta = read_board_metadata(board_slug)
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+        elif workspace_kind == "dir":
+            worker_meta = board_meta.get("discord_worker")
+            if isinstance(worker_meta, dict):
+                worktree_path = str(worker_meta.get("worktree_path") or "").strip()
+                if worktree_path:
+                    workspace_path = worktree_path
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -5055,9 +5064,16 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         return p
     if kind == "dir":
         if not task.workspace_path:
-            raise ValueError(
-                f"task {task.id} has workspace_kind=dir but no workspace_path"
-            )
+            board_meta = read_board_metadata(board)
+            worker_meta = board_meta.get("discord_worker")
+            worktree_path = ""
+            if isinstance(worker_meta, dict):
+                worktree_path = str(worker_meta.get("worktree_path") or "").strip()
+            if not worktree_path:
+                raise ValueError(
+                    f"task {task.id} has workspace_kind=dir but no workspace_path"
+                )
+            task.workspace_path = worktree_path
         p = Path(task.workspace_path).expanduser()
         if not p.is_absolute():
             raise ValueError(

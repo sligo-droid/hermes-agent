@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import shutil
 import sqlite3
@@ -245,6 +246,120 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.status == "ready"
     assert t.assignee == "alice"
     assert t.workspace_kind == "scratch"
+
+
+def test_discord_worker_dir_task_inherits_board_worktree_path(kanban_home, tmp_path):
+    board = "discord-12345"
+    worktree = tmp_path / "hermes-discord-12345"
+    kb.create_board(board)
+    meta_path = kb.board_metadata_path(board)
+    meta = kb.read_board_metadata(board)
+    meta.pop("db_path", None)
+    meta["discord_worker"] = {
+        "kind": "discord_worker_board",
+        "worktree_path": str(worktree),
+    }
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="review",
+            workspace_kind="dir",
+            workspace_path="",
+            board=board,
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    assert task.workspace_path == str(worktree)
+
+
+def test_resolve_workspace_uses_discord_worker_worktree_for_legacy_dir_task(kanban_home, tmp_path):
+    board = "discord-legacy"
+    worktree = tmp_path / "hermes-discord-legacy"
+    kb.create_board(board)
+    meta_path = kb.board_metadata_path(board)
+    meta = kb.read_board_metadata(board)
+    meta.pop("db_path", None)
+    meta["discord_worker"] = {
+        "kind": "discord_worker_board",
+        "worktree_path": str(worktree),
+    }
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="legacy malformed task",
+            workspace_kind="dir",
+            workspace_path=str(worktree),
+            board=board,
+        )
+        conn.execute("UPDATE tasks SET workspace_path = NULL WHERE id = ?", (task_id,))
+        conn.commit()
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    assert kb.resolve_workspace(task, board=board) == worktree
+    assert worktree.is_dir()
+
+
+def test_dispatch_uses_discord_worker_worktree_for_legacy_dir_task(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "discord-dispatch"
+    worktree = tmp_path / "hermes-discord-dispatch"
+    kb.create_board(board)
+    meta_path = kb.board_metadata_path(board)
+    meta = kb.read_board_metadata(board)
+    meta.pop("db_path", None)
+    meta["discord_worker"] = {
+        "kind": "discord_worker_board",
+        "worktree_path": str(worktree),
+    }
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append((task.id, workspace))
+
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="legacy malformed task",
+            assignee="dev",
+            workspace_kind="dir",
+            workspace_path=str(worktree),
+            board=board,
+        )
+        conn.execute("UPDATE tasks SET workspace_path = NULL WHERE id = ?", (task_id,))
+        conn.commit()
+
+        result = kb.dispatch_once(conn, board=board, spawn_fn=fake_spawn)
+        task = kb.get_task(conn, task_id)
+
+    assert result.auto_blocked == []
+    assert spawns == [(task_id, str(worktree))]
+    assert task.workspace_path == str(worktree)
+    assert task.status == "running"
+
+
+def test_resolve_workspace_without_dir_path_or_discord_worker_metadata_still_errors(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="broken dir task",
+            workspace_kind="dir",
+            workspace_path="/tmp/placeholder",
+        )
+        conn.execute("UPDATE tasks SET workspace_path = NULL WHERE id = ?", (task_id,))
+        conn.commit()
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    with pytest.raises(ValueError, match="workspace_kind=dir but no workspace_path"):
+        kb.resolve_workspace(task)
 
 
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
