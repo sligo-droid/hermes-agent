@@ -4418,6 +4418,24 @@ class GatewayRunner:
             if getattr(event.source, "message_id", None) is None:
                 event.source.message_id = event.message_id
 
+    def _discord_work_item_id_for_event(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> Optional[str]:
+        work_item_id = getattr(event, "work_item_id", None)
+        if work_item_id or getattr(event.source, "platform", None) != Platform.DISCORD:
+            return str(work_item_id) if work_item_id else None
+        try:
+            work_id = self._ledger().id_for_event(event, session_key)
+            item = self._ledger().get(str(work_id)) if work_id else None
+        except Exception:
+            return None
+        if not isinstance(item, dict):
+            return None
+        self._hydrate_discord_resume_event_from_work_item(event, item)
+        return str(item.get("id") or work_id or "") or None
+
     def _schedule_resume_pending_sessions(self) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
@@ -11398,7 +11416,7 @@ class GatewayRunner:
             await self.hooks.emit("agent:start", hook_ctx)
 
             # Run the agent
-            work_item_id = getattr(event, "work_item_id", None)
+            work_item_id = self._discord_work_item_id_for_event(event, session_key)
             if work_item_id and source.platform == Platform.DISCORD:
                 try:
                     self._ledger().mark_agent_running(
@@ -11558,7 +11576,7 @@ class GatewayRunner:
             if _footer_line and response and not agent_result.get("already_sent"):
                 response = f"{response}\n\n{_footer_line}"
 
-            work_item_id = getattr(event, "work_item_id", None)
+            work_item_id = self._discord_work_item_id_for_event(event, session_key)
             if work_item_id and source.platform == Platform.DISCORD:
                 try:
                     title = None
@@ -14392,15 +14410,17 @@ class GatewayRunner:
         final_response: str,
         agent_result: Optional[Dict[str, Any]],
     ) -> None:
-        feature_summary = getattr(event, "feature_summary", None)
-        project_summary = getattr(event, "project_summary", None)
-        if source.platform != Platform.DISCORD or (not feature_summary and not project_summary):
+        if source.platform != Platform.DISCORD:
             return
         adapter = self.adapters.get(Platform.DISCORD)
         if not adapter or not hasattr(adapter, "register_post_delivery_callback"):
             return
         status = self._discord_summary_status(agent_result)
-        work_item_id = getattr(event, "work_item_id", None)
+        work_item_id = self._discord_work_item_id_for_event(event, session_key)
+        feature_summary = getattr(event, "feature_summary", None)
+        project_summary = getattr(event, "project_summary", None)
+        if not feature_summary and not project_summary:
+            return
         status = self._discord_ledger_summary_status(work_item_id, status)
 
         async def _deliver():
