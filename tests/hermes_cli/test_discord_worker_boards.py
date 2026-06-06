@@ -1014,6 +1014,61 @@ def test_public_board_index_lists_session_links(monkeypatch, tmp_path):
     assert "Build the thing" in html
 
 
+def test_public_board_index_skips_board_with_unreadable_worker_metadata(monkeypatch, tmp_path, caplog):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    good = dwb.set_goal(thread_id="5151", goal="Good board")
+    bad = dwb.set_goal(thread_id="5152", goal="Bad board")
+    original_read_worker_meta = dwb._read_worker_meta
+
+    def read_worker_meta(slug):
+        if slug == bad.slug:
+            raise ValueError("bad metadata token=secret-token")
+        return original_read_worker_meta(slug)
+
+    monkeypatch.setattr(dwb, "_read_worker_meta", read_worker_meta)
+
+    with caplog.at_level("WARNING", logger="hermes_cli.discord_worker_boards"):
+        html = dwb.render_public_board_index_html()
+
+    assert f"/workers/{good.worker['thread_id']}" in html
+    assert "Good board" in html
+    assert f"/workers/{bad.worker['thread_id']}" not in html
+    assert "Bad board" not in html
+    assert "secret-token" not in html
+    assert f"Skipping public worker-board index entry for board {bad.slug}" in caplog.text
+    assert "ValueError" in caplog.text
+    assert "secret-token" not in caplog.text
+
+
+def test_public_board_index_skips_board_with_db_snapshot_failure(monkeypatch, tmp_path, caplog):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    good = dwb.set_goal(thread_id="5153", goal="Good DB board")
+    bad = dwb.set_goal(thread_id="5154", goal="Bad DB board")
+    original_connect = kanban_db.connect
+
+    def connect(*args, **kwargs):
+        if kwargs.get("board") == bad.slug:
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(kanban_db, "connect", connect)
+
+    with caplog.at_level("WARNING", logger="hermes_cli.discord_worker_boards"):
+        html = dwb.render_public_board_index_html()
+
+    assert f"/workers/{good.worker['thread_id']}" in html
+    assert "Good DB board" in html
+    assert f"/workers/{bad.worker['thread_id']}" not in html
+    assert "Bad DB board" not in html
+    assert f"Skipping public worker-board index entry for board {bad.slug}" in caplog.text
+    assert "DatabaseError" in caplog.text
+
+
 def test_generated_summary_title_replaces_workers_board_title(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

@@ -4014,35 +4014,42 @@ def public_board_index_snapshot() -> dict[str, Any]:
     boards = []
     for board in kanban_db.list_boards(include_archived=False):
         slug = str(board.get("slug") or kanban_db.DEFAULT_BOARD)
-        worker = _read_worker_meta(slug)
-        if worker.get("kind") != "discord_worker_board":
-            continue
-        conn = kanban_db.connect(board=slug)
         try:
-            counts = kanban_db.board_stats(conn).get("by_status", {})
-            running = _running_ticket_snapshot(conn)
-            runtime = _board_runtime_snapshot(
-                worker,
-                counts=counts,
-                running=running,
-                conn=conn,
+            worker = _read_worker_meta(slug)
+            if worker.get("kind") != "discord_worker_board":
+                continue
+            conn = kanban_db.connect(board=slug)
+            try:
+                counts = kanban_db.board_stats(conn).get("by_status", {})
+                running = _running_ticket_snapshot(conn)
+                runtime = _board_runtime_snapshot(
+                    worker,
+                    counts=counts,
+                    running=running,
+                    conn=conn,
+                )
+            finally:
+                conn.close()
+            session_id = _public_session_id_for_board(slug, worker)
+            boards.append(
+                {
+                    "board": slug,
+                    "name": _worker_board_name(worker, board, slug),
+                    "description": board.get("description") or "",
+                    "session_id": session_id,
+                    "public_url": public_session_board_url(session_id),
+                    "worker": _public_worker_meta(worker),
+                    "counts": counts,
+                    "running": running,
+                    "runtime": runtime,
+                }
             )
-        finally:
-            conn.close()
-        session_id = _public_session_id_for_board(slug, worker)
-        boards.append(
-            {
-                "board": slug,
-                "name": _worker_board_name(worker, board, slug),
-                "description": board.get("description") or "",
-                "session_id": session_id,
-                "public_url": public_session_board_url(session_id),
-                "worker": _public_worker_meta(worker),
-                "counts": counts,
-                "running": running,
-                "runtime": runtime,
-            }
-        )
+        except Exception as exc:
+            logger.warning(
+                "Skipping public worker-board index entry for board %s: %s",
+                slug,
+                type(exc).__name__,
+            )
     boards.sort(key=newest_sort_key, reverse=True)
     return {"boards": boards}
 
