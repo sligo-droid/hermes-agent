@@ -204,7 +204,7 @@ function availableActionKinds(item: CommandCenterWorkItem): ActionKind[] {
   const canApproveReject = Boolean(proposalId && item.status === "proposed");
   const canPause = Boolean(["queued", "running", "review", "accepted"].includes(item.status) && (proposalId || (item.execution?.pause_action && item.execution.board)) && !item.execution?.paused);
   const canResume = Boolean((item.status === "paused" || item.execution?.paused || item.execution?.resumable) && (proposalId || (item.execution?.resume_action && item.execution.board)) && item.status !== "archived");
-  const canUndo = Boolean(proposalId && item.status === "shipped");
+  const canUndo = Boolean(proposalId && item.decision?.undo_followup_action && isCompletedItem(item));
   const canArchive = Boolean((item.execution?.archiveable && item.execution.board && item.execution.board !== "default" && item.id.startsWith("kanban-board:")) || proposalCanArchive);
   const canRepair = Boolean(item.status === "blocked" && item.execution?.board && item.execution?.repair_action && item.execution?.repairable !== false && !item.execution?.repair_task_id);
   const actions: ActionKind[] = [];
@@ -1070,7 +1070,7 @@ export default function CommandCenterPage() {
           )}
           {activeView === "completed" && (
             <>
-              <WorkList activeAction={activeAction} emptyLabel="completed items" emptyMessage="Completed and shipped work items will appear here." items={pagedCompletedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} showActions={false} />
+              <WorkList activeAction={activeAction} emptyLabel="completed items" emptyMessage="Completed and shipped work items will appear here." items={pagedCompletedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
               <PaginationControls label="completed" onPageChange={(page) => setPage("completed", page)} page={pages.completed} totalItems={pageTotals.completed} />
             </>
           )}
