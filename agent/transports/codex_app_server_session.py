@@ -212,6 +212,8 @@ class CodexAppServerSession:
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
+        scope_kind: str = "codex-app-server",
+        scope_purpose: str = "Codex app-server runtime",
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
@@ -229,6 +231,8 @@ class CodexAppServerSession:
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
+        self._scope_kind = scope_kind
+        self._scope_purpose = scope_purpose
 
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
@@ -256,6 +260,9 @@ class CodexAppServerSession:
                 extra_args=self._extra_args,
                 env=self._env,
                 replace_env=self._replace_env,
+                cwd=self._cwd,
+                scope_kind=self._scope_kind,
+                scope_purpose=self._scope_purpose,
             )
         self._client.initialize(
             client_name="hermes",

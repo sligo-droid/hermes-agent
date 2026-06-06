@@ -59,6 +59,82 @@ class TestLoadMCPConfig:
             result = _load_mcp_config()
             assert result == {}
 
+
+class TestMCPGatewayChildScope:
+    def test_stdio_command_is_wrapped_for_gateway_child_scope(self, monkeypatch):
+        from tools import mcp_tool
+
+        captured = {}
+
+        def fake_resolve(command, env):
+            return "/usr/bin/node", env
+
+        def fake_build(command, **kwargs):
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+            from hermes_cli.gateway_child_isolation import GatewayChildScope
+
+            return ["/usr/bin/systemd-run", "--user", "--scope", "--", *command], GatewayChildScope(
+                enabled=True,
+                unit="hermes-gateway-child-mcp-test.scope",
+                kind="mcp-stdio",
+                purpose="MCP stdio server filesystem",
+                command_label="filesystem",
+                workspace="/repo",
+                session_key="discord:123",
+            )
+
+        monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+        monkeypatch.setattr(mcp_tool, "_resolve_stdio_command", fake_resolve)
+        monkeypatch.setattr(mcp_tool, "_write_stderr_log_header", lambda name: None)
+        monkeypatch.setattr(mcp_tool, "_get_mcp_stderr_log", lambda: None)
+        monkeypatch.setattr(mcp_tool, "_snapshot_child_pids", lambda: set())
+        monkeypatch.setattr(
+            "tools.osv_check.check_package_for_malware",
+            lambda command, args: None,
+        )
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda name, default="": {
+                "HERMES_SESSION_CWD": "/repo",
+                "HERMES_SESSION_KEY": "discord:123",
+            }.get(name, default),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.gateway_child_isolation.build_gateway_child_scope_argv",
+            fake_build,
+        )
+
+        class FakeParams:
+            def __init__(self, command, args, env):
+                captured["params"] = (command, args, env)
+
+        monkeypatch.setattr(mcp_tool, "StdioServerParameters", FakeParams)
+
+        class FakeStdioClient:
+            def __init__(self, params, errlog=None):
+                pass
+
+            async def __aenter__(self):
+                raise RuntimeError("stop after params")
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        monkeypatch.setattr(mcp_tool, "stdio_client", lambda params, errlog=None: FakeStdioClient(params, errlog))
+
+        server = mcp_tool.MCPServerTask("filesystem")
+        with pytest.raises(RuntimeError, match="stop after params"):
+            asyncio.run(server._run_stdio({"command": "node", "args": ["server.js"], "env": {}}))
+
+        assert captured["command"] == ["/usr/bin/node"]
+        assert captured["kwargs"]["kind"] == "mcp-stdio"
+        assert captured["kwargs"]["session_key"] == "discord:123"
+        command, args, env = captured["params"]
+        assert command == "/usr/bin/systemd-run"
+        assert args[:4] == ["--user", "--scope", "--", "/usr/bin/node"]
+        assert args[-1] == "server.js"
+
     def test_valid_config_parsed(self):
         """Valid mcp_servers config is returned as-is."""
         servers = {

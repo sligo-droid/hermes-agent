@@ -164,6 +164,7 @@ class TestSpawnEnvIsolation:
         from agent.transports import codex_app_server as cas
 
         captured = {}
+        monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
 
         class FakePopen:
             def __init__(self, cmd, *args, **kwargs):
@@ -189,6 +190,7 @@ class TestSpawnEnvIsolation:
                 pass
 
         monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
         monkeypatch.setenv("HOME", "/users/alice")
 
         client = cas.CodexAppServerClient(codex_bin="codex")
@@ -208,6 +210,7 @@ class TestSpawnEnvIsolation:
         from agent.transports import codex_app_server as cas
 
         captured = {}
+        monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
 
         class FakePopen:
             def __init__(self, cmd, *args, **kwargs):
@@ -231,6 +234,7 @@ class TestSpawnEnvIsolation:
                 pass
 
         monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
         monkeypatch.setenv("HOME", "/users/alice")
 
         client = cas.CodexAppServerClient(
@@ -251,6 +255,7 @@ class TestSpawnEnvIsolation:
         gh_dir.mkdir(parents=True)
         (gh_dir / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
         captured = {}
+        monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
 
         class FakePopen:
             def __init__(self, cmd, *args, **kwargs):
@@ -287,6 +292,7 @@ class TestSpawnEnvIsolation:
         import subprocess
         from agent.transports import codex_app_server as cas
 
+        monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
         monkeypatch.setenv("HERMES_KANBAN_DB", "/live/kanban.db")
         monkeypatch.setenv("HOME", "/users/alice")
         captured = {}
@@ -359,6 +365,7 @@ class TestSpawnEnvIsolation:
                 pass
 
         monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
         monkeypatch.setenv("HOME", "/users/alice")
         monkeypatch.setenv("HERMES_HOME", "/users/alice/.hermes/profiles/backend-worker")
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_smoke")
@@ -370,6 +377,7 @@ class TestSpawnEnvIsolation:
             "HERMES_KANBAN_WORKSPACE",
             "/users/alice/workspaces/project-smoke",
         )
+        monkeypatch.setenv("HERMES_CODEX_WORKER_NETWORK_ACCESS", "1")
 
         client = cas.CodexAppServerClient(codex_bin="codex")
         client._closed = True
@@ -383,6 +391,44 @@ class TestSpawnEnvIsolation:
         )
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
+
+    def test_kanban_worker_honors_network_access_from_explicit_env(self, monkeypatch):
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+        monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_smoke")
+
+        client = cas.CodexAppServerClient(
+            codex_bin="codex", env={"HERMES_CODEX_WORKER_NETWORK_ACCESS": "1"}
+        )
+        client._closed = True
+
+        assert "sandbox_workspace_write.network_access=true" in captured["cmd"]
 
     def test_kanban_worker_network_access_without_live_control_env(self, monkeypatch):
         """Sanitized role-worker env still enables workspace-write + network."""
@@ -413,6 +459,7 @@ class TestSpawnEnvIsolation:
             def kill(self):
                 pass
 
+        monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
         monkeypatch.setenv("HERMES_KANBAN_DB", "/live/kanban.db")
         monkeypatch.setattr(subprocess, "Popen", FakePopen)
 
@@ -433,3 +480,74 @@ class TestSpawnEnvIsolation:
         assert 'sandbox_workspace_write.writable_roots=["/users/alice/workspaces/project-smoke"]' in cmd
         assert "sandbox_workspace_write.network_access=true" in cmd
         assert not any("/live/kanban.db" in arg for arg in cmd)
+
+    def test_spawn_wraps_codex_app_server_in_gateway_child_scope(self, monkeypatch, tmp_path):
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        def fake_build(command, **kwargs):
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+            from hermes_cli.gateway_child_isolation import GatewayChildScope
+
+            return ["/usr/bin/systemd-run", "--user", "--scope", "--", *command], GatewayChildScope(
+                enabled=True,
+                unit="hermes-gateway-child-codex-app-server-session.scope",
+                kind="codex-app-server",
+                purpose="Codex app-server runtime",
+                command_label="codex-app-server",
+                workspace=str(tmp_path),
+                session_key="discord:123",
+            )
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                captured["env"] = kwargs.get("env", {}).copy()
+                captured["popen_kwargs"] = kwargs
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setattr(
+            "hermes_cli.gateway_child_isolation.build_gateway_child_scope_argv",
+            fake_build,
+        )
+
+        client = cas.CodexAppServerClient(
+            codex_bin="codex",
+            cwd=str(tmp_path),
+            env={"HERMES_SESSION_KEY": "discord:123", "OPENAI_API_KEY": "secret"},
+        )
+        client._closed = True
+
+        assert captured["command"] == ["codex", "app-server"]
+        assert captured["kwargs"]["kind"] == "codex-app-server"
+        assert captured["kwargs"]["purpose"] == "Codex app-server runtime"
+        assert captured["kwargs"]["command_label"] == "codex-app-server"
+        assert captured["kwargs"]["session_key"] == "discord:123"
+        assert captured["kwargs"]["cwd"] == str(tmp_path)
+        assert captured["cmd"][:4] == ["/usr/bin/systemd-run", "--user", "--scope", "--"]
+        assert captured["cmd"][-2:] == ["codex", "app-server"]
+        assert captured["popen_kwargs"]["stdin"] is subprocess.PIPE
+        assert captured["popen_kwargs"]["stdout"] is subprocess.PIPE
+        assert captured["popen_kwargs"]["stderr"] is subprocess.PIPE
+        assert captured["env"]["OPENAI_API_KEY"] == "secret"
+        assert client.child_scope_unit == "hermes-gateway-child-codex-app-server-session.scope"

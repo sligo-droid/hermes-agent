@@ -1182,6 +1182,14 @@ def test_runtime_explicit_config_and_env_override_auto(monkeypatch):
     monkeypatch.setenv("HERMES_CODEX_WORKER_SERVICE_TIER", "fast")
 
     settings = workers._role_runtime_settings("dev", cfg, task)
+    assert settings["reasoning"] == "low"
+    assert settings["service_tier"] == "normal"
+
+    cfg = {
+        "roles": {"dev": {"reasoning": "auto", "service_tier": "auto"}},
+        "service_tier": "normal",
+    }
+    settings = workers._role_runtime_settings("dev", cfg, task)
     assert settings["reasoning"] == "xhigh"
     assert settings["service_tier"] == "fast"
 
