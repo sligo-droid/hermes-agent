@@ -61,7 +61,10 @@ class CompletionNoticeAdapter(DiscordStatusSyncAdapter):
         self.completions.append(dict(target))
         from hermes_cli import discord_worker_boards as dwb
 
-        dwb.mark_thread_status_synced(str(target.get("board") or ""), completion_message=True)
+        dwb.mark_thread_completion_notice_sent(
+            str(target.get("board") or ""),
+            message_id="completion-message-1",
+        )
         return target.get("board")
 
 
@@ -1121,13 +1124,13 @@ def test_discord_stale_completion_notice_flag_keeps_terminal_target_until_cleare
     assert "terminal_completion_message_sent_at" not in worker
 
 
-def test_discord_kanban_typing_watcher_clears_stale_completion_notice_flag(tmp_path, monkeypatch):
+def test_discord_kanban_typing_watcher_keeps_completion_notice_pending_without_sender(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb
 
     board = dwb.set_goal(
         thread_id="99019",
-        goal="Suppress completed goal notice",
+        goal="Keep completed goal notice pending until Discord can send it",
         chat_id="parent-99019",
     )
     conn = kb.connect(board=board.slug)
@@ -1155,7 +1158,8 @@ def test_discord_kanban_typing_watcher_clears_stale_completion_notice_flag(tmp_p
     asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
 
     worker = kb.read_board_metadata(board.slug)["discord_worker"]
-    assert "terminal_completion_message_pending" not in worker
+    assert worker["terminal_completion_message_pending"] is True
+    assert "terminal_completion_message_sent_at" not in worker
 
 
 def test_discord_kanban_typing_watcher_sends_completion_notice(tmp_path, monkeypatch):
@@ -1195,6 +1199,41 @@ def test_discord_kanban_typing_watcher_sends_completion_notice(tmp_path, monkeyp
     assert adapter.completions[0]["board"] == board.slug
     worker = kb.read_board_metadata(board.slug)["discord_worker"]
     assert "terminal_completion_message_pending" not in worker
+    assert worker["terminal_completion_message_id"] == "completion-message-1"
+    assert isinstance(worker["terminal_completion_message_sent_at"], int)
+
+
+def test_discord_worker_new_goal_clears_prior_completion_notice_proof(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(
+        thread_id="99022",
+        goal="First completed goal",
+        chat_id="parent-99022",
+    )
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_completion_message_pending": True,
+            "terminal_completion_message_sent_at": 123,
+            "terminal_completion_message_id": "old-completion-message",
+        },
+    )
+
+    board = dwb.set_goal(
+        thread_id="99022",
+        goal="Second goal should not inherit completion notice proof",
+        chat_id="parent-99022",
+    )
+
+    worker = kb.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["goal_status"] == "active"
+    assert "terminal_completion_message_pending" not in worker
+    assert "terminal_completion_message_sent_at" not in worker
+    assert "terminal_completion_message_id" not in worker
 
 
 def test_discord_thread_status_targets_mark_foreman_generated_completion(tmp_path, monkeypatch):

@@ -247,8 +247,12 @@ def test_run_slash_repair_restores_known_good_backup_json(kanban_home):
     board = "cli-restore-board"
     kb.create_board(board)
     db_path = kb.kanban_db_path(board)
-    with kb.connect(board=board) as conn:
+    conn = kb.connect(board=board)
+    try:
         kb.create_task(conn, title="from cli backup")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
     backup = db_path.parent / "kanban.db.known-good.1.bak"
     shutil.copy2(db_path, backup)
     db_path.write_bytes(b"not a sqlite database")

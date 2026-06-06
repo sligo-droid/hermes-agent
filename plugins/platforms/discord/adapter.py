@@ -3989,13 +3989,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 send_kwargs["allowed_mentions"] = allowed_mentions
         except Exception:
             pass
-        await thread.send(**send_kwargs)
+        sent_message = await thread.send(**send_kwargs)
         try:
-            from hermes_cli.discord_worker_boards import mark_thread_status_synced
+            from hermes_cli.discord_worker_boards import mark_thread_completion_notice_sent
 
-            mark_thread_status_synced(board, completion_message=True)
+            mark_thread_completion_notice_sent(
+                board,
+                message_id=str(getattr(sent_message, "id", "") or "") or None,
+            )
         except Exception:
-            logger.debug("[%s] Failed to clear Discord terminal completion notice flag", self.name, exc_info=True)
+            logger.debug("[%s] Failed to record Discord terminal completion notice send", self.name, exc_info=True)
             return None
         return board
 
