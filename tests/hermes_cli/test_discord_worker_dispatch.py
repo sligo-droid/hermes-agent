@@ -291,6 +291,39 @@ def test_discord_worker_dispatch_reviewer_lane_is_singleton(monkeypatch, tmp_pat
     assert sum(len(result.spawned) for _board, result in results if result is not None) == 1
 
 
+def test_discord_worker_dispatch_ready_reviewer_is_control_ready(monkeypatch, tmp_path):
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_dispatch import dispatch_discord_worker_boards
+
+    board = _prepare_board(monkeypatch, tmp_path, thread_id="ready-reviewer", running_role=None)
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        conn.execute("UPDATE tasks SET status = 'done' WHERE assignee = ?", (dwb.ROLE_DEV,))
+        task_id = kanban_db.create_task(
+            conn,
+            title="Ready reviewer task",
+            assignee=dwb.ROLE_REVIEWER,
+            tenant=board.slug,
+        )
+        conn.execute("UPDATE tasks SET status = 'ready', claim_lock = NULL WHERE id = ?", (task_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    spawned = []
+
+    results = dispatch_discord_worker_boards(
+        [board.slug],
+        max_global_workers=4,
+        max_workers_per_board=2,
+        max_dev_workers_per_board=1,
+        spawn_fn=lambda task, workspace, board=None: spawned.append((task.assignee, board)) or 7500,
+    )
+
+    assert spawned == [(dwb.ROLE_REVIEWER, board.slug)]
+    assert sum(len(result.spawned) for _board, result in results if result is not None) == 1
+
+
 def test_discord_worker_dispatch_records_corrupt_open_once_then_skips(
     monkeypatch,
     tmp_path,

@@ -136,7 +136,7 @@ def _ready_role_counts(board: str) -> dict[str, int]:
         for row in rows:
             role = str(row["role"] or "")
             status = str(row["status"] or "")
-            if role == dwb.ROLE_REVIEWER and status == "review":
+            if role == dwb.ROLE_REVIEWER and status in {"ready", "review"}:
                 counts[role] += int(row["count"] or 0)
             elif role in {dwb.ROLE_PLANNER, dwb.ROLE_DEV} and status == "ready":
                 counts[role] += int(row["count"] or 0)
