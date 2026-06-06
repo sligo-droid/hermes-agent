@@ -371,8 +371,10 @@ def _schema_instructions(role: str) -> str:
         return (
             'Schema: {"status":"completed|blocked|checkpoint","summary":"...",'
             '"actions":["..."],"verification":["..."],"changed_tasks":[{"id":"...","action":"...","status":"..."}],'
+            '"follow_up_proposals":[{"id":"...","title":"...","url":"...","reason":"..."}],'
             '"blocker":null} '
             "Record every Kanban repair action in actions and changed_tasks. "
+            "If you create a Command Center self-improvement proposal/job for a durable repo fix discovered during repair, report it in optional follow_up_proposals; otherwise use an empty list or omit it. "
             "Use blocked only when repair cannot safely proceed and blocker explains the next human/operator action. "
             "Never include secrets, raw credentials, or unredacted tokens in the JSON."
         )
