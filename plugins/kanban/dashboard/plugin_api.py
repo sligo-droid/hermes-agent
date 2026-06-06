@@ -602,6 +602,10 @@ class BoardRepairBody(BaseModel):
     detail: Optional[str] = None
 
 
+class BoardUndoFollowupBody(BaseModel):
+    reason: Optional[str] = Field(default=None, max_length=2000)
+
+
 def _proposal_actor() -> str:
     return os.environ.get("USER") or os.environ.get("USERNAME") or "dashboard"
 
@@ -686,6 +690,29 @@ def _repair_task_body(
             "- Use the existing self-improvement proposal path: persist a `self_improvement.proposal_run.v1` proposal run with `self_improvement.proposal_storage.ingest_proposal_output(...)`, not a new repair endpoint or ad hoc dashboard row.",
             "- The proposed card must specify the repo fix for human approval and include title, summary/body, rationale, scope, and verification; its `kanban_task` should contain the implementation brief humans would approve into a follow-up job.",
             "- Report any created follow-up proposal id/title/url in your final JSON `follow_up_proposals`; if no durable repo fix is needed, say so in verification.",
+        ]
+    )
+
+
+def _board_undo_followup_task_body(*, board: str, board_meta: dict[str, Any], reason: str | None, task_counts: dict[str, int]) -> str:
+    worker = _discord_worker_meta(board)
+    board_url = _worker_board_url(board=board, board_public_url=worker.get("public_url") if worker else None)
+    return "\n".join(
+        [
+            "Review the completed Command Center worker board and prepare the safest revert path if needed.",
+            "",
+            "Board:",
+            f"- slug: {board}",
+            f"- name: {board_meta.get('name') or board}",
+            f"- worker_url: {board_url or 'unavailable'}",
+            f"- task_counts: {json.dumps(task_counts, sort_keys=True)}",
+            "",
+            f"Reason: {reason or 'operator requested follow-up'}",
+            "",
+            "Instructions:",
+            "- Inspect completed work, artifacts, commits/PRs, and worker summaries before proposing any revert.",
+            "- Prefer the smallest safe compensating follow-up over destructive state changes.",
+            "- Do not mutate live production state unless the task explicitly requires it and verification is available.",
         ]
     )
 
@@ -892,6 +919,21 @@ def _stop_generic_board_for_archive(board: str, *, reason: str) -> dict[str, Any
     finally:
         conn.close()
     return {"board": board, "archived_tasks": archived, "reclaimed": reclaimed}
+
+
+def _board_is_completed(board: str, board_meta: dict[str, Any]) -> bool:
+    worker_status = _discord_worker_board_status(_discord_worker_meta(board))
+    if worker_status == "done":
+        return True
+    conn = _conn(board=board)
+    try:
+        active_tasks = [task for task in kanban_db.list_tasks(conn, include_archived=False) if task.status != "archived"]
+    finally:
+        conn.close()
+    if active_tasks and all(task.status == "done" for task in active_tasks):
+        return True
+    worker = board_meta.get(DISCORD_WORKER_META_KEY) if isinstance(board_meta.get(DISCORD_WORKER_META_KEY), dict) else {}
+    return str(worker.get("goal_status") or "").lower() in {"done", "shipped", "complete", "completed"} or str(worker.get("phase") or "").lower() == "complete"
 
 
 def _planner_task_matches_card(task: kanban_db.Task, card: dict[str, Any]) -> bool:
@@ -2864,6 +2906,60 @@ def repair_board(slug: str, payload: BoardRepairBody | None = None):
         "created": created,
         "task": _task_dict(task) if task else None,
         "worker_url": _worker_ticket_url(task_id, board=normed, board_public_url=worker.get("public_url") if worker else None),
+        "board": kanban_db.read_board_metadata(normed),
+        "idempotency_key": idempotency_key,
+    }
+
+
+@router.post("/boards/{slug}/undo-followup")
+def board_undo_followup(slug: str, payload: BoardUndoFollowupBody | None = None):
+    """Create or return a follow-up task for reviewing a completed board revert path."""
+    try:
+        normed = kanban_db._normalize_board_slug(slug)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not normed or normed == kanban_db.DEFAULT_BOARD or not kanban_db.board_exists(normed):
+        raise HTTPException(status_code=404, detail=f"board {slug!r} does not exist")
+    board_meta = kanban_db.read_board_metadata(normed)
+    conn = _conn(board=normed)
+    created = False
+    idempotency_key = f"command-center-revert:{normed}"
+    try:
+        existing = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+            (idempotency_key,),
+        ).fetchone()
+        if existing:
+            task_id = str(existing["id"])
+            task = kanban_db.get_task(conn, task_id)
+        else:
+            if not _board_is_completed(normed, board_meta):
+                raise HTTPException(status_code=409, detail="downstream board is not fully implemented")
+            reason = payload.reason.strip() if payload and payload.reason else None
+            task_counts = _board_counts(normed)
+            workspace = _dashboard_worker_workspace(board_meta)
+            task_id = kanban_db.create_task(
+                conn,
+                title=f"Review revert path for completed board: {board_meta.get('name') or normed}",
+                body=_board_undo_followup_task_body(board=normed, board_meta=board_meta, reason=reason, task_counts=task_counts),
+                assignee=ROLE_FOREMAN,
+                created_by=command_center.COMMAND_CENTER_REVERT_CREATED_BY,
+                workspace_kind=workspace["workspace_kind"],
+                workspace_path=workspace["workspace_path"],
+                tenant=str(board_meta.get("project") or board_meta.get("tenant") or normed),
+                priority=command_center.COMMAND_CENTER_REPAIR_PRIORITY,
+                idempotency_key=idempotency_key,
+                max_runtime_seconds=1800,
+                initial_status="blocked",
+            )
+            created = True
+            task = kanban_db.get_task(conn, task_id)
+    finally:
+        conn.close()
+    return {
+        "created": created,
+        "task": _task_dict(task) if task else None,
+        "worker_url": _worker_ticket_url(task_id, board=normed, board_public_url=_discord_worker_meta(normed).get("public_url") if _discord_worker_meta(normed) else None),
         "board": kanban_db.read_board_metadata(normed),
         "idempotency_key": idempotency_key,
     }

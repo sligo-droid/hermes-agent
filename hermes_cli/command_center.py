@@ -24,6 +24,7 @@ from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
 from self_improvement import proposal_storage
 
 COMMAND_CENTER_REPAIR_CREATED_BY = "command-center-repair"
+COMMAND_CENTER_REVERT_CREATED_BY = "command-center-revert"
 COMMAND_CENTER_REPAIR_PRIORITY = 1_000_000
 COMMAND_CENTER_REPAIR_ASSIGNEE = "foreman"
 COMMAND_CENTER_REPAIR_ACTIVE_STATUSES = {"triage", "todo", "ready", "running", "review", "blocked", "scheduled"}
@@ -587,6 +588,7 @@ def _execution_from_board(
     )
     active_statuses = {str(task.get("status") or "").lower() for task in tasks}
     resumable = paused or bool(active_statuses & {"blocked", "scheduled"})
+    canonical_status = _canonical_status_from_board(tasks, board_meta=board_meta, runs=runs)[0]
     execution = {
         "board": board,
         "board_name": board_meta.get("name") or board,
@@ -605,7 +607,9 @@ def _execution_from_board(
         "task_counts": _task_status_counts(tasks),
         "run_count": len(runs),
     }
-    return _with_repair_metadata(execution, status=_canonical_status_from_board(tasks, board_meta=board_meta, runs=runs)[0], tasks=tasks)
+    if board != kanban_db.DEFAULT_BOARD and not archived and canonical_status == "shipped":
+        execution["undo_followup_action"] = f"/api/plugins/kanban/boards/{quote(board, safe='')}/undo-followup"
+    return _with_repair_metadata(execution, status=canonical_status, tasks=tasks)
 
 
 def _proposal_source(card: dict[str, Any]) -> dict[str, Any]:
