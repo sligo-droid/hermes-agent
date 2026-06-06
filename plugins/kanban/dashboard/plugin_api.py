@@ -52,7 +52,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli import command_center, kanban_db
-from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY, ROLE_PLANNER
+from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY, ROLE_FOREMAN, ROLE_PLANNER
 from hermes_cli import kanban_diagnostics as kd
 from self_improvement import discord_publish, proposal_storage
 
@@ -594,6 +594,14 @@ class ProposalFollowupBody(BaseModel):
     reason: Optional[str] = Field(default=None, max_length=2000)
 
 
+class BoardRepairBody(BaseModel):
+    task_id: Optional[str] = None
+    work_item_id: Optional[str] = None
+    title: Optional[str] = None
+    status: Optional[str] = None
+    detail: Optional[str] = None
+
+
 def _proposal_actor() -> str:
     return os.environ.get("USER") or os.environ.get("USERNAME") or "dashboard"
 
@@ -633,6 +641,85 @@ def _proposal_task_body(card: dict[str, Any]) -> str:
             source_block,
         ]
     )
+
+
+def _repair_task_body(
+    *,
+    board: str,
+    board_meta: dict[str, Any],
+    payload: BoardRepairBody,
+    source_task: kanban_db.Task | None,
+    task_counts: dict[str, int],
+) -> str:
+    worker = _discord_worker_meta(board)
+    board_url = _worker_board_url(board=board, board_public_url=worker.get("public_url") if worker else None)
+    source_title = payload.title or (source_task.title if source_task else None) or board_meta.get("name") or board
+    return "\n".join(
+        [
+            "Diagnose and repair a blocked Command Center worker board.",
+            "",
+            "Use the foreman profile/role with the broadest available context and permissions. Inspect the board, task state, recent runs, logs, and persisted metadata; safely unblock or repair stuck tickets; wake dispatch if needed; and report exactly what changed.",
+            "",
+            "Board:",
+            f"- slug: {board}",
+            f"- name: {board_meta.get('name') or board}",
+            f"- worker_url: {board_url or 'unavailable'}",
+            f"- task_counts: {json.dumps(task_counts, sort_keys=True)}",
+            "",
+            "Source work item:",
+            f"- work_item_id: {payload.work_item_id or 'unknown'}",
+            f"- task_id: {payload.task_id or (source_task.id if source_task else 'board-rollup')}",
+            f"- title: {source_title}",
+            f"- status: {payload.status or (source_task.status if source_task else 'blocked')}",
+            f"- detail: {payload.detail or 'blocked Command Center item'}",
+            "",
+            "Instructions:",
+            "- Do not create duplicate Foreman repair tickets for this source.",
+            "- Prefer repairing task/board state over deleting evidence.",
+            "- If a task is safely resumable, move it back to ready and mark dispatch dirty.",
+            "- If the block is legitimate, leave it blocked with a clear explanation and next action.",
+        ]
+    )
+
+
+def _active_repair_task(conn, idempotency_key: str) -> kanban_db.Task | None:
+    exact_keys = [idempotency_key]
+    like_keys = [f"{idempotency_key}:%"]
+    parts = idempotency_key.split(":", 2)
+    if len(parts) == 3 and parts[2] == parts[1]:
+        # Board-rollup repair uses command-center-repair:<board>:<board>.
+        # Suppress it when any active task-specific repair already exists on
+        # that board, even if the UI snapshot is stale.
+        like_keys.append(f"{parts[0]}:{parts[1]}:%")
+    clauses = ["idempotency_key = ?" for _ in exact_keys] + ["idempotency_key LIKE ?" for _ in like_keys]
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE " + " OR ".join(clauses) + " ORDER BY created_at DESC, id DESC",
+        (*exact_keys, *like_keys),
+    ).fetchall()
+    for row in rows:
+        task = kanban_db.get_task(conn, row["id"])
+        if task and task.status in command_center.COMMAND_CENTER_REPAIR_ACTIVE_STATUSES:
+            return task
+    return None
+
+
+def _repair_attempt_idempotency_key(conn, base_key: str, *, now: int | None = None) -> str:
+    row = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+        (base_key,),
+    ).fetchone()
+    if not row:
+        return base_key
+    attempt_second = int(now if now is not None else time.time())
+    for suffix in [str(attempt_second), *(f"{attempt_second}-{index}" for index in range(1, 100))]:
+        candidate = f"{base_key}:{suffix}"
+        existing = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' LIMIT 1",
+            (candidate,),
+        ).fetchone()
+        if not existing:
+            return candidate
+    return f"{base_key}:{attempt_second}-overflow"
 
 
 def _latest_self_improvement_board(proposal_id: str) -> str:
@@ -2639,6 +2726,73 @@ def resume_board(slug: str):
     else:
         result = _resume_generic_board(normed)
     return {"result": result, "board": kanban_db.read_board_metadata(normed)}
+
+
+@router.post("/boards/{slug}/repair")
+def repair_board(slug: str, payload: BoardRepairBody | None = None):
+    """Create or return a high-priority Foreman repair ticket for a blocked board."""
+    try:
+        normed = kanban_db._normalize_board_slug(slug)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not normed or not kanban_db.board_exists(normed):
+        raise HTTPException(status_code=404, detail=f"board {slug!r} does not exist")
+    payload = payload or BoardRepairBody()
+    source_task_id = str(payload.task_id or "").strip() or None
+    idempotency_key = command_center.command_center_repair_idempotency_key(normed, source_task_id)
+    conn = _conn(board=normed)
+    created = False
+    try:
+        source_task = kanban_db.get_task(conn, source_task_id) if source_task_id else None
+        if source_task_id and source_task is None:
+            raise HTTPException(status_code=404, detail=f"task {source_task_id!r} not found on board {normed!r}")
+        board_meta = kanban_db.read_board_metadata(normed)
+        task_counts = _board_counts(normed)
+        task = _active_repair_task(conn, idempotency_key)
+        if task:
+            task_id = task.id
+        else:
+            create_key = _repair_attempt_idempotency_key(conn, idempotency_key)
+            task_id = kanban_db.create_task(
+                conn,
+                title=f"Repair blocked board: {payload.title or board_meta.get('name') or normed}",
+                body=_repair_task_body(
+                    board=normed,
+                    board_meta=board_meta,
+                    payload=payload,
+                    source_task=source_task,
+                    task_counts=task_counts,
+                ),
+                assignee=ROLE_FOREMAN,
+                created_by=command_center.COMMAND_CENTER_REPAIR_CREATED_BY,
+                workspace_kind="dir",
+                tenant=str(board_meta.get("project") or board_meta.get("tenant") or normed),
+                priority=command_center.COMMAND_CENTER_REPAIR_PRIORITY,
+                idempotency_key=create_key,
+                max_runtime_seconds=1800,
+            )
+            created = True
+            task = kanban_db.get_task(conn, task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+    worker = _discord_worker_meta(normed)
+    if worker:
+        try:
+            from hermes_cli import discord_worker_boards as dwb
+
+            dwb.mark_dispatch_dirty(board=normed, reason="command-center-repair")
+        except Exception:
+            pass
+    return {
+        "created": created,
+        "task": _task_dict(task) if task else None,
+        "worker_url": _worker_ticket_url(task_id, board=normed, board_public_url=worker.get("public_url") if worker else None),
+        "board": kanban_db.read_board_metadata(normed),
+        "idempotency_key": idempotency_key,
+    }
 
 
 @router.delete("/boards/{slug}")

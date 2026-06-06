@@ -15,7 +15,7 @@ import {
   PauseCircle,
   RotateCcw,
   PlayCircle,
-  Send,
+  Wrench,
   X,
 } from "lucide-react";
 import { Badge } from "@nous-research/ui/ui/components/badge";
@@ -32,7 +32,7 @@ import type {
 import { cn } from "@/lib/utils";
 
 type ViewKey = "overview" | "inbox" | "work" | "archive" | "runs" | "recommendations" | "sources";
-type ActionKind = "approve" | "reject" | "pause" | "resume" | "undo" | "archive";
+type ActionKind = "approve" | "reject" | "pause" | "resume" | "undo" | "archive" | "repair";
 type ActiveAction = { ids: string[]; kind: ActionKind };
 type VisualStatus = "proposed" | "queued" | "running" | "review" | "blocked" | "paused" | "shipped" | "archived" | "unknown";
 
@@ -44,6 +44,7 @@ const ACTION_PROGRESS_LABELS: Record<ActionKind, string> = {
   resume: "Resuming",
   undo: "Requesting revert",
   archive: "Archiving",
+  repair: "Repairing",
 };
 
 function waitForActionSettle(durationMs = ACTION_SETTLE_MS): Promise<void> {
@@ -179,11 +180,13 @@ function availableActionKinds(item: CommandCenterWorkItem): ActionKind[] {
   const canResume = Boolean((item.status === "paused" || item.execution?.paused || item.execution?.resumable) && (proposalId || (item.execution?.resume_action && item.execution.board)) && item.status !== "archived");
   const canUndo = Boolean(proposalId && item.status === "shipped");
   const canArchive = Boolean((item.execution?.archiveable && item.execution.board && item.execution.board !== "default" && item.id.startsWith("kanban-board:")) || proposalCanArchive);
+  const canRepair = Boolean(item.status === "blocked" && item.execution?.board && item.execution?.repair_action && item.execution?.repairable !== false && !item.execution?.repair_task_id);
   const actions: ActionKind[] = [];
   if (canApproveReject) actions.push("approve", "reject");
   if (canResume) actions.push("resume");
   if (canPause) actions.push("pause");
   if (canUndo) actions.push("undo");
+  if (canRepair) actions.push("repair");
   if (canArchive) actions.push("archive");
   return actions;
 }
@@ -311,6 +314,7 @@ function ActionButton({
     pause: { label: "Pause", icon: PauseCircle, className: "border-orange-200/70 bg-orange-400 text-orange-950 hover:bg-orange-300 focus-visible:ring-orange-100/75", strong: true },
     resume: { label: "Resume", icon: PlayCircle, className: "border-emerald-200/70 bg-emerald-400 text-emerald-950 hover:bg-emerald-300 focus-visible:ring-emerald-100/75", strong: true },
     undo: { label: "Revert", icon: RotateCcw, className: "border-sky-200/65 bg-sky-400 text-sky-950 hover:bg-sky-300 focus-visible:ring-sky-100/75" },
+    repair: { label: "Repair", icon: Wrench, className: "border-amber-200/70 bg-amber-300 text-amber-950 hover:bg-amber-200 focus-visible:ring-amber-100/75", strong: true },
     archive: { label: "Archive board", icon: Archive, className: "border-violet-200/60 bg-violet-400 text-violet-950 hover:bg-violet-300 focus-visible:ring-violet-100/75" },
   }[kind];
   const Icon = config.icon;
@@ -791,6 +795,14 @@ export default function CommandCenterPage() {
     } else if (kind === "resume") {
       if (proposalId) await api.resumeSelfImprovementProposal(proposalId);
       else if (board) await api.resumeKanbanBoard(board);
+    } else if (kind === "repair" && board) {
+      await api.repairKanbanBoard(board, {
+        task_id: item.execution?.task_id || null,
+        work_item_id: item.id,
+        title: item.title,
+        status: item.status,
+        detail: item.status_detail || item.summary || item.body_preview || null,
+      });
     } else if (proposalId && kind === "undo") {
       const reason = window.prompt("Reason for revert follow-up?", "Operator requested revert follow-up from Command Center.") || undefined;
       await api.requestSelfImprovementUndoFollowup(proposalId, reason);
@@ -900,12 +912,6 @@ export default function CommandCenterPage() {
         </section>
       )}
 
-      <Card className="border-white/10 bg-white/[0.035]">
-        <CardContent className="flex flex-col gap-3 py-4 text-xs leading-5 text-slate-500 sm:flex-row sm:items-center sm:justify-between">
-          <span>{snapshot?.summary || "Sources create work items; workers move them forward."}</span>
-          <span>Generated {formatTime(snapshot?.generated_at)} · <Send className="inline h-3 w-3" /> Worker-board work rolls up board-level execution.</span>
-        </CardContent>
-      </Card>
     </div>
   );
 }

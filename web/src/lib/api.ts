@@ -356,6 +356,15 @@ export const api = {
       `/api/plugins/kanban/boards/${encodeURIComponent(slug)}/resume`,
       { method: "POST" },
     ),
+  repairKanbanBoard: (slug: string, body: CommandCenterRepairRequest) =>
+    fetchJSON<CommandCenterRepairResponse>(
+      `/api/plugins/kanban/boards/${encodeURIComponent(slug)}/repair`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
 
   // Self-improvement proposal board
   getSelfImprovementProposals: () =>
@@ -908,11 +917,32 @@ export interface CommandCenterExecution {
   archive_action?: string | null;
   pause_action?: string | null;
   resume_action?: string | null;
+  repair_action?: string | null;
   paused?: boolean;
   resumable?: boolean;
   archiveable?: boolean;
+  repairable?: boolean;
+  repair_task_id?: string | null;
+  repair_task_status?: string | null;
+  repair_worker_url?: string | null;
   task_counts?: Record<string, number>;
   run_count?: number;
+}
+
+export interface CommandCenterRepairRequest {
+  task_id?: string | null;
+  work_item_id?: string | null;
+  title?: string | null;
+  status?: string | null;
+  detail?: string | null;
+}
+
+export interface CommandCenterRepairResponse {
+  created: boolean;
+  task?: Record<string, unknown> | null;
+  worker_url?: string | null;
+  board?: Record<string, unknown> | null;
+  idempotency_key?: string | null;
 }
 
 export interface CommandCenterWorkItem {

@@ -21,6 +21,11 @@ from hermes_cli import kanban_db
 from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
 from self_improvement import proposal_storage
 
+COMMAND_CENTER_REPAIR_CREATED_BY = "command-center-repair"
+COMMAND_CENTER_REPAIR_PRIORITY = 1_000_000
+COMMAND_CENTER_REPAIR_ASSIGNEE = "foreman"
+COMMAND_CENTER_REPAIR_ACTIVE_STATUSES = {"triage", "todo", "ready", "running", "review", "blocked", "scheduled"}
+
 _TERMINAL_TASK_STATUSES = {"done", "archived"}
 _WAITING_TASK_STATUSES = {"triage", "todo", "scheduled", "ready"}
 _RUNNING_TASK_STATUSES = {"running"}
@@ -189,6 +194,49 @@ def _worker_console_url(task_id: str, *, board: str | None) -> str | None:
     if not board or board == kanban_db.DEFAULT_BOARD:
         return None
     return f"/workers/{quote(str(board), safe='')}/tickets/{quote(task_id, safe='')}/console"
+
+
+def command_center_repair_idempotency_key(board: str, task_id: str | None = None) -> str:
+    target = str(task_id or board or kanban_db.DEFAULT_BOARD).strip() or kanban_db.DEFAULT_BOARD
+    return f"command-center-repair:{board}:{target}"
+
+
+def _repair_task_for_key(tasks: list[dict[str, Any]], idempotency_key: str) -> dict[str, Any] | None:
+    parts = idempotency_key.split(":", 2)
+    board_prefix = f"{parts[0]}:{parts[1]}:" if len(parts) == 3 and parts[2] == parts[1] else ""
+    attempt_prefix = f"{idempotency_key}:"
+    matches = [
+        task for task in tasks
+        if (
+            task.get("idempotency_key") == idempotency_key
+            or str(task.get("idempotency_key") or "").startswith(attempt_prefix)
+            or (board_prefix and str(task.get("idempotency_key") or "").startswith(board_prefix))
+        )
+        and str(task.get("status") or "").lower() in COMMAND_CENTER_REPAIR_ACTIVE_STATUSES
+    ]
+    if not matches:
+        return None
+    return sorted(matches, key=lambda item: (_epoch_or_none(item.get("created_at")) or 0, str(item.get("id") or "")), reverse=True)[0]
+
+
+def _with_repair_metadata(execution: dict[str, Any], *, status: str, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    if status != "blocked":
+        return execution
+    board = str(execution.get("board") or "").strip()
+    if not board:
+        return execution
+    task_id = str(execution.get("task_id") or "").strip() or None
+    idempotency_key = command_center_repair_idempotency_key(board, task_id)
+    repair_task = _repair_task_for_key(tasks, idempotency_key)
+    execution = dict(execution)
+    execution["repair_action"] = f"/api/plugins/kanban/boards/{quote(board, safe='')}/repair"
+    execution["repairable"] = repair_task is None
+    if repair_task:
+        repair_task_id = str(repair_task.get("id") or "")
+        execution["repair_task_id"] = repair_task_id
+        execution["repair_task_status"] = repair_task.get("status")
+        execution["repair_worker_url"] = _worker_ticket_url(repair_task_id, board=board) if repair_task_id else None
+    return execution
 
 
 def _discord_urls(ref: dict[str, Any]) -> dict[str, str]:
@@ -420,7 +468,7 @@ def _execution_from_task(
     task_status = str(task.get("status") or "").lower()
     paused = task_status in {"blocked", "scheduled"}
     started = _has_started_execution(task, runs=runs)
-    return {
+    execution = {
         "board": board,
         "board_name": board_meta.get("name") or board,
         "task_id": task_id,
@@ -436,6 +484,7 @@ def _execution_from_task(
         "workspace_kind": task.get("workspace_kind"),
         "workspace_path": task.get("workspace_path"),
     }
+    return _with_repair_metadata(execution, status=_canonical_status_from_task(task)[0], tasks=[task])
 
 
 def _execution_from_board(
@@ -456,7 +505,7 @@ def _execution_from_board(
     )
     active_statuses = {str(task.get("status") or "").lower() for task in tasks}
     resumable = paused or bool(active_statuses & {"blocked", "scheduled"})
-    return {
+    execution = {
         "board": board,
         "board_name": board_meta.get("name") or board,
         "task_id": None,
@@ -474,6 +523,7 @@ def _execution_from_board(
         "task_counts": _task_status_counts(tasks),
         "run_count": len(runs),
     }
+    return _with_repair_metadata(execution, status=_canonical_status_from_board(tasks, board_meta=board_meta, runs=runs)[0], tasks=tasks)
 
 
 def _proposal_source(card: dict[str, Any]) -> dict[str, Any]:

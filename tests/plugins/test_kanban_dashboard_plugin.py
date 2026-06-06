@@ -188,6 +188,85 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_command_center_repair_creates_idempotent_foreman_task(client):
+    board = "repair-action-board"
+    kb.write_board_metadata(board, name="Repair Action Board")
+    conn = kb.connect(board=board)
+    try:
+        blocked_task_id = kb.create_task(
+            conn,
+            title="Blocked worker ticket",
+            assignee="dev",
+            initial_status="blocked",
+        )
+    finally:
+        conn.close()
+
+    payload = {
+        "task_id": blocked_task_id,
+        "work_item_id": f"kanban-board:{board}",
+        "title": "Blocked worker ticket",
+        "status": "blocked",
+        "detail": "worker stalled",
+    }
+    first = client.post(f"/api/plugins/kanban/boards/{board}/repair", json=payload)
+    assert first.status_code == 200, first.text
+    first_body = first.json()
+    assert first_body["created"] is True
+    repair_task = first_body["task"]
+    assert repair_task["status"] == "ready"
+    assert repair_task["assignee"] == "foreman"
+    assert repair_task["created_by"] == "command-center-repair"
+    assert repair_task["priority"] == 1_000_000
+    assert repair_task["max_runtime_seconds"] == 1800
+    assert repair_task["idempotency_key"] == f"command-center-repair:{board}:{blocked_task_id}"
+    assert "Use the foreman profile/role" in repair_task["body"]
+    assert first_body["worker_url"].endswith(f"/workers/{board}/tickets/{repair_task['id']}")
+
+    board_rollup = client.post(f"/api/plugins/kanban/boards/{board}/repair", json={"title": "Board rollup"})
+    assert board_rollup.status_code == 200, board_rollup.text
+    board_rollup_body = board_rollup.json()
+    assert board_rollup_body["created"] is False
+    assert board_rollup_body["task"]["id"] == repair_task["id"]
+
+    second = client.post(f"/api/plugins/kanban/boards/{board}/repair", json=payload)
+    assert second.status_code == 200, second.text
+    second_body = second.json()
+    assert second_body["created"] is False
+    assert second_body["task"]["id"] == repair_task["id"]
+
+    conn = kb.connect(board=board)
+    try:
+        assert kb.complete_task(conn, repair_task["id"], summary="repair complete") is True
+    finally:
+        conn.close()
+
+    third = client.post(f"/api/plugins/kanban/boards/{board}/repair", json=payload)
+    assert third.status_code == 200, third.text
+    third_body = third.json()
+    assert third_body["created"] is True
+    assert third_body["task"]["id"] != repair_task["id"]
+    assert third_body["task"]["status"] == "ready"
+    assert third_body["task"]["assignee"] == "foreman"
+    assert third_body["task"]["idempotency_key"].startswith(f"command-center-repair:{board}:{blocked_task_id}:")
+
+    fourth = client.post(f"/api/plugins/kanban/boards/{board}/repair", json=payload)
+    assert fourth.status_code == 200, fourth.text
+    fourth_body = fourth.json()
+    assert fourth_body["created"] is False
+    assert fourth_body["task"]["id"] == third_body["task"]["id"]
+
+    conn = kb.connect(board=board)
+    try:
+        repair_tasks = [
+            task for task in kb.list_tasks(conn, include_archived=False)
+            if task.created_by == "command-center-repair"
+        ]
+    finally:
+        conn.close()
+    assert [task.id for task in repair_tasks] == [repair_task["id"], third_body["task"]["id"]]
+
+
 def test_self_improvement_approve_is_idempotent_and_audited(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]

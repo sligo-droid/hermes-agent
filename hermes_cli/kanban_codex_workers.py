@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from hermes_cli.discord_worker_boards import ROLE_ASSIGNEES, ROLE_DEV, ROLE_PLANNER, ROLE_REVIEWER
+from hermes_cli.discord_worker_boards import ROLE_ASSIGNEES, ROLE_DEV, ROLE_FOREMAN, ROLE_PLANNER, ROLE_REVIEWER
 
 _OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV}
 _SENSITIVE_ENV_FRAGMENTS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "ACCESS_KEY")
@@ -36,6 +36,7 @@ _WORKER_CONTAINER_ENV_KEYS = {"PYTHONPATH", "HOME"}
 _ROLE_DEFAULT_REASONING = {
     "planner": "xhigh",
     "dev": "medium",
+    "foreman": "xhigh",
     "reviewer": "xhigh",
 }
 _VALID_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh"}
@@ -159,7 +160,7 @@ def _is_auto(value: Any) -> bool:
 
 
 def _adaptive_reasoning(role: str, task: Any = None) -> str:
-    if role in {ROLE_PLANNER, ROLE_REVIEWER}:
+    if role in {ROLE_PLANNER, ROLE_REVIEWER, ROLE_FOREMAN}:
         return "xhigh"
     if role != ROLE_DEV:
         return _ROLE_DEFAULT_REASONING.get(role, "medium")
@@ -351,7 +352,7 @@ def _redacted_command(cmd: list[str], env: dict[str, str]) -> str:
 
 
 def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None) -> Optional[Any]:
-    """Spawn a Codex worker for planner/dev/reviewer tasks.
+    """Spawn a coding worker for planner/dev/reviewer/foreman tasks.
 
     Returns the host-side subprocess pid or systemd unit handle so the existing
     Kanban crash detector can observe the worker lifecycle. Durable state lives

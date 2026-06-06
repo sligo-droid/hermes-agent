@@ -22,6 +22,7 @@ from hermes_cli.discord_worker_boards import (
     MERGE_POLICY_NEVER,
     PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL,
     ROLE_DEV,
+    ROLE_FOREMAN,
     ROLE_PLANNER,
     ROLE_REVIEWER,
     VALID_MERGE_POLICIES,
@@ -85,7 +86,7 @@ def main() -> int:
     board = os.environ.get("HERMES_KANBAN_BOARD", "").strip() or None
     role = os.environ.get("HERMES_CODEX_WORKER_ROLE", "").strip().lower()
     workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip() or os.getcwd()
-    if not task_id or role not in {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER}:
+    if not task_id or role not in {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER, ROLE_FOREMAN}:
         return 2
 
     conn = kanban_db.connect(board=board)
@@ -141,16 +142,7 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
     outcome = _role_outcome_frame(role)
     schema = _schema_instructions(role)
     git = _git_summary(os.environ.get("HERMES_KANBAN_WORKSPACE", "") or os.getcwd())
-    discord_access = (
-        "Discord and board control access:\n"
-        "- Planner/dev/reviewer workers are read-only for normal Discord access. "
-        "The finalizer/operator owns board and Discord mutation.\n"
-        "- You may inspect Discord message context with "
-        "`python -m hermes_cli.discord_worker_read fetch-message --channel-id <id> --message-id <id>`.\n"
-        "- You may inspect recent thread/channel history with "
-        "`python -m hermes_cli.discord_worker_read fetch-messages --channel-id <id> --limit 25`.\n"
-        "- Do not call mutation helpers such as Discord REST writes, board updates, task status changes, or summary syncs from this role.\n\n"
-    )
+    discord_access = _discord_access_prompt(role)
     frontend_smoke = (
         "Frontend preview smoke contract:\n"
         "- If you start a frontend preview server, every smoke probe must use the exact host:port you started.\n"
@@ -301,6 +293,18 @@ def _role_outcome_frame(role: str) -> str:
             "- criteria_assessment maps each criterion to evidence or a gap.\n"
             "Stop when: Return the JSON review verdict."
         )
+    if role == ROLE_FOREMAN:
+        return (
+            "Outcome frame:\n"
+            "Goal: Repair a blocked Command Center worker-board ticket without creating code-change PR work.\n"
+            "Success means:\n"
+            "- The JSON status is completed, blocked, or checkpoint.\n"
+            "- actions, verification, and changed_tasks describe every safe Kanban board/task mutation performed.\n"
+            "- Stuck worker-board tickets are retried, unblocked, closed, reassigned, or left blocked only when safe and explained.\n"
+            "- Dispatch is marked dirty when repair actions should wake the dispatcher.\n"
+            "- Secrets and credentials stay redacted from summaries and metadata.\n"
+            "Stop when: Return the JSON repair result."
+        )
     return (
         "Outcome frame:\n"
         "Goal: Complete the assigned Kanban ticket or produce a checkpoint/blocker with evidence.\n"
@@ -323,6 +327,11 @@ def _pr_policy_prompt_note(role: str) -> str:
         return (
             "PR lifecycle policy: Do not create new dev tickets for pure PR chores such as git push, gh pr create/view/checks, updating a PR, or waiting on checks. "
             "If the implementation satisfies the goal and only PR lifecycle work remains, approve it; Hermes finalizes the PR deterministically.\n"
+        )
+    if role == ROLE_FOREMAN:
+        return (
+            "PR lifecycle policy: Do not create code-change PRs, push branches, or merge. "
+            "This repair role may safely mutate Kanban board/task state to recover stuck worker-board tickets.\n"
         )
     return (
         "PR lifecycle policy: Do not run git push, gh pr create, gh pr merge, or other remote/PR mutation commands. "
@@ -358,6 +367,15 @@ def _schema_instructions(role: str) -> str:
             "When requesting changes, each new_tasks body must be a self-contained follow-up brief that opens with Goal, Success means, and Stop when. "
             "Do not emit new_tasks for pure PR lifecycle chores: git push, gh pr create/view/checks, updating an existing PR, waiting on checks, or merging."
         )
+    if role == ROLE_FOREMAN:
+        return (
+            'Schema: {"status":"completed|blocked|checkpoint","summary":"...",'
+            '"actions":["..."],"verification":["..."],"changed_tasks":[{"id":"...","action":"...","status":"..."}],'
+            '"blocker":null} '
+            "Record every Kanban repair action in actions and changed_tasks. "
+            "Use blocked only when repair cannot safely proceed and blocker explains the next human/operator action. "
+            "Never include secrets, raw credentials, or unredacted tokens in the JSON."
+        )
     return (
         'Schema: {"status":"completed|blocked|checkpoint","summary":"...","changed_files":["..."],'
         '"tests":[{"command":"...","result":"passed|failed|not_run","output":"..."}],'
@@ -366,6 +384,27 @@ def _schema_instructions(role: str) -> str:
         '"smoke_routes":["..."],"known_warnings":["..."],"notes":"..."},"blocker":null,"pr_ready":false} '
         "Always include handoff so reviewers can audit the exact changed files, checks, preview URL/command, smoke routes, warnings, and notes. "
         "Never push to a remote branch and never create, update, or merge a PR; stop after local code and verification."
+    )
+
+
+def _discord_access_prompt(role: str) -> str:
+    if role == ROLE_FOREMAN:
+        return (
+            "Discord and board control access:\n"
+            "- Foreman repair workers are not subject to the planner/dev/reviewer read-only Discord or PR-mutation restrictions.\n"
+            "- You may inspect and safely mutate Kanban board/task state to recover blocked worker-board tickets: mark dispatch dirty, retry, unblock, close, reassign, or leave blocked with a clear explanation when safe.\n"
+            "- Use Discord worker read/control broker access only when necessary to inspect context or coordinate recovery; keep Discord writes minimal and operator-safe.\n"
+            "- Keep secrets, credentials, tokens, and private environment values redacted in all summaries, actions, and metadata.\n\n"
+        )
+    return (
+        "Discord and board control access:\n"
+        "- Planner/dev/reviewer workers are read-only for normal Discord access. "
+        "The finalizer/operator owns board and Discord mutation.\n"
+        "- You may inspect Discord message context with "
+        "`python -m hermes_cli.discord_worker_read fetch-message --channel-id <id> --message-id <id>`.\n"
+        "- You may inspect recent thread/channel history with "
+        "`python -m hermes_cli.discord_worker_read fetch-messages --channel-id <id> --limit 25`.\n"
+        "- Do not call mutation helpers such as Discord REST writes, board updates, task status changes, or summary syncs from this role.\n\n"
     )
 
 
@@ -809,7 +848,7 @@ def _worker_reasoning_effort(role: str) -> str:
     effort = str(os.environ.get("HERMES_CODEX_WORKER_REASONING") or "").strip().lower()
     if effort in {"minimal", "low", "medium", "high", "xhigh"}:
         return effort
-    if role in {ROLE_PLANNER, ROLE_REVIEWER}:
+    if role in {ROLE_PLANNER, ROLE_REVIEWER, ROLE_FOREMAN}:
         return "xhigh"
     return "medium"
 
@@ -830,6 +869,8 @@ def _attach_scheduled_runtime(result: Any, role: str) -> None:
                 name = "plan"
             elif role == ROLE_REVIEWER:
                 name = "review"
+            elif role == ROLE_FOREMAN:
+                name = "repair"
             setattr(
                 result,
                 "run_profile",
@@ -854,6 +895,8 @@ def _attach_scheduled_runtime(result: Any, role: str) -> None:
 def _role_timeout(role: str) -> float:
     if role == ROLE_DEV:
         return float(os.environ.get("HERMES_CODEX_DEV_TIMEOUT", "3600"))
+    if role == ROLE_FOREMAN:
+        return float(os.environ.get("HERMES_CODEX_FOREMAN_TIMEOUT", "1800"))
     return float(os.environ.get("HERMES_CODEX_PLANNER_REVIEWER_TIMEOUT", "1800"))
 
 
@@ -1008,6 +1051,35 @@ def _apply_role_output(
         _update_phase(board, "dev", goal_status="active")
         return
 
+    if role == ROLE_FOREMAN:
+        metadata = _foreman_metadata(payload)
+        if status == "blocked":
+            kanban_db.block_task(
+                conn,
+                task_id,
+                reason=payload.get("blocker") or summary,
+                expected_run_id=expected_run_id,
+            )
+            return
+        if status == "checkpoint":
+            kanban_db.schedule_task(
+                conn,
+                task_id,
+                reason=summary or "Foreman repair checkpoint.",
+                expected_run_id=expected_run_id,
+            )
+            return
+        completed = _complete_role_task(
+            conn,
+            task_id,
+            summary=summary or "Foreman repair completed.",
+            metadata=metadata,
+            expected_run_id=expected_run_id,
+        )
+        if not completed:
+            raise RuntimeError("foreman completed but Kanban task transition was rejected")
+        return
+
     if status == "blocked":
         blocked = kanban_db.block_task(
             conn,
@@ -1035,6 +1107,20 @@ def _apply_role_output(
     )
     if not completed:
         raise RuntimeError("worker completed but Kanban task transition was rejected")
+
+
+def _foreman_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"raw": payload}
+    actions = payload.get("actions")
+    if isinstance(actions, list):
+        metadata["actions"] = actions
+    verification = payload.get("verification")
+    if isinstance(verification, list):
+        metadata["verification"] = verification
+    changed_tasks = payload.get("changed_tasks")
+    if isinstance(changed_tasks, list):
+        metadata["changed_tasks"] = changed_tasks
+    return metadata
 
 
 def _complete_role_task(
