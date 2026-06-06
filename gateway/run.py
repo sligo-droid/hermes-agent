@@ -8376,6 +8376,34 @@ class GatewayRunner:
 
             timeout = self._restart_drain_timeout
 
+            def _cron_tick_active() -> bool:
+                try:
+                    from cron.scheduler import is_tick_running
+                    return bool(is_tick_running())
+                except Exception as _e:
+                    logger.debug("Cron tick running check failed during shutdown: %s", _e)
+                    return False
+
+            if self._restart_requested and _cron_tick_active():
+                _cron_wait_started_at = time.monotonic()
+                logger.info(
+                    "Gateway restart requested while a cron tick is active; waiting up to %.1fs for cron to finish.",
+                    timeout,
+                )
+                while _cron_tick_active() and (time.monotonic() - _cron_wait_started_at) < timeout:
+                    self._update_runtime_status("draining")
+                    await asyncio.sleep(1.0)
+                if _cron_tick_active():
+                    logger.warning(
+                        "Gateway restart proceeding after %.1fs with cron tick still active.",
+                        time.monotonic() - _cron_wait_started_at,
+                    )
+                else:
+                    logger.info(
+                        "Gateway restart cron wait completed at +%.2fs.",
+                        _phase_elapsed(),
+                    )
+
             _drain_started_at = time.monotonic()
             active_agents, timed_out = await self._drain_active_agents(timeout)
             logger.info(
