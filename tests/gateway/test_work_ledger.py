@@ -92,6 +92,41 @@ def test_ledger_strips_transient_summary_objects(tmp_path):
     assert stored["project_summary"] == {"channel_id": "channel-1"}
 
 
+def test_mark_agent_running_clears_stale_terminal_fields(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(message_id="m1")
+    event.feature_summary = {
+        "message_id": "summary-1",
+        "initial_request": "Fix the bug",
+    }
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="Operation interrupted: waiting for model response.",
+        session_id="session-1",
+        summary_status="Interrupted",
+        feature_summary=event.feature_summary,
+    )
+    ledger.mark_response_delivered(item["id"], result_message_id="stale-result")
+
+    assert ledger.mark_agent_running(item["id"], session_id="session-2") is True
+
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "agent_running"
+    assert stored["session_id"] == "session-2"
+    for key in (
+        "agent_done_at",
+        "completion_gate",
+        "final_response",
+        "result_message_id",
+        "summary_status",
+        "summary_updated_at",
+    ):
+        assert key not in stored
+
+
 def test_ledger_skips_completed_and_expires_stale_items(tmp_path):
     now = 1000.0
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json", now_fn=lambda: now)
@@ -521,6 +556,54 @@ async def test_startup_defers_interrupted_discord_work_for_resume_pending_sessio
     adapter._send_with_retry.assert_not_awaited()
     adapter.update_feature_summary.assert_not_awaited()
     assert runner.work_ledger.get(item["id"])["status"] == "agent_done"
+
+
+@pytest.mark.asyncio
+async def test_post_delivery_summary_recovers_existing_discord_work_item(tmp_path):
+    runner = object.__new__(GatewayRunner)
+    runner.work_ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    runner.adapters = {}
+    runner._update_discord_summaries = AsyncMock(return_value=True)
+    captured = {}
+
+    def register_callback(session_key, callback, *, generation=None):
+        captured["session_key"] = session_key
+        captured["callback"] = callback
+        captured["generation"] = generation
+
+    adapter = SimpleNamespace(register_post_delivery_callback=register_callback)
+    runner.adapters = {Platform.DISCORD: adapter}
+
+    event = _discord_event(message_id="m1")
+    event.feature_summary = {"message_id": "summary-1", "initial_request": "do the work"}
+    session_key = build_session_key(event.source)
+    item = runner.work_ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+
+    # Recreate the auto-resume shape from production: the synthesized event has
+    # the original source/message id but may not carry the prior ledger handle.
+    resume_event = _discord_event(message_id="m1")
+
+    runner._register_discord_summary_post_delivery(
+        event=resume_event,
+        source=resume_event.source,
+        session_key=session_key,
+        run_generation=7,
+        session_id="session-2",
+        final_response="final answer",
+        agent_result={"api_calls": 1},
+    )
+
+    assert captured["session_key"] == session_key
+    assert captured["generation"] == 7
+    assert resume_event.work_item_id == item["id"]
+    assert resume_event.feature_summary == event.feature_summary
+
+    assert await captured["callback"]() is True
+
+    runner._update_discord_summaries.assert_awaited_once()
+    assert runner._update_discord_summaries.await_args.kwargs["feature_summary"] == event.feature_summary
+    assert runner.work_ledger.get(item["id"])["status"] == "completed"
 
 
 @pytest.mark.asyncio
