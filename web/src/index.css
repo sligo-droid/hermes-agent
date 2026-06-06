@@ -235,6 +235,20 @@ code { font-size: 0.875rem; }
   border-color: rgb(125 211 252 / 0.54);
   box-shadow: 0 0 34px rgb(14 165 233 / 0.11), inset 0 1px 0 rgb(255 255 255 / 0.07);
 }
+.command-center-card-mega-blocked {
+  border-color: rgb(244 63 94 / 0.6) !important;
+  background: linear-gradient(135deg, rgb(244 63 94 / 0.18), rgb(8 9 10 / 0.9) 44%, rgb(251 191 36 / 0.1));
+  box-shadow: 0 0 34px rgb(244 63 94 / 0.18), inset 0 1px 0 rgb(255 255 255 / 0.08);
+}
+.command-center-card-mega-blocked:hover {
+  border-color: rgb(251 113 133 / 0.78) !important;
+  box-shadow: 0 0 42px rgb(244 63 94 / 0.23), inset 0 1px 0 rgb(255 255 255 / 0.1);
+}
+.command-center-mega-blocked-banner {
+  background: rgb(127 29 29 / 0.32);
+  border-color: rgb(251 113 133 / 0.48);
+  color: rgb(255 228 230);
+}
 .command-center-status-rail {
   bottom: 1rem;
   left: 0.55rem;
@@ -317,6 +331,13 @@ code { font-size: 0.875rem; }
   border-color: rgb(248 113 113 / 0.28);
   color: rgb(254 202 202);
 }
+.command-center-status-mega-blocked.command-center-status-indicator {
+  --command-center-status-glow: rgb(244 63 94 / 0.3);
+  background: rgb(244 63 94 / 0.18);
+  border-color: rgb(251 113 133 / 0.54);
+  color: rgb(255 228 230);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.14), 0 0 22px var(--command-center-status-glow);
+}
 .command-center-status-paused.command-center-status-indicator {
   --command-center-status-glow: rgb(251 146 60 / 0.16);
   background: rgb(251 146 60 / 0.08);
@@ -341,6 +362,7 @@ code { font-size: 0.875rem; }
 .command-center-status-running.command-center-status-rail { background: linear-gradient(180deg, rgb(103 232 249), rgb(129 140 248)); box-shadow: 0 0 18px rgb(34 211 238 / 0.28); }
 .command-center-status-review.command-center-status-rail { background: rgb(167 139 250 / 0.72); }
 .command-center-status-blocked.command-center-status-rail { background: rgb(248 113 113 / 0.78); }
+.command-center-status-mega-blocked.command-center-status-rail { background: linear-gradient(180deg, rgb(251 113 133), rgb(251 191 36)); box-shadow: 0 0 20px rgb(244 63 94 / 0.42); width: 5px; }
 .command-center-status-paused.command-center-status-rail { background: rgb(251 146 60 / 0.72); }
 .command-center-status-shipped.command-center-status-rail { background: rgb(52 211 153 / 0.72); }
 .command-center-status-archived.command-center-status-rail,
@@ -358,6 +380,9 @@ code { font-size: 0.875rem; }
   }
   .command-center-live-meter span:nth-child(3) {
     animation-delay: 0.26s;
+  }
+  .command-center-card-mega-blocked {
+    animation: command-center-mega-blocked-pulse 2.4s ease-in-out infinite;
   }
 }
 
@@ -379,6 +404,12 @@ code { font-size: 0.875rem; }
 @keyframes command-center-meter {
   100% {
     transform: scaleY(0.62);
+  }
+}
+
+@keyframes command-center-mega-blocked-pulse {
+  50% {
+    box-shadow: 0 0 48px rgb(244 63 94 / 0.3), inset 0 1px 0 rgb(255 255 255 / 0.12);
   }
 }
 
@@ -447,6 +478,16 @@ code { font-size: 0.875rem; }
   border-color: rgb(14 116 144 / 0.48) !important;
   box-shadow: 0 14px 36px rgb(15 23 42 / 0.1), inset 0 0 0 1px rgb(14 116 144 / 0.14);
 }
+.sligo-light .command-center-card-mega-blocked {
+  background: linear-gradient(135deg, rgb(255 228 230 / 0.86), rgb(255 255 255 / 0.96) 48%, rgb(254 243 199 / 0.8)) !important;
+  border-color: rgb(190 18 60 / 0.48) !important;
+  box-shadow: 0 14px 36px rgb(159 18 57 / 0.15), inset 0 0 0 1px rgb(190 18 60 / 0.12);
+}
+.sligo-light .command-center-mega-blocked-banner {
+  background: rgb(255 228 230 / 0.92);
+  border-color: rgb(190 18 60 / 0.34);
+  color: rgb(136 19 55) !important;
+}
 .sligo-light .command-center-status-proposed.command-center-status-indicator {
   background: rgb(224 242 254 / 0.88);
   border-color: rgb(14 116 144 / 0.26);
@@ -471,6 +512,11 @@ code { font-size: 0.875rem; }
   background: rgb(254 242 242 / 0.96);
   border-color: rgb(185 28 28 / 0.26);
   color: rgb(153 27 27) !important;
+}
+.sligo-light .command-center-status-mega-blocked.command-center-status-indicator {
+  background: rgb(255 228 230 / 0.98);
+  border-color: rgb(190 18 60 / 0.38);
+  color: rgb(136 19 55) !important;
 }
 .sligo-light .command-center-status-paused.command-center-status-indicator {
   background: rgb(255 247 237 / 0.96);

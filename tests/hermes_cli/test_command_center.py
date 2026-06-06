@@ -563,6 +563,7 @@ def test_snapshot_blocked_board_repair_metadata_suppresses_existing_ticket(tmp_p
     snapshot = command_center.build_command_center_snapshot()
     item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
     assert item["execution"]["repairable"] is False
+    assert item["status"] == "blocked"
     assert item["execution"]["repair_task_id"] == repair_task_id
     assert item["execution"]["repair_task_status"] == "ready"
     assert item["execution"]["repair_worker_url"].endswith(f"/workers/{board}/tickets/{repair_task_id}")
@@ -578,6 +579,42 @@ def test_snapshot_blocked_board_repair_metadata_suppresses_existing_ticket(tmp_p
     item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
     assert item["execution"]["repairable"] is True
     assert "repair_task_id" not in item["execution"]
+
+
+def test_snapshot_blocked_board_with_blocked_repair_is_mega_blocked(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "mega-blocked-repair-board"
+    kanban_db.write_board_metadata(board, name="Mega Blocked Repair Board")
+    conn = kanban_db.connect(board=board)
+    try:
+        blocked_task_id = kanban_db.create_task(
+            conn,
+            title="Blocked task",
+            assignee="dev",
+            initial_status="blocked",
+        )
+        repair_task_id = kanban_db.create_task(
+            conn,
+            title="Repair blocked board",
+            assignee="foreman",
+            created_by="command-center-repair",
+            priority=1_000_000,
+            idempotency_key=command_center.command_center_repair_idempotency_key(board, blocked_task_id),
+        )
+        kanban_db.set_status_direct(conn, repair_task_id, "blocked")
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+
+    assert item["status"] == "mega_blocked"
+    assert item["status_detail"] == "repair_blocked"
+    assert item["execution"]["repairable"] is False
+    assert item["execution"]["repair_task_id"] == repair_task_id
+    assert item["execution"]["repair_task_status"] == "blocked"
+    assert item["execution"]["repair_blocked"] is True
+    assert item["execution"]["repair_status_detail"] == "Active Command Center repair task is blocked."
 
 
 def test_snapshot_skips_internal_default_board_foreman_tasks(tmp_path, monkeypatch):
