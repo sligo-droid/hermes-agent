@@ -200,12 +200,13 @@ function runIsActive(run: CommandCenterRun): boolean {
 
 function availableActionKinds(item: CommandCenterWorkItem): ActionKind[] {
   const proposalId = item.decision?.proposal_id;
+  const board = item.execution?.board;
   const proposalCanArchive = Boolean(proposalId && ["queued", "running", "review", "blocked", "accepted", "paused"].includes(item.status));
   const canApproveReject = Boolean(proposalId && item.status === "proposed");
-  const canPause = Boolean(["queued", "running", "review", "accepted"].includes(item.status) && (proposalId || (item.execution?.pause_action && item.execution.board)) && !item.execution?.paused);
-  const canResume = Boolean((item.status === "paused" || item.execution?.paused || item.execution?.resumable) && (proposalId || (item.execution?.resume_action && item.execution.board)) && item.status !== "archived");
-  const canUndo = Boolean(proposalId && item.decision?.undo_followup_action && isCompletedItem(item));
-  const canArchive = Boolean((item.execution?.archiveable && item.execution.board && item.execution.board !== "default" && item.id.startsWith("kanban-board:")) || proposalCanArchive);
+  const canPause = Boolean(["queued", "running", "review", "accepted"].includes(item.status) && (proposalId || (item.execution?.pause_action && board)) && !item.execution?.paused);
+  const canResume = Boolean((item.status === "paused" || item.execution?.paused || item.execution?.resumable) && (proposalId || (item.execution?.resume_action && board)) && item.status !== "archived");
+  const canUndo = Boolean(isCompletedItem(item) && ((proposalId && item.decision?.undo_followup_action) || (board && item.execution?.undo_followup_action)));
+  const canArchive = Boolean((item.execution?.archiveable && board && board !== "default" && item.id.startsWith("kanban-board:")) || proposalCanArchive);
   const canRepair = Boolean(item.status === "blocked" && item.execution?.board && item.execution?.repair_action && item.execution?.repairable !== false && !item.execution?.repair_task_id);
   const actions: ActionKind[] = [];
   if (canApproveReject) actions.push("approve", "archive");
@@ -972,9 +973,10 @@ export default function CommandCenterPage() {
         status: item.status,
         detail: item.status_detail || item.summary || item.body_preview || null,
       });
-    } else if (proposalId && kind === "undo") {
+    } else if (kind === "undo") {
       const reason = window.prompt("Reason for revert follow-up?", "Operator requested revert follow-up from Command Center.") || undefined;
-      await api.requestSelfImprovementUndoFollowup(proposalId, reason);
+      if (proposalId && item.decision?.undo_followup_action) await api.requestSelfImprovementUndoFollowup(proposalId, reason);
+      else if (board && item.execution?.undo_followup_action) await api.requestKanbanBoardUndoFollowup(board, reason);
     }
   }, []);
   const handleAction = useCallback(async (kind: ActionKind, item: CommandCenterWorkItem) => {

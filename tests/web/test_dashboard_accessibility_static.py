@@ -137,10 +137,13 @@ def test_command_center_completed_lane_preserves_revert_and_archive_buttons():
     action_source = source.split("function availableActionKinds", 1)[1].split("function actionSet", 1)[0]
     completed_branch = source.split('activeView === "completed"', 1)[1].split('activeView === "archive"', 1)[0]
 
-    assert 'const canUndo = Boolean(proposalId && item.decision?.undo_followup_action && isCompletedItem(item));' in action_source
+    assert 'const canUndo = Boolean(isCompletedItem(item) && ((proposalId && item.decision?.undo_followup_action) || (board && item.execution?.undo_followup_action)));' in action_source
     assert 'actions.push("undo")' in action_source
     assert 'actions.push("archive")' in action_source
     assert action_source.index('actions.push("undo")') < action_source.index('actions.push("archive")')
+    assert 'await api.requestKanbanBoardUndoFollowup(board, reason);' in source
+    assert 'if (proposalId && item.decision?.undo_followup_action) await api.requestSelfImprovementUndoFollowup(proposalId, reason);' in source
+    assert 'else if (board && item.execution?.undo_followup_action) await api.requestKanbanBoardUndoFollowup(board, reason);' in source
     assert 'showActions={false}' not in completed_branch
     assert 'showActions={false}' in source.split('activeView === "archive"', 1)[1]
 

@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from hermes_cli import command_center, kanban_db
+from hermes_cli import command_center, command_center_verification, kanban_db
 from self_improvement import proposal_storage
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "self_improvement"
@@ -803,6 +803,31 @@ def test_self_improvement_board_rollup_preserves_proposal_controls(tmp_path, mon
     assert item["decision"]["pause_action"].endswith(f"/{card['proposal_id']}/pause")
     assert item["decision"]["resume_action"].endswith(f"/{card['proposal_id']}/resume")
     assert item["decision"]["undo_followup_action"].endswith(f"/{card['proposal_id']}/undo-followup")
+
+
+def test_completed_board_rollup_exposes_revert_and_archive_actions(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "discord-completed-revert-actions"
+    kanban_db.write_board_metadata(board, name="Completed Revert Board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Completed worker", tenant="hermes", board=board)
+        with conn:
+            conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200, task_id))
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot(project="hermes")
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+    summary = command_center_verification.summarize_completed_actions(snapshot, project="hermes")
+
+    assert item["status"] == "shipped"
+    assert item["decision"]["needed"] is False
+    assert item["execution"]["undo_followup_action"].endswith(f"/boards/{board}/undo-followup")
+    assert item["execution"]["archiveable"] is True
+    assert summary["completed_count"] == 1
+    assert summary["revertable_completed_ids"] == [f"kanban-board:{board}"]
+    assert summary["missing_revert_count"] == 0
 
 
 def test_self_improvement_board_rollup_preserves_proposal_naming_and_context(tmp_path, monkeypatch):
