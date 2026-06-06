@@ -748,17 +748,39 @@ def _discord_worker_meta(board: str | None) -> dict[str, Any]:
     return worker
 
 
+def _runtime_checkout_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _is_runtime_checkout_path(path: str) -> bool:
+    try:
+        candidate = Path(path).expanduser().resolve(strict=False)
+        root = _runtime_checkout_root().resolve(strict=False)
+    except Exception:
+        return False
+    return candidate == root or root in candidate.parents
+
+
 def _dashboard_worker_workspace(board_meta: dict[str, Any] | None, *candidates: Any) -> dict[str, str | None]:
-    """Return safe workspace args for dashboard-created worker tasks."""
+    """Return safe workspace args for dashboard-created worker tasks.
+
+    Worker jobs must not run in the checkout that happens to be serving the
+    dashboard/gateway. For Hermes that runtime checkout is usually the canonical
+    ``main`` tree; foreground/dashboard/cron repair work still needs the same
+    per-board worktree isolation as Discord-originated workers.
+    """
     meta = board_meta if isinstance(board_meta, dict) else {}
     worker = meta.get(DISCORD_WORKER_META_KEY)
     paths: list[Any] = []
     if isinstance(worker, dict):
-        paths.extend([worker.get("worktree_path"), worker.get("project_path")])
-    paths.extend([meta.get("default_workdir"), meta.get("project_path"), *candidates])
+        paths.append(worker.get("worktree_path"))
+    paths.extend(candidates)
     for value in paths:
         path = str(value or "").strip()
-        if path and Path(path).expanduser().is_absolute():
+        if not path:
+            continue
+        expanded = Path(path).expanduser()
+        if expanded.is_absolute() and not _is_runtime_checkout_path(path):
             return {"workspace_kind": "dir", "workspace_path": path}
     return {"workspace_kind": "scratch", "workspace_path": None}
 
@@ -2773,7 +2795,10 @@ def repair_board(slug: str, payload: BoardRepairBody | None = None):
             task_id = task.id
         else:
             create_key = _repair_attempt_idempotency_key(conn, idempotency_key)
-            workspace = _dashboard_worker_workspace(board_meta)
+            workspace = _dashboard_worker_workspace(
+                board_meta,
+                source_task.workspace_path if source_task and source_task.workspace_kind == "dir" else None,
+            )
             task_id = kanban_db.create_task(
                 conn,
                 title=f"Repair blocked board: {payload.title or board_meta.get('name') or normed}",

@@ -291,6 +291,35 @@ def test_command_center_repair_uses_discord_worker_worktree(client):
     assert task["workspace_path"] == worker_path
 
 
+def test_command_center_repair_inherits_source_task_workspace(client):
+    board = "repair-source-workspace"
+    workspace_path = "/tmp/hermes-test-source-worktree"
+    kb.write_board_metadata(board, name="Repair Source Workspace")
+    conn = kb.connect(board=board)
+    try:
+        blocked_task_id = kb.create_task(
+            conn,
+            title="Blocked worker ticket",
+            assignee="dev",
+            workspace_kind="dir",
+            workspace_path=workspace_path,
+            initial_status="blocked",
+        )
+    finally:
+        conn.close()
+
+    response = client.post(
+        f"/api/plugins/kanban/boards/{board}/repair",
+        json={"task_id": blocked_task_id, "title": "Blocked worker ticket"},
+    )
+
+    assert response.status_code == 200, response.text
+    task = response.json()["task"]
+    assert task["created_by"] == "command-center-repair"
+    assert task["workspace_kind"] == "dir"
+    assert task["workspace_path"] == workspace_path
+
+
 def test_self_improvement_approve_is_idempotent_and_audited(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
@@ -709,11 +738,10 @@ def test_self_improvement_approve_falls_back_without_discord_channel(client, mon
         conn.close()
 
 
-def test_self_improvement_approve_uses_board_default_workdir_when_available(client, monkeypatch):
+def test_self_improvement_approve_ignores_board_default_workdir_for_worker_jobs(client, monkeypatch):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
-    workspace_path = "/tmp/hermes-test-board-default"
-    kb.write_board_metadata("default", default_workdir=workspace_path)
+    kb.write_board_metadata("default", default_workdir=str(Path(__file__).resolve().parents[2]))
 
     monkeypatch.setattr(discord_publish, "configured_project_channel_id", lambda project: "")
     monkeypatch.setattr(
@@ -729,8 +757,8 @@ def test_self_improvement_approve_uses_board_default_workdir_when_available(clie
     try:
         task = kb.get_task(conn, response.json()["task"]["id"])
         assert task is not None
-        assert task.workspace_kind == "dir"
-        assert task.workspace_path == workspace_path
+        assert task.workspace_kind == "scratch"
+        assert task.workspace_path is None
     finally:
         conn.close()
 
