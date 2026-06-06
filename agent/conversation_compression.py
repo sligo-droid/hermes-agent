@@ -382,6 +382,17 @@ def _compression_churn_details(
     current = lineage[0]
     ancestors = lineage[1:]
     lineage_token_baseline = int(original_tokens or compressed_tokens or _lineage_row_input_tokens(current) or 0)
+    current_no_progress = bool(
+        current.get("parent_session_id")
+        and not _lineage_row_has_durable_progress(current)
+        and (
+            _lineage_row_message_count(current) == 0
+            or _lineage_row_similar_to_current(
+                current,
+                current_tokens=lineage_token_baseline,
+            )
+        )
+    )
     no_progress_lineage = [
         row for row in lineage
         if row.get("parent_session_id")
@@ -412,13 +423,13 @@ def _compression_churn_details(
     )
 
     reasons: list[str] = []
-    if len(recent_compression_parents) >= _CHURN_RECENT_COMPRESSION_LIMIT:
+    if current_no_progress and len(recent_compression_parents) >= _CHURN_RECENT_COMPRESSION_LIMIT:
         reasons.append("recent_compression_lineage")
-    if current_is_empty_child and similar_tokens:
+    if current_no_progress and current_is_empty_child and similar_tokens:
         reasons.append("empty_child_similar_tokens")
-    if len(zero_message_compression_children) >= _CHURN_ZERO_MESSAGE_LIMIT:
+    if current_no_progress and len(zero_message_compression_children) >= _CHURN_ZERO_MESSAGE_LIMIT:
         reasons.append("repeated_zero_message_children")
-    if large_zero_message_children:
+    if current_no_progress and large_zero_message_children:
         reasons.append("large_zero_message_child")
     if not reasons:
         return None

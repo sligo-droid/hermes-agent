@@ -1141,11 +1141,11 @@ class SessionDB:
                     "input_tokens": row[6],
                     "api_call_count": row[7],
                 }
-                rows.append(item)
                 started_at = float(item.get("started_at") or 0.0)
                 parent_id = item.get("parent_session_id")
                 if started_at and started_at < cutoff:
                     break
+                rows.append(item)
                 if not parent_id:
                     break
                 current = str(parent_id)
