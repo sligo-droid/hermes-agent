@@ -36,7 +36,7 @@ type PaginatedViewKey = "overview" | "inbox" | "work" | "archive";
 type ActionKind = "approve" | "reject" | "pause" | "replay" | "repair" | "undo" | "archive";
 type ActiveAction = { ids: string[]; kind: ActionKind };
 type InboxPageItem = { type: "work"; item: CommandCenterWorkItem } | { type: "source"; source: CommandCenterSource };
-type VisualStatus = "proposed" | "queued" | "running" | "review" | "blocked" | "paused" | "shipped" | "archived" | "unknown";
+type VisualStatus = "proposed" | "queued" | "running" | "review" | "blocked" | "mega_blocked" | "paused" | "shipped" | "archived" | "unknown";
 type CommandCenterPagination = { project: string; pages: Record<PaginatedViewKey, number> };
 
 const ACTION_SETTLE_MS = 600;
@@ -106,6 +106,7 @@ function visualStatusKey(status?: string | null, active = false): VisualStatus {
   if (["queued", "accepted"].includes(normalized)) return "queued";
   if (normalized === "running") return "running";
   if (normalized === "review") return "review";
+  if (normalized === "mega_blocked") return "mega_blocked";
   if (["blocked", "missing", "error"].includes(normalized)) return "blocked";
   if (normalized === "paused") return "paused";
   if (["shipped", "done"].includes(normalized)) return "shipped";
@@ -119,6 +120,7 @@ const STATUS_VISUALS = {
   running: { label: "Running", icon: Activity, className: "command-center-status-running" },
   review: { label: "Review", icon: CircleDashed, className: "command-center-status-review" },
   blocked: { label: "Blocked", icon: AlertTriangle, className: "command-center-status-blocked" },
+  mega_blocked: { label: "MEGA BLOCKED", icon: AlertTriangle, className: "command-center-status-mega-blocked" },
   paused: { label: "Paused", icon: PauseCircle, className: "command-center-status-paused" },
   shipped: { label: "Shipped", icon: CheckCircle2, className: "command-center-status-shipped" },
   archived: { label: "Archived", icon: Archive, className: "command-center-status-archived" },
@@ -433,6 +435,7 @@ function WorkItemCard({
   const running = isRunningWorkItem(item);
   const runningDetail = running ? runningDescriptor(item) : null;
   const visualStatus = visualStatusKey(item.status, running);
+  const repairBlocked = item.status === "mega_blocked" || Boolean(item.execution?.repair_blocked);
   const disabledTitle = (kind: ActionKind) => {
     if (!selectionActive) return undefined;
     if (!selected) return "Clear selection before acting on this ticket";
@@ -454,6 +457,7 @@ function WorkItemCard({
         selected && "command-center-card-selected border-cyan-100/45 bg-cyan-100/[0.055]",
         workerUrl ? "cursor-pointer border-white/10 hover:border-cyan-100/35 hover:bg-cyan-100/[0.045] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/35" : "border-white/10 hover:border-white/20 hover:bg-white/[0.03]",
         running && "command-center-card-running",
+        repairBlocked && "command-center-card-mega-blocked",
       )}
       onClick={workerUrl ? openWorker : undefined}
       onKeyDown={workerUrl ? (event) => {
@@ -496,6 +500,16 @@ function WorkItemCard({
       <div className="mt-3 block w-full text-left">
         <p className="text-sm leading-6 text-slate-300">{item.summary || item.body_preview || "No summary yet."}</p>
       </div>
+      {repairBlocked ? (
+        <div className="command-center-mega-blocked-banner mt-3 rounded-xl border px-3 py-2 text-left" role="status">
+          <span className="text-xs font-black uppercase tracking-[0.18em]">Repair blocked</span>
+          <p className="mt-1 text-xs leading-5">
+            Worker board is blocked and its Command Center repair task is also blocked
+            {item.execution?.repair_task_id ? ` (${item.execution.repair_task_id})` : ""}.
+            {item.execution?.repair_status_detail ? ` ${item.execution.repair_status_detail}` : ""}
+          </p>
+        </div>
+      ) : null}
       <div aria-busy={rowBusy} className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3">
         {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && (
           <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/[0.07] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" href={item.execution.task_url} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank">
