@@ -65,6 +65,32 @@ def test_collects_systemd_child_scope_metadata(tmp_path):
     assert child.label == "lsp: LSP server pyright"
 
 
+def test_systemd_child_scope_counts_descendant_rss(tmp_path):
+    proc = tmp_path / "proc"
+    _write_proc(proc, 100, ppid=1, rss_kb=2048, name="python", cmdline="gateway")
+    _write_proc(proc, 200, ppid=1, rss_kb=8192, name="worker", cmdline="worker")
+    _write_proc(proc, 201, ppid=200, rss_kb=4096, name="helper", cmdline="helper --secret:value")
+
+    def runner(args, *, timeout=2.0):
+        if args[0] == "list-units":
+            return SimpleNamespace(
+                returncode=0,
+                stdout="hermes-gateway-child-terminal-session-worker-123.scope loaded active running x\n",
+                stderr="",
+            )
+        assert args[:2] == ["show", "hermes-gateway-child-terminal-session-worker-123.scope"]
+        return SimpleNamespace(
+            returncode=0,
+            stdout="MainPID=200\nDescription=Hermes gateway child terminal: coding worker\n",
+            stderr="",
+        )
+
+    telemetry = mt.collect_gateway_memory_telemetry([100], proc_root=proc, systemctl_runner=runner)
+
+    assert telemetry.child_rss_kb == 12288
+    assert telemetry.top_children[0].rss_kb == 12288
+
+
 def test_tolerates_missing_systemd_and_exited_child(tmp_path):
     proc = tmp_path / "proc"
     _write_proc(proc, 100, ppid=1, rss_kb=2048, name="python", cmdline="gateway")

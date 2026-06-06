@@ -12,6 +12,7 @@ import pytest
 
 import hermes_cli.doctor as doctor
 import hermes_cli.gateway as gateway_cli
+from gateway import memory_telemetry as mt
 from hermes_cli import doctor as doctor_mod
 from hermes_cli.doctor import _has_provider_env_config
 
@@ -49,6 +50,45 @@ class TestProviderEnvDetection:
     def test_returns_false_when_no_provider_settings(self):
         content = "TERMINAL_ENV=local\n"
         assert not _has_provider_env_config(content)
+
+
+def test_doctor_gateway_memory_telemetry_reports_children(monkeypatch, capsys):
+    monkeypatch.setattr(
+        gateway_cli,
+        "get_gateway_runtime_snapshot",
+        lambda: gateway_cli.GatewayRuntimeSnapshot(
+            manager="manual process",
+            gateway_pids=(100,),
+        ),
+    )
+    monkeypatch.setattr(
+        mt,
+        "collect_gateway_memory_telemetry",
+        lambda pids: mt.GatewayMemoryTelemetry(
+            gateway_pids=tuple(pids),
+            gateway_rss_kb=2048,
+            child_rss_kb=4096,
+            top_children=(
+                mt.ChildMemory(
+                    pid=200,
+                    rss_kb=4096,
+                    kind="lsp",
+                    label="server --token=[redacted]",
+                    unit="hermes-gateway-child-lsp-session-server.scope",
+                ),
+            ),
+            source="systemd+/proc",
+        ),
+    )
+
+    doctor._check_gateway_memory_telemetry()
+
+    output = capsys.readouterr().out
+    assert "Gateway memory telemetry" in output
+    assert "Gateway RSS: 2.0 MiB" in output
+    assert "Isolated child/helper RSS: 4.0 MiB" in output
+    assert "PID 200 lsp unit=hermes-gateway-child-lsp-session-server.scope" in output
+    assert "token=[redacted]" in output
 
 
 class TestDoctorEnvFileEncoding:

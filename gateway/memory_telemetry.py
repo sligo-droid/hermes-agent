@@ -129,6 +129,16 @@ def _descendant_pids(processes: Sequence[ProcessMemory], roots: set[int]) -> set
     return found
 
 
+def _tree_rss_kb(processes_by_pid: dict[int, ProcessMemory], root_pid: int) -> int:
+    roots = {root_pid}
+    descendants = _descendant_pids(tuple(processes_by_pid.values()), roots)
+    return sum(
+        proc.rss_kb
+        for pid in roots | descendants
+        if (proc := processes_by_pid.get(pid)) is not None
+    )
+
+
 def sanitize_process_label(label: str, *, max_len: int = 96) -> str:
     cleaned = _SECRET_RE.sub(r"\1\2[redacted]", " ".join(str(label or "").split()))
     if len(cleaned) > max_len:
@@ -231,7 +241,7 @@ def collect_gateway_memory_telemetry(
         label = description.removeprefix("Hermes gateway child ").strip(": ") or _label_for_process(proc)
         children[("systemd", pid)] = ChildMemory(
             pid=pid,
-            rss_kb=proc.rss_kb,
+            rss_kb=_tree_rss_kb(by_pid, pid),
             kind=_kind_from_unit(unit),
             label=sanitize_process_label(label),
             unit=unit,
