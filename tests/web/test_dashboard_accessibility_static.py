@@ -52,19 +52,30 @@ def test_command_center_worker_rows_and_ticket_links_open_new_tabs():
     assert 'href={item.execution.task_url} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank"' in card_source
 
 
-def test_command_center_running_rows_have_live_indicator():
+def test_command_center_rows_use_visual_status_indicators_without_visible_status_labels():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
     styles = (ROOT / "web/src/index.css").read_text(encoding="utf-8")
     card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
 
+    assert "function StatusPill" not in source
+    assert "function RunningIndicator" not in source
+    assert "function StatusGlyph" in source
+    assert "function StatusRail" in source
     assert "function runningDescriptor" in source
-    assert "function RunningIndicator" in source
     assert "const running = isRunningWorkItem(item);" in card_source
     assert "command-center-card-running" in card_source
-    assert "Running work item:" in source
-    assert "command-center-running-chip" in source
-    assert "command-center-live-scan" in styles
+    assert "<StatusRail status={visualStatus} />" in card_source
+    assert "command-center-status-rail" in source
+    assert "{running && <RunningMeter />}" in card_source
+    assert "command-center-live-meter" in source
+    assert "<StatusPill" not in source
+    assert "<span>Running</span>" not in source
+    assert "{value || \"unknown\"}" not in source
+    assert "aria-label={`Status:" in source
+    assert "command-center-status-breathe" in styles
+    assert "command-center-running-chip" not in styles
     assert ".sligo-light .command-center-card-running" in styles
+    assert ".sligo-light .command-center-status-running.command-center-status-indicator" in styles
 
 
 def test_command_center_archive_action_is_one_click_without_removing_other_prompts():
