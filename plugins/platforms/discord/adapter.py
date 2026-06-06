@@ -7133,6 +7133,13 @@ class DiscordAdapter(BasePlatformAdapter):
         ids.update(ch for ch in self._discord_free_response_channels() if ch != "*")
         ids.update(ch for ch in self._discord_feature_request_channels() if ch != "*")
         ids.update(ch for ch in self._discord_no_thread_channel_ids() if ch != "*")
+        try:
+            state = self._read_discord_root_mention_recovery_state()
+            channels = state.get("channels") if isinstance(state, dict) else None
+            if isinstance(channels, dict):
+                ids.update(str(channel_id).strip() for channel_id in channels if str(channel_id).strip())
+        except Exception:
+            logger.debug("[%s] Discord root recovery state unreadable while listing channels", self.name, exc_info=True)
         ignored = self._discord_ignored_channel_ids()
         if "*" in ignored:
             return []
@@ -7251,8 +7258,14 @@ class DiscordAdapter(BasePlatformAdapter):
         if isinstance(channel, discord.DMChannel) or isinstance(channel, discord.Thread):
             return
         channel_id = str(getattr(channel, "id", "") or "")
-        if not channel_id or channel_id not in set(self._discord_relevant_root_channel_ids()):
+        if not channel_id:
             return
+        if channel_id not in set(self._discord_relevant_root_channel_ids()):
+            if not self._message_mentions_self(message):
+                return
+            ignored = self._discord_ignored_channel_ids()
+            if "*" in ignored or channel_id in ignored:
+                return
         message_id = str(getattr(message, "id", "") or "")
         if not message_id:
             return
@@ -7264,6 +7277,32 @@ class DiscordAdapter(BasePlatformAdapter):
             )
         except Exception:
             logger.debug("[%s] Failed to update Discord root-channel recovery watermark", self.name, exc_info=True)
+
+    def _mark_discord_thread_participation(
+        self,
+        thread_id: str,
+        *,
+        message_id: Any = "",
+        channel_id: Any = "",
+        auto_created: bool = False,
+    ) -> None:
+        thread_id = str(thread_id or "").strip()
+        if not thread_id:
+            return
+        try:
+            self._threads.mark(thread_id)
+        except OSError as exc:
+            context = "auto-thread" if auto_created else "thread"
+            logger.warning(
+                "[%s] Discord %s %s registry persistence failed for message %s in channel %s; continuing intake: %s",
+                self.name,
+                context,
+                thread_id,
+                message_id,
+                channel_id,
+                exc,
+                exc_info=True,
+            )
 
     async def _recent_root_channel_messages_for_recovery(
         self,
@@ -9349,7 +9388,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     thread_id = str(thread.id)
                     auto_threaded_channel = thread
                     auto_threaded_direct_question = should_auto_thread_direct_question
-                    self._threads.mark(thread_id)
+                    self._mark_discord_thread_participation(
+                        thread_id,
+                        message_id=getattr(message, "id", ""),
+                        channel_id=parent_channel_id,
+                        auto_created=True,
+                    )
 
         if (
             feature_request_intent is None
@@ -9756,7 +9800,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # Track thread participation so the bot won't require @mention for
         # follow-up messages in threads it has already engaged in.
         if thread_id:
-            self._threads.mark(thread_id)
+            self._mark_discord_thread_participation(
+                thread_id,
+                message_id=getattr(message, "id", ""),
+                channel_id=getattr(getattr(message, "channel", None), "id", ""),
+            )
 
         # Only batch plain text messages — commands, media, etc. dispatch
         # immediately since they won't be split by the Discord client.

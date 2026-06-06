@@ -2,6 +2,17 @@
 
 Instructions for AI coding assistants and developers working on the `hermes-agent` codebase. Keep this file compact: it is auto-loaded as project context, so prefer pointers to source files and docs over long copied examples.
 
+## Repo State Entry Points
+
+Before broad Hermes work, read the repo-backed state/context split:
+
+- `docs/project-state.md` — current Hermes operational truth, focus, blockers, and next actions.
+- `docs/context.md` — durable Sligo/Hermes product context and knowledge-store boundaries.
+- `docs/sligo-command-center.md` — Command Center product model when that surface is in scope.
+- `docs/decisions/` — durable rationale for reversal-prone project choices.
+
+Keep current project state in repo docs, not skills. Skills are reusable procedures, pitfalls, and verification checklists; they are not the Hermes target/status ledger.
+
 ## Working Rules
 
 - Prefer `.venv`, then `venv`, then `$HOME/.hermes/hermes-agent/venv` for shared-worktree installs.

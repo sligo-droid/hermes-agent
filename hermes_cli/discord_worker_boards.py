@@ -15,6 +15,7 @@ import os
 import re
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import time
 from dataclasses import dataclass
@@ -2319,14 +2320,11 @@ def source_task_reaction_state(board: str, task_id: str) -> Optional[str]:
     task_id = str(task_id or "").strip()
     if not task_id:
         return None
-    conn = kanban_db.connect(board=board)
-    try:
+    with kanban_db.connect_closing(board=board) as conn:
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             return None
         latest = kanban_db.latest_run(conn, task_id)
-    finally:
-        conn.close()
 
     status = str(getattr(task, "status", "") or "").strip().lower()
     latest_status = str(getattr(latest, "status", "") or "").strip().lower() if latest else ""
@@ -5069,6 +5067,43 @@ def is_paused_or_cancelled(board: str) -> bool:
     return bool(worker.get("paused") or worker.get("cancelled"))
 
 
+def _paused_corrupt_incident(board: str) -> Optional[dict[str, Any]]:
+    try:
+        incident = kanban_db.is_board_paused_for_corruption(board)
+    except Exception:
+        return None
+    if not incident:
+        return None
+    db_path = Path(str(incident.get("db_path") or kanban_db.kanban_db_path(board)))
+    try:
+        fingerprint = kanban_db._db_content_fingerprint(db_path)
+    except Exception:
+        fingerprint = None
+    if incident.get("fingerprint") == fingerprint:
+        return incident
+    logger.info(
+        "discord worker board: board %s database changed since corruption incident; retrying",
+        board,
+    )
+    return None
+
+
+def _is_skippable_board_db_error(exc: Exception) -> bool:
+    return isinstance(exc, (kanban_db.KanbanDbCorruptError, sqlite3.DatabaseError, OSError))
+
+
+def _log_skipped_board_target(board: str, exc: Exception, *, source: str) -> None:
+    if isinstance(exc, kanban_db.KanbanDbCorruptError):
+        logger.warning(
+            "%s: skipping board %s after kanban DB corruption: %s",
+            source,
+            board,
+            exc,
+        )
+    else:
+        logger.debug("%s: skipping board %s after DB open/read failure: %s", source, board, exc)
+
+
 def running_worker_thread_targets() -> list[dict[str, Any]]:
     """Return Discord thread targets whose worker board is actively running."""
     targets: list[dict[str, Any]] = []
@@ -5082,25 +5117,44 @@ def running_worker_thread_targets() -> list[dict[str, Any]]:
             continue
         if _worker_source_message_too_old(worker):
             continue
-        conn = kanban_db.connect(board=board)
+        if _paused_corrupt_incident(board):
+            logger.debug(
+                "discord worker typing targets: board %s paused for unchanged DB corruption; skipping",
+                board,
+            )
+            continue
         try:
-            placeholders = ",".join("?" for _ in ROLE_ASSIGNEES)
-            row = conn.execute(
-                "SELECT COUNT(*) FROM tasks "
-                "WHERE status = 'running' AND lower(assignee) IN "
-                f"({placeholders})",
-                tuple(sorted(ROLE_ASSIGNEES)),
-            ).fetchone()
-            running = int(row[0] or 0) if row else 0
-        finally:
-            conn.close()
+            with kanban_db.connect_closing(board=board) as conn:
+                placeholders = ",".join("?" for _ in ROLE_ASSIGNEES)
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM tasks "
+                    "WHERE status = 'running' AND lower(assignee) IN "
+                    f"({placeholders})",
+                    tuple(sorted(ROLE_ASSIGNEES)),
+                ).fetchone()
+                running = int(row[0] or 0) if row else 0
+        except Exception as exc:
+            if _is_skippable_board_db_error(exc):
+                _log_skipped_board_target(board, exc, source="discord worker typing targets")
+                continue
+            raise
         source_context = _worker_source_task_context(worker)
         source_state = None
         if source_context.get("source_board") and source_context.get("source_task_id"):
-            source_state = source_task_reaction_state(
-                source_context["source_board"],
-                source_context["source_task_id"],
-            )
+            try:
+                source_state = source_task_reaction_state(
+                    source_context["source_board"],
+                    source_context["source_task_id"],
+                )
+            except Exception as exc:
+                if _is_skippable_board_db_error(exc):
+                    _log_skipped_board_target(
+                        source_context["source_board"],
+                        exc,
+                        source="discord worker source task state",
+                    )
+                else:
+                    raise
         if running <= 0 and source_state != "running":
             continue
         targets.append(
@@ -5127,24 +5181,31 @@ def running_notify_thread_targets() -> list[dict[str, Any]]:
     targets: list[dict[str, Any]] = []
     for board_meta in kanban_db.list_boards(include_archived=False):
         board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
-        conn = kanban_db.connect(board=board)
+        if _paused_corrupt_incident(board):
+            logger.debug(
+                "discord notify typing targets: board %s paused for unchanged DB corruption; skipping",
+                board,
+            )
+            continue
         try:
-            rows = conn.execute(
-                """
-                SELECT t.id AS task_id,
-                       n.chat_id AS chat_id,
-                       n.thread_id AS thread_id
-                  FROM tasks t
-                  JOIN kanban_notify_subs n ON n.task_id = t.id
-                 WHERE t.status = 'running'
-                   AND lower(n.platform) = 'discord'
-                   AND COALESCE(n.thread_id, '') != ''
-                """
-            ).fetchall()
-        except Exception:
-            rows = []
-        finally:
-            conn.close()
+            with kanban_db.connect_closing(board=board) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT t.id AS task_id,
+                           n.chat_id AS chat_id,
+                           n.thread_id AS thread_id
+                      FROM tasks t
+                      JOIN kanban_notify_subs n ON n.task_id = t.id
+                     WHERE t.status = 'running'
+                       AND lower(n.platform) = 'discord'
+                       AND COALESCE(n.thread_id, '') != ''
+                    """
+                ).fetchall()
+        except Exception as exc:
+            if _is_skippable_board_db_error(exc):
+                _log_skipped_board_target(board, exc, source="discord notify typing targets")
+                continue
+            raise
         for row in rows:
             thread_id = str(row["thread_id"] or "").strip()
             if not thread_id:
