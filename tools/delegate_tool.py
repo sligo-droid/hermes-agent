@@ -1526,15 +1526,30 @@ def _run_single_child(
         # Run child with a hard timeout to prevent indefinite blocking
         # when the child's API call or tool-level HTTP request hangs.
         child_timeout = _get_child_timeout()
-        _timeout_executor = ThreadPoolExecutor(
-            max_workers=1,
-            # Install a non-interactive approval callback in the worker thread
-            # so dangerous-command prompts from the subagent don't fall back to
-            # input() and deadlock the parent's prompt_toolkit TUI.
-            # Callback (deny vs approve) is governed by delegation.subagent_auto_approve.
-            initializer=_set_subagent_approval_cb,
-            initargs=(_get_subagent_approval_callback(),),
-        )
+        try:
+            _timeout_executor = ThreadPoolExecutor(
+                max_workers=1,
+                # Install a non-interactive approval callback in the worker thread
+                # so dangerous-command prompts from the subagent don't fall back to
+                # input() and deadlock the parent's prompt_toolkit TUI.
+                # Callback (deny vs approve) is governed by delegation.subagent_auto_approve.
+                initializer=_set_subagent_approval_cb,
+                initargs=(_get_subagent_approval_callback(),),
+            )
+        except RuntimeError as exc:
+            if not _is_interpreter_shutdown_error(exc):
+                raise
+            duration = round(time.monotonic() - child_start, 2)
+            return {
+                "task_index": task_index,
+                "status": "error",
+                "summary": None,
+                "error": _delegation_shutdown_message(),
+                "exit_reason": "error",
+                "api_calls": 0,
+                "duration_seconds": duration,
+                "_child_role": getattr(child, "_delegate_role", None),
+            }
         # Capture the worker thread so the timeout diagnostic can dump its
         # Python stack (see #14726 — 0-API-call hangs are opaque without it).
         _worker_thread_holder: Dict[str, Optional[threading.Thread]] = {"t": None}

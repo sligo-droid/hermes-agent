@@ -2656,6 +2656,28 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         self.assertIn("interpreter is shutting down", result["error"])
         self.assertEqual(result["api_calls"], 0)
 
+    def test_run_single_child_reports_executor_construction_shutdown_error(self):
+        from tools import delegate_tool
+
+        class FakeExecutor:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError("cannot schedule new futures after interpreter shutdown")
+
+        child = MagicMock()
+        child._delegate_role = "leaf"
+
+        with patch("tools.delegate_tool.ThreadPoolExecutor", FakeExecutor):
+            result = delegate_tool._run_single_child(
+                0,
+                "cron system-doctor delegation after compacted late turn",
+                child=child,
+                parent_agent=_make_mock_parent(),
+            )
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("interpreter is shutting down", result["error"])
+        self.assertEqual(result["api_calls"], 0)
+
     @patch("tools.delegate_tool._run_single_child")
     def test_delegate_task_reports_batch_submit_shutdown_error(self, mock_run):
         parent = _make_mock_parent()

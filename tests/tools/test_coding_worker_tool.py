@@ -670,6 +670,42 @@ def test_delegate_opencode_omits_parent_scope_for_legacy_backend(monkeypatch, tm
     assert seen["title"] == "Hermes delegated coding task"
 
 
+def test_delegate_opencode_retries_when_passthrough_signature_rejects_scope(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    monkeypatch.setattr(ow, "load_coding_worker_backend", lambda: ow.BACKEND_OPENCODE)
+    calls = []
+
+    def fake_wrapper(prompt, workspace, **kwargs):
+        calls.append(dict(kwargs))
+        if "scope_session_key" in kwargs:
+            raise TypeError("run_opencode_task() got an unexpected keyword argument 'scope_session_key'")
+        return SimpleNamespace(
+            final_text="done",
+            error=None,
+            interrupted=False,
+            agents=["build"],
+            plan_text="",
+            thread_id="ses-build",
+            turn_id="ses-build",
+            tool_iterations=1,
+        )
+
+    monkeypatch.setattr(ow, "run_opencode_task", fake_wrapper)
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="system-doctor delegated worker after compaction",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert len(calls) == 2
+    assert calls[0]["scope_session_key"] == "discord:123"
+    assert "scope_session_key" not in calls[1]
+
+
 def test_delegate_includes_repo_state_preflight(monkeypatch, tmp_path):
     from agent import opencode_worker as ow
 

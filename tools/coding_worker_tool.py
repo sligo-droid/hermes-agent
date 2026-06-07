@@ -69,6 +69,7 @@ def _resolve_cwd(cwd: Optional[str], parent_agent: Any) -> str:
 
 def _call_opencode_task(run_opencode_task: Any, *args: Any, scope_session_key: str = "", **kwargs: Any) -> Any:
     """Call the OpenCode backend with parent session scoping when supported."""
+    scoped_kwargs = dict(kwargs)
     try:
         parameters = inspect.signature(run_opencode_task).parameters
     except (TypeError, ValueError):
@@ -77,8 +78,17 @@ def _call_opencode_task(run_opencode_task: Any, *args: Any, scope_session_key: s
         parameter.kind is inspect.Parameter.VAR_KEYWORD
         for parameter in parameters.values()
     ):
-        kwargs["scope_session_key"] = scope_session_key
-    return run_opencode_task(*args, **kwargs)
+        scoped_kwargs["scope_session_key"] = scope_session_key
+    try:
+        return run_opencode_task(*args, **scoped_kwargs)
+    except TypeError as exc:
+        if (
+            "scope_session_key" not in scoped_kwargs
+            or "scope_session_key" not in str(exc)
+            or "unexpected" not in str(exc).lower()
+        ):
+            raise
+        return run_opencode_task(*args, **kwargs)
 
 
 def _worker_project_context(workdir: str) -> str:
