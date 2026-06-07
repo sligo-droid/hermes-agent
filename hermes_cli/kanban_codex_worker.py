@@ -35,7 +35,7 @@ from hermes_cli.discord_worker_boards import (
     record_codex_worker_result,
 )
 
-_OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV}
+_OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER}
 _COMMAND_CENTER_REPAIR_CREATED_BY = "command-center-repair"
 _CODEX_AUTH_RETRY_LIMIT = 2
 _PR_GUARDED_ROLES = {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER}
