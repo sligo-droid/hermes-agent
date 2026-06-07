@@ -3645,3 +3645,69 @@ class TestAuxUnhealthyCache:
             )
             # After the 402, OpenRouter is in the unhealthy cache.
             assert _is_provider_unhealthy("openrouter") is True
+
+    def test_repeated_payment_warnings_are_aggregated_with_summary(self, monkeypatch, caplog):
+        import agent.auxiliary_client as aux
+
+        now = 1000.0
+        monkeypatch.setattr(aux, "_aux_time", lambda: now)
+
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            aux._mark_provider_unhealthy("openrouter")
+            aux._mark_provider_unhealthy("openrouter")
+            aux._mark_provider_unhealthy("openrouter")
+
+            assert sum("marking openrouter unhealthy" in rec.message for rec in caplog.records) == 1
+            assert not any("Auxiliary health summary" in rec.message for rec in caplog.records)
+
+            now = 1061.0
+            monkeypatch.setattr(aux, "_aux_time", lambda: now)
+            aux._mark_provider_unhealthy("openrouter")
+
+        messages = [rec.message for rec in caplog.records]
+        assert sum("marking openrouter unhealthy" in msg for msg in messages) == 2
+        summaries = [msg for msg in messages if "Auxiliary health summary" in msg]
+        assert len(summaries) == 1
+        assert "provider=openrouter" in summaries[0]
+        assert "failure_class=payment_error" in summaries[0]
+        assert "suppressed=2" in summaries[0]
+        assert "first=" in summaries[0]
+        assert "last=" in summaries[0]
+
+    def test_distinct_provider_and_failure_class_warnings_remain_visible(self, monkeypatch, caplog):
+        import agent.auxiliary_client as aux
+
+        monkeypatch.setattr(aux, "_aux_time", lambda: 2000.0)
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            aux.log_auxiliary_health_warning("openrouter", "no_provider", "openrouter no provider")
+            aux.log_auxiliary_health_warning("nous", "no_provider", "nous no provider")
+            aux.log_auxiliary_health_warning("openrouter", "fallbacks_exhausted", "openrouter exhausted")
+
+        messages = [rec.message for rec in caplog.records]
+        assert "openrouter no provider" in messages
+        assert "nous no provider" in messages
+        assert "openrouter exhausted" in messages
+
+    def test_provider_recovery_flushes_summary_and_resets_bucket(self, monkeypatch, caplog):
+        import agent.auxiliary_client as aux
+
+        now = 3000.0
+        monkeypatch.setattr(aux, "_aux_time", lambda: now)
+
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            aux._mark_provider_unhealthy("openrouter", ttl=10)
+            aux._mark_provider_unhealthy("openrouter", ttl=10)
+            assert aux._is_provider_unhealthy("openrouter") is True
+
+            now = 3011.0
+            monkeypatch.setattr(aux, "_aux_time", lambda: now)
+            assert aux._is_provider_unhealthy("openrouter") is False
+            aux._mark_provider_unhealthy("openrouter", ttl=10)
+
+        messages = [rec.message for rec in caplog.records]
+        summaries = [msg for msg in messages if "Auxiliary health summary" in msg]
+        assert len(summaries) == 1
+        assert "provider=openrouter" in summaries[0]
+        assert "failure_class=payment_error" in summaries[0]
+        assert "suppressed=1" in summaries[0]
+        assert sum("marking openrouter unhealthy" in msg for msg in messages) == 2
