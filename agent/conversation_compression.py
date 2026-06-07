@@ -40,6 +40,21 @@ from agent.model_metadata import estimate_request_tokens_rough
 
 logger = logging.getLogger(__name__)
 
+_CHURN_WINDOW_SECONDS = 10 * 60
+_CHURN_RECENT_COMPRESSION_LIMIT = 3
+_CHURN_ZERO_MESSAGE_LIMIT = 2
+_CHURN_LARGE_INPUT_TOKENS = 100_000
+_CHURN_SIMILAR_TOKEN_RATIO = 0.90
+_CHURN_PROGRESS_MESSAGE_LIMIT = 2
+
+
+class CompressionChurnError(RuntimeError):
+    """Raised when another compression split would continue lineage churn."""
+
+    def __init__(self, details: dict[str, Any]) -> None:
+        self.details = details
+        super().__init__(details.get("message") or "Compression loop detected")
+
 
 def _compression_lock_holder(agent: Any) -> str:
     """Build a unique holder id for the lock: pid:tid:agent-instance:uuid.
@@ -268,6 +283,191 @@ def replay_compression_warning(agent: Any) -> None:
             pass
 
 
+def _content_text_length(content: Any) -> int:
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if isinstance(part, dict):
+                total += _content_text_length(part.get("text") or part.get("content") or part.get("data") or "")
+            else:
+                total += _content_text_length(part)
+        return total
+    if content is None:
+        return 0
+    return len(str(content))
+
+
+def _largest_message_candidate(messages: list) -> dict[str, Any]:
+    candidate: dict[str, Any] = {}
+    for idx, msg in enumerate(messages or []):
+        if not isinstance(msg, dict):
+            continue
+        size = _content_text_length(msg.get("content"))
+        for tool_call in msg.get("tool_calls") or []:
+            if isinstance(tool_call, dict):
+                size += _content_text_length(tool_call.get("function", {}).get("arguments"))
+        if size > int(candidate.get("chars") or 0):
+            preview = msg.get("content")
+            if not isinstance(preview, str):
+                preview = str(preview) if preview is not None else ""
+            candidate = {
+                "index": idx,
+                "role": msg.get("role"),
+                "chars": size,
+                "tool_name": msg.get("tool_name"),
+                "preview": preview[:240],
+            }
+    return candidate
+
+
+def _lineage_row_input_tokens(row: dict[str, Any]) -> int:
+    return int(row.get("input_tokens") or 0)
+
+
+def _lineage_row_message_count(row: dict[str, Any]) -> int:
+    return int(row.get("message_count") or 0)
+
+
+def _lineage_row_has_durable_progress(row: dict[str, Any]) -> bool:
+    # Message rows are the durable transcript progress signal.  Tiny counts can
+    # be synthetic continuation metadata, so require more than a trivial amount.
+    return _lineage_row_message_count(row) > _CHURN_PROGRESS_MESSAGE_LIMIT
+
+
+def _lineage_row_similar_to_current(row: dict[str, Any], current_tokens: int) -> bool:
+    row_tokens = _lineage_row_input_tokens(row)
+    if row_tokens <= 0 or current_tokens <= 0:
+        return False
+    lower = current_tokens * _CHURN_SIMILAR_TOKEN_RATIO
+    upper = current_tokens / _CHURN_SIMILAR_TOKEN_RATIO
+    return lower <= row_tokens <= upper
+
+
+def _lineage_row_no_progress(row: dict[str, Any], *, current_tokens: int) -> bool:
+    return (
+        _lineage_row_message_count(row) == 0
+        or _lineage_row_similar_to_current(row, current_tokens)
+        or not _lineage_row_has_durable_progress(row)
+    )
+
+
+def _compression_churn_details(
+    agent: Any,
+    messages: list,
+    *,
+    original_tokens: Optional[int],
+    compressed_tokens: int,
+) -> Optional[dict[str, Any]]:
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if not session_db or not session_id:
+        return None
+    get_lineage = getattr(session_db, "get_recent_compression_lineage", None)
+    if not callable(get_lineage):
+        return None
+    try:
+        lineage = get_lineage(
+            session_id,
+            window_seconds=_CHURN_WINDOW_SECONDS,
+            limit=12,
+        )
+    except Exception:
+        logger.debug("compression churn lineage query failed", exc_info=True)
+        return None
+    if not lineage:
+        return None
+
+    current = lineage[0]
+    ancestors = lineage[1:]
+    lineage_token_baseline = int(original_tokens or compressed_tokens or _lineage_row_input_tokens(current) or 0)
+    current_no_progress = bool(
+        current.get("parent_session_id")
+        and not _lineage_row_has_durable_progress(current)
+        and (
+            _lineage_row_message_count(current) == 0
+            or _lineage_row_similar_to_current(
+                current,
+                current_tokens=lineage_token_baseline,
+            )
+        )
+    )
+    no_progress_lineage = [
+        row for row in lineage
+        if row.get("parent_session_id")
+        and _lineage_row_no_progress(row, current_tokens=lineage_token_baseline)
+    ]
+    recent_compression_parents = [
+        row for row in ancestors
+        if row.get("end_reason") == "compression"
+        and _lineage_row_no_progress(row, current_tokens=lineage_token_baseline)
+    ]
+    zero_message_compression_children = [
+        row for row in lineage
+        if _lineage_row_message_count(row) == 0
+        and row.get("parent_session_id")
+    ]
+    large_zero_message_children = [
+        row for row in zero_message_compression_children
+        if int(row.get("input_tokens") or 0) >= _CHURN_LARGE_INPUT_TOKENS
+    ]
+    similar_tokens = bool(
+        original_tokens
+        and compressed_tokens
+        and compressed_tokens >= int(original_tokens * _CHURN_SIMILAR_TOKEN_RATIO)
+    )
+    token_reduction_stalled = bool(
+        not original_tokens
+        or not compressed_tokens
+        or similar_tokens
+    )
+    current_is_empty_child = bool(
+        current.get("parent_session_id")
+        and _lineage_row_message_count(current) == 0
+    )
+
+    reasons: list[str] = []
+    if (
+        current_no_progress
+        and token_reduction_stalled
+        and len(recent_compression_parents) >= _CHURN_RECENT_COMPRESSION_LIMIT
+    ):
+        reasons.append("recent_compression_lineage")
+    if current_no_progress and current_is_empty_child and similar_tokens:
+        reasons.append("empty_child_similar_tokens")
+    if (
+        current_no_progress
+        and token_reduction_stalled
+        and len(zero_message_compression_children) >= _CHURN_ZERO_MESSAGE_LIMIT
+    ):
+        reasons.append("repeated_zero_message_children")
+    if current_no_progress and token_reduction_stalled and large_zero_message_children:
+        reasons.append("large_zero_message_child")
+    if not reasons:
+        return None
+
+    root = lineage[-1].get("id") if lineage else session_id
+    return {
+        "code": "compression_loop_churn",
+        "reasons": reasons,
+        "message": "Compression loop detected before rotating to another continuation session.",
+        "lineage_root_session_id": root,
+        "current_session_id": session_id,
+        "recent_window_seconds": _CHURN_WINDOW_SECONDS,
+        "recent_session_count": len(lineage),
+        "recent_compression_parent_count": len(recent_compression_parents),
+        "no_progress_lineage_count": len(no_progress_lineage),
+        "zero_message_child_count": len(zero_message_compression_children),
+        "large_zero_message_child_count": len(large_zero_message_children),
+        "original_tokens": int(original_tokens or 0),
+        "compressed_tokens": int(compressed_tokens or 0),
+        "message_count": len(messages or []),
+        "largest_message_candidate": _largest_message_candidate(messages),
+        "lineage": lineage,
+    }
+
+
 def compress_context(
     agent: Any,
     messages: list,
@@ -478,6 +678,23 @@ def compress_context(
     new_system_prompt = agent._build_system_prompt(system_message)
     agent._cached_system_prompt = new_system_prompt
 
+    _compressed_est = estimate_request_tokens_rough(
+        compressed,
+        system_prompt=new_system_prompt or "",
+        tools=agent.tools or None,
+    )
+    if not force:
+        _churn_details = _compression_churn_details(
+            agent,
+            messages,
+            original_tokens=approx_tokens,
+            compressed_tokens=_compressed_est,
+        )
+        if _churn_details:
+            _release_lock()
+            logger.error("compression churn breaker triggered: %s", _churn_details)
+            raise CompressionChurnError(_churn_details)
+
     if agent._session_db:
         try:
             # Propagate title to the new session with auto-numbering
@@ -564,11 +781,6 @@ def compress_context(
     # Keep the post-compression rough estimate for diagnostics, but do not
     # treat it as provider-reported prompt usage. Schema-heavy rough estimates
     # can remain above threshold even after the next real API request fits.
-    _compressed_est = estimate_request_tokens_rough(
-        compressed,
-        system_prompt=new_system_prompt or "",
-        tools=agent.tools or None,
-    )
     agent.context_compressor.last_compression_rough_tokens = _compressed_est
     agent.context_compressor.last_prompt_tokens = -1
     agent.context_compressor.last_completion_tokens = 0

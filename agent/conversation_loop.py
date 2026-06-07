@@ -65,6 +65,7 @@ from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
+from agent.conversation_compression import CompressionChurnError
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +264,41 @@ def _emergency_shrink_context(
 
 def _fmt_token_count(value: int | None) -> str:
     return f"{int(value or 0):,}"
+
+
+def _compression_churn_result(
+    agent: Any,
+    messages: list[dict[str, Any]],
+    conversation_history: list[dict[str, Any]] | None,
+    api_call_count: int,
+    exc: CompressionChurnError,
+) -> dict[str, Any]:
+    details = getattr(exc, "details", {}) or {}
+    candidate = details.get("largest_message_candidate") or {}
+    agent._flush_status_buffer()
+    agent._vprint(
+        f"{agent.log_prefix}❌ Compression loop detected; stopping before creating another continuation session.",
+        force=True,
+    )
+    if candidate:
+        role = candidate.get("role") or "unknown"
+        chars = int(candidate.get("chars") or 0)
+        idx = candidate.get("index")
+        agent._vprint(
+            f"{agent.log_prefix}   Largest retained segment: message #{idx} role={role} ~{chars:,} chars.",
+            force=True,
+        )
+    agent._persist_session(messages, conversation_history)
+    return {
+        "messages": messages,
+        "completed": False,
+        "api_calls": api_call_count,
+        "error": "Compression loop detected; no further continuation session was created.",
+        "partial": True,
+        "failed": True,
+        "compression_exhausted": True,
+        "compression_loop": details,
+    }
 
 
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
@@ -905,10 +941,19 @@ def run_conversation(
             for _pass in range(3):
                 _orig_len = len(messages)
                 _orig_tokens = _preflight_tokens
-                messages, active_system_prompt = agent._compress_context(
-                    messages, system_message, approx_tokens=_preflight_tokens,
-                    task_id=effective_task_id,
-                )
+                try:
+                    messages, active_system_prompt = agent._compress_context(
+                        messages, system_message, approx_tokens=_preflight_tokens,
+                        task_id=effective_task_id,
+                    )
+                except CompressionChurnError as exc:
+                    return _compression_churn_result(
+                        agent,
+                        messages,
+                        conversation_history,
+                        api_call_count=0,
+                        exc=exc,
+                    )
                 # Re-estimate after compression.  A summary failure can still
                 # prune old tool results, which keeps message count unchanged
                 # while materially reducing request tokens.
@@ -2970,11 +3015,20 @@ def run_conversation(
                     compression_attempts += 1
                     if compression_attempts <= max_compression_attempts:
                         original_len = len(messages)
-                        messages, active_system_prompt = agent._compress_context(
-                            messages, system_message,
-                            approx_tokens=approx_tokens,
-                            task_id=effective_task_id,
-                        )
+                        try:
+                            messages, active_system_prompt = agent._compress_context(
+                                messages, system_message,
+                                approx_tokens=approx_tokens,
+                                task_id=effective_task_id,
+                            )
+                        except CompressionChurnError as exc:
+                            return _compression_churn_result(
+                                agent,
+                                messages,
+                                conversation_history,
+                                api_call_count,
+                                exc,
+                            )
                         # Compression created a new session — clear history
                         # so _flush_messages_to_session_db writes compressed
                         # messages to the new session, not skipping them.
@@ -3145,10 +3199,19 @@ def run_conversation(
 
                     original_len = len(messages)
                     original_tokens = approx_tokens
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message, approx_tokens=approx_tokens,
-                        task_id=effective_task_id,
-                    )
+                    try:
+                        messages, active_system_prompt = agent._compress_context(
+                            messages, system_message, approx_tokens=approx_tokens,
+                            task_id=effective_task_id,
+                        )
+                    except CompressionChurnError as exc:
+                        return _compression_churn_result(
+                            agent,
+                            messages,
+                            conversation_history,
+                            api_call_count,
+                            exc,
+                        )
                     # Compression created a new session — clear history
                     # so _flush_messages_to_session_db writes compressed
                     # messages to the new session, not skipping them.
@@ -3319,10 +3382,19 @@ def run_conversation(
 
                     original_len = len(messages)
                     original_tokens = approx_tokens
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message, approx_tokens=approx_tokens,
-                        task_id=effective_task_id,
-                    )
+                    try:
+                        messages, active_system_prompt = agent._compress_context(
+                            messages, system_message, approx_tokens=approx_tokens,
+                            task_id=effective_task_id,
+                        )
+                    except CompressionChurnError as exc:
+                        return _compression_churn_result(
+                            agent,
+                            messages,
+                            conversation_history,
+                            api_call_count,
+                            exc,
+                        )
                     # Compression created a new session — clear history
                     # so _flush_messages_to_session_db writes compressed
                     # messages to the new session, not skipping them.
@@ -4295,11 +4367,20 @@ def run_conversation(
 
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message,
-                        approx_tokens=_real_tokens,
-                        task_id=effective_task_id,
-                    )
+                    try:
+                        messages, active_system_prompt = agent._compress_context(
+                            messages, system_message,
+                            approx_tokens=_real_tokens,
+                            task_id=effective_task_id,
+                        )
+                    except CompressionChurnError as exc:
+                        return _compression_churn_result(
+                            agent,
+                            messages,
+                            conversation_history,
+                            api_call_count,
+                            exc,
+                        )
                     # Compression created a new session — clear history so
                     # _flush_messages_to_session_db writes compressed messages
                     # to the new session (see preflight compression comment).
