@@ -89,6 +89,7 @@ _POSIX_PATH_RE = re.compile(
 _WINDOWS_PATH_RE = re.compile(r"(?<![\w:/.-])[A-Za-z]:\\[^\s\"'<>),;{}\[\]]+")
 _CONTEXT_PACK_JSON_FILENAME = "context-pack.json"
 _CONTEXT_PACK_MARKDOWN_FILENAME = "context-pack.md"
+_SKIPPED_BOARD_TARGET_LOG_KEYS: set[tuple[str, str, str]] = set()
 
 
 class TicketMoveConflict(RuntimeError):
@@ -3200,7 +3201,10 @@ def thread_status_targets() -> list[dict[str, Any]]:
         pass
     for board_meta in kanban_db.list_boards(include_archived=False):
         board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
-        worker = _read_worker_meta(board)
+        if _board_target_skipped_by_metadata(board, board_meta, source="discord thread status targets"):
+            continue
+        raw_worker = board_meta.get(DISCORD_WORKER_META_KEY)
+        worker = dict(raw_worker) if isinstance(raw_worker, dict) else {}
         if worker.get("kind") != "discord_worker_board":
             continue
         thread_id = str(worker.get("thread_id") or "").strip()
@@ -3208,12 +3212,6 @@ def thread_status_targets() -> list[dict[str, Any]]:
             continue
         if _worker_source_message_too_old(worker):
             _clear_stale_terminal_sync_flags(board, worker)
-            continue
-        if _paused_corrupt_incident(board):
-            logger.debug(
-                "discord thread status targets: board %s paused for unchanged DB corruption; skipping",
-                board,
-            )
             continue
         try:
             summary = feature_summary_snapshot(board)
@@ -5389,6 +5387,16 @@ def _is_skippable_board_db_error(exc: Exception) -> bool:
 
 def _log_skipped_board_target(board: str, exc: Exception, *, source: str) -> None:
     if isinstance(exc, kanban_db.KanbanDbCorruptError):
+        key = (source, board, type(exc).__name__)
+        if key in _SKIPPED_BOARD_TARGET_LOG_KEYS:
+            logger.debug(
+                "%s: skipping board %s after kanban DB corruption: %s",
+                source,
+                board,
+                exc,
+            )
+            return
+        _SKIPPED_BOARD_TARGET_LOG_KEYS.add(key)
         logger.warning(
             "%s: skipping board %s after kanban DB corruption: %s",
             source,

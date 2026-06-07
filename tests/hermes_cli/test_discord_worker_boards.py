@@ -3202,6 +3202,47 @@ def test_notify_targets_skip_corrupt_board_and_keep_healthy_target(monkeypatch, 
     ]
 
 
+def test_typing_targets_bound_corrupt_board_warning_log(monkeypatch, tmp_path, caplog):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    healthy = _make_discord_board("2418")
+    broken = _make_discord_board("2419")
+    healthy_task = _create_ready_dev_task(healthy.slug)
+    _create_ready_dev_task(broken.slug)
+    with kanban_db.connect_closing(board=healthy.slug) as conn:
+        kanban_db.claim_task(conn, healthy_task)
+
+    real_connect_closing = kanban_db.connect_closing
+
+    def fake_connect_closing(db_path=None, *, board=None):
+        if board == broken.slug:
+            raise kanban_db.KanbanDbCorruptError(
+                kanban_db.kanban_db_path(broken.slug),
+                None,
+                "integrity check failed",
+            )
+        return real_connect_closing(db_path=db_path, board=board)
+
+    monkeypatch.setattr(kanban_db, "connect_closing", fake_connect_closing)
+
+    with caplog.at_level("WARNING", logger="hermes_cli.discord_worker_boards"):
+        for _ in range(3):
+            assert dwb.running_worker_thread_targets() == [
+                {
+                    "board": healthy.slug,
+                    "thread_id": "2418",
+                    "chat_id": "2418",
+                    "running": 1,
+                }
+            ]
+
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert broken.slug in warnings[0].getMessage()
+
+
 def test_typing_targets_do_not_open_paused_corrupt_board(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
