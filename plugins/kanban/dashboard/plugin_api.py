@@ -1792,10 +1792,38 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
     idempotency_key = f"self-improvement:{proposal_id}"
     task = None
     task_id = ""
+    if discord_route and discord_route.thread_id and (discord_route.error or not discord_route.board):
+        metadata = {
+            "idempotency_key": idempotency_key,
+            "board": discord_route.board or "",
+            **discord_route.metadata(),
+        }
+        proposal_storage.record_audit_event(
+            proposal_id,
+            action="approval_discord_worker_failed",
+            actor=_proposal_actor(),
+            reason=discord_route.error or "Discord worker board was not created",
+            metadata=metadata,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Discord worker board failed: {discord_route.error or 'board was not created'}",
+        )
     if discord_route and discord_route.board:
         discord_route = discord_publish.activate_approved_proposal(card, discord_route)
         board = discord_route.board if discord_route and discord_route.board else _resolve_board(str(task_payload.get("board") or "") or None)
         if discord_route and discord_route.error:
+            proposal_storage.record_audit_event(
+                proposal_id,
+                action="approval_discord_worker_failed",
+                actor=_proposal_actor(),
+                reason=discord_route.error,
+                metadata={
+                    "idempotency_key": idempotency_key,
+                    "board": board or "",
+                    **discord_route.metadata(),
+                },
+            )
             raise HTTPException(status_code=500, detail=f"Discord worker activation failed: {discord_route.error}")
         task = _self_improvement_planner_task(board, card)
         if task is None:

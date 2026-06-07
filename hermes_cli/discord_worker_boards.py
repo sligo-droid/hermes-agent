@@ -447,12 +447,7 @@ def mark_completion_notice_pending_on_done_transition(
         return False
     if _terminal_worker_reaction_state(worker) != "done":
         return False
-    if worker.get("terminal_completion_message_sent_at") or worker.get("terminal_completion_message_id"):
-        return False
-    if worker.get("terminal_completion_message_pending") is True:
-        return False
-    worker["terminal_completion_message_pending"] = True
-    return True
+    return _arm_terminal_completion_notice_if_ready(worker)
 
 
 def board_has_unsynced_terminal_reaction(board: str) -> bool:
@@ -477,6 +472,23 @@ def board_has_pending_terminal_completion_notice(board: str) -> bool:
     if worker.get("kind") != "discord_worker_board" or _terminal_worker_reaction_state(worker) != "done":
         return False
     return bool(worker.get("terminal_completion_message_pending"))
+
+
+def _board_has_completion_notice_proof(worker: dict[str, Any]) -> bool:
+    return bool(worker.get("terminal_completion_message_sent_at") or worker.get("terminal_completion_message_id"))
+
+
+def _arm_terminal_completion_notice_if_ready(worker: dict[str, Any]) -> bool:
+    if worker.get("kind") != "discord_worker_board":
+        return False
+    if _terminal_worker_reaction_state(worker) != "done":
+        return False
+    if _board_has_completion_notice_proof(worker):
+        return False
+    if worker.get("terminal_completion_message_pending") is True:
+        return False
+    worker["terminal_completion_message_pending"] = True
+    return True
 
 
 def _update_worker_meta(board: str, updates: dict[str, Any]) -> dict[str, Any]:
@@ -3010,6 +3022,7 @@ def record_final_discord_response(
     if result_message_id:
         worker["final_discord_message_id"] = str(result_message_id)
     worker["terminal_summary_sync_pending"] = True
+    _arm_terminal_completion_notice_if_ready(worker)
     metadata[DISCORD_WORKER_META_KEY] = worker
     metadata.pop("db_path", None)
     atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
@@ -3017,6 +3030,10 @@ def record_final_discord_response(
         persist_board_run_summary(board)
     except Exception:
         logger.debug("Failed to refresh Discord board run summary for %s", board, exc_info=True)
+    try:
+        mark_dispatch_dirty(board=board, reason="final-discord-response-recorded")
+    except Exception:
+        logger.debug("Failed to mark Discord worker dispatch dirty for %s", board, exc_info=True)
 
 
 def _is_current_board_run_summary(summary: dict[str, Any], board: str) -> bool:
@@ -3234,9 +3251,15 @@ def thread_status_targets() -> list[dict[str, Any]]:
         active_foreman_sources.update(active_master_foreman_source_boards())
     except Exception:
         pass
-    for board_meta in kanban_db.list_boards(include_archived=False):
+    seen_boards: set[str] = set()
+    board_metas = kanban_db.list_boards(include_archived=False)
+    board_metas.extend(_archived_terminal_completion_notice_boards())
+    for board_meta in board_metas:
         board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
-        worker = _read_worker_meta(board)
+        if board in seen_boards:
+            continue
+        seen_boards.add(board)
+        worker = _worker_meta_from_board_meta(board, board_meta)
         if worker.get("kind") != "discord_worker_board":
             continue
         thread_id = str(worker.get("thread_id") or "").strip()
@@ -3252,13 +3275,13 @@ def thread_status_targets() -> list[dict[str, Any]]:
             )
             continue
         try:
-            summary = feature_summary_snapshot(board)
+            summary = _feature_summary_snapshot_for_status(board, board_meta, worker)
         except Exception as exc:
             if _is_skippable_board_db_error(exc):
                 _log_skipped_board_target(board, exc, source="discord thread status feature summary")
                 continue
             try:
-                summary = {"state": board_thread_state(board)}
+                summary = {"state": _board_thread_state_for_status(board, board_meta, worker)}
             except Exception as state_exc:
                 if _is_skippable_board_db_error(state_exc):
                     _log_skipped_board_target(board, state_exc, source="discord thread status state fallback")
@@ -3267,7 +3290,7 @@ def thread_status_targets() -> list[dict[str, Any]]:
         state = summary.get("state")
         if not state:
             try:
-                state = board_thread_state(board)
+                state = _board_thread_state_for_status(board, board_meta, worker)
             except Exception as exc:
                 if _is_skippable_board_db_error(exc):
                     _log_skipped_board_target(board, exc, source="discord thread status board state")
@@ -3299,7 +3322,7 @@ def thread_status_targets() -> list[dict[str, Any]]:
         terminal_reaction_sync_needed = False
         if is_terminal_worker and state in {"done", "blocked", "errored"}:
             try:
-                reaction_state = board_thread_reaction_state(board)
+                reaction_state = _board_thread_reaction_state_for_status(board, board_meta, worker)
             except Exception as exc:
                 if _is_skippable_board_db_error(exc):
                     _log_skipped_board_target(board, exc, source="discord thread status reaction state")
@@ -3324,7 +3347,7 @@ def thread_status_targets() -> list[dict[str, Any]]:
             reaction_state = source_state
         elif not reaction_state:
             try:
-                reaction_state = board_thread_reaction_state(board)
+                reaction_state = _board_thread_reaction_state_for_status(board, board_meta, worker)
             except Exception as exc:
                 if _is_skippable_board_db_error(exc):
                     _log_skipped_board_target(board, exc, source="discord thread status reaction state")
@@ -3353,6 +3376,8 @@ def thread_status_targets() -> list[dict[str, Any]]:
             "terminal_summary_sync_pending": bool(worker.get("terminal_summary_sync_pending")),
             "terminal_completion_message_pending": terminal_completion_message_pending,
             "terminal_reaction_sync_needed": terminal_reaction_sync_needed,
+            "archived": bool(board_meta.get("archived")),
+            "metadata_path": str(board_meta.get("metadata_path") or ""),
         }
         if source_context:
             target.update(source_context)
@@ -3369,12 +3394,144 @@ def thread_status_targets() -> list[dict[str, Any]]:
     return targets
 
 
+def _archived_terminal_completion_notice_boards() -> list[dict[str, Any]]:
+    """Return archived terminal boards that still owe a Discord final response."""
+    boards: list[dict[str, Any]] = []
+    try:
+        candidates = kanban_db.list_boards(include_archived=True)
+    except Exception:
+        return boards
+    for board_meta in candidates:
+        if not board_meta.get("archived"):
+            continue
+        board = str(board_meta.get("slug") or "").strip()
+        if not board:
+            continue
+        worker = board_meta.get(DISCORD_WORKER_META_KEY) if isinstance(board_meta.get(DISCORD_WORKER_META_KEY), dict) else {}
+        if worker.get("kind") != "discord_worker_board":
+            continue
+        if _terminal_worker_reaction_state(worker) != "done":
+            continue
+        if not worker.get("terminal_completion_message_pending"):
+            continue
+        summary = worker.get("board_summary") if isinstance(worker.get("board_summary"), dict) else {}
+        final_response = summary.get("final_response") if isinstance(summary.get("final_response"), dict) else {}
+        if not str(final_response.get("text") or "").strip():
+            continue
+        boards.append(board_meta)
+    return boards
+
+
+def _worker_meta_from_board_meta(board: str, board_meta: dict[str, Any]) -> dict[str, Any]:
+    raw = board_meta.get(DISCORD_WORKER_META_KEY)
+    if isinstance(raw, dict) and board_meta.get("archived"):
+        return dict(raw)
+    return _read_worker_meta(board)
+
+
+def _read_board_run_summary_for_status(board: str, board_meta: dict[str, Any], worker: dict[str, Any]) -> dict[str, Any]:
+    if not board_meta.get("archived"):
+        return read_board_run_summary(board)
+    embedded = worker.get("board_summary") if isinstance(worker.get("board_summary"), dict) else {}
+    if embedded and _is_current_board_run_summary(embedded, board):
+        return embedded
+    path = Path(str(board_meta.get("archived_path") or "")) / BOARD_RUN_SUMMARY_FILENAME
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return loaded if _is_current_board_run_summary(loaded, board) else {}
+
+
+def _feature_summary_snapshot_for_status(board: str, board_meta: dict[str, Any], worker: dict[str, Any]) -> dict[str, Any]:
+    if not board_meta.get("archived"):
+        return feature_summary_snapshot(board)
+    terminal_summary = _read_board_run_summary_for_status(board, board_meta, worker)
+    state = _terminal_worker_reaction_state(worker) or str(terminal_summary.get("goal_status") or "") or "done"
+    outcome = _terminal_summary_outcome(terminal_summary) if terminal_summary else "Done."
+    snapshot = {
+        "board": board,
+        "thread_id": str(worker.get("thread_id") or ""),
+        "chat_id": str(worker.get("chat_id") or worker.get("thread_id") or ""),
+        "message_id": str(worker.get("summary_message_id") or "").strip(),
+        "source_message_id": str(worker.get("source_message_id") or "").strip(),
+        "guild_id": str(worker.get("guild_id") or "").strip(),
+        "parent_channel_id": str(worker.get("parent_channel_id") or "").strip(),
+        "state": state,
+        "title": _worker_generated_title(worker),
+        "fallback_title": _fallback_feature_title(worker),
+        "outcome": outcome,
+        "branch": str(worker.get("worker_branch") or "").strip(),
+        "pr_url": str(worker.get("pr_url") or "").strip(),
+        "pr_number": str(worker.get("pr_number") or "").strip(),
+        "public_url": str(worker.get("public_url") or "").strip(),
+        "board_summary": terminal_summary,
+        "runtime_breakdown": terminal_summary.get("runtime_breakdown") if isinstance(terminal_summary.get("runtime_breakdown"), dict) else {},
+        "terminal_summary_updated_at": terminal_summary.get("generated_at") if terminal_summary else None,
+        "updated_at": worker.get("updated_at"),
+    }
+    key_payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    snapshot["sync_key"] = hashlib.sha256(key_payload.encode("utf-8")).hexdigest()
+    return snapshot
+
+
+def _board_thread_state_for_status(board: str, board_meta: dict[str, Any], worker: dict[str, Any]) -> str:
+    if board_meta.get("archived"):
+        return _terminal_worker_reaction_state(worker) or "done"
+    return board_thread_state(board)
+
+
+def _board_thread_reaction_state_for_status(board: str, board_meta: dict[str, Any], worker: dict[str, Any]) -> str:
+    if board_meta.get("archived"):
+        return _terminal_worker_reaction_state(worker) or "done"
+    return board_thread_reaction_state(board)
+
+
+def _sync_metadata_path(metadata_path: object) -> Path | None:
+    if not metadata_path:
+        return None
+    try:
+        path = Path(str(metadata_path)).expanduser().resolve()
+    except Exception:
+        return None
+    try:
+        root = kanban_db.boards_root().resolve()
+    except Exception:
+        return None
+    if root not in path.parents:
+        return None
+    if path.name != "board.json":
+        return None
+    return path
+
+
+def _read_thread_sync_metadata(board: str, metadata_path: object = None) -> tuple[dict[str, Any], Path | None]:
+    path = _sync_metadata_path(metadata_path)
+    if path is not None:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return raw, path
+        except Exception:
+            logger.debug("Failed to read Discord thread sync metadata from %s", path, exc_info=True)
+    return kanban_db.read_board_metadata(board), None
+
+
+def _write_thread_sync_metadata(board: str, metadata: dict[str, Any], path: Path | None) -> None:
+    metadata.pop("db_path", None)
+    if path is not None:
+        atomic_json_write(path, metadata, indent=2)
+        return
+    atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
+
+
 def mark_thread_status_synced(
     board: str,
     *,
     reaction: bool = False,
     summary: bool = False,
     completion_message: bool = False,
+    metadata_path: object = None,
 ) -> None:
     """Clear one-shot terminal Discord thread sync flags for a board.
 
@@ -3385,7 +3542,7 @@ def mark_thread_status_synced(
     """
     if not board or not (reaction or summary or completion_message):
         return
-    metadata = kanban_db.read_board_metadata(board)
+    metadata, sync_path = _read_thread_sync_metadata(board, metadata_path)
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
     if worker.get("kind") != "discord_worker_board":
         return
@@ -3393,10 +3550,13 @@ def mark_thread_status_synced(
     if reaction:
         if worker.pop("terminal_reaction_sync_pending", None) is not None:
             changed = True
-        try:
-            reaction_state = board_thread_reaction_state(board)
-        except Exception:
-            reaction_state = ""
+        if sync_path is not None:
+            reaction_state = _terminal_worker_reaction_state(worker)
+        else:
+            try:
+                reaction_state = board_thread_reaction_state(board)
+            except Exception:
+                reaction_state = ""
         if reaction_state in {"done", "blocked", "errored"} and _terminal_reaction_synced_state(worker) != reaction_state:
             worker["terminal_reaction_synced_state"] = reaction_state
             changed = True
@@ -3408,19 +3568,19 @@ def mark_thread_status_synced(
         return
     worker["updated_at"] = _now()
     metadata[DISCORD_WORKER_META_KEY] = worker
-    metadata.pop("db_path", None)
-    atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
+    _write_thread_sync_metadata(board, metadata, sync_path)
 
 
 def mark_thread_completion_notice_sent(
     board: str,
     *,
     message_id: Optional[str] = None,
+    metadata_path: object = None,
 ) -> None:
     """Record durable proof that a terminal completion notice was sent."""
     if not board:
         return
-    metadata = kanban_db.read_board_metadata(board)
+    metadata, sync_path = _read_thread_sync_metadata(board, metadata_path)
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
     if worker.get("kind") != "discord_worker_board":
         return
@@ -3437,8 +3597,7 @@ def mark_thread_completion_notice_sent(
         return
     worker["updated_at"] = now
     metadata[DISCORD_WORKER_META_KEY] = worker
-    metadata.pop("db_path", None)
-    atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
+    _write_thread_sync_metadata(board, metadata, sync_path)
 
 
 def _board_runtime_snapshot(
