@@ -7296,7 +7296,31 @@ class GatewayRunner:
             pass
         board_summary = target.get("board_summary") if isinstance(target.get("board_summary"), dict) else {}
         final_response = board_summary.get("final_response") if isinstance(board_summary.get("final_response"), dict) else {}
-        return bool(str(final_response.get("text") or "").strip())
+        if str(final_response.get("text") or "").strip():
+            return True
+        # Role-worker / cron-origin boards can finish without a final agent
+        # message recorded on the board. The Discord adapter already renders a
+        # useful fallback from the deterministic board summary; do not leave the
+        # visible thread pending forever just because final_response is empty.
+        if str(target.get("outcome") or "").strip():
+            return True
+        if not board_summary:
+            return False
+        if str(board_summary.get("outcome") or "").strip():
+            return True
+        task_counts = board_summary.get("task_counts") if isinstance(board_summary.get("task_counts"), dict) else {}
+        try:
+            if int(task_counts.get("total") or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+        pr = board_summary.get("pr") if isinstance(board_summary.get("pr"), dict) else {}
+        if str(pr.get("url") or "").strip():
+            return True
+        latest_tasks = board_summary.get("latest_tasks")
+        if isinstance(latest_tasks, list) and latest_tasks:
+            return True
+        return False
 
     @staticmethod
     def _discord_foreman_clamped_int(
