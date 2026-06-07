@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-07 20:33 UTC
+Last updated: 2026-06-08 00:02 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -34,6 +34,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Fixed self-improvement Discord approval embeds and Command Center artifacts so approved cron-origin worker jobs link to the specific worker board instead of a bare `/workers` index; existing audit metadata can now repair legacy worker URLs without creating duplicate Work Items.
 - [x] Fixed terminal Discord worker reaction sync so paused/cancelled boards with pending terminal sync remain status targets before archive; archive no longer gets stuck forever on the “retry after sync” guard when a stale paused board still needs its final Discord reaction.
 - [x] Changed Discord worker-board completion follow-ups without a captured final response to render like normal feature-request shipped summaries: `What changed`, `Verification`, and `Shipped` sections from board metadata instead of raw Kanban internals.
+- [x] Hardened Kanban role-worker recovery so reviewer/planner/dev/foreman tasks already blocked by the dead-PID race can still apply a fresh recorded sidecar result instead of leaving the board permanently stuck.
 
 ## In Progress
 
