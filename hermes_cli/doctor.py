@@ -1982,36 +1982,61 @@ def run_doctor(args):
                 )
             else:
                 from plugins.memory.honcho.client import get_honcho_client, reset_honcho_client
+
+                def _report_honcho_embeddings_repair(repaired: bool, repair_facts: list[str]) -> None:
+                    if not repair_facts:
+                        return
+                    if repaired:
+                        check_ok("Honcho embeddings auto-repair", "docker start hermes-honcho-embeddings")
+                    else:
+                        check_warn("Honcho embeddings auto-repair", "not completed")
+                    for fact in repair_facts:
+                        check_info(fact)
+
+                def _repair_honcho_embeddings_from_connection(detail: object) -> bool:
+                    if not hcfg.base_url:
+                        return False
+                    try:
+                        from plugins.memory.honcho.cli import repair_honcho_embeddings_for_base_url_health
+
+                        repaired, repair_facts = repair_honcho_embeddings_for_base_url_health(
+                            hcfg.base_url,
+                            detail,
+                        )
+                        _report_honcho_embeddings_repair(repaired, repair_facts)
+                        return repaired
+                    except Exception as repair_exc:
+                        check_warn("Honcho embeddings auto-repair", f"failed: {repair_exc}")
+                        return False
+
+                def _repair_honcho_embeddings_from_endpoint() -> bool:
+                    if not hcfg.base_url:
+                        return False
+                    try:
+                        from plugins.memory.honcho.cli import repair_honcho_embeddings_for_local_base_url
+
+                        repaired, repair_facts = repair_honcho_embeddings_for_local_base_url(hcfg.base_url)
+                        _report_honcho_embeddings_repair(repaired, repair_facts)
+                        return repaired
+                    except Exception as repair_exc:
+                        check_warn("Honcho embeddings auto-repair", f"failed: {repair_exc}")
+                        return False
+
                 reset_honcho_client()
                 try:
                     get_honcho_client(hcfg)
+                    _repair_honcho_embeddings_from_endpoint()
                     check_ok(
                         "Honcho connected",
                         f"workspace={hcfg.workspace_id} mode={hcfg.recall_mode} freq={hcfg.write_frequency}",
                     )
                 except Exception as _e:
-                    repaired = False
-                    if hcfg.base_url:
-                        try:
-                            from plugins.memory.honcho.cli import repair_honcho_embeddings_for_base_url_health
-
-                            repaired, repair_facts = repair_honcho_embeddings_for_base_url_health(
-                                hcfg.base_url,
-                                _e,
-                            )
-                            if repair_facts:
-                                if repaired:
-                                    check_ok("Honcho embeddings auto-repair", "docker start hermes-honcho-embeddings")
-                                else:
-                                    check_warn("Honcho embeddings auto-repair", "not completed")
-                                for fact in repair_facts:
-                                    check_info(fact)
-                        except Exception as repair_exc:
-                            check_warn("Honcho embeddings auto-repair", f"failed: {repair_exc}")
+                    repaired = _repair_honcho_embeddings_from_connection(_e)
                     if repaired:
                         reset_honcho_client()
                         try:
                             get_honcho_client(hcfg)
+                            _repair_honcho_embeddings_from_endpoint()
                             check_ok(
                                 "Honcho connected",
                                 f"workspace={hcfg.workspace_id} mode={hcfg.recall_mode} freq={hcfg.write_frequency}",

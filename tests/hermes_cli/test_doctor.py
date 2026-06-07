@@ -426,6 +426,70 @@ class TestDoctorMemoryProviderSection:
         assert "Honcho connected" in out
         assert "Honcho connection failed" not in out
 
+    def test_honcho_embeddings_repair_runs_when_client_connects_but_embeddings_are_down(self, monkeypatch, tmp_path):
+        import plugins.memory.honcho.client as honcho_client
+        import plugins.memory.honcho.cli as honcho_cli
+
+        home = self._make_hermes_home(tmp_path, provider="honcho")
+        honcho_config = tmp_path / "honcho.json"
+        honcho_config.write_text("{}", encoding="utf-8")
+
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        (tmp_path / "project").mkdir(exist_ok=True)
+
+        fake_model_tools = types.SimpleNamespace(
+            check_tool_availability=lambda *a, **kw: ([], []),
+            TOOLSET_REQUIREMENTS={},
+        )
+        monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+        hcfg = SimpleNamespace(
+            enabled=True,
+            api_key=None,
+            base_url="http://127.0.0.1:8000",
+            workspace_id="hermes",
+            recall_mode="hybrid",
+            write_frequency="async",
+        )
+        monkeypatch.setattr(honcho_client.HonchoClientConfig, "from_global_config", lambda: hcfg)
+        monkeypatch.setattr(honcho_client, "resolve_config_path", lambda: honcho_config)
+        monkeypatch.setattr(honcho_client, "reset_honcho_client", lambda: None)
+        monkeypatch.setattr(honcho_client, "get_honcho_client", lambda cfg: object())
+
+        repair_calls = []
+
+        def fake_repair(base_url):
+            repair_calls.append(base_url)
+            return True, [
+                "Embeddings health failed at http://127.0.0.1:8080/health: [Errno 111] Connection refused",
+                "container hermes-honcho-embeddings state=exited status=Exited (0) 2 hours ago",
+                "Repair attempted: docker start hermes-honcho-embeddings",
+                "Embeddings health OK at http://127.0.0.1:8080/health: {'status': 'ok'}",
+                "/app/llama-server exists and is executable",
+                "Repair complete: re-enter normal Honcho doctor/status check",
+            ]
+
+        monkeypatch.setattr(
+            honcho_cli,
+            "repair_honcho_embeddings_for_local_base_url",
+            fake_repair,
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doctor_mod.run_doctor(Namespace(fix=False))
+        out = buf.getvalue()
+
+        assert repair_calls == ["http://127.0.0.1:8000"]
+        assert "Honcho embeddings auto-repair" in out
+        assert "Embeddings health failed at http://127.0.0.1:8080/health" in out
+        assert "Repair attempted: docker start hermes-honcho-embeddings" in out
+        assert "/app/llama-server exists and is executable" in out
+        assert "Honcho connected" in out
+        assert "Honcho connection failed" not in out
+
 
 def test_run_doctor_termux_treats_docker_and_browser_warnings_as_expected(monkeypatch, tmp_path):
     helper = TestDoctorMemoryProviderSection()

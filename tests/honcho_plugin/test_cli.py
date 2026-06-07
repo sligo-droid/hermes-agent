@@ -640,7 +640,7 @@ class TestHonchoEmbeddingsAutoRepair:
 
         assert ok is False
         assert not any(cmd[1:2] == ["start"] for cmd in calls)
-        assert any("not in the exited state" in fact for fact in facts)
+        assert any("not in the stopped/exited state" in fact for fact in facts)
 
     def test_non_connection_refused_honcho_failure_does_not_repair(self):
         import plugins.memory.honcho.cli as honcho_cli
@@ -685,6 +685,26 @@ class TestHonchoEmbeddingsAutoRepair:
         assert ok is False
         assert called is False
         assert facts == ["Repair skipped: Honcho base URL is not local"]
+
+    def test_local_base_url_repair_uses_embeddings_endpoint_failure(self):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        called = []
+
+        def fake_repair(**kwargs):
+            called.append(kwargs)
+            return True, ["Embeddings health failed at http://127.0.0.1:8080/health: connection refused"]
+
+        from unittest.mock import patch
+
+        with patch.object(honcho_cli, "auto_repair_honcho_embeddings_container", fake_repair):
+            ok, facts = honcho_cli.repair_honcho_embeddings_for_local_base_url(
+                "http://127.0.0.1:8000",
+            )
+
+        assert ok is True
+        assert called == [{"port": honcho_cli.LOCAL_EMBEDDING_PORT}]
+        assert facts == ["Embeddings health failed at http://127.0.0.1:8080/health: connection refused"]
 
     def test_docker_start_failure_reports_exact_step(self):
         import plugins.memory.honcho.cli as honcho_cli

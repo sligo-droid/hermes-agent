@@ -693,8 +693,8 @@ def auto_repair_honcho_embeddings_container(
 
     state, state_detail = _docker_container_state(docker, run=run)
     facts.append(state_detail)
-    if state != "exited":
-        facts.append("Repair skipped: container is not in the exited state")
+    if state not in {"exited", "stopped"}:
+        facts.append("Repair skipped: container is not in the stopped/exited state")
         return False, facts
 
     start_cmd = [docker, "start", LOCAL_EMBEDDING_CONTAINER]
@@ -870,6 +870,17 @@ def repair_honcho_embeddings_for_base_url_health(
         ]
     repaired, facts = auto_repair_honcho_embeddings_container(port=port)
     return repaired, [f"Local Honcho health failed: {detail}", *facts]
+
+
+def repair_honcho_embeddings_for_local_base_url(
+    base_url: str,
+    *,
+    port: int = LOCAL_EMBEDDING_PORT,
+) -> tuple[bool, list[str]]:
+    if not _is_local_url(base_url):
+        return False, ["Repair skipped: Honcho base URL is not local"]
+    repaired, facts = auto_repair_honcho_embeddings_container(port=port)
+    return repaired, facts
 
 
 def _embedding_pid_path() -> Path:
