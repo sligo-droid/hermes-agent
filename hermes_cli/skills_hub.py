@@ -713,7 +713,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
             c.print(Panel("\n".join(metadata_lines), title="Upstream Metadata", border_style="blue"))
 
     # Confirm with user — show appropriate warning based on source
-    # skip_confirm bypasses the prompt (needed in TUI mode where input() hangs)
+    # skip_confirm bypasses the prompt for non-interactive installs.
     if not force and not skip_confirm:
         c.print()
         if bundle.source == "official":
@@ -1180,7 +1180,7 @@ def do_uninstall(name: str, console: Optional[Console] = None,
 
     c = console or _console
 
-    # skip_confirm bypasses the prompt (needed in TUI mode where input() hangs)
+    # skip_confirm bypasses the prompt for non-interactive uninstalls.
     if not skip_confirm:
         c.print(f"\n[bold]Uninstall '{name}'?[/]")
         try:

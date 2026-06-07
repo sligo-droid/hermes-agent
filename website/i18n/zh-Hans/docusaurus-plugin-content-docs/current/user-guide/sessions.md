@@ -142,7 +142,7 @@ display:
 ```
 
 :::tip
-Session ID 格式为 `YYYYMMDD_HHMMSS_<hex>`——CLI/TUI session 使用 6 位十六进制后缀（例如 `20250305_091523_a1b2c3`），gateway session 使用 8 位后缀（例如 `20250305_091523_a1b2c3d4`）。可以按 ID（完整或唯一前缀）或按标题恢复——`-c` 和 `-r` 均支持两种方式。
+Session ID 格式为 `YYYYMMDD_HHMMSS_<hex>`——CLI session 使用 6 位十六进制后缀（例如 `20250305_091523_a1b2c3`），gateway session 使用 8 位后缀（例如 `20250305_091523_a1b2c3d4`）。可以按 ID（完整或唯一前缀）或按标题恢复——`-c` 和 `-r` 均支持两种方式。
 :::
 
 ## 跨平台切换

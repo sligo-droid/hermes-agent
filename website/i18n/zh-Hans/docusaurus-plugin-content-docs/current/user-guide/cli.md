@@ -6,11 +6,7 @@ description: "掌握 Hermes Agent 终端界面——命令、快捷键、人格�
 
 # CLI 界面
 
-Hermes Agent 的 CLI 是一个完整的终端用户界面（TUI），而非 Web UI。它支持多行编辑、斜杠命令自动补全、对话历史、中断并重定向，以及流式工具输出。专为常驻终端的用户而生。
-
-:::tip
-Hermes 还提供了一个现代 TUI，支持模态覆盖层、鼠标选择和非阻塞输入。使用 `hermes --tui` 启动——参见 [TUI](tui.md) 指南。
-:::
+Hermes Agent 的 CLI 是一个完整的交互式终端界面，而非 Web UI。它支持多行编辑、斜杠命令自动补全、对话历史、中断并重定向，以及流式工具输出。专为常驻终端的用户而生。
 
 ## 运行 CLI
 
@@ -129,7 +125,7 @@ hermes -w -q "Fix issue #123"     # 在 worktree 中以单次查询模式运行
 | `/reasoning high` | 提高推理强度 |
 | `/title My Session` | 为当前会话命名 |
 | `/status` | 显示会话信息——模型/配置/token/时长——以及本地**会话摘要**块（近期轮次数、常用工具、涉及文件、最新用户 prompt + 助手回复）。纯本地计算，不调用 LLM。 |
-| `/sessions` | 在经典 CLI 中直接打开交互式会话选择器（与 TUI 使用同一界面）。输入过滤，方向键导航，Enter 恢复。 |
+| `/sessions` | 在 CLI 中直接打开交互式会话选择器。输入过滤，方向键导航，Enter 恢复。 |
 
 完整的内置 CLI 和消息列表，参见[斜杠命令参考](../reference/slash-commands.md)。
 

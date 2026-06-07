@@ -4,7 +4,7 @@ This document is durable context for Sligo Labs' `hermes-agent` fork. It should 
 
 ## Product Goal
 
-Hermes Agent is an autonomous AI agent framework. In Sligo Labs' fork, Hermes is also command infrastructure for building and operating high-quality end-client software: CLI/TUI agent, messaging gateway, Discord dev-shop, Kanban worker orchestration, cron/self-improvement loops, and the Sligo Command Center.
+Hermes Agent is an autonomous AI agent framework. In Sligo Labs' fork, Hermes is also command infrastructure for building and operating high-quality end-client software: CLI agent, messaging gateway, Discord dev-shop, Kanban worker orchestration, cron/self-improvement loops, and the Sligo Command Center.
 
 The target is not “more autonomous churn.” The target is reliable, evidence-backed execution that preserves attention, ships the right work, and keeps operator state visible.
 
@@ -12,7 +12,7 @@ The target is not “more autonomous churn.” The target is reliable, evidence-
 
 Primary users:
 
-- Sligo Labs operator/developer using CLI, TUI, Discord, and dashboard surfaces.
+- Sligo Labs operator/developer using CLI, Discord, and dashboard surfaces.
 - Trusted Discord project channels, especially Hermes `#dev` and PID.
 - Future agents/workers that need to resume repo work without reconstructing state from conversations.
 
@@ -45,7 +45,7 @@ Boundary rule: if a note says “what is true right now for this Hermes repo,”
 Stable repo map lives in `AGENTS.md`; this section is the product-level map.
 
 - **Agent runtime:** `run_agent.py`, `agent/`, `model_tools.py`, `toolsets.py`, `tools/`.
-- **CLI/TUI:** classic CLI in `cli.py`/`hermes_cli/`; modern Ink TUI in `ui-tui/` with Python bridge under `tui_gateway/`.
+- **CLI:** classic CLI in `cli.py`/`hermes_cli/`.
 - **Gateway:** `gateway/` plus platform plugins. Discord adapter behavior is central to Sligo dev-shop operations.
 - **Kanban/workers:** durable SQLite boards and dispatcher/worker code under `hermes_cli/kanban*` plus worker-specific tools.
 - **Cron:** `cron/` scheduler and job state, used for unattended audits and delivery.

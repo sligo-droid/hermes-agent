@@ -40,8 +40,7 @@ File counts shift constantly; use the filesystem as source of truth. Common entr
 - `gateway/` — messaging gateway/session orchestration and core platform helpers; platform adapters may live in plugins (Discord: `plugins/platforms/discord/adapter.py`, `DiscordAdapter`; do not infer missing Hermes source from `discord.py` package bytecode).
 - `plugins/` — plugin systems: platform adapters, memory, context engine, model providers, kanban, observability, image generation, etc.
 - `skills/` — bundled default skills; `optional-skills/` — heavier/niche skills installed explicitly.
-- `ui-tui/` + `tui_gateway/` — Ink TUI and Python JSON-RPC gateway.
-- `hermes_cli/pty_bridge.py` + `hermes_cli/web_server.py` — dashboard `/chat` embeds the real TUI through a PTY.
+- `web/` + `hermes_cli/web_server.py` — browser dashboard and operator surfaces.
 - `cron/` — scheduled jobs.
 - `tests/` — pytest suite; always run through `scripts/run_tests.sh`.
 
@@ -77,25 +76,9 @@ When adding a command:
 
 The CLI skin engine lives in `hermes_cli/skin_engine.py`. Skins are data-only; built-ins live in `_BUILTIN_SKINS`, user skins live under `$HERMES_HOME/skins/*.yaml`, and runtime activation uses `/skin <name>` or `display.skin`.
 
-## TUI and Dashboard
+## Dashboard
 
-The TUI is the primary terminal UI: Node/Ink owns rendering and Python `tui_gateway` owns sessions/tools/model calls over newline-delimited JSON-RPC.
-
-Useful commands:
-
-```bash
-cd ui-tui
-npm install        # first time
-npm run dev        # watch mode
-npm start          # production start
-npm run build      # build hermes-ink + tsc
-npm run type-check # tsc --noEmit
-npm run lint
-npm run fmt
-npm test           # vitest
-```
-
-Dashboard `/chat` embeds the real `hermes --tui` through `hermes_cli/pty_bridge.py`; do **not** rebuild the main chat transcript/composer in React. Support UI around the PTY pane is fine (sidebars, inspectors, status panels) as long as it does not replace the terminal chat surface or couple state destructively to the PTY child.
+The browser dashboard lives in `web/` with Python routes in `hermes_cli/web_server.py`.
 
 ## Tools and Toolsets
 

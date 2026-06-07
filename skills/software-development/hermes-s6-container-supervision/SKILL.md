@@ -54,7 +54,7 @@ If you're just running the Hermes Agent and want to use Docker, see `website/doc
 │
 └── CMD ("main program")               ← /opt/hermes/docker/main-wrapper.sh
     └── routes user args: bare exec | hermes subcommand | hermes (no args)
-        — exec'd by /init with stdin/stdout/stderr inherited (TTY for --tui)
+        — exec'd by /init with stdin/stdout/stderr inherited
 ```
 
 ## Key files

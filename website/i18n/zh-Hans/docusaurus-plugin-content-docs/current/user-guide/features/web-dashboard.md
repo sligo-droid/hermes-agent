@@ -24,7 +24,6 @@ hermes dashboard
 | `--host` | `127.0.0.1` | 绑定地址 |
 | `--no-open` | — | 不自动打开浏览器 |
 | `--insecure` | 关闭 | 允许绑定到非 localhost 主机（**危险**——会在网络上暴露 API 密钥；请配合防火墙和强认证使用） |
-| `--tui` | 关闭 | 启用浏览器内 Chat 标签页（通过 PTY/WebSocket 嵌入 `hermes --tui`）。也可设置 `HERMES_DASHBOARD_TUI=1`。 |
 
 ```bash
 # 自定义端口
@@ -36,23 +35,19 @@ hermes dashboard --host 0.0.0.0
 # 启动时不打开浏览器
 hermes dashboard --no-open
 
-# 启用浏览器内 Chat 标签页
-hermes dashboard --tui
 ```
 
 ## 前置条件
 
-默认的 `hermes-agent` 安装不包含 HTTP 栈或 PTY 辅助工具——这些是可选扩展。**Web Dashboard** 需要 FastAPI 和 Uvicorn（`web` 扩展）。**Chat** 标签页还需要 `ptyprocess` 来在伪终端（pseudo-terminal）后面启动嵌入式 TUI（POSIX 上的 `pty` 扩展）。使用以下命令同时安装：
+默认的 `hermes-agent` 安装不包含 HTTP 栈——这是可选扩展。**Web Dashboard** 需要 FastAPI 和 Uvicorn（`web` 扩展）。使用以下命令安装：
 
 ```bash
-pip install 'hermes-agent[web,pty]'
+pip install 'hermes-agent[web]'
 ```
 
-`web` 扩展会引入 FastAPI/Uvicorn；`pty` 扩展会引入 `ptyprocess`（POSIX）或 `pywinpty`（原生 Windows——注意嵌入式 TUI 本身仍需要 WSL）。`pip install hermes-agent[all]` 包含两个扩展，如果你还需要消息/语音等功能，这是最简便的方式。
+`pip install hermes-agent[all]` 包含 web 扩展，如果你还需要消息/语音等功能，这是最简便的方式。
 
 在没有依赖项的情况下运行 `hermes dashboard` 时，它会告诉你需要安装什么。如果前端尚未构建且 `npm` 可用，则会在首次启动时自动构建。
-
-Chat 标签页在普通 `hermes dashboard` 启动时默认关闭。如需嵌入式浏览器聊天面板，请使用 `hermes dashboard --tui` 启动，或设置 `HERMES_DASHBOARD_TUI=1`。
 
 ## 页面
 
@@ -66,28 +61,6 @@ Chat 标签页在普通 `hermes dashboard` 启动时默认关闭。如需嵌入�
 - **最近会话**——最近 20 个会话的列表，包含模型、消息数、token 用量和对话预览
 
 状态页每 5 秒自动刷新一次。
-
-### Chat（聊天）
-
-**Chat** 标签页将完整的 Hermes TUI（与 `hermes --tui` 相同的界面）直接嵌入浏览器。你在终端 TUI 中能做的一切——斜杠命令、模型选择器、工具调用卡片、Markdown 流式输出、clarify/sudo/approval 提示、皮肤主题——在这里都完全一致，因为 Dashboard 运行的是真实的 TUI 二进制文件，并通过 [xterm.js](https://xtermjs.org/) 的 WebGL 渲染器以像素级精度渲染其 ANSI 输出。
-
-**工作原理：**
-
-- `/api/pty` 打开一个经 Dashboard 会话 token 认证的 WebSocket
-- 服务器在 POSIX 伪终端后面启动 `hermes --tui`
-- 按键传输到 PTY；ANSI 输出流式返回浏览器
-- xterm.js 的 WebGL 渲染器将每个单元格绘制到整数像素网格；鼠标追踪（SGR 1006）、宽字符（Unicode 11）和方框绘制字形均原生渲染
-- 调整浏览器窗口大小会通过 `@xterm/addon-fit` 插件调整 TUI 大小
-
-**恢复已有会话：** 在 **Sessions** 标签页中，点击任意会话旁的播放图标（▶）。这会跳转到 `/chat?resume=<id>` 并以 `--resume` 参数启动 TUI，加载完整历史记录。
-
-**前置条件：**
-
-- Node.js（与 `hermes --tui` 相同的要求；TUI 包在首次启动时构建）
-- `ptyprocess`——由 `pty` 扩展安装（`pip install 'hermes-agent[web,pty]'`，或 `[all]` 同时包含两者）
-- POSIX 内核（Linux、macOS 或 WSL2）。`/chat` 终端面板特别需要 POSIX PTY——原生 Windows Python 没有等效实现，因此在原生 Windows 安装上，Dashboard 的其余部分（sessions、jobs、metrics、config editor）可以正常工作，但 `/chat` 标签页会显示提示，告知你需要使用 WSL2 才能使用该功能。
-
-关闭浏览器标签页后，PTY 会在服务器端被干净地回收。重新打开会启动一个新会话。
 
 ### Config（配置）
 

@@ -14,7 +14,6 @@ tests/hermes_cli/test_profile_distribution.py::TestCodingTeamDistributionExample
 tests/agent/test_shell_hooks.py::TestCallbackSubprocess::test_block_translation_end_to_end
 
 # Core session and agent sanity checks.
-tests/test_lazy_session_regressions.py
 tests/run_agent/test_session_id_env.py
 tests/run_agent/test_session_meta_filtering.py
 tests/run_agent/test_session_reset_fix.py

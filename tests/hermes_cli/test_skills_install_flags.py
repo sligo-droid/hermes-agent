@@ -1,7 +1,7 @@
 """
 Tests for --yes / --force flag separation in `hermes skills install`.
 
---yes / -y  → skip_confirm (bypass interactive prompt, needed in TUI mode)
+--yes / -y  → skip_confirm (bypass interactive prompt for non-interactive installs)
 --force     → force (install despite blocked scan verdict)
 
 Based on PR #1595 by 333Alden333 (salvaged).
