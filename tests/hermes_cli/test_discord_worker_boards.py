@@ -480,8 +480,8 @@ def test_board_thread_state_reflects_kanban_tasks(monkeypatch, tmp_path):
             (failed,),
         )
         conn.commit()
-        assert dwb.board_thread_state(board.slug) == "errored"
-        assert dwb.board_thread_reaction_state(board.slug) == "errored"
+        assert dwb.board_thread_state(board.slug) == "blocked"
+        assert dwb.board_thread_reaction_state(board.slug) == "blocked"
     finally:
         conn.close()
 

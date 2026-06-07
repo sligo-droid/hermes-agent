@@ -2361,14 +2361,13 @@ def board_thread_state(board: str) -> str:
         tasks = kanban_db.list_tasks(conn, include_archived=False)
         if tasks:
             blocked_tasks = [task for task in tasks if task.status == "blocked"]
-            for task in blocked_tasks:
-                latest = kanban_db.latest_run(conn, task.id)
-                if (
-                    (latest and latest.outcome in {"spawn_failed", "crashed", "timed_out", "gave_up"})
-                    or (latest is None and task.last_failure_error)
-                ):
-                    return "errored"
             if blocked_tasks:
+                # The public Discord marker should reflect the current board
+                # state, not the run outcome that explained how it got there.
+                # A crashed/timed-out role worker parks the ticket in Kanban's
+                # blocked lane for operator attention; leaving the source
+                # message on ⏳ hides that stall, while showing ❌ implies a
+                # terminal failure rather than a human-actionable blocker.
                 return "blocked"
             if is_terminal and all(task.status == "done" for task in tasks):
                 return "done"
@@ -3352,9 +3351,14 @@ def thread_status_targets() -> list[dict[str, Any]]:
                 reaction_state in {"done", "blocked", "errored"}
                 and reaction_state != _terminal_reaction_synced_state(worker)
             )
+        non_terminal_attention_state = (
+            not is_terminal_worker
+            and state in {"blocked", "errored"}
+        )
         if (
             visible_state not in {"active", "running"}
             and not source_state
+            and not non_terminal_attention_state
             and not (
                 is_terminal_worker
                 and state in {"done", "blocked", "errored"}
