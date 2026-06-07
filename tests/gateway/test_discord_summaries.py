@@ -1541,11 +1541,109 @@ async def test_send_kanban_completion_notice_posts_once(adapter, monkeypatch, tm
     assert sent == board.slug
     assert len(thread.sent) == 1
     kwargs, _message = thread.sent[0]
-    assert "Done. Tasks: done:1 total:1." in kwargs["content"]
+    assert kwargs["content"].startswith("Completed.\n\nWhat changed:")
     assert "https://github.example/pr/1" in kwargs["content"]
-    assert "Worker: https://hermes.example/workers/200" in kwargs["content"]
+    assert "Shipped:" in kwargs["content"]
+    assert "- Worker: https://hermes.example/workers/200" in kwargs["content"]
+    assert "Board summary:" not in kwargs["content"]
     worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert "terminal_completion_message_pending" not in worker
+
+
+@pytest.mark.asyncio
+async def test_send_kanban_completion_notice_renders_human_fallback_summary(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 200 else None
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
+
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.start_direct_goal(thread_id="200", goal="Ship the dashboard")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_completion_message_pending": True,
+        },
+    )
+
+    sent = await adapter.send_kanban_completion_notice(
+        {
+            "board": board.slug,
+            "thread_id": "200",
+            "chat_id": "200",
+            "state": "done",
+            "terminal_completion_message_pending": True,
+            "board_summary": {
+                "title": "Ship the dashboard",
+                "outcome": "Done. Tasks: done:3. PR: https://github.example/pr/1.",
+                "latest_tasks": [
+                    {
+                        "assignee": "reviewer",
+                        "status": "done",
+                        "latest_summary": "Approved. The implementation is covered and ready to ship.",
+                    },
+                    {
+                        "assignee": "developer",
+                        "status": "done",
+                        "latest_summary": "Implemented dataset-scoped Census helper and Data Ledger wiring.",
+                    },
+                    {
+                        "assignee": "planner",
+                        "status": "done",
+                        "latest_summary": "Confirmed the requested Federal Census panel scope.",
+                    },
+                ],
+                "review": {
+                    "final_verdict": {
+                        "status": "approved",
+                        "summary": "Approved. The implementation is covered and ready to ship.",
+                    }
+                },
+                "verification_commands": [
+                    {"command": "pnpm --dir dashboard check", "result": "passed"},
+                    {"command": "git diff --check", "result": "passed"},
+                ],
+                "pr": {
+                    "url": "https://github.example/pr/1",
+                    "merge_state": "merged",
+                    "merge_commit": "abcdef1234567890",
+                    "checks_status": "passed",
+                    "checks_total": 4,
+                },
+                "deployment_status": "done",
+                "branch": "discord/200",
+                "task_counts": {"done": 3, "total": 3},
+                "public_url": "https://hermes.example/workers/200",
+            },
+        }
+    )
+
+    assert sent == board.slug
+    assert len(thread.sent) == 1
+    content = thread.sent[0][0]["content"]
+    assert content.startswith("Completed.\n\nWhat changed:")
+    what_changed = content.split("\n\nVerification:", 1)[0]
+    assert "- Implemented dataset-scoped Census helper and Data Ledger wiring." in content
+    assert "- Confirmed the requested Federal Census panel scope." in content
+    assert "- PR: https://github.example/pr/1" not in what_changed
+    assert "Verification:" in content
+    assert "- `pnpm --dir dashboard check` → `passed`" in content
+    assert "- PR checks: `passed` (4 checks)" in content
+    assert "- Deployment: `done`" in content
+    assert "Shipped:" in content
+    assert "- PR: https://github.example/pr/1" in content
+    assert "- Merged: `abcdef123456`" in content
+    assert "- Branch: `discord/200`" in content
+    assert "- Worker tasks: `3 done`" in content
+    assert "- Worker: https://hermes.example/workers/200" in content
+    assert "Board summary:" not in content
+    assert "Kanban goal:" not in content
+    assert "Runs:" not in content
+    assert "Runtime:" not in content
 
 
 @pytest.mark.asyncio

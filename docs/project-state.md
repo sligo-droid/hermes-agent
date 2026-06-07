@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-07 14:12 UTC
+Last updated: 2026-06-07 20:33 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -33,6 +33,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Hardened self-improvement Discord worker completion routing: final Discord responses now re-arm pending terminal follow-ups on already-complete boards, archived terminal boards with ready final responses remain discoverable for one-shot completion delivery, and approval routes that already created Discord threads fail visibly instead of silently falling back to default-board work when durable worker-board creation/activation fails.
 - [x] Fixed self-improvement Discord approval embeds and Command Center artifacts so approved cron-origin worker jobs link to the specific worker board instead of a bare `/workers` index; existing audit metadata can now repair legacy worker URLs without creating duplicate Work Items.
 - [x] Fixed terminal Discord worker reaction sync so paused/cancelled boards with pending terminal sync remain status targets before archive; archive no longer gets stuck forever on the “retry after sync” guard when a stale paused board still needs its final Discord reaction.
+- [x] Changed Discord worker-board completion follow-ups without a captured final response to render like normal feature-request shipped summaries: `What changed`, `Verification`, and `Shipped` sections from board metadata instead of raw Kanban internals.
 
 ## In Progress
 
