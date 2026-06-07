@@ -428,7 +428,11 @@ def _compression_churn_details(
     )
 
     reasons: list[str] = []
-    if current_no_progress and len(recent_compression_parents) >= _CHURN_RECENT_COMPRESSION_LIMIT:
+    if (
+        current_no_progress
+        and token_reduction_stalled
+        and len(recent_compression_parents) >= _CHURN_RECENT_COMPRESSION_LIMIT
+    ):
         reasons.append("recent_compression_lineage")
     if current_no_progress and current_is_empty_child and similar_tokens:
         reasons.append("empty_child_similar_tokens")

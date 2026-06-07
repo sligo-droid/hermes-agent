@@ -169,7 +169,7 @@ def test_compress_context_ignores_recovered_large_zero_message_ancestor():
         assert agent.session_id != "current"
 
 
-def test_compress_context_allows_reduced_zero_message_lineage():
+def test_compress_context_allows_reduced_zero_message_lineage_with_three_recent_compression_parents():
     from agent.conversation_compression import compress_context
     from hermes_state import SessionDB
     from run_agent import AIAgent
@@ -177,6 +177,7 @@ def test_compress_context_allows_reduced_zero_message_lineage():
     with tempfile.TemporaryDirectory() as tmpdir:
         db = SessionDB(db_path=Path(tmpdir) / "state.db")
         db.create_session("root", "cli")
+        db.update_token_counts("root", input_tokens=160_000, absolute=True)
         db.end_session("root", "compression")
 
         db.create_session("child1", "cli", parent_session_id="root")
@@ -184,7 +185,11 @@ def test_compress_context_allows_reduced_zero_message_lineage():
         db.end_session("child1", "compression")
 
         db.create_session("child2", "cli", parent_session_id="child1")
-        db.update_token_counts("child2", input_tokens=80_000, absolute=True)
+        db.update_token_counts("child2", input_tokens=90_000, absolute=True)
+        db.end_session("child2", "compression")
+
+        db.create_session("child3", "cli", parent_session_id="child2")
+        db.update_token_counts("child3", input_tokens=80_000, absolute=True)
 
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
             agent = AIAgent(
@@ -193,7 +198,7 @@ def test_compress_context_allows_reduced_zero_message_lineage():
                 model="test/model",
                 quiet_mode=True,
                 session_db=db,
-                session_id="child2",
+                session_id="child3",
                 skip_context_files=True,
                 skip_memory=True,
             )
@@ -221,7 +226,7 @@ def test_compress_context_allows_reduced_zero_message_lineage():
 
         assert compressed == [{"role": "user", "content": "compressed summary"}]
         assert new_system_prompt == "system"
-        assert agent.session_id != "child2"
+        assert agent.session_id != "child3"
 
 
 def test_compress_context_allows_meaningful_progress_lineage():
