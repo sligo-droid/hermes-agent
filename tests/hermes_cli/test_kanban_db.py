@@ -129,6 +129,76 @@ def test_board_metadata_non_utf8_bytes_fall_back_to_synthesized_metadata(kanban_
     assert any(row["slug"] == board for row in kb.list_boards(include_archived=True))
 
 
+def _inject_invalid_utf8_task_field(conn: sqlite3.Connection, task_id: str, field: str) -> None:
+    conn.execute(
+        f"UPDATE tasks SET {field} = CAST(x'ff' AS TEXT) WHERE id = ?",
+        (task_id,),
+    )
+
+
+def test_list_tasks_quarantines_post_init_invalid_utf8_body(kanban_home):
+    board = "utf8-body-board"
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(conn, title="bad body", assignee="alice")
+        _inject_invalid_utf8_task_field(conn, task_id, "body")
+
+        with pytest.raises(kb.KanbanDbCorruptError) as exc_info:
+            kb.list_tasks(conn)
+
+    incident = kb.is_board_paused_for_corruption(board)
+    assert incident is not None
+    assert incident["fingerprint"] == exc_info.value.incident["fingerprint"]
+    assert incident["quarantine_path"]
+    assert "post-init task-row read corruption in list_tasks" in incident["reason"]
+    assert "integrity_check=" in incident["reason"]
+
+    with kb.connect(board=board) as conn:
+        with pytest.raises(kb.KanbanDbCorruptError) as repeat:
+            kb.list_tasks(conn)
+    assert repeat.value.incident == incident
+
+
+def test_get_task_quarantines_post_init_invalid_utf8_status(kanban_home):
+    board = "utf8-status-board"
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(conn, title="bad status", assignee="alice")
+        _inject_invalid_utf8_task_field(conn, task_id, "status")
+
+        with pytest.raises(kb.KanbanDbCorruptError) as exc_info:
+            kb.get_task(conn, task_id)
+
+    incident = kb.is_board_paused_for_corruption(board)
+    assert incident is not None
+    assert incident == exc_info.value.incident
+    assert "post-init task-row read corruption in get_task" in incident["reason"]
+    assert incident["quarantine_path"]
+
+
+def test_dispatch_once_quarantines_post_init_invalid_utf8_ready_row(
+    kanban_home, all_assignees_spawnable,
+):
+    board = "utf8-dispatch-board"
+    spawns = []
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(conn, title="bad dispatch", assignee="alice")
+        _inject_invalid_utf8_task_field(conn, task_id, "assignee")
+
+        with pytest.raises(kb.KanbanDbCorruptError) as exc_info:
+            kb.dispatch_once(conn, board=board, spawn_fn=lambda task, workspace: spawns.append(task.id))
+
+    assert spawns == []
+    incident = kb.is_board_paused_for_corruption(board)
+    assert incident is not None
+    assert incident == exc_info.value.incident
+    assert "post-init task-row read corruption in dispatch_once.ready_rows" in incident["reason"]
+
+    with kb.connect(board=board) as conn:
+        with pytest.raises(kb.KanbanDbCorruptError) as repeat:
+            kb.dispatch_once(conn, board=board, spawn_fn=lambda task, workspace: spawns.append(task.id))
+    assert repeat.value.incident == incident
+    assert spawns == []
+
+
 def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     """Legacy DBs missing additive indexed columns must migrate cleanly.
 
