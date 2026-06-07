@@ -47,6 +47,7 @@
           ] ++ lib.optionals pkgs.stdenv.isLinux [ "matrix" ];
         };
 
+        tui = hermesAgent.hermesTui;
         web = hermesAgent.hermesWeb;
 
         fix-lockfiles = hermesAgent.hermesNpmLib.mkFixLockfiles {

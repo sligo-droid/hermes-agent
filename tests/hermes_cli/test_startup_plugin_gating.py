@@ -78,8 +78,10 @@ def _live_subcommand_names() -> set[str]:
         (["hermes", "-w"], None),
         # -p / --profile is stripped from sys.argv by
         # _apply_profile_override() at import time, so it never reaches
-        # _first_positional_argv. We test with just -w here.
+        # _first_positional_argv. We test with just -w / --tui here.
+        (["hermes", "-w", "--tui"], None),
         (["hermes", "version"], "version"),
+        (["hermes", "--tui", "chat"], "chat"),
         (["hermes", "-w", "logs"], "logs"),
         (["hermes", "chat", "hello world"], "chat"),
         (["hermes", "gateway", "run"], "gateway"),
@@ -114,6 +116,8 @@ def test_first_positional_argv(argv, expected):
         ["hermes", "version"],               # known built-in
         ["hermes", "logs"],
         ["hermes", "gateway", "run"],
+        ["hermes", "--tui"],
+        ["hermes", "-w", "--tui"],
         ["hermes", "chat", "hi"],
         ["hermes", "help"],                  # accepted built-in-ish
         ["hermes", "-m", "gpt5", "chat"],    # flag-value-skipping

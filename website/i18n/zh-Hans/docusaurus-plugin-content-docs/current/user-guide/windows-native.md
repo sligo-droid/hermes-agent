@@ -60,7 +60,7 @@ iex (irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/script
 | 依赖 | Hermes 需要它的原因 |
 |---|---|
 | **PortableGit** | 为终端工具提供 `bash.exe`，为会话内克隆提供 `git`。在安装时配置，而非由 `dep_ensure` 负责。 |
-| **Node.js 22** | 浏览器工具（`agent-browser`）和 WhatsApp 桥接所必需。 |
+| **Node.js 22** | 浏览器工具（`agent-browser`）、TUI 的 web 桥接以及 WhatsApp 桥接所必需。 |
 | **ffmpeg** | TTS / 语音消息的音频格式转换。 |
 | **ripgrep** | 快速文件搜索——不可用时回退到 `grep`。 |
 | **npm 包** | `agent-browser`、Playwright Chromium 以及各工具集的 Node 依赖，在首次使用浏览器工具时安装一次。 |
@@ -88,11 +88,12 @@ iex (irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/script
 
 ## 功能矩阵
 
-所有主要功能均可在 Windows 上原生运行。
+除 dashboard 内嵌终端面板外，所有功能均可在 Windows 上原生运行。
 
 | 功能 | 原生 Windows | WSL2 |
 |---|---|---|
 | CLI（`hermes chat`、`hermes setup`、`hermes gateway` 等） | ✓ | ✓ |
+| 交互式 TUI（`hermes --tui`） | ✓ | ✓ |
 | 消息 gateway（Telegram、Discord、Slack、WhatsApp，15+ 平台） | ✓ | ✓ |
 | Cron 调度器 | ✓ | ✓ |
 | 浏览器工具（通过 Node 驱动 Chromium） | ✓ | ✓ |

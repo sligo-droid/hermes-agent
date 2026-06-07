@@ -197,7 +197,7 @@ TUI 提供 `/agents` 浮层（别名 `/tasks`），将递归 `delegate_task` 扇
 - 终止和暂停控制——可在不中断其兄弟智能体的情况下取消特定子智能体
 - 事后回顾：即使子智能体已返回父智能体，也可逐轮查看其历史记录
 
-在 CLI 中使用 `/agents`（别名 `/tasks`）可以打印当前会话中活动 agent 和运行任务的简洁文本摘要。
+经典 CLI 仅将 `/agents` 打印为文本摘要；TUI 才是浮层真正发挥作用的地方。参见 [TUI — 斜杠命令](/user-guide/tui#slash-commands)。
 
 ## 深度限制与嵌套编排 {#depth-limit-and-nested-orchestration}
 

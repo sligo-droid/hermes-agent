@@ -1,7 +1,7 @@
 ---
 sidebar_position: 8
 title: "Extending the CLI"
-description: "Build wrapper CLIs that extend Hermes with custom widgets, keybindings, and layout changes"
+description: "Build wrapper CLIs that extend the Hermes TUI with custom widgets, keybindings, and layout changes"
 ---
 
 # Extending the CLI
@@ -85,7 +85,7 @@ python my_cli.py
 
 ### `_get_extra_tui_widgets()`
 
-Returns a list of prompt_toolkit widgets to insert into the CLI layout. Widgets appear **between the spacer and the status bar** — above the input area but below the main output.
+Returns a list of prompt_toolkit widgets to insert into the TUI layout. Widgets appear **between the spacer and the status bar** — above the input area but below the main output.
 
 ```python
 def _get_extra_tui_widgets(self) -> list:

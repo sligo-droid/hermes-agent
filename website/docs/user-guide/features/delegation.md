@@ -190,7 +190,14 @@ If a subagent times out having made **zero** API calls (usually: provider unreac
 
 ## Monitoring Running Subagents (`/agents`)
 
-Use `/agents` (alias `/tasks`) in the CLI to print a compact text summary of active agents and running tasks across the current session.
+The TUI ships a `/agents` overlay (alias `/tasks`) that turns recursive `delegate_task` fan-out into a first-class audit surface:
+
+- Live tree view of running and recently-finished subagents, grouped by parent
+- Per-branch cost, token, and file-touched rollups
+- Kill and pause controls — cancel a specific subagent mid-flight without interrupting its siblings
+- Post-hoc review: step through each subagent's turn-by-turn history even after they've returned to the parent
+
+The classic CLI just prints `/agents` as a text summary; the TUI is where the overlay shines. See [TUI — Slash commands](/user-guide/tui#slash-commands).
 
 ## Depth Limit and Nested Orchestration
 

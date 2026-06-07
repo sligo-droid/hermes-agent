@@ -79,7 +79,7 @@ class TestCliSkinPromptIntegration:
         assert cli._app.style is not None
         cli._invalidate.assert_called_once_with(min_interval=0.0)
 
-    def test_handle_skin_command_refreshes_live_cli(self, capsys):
+    def test_handle_skin_command_refreshes_live_tui(self, capsys):
         cli = _make_cli_stub()
 
         with patch("cli.save_config_value", return_value=True):
@@ -87,7 +87,7 @@ class TestCliSkinPromptIntegration:
 
         output = capsys.readouterr().out
         assert "Skin set to: ares (saved)" in output
-        assert "Prompt + CLI colors updated." in output
+        assert "Prompt + TUI colors updated." in output
         assert cli._app.style is not None
 
 

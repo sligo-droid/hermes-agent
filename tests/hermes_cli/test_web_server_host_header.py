@@ -158,9 +158,10 @@ class TestWebSocketHostOriginGuard:
         import hermes_cli.web_server as ws
 
         monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
 
         client = TestClient(ws.app)
-        url = f"/api/workers/sess-1/tickets/t_1/console/pty?token={ws._SESSION_TOKEN}"
+        url = f"/api/events?token={ws._SESSION_TOKEN}&channel=security-test"
         with pytest.raises(WebSocketDisconnect) as exc:
             with client.websocket_connect(
                 url,
@@ -180,9 +181,10 @@ class TestWebSocketHostOriginGuard:
         import hermes_cli.web_server as ws
 
         monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
 
         client = TestClient(ws.app)
-        url = f"/api/workers/sess-1/tickets/t_1/console/pty?token={ws._SESSION_TOKEN}"
+        url = f"/api/events?token={ws._SESSION_TOKEN}&channel=security-test"
         with pytest.raises(WebSocketDisconnect) as exc:
             with client.websocket_connect(
                 url,
@@ -201,9 +203,10 @@ class TestWebSocketHostOriginGuard:
         import hermes_cli.web_server as ws
 
         monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
 
         client = TestClient(ws.app)
-        url = f"/api/workers/sess-1/tickets/t_1/console/pty?token={ws._SESSION_TOKEN}"
+        url = f"/api/events?token={ws._SESSION_TOKEN}&channel=security-test"
         with client.websocket_connect(
             url,
             headers={

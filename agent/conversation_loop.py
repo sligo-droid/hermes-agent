@@ -1457,7 +1457,7 @@ def run_conversation(
             face = random.choice(KawaiiSpinner.get_thinking_faces())
             verb = random.choice(KawaiiSpinner.get_thinking_verbs())
             if agent.thinking_callback:
-                # Interactive CLI mode: use prompt_toolkit widget instead of raw spinner
+                # CLI TUI mode: use prompt_toolkit widget instead of raw spinner
                 # (works in both streaming and non-streaming modes)
                 agent.thinking_callback(f"{face} {verb}...")
             elif not agent._has_stream_consumers() and agent._should_start_quiet_spinner():

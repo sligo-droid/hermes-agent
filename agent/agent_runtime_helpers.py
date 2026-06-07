@@ -1377,7 +1377,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # failure, etc.) we restore these atomically so the agent isn't left with a
     # new model/provider name paired with the OLD client — that mismatch causes
     # HTTP 400s like "claude-sonnet-4-6 is not supported on openai-codex" on the
-    # next turn. Callers in cli.py / gateway/run.py
+    # next turn.  Callers in cli.py / gateway/run.py / tui_gateway/server.py
     # catch the re-raised exception and show the user a warning; without this
     # rollback the warning is misleading because the swap partially succeeded.
     # Use a sentinel so we can distinguish "attribute was unset" from
@@ -1484,8 +1484,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # Rollback every mutated field to the pre-swap snapshot so the agent
         # is left consistent (old model + old provider + old client) and the
         # caller's exception handler can surface a meaningful warning.  The
-        # exception is re-raised; cli.py / gateway/run.py catch it and print
-        # "Agent swap failed; change applied to next session".
+        # exception is re-raised; cli.py / gateway/run.py / tui_gateway catch
+        # it and print "Agent swap failed; change applied to next session".
         for _name, _value in _snapshot.items():
             if _value is _MISSING:
                 # Attribute did not exist before the swap — don't fabricate it.
@@ -1583,8 +1583,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # or the NEW one.  The chain was seeded from config at agent init for
     # the original provider — without pruning, a failed turn on the new
     # primary silently re-activates the provider the user just rejected,
-    # which is exactly what was reported during provider-switch testing
-    # ("switched to anthropic, CLI keeps trying openrouter").
+    # which is exactly what was reported during TUI v2 blitz testing
+    # ("switched to anthropic, tui keeps trying openrouter").
     old_norm = (old_provider or "").strip().lower()
     new_norm = (new_provider or "").strip().lower()
     fallback_chain = list(getattr(agent, "_fallback_chain", []) or [])

@@ -396,7 +396,7 @@ tool_timeout_sec = 600.0
 ## 架构
 
 ```
-                ┌─── Hermes shell (CLI / gateway) ───┐
+                ┌─── Hermes shell (CLI / TUI / gateway) ───┐
                 │  sessions DB · slash commands · memory   │
                 │  & skill review · cron · session pickers │
                 └──┬──────────────────────────────────────┬┘

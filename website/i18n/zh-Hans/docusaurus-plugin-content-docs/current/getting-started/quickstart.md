@@ -155,11 +155,14 @@ hermes config set OPENROUTER_API_KEY sk-or-...
 
 ```bash
 hermes            # 经典 CLI
+hermes --tui      # 现代 TUI（推荐）
 ```
 
 你会看到一个欢迎横幅，显示你的模型、可用工具和 skills。使用一个具体且易于验证的 prompt（提示词）：
 
-Hermes 使用 `hermes` 或 `hermes chat` 启动经典终端聊天界面。
+:::tip 选择你的界面
+Hermes 提供两种终端界面：经典的 `prompt_toolkit` CLI，以及更新的 [TUI](../user-guide/tui.md)（支持模态覆盖层、鼠标选择和非阻塞输入）。两者共享相同的会话、斜杠命令和配置——分别用 `hermes` 和 `hermes --tui` 试试看。
+:::
 
 ```
 Summarize this repo in 5 bullets and tell me what the main entrypoint is.
