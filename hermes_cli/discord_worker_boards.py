@@ -89,6 +89,7 @@ _POSIX_PATH_RE = re.compile(
 _WINDOWS_PATH_RE = re.compile(r"(?<![\w:/.-])[A-Za-z]:\\[^\s\"'<>),;{}\[\]]+")
 _CONTEXT_PACK_JSON_FILENAME = "context-pack.json"
 _CONTEXT_PACK_MARKDOWN_FILENAME = "context-pack.md"
+_SKIPPED_BOARD_TARGET_LOG_KEYS: set[tuple[str, str, str]] = set()
 
 
 class TicketMoveConflict(RuntimeError):
@@ -3236,7 +3237,10 @@ def thread_status_targets() -> list[dict[str, Any]]:
         pass
     for board_meta in kanban_db.list_boards(include_archived=False):
         board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
-        worker = _read_worker_meta(board)
+        if _board_target_skipped_by_metadata(board, board_meta, source="discord thread status targets"):
+            continue
+        raw_worker = board_meta.get(DISCORD_WORKER_META_KEY)
+        worker = dict(raw_worker) if isinstance(raw_worker, dict) else {}
         if worker.get("kind") != "discord_worker_board":
             continue
         thread_id = str(worker.get("thread_id") or "").strip()
@@ -3244,12 +3248,6 @@ def thread_status_targets() -> list[dict[str, Any]]:
             continue
         if _worker_source_message_too_old(worker):
             _clear_stale_terminal_sync_flags(board, worker)
-            continue
-        if _paused_corrupt_incident(board):
-            logger.debug(
-                "discord thread status targets: board %s paused for unchanged DB corruption; skipping",
-                board,
-            )
             continue
         try:
             summary = feature_summary_snapshot(board)
@@ -5368,8 +5366,24 @@ def is_paused_or_cancelled(board: str) -> bool:
 
 def _paused_corrupt_incident(board: str) -> Optional[dict[str, Any]]:
     try:
-        incident = kanban_db.is_board_paused_for_corruption(board)
+        metadata = kanban_db.read_board_metadata(board)
     except Exception:
+        return None
+    return _paused_corrupt_incident_from_meta(board, metadata)
+
+
+def _paused_corrupt_incident_from_meta(board: str, metadata: dict[str, Any]) -> Optional[dict[str, Any]]:
+    incident = metadata.get("corruption_incident") if isinstance(metadata, dict) else None
+    if not incident:
+        try:
+            incident = kanban_db.is_board_paused_for_corruption(board)
+        except Exception:
+            incident = None
+        if incident:
+            metadata = {"paused": True}
+    if not (metadata.get("paused") is True and isinstance(incident, dict)):
+        return None
+    if incident.get("pause_reason") != "kanban_db_corruption":
         return None
     if not incident:
         return None
@@ -5387,12 +5401,40 @@ def _paused_corrupt_incident(board: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def _board_target_skipped_by_metadata(board: str, board_meta: dict[str, Any], *, source: str) -> bool:
+    if _paused_corrupt_incident_from_meta(board, board_meta):
+        logger.debug(
+            "%s: board %s paused for unchanged DB corruption; skipping",
+            source,
+            board,
+        )
+        return True
+    if bool(board_meta.get("paused")) or bool(board_meta.get("quarantined")):
+        logger.debug(
+            "%s: board %s paused or quarantined; skipping",
+            source,
+            board,
+        )
+        return True
+    return False
+
+
 def _is_skippable_board_db_error(exc: Exception) -> bool:
     return isinstance(exc, (kanban_db.KanbanDbCorruptError, sqlite3.DatabaseError, OSError))
 
 
 def _log_skipped_board_target(board: str, exc: Exception, *, source: str) -> None:
     if isinstance(exc, kanban_db.KanbanDbCorruptError):
+        key = (source, board, type(exc).__name__)
+        if key in _SKIPPED_BOARD_TARGET_LOG_KEYS:
+            logger.debug(
+                "%s: skipping board %s after kanban DB corruption: %s",
+                source,
+                board,
+                exc,
+            )
+            return
+        _SKIPPED_BOARD_TARGET_LOG_KEYS.add(key)
         logger.warning(
             "%s: skipping board %s after kanban DB corruption: %s",
             source,
@@ -5408,19 +5450,16 @@ def running_worker_thread_targets() -> list[dict[str, Any]]:
     targets: list[dict[str, Any]] = []
     for board_meta in kanban_db.list_boards(include_archived=False):
         board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
-        worker = _read_worker_meta(board)
+        if _board_target_skipped_by_metadata(board, board_meta, source="discord worker typing targets"):
+            continue
+        raw_worker = board_meta.get(DISCORD_WORKER_META_KEY)
+        worker = dict(raw_worker) if isinstance(raw_worker, dict) else {}
         if worker.get("kind") != "discord_worker_board":
             continue
         thread_id = str(worker.get("thread_id") or "").strip()
         if not thread_id:
             continue
         if _worker_source_message_too_old(worker):
-            continue
-        if _paused_corrupt_incident(board):
-            logger.debug(
-                "discord worker typing targets: board %s paused for unchanged DB corruption; skipping",
-                board,
-            )
             continue
         try:
             with kanban_db.connect_closing(board=board) as conn:
@@ -5488,11 +5527,7 @@ def running_notify_thread_targets() -> list[dict[str, Any]]:
     targets: list[dict[str, Any]] = []
     for board_meta in kanban_db.list_boards(include_archived=False):
         board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
-        if _paused_corrupt_incident(board):
-            logger.debug(
-                "discord notify typing targets: board %s paused for unchanged DB corruption; skipping",
-                board,
-            )
+        if _board_target_skipped_by_metadata(board, board_meta, source="discord notify typing targets"):
             continue
         try:
             with kanban_db.connect_closing(board=board) as conn:
