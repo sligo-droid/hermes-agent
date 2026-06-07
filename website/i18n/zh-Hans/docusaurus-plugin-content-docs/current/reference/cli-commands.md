@@ -832,7 +832,7 @@ hermes skills reset google-workspace --restore --yes
 - `--source skills-sh` 搜索公共 `skills.sh` 目录。
 - `--source well-known` 允许你将 Hermes 指向暴露 `/.well-known/skills/index.json` 的站点。
 - `--source browse-sh` 搜索 [browse.sh](https://browse.sh) 包含 200+ 站点特定浏览器自动化 skill 的目录。标识符形如 `browse-sh/airbnb.com/search-listings-ddgioa`。
-- 传入 `http(s)://…/*.md` URL 可直接安装单文件 SKILL.md。当 frontmatter 没有 `name:` 且 URL slug 不是有效标识符时，交互式终端会提示输入名称；非交互式界面（TUI 内的 `/skills install`、gateway 平台）需要改用 `--name <x>`。
+- 传入 `http(s)://…/*.md` URL 可直接安装单文件 SKILL.md。当 frontmatter 没有 `name:` 且 URL slug 不是有效标识符时，交互式终端会提示输入名称；非交互式界面（gateway 平台、脚本）需要改用 `--name <x>`。
 
 ## `hermes bundles`
 

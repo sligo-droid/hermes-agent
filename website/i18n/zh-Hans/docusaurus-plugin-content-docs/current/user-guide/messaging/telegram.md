@@ -718,7 +718,7 @@ gateway:
         disable_topic_auto_rename: true
 ```
 
-启用此标志后，Hermes 仍会生成内部会话标题（供 `hermes sessions`、TUI 等使用），但永远不会编辑 Telegram 话题名称。当你在 BotFather Threaded Mode 下手动整理话题，且不希望每次第一次回复都覆盖标题时，此功能很有用。
+启用此标志后，Hermes 仍会生成内部会话标题（供 `hermes sessions` 和其他本地会话视图使用），但永远不会编辑 Telegram 话题名称。当你在 BotFather Threaded Mode 下手动整理话题，且不希望每次第一次回复都覆盖标题时，此功能很有用。
 
 ### 话题内的 `/new`
 

@@ -22,7 +22,6 @@ const sidebars: SidebarsConfig = {
       collapsed: true,
       items: [
         'user-guide/cli',
-        'user-guide/tui',
         'user-guide/windows-native',
         'user-guide/windows-wsl-quickstart',
         'user-guide/configuration',

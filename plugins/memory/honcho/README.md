@@ -219,7 +219,7 @@ In gateway deployments (Telegram, Discord, Slack, etc.) each user arrives with a
 3. userPeerAliases[runtime_id_alt] → check alt-ID too (Telegram UID + username, etc.)
 4. runtimePeerPrefix + runtime_id → namespaced peer, with sha256 collision escalation
 5. raw sanitized runtime_id      → fallback peer
-6. peerName                      → no runtime ID at all (CLI/TUI)
+6. peerName                      → no runtime ID at all (CLI)
 7. session-key fallback          → no config either
 ```
 

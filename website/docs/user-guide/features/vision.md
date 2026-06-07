@@ -54,7 +54,7 @@ If your clipboard has **only an image** (no text), terminals still cannot send b
 
 ### `/terminal-setup` for VS Code / Cursor / Windsurf
 
-If you run the TUI inside a local VS Code-family integrated terminal on macOS, Hermes can install the recommended `workbench.action.terminal.sendSequence` bindings for better multiline and undo/redo parity:
+If you run the CLI inside a local VS Code-family integrated terminal on macOS, Hermes can install the recommended `workbench.action.terminal.sendSequence` bindings for better multiline and undo/redo parity:
 
 ```text
 /terminal-setup

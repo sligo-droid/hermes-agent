@@ -281,7 +281,7 @@ hermes uninstall            Uninstall Hermes
 /yolo                Toggle approval bypass
 /busy [sub]          Control what Enter does while Hermes is working (CLI)
                      (subcommands: queue, steer, interrupt, status)
-/indicator [style]   Pick the TUI busy-indicator style (CLI)
+/indicator [style]   Pick the CLI busy-indicator style (CLI)
                      (styles: kaomoji, emoji, unicode, ascii)
 /footer [on|off]     Toggle gateway runtime-metadata footer on final replies
 /skin [name]         Change theme (CLI)

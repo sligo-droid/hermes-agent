@@ -130,12 +130,11 @@ def normalize_voice_record_key_for_prompt_toolkit(raw: Any) -> str:
 
     modifier_token, key_token = parts
 
-    # ``super`` / ``win`` / ``windows`` are TUI-only (prompt_toolkit has
+    # ``super`` / ``win`` / ``windows`` are unsupported (prompt_toolkit has
     # no super modifier, so ``@kb.add(super+b)`` crashes the CLI at
     # startup). Fall back to the documented default here; the CLI
     # binding site is expected to log a warning when the configured
-    # value is one of these spellings so users know the TUI+CLI
-    # runtimes diverge on that shortcut (Copilot round-11 on #19835).
+    # value is one of these spellings (Copilot round-11 on #19835).
     if modifier_token in {"super", "win", "windows"}:
         return _DEFAULT_PT_KEY
 

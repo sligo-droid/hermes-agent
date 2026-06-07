@@ -11984,7 +11984,7 @@ Examples:
         "--yes",
         "-y",
         action="store_true",
-        help="Skip confirmation prompt (needed in TUI mode)",
+        help="Skip confirmation prompt (needed for non-interactive installs)",
     )
 
     skills_inspect = skills_subparsers.add_parser(

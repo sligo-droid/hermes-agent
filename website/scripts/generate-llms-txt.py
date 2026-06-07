@@ -47,7 +47,6 @@ SECTIONS: list[tuple[str, list[tuple[str, str, str | None]]]] = [
     ]),
     ("Using Hermes", [
         ("user-guide/cli", "CLI", None),
-        ("user-guide/tui", "TUI (Ink terminal UI)", None),
         ("user-guide/configuration", "Configuration", None),
         ("user-guide/configuring-models", "Configuring Models", None),
         ("user-guide/sessions", "Sessions", None),

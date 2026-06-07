@@ -1583,8 +1583,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # or the NEW one.  The chain was seeded from config at agent init for
     # the original provider — without pruning, a failed turn on the new
     # primary silently re-activates the provider the user just rejected,
-    # which is exactly what was reported during TUI v2 blitz testing
-    # ("switched to anthropic, tui keeps trying openrouter").
+    # which is exactly what was reported during provider-switch testing
+    # ("switched to anthropic, CLI keeps trying openrouter").
     old_norm = (old_provider or "").strip().lower()
     new_norm = (new_provider or "").strip().lower()
     fallback_chain = list(getattr(agent, "_fallback_chain", []) or [])

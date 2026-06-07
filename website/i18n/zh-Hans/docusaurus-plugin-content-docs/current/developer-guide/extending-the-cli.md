@@ -1,7 +1,7 @@
 ---
 sidebar_position: 8
 title: "扩展 CLI"
-description: "构建包装 CLI，通过自定义 widget、快捷键和布局变更来扩展 Hermes TUI"
+description: "构建包装 CLI，通过自定义 widget、快捷键和布局变更来扩展 Hermes"
 ---
 
 # 扩展 CLI
@@ -85,7 +85,7 @@ python my_cli.py
 
 ### `_get_extra_tui_widgets()`
 
-返回要插入 TUI 布局的 prompt_toolkit widget 列表。Widget 出现在**间隔区与状态栏之间**——位于输入区上方、主输出区下方。
+返回要插入 CLI 布局的 prompt_toolkit widget 列表。Widget 出现在**间隔区与状态栏之间**——位于输入区上方、主输出区下方。
 
 ```python
 def _get_extra_tui_widgets(self) -> list:

@@ -63,13 +63,13 @@ If you want the fully explicit path, follow the dedicated [Termux guide](./termu
 
 :::note Windows Feature Parity (Early Beta)
 
-Native Windows is in **early beta**. Everything except the browser-based dashboard chat terminal runs natively on Windows:
+Native Windows is in **early beta**. Core Hermes workflows run natively on Windows:
 - **CLI (`hermes chat`, `hermes setup`, `hermes gateway`, …)** — native, uses your default terminal
 - **Gateway (Telegram, Discord, Slack, …)** — native, runs as a background PowerShell process
 - **Cron scheduler** — native
 - **Browser tool** — native (Chromium via Node.js)
 - **MCP servers** — native (stdio and HTTP transports both supported)
-- **Dashboard `/chat` terminal pane** — **WSL2 only** (uses a POSIX PTY; native Windows has no equivalent).  The rest of the dashboard (sessions, jobs, metrics) works natively — only the embedded PTY terminal tab is gated.
+- **Dashboard** — native for sessions, jobs, metrics, and configuration views.
 
 Set `HERMES_DISABLE_WINDOWS_UTF8=1` in your environment if you hit an encoding-related bug and want to fall back to the legacy cp1252 stdio path (useful for bisecting).
 :::

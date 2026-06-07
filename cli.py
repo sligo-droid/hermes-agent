@@ -9829,7 +9829,7 @@ class HermesCLI:
             print(f"  Skin set to: {new_skin}")
         print("  Note: banner colors will update on next session start.")
         if self._apply_tui_skin_style():
-            print("  Prompt + TUI colors updated.")
+            print("  Prompt + CLI colors updated.")
 
     def _handle_footer_command(self, cmd_original: str) -> None:
         """Toggle or inspect ``display.runtime_footer.enabled`` from the CLI.
@@ -13643,9 +13643,8 @@ class HermesCLI:
                 and _voice_key == "c-b"
             ):
                 logger.warning(
-                    "voice.record_key %r uses a TUI-only modifier (super/win); "
-                    "CLI fell back to Ctrl+B. Use ctrl+<key> or alt+<key> for "
-                    "cross-runtime parity.",
+                    "voice.record_key %r uses an unsupported modifier (super/win); "
+                    "CLI fell back to Ctrl+B. Use ctrl+<key> or alt+<key> instead.",
                     _raw_key,
                 )
         except Exception:

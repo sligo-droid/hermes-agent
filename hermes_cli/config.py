@@ -87,7 +87,7 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 #   ``PYTHONUSERBASE`` — Python interpreter init. Hermes itself starts
 #   from one of these on every restart.
 # * ``NODE_OPTIONS`` / ``NODE_PATH`` — Node interpreter; affects npm,
-#   ``hermes update``, the TUI build.
+#   ``hermes update``, and dashboard builds.
 # * ``PATH`` — too broad to allow. The dashboard never needs to rewrite
 #   the operator's PATH; if a tool can't be found, the fix is to add an
 #   absolute path in the integration config, not to mutate PATH globally.
@@ -1290,7 +1290,7 @@ DEFAULT_CONFIG = {
         # responses, log lines, tool outputs, or slash-command descriptions.
         # Supported: en, zh, ja, de, es, fr, tr, uk.  Unknown values fall back to en.
         "language": "en",
-        # TUI busy indicator style: kaomoji (default), emoji, unicode (braille
+        # CLI busy indicator style: kaomoji (default), emoji, unicode (braille
         # spinner), or ascii.  Live-swappable via `/indicator <style>`.
         "tui_status_indicator": "kaomoji",
         "user_message_preview": {  # CLI: how many submitted user-message lines to echo back in scrollback
