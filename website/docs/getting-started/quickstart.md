@@ -169,14 +169,11 @@ The right value goes to the right file automatically.
 
 ```bash
 hermes            # classic CLI
-hermes --tui      # modern TUI (recommended)
 ```
 
 You'll see a welcome banner with your model, available tools, and skills. Use a prompt that's specific and easy to verify:
 
-:::tip Pick your interface
-Hermes ships with two terminal interfaces: the classic `prompt_toolkit` CLI and a newer [TUI](../user-guide/tui.md) with modal overlays, mouse selection, and non-blocking input. Both share the same sessions, slash commands, and config — try each with `hermes` vs `hermes --tui`.
-:::
+Hermes starts in the classic terminal chat interface with `hermes` or `hermes chat`.
 
 ```
 Summarize this repo in 5 bullets and tell me what the main entrypoint is.

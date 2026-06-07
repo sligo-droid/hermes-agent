@@ -45,7 +45,7 @@ Boundary rule: if a note says “what is true right now for this Hermes repo,”
 Stable repo map lives in `AGENTS.md`; this section is the product-level map.
 
 - **Agent runtime:** `run_agent.py`, `agent/`, `model_tools.py`, `toolsets.py`, `tools/`.
-- **CLI/TUI:** classic CLI in `cli.py`/`hermes_cli/`; modern Ink TUI in `ui-tui/` with Python bridge under `tui_gateway/`.
+- **CLI:** classic CLI in `cli.py`/`hermes_cli/`.
 - **Gateway:** `gateway/` plus platform plugins. Discord adapter behavior is central to Sligo dev-shop operations.
 - **Kanban/workers:** durable SQLite boards and dispatcher/worker code under `hermes_cli/kanban*` plus worker-specific tools.
 - **Cron:** `cron/` scheduler and job state, used for unattended audits and delivery.

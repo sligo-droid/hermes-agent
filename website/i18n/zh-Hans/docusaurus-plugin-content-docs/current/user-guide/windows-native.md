@@ -88,12 +88,11 @@ iex (irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/script
 
 ## 功能矩阵
 
-除 dashboard 内嵌终端面板外，所有功能均可在 Windows 上原生运行。
+所有主要功能均可在 Windows 上原生运行。
 
 | 功能 | 原生 Windows | WSL2 |
 |---|---|---|
 | CLI（`hermes chat`、`hermes setup`、`hermes gateway` 等） | ✓ | ✓ |
-| 交互式 TUI（`hermes --tui`） | ✓ | ✓ |
 | 消息 gateway（Telegram、Discord、Slack、WhatsApp，15+ 平台） | ✓ | ✓ |
 | Cron 调度器 | ✓ | ✓ |
 | 浏览器工具（通过 Node 驱动 Chromium） | ✓ | ✓ |

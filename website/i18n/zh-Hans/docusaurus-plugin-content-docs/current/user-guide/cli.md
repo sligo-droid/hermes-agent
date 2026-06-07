@@ -8,10 +8,6 @@ description: "掌握 Hermes Agent 终端界面——命令、快捷键、人格�
 
 Hermes Agent 的 CLI 是一个完整的终端用户界面（TUI），而非 Web UI。它支持多行编辑、斜杠命令自动补全、对话历史、中断并重定向，以及流式工具输出。专为常驻终端的用户而生。
 
-:::tip
-Hermes 还提供了一个现代 TUI，支持模态覆盖层、鼠标选择和非阻塞输入。使用 `hermes --tui` 启动——参见 [TUI](tui.md) 指南。
-:::
-
 ## 运行 CLI
 
 ```bash

@@ -13,7 +13,6 @@ One command — `hermes setup --portal` — and you're ready to `hermes chat`. S
 :::
 
 :::tip
-Hermes also ships a modern TUI with modal overlays, mouse selection, and non-blocking input. Launch it with `hermes --tui` — see the [TUI](tui.md) guide.
 :::
 
 ## Running the CLI

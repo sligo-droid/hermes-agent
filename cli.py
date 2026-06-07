@@ -1503,18 +1503,15 @@ def _hex_to_ansi(hex_color: str, *, bold: bool = False) -> str:
 # ────────────────────────────────────────────────────────────────────────
 # Light/dark terminal mode detection.
 #
-# Mirrors ui-tui/src/theme.ts detectLightMode().  Used to decide whether
-# to remap "near-white" skin colors (e.g. #FFF8DC banner_text, #B8860B
-# banner_dim) to darker equivalents that are readable on a light
-# Terminal.app / iTerm2 background.
+# Decides whether to remap "near-white" skin colors (e.g. #FFF8DC
+# banner_text, #B8860B banner_dim) to darker equivalents that are readable on
+# a light Terminal.app / iTerm2 background.
 #
 # Detection priority:
-#   1. HERMES_LIGHT / HERMES_TUI_LIGHT env (true/false) — explicit override
-#   2. HERMES_TUI_THEME=light|dark — explicit theme
-#   3. HERMES_TUI_BACKGROUND=#RRGGBB — explicit bg hint
-#   4. COLORFGBG env (set by xterm/Konsole/urxvt) — bg slot 7/15 = light
-#   5. OSC 11 query (\x1b]11;?\x1b\\) — ask the terminal directly
-#   6. Default: assume dark (matches the legacy Hermes assumption)
+#   1. HERMES_LIGHT env (true/false) — explicit override
+#   2. COLORFGBG env (set by xterm/Konsole/urxvt) — bg slot 7/15 = light
+#   3. OSC 11 query (\x1b]11;?\x1b\\) — ask the terminal directly
+#   4. Default: assume dark (matches the legacy Hermes assumption)
 #
 # Cached after first call so we don't query the terminal repeatedly.
 _LIGHT_MODE_CACHE: bool | None = None
@@ -1617,32 +1614,15 @@ def _detect_light_mode() -> bool:
     result = False
     try:
         # 1. Explicit env override
-        for var in ("HERMES_LIGHT", "HERMES_TUI_LIGHT"):
-            v = (os.environ.get(var) or "").strip().lower()
-            if _TRUE_RE.match(v):
-                result = True
-                _LIGHT_MODE_CACHE = result
-                return result
-            if _FALSE_RE.match(v):
-                _LIGHT_MODE_CACHE = result
-                return result
-        # 2. Theme hint
-        theme = (os.environ.get("HERMES_TUI_THEME") or "").strip().lower()
-        if theme == "light":
+        v = (os.environ.get("HERMES_LIGHT") or "").strip().lower()
+        if _TRUE_RE.match(v):
             result = True
             _LIGHT_MODE_CACHE = result
             return result
-        if theme == "dark":
+        if _FALSE_RE.match(v):
             _LIGHT_MODE_CACHE = result
             return result
-        # 3. Explicit bg hex
-        bg_hint = os.environ.get("HERMES_TUI_BACKGROUND") or ""
-        bg_lum = _luminance_from_hex(bg_hint)
-        if bg_lum is not None:
-            result = bg_lum >= 0.5
-            _LIGHT_MODE_CACHE = result
-            return result
-        # 4. COLORFGBG (xterm/Konsole/urxvt)
+        # 2. COLORFGBG (xterm/Konsole/urxvt)
         cfgbg = (os.environ.get("COLORFGBG") or "").strip()
         if cfgbg:
             last = cfgbg.split(";")[-1] if ";" in cfgbg else cfgbg
@@ -1655,7 +1635,7 @@ def _detect_light_mode() -> bool:
                 if 0 <= bg < 16:
                     _LIGHT_MODE_CACHE = result
                     return result
-        # 5. OSC 11 query (best-effort, only when stdin/stdout are TTY)
+        # 3. OSC 11 query (best-effort, only when stdin/stdout are TTY)
         bg_color = _query_osc11_background()
         if bg_color:
             lum = _luminance_from_hex(bg_color)
@@ -9946,9 +9926,7 @@ class HermesCLI:
         turn (the same UX failure mode that motivated this entire fix), since
         ``_session_yolo`` is keyed by session id.
 
-        Mirrors ``tui_gateway/server.py`` (~line 1297-1305) which performs the
-        same transfer for the TUI's session-rename path. No-op when YOLO
-        wasn't enabled or when the ids match.
+        No-op when YOLO wasn't enabled or when the ids match.
         """
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return
@@ -9993,9 +9971,8 @@ class HermesCLI:
     def _toggle_yolo(self):
         """Toggle YOLO mode — skip all dangerous command approval prompts.
 
-        Per-session toggle that mirrors the gateway and TUI ``/yolo`` handlers
-        (see ``gateway/run.py:_handle_yolo_command`` and
-        ``tui_gateway/server.py`` key=="yolo"). We deliberately do NOT mutate
+        Per-session toggle that mirrors the gateway ``/yolo`` handler
+        (see ``gateway/run.py:_handle_yolo_command``). We deliberately do NOT mutate
         ``HERMES_YOLO_MODE`` here — that env var is read once at module import
         time into ``tools.approval._YOLO_MODE_FROZEN`` to keep prompt-injected
         skills from flipping the bypass mid-session, so setting it after CLI
@@ -12111,8 +12088,8 @@ class HermesCLI:
                 # ``tools.approval.is_current_session_yolo_enabled()`` resolves
                 # against the same key that ``/yolo`` toggles under (see
                 # ``_toggle_yolo`` → ``enable_session_yolo(self.session_id)``).
-                # Mirrors ``tui_gateway/server.py`` and ``gateway/run.py`` which
-                # bind the same contextvar before invoking the agent.
+                # Mirrors ``gateway/run.py``, which binds the same contextvar
+                # before invoking the agent.
                 try:
                     from tools.approval import (
                         reset_current_session_key,

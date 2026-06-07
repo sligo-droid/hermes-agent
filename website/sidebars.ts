@@ -353,7 +353,6 @@ const sidebars: SidebarsConfig = {
                   key: 'skills-bundled-software-development',
                   collapsed: true,
                   items: [
-                    'user-guide/skills/bundled/software-development/software-development-debugging-hermes-tui-commands',
                     'user-guide/skills/bundled/software-development/software-development-hermes-agent-skill-authoring',
                     'user-guide/skills/bundled/software-development/software-development-hermes-s6-container-supervision',
                     'user-guide/skills/bundled/software-development/software-development-node-inspect-debugger',

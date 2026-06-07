@@ -1,8 +1,6 @@
 """Behavior tests for hermes_cli.inventory.
 
-Locks the invariants the three migrated consumers (web_server.py
-/api/model/options, tui_gateway model.options, tui_gateway model.save_key)
-depend on:
+Locks the invariants the web dashboard model picker depends on:
 
 - load_picker_context() reproduces the inline 17-LOC config-slice exactly.
 - with_overrides() is truthy-only (empty agent attrs must not clobber).
@@ -13,8 +11,7 @@ depend on:
   3 of list_authenticated_providers sets is_user_defined=True for
   canonical slugs in the providers: dict, and that flag must NOT demote
   them to the tail.
-- picker_hints adds authenticated/auth_type/key_env/warning per row,
-  matching the TUI ModelPickerDialog shape.
+- picker_hints adds authenticated/auth_type/key_env/warning per row.
 """
 
 from __future__ import annotations

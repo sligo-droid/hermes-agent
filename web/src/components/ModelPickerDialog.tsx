@@ -2,7 +2,6 @@ import { Button } from "@nous-research/ui/ui/components/button";
 import { ListItem } from "@nous-research/ui/ui/components/list-item";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { Input } from "@nous-research/ui/ui/components/input";
-import type { GatewayClient } from "@/lib/gatewayClient";
 import { Check, Search, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -12,23 +11,9 @@ import { useModalBehavior } from "@/hooks/useModalBehavior";
 /**
  * Two-stage model picker modal.
  *
- * Mirrors ui-tui/src/components/modelPicker.tsx:
- *   Stage 1: pick provider (authenticated providers only)
- *   Stage 2: pick model within that provider
- *
- * Two invocation modes:
- *
- * 1. Chat-session mode (ChatSidebar) — pass `gw` + `sessionId`. The picker
- *    loads options via the sidebar's JSON-RPC sidecar and emits the result
- *    as a slash command string (`/model <model> --provider <slug> [--global]`)
- *    through `onSubmit`. ChatPage then injects that command into the visible
- *    PTY TUI session; the sidecar is not used to mutate visible chat state.
- *
- * 2. Standalone mode (ModelsPage, Config settings) — pass a `loader` and
- *    `onApply`. The picker fetches options via the REST endpoint and calls
+ * Standalone model picker used by ModelsPage and config settings. The picker
+ * fetches options via the REST endpoint and calls
  *    `onApply(provider, model, persistGlobal)` instead of emitting a slash
- *    command.  This lets the Models page reuse the same UI without
- *    requiring an open chat PTY.
  */
 
 interface ModelOptionProvider {
@@ -47,12 +32,6 @@ interface ModelOptionsResponse {
 }
 
 interface Props {
-  /** Chat-mode: when present, picker emits a slash command via onSubmit. */
-  gw?: GatewayClient;
-  sessionId?: string;
-  onSubmit?(slashCommand: string): void;
-
-  /** Standalone-mode: when present (and onSubmit absent), picker calls onApply. */
   loader?(): Promise<ModelOptionsResponse>;
   onApply?(args: {
     provider: string;
@@ -68,16 +47,12 @@ interface Props {
 
 export function ModelPickerDialog(props: Props) {
   const {
-    gw,
-    sessionId,
-    onSubmit,
     loader,
     onApply,
     onClose,
     title = "Switch Model",
     alwaysGlobal = false,
   } = props;
-  const standalone = !!loader && !!onApply;
 
   const [providers, setProviders] = useState<ModelOptionProvider[]>([]);
   const [currentModel, setCurrentModel] = useState("");
@@ -96,12 +71,7 @@ export function ModelPickerDialog(props: Props) {
   useEffect(() => {
     closedRef.current = false;
 
-    const promise = standalone
-      ? (loader as () => Promise<ModelOptionsResponse>)()
-      : (gw as GatewayClient).request<ModelOptionsResponse>(
-          "model.options",
-          sessionId ? { session_id: sessionId } : {},
-        );
+    const promise = (loader as () => Promise<ModelOptionsResponse>)();
 
     promise
       .then((r) => {
@@ -164,7 +134,7 @@ export function ModelPickerDialog(props: Props) {
 
   const confirm = async () => {
     if (!canConfirm || !selectedProvider) return;
-    if (standalone && onApply) {
+    if (onApply) {
       setApplying(true);
       try {
         await onApply({
@@ -178,12 +148,6 @@ export function ModelPickerDialog(props: Props) {
       } finally {
         setApplying(false);
       }
-    } else if (onSubmit) {
-      const global = persistGlobal ? " --global" : "";
-      onSubmit(
-        `/model ${selectedModel} --provider ${selectedProvider.slug}${global}`,
-      );
-      onClose();
     }
   };
 
@@ -222,14 +186,9 @@ export function ModelPickerDialog(props: Props) {
             {title}
           </h2>
           <p className="text-xs text-muted-foreground mt-1 font-mono">
-            {standalone ? "current" : "sidecar reports"}: {currentModel || "(unknown)"}
+            current: {currentModel || "(unknown)"}
             {currentProviderSlug && ` · ${currentProviderSlug}`}
           </p>
-          {!standalone && (
-            <p className="text-xs text-muted-foreground mt-1">
-              Switches are sent to the visible TUI terminal session.
-            </p>
-          )}
         </header>
 
         <div className="px-5 pt-3 pb-2 border-b border-border">

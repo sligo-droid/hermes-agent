@@ -1,11 +1,10 @@
-"""Process-wide voice recording + TTS API for the TUI gateway.
+"""Process-wide voice recording + TTS API for Hermes interfaces.
 
 Wraps ``tools.voice_mode`` (recording/transcription) and ``tools.tts_tool``
-(text-to-speech) behind idempotent, stateful entry points that the gateway's
-``voice.record``, ``voice.toggle``, and ``voice.tts`` JSON-RPC handlers can
-call from a dedicated thread. The gateway imports this module lazily so that
-missing optional audio deps (sounddevice, faster-whisper, numpy) surface as
-an ``ImportError`` at call time, not at startup.
+(text-to-speech) behind idempotent, stateful entry points that callers can use
+from a dedicated thread. Callers import this module lazily so that missing
+optional audio deps (sounddevice, faster-whisper, numpy) surface as an
+``ImportError`` at call time, not at startup.
 
 Two usage modes are exposed:
 
@@ -27,18 +26,11 @@ import sys
 import threading
 from typing import Any, Callable, Optional
 
-# Modifier aliases mirrored from the TUI parser (``ui-tui/src/lib/platform.ts``)
-# ``_MOD_ALIASES`` table — the contract that removes the cross-runtime
-# mismatch Copilot flagged in round-9 on #19835.
-#
 # ``super``/``win``/``windows`` are intentionally absent: prompt_toolkit
-# has no super/meta modifier for the Cmd key, so those spellings are
-# TUI-only. The normalizer below returns the documented default
-# (``c-b``) for them — a silent fallback was preferred to a hard
-# startup crash (Copilot round-11). The CLI binding site
-# (``_register_voice_handler`` in cli.py) logs a warning when that
-# fallback fires so users see why their TUI-only shortcut isn't
-# bound in the classic CLI.
+# has no super/meta modifier for the Cmd key. The normalizer below returns the
+# documented default (``c-b``) for those spellings; the CLI binding site
+# (``_register_voice_handler`` in cli.py) logs a warning when that fallback
+# fires.
 _VOICE_MOD_ALIASES = {
     "ctrl": "c-",
     "control": "c-",
@@ -69,15 +61,12 @@ _VOICE_NAMED_KEYS = {
 # ``useInputHandlers()`` intercepts these before the voice check runs,
 # so a binding like ``ctrl+c`` (interrupt), ``ctrl+d`` (quit), or
 # ``ctrl+l`` (clear screen) would be advertised in /voice status but
-# never fire push-to-talk — the same blocklist the TUI parser uses.
+# never fire push-to-talk.
 _VOICE_RESERVED_CTRL_CHARS = frozenset({"c", "d", "l"})
 
 # On macOS the classic CLI's prompt_toolkit bindings for copy / exit /
 # clear also claim ``a-c`` / ``a-d`` / ``a-l`` via the action-modifier
-# lookup, and hermes-ink reports Alt as ``key.meta`` on many terminals.
-# Mirror the TUI parser's darwin-only reservation so ``option+c`` etc.
-# don't bind Alt+C in the CLI while the TUI silently falls back to
-# Ctrl+B (Copilot round-14 on #19835).
+# lookup. Keep ``option+c`` etc. from binding Alt+C in the CLI.
 _VOICE_RESERVED_ALT_CHARS_MAC = frozenset({"c", "d", "l"})
 
 _DEFAULT_PT_KEY = "c-b"
@@ -108,18 +97,13 @@ def voice_record_key_from_config(cfg: Any) -> Any:
 def normalize_voice_record_key_for_prompt_toolkit(raw: Any) -> str:
     """Coerce ``voice.record_key`` into prompt_toolkit's ``c-x`` / ``a-x`` format.
 
-    Mirrors the TUI parser contract (``ui-tui/src/lib/platform.ts``)
-    so one config value binds the same shortcut in both runtimes:
-
     * non-string / empty / typo'd / bare-char / multi-modifier / reserved
       ``ctrl+c|d|l`` → documented default ``c-b``
     * single-char keys: ``ctrl+o`` → ``c-o``
     * named keys: ``ctrl+space`` → ``c-space`` (aliases collapse:
       ``ctrl+return`` → ``c-enter``)
-    * ``super`` / ``win`` / ``windows`` → ``c-b`` (TUI-only modifiers —
-      prompt_toolkit has no super mod; the CLI binding site is
-      expected to warn when this fallback fires so users see the
-      cross-runtime split, Copilot round-11 on #19835)
+    * ``super`` / ``win`` / ``windows`` → ``c-b`` (prompt_toolkit has no super
+      mod; the CLI binding site warns when this fallback fires)
     """
     if not isinstance(raw, str):
         return _DEFAULT_PT_KEY

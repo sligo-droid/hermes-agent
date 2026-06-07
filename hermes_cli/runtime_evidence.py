@@ -348,7 +348,6 @@ def _candidate_log_paths(home: Path) -> list[Path]:
         logs / "gateway.log",
         logs / "errors.log",
         logs / "agent.log",
-        logs / "tui_gateway_crash.log",
     ]
 
 

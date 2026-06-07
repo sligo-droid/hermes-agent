@@ -76,7 +76,6 @@ import CronPage from "@/pages/CronPage";
 import ProfilesPage from "@/pages/ProfilesPage";
 import SkillsPage from "@/pages/SkillsPage";
 import PluginsPage from "@/pages/PluginsPage";
-import ChatPage from "@/pages/ChatPage";
 import WorkerConsolePage from "@/pages/WorkerConsolePage";
 import CommandCenterPage from "@/pages/CommandCenterPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
@@ -86,7 +85,6 @@ import type { Translations } from "@/i18n/types";
 import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
 import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
-import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 import { currentDashboardSurface, sligoHostUrl } from "@/lib/dashboard-host";
 import { api } from "@/lib/api";
 import type { StatusResponse } from "@/lib/api";
@@ -117,13 +115,6 @@ function UnknownRouteFallback({ pluginsLoading }: { pluginsLoading: boolean }) {
   return <Navigate to="/sessions" replace />;
 }
 
-const CHAT_NAV_ITEM: NavItem = {
-  path: "/chat",
-  labelKey: "chat",
-  label: "Chat",
-  icon: Terminal,
-};
-
 const WORKERS_NAV_ITEM: NavItem = {
   path: "/workers",
   label: "Kanban",
@@ -137,15 +128,6 @@ const COMMAND_CENTER_NAV_ITEM: NavItem = {
   icon: Workflow,
 };
 
-/**
- * Built-in routes except /chat.  Chat is rendered persistently (outside
- * <Routes>) when embedded — see the persistent chat host block rendered
- * inline near the bottom of this file — so the PTY child, WebSocket,
- * and xterm instance survive when the user visits another tab and comes
- * back.  A `display:none` toggle hides the terminal without unmounting.
- * Routing still owns the URL so /chat deep-links, browser back/forward,
- * and nav highlight keep working.
- */
 const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/": SessionsRootRedirect,
   "/sessions": SessionsPage,
@@ -203,14 +185,6 @@ const SLIGO_ROUTES: Record<string, ComponentType> = {
   "/self-improvement": CommandCenterPage,
   "/workers/:sessionId/tickets/:taskId/console": WorkerConsolePage,
 };
-
-// Route placeholder for /chat.  The persistent ChatPage host (rendered
-// outside <Routes> when embedded chat is on) paints on top; this empty
-// element just claims the path so the `*` catch-all redirect doesn't
-// fire when the user navigates to /chat.
-function ChatRouteSink() {
-  return null;
-}
 
 const BUILTIN_NAV_REST: NavItem[] = [
   {
@@ -529,9 +503,6 @@ export default function App() {
   const tooltipWarmRef = useRef(0);
   const sidebarStatus = useSidebarStatus();
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
-  const normalizedPath = pathname.replace(/\/$/, "") || "/";
-  const isChatRoute = normalizedPath === "/chat";
-  const embeddedChat = isDashboardEmbeddedChatEnabled();
   const dashboardSurface = currentDashboardSurface();
 
   // `dashboard.show_token_analytics` gates the Analytics nav item.  The
@@ -551,51 +522,26 @@ export default function App() {
       .catch(() => setShowTokenAnalytics(false));
   }, []);
 
-  // A plugin can replace the built-in /chat page via `tab.override: "/chat"`
-  // in its manifest.  When one does, `buildRoutes` already swaps the route
-  // element for <PluginPage /> — but we also have to suppress the
-  // persistent ChatPage host below, or the plugin's page and the built-in
-  // terminal would paint on top of each other.  The override is niche
-  // (nothing ships overriding /chat today) but it's an advertised
-  // extension point, so preserve the pre-persistence contract: when a
-  // plugin owns /chat, the built-in chat UI is entirely absent.
-  //
-  // Waiting on `pluginsLoading` is load-bearing: manifests arrive
-  // asynchronously from /api/dashboard/plugins, so on initial render
-  // `chatOverriddenByPlugin` is always false.  Without the loading
-  // gate, the persistent host would mount, spawn a PTY, and THEN get
-  // yanked out from under the user when the plugin's manifest resolves
-  // — killing the session mid-paint.  Delaying host mount by the
-  // plugin-load window (typically <50ms, worst case 2s safety timeout)
-  // is the cheaper trade-off.
-  const chatOverriddenByPlugin = useMemo(
-    () => manifests.some((m) => m.tab.override === "/chat"),
-    [manifests],
-  );
-
   const builtinRoutes = useMemo(
     () => {
       if (dashboardSurface === "sligo") return SLIGO_ROUTES;
       return {
         ...BUILTIN_ROUTES_CORE,
         ...(dashboardSurface === "hermes" ? HERMES_HOST_REDIRECT_ROUTES : {}),
-        ...(embeddedChat ? { "/chat": ChatRouteSink } : {}),
       };
     },
-    [dashboardSurface, embeddedChat],
+    [dashboardSurface],
   );
 
   const builtinNav = useMemo(() => {
     if (dashboardSurface === "sligo") {
       return [COMMAND_CENTER_NAV_ITEM, WORKERS_NAV_ITEM];
     }
-    const base = embeddedChat
-      ? [CHAT_NAV_ITEM, ...BUILTIN_NAV_REST]
-      : BUILTIN_NAV_REST;
+    const base = BUILTIN_NAV_REST;
     return showTokenAnalytics
       ? base
       : base.filter((n) => n.path !== "/analytics");
-  }, [dashboardSurface, embeddedChat, showTokenAnalytics]);
+  }, [dashboardSurface, showTokenAnalytics]);
 
   const sidebarNav = useMemo(
     () => {
@@ -908,9 +854,7 @@ export default function App() {
               className={cn(
                 "relative z-2 flex min-w-0 min-h-0 flex-1 flex-col",
                 "px-3 sm:px-6",
-                isChatRoute
-                  ? "pb-0 pt-1 sm:pt-2 lg:pt-4"
-                  : "pt-2 sm:pt-4 lg:pt-6",
+                "pt-2 sm:pt-4 lg:pt-6",
                 isDocsRoute && "min-h-0 flex-1",
               )}
             >
@@ -918,10 +862,8 @@ export default function App() {
               <div
                 className={cn(
                   "w-full min-w-0",
-                  !isChatRoute &&
-                    "pb-[calc(2rem+env(safe-area-inset-bottom,0px))] lg:pb-8",
-                  (isDocsRoute || isChatRoute) &&
-                    "min-h-0 flex flex-1 flex-col",
+                  "pb-[calc(2rem+env(safe-area-inset-bottom,0px))] lg:pb-8",
+                  isDocsRoute && "min-h-0 flex flex-1 flex-col",
                 )}
               >
                 <Routes>
@@ -933,34 +875,6 @@ export default function App() {
                     element={<UnknownRouteFallback pluginsLoading={pluginsLoading} />}
                   />
                 </Routes>
-
-                {embeddedChat &&
-                  !chatOverriddenByPlugin &&
-                  (pluginsLoading ? (
-                    isChatRoute ? (
-                      <div
-                        className="flex min-h-0 min-w-0 flex-1 items-center justify-center"
-                        aria-busy="true"
-                        aria-live="polite"
-                      >
-                        <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                          <Spinner />
-                          <span>Loading chat…</span>
-                        </div>
-                      </div>
-                    ) : null
-                  ) : (
-                    <div
-                      data-chat-active={isChatRoute ? "true" : "false"}
-                      className={cn(
-                        "min-h-0 min-w-0",
-                        isChatRoute ? "flex flex-1 flex-col" : "hidden",
-                      )}
-                      aria-hidden={!isChatRoute}
-                    >
-                      <ChatPage isActive={isChatRoute} />
-                    </div>
-                  ))}
               </div>
               <PluginSlot name="post-main" />
             </div>
