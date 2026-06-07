@@ -607,8 +607,9 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
 
     root = boards_root()
     if root.is_dir():
-        for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
-            if not child.is_dir():
+        children = [child for child in sorted(root.iterdir(), key=lambda p: p.name.lower()) if child.is_dir()]
+        for child in children:
+            if child.name == "_archived":
                 continue
             slug = child.name
             # Keep slug normalisation soft for discovery — but skip dirs
@@ -628,7 +629,48 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
                 continue
             entries.append(meta)
             seen.add(normed)
+
+        archive_root = root / "_archived"
+        if include_archived and archive_root.is_dir():
+            for archived_child in sorted(archive_root.iterdir(), key=lambda p: p.name.lower()):
+                if not archived_child.is_dir():
+                    continue
+                slug = _archived_board_slug_from_dir(archived_child.name)
+                try:
+                    normed = _normalize_board_slug(slug)
+                except ValueError:
+                    continue
+                if not normed or normed in seen:
+                    continue
+                has_db = (archived_child / "kanban.db").exists()
+                has_meta = (archived_child / "board.json").exists()
+                if not (has_db or has_meta):
+                    continue
+                meta = read_board_metadata(normed)
+                try:
+                    if has_meta:
+                        raw = json.loads((archived_child / "board.json").read_text(encoding="utf-8"))
+                        if isinstance(raw, dict):
+                            meta.update(raw)
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    pass
+                meta["slug"] = normed
+                meta["archived"] = True
+                meta["archived_path"] = str(archived_child)
+                meta["metadata_path"] = str(archived_child / "board.json")
+                meta["db_path"] = str(archived_child / "kanban.db")
+                entries.append(meta)
+                seen.add(normed)
     return entries
+
+
+def _archived_board_slug_from_dir(dirname: str) -> str:
+    """Return the original board slug from an archive directory name."""
+
+    # remove_board() writes <slug>-<unix_ts> and may append -<n> for rapid
+    # collision avoidance. Board slugs can contain hyphens, so strip only the
+    # timestamp suffix shape instead of a blind rsplit("-", 1).
+    return re.sub(r"-\d{10}(?:-\d+)?$", "", dirname)
 
 
 def remove_board(slug: str, *, archive: bool = True) -> dict:
