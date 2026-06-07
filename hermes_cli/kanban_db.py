@@ -6880,9 +6880,9 @@ def dispatch_once(
     """Run one dispatcher tick.
 
     Steps:
-      1. Reclaim stale running tasks (TTL expired).
-      2. Apply durable role-worker sidecar results while the matching current
+      1. Apply durable role-worker sidecar results while the matching current
          run is still intact.
+      2. Reclaim stale running tasks (TTL expired).
       3. Reclaim stale running tasks (no recent heartbeat).
       4. Reclaim crashed running tasks (host-local PID no longer alive).
       5. Promote todo -> ready where all parents are done.
@@ -6912,7 +6912,6 @@ def dispatch_once(
     reap_worker_zombies()
 
     result = DispatchResult()
-    result.reclaimed = release_stale_claims(conn)
     if board:
         try:
             from hermes_cli.kanban_codex_worker import recover_recorded_role_outputs_for_running_tasks
@@ -6920,6 +6919,7 @@ def dispatch_once(
             recover_recorded_role_outputs_for_running_tasks(conn, board=board)
         except Exception:
             pass
+    result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
