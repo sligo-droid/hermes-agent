@@ -112,6 +112,72 @@ def test_compress_context_trips_churn_breaker_before_session_rotation():
         assert details["lineage"][0]["api_call_count"] == 4
 
 
+def test_compress_context_trips_when_zero_message_lineage_keeps_little_headroom():
+    from agent.conversation_compression import CompressionChurnError, compress_context
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = SessionDB(db_path=Path(tmpdir) / "state.db")
+        db.create_session("root", "cli")
+        db.update_token_counts("root", input_tokens=190_000, absolute=True)
+        db.end_session("root", "compression")
+
+        db.create_session("child1", "cli", parent_session_id="root")
+        db.update_token_counts("child1", input_tokens=186_000, absolute=True)
+        db.end_session("child1", "compression")
+
+        db.create_session("child2", "cli", parent_session_id="child1")
+        db.update_token_counts(
+            "child2",
+            input_tokens=170_000,
+            api_call_count=3,
+            absolute=True,
+        )
+
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                session_db=db,
+                session_id="child2",
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        agent._build_system_prompt = lambda _system_message: "system"
+        agent.commit_memory_session = lambda _messages: None
+        agent.context_compressor.threshold_tokens = 190_400
+        agent.context_compressor.compress = lambda _messages, **_kwargs: [
+            {"role": "user", "content": "compressed summary"}
+        ]
+
+        messages = [
+            {"role": "user", "content": "keep going"},
+            {"role": "assistant", "content": "x" * 400_000},
+        ]
+
+        with patch(
+            "agent.conversation_compression.estimate_request_tokens_rough",
+            return_value=164_000,
+        ):
+            try:
+                compress_context(agent, messages, "system", approx_tokens=195_000)
+            except CompressionChurnError as exc:
+                details = exc.details
+            else:
+                raise AssertionError("expected CompressionChurnError")
+
+        assert agent.session_id == "child2"
+        assert "empty_child_insufficient_headroom" in details["reasons"]
+        assert "empty_child_similar_tokens" not in details["reasons"]
+        assert details["threshold_tokens"] == 190_400
+        assert details["insufficient_headroom_tokens"] == 152_320
+        assert details["compressed_tokens"] == 164_000
+        assert details["zero_message_child_count"] == 2
+
+
 def test_compress_context_ignores_recovered_large_zero_message_ancestor():
     from agent.conversation_compression import compress_context
     from hermes_state import SessionDB

@@ -45,6 +45,7 @@ _CHURN_RECENT_COMPRESSION_LIMIT = 3
 _CHURN_ZERO_MESSAGE_LIMIT = 2
 _CHURN_LARGE_INPUT_TOKENS = 100_000
 _CHURN_SIMILAR_TOKEN_RATIO = 0.90
+_CHURN_INSUFFICIENT_HEADROOM_RATIO = 0.80
 _CHURN_PROGRESS_MESSAGE_LIMIT = 2
 
 
@@ -345,6 +346,14 @@ def _lineage_row_similar_to_current(row: dict[str, Any], current_tokens: int) ->
     return lower <= row_tokens <= upper
 
 
+def _churn_threshold_tokens(agent: Any) -> int:
+    compressor = getattr(agent, "context_compressor", None)
+    try:
+        return int(getattr(compressor, "threshold_tokens", None) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _lineage_row_no_progress(row: dict[str, Any], *, current_tokens: int) -> bool:
     return (
         _lineage_row_message_count(row) == 0
@@ -417,10 +426,22 @@ def _compression_churn_details(
         and compressed_tokens
         and compressed_tokens >= int(original_tokens * _CHURN_SIMILAR_TOKEN_RATIO)
     )
+    threshold_tokens = _churn_threshold_tokens(agent)
+    insufficient_headroom_tokens = (
+        int(threshold_tokens * _CHURN_INSUFFICIENT_HEADROOM_RATIO)
+        if threshold_tokens
+        else 0
+    )
+    compressed_over_threshold = bool(threshold_tokens and compressed_tokens >= threshold_tokens)
+    compressed_insufficient_headroom = bool(
+        insufficient_headroom_tokens
+        and compressed_tokens >= insufficient_headroom_tokens
+    )
     token_reduction_stalled = bool(
         not original_tokens
         or not compressed_tokens
         or similar_tokens
+        or compressed_over_threshold
     )
     current_is_empty_child = bool(
         current.get("parent_session_id")
@@ -436,6 +457,13 @@ def _compression_churn_details(
         reasons.append("recent_compression_lineage")
     if current_no_progress and current_is_empty_child and similar_tokens:
         reasons.append("empty_child_similar_tokens")
+    if (
+        current_no_progress
+        and current_is_empty_child
+        and compressed_insufficient_headroom
+        and len(zero_message_compression_children) >= _CHURN_ZERO_MESSAGE_LIMIT
+    ):
+        reasons.append("empty_child_insufficient_headroom")
     if (
         current_no_progress
         and token_reduction_stalled
@@ -462,6 +490,8 @@ def _compression_churn_details(
         "large_zero_message_child_count": len(large_zero_message_children),
         "original_tokens": int(original_tokens or 0),
         "compressed_tokens": int(compressed_tokens or 0),
+        "threshold_tokens": threshold_tokens,
+        "insufficient_headroom_tokens": insufficient_headroom_tokens,
         "message_count": len(messages or []),
         "largest_message_candidate": _largest_message_candidate(messages),
         "lineage": lineage,
