@@ -417,6 +417,11 @@ def _compression_churn_details(
         and compressed_tokens
         and compressed_tokens >= int(original_tokens * _CHURN_SIMILAR_TOKEN_RATIO)
     )
+    token_reduction_stalled = bool(
+        not original_tokens
+        or not compressed_tokens
+        or similar_tokens
+    )
     current_is_empty_child = bool(
         current.get("parent_session_id")
         and _lineage_row_message_count(current) == 0
@@ -427,9 +432,13 @@ def _compression_churn_details(
         reasons.append("recent_compression_lineage")
     if current_no_progress and current_is_empty_child and similar_tokens:
         reasons.append("empty_child_similar_tokens")
-    if current_no_progress and len(zero_message_compression_children) >= _CHURN_ZERO_MESSAGE_LIMIT:
+    if (
+        current_no_progress
+        and token_reduction_stalled
+        and len(zero_message_compression_children) >= _CHURN_ZERO_MESSAGE_LIMIT
+    ):
         reasons.append("repeated_zero_message_children")
-    if current_no_progress and large_zero_message_children:
+    if current_no_progress and token_reduction_stalled and large_zero_message_children:
         reasons.append("large_zero_message_child")
     if not reasons:
         return None
