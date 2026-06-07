@@ -22,6 +22,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 import os
+import sys
 import threading
 import time
 from concurrent.futures import (
@@ -135,6 +136,25 @@ MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected u
 # stays as the default fallback and is still the symbol tests import.
 _MIN_SPAWN_DEPTH = 1
 _MAX_SPAWN_DEPTH_CAP = 3
+
+
+def _interpreter_shutdown_in_progress() -> bool:
+    if sys.is_finalizing():
+        return True
+    try:
+        import concurrent.futures.thread as _futures_thread
+
+        return bool(getattr(_futures_thread, "_shutdown", False))
+    except Exception:
+        return False
+
+
+def _is_interpreter_shutdown_error(exc: BaseException) -> bool:
+    return isinstance(exc, RuntimeError) and "interpreter shutdown" in str(exc).lower()
+
+
+def _delegation_shutdown_message() -> str:
+    return "Delegation is unavailable because the Python interpreter is shutting down."
 
 
 # ---------------------------------------------------------------------------
@@ -1506,15 +1526,30 @@ def _run_single_child(
         # Run child with a hard timeout to prevent indefinite blocking
         # when the child's API call or tool-level HTTP request hangs.
         child_timeout = _get_child_timeout()
-        _timeout_executor = ThreadPoolExecutor(
-            max_workers=1,
-            # Install a non-interactive approval callback in the worker thread
-            # so dangerous-command prompts from the subagent don't fall back to
-            # input() and deadlock the parent's prompt_toolkit TUI.
-            # Callback (deny vs approve) is governed by delegation.subagent_auto_approve.
-            initializer=_set_subagent_approval_cb,
-            initargs=(_get_subagent_approval_callback(),),
-        )
+        try:
+            _timeout_executor = ThreadPoolExecutor(
+                max_workers=1,
+                # Install a non-interactive approval callback in the worker thread
+                # so dangerous-command prompts from the subagent don't fall back to
+                # input() and deadlock the parent's prompt_toolkit TUI.
+                # Callback (deny vs approve) is governed by delegation.subagent_auto_approve.
+                initializer=_set_subagent_approval_cb,
+                initargs=(_get_subagent_approval_callback(),),
+            )
+        except RuntimeError as exc:
+            if not _is_interpreter_shutdown_error(exc):
+                raise
+            duration = round(time.monotonic() - child_start, 2)
+            return {
+                "task_index": task_index,
+                "status": "error",
+                "summary": None,
+                "error": _delegation_shutdown_message(),
+                "exit_reason": "error",
+                "api_calls": 0,
+                "duration_seconds": duration,
+                "_child_role": getattr(child, "_delegate_role", None),
+            }
         # Capture the worker thread so the timeout diagnostic can dump its
         # Python stack (see #14726 — 0-API-call hangs are opaque without it).
         _worker_thread_holder: Dict[str, Optional[threading.Thread]] = {"t": None}
@@ -1526,7 +1561,23 @@ def _run_single_child(
                 task_id=child_task_id,
             )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        try:
+            _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        except RuntimeError as exc:
+            if not _is_interpreter_shutdown_error(exc):
+                raise
+            _timeout_executor.shutdown(wait=False)
+            duration = round(time.monotonic() - child_start, 2)
+            return {
+                "task_index": task_index,
+                "status": "error",
+                "summary": None,
+                "error": _delegation_shutdown_message(),
+                "exit_reason": "error",
+                "api_calls": 0,
+                "duration_seconds": duration,
+                "_child_role": getattr(child, "_delegate_role", None),
+            }
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -1960,6 +2011,9 @@ def delegate_task(
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
+    if _interpreter_shutdown_in_progress():
+        return tool_error(_delegation_shutdown_message())
+
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
     # children.  Cleared via the matching `delegation.pause` RPC.
@@ -2115,16 +2169,27 @@ def delegate_task(
         completed_count = 0
         spinner_ref = getattr(parent_agent, "_delegate_spinner", None)
 
-        with ThreadPoolExecutor(max_workers=max_children) as executor:
+        try:
+            executor_cm = ThreadPoolExecutor(max_workers=max_children)
+        except RuntimeError as exc:
+            if _is_interpreter_shutdown_error(exc):
+                return tool_error(_delegation_shutdown_message())
+            raise
+        with executor_cm as executor:
             futures = {}
             for i, t, child in children:
-                future = executor.submit(
-                    _run_single_child,
-                    task_index=i,
-                    goal=t["goal"],
-                    child=child,
-                    parent_agent=parent_agent,
-                )
+                try:
+                    future = executor.submit(
+                        _run_single_child,
+                        task_index=i,
+                        goal=t["goal"],
+                        child=child,
+                        parent_agent=parent_agent,
+                    )
+                except RuntimeError as exc:
+                    if _is_interpreter_shutdown_error(exc):
+                        return tool_error(_delegation_shutdown_message())
+                    raise
                 futures[future] = i
 
             # Poll futures with interrupt checking.  as_completed() blocks
