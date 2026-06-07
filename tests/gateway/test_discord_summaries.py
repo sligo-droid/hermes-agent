@@ -1543,8 +1543,155 @@ async def test_send_kanban_completion_notice_posts_once(adapter, monkeypatch, tm
     kwargs, _message = thread.sent[0]
     assert "Done. Tasks: done:1 total:1." in kwargs["content"]
     assert "https://github.example/pr/1" in kwargs["content"]
-    assert "Kanban: https://hermes.example/workers/200" in kwargs["content"]
+    assert "Worker: https://hermes.example/workers/200" in kwargs["content"]
     worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "terminal_completion_message_pending" not in worker
+
+
+@pytest.mark.asyncio
+async def test_send_kanban_completion_notice_uses_full_final_response(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 200 else None
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="200", goal="Ship the dashboard")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_completion_message_pending": True,
+        },
+    )
+    final_response = "Completed.\n\nWhat changed:\nRoot cause confirmed and fixed.\n\nVerification:\nFocused tests passed."
+
+    sent = await adapter.send_kanban_completion_notice(
+        {
+            "board": board.slug,
+            "thread_id": "200",
+            "chat_id": "200",
+            "state": "done",
+            "outcome": "Done. Tasks: done:1 total:1.",
+            "terminal_completion_message_pending": True,
+            "board_summary": {
+                "final_response": {"text": final_response},
+                "pr": {"url": "https://github.example/pr/1", "merge_state": "merged"},
+                "public_url": "https://hermes.example/workers/200",
+            },
+        }
+    )
+
+    assert sent == board.slug
+    assert len(thread.sent) == 1
+    content = thread.sent[0][0]["content"]
+    assert content.startswith("Completed.\n\nWhat changed:")
+    assert "Root cause confirmed and fixed." in content
+    assert "Verification:" in content
+    assert "Merged: https://github.example/pr/1" in content
+    assert "Worker: https://hermes.example/workers/200" in content
+    assert "✅ Done" not in content
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["terminal_completion_message_id"] == "300"
+    assert "terminal_completion_message_pending" not in worker
+
+
+@pytest.mark.asyncio
+async def test_send_kanban_completion_notice_posts_all_chunks(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 200 else None
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="200", goal="Ship the dashboard")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_completion_message_pending": True,
+        },
+    )
+    final_response = "Completed.\n\nWhat changed:\n" + "\n".join(
+        f"- verified detailed completion item {idx} with enough text to force chunking" for idx in range(80)
+    )
+
+    sent = await adapter.send_kanban_completion_notice(
+        {
+            "board": board.slug,
+            "thread_id": "200",
+            "chat_id": "200",
+            "state": "done",
+            "terminal_completion_message_pending": True,
+            "board_summary": {"final_response": {"text": final_response}},
+        }
+    )
+
+    assert sent == board.slug
+    assert len(thread.sent) > 1
+    assert all(len(kwargs["content"]) <= adapter.MAX_MESSAGE_LENGTH for kwargs, _message in thread.sent)
+    assert "verified detailed completion item 0" in thread.sent[0][0]["content"]
+    assert "verified detailed completion item 79" in thread.sent[-1][0]["content"]
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["terminal_completion_message_id"] == "300"
+    assert "terminal_completion_message_pending" not in worker
+
+
+@pytest.mark.asyncio
+async def test_send_kanban_completion_notice_records_first_chunk_before_continuation_failure(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    parent = FakeTextChannel(channel_id=100)
+
+    class FailAfterFirstThread(FakeThread):
+        async def send(self, **kwargs):
+            if self.sent:
+                raise RuntimeError("continuation send failed")
+            return await super().send(**kwargs)
+
+    thread = FailAfterFirstThread(channel_id=200, parent=parent)
+    adapter._client.get_channel = lambda channel_id: thread if int(channel_id) == 200 else None
+    adapter._client.fetch_channel = AsyncMock(return_value=thread)
+
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="200", goal="Ship the dashboard")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_completion_message_pending": True,
+        },
+    )
+    final_response = "Completed.\n\nWhat changed:\n" + "\n".join(
+        f"- verified detailed completion item {idx} with enough text to force chunking" for idx in range(80)
+    )
+
+    sent = await adapter.send_kanban_completion_notice(
+        {
+            "board": board.slug,
+            "thread_id": "200",
+            "chat_id": "200",
+            "state": "done",
+            "terminal_completion_message_pending": True,
+            "board_summary": {"final_response": {"text": final_response}},
+        }
+    )
+
+    assert sent == board.slug
+    assert len(thread.sent) == 1
+    assert "verified detailed completion item 0" in thread.sent[0][0]["content"]
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["terminal_completion_message_id"] == "300"
     assert "terminal_completion_message_pending" not in worker
 
 

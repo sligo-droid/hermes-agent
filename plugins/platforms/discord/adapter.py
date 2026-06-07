@@ -3982,24 +3982,35 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         content = self._kanban_completion_notice_content(target)
         chunks = self.truncate_message(content, self.MAX_MESSAGE_LENGTH)
-        send_kwargs: Dict[str, Any] = {"content": chunks[0] if chunks else content[: self.MAX_MESSAGE_LENGTH]}
+        if not chunks:
+            chunks = [content[: self.MAX_MESSAGE_LENGTH]]
+        base_send_kwargs: Dict[str, Any] = {}
         try:
             allowed_mentions = _build_allowed_mentions()
             if allowed_mentions is not None:
-                send_kwargs["allowed_mentions"] = allowed_mentions
+                base_send_kwargs["allowed_mentions"] = allowed_mentions
         except Exception:
             pass
-        sent_message = await thread.send(**send_kwargs)
+        first_chunk, *remaining_chunks = chunks
+        first_send_kwargs: Dict[str, Any] = {**base_send_kwargs, "content": first_chunk}
+        first_message = await thread.send(**first_send_kwargs)
         try:
             from hermes_cli.discord_worker_boards import mark_thread_completion_notice_sent
 
             mark_thread_completion_notice_sent(
                 board,
-                message_id=str(getattr(sent_message, "id", "") or "") or None,
+                message_id=str(getattr(first_message, "id", "") or "") or None,
             )
         except Exception:
             logger.debug("[%s] Failed to record Discord terminal completion notice send", self.name, exc_info=True)
             return None
+        for chunk in remaining_chunks:
+            send_kwargs: Dict[str, Any] = {**base_send_kwargs, "content": chunk}
+            try:
+                await thread.send(**send_kwargs)
+            except Exception:
+                logger.debug("[%s] Failed to send a continuation chunk for Discord terminal completion notice", self.name, exc_info=True)
+                break
         return board
 
     def _clear_terminal_kanban_sync_flags(
@@ -4030,15 +4041,62 @@ class DiscordAdapter(BasePlatformAdapter):
         return True
 
     def _kanban_completion_notice_content(self, target: Dict[str, Any]) -> str:
-        outcome = str(target.get("outcome") or "").strip() or "Done. Kanban work completed."
-        lines = [outcome]
-        pr_url = str(target.get("pr_url") or "").strip()
-        if pr_url and pr_url not in outcome:
-            lines.append(f"PR: {pr_url}")
-        public_url = str(target.get("public_url") or "").strip()
-        if public_url:
-            lines.append(f"Kanban: {public_url}")
+        raw_summary = target.get("board_summary")
+        board_summary: Dict[str, Any] = raw_summary if isinstance(raw_summary, dict) else {}
+        final_response = self._kanban_completion_final_response(board_summary)
+        if final_response:
+            lines = [final_response]
+            lines.extend(self._kanban_completion_notice_link_lines(target, board_summary, existing_text=final_response))
+            return "\n".join(lines)
+
+        outcome = str(target.get("outcome") or "").strip()
+        rendered_summary = self._kanban_completion_rendered_summary(board_summary)
+        lines = ["Completed."]
+        if outcome:
+            lines.extend(["", "Outcome:", outcome])
+        elif not rendered_summary:
+            lines.extend(["", "Kanban work completed."])
+        if rendered_summary:
+            lines.extend(["", "Board summary:", rendered_summary])
+        lines.extend(self._kanban_completion_notice_link_lines(target, board_summary, existing_text="\n".join(lines)))
         return "\n".join(lines)
+
+    @staticmethod
+    def _kanban_completion_final_response(board_summary: Dict[str, Any]) -> str:
+        final = board_summary.get("final_response") if isinstance(board_summary, dict) else None
+        if not isinstance(final, dict):
+            return ""
+        return str(final.get("text") or "").strip()
+
+    @staticmethod
+    def _kanban_completion_rendered_summary(board_summary: Dict[str, Any]) -> str:
+        if not board_summary:
+            return ""
+        try:
+            from hermes_cli.discord_worker_boards import render_board_run_summary_text
+
+            return str(render_board_run_summary_text(board_summary) or "").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _kanban_completion_notice_link_lines(
+        target: Dict[str, Any],
+        board_summary: Dict[str, Any],
+        *,
+        existing_text: str,
+    ) -> list[str]:
+        existing = existing_text or ""
+        pr = board_summary.get("pr") if isinstance(board_summary.get("pr"), dict) else {}
+        pr_url = str(target.get("pr_url") or pr.get("url") or "").strip()
+        public_url = str(target.get("public_url") or board_summary.get("public_url") or "").strip()
+        lines: list[str] = []
+        if pr_url and pr_url not in existing:
+            label = "Merged" if str(pr.get("merge_state") or "").strip().lower() == "merged" else "PR"
+            lines.append(f"{label}: {pr_url}")
+        if public_url and public_url not in existing:
+            lines.append(f"Worker: {public_url}")
+        return ([""] + lines) if lines else []
 
     @staticmethod
     def _is_discord_thread_object(channel: Any) -> bool:

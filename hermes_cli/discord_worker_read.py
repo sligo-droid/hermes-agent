@@ -311,7 +311,11 @@ def update_board(
 ) -> dict[str, Any]:
     _require_control_access("board metadata mutation")
     from hermes_cli import kanban_db
-    from hermes_cli.discord_worker_boards import mark_dispatch_dirty, persist_board_run_summary
+    from hermes_cli.discord_worker_boards import (
+        mark_completion_notice_pending_on_done_transition,
+        mark_dispatch_dirty,
+        persist_board_run_summary,
+    )
     from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
     from utils import atomic_json_write
 
@@ -322,6 +326,7 @@ def update_board(
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
     if worker.get("kind") != "discord_worker_board":
         raise KeyError(f"unknown Discord worker board: {board}")
+    previous = dict(worker)
 
     updates = dict(set_values or {})
     for key, value in (
@@ -345,6 +350,7 @@ def update_board(
         worker[str(key)] = value
     for key in delete_keys or []:
         worker.pop(str(key), None)
+    mark_completion_notice_pending_on_done_transition(worker, previous)
     worker["updated_at"] = int(time.time())
     metadata[DISCORD_WORKER_META_KEY] = worker
     metadata.pop("db_path", None)

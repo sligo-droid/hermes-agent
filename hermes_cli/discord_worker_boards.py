@@ -429,6 +429,32 @@ def _is_terminal_worker_meta(worker: dict[str, Any]) -> bool:
     return bool(worker.get("cancelled") or status in TERMINAL_GOAL_STATUSES or phase == "complete")
 
 
+def mark_completion_notice_pending_on_done_transition(
+    worker: dict[str, Any],
+    previous: dict[str, Any] | None = None,
+) -> bool:
+    """Set the one-shot Discord completion notice flag when a board becomes done.
+
+    This complements the codex worker's direct phase update path. Foreman and
+    read-token updates mutate board metadata through helper modules, so the
+    completion notice has to be armed at the metadata layer too.
+    """
+
+    if worker.get("kind") != "discord_worker_board":
+        return False
+    previous = previous or {}
+    if _terminal_worker_reaction_state(previous) == "done":
+        return False
+    if _terminal_worker_reaction_state(worker) != "done":
+        return False
+    if worker.get("terminal_completion_message_sent_at") or worker.get("terminal_completion_message_id"):
+        return False
+    if worker.get("terminal_completion_message_pending") is True:
+        return False
+    worker["terminal_completion_message_pending"] = True
+    return True
+
+
 def board_has_unsynced_terminal_reaction(board: str) -> bool:
     """Return whether a terminal Discord worker board still needs reaction sync."""
     worker = _read_worker_meta(board)
@@ -443,6 +469,14 @@ def board_has_unsynced_terminal_reaction(board: str) -> bool:
     if worker.get("terminal_reaction_sync_pending"):
         return True
     return _terminal_reaction_synced_state(worker) != reaction_state
+
+
+def board_has_pending_terminal_completion_notice(board: str) -> bool:
+    """Return whether a done Discord worker board still needs its follow-up post."""
+    worker = _read_worker_meta(board)
+    if worker.get("kind") != "discord_worker_board" or _terminal_worker_reaction_state(worker) != "done":
+        return False
+    return bool(worker.get("terminal_completion_message_pending"))
 
 
 def _update_worker_meta(board: str, updates: dict[str, Any]) -> dict[str, Any]:
@@ -466,6 +500,7 @@ def _update_worker_meta(board: str, updates: dict[str, Any]) -> dict[str, Any]:
             worker["terminal_summary_sync_pending"] = True
         if became_terminal or terminal_reaction_changed:
             worker["terminal_reaction_sync_pending"] = True
+        mark_completion_notice_pending_on_done_transition(worker, previous)
     worker["updated_at"] = _now()
     metadata[DISCORD_WORKER_META_KEY] = worker
     written = _write_metadata(board, metadata)
@@ -3179,6 +3214,7 @@ def feature_summary_snapshot(board: str) -> dict[str, Any]:
         "pr_url": str(worker.get("pr_url") or "").strip(),
         "pr_number": str(worker.get("pr_number") or "").strip(),
         "public_url": str(worker.get("public_url") or "").strip(),
+        "board_summary": terminal_summary,
         "runtime_breakdown": runtime_breakdown,
         "terminal_summary_updated_at": terminal_summary.get("generated_at") if terminal_summary else None,
         "updated_at": worker.get("updated_at"),
@@ -3310,11 +3346,13 @@ def thread_status_targets() -> list[dict[str, Any]]:
             "pr_url": summary.get("pr_url") or "",
             "pr_number": summary.get("pr_number") or "",
             "public_url": summary.get("public_url") or "",
+            "board_summary": summary.get("board_summary") if isinstance(summary.get("board_summary"), dict) else {},
             "runtime_breakdown": summary.get("runtime_breakdown") or {},
             "sync_key": summary.get("sync_key") or "",
             "terminal_reaction_sync_pending": bool(worker.get("terminal_reaction_sync_pending")),
             "terminal_summary_sync_pending": bool(worker.get("terminal_summary_sync_pending")),
             "terminal_completion_message_pending": terminal_completion_message_pending,
+            "terminal_reaction_sync_needed": terminal_reaction_sync_needed,
         }
         if source_context:
             target.update(source_context)

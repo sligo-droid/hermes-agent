@@ -1024,6 +1024,11 @@ def test_discord_terminal_status_target_syncs_only_when_pending(tmp_path, monkey
     assert [target["board"] for target in dwb.thread_status_targets()] == [board.slug]
 
     dwb.mark_thread_status_synced(board.slug, summary=True)
+    targets = dwb.thread_status_targets()
+    assert [target["board"] for target in targets] == [board.slug]
+    assert targets[0]["terminal_completion_message_pending"] is True
+
+    dwb.mark_thread_completion_notice_sent(board.slug, message_id="completion-message-1")
     assert dwb.thread_status_targets() == []
 
 
@@ -1055,6 +1060,11 @@ def test_discord_terminal_pr_refresh_requeues_summary_sync(tmp_path, monkeypatch
         },
     )
     dwb.mark_thread_status_synced(board.slug, reaction=True, summary=True)
+    targets = dwb.thread_status_targets()
+    assert [target["board"] for target in targets] == [board.slug]
+    assert targets[0]["terminal_completion_message_pending"] is True
+
+    dwb.mark_thread_completion_notice_sent(board.slug, message_id="completion-message-1")
     assert dwb.thread_status_targets() == []
 
     dwb._update_worker_meta(
@@ -1194,9 +1204,21 @@ def test_discord_kanban_typing_watcher_sends_completion_notice(tmp_path, monkeyp
     runner = _make_discord_runner(adapter)
 
     asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+    assert adapter.completions == []
+    worker = kb.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["terminal_completion_message_pending"] is True
+
+    dwb.record_final_discord_response(
+        board.slug,
+        final_response="✅ Done. Completed goal with verified final response.",
+        session_id="session-99020",
+    )
+    runner._running = True
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
 
     assert len(adapter.completions) == 1
     assert adapter.completions[0]["board"] == board.slug
+    assert adapter.completions[0]["board_summary"]["final_response"]["text"] == "✅ Done. Completed goal with verified final response."
     worker = kb.read_board_metadata(board.slug)["discord_worker"]
     assert "terminal_completion_message_pending" not in worker
     assert worker["terminal_completion_message_id"] == "completion-message-1"

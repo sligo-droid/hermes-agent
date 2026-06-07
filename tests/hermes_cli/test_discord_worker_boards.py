@@ -75,6 +75,52 @@ def test_old_discord_worker_boards_are_not_status_targets(monkeypatch, tmp_path)
     assert "terminal_completion_message_pending" not in worker
 
 
+def test_done_metadata_transition_arms_completion_notice(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    thread_id = _discord_snowflake_at(time.time())
+    board = dwb.start_direct_goal(thread_id=thread_id, goal="Ship it")
+
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "concise_outcome": "Merged the fix.",
+        },
+    )
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["terminal_summary_sync_pending"] is True
+    assert worker["terminal_reaction_sync_pending"] is True
+    assert worker["terminal_completion_message_pending"] is True
+    assert dwb.board_has_pending_terminal_completion_notice(board.slug) is True
+    target = dwb.thread_status_targets()[0]
+    assert target["state"] == "done"
+    assert target["terminal_completion_message_pending"] is True
+    assert target["board_summary"]["goal_status"] == "done"
+
+
+def test_done_metadata_update_after_completion_notice_does_not_rearm(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    thread_id = _discord_snowflake_at(time.time() + 1)
+    board = dwb.start_direct_goal(thread_id=thread_id, goal="Ship it")
+    dwb._update_worker_meta(board.slug, {"goal_status": "done", "phase": "complete"})
+    dwb.mark_thread_completion_notice_sent(board.slug, message_id="done-message")
+
+    dwb._update_worker_meta(board.slug, {"pr_url": "https://github.example.test/acme/repo/pull/1"})
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "terminal_completion_message_pending" not in worker
+    assert worker["terminal_completion_message_id"] == "done-message"
+    assert dwb.board_has_pending_terminal_completion_notice(board.slug) is False
+
+
 def test_old_discord_worker_boards_are_not_executable(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

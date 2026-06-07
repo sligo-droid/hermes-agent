@@ -883,6 +883,7 @@ def test_auto_close_completed_foreman_board_reconciles_stale_source_and_foreman(
     assert source_worker["blocked_reason"] == ""
     assert source_worker["terminal_summary_sync_pending"] is True
     assert source_worker["terminal_reaction_sync_pending"] is True
+    assert source_worker["terminal_completion_message_pending"] is True
     assert foreman_worker["goal_status"] == "done"
     assert foreman_worker["phase"] == "complete"
     assert foreman_worker["blocked_reason"] == ""
