@@ -430,6 +430,25 @@ def _is_terminal_worker_meta(worker: dict[str, Any]) -> bool:
     return bool(worker.get("cancelled") or status in TERMINAL_GOAL_STATUSES or phase == "complete")
 
 
+def _terminal_worker_reaction_sync_needed(worker: dict[str, Any]) -> bool:
+    reaction_state = _terminal_worker_reaction_state(worker)
+    if reaction_state not in {"done", "blocked", "errored"}:
+        return False
+    if worker.get("terminal_reaction_sync_pending"):
+        return True
+    return _terminal_reaction_synced_state(worker) != reaction_state
+
+
+def _terminal_worker_status_sync_needed(worker: dict[str, Any]) -> bool:
+    if worker.get("kind") != "discord_worker_board" or not _is_terminal_worker_meta(worker):
+        return False
+    return bool(
+        worker.get("terminal_summary_sync_pending")
+        or worker.get("terminal_completion_message_pending")
+        or _terminal_worker_reaction_sync_needed(worker)
+    )
+
+
 def mark_completion_notice_pending_on_done_transition(
     worker: dict[str, Any],
     previous: dict[str, Any] | None = None,
@@ -3237,10 +3256,15 @@ def thread_status_targets() -> list[dict[str, Any]]:
         pass
     for board_meta in kanban_db.list_boards(include_archived=False):
         board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
-        if _board_target_skipped_by_metadata(board, board_meta, source="discord thread status targets"):
-            continue
         raw_worker = board_meta.get(DISCORD_WORKER_META_KEY)
         worker = dict(raw_worker) if isinstance(raw_worker, dict) else {}
+        terminal_status_sync_needed = _terminal_worker_status_sync_needed(worker)
+        if _board_target_skipped_by_metadata(
+            board,
+            board_meta,
+            source="discord thread status targets",
+        ) and not terminal_status_sync_needed:
+            continue
         if worker.get("kind") != "discord_worker_board":
             continue
         thread_id = str(worker.get("thread_id") or "").strip()

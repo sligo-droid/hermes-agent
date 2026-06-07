@@ -104,6 +104,35 @@ def test_done_metadata_transition_arms_completion_notice(monkeypatch, tmp_path):
     assert target["board_summary"]["goal_status"] == "done"
 
 
+def test_paused_terminal_worker_with_pending_sync_remains_status_target(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    thread_id = _discord_snowflake_at(time.time())
+    board = dwb.start_direct_goal(thread_id=thread_id, goal="Archive a stale paused worker")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "cancelled",
+            "phase": "cancelled",
+            "cancelled": True,
+            "terminal_reaction_sync_pending": True,
+            "terminal_summary_sync_pending": True,
+        },
+    )
+    metadata = kanban_db.read_board_metadata(board.slug)
+    metadata["paused"] = True
+    metadata["pause_reason"] = "manual_visibility_recovery_stale_branch_preserved"
+    dwb._write_metadata(board.slug, metadata)
+
+    target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
+
+    assert target["state"] == "errored"
+    assert target["terminal_reaction_sync_pending"] is True
+    assert target["terminal_summary_sync_pending"] is True
+
+
 def test_done_metadata_update_after_completion_notice_does_not_rearm(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
