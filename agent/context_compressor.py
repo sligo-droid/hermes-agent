@@ -23,7 +23,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from agent.auxiliary_client import call_llm, _is_connection_error
+from agent.auxiliary_client import call_llm, _is_connection_error, log_auxiliary_health_warning
 from agent.context_engine import ContextEngine
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -1523,10 +1523,14 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             # No provider configured — long cooldown, unlikely to self-resolve
             self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
             self._last_summary_error = "no auxiliary LLM provider configured"
-            logger.warning("Context compression: no provider available for "
-                            "summary. Middle turns will be dropped without summary "
-                            "for %d seconds.",
-                            _SUMMARY_FAILURE_COOLDOWN_SECONDS)
+            log_auxiliary_health_warning(
+                self.provider or "auto",
+                "compression_no_provider",
+                "Context compression: no provider available for "
+                "summary. Middle turns will be dropped without summary "
+                "for %d seconds.",
+                _SUMMARY_FAILURE_COOLDOWN_SECONDS,
+            )
             return None
         except Exception as e:
             # If the summary model is different from the main model and the
@@ -1619,7 +1623,9 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             if len(err_text) > 220:
                 err_text = err_text[:217].rstrip() + "..."
             self._last_summary_error = err_text
-            logger.warning(
+            log_auxiliary_health_warning(
+                self.provider or "auto",
+                "compression_summary_failed",
                 "Failed to generate context summary: %s. "
                 "Further summary attempts paused for %d seconds.",
                 e,

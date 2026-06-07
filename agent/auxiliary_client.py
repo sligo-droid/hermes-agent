@@ -2187,8 +2187,84 @@ def _get_provider_chain() -> List[tuple]:
 # the user might be running two profiles with different OpenRouter keys.
 
 _AUX_UNHEALTHY_TTL_SECONDS = 600  # 10 minutes
+_AUX_WARNING_WINDOW_SECONDS = 60
 _aux_unhealthy_until: Dict[str, float] = {}
 _aux_unhealthy_logged_at: Dict[str, float] = {}
+_aux_warning_buckets: Dict[Tuple[str, str], Dict[str, float]] = {}
+_aux_warning_lock = threading.RLock()
+
+
+def _aux_time() -> float:
+    return time.time()
+
+
+def _format_aux_warning_ts(ts: float) -> str:
+    return time.strftime("%H:%M:%S", time.localtime(ts))
+
+
+def _emit_aux_warning_summary(provider: str, failure_class: str, bucket: Dict[str, float]) -> None:
+    suppressed = int(bucket.get("suppressed", 0))
+    if suppressed <= 0:
+        return
+    logger.warning(
+        "Auxiliary health summary: provider=%s failure_class=%s suppressed=%d first=%s last=%s",
+        provider,
+        failure_class,
+        suppressed,
+        _format_aux_warning_ts(bucket.get("first", 0.0)),
+        _format_aux_warning_ts(bucket.get("last", 0.0)),
+    )
+
+
+def _should_emit_aux_health_warning(
+    provider: str,
+    failure_class: str,
+    *,
+    window: float = _AUX_WARNING_WINDOW_SECONDS,
+) -> bool:
+    """Return True for the first visible warning in a bounded window.
+
+    Repeats for the same normalized provider/failure class are counted and
+    summarized when the window rolls over or the provider recovers.
+    """
+    normalized_provider = _normalize_chain_label(provider or "auto") or "auto"
+    key = (normalized_provider, failure_class)
+    now = _aux_time()
+    with _aux_warning_lock:
+        bucket = _aux_warning_buckets.get(key)
+        if bucket is None:
+            _aux_warning_buckets[key] = {"first": now, "last": now, "suppressed": 0.0}
+            return True
+        if now - bucket.get("first", now) >= window:
+            _emit_aux_warning_summary(normalized_provider, failure_class, bucket)
+            _aux_warning_buckets[key] = {"first": now, "last": now, "suppressed": 0.0}
+            return True
+        bucket["last"] = now
+        bucket["suppressed"] = bucket.get("suppressed", 0.0) + 1.0
+        return False
+
+
+def _flush_aux_health_warning_summary(provider: str, failure_class: Optional[str] = None) -> None:
+    normalized_provider = _normalize_chain_label(provider or "auto") or "auto"
+    with _aux_warning_lock:
+        keys = [
+            key for key in _aux_warning_buckets
+            if key[0] == normalized_provider and (failure_class is None or key[1] == failure_class)
+        ]
+        for key in keys:
+            bucket = _aux_warning_buckets.pop(key)
+            _emit_aux_warning_summary(key[0], key[1], bucket)
+
+
+def log_auxiliary_health_warning(
+    provider: str,
+    failure_class: str,
+    message: str,
+    *args: Any,
+    window: float = _AUX_WARNING_WINDOW_SECONDS,
+) -> None:
+    if _should_emit_aux_health_warning(provider, failure_class, window=window):
+        logger.warning(message, *args)
 
 # Map provider names that show up in resolved_provider / explicit-config
 # back to the chain labels used by _get_provider_chain(). Keep in sync
@@ -2223,14 +2299,17 @@ def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None
     label = _normalize_chain_label(provider)
     if not label:
         return
-    expires_at = time.time() + (ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS)
-    _aux_unhealthy_until[label] = expires_at
-    logger.warning(
+    expires_at = _aux_time() + (ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS)
+    with _aux_warning_lock:
+        _aux_unhealthy_until[label] = expires_at
+    log_auxiliary_health_warning(
+        label,
+        "payment_error",
         "Auxiliary: marking %s unhealthy for %ds (payment / credit error). "
         "Subsequent auxiliary calls will skip it until %s.",
         label,
         int(ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS),
-        time.strftime("%H:%M:%S", time.localtime(expires_at)),
+        _format_aux_warning_ts(expires_at),
     )
 
 
@@ -2243,9 +2322,11 @@ def _is_provider_unhealthy(label: str) -> bool:
     expires_at = _aux_unhealthy_until.get(label)
     if expires_at is None:
         return False
-    if time.time() >= expires_at:
-        _aux_unhealthy_until.pop(label, None)
-        _aux_unhealthy_logged_at.pop(label, None)
+    if _aux_time() >= expires_at:
+        with _aux_warning_lock:
+            _aux_unhealthy_until.pop(label, None)
+            _aux_unhealthy_logged_at.pop(label, None)
+        _flush_aux_health_warning_summary(label)
         return False
     return True
 
@@ -2255,10 +2336,12 @@ def _log_skip_unhealthy(label: str, task: Optional[str] = None) -> None:
     provider. Avoids spamming the log on bursty sessions while still
     giving the user a trail.
     """
-    now = time.time()
+    now = _aux_time()
+    emit = _should_emit_aux_health_warning(label, "unhealthy_skip")
     last = _aux_unhealthy_logged_at.get(label, 0.0)
-    if now - last >= 60:
-        _aux_unhealthy_logged_at[label] = now
+    if emit and now - last >= 60:
+        with _aux_warning_lock:
+            _aux_unhealthy_logged_at[label] = now
         expires_at = _aux_unhealthy_until.get(label, now)
         logger.info(
             "Auxiliary %s: skipping %s (recently returned payment error, retry in %ds)",
@@ -2269,8 +2352,10 @@ def _log_skip_unhealthy(label: str, task: Optional[str] = None) -> None:
 def _reset_aux_unhealthy_cache() -> None:
     """Clear the unhealthy cache. Used by tests and by a future explicit
     user trigger (e.g. ``hermes config aux reset``)."""
-    _aux_unhealthy_until.clear()
-    _aux_unhealthy_logged_at.clear()
+    with _aux_warning_lock:
+        _aux_unhealthy_until.clear()
+        _aux_unhealthy_logged_at.clear()
+        _aux_warning_buckets.clear()
 
 
 def _is_payment_error(exc: Exception) -> bool:
@@ -3141,10 +3226,14 @@ def _resolve_auto(
             return client, model
         tried.append(label)
 
-    logger.warning("Auxiliary auto-detect: no provider available (tried: %s). "
-                   "Compression, summarization, and memory flush will not work. "
-                   "Set OPENROUTER_API_KEY or configure a local model in config.yaml.",
-                   ", ".join(tried))
+    log_auxiliary_health_warning(
+        "auto",
+        "no_provider",
+        "Auxiliary auto-detect: no provider available (tried: %s). "
+        "Compression, summarization, and memory flush will not work. "
+        "Set OPENROUTER_API_KEY or configure a local model in config.yaml.",
+        ", ".join(tried),
+    )
     return None, None
 
 
@@ -5381,7 +5470,9 @@ def call_llm(
             # All fallback layers exhausted — emit a single user-visible
             # warning so the operator knows aux task is about to fail.
             # (#26882) The error itself is re-raised below.
-            logger.warning(
+            log_auxiliary_health_warning(
+                resolved_provider or "auto",
+                "fallbacks_exhausted",
                 "Auxiliary %s: %s on %s and all fallbacks exhausted "
                 "(fallback_chain + main agent model). Raising original error.",
                 task or "call", reason, resolved_provider,
@@ -5825,7 +5916,9 @@ async def async_call_llm(
                 return _validate_llm_response(
                     await async_fb.chat.completions.create(**fb_kwargs), task)
             # All fallback layers exhausted — warn before re-raising. (#26882)
-            logger.warning(
+            log_auxiliary_health_warning(
+                resolved_provider or "auto",
+                "fallbacks_exhausted",
                 "Auxiliary %s (async): %s on %s and all fallbacks exhausted "
                 "(fallback_chain + main agent model). Raising original error.",
                 task or "call", reason, resolved_provider,
