@@ -726,7 +726,11 @@ def _run_opencode_once(
             )
         if session_id:
             result.thread_id = session_id
-            result.final_text = _load_final_text_from_export(binary_or_error, session_id)
+            result.final_text = _load_final_text_from_export(
+                binary_or_error,
+                session_id,
+                env=process_env,
+            )
     if proc.returncode != 0 and result.error is None:
         result.error = _classify_opencode_error(
             result.stdout,
@@ -915,7 +919,9 @@ def _parse_opencode_output(
     )
 
 
-def _load_final_text_from_export(binary: str, session_id: Optional[str]) -> str:
+def _load_final_text_from_export(
+    binary: str, session_id: Optional[str], *, env: Optional[dict[str, str]] = None
+) -> str:
     """Recover assistant text from ``opencode export`` when JSONL output is sparse."""
     if not session_id:
         return ""
@@ -928,6 +934,7 @@ def _load_final_text_from_export(binary: str, session_id: Optional[str]) -> str:
             check=False,
             encoding="utf-8",
             errors="replace",
+            env=env,
         )
     except Exception:
         return ""
