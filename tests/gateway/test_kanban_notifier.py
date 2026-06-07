@@ -1175,7 +1175,7 @@ def test_discord_kanban_typing_watcher_keeps_completion_notice_pending_without_s
     assert "terminal_completion_message_sent_at" not in worker
 
 
-def test_discord_kanban_typing_watcher_sends_completion_notice(tmp_path, monkeypatch):
+def test_discord_kanban_typing_watcher_sends_summary_fallback_completion_notice(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb
 
@@ -1207,16 +1207,52 @@ def test_discord_kanban_typing_watcher_sends_completion_notice(tmp_path, monkeyp
     runner = _make_discord_runner(adapter)
 
     asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
-    assert adapter.completions == []
-    worker = kb.read_board_metadata(board.slug)["discord_worker"]
-    assert worker["terminal_completion_message_pending"] is True
 
+    assert len(adapter.completions) == 1
+    assert adapter.completions[0]["board"] == board.slug
+    assert adapter.completions[0]["board_summary"]["final_response"]["text"] == ""
+    assert adapter.completions[0]["board_summary"]["task_counts"]["total"] == 1
+    worker = kb.read_board_metadata(board.slug)["discord_worker"]
+    assert "terminal_completion_message_pending" not in worker
+    assert worker["terminal_completion_message_id"] == "completion-message-1"
+    assert isinstance(worker["terminal_completion_message_sent_at"], int)
+
+
+def test_discord_kanban_typing_watcher_prefers_recorded_final_response_notice(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(
+        thread_id="99020-final",
+        goal="Announce completed goal with final response",
+        chat_id="parent-99020-final",
+    )
+    conn = kb.connect(board=board.slug)
+    try:
+        task = kb.list_tasks(conn, include_archived=False)[0]
+        claimed = kb.claim_task(conn, task.id)
+        assert claimed is not None
+        kb.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_reaction_sync_pending": True,
+            "terminal_summary_sync_pending": True,
+            "terminal_completion_message_pending": True,
+        },
+    )
     dwb.record_final_discord_response(
         board.slug,
         final_response="✅ Done. Completed goal with verified final response.",
         session_id="session-99020",
     )
-    runner._running = True
+
+    adapter = CompletionNoticeAdapter()
+    runner = _make_discord_runner(adapter)
     asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
 
     assert len(adapter.completions) == 1
