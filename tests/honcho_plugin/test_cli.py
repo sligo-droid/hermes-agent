@@ -642,6 +642,50 @@ class TestHonchoEmbeddingsAutoRepair:
         assert not any(cmd[1:2] == ["start"] for cmd in calls)
         assert any("not in the exited state" in fact for fact in facts)
 
+    def test_non_connection_refused_honcho_failure_does_not_repair(self):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        called = False
+
+        def fake_repair(**kwargs):
+            nonlocal called
+            called = True
+            return True, ["should not run"]
+
+        from unittest.mock import patch
+
+        with patch.object(honcho_cli, "auto_repair_honcho_embeddings_container", fake_repair):
+            ok, facts = honcho_cli.repair_honcho_embeddings_for_base_url_health(
+                "http://127.0.0.1:8000",
+                "HTTP 500: backend unavailable",
+            )
+
+        assert ok is False
+        assert called is False
+        assert any("not a connection-refused error" in fact for fact in facts)
+
+    def test_non_local_honcho_url_does_not_repair(self):
+        import plugins.memory.honcho.cli as honcho_cli
+
+        called = False
+
+        def fake_repair(**kwargs):
+            nonlocal called
+            called = True
+            return True, ["should not run"]
+
+        from unittest.mock import patch
+
+        with patch.object(honcho_cli, "auto_repair_honcho_embeddings_container", fake_repair):
+            ok, facts = honcho_cli.repair_honcho_embeddings_for_base_url_health(
+                "https://honcho.example.com",
+                "connection refused",
+            )
+
+        assert ok is False
+        assert called is False
+        assert facts == ["Repair skipped: Honcho base URL is not local"]
+
     def test_docker_start_failure_reports_exact_step(self):
         import plugins.memory.honcho.cli as honcho_cli
 

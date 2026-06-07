@@ -863,6 +863,11 @@ def repair_honcho_embeddings_for_base_url_health(
 ) -> tuple[bool, list[str]]:
     if not _is_local_url(base_url):
         return False, ["Repair skipped: Honcho base URL is not local"]
+    if not _is_connection_refused(detail):
+        return False, [
+            f"Local Honcho health failed: {detail}",
+            "Repair skipped: Honcho health failure is not a connection-refused error",
+        ]
     repaired, facts = auto_repair_honcho_embeddings_container(port=port)
     return repaired, [f"Local Honcho health failed: {detail}", *facts]
 

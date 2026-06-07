@@ -363,6 +363,69 @@ class TestDoctorMemoryProviderSection:
         assert "Memory Provider" in out
         assert "Built-in memory active" not in out
 
+    def test_honcho_embeddings_repair_rechecks_normal_connection_path(self, monkeypatch, tmp_path):
+        import plugins.memory.honcho.client as honcho_client
+        import plugins.memory.honcho.cli as honcho_cli
+
+        home = self._make_hermes_home(tmp_path, provider="honcho")
+        honcho_config = tmp_path / "honcho.json"
+        honcho_config.write_text("{}", encoding="utf-8")
+
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        (tmp_path / "project").mkdir(exist_ok=True)
+
+        fake_model_tools = types.SimpleNamespace(
+            check_tool_availability=lambda *a, **kw: ([], []),
+            TOOLSET_REQUIREMENTS={},
+        )
+        monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+        hcfg = SimpleNamespace(
+            enabled=True,
+            api_key=None,
+            base_url="http://127.0.0.1:8000",
+            workspace_id="hermes",
+            recall_mode="hybrid",
+            write_frequency="async",
+        )
+        monkeypatch.setattr(honcho_client.HonchoClientConfig, "from_global_config", lambda: hcfg)
+        monkeypatch.setattr(honcho_client, "resolve_config_path", lambda: honcho_config)
+        monkeypatch.setattr(honcho_client, "reset_honcho_client", lambda: None)
+
+        calls = []
+
+        def fake_get_honcho_client(cfg):
+            calls.append(cfg)
+            if len(calls) == 1:
+                raise RuntimeError("[Errno 111] Connection refused")
+            return object()
+
+        monkeypatch.setattr(honcho_client, "get_honcho_client", fake_get_honcho_client)
+        monkeypatch.setattr(
+            honcho_cli,
+            "repair_honcho_embeddings_for_base_url_health",
+            lambda base_url, detail: (
+                True,
+                [
+                    f"Local Honcho health failed: {detail}",
+                    "Repair complete: re-enter normal Honcho doctor/status check",
+                ],
+            ),
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doctor_mod.run_doctor(Namespace(fix=False))
+        out = buf.getvalue()
+
+        assert len(calls) == 2
+        assert "Honcho embeddings auto-repair" in out
+        assert "Repair complete: re-enter normal Honcho doctor/status check" in out
+        assert "Honcho connected" in out
+        assert "Honcho connection failed" not in out
+
 
 def test_run_doctor_termux_treats_docker_and_browser_warnings_as_expected(monkeypatch, tmp_path):
     helper = TestDoctorMemoryProviderSection()
