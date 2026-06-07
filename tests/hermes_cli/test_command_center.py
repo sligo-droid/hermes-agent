@@ -71,6 +71,35 @@ def test_snapshot_preserves_approval_artifacts_after_followup_audit_events(tmp_p
     assert not any(row["id"] == f"self-improvement:{card['proposal_id']}" for row in snapshot["work_items"])
 
 
+def test_snapshot_derives_worker_url_from_legacy_approval_board_metadata(tmp_path, monkeypatch):
+    _ingest_valid(monkeypatch, tmp_path)
+    card = _first_card()
+    board = "1512960023947378698"
+    kanban_db.write_board_metadata(board, name="Self Improvement Worker")
+    proposal_storage.record_approval(
+        card["proposal_id"],
+        kanban_task_id="t_approved",
+        worker_url="/workers",
+        actor="operator",
+        metadata={
+            "board": board,
+            "discord_board": board,
+            "discord_thread_id": board,
+            "discord_top_level_message_id": board,
+            "discord_board_public_url": "https://sligo.sligolabs.com/workers",
+        },
+    )
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+    artifact_urls = {artifact["url"] for artifact in item["artifacts"] if artifact["kind"] == "worker_board"}
+
+    assert item["project"] == "pid"
+    assert item["execution"]["worker_url"] == f"/workers/{board}"
+    assert f"/workers/{board}" in artifact_urls
+    assert "/workers" not in artifact_urls
+
+
 def test_snapshot_omits_default_board_approved_proposal_rows(tmp_path, monkeypatch):
     _ingest_valid(monkeypatch, tmp_path)
     approved_card = _first_card()
