@@ -1994,7 +1994,15 @@ def run_doctor(args):
                         check_info(fact)
 
                 def _honcho_endpoint_repair_failed(repaired: bool, repair_facts: list[str]) -> bool:
-                    return bool(repair_facts) and not repaired and any("Repair failed:" in fact for fact in repair_facts)
+                    if repaired or not repair_facts:
+                        return False
+                    return any(
+                        "Repair failed:" in fact
+                        or "docker ps failed:" in fact
+                        or "container hermes-honcho-embeddings not found" in fact
+                        or "Repair skipped: container is not in the stopped/exited state" in fact
+                        for fact in repair_facts
+                    )
 
                 def _repair_honcho_embeddings_from_connection(detail: object) -> bool:
                     if not hcfg.base_url:
