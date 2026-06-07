@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -101,6 +102,35 @@ def test_done_metadata_transition_arms_completion_notice(monkeypatch, tmp_path):
     assert target["state"] == "done"
     assert target["terminal_completion_message_pending"] is True
     assert target["board_summary"]["goal_status"] == "done"
+
+
+def test_paused_terminal_worker_with_pending_sync_remains_status_target(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    thread_id = _discord_snowflake_at(time.time())
+    board = dwb.start_direct_goal(thread_id=thread_id, goal="Archive a stale paused worker")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "cancelled",
+            "phase": "cancelled",
+            "cancelled": True,
+            "terminal_reaction_sync_pending": True,
+            "terminal_summary_sync_pending": True,
+        },
+    )
+    metadata = kanban_db.read_board_metadata(board.slug)
+    metadata["paused"] = True
+    metadata["pause_reason"] = "manual_visibility_recovery_stale_branch_preserved"
+    dwb._write_metadata(board.slug, metadata)
+
+    target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
+
+    assert target["state"] == "errored"
+    assert target["terminal_reaction_sync_pending"] is True
+    assert target["terminal_summary_sync_pending"] is True
 
 
 def test_done_metadata_update_after_completion_notice_does_not_rearm(monkeypatch, tmp_path):
@@ -3247,6 +3277,47 @@ def test_notify_targets_skip_corrupt_board_and_keep_healthy_target(monkeypatch, 
     ]
 
 
+def test_typing_targets_bound_corrupt_board_warning_log(monkeypatch, tmp_path, caplog):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    healthy = _make_discord_board("2418")
+    broken = _make_discord_board("2419")
+    healthy_task = _create_ready_dev_task(healthy.slug)
+    _create_ready_dev_task(broken.slug)
+    with kanban_db.connect_closing(board=healthy.slug) as conn:
+        kanban_db.claim_task(conn, healthy_task)
+
+    real_connect_closing = kanban_db.connect_closing
+
+    def fake_connect_closing(db_path=None, *, board=None):
+        if board == broken.slug:
+            raise kanban_db.KanbanDbCorruptError(
+                kanban_db.kanban_db_path(broken.slug),
+                None,
+                "integrity check failed",
+            )
+        return real_connect_closing(db_path=db_path, board=board)
+
+    monkeypatch.setattr(kanban_db, "connect_closing", fake_connect_closing)
+
+    with caplog.at_level("WARNING", logger="hermes_cli.discord_worker_boards"):
+        for _ in range(3):
+            assert dwb.running_worker_thread_targets() == [
+                {
+                    "board": healthy.slug,
+                    "thread_id": "2418",
+                    "chat_id": "2418",
+                    "running": 1,
+                }
+            ]
+
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert broken.slug in warnings[0].getMessage()
+
+
 def test_typing_targets_do_not_open_paused_corrupt_board(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -3262,6 +3333,38 @@ def test_typing_targets_do_not_open_paused_corrupt_board(monkeypatch, tmp_path):
     def fail_connect(*_args, **_kwargs):
         raise AssertionError("paused corrupt board should not be opened")
 
+    monkeypatch.setattr(kanban_db, "connect_closing", fail_connect)
+
+    assert dwb.running_worker_thread_targets() == []
+    assert dwb.running_notify_thread_targets() == []
+    assert dwb.running_discord_thread_typing_targets() == []
+
+
+def test_typing_targets_skip_paused_and_quarantined_boards_from_metadata(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    paused = _make_discord_board("2415")
+    quarantined = _make_discord_board("2416")
+    _create_ready_dev_task(paused.slug)
+    _create_ready_dev_task(quarantined.slug)
+
+    for board, updates in (
+        (paused.slug, {"paused": True}),
+        (quarantined.slug, {"quarantined": True}),
+    ):
+        meta = kanban_db.read_board_metadata(board)
+        meta.update(updates)
+        meta.pop("db_path", None)
+        kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+
+    def fail_connect(*_args, **_kwargs):
+        if _kwargs.get("board") == kanban_db.DEFAULT_BOARD:
+            return real_connect_closing(*_args, **_kwargs)
+        raise AssertionError("paused/quarantined board should not be opened")
+
+    real_connect_closing = kanban_db.connect_closing
     monkeypatch.setattr(kanban_db, "connect_closing", fail_connect)
 
     assert dwb.running_worker_thread_targets() == []
@@ -3392,6 +3495,53 @@ def test_typing_target_enumeration_uses_closing_connections(monkeypatch, tmp_pat
 
     assert opened == closed
     assert opened > 0
+
+
+def _open_fd_targets(path: Path) -> set[str]:
+    fd_root = Path("/proc/self/fd")
+    if not fd_root.is_dir():
+        return set()
+    prefix = str(path)
+    targets: set[str] = set()
+    for entry in fd_root.iterdir():
+        try:
+            target = os.readlink(entry)
+        except OSError:
+            continue
+        if target == prefix or target.startswith(prefix + "-"):
+            targets.add(target)
+    return targets
+
+
+def test_typing_target_repeated_enumeration_does_not_leak_board_db_fds(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    fd_root = Path("/proc/self/fd")
+    if not fd_root.is_dir():
+        return
+
+    board = _make_discord_board("2417")
+    task_id = _create_ready_dev_task(board.slug)
+    with kanban_db.connect_closing(board=board.slug) as conn:
+        kanban_db.claim_task(conn, task_id)
+        kanban_db.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="discord",
+            chat_id="parent-2417",
+            thread_id="thread-2417",
+        )
+
+    db_path = kanban_db.kanban_db_path(board.slug)
+    before = _open_fd_targets(db_path)
+    for _ in range(10):
+        assert dwb.running_worker_thread_targets()
+        assert dwb.running_notify_thread_targets()
+    after = _open_fd_targets(db_path)
+
+    assert after == before
 
 
 def test_discord_worker_dispatch_spawns_across_two_boards(monkeypatch, tmp_path):

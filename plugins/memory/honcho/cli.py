@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import shlex
+import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -451,6 +454,17 @@ def _embedding_url(port: int = LOCAL_EMBEDDING_PORT, path: str = "") -> str:
     return f"{base}{path}"
 
 
+def _is_local_url(url: str | None) -> bool:
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower()
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
 def _parse_positive_int(value: object) -> int | None:
     try:
         parsed = int(str(value))
@@ -588,6 +602,136 @@ def _http_get_json(url: str, timeout: float = 2.0) -> tuple[bool, object | str]:
         return False, str(e)
 
 
+def _is_connection_refused(detail: object) -> bool:
+    text = str(detail).lower()
+    return "connection refused" in text or "errno 111" in text
+
+
+def _docker_container_state(
+    docker: str,
+    *,
+    run=subprocess.run,
+) -> tuple[str | None, str]:
+    """Return exact Docker state for the local embeddings container."""
+    cmd = [
+        docker,
+        "ps",
+        "-a",
+        "--filter", f"name=^{LOCAL_EMBEDDING_CONTAINER}$",
+        "--format", "{{.Names}}\t{{.State}}\t{{.Status}}",
+    ]
+    try:
+        proc = run(cmd, capture_output=True, text=True, timeout=5, check=False)
+    except Exception as exc:
+        return None, f"docker ps failed: {exc}"
+    if proc.returncode != 0:
+        return None, f"docker ps failed: {(proc.stderr or proc.stdout).strip()[:500]}"
+
+    matches = []
+    for raw in proc.stdout.splitlines():
+        parts = raw.split("\t", 2)
+        if len(parts) >= 2 and parts[0] == LOCAL_EMBEDDING_CONTAINER:
+            status = parts[2] if len(parts) > 2 else ""
+            matches.append((parts[1].strip().lower(), status.strip()))
+    if not matches:
+        return None, f"container {LOCAL_EMBEDDING_CONTAINER} not found"
+    state, status = matches[0]
+    detail = f"container {LOCAL_EMBEDDING_CONTAINER} state={state}"
+    if status:
+        detail += f" status={status}"
+    return state, detail
+
+
+def _verify_container_llama_server(
+    docker: str,
+    *,
+    run=subprocess.run,
+) -> tuple[bool, str]:
+    cmd = [docker, "exec", LOCAL_EMBEDDING_CONTAINER, "test", "-x", "/app/llama-server"]
+    try:
+        proc = run(cmd, capture_output=True, text=True, timeout=10, check=False)
+    except Exception as exc:
+        return False, f"/app/llama-server check failed: {exc}"
+    if proc.returncode == 0:
+        return True, "/app/llama-server exists and is executable"
+    return False, f"/app/llama-server missing or not executable: {(proc.stderr or proc.stdout).strip()[:500]}"
+
+
+def auto_repair_honcho_embeddings_container(
+    *,
+    port: int = LOCAL_EMBEDDING_PORT,
+    health_detail: object | None = None,
+    run=subprocess.run,
+    which=shutil.which,
+    http_get=_http_get_json,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+    poll_timeout: float = 20.0,
+    poll_interval: float = 1.0,
+) -> tuple[bool, list[str]]:
+    """Start only the stopped local Honcho embeddings container when safe.
+
+    Returns (repaired, facts).  A false return may mean no repair was needed,
+    the exact safe condition was absent, or a bounded repair step failed.
+    """
+    facts: list[str] = []
+    health_url = _embedding_url(port, "/health")
+    if health_detail is None:
+        ok_health, health_detail = http_get(health_url)
+        if ok_health:
+            return False, [f"Embeddings health already OK at {health_url}; no repair attempted"]
+
+    facts.append(f"Embeddings health failed at {health_url}: {health_detail}")
+    if not _is_connection_refused(health_detail):
+        facts.append("Repair skipped: health failure is not a connection-refused error")
+        return False, facts
+
+    docker = which("docker")
+    if not docker:
+        facts.append("Repair failed: docker not found")
+        return False, facts
+
+    state, state_detail = _docker_container_state(docker, run=run)
+    facts.append(state_detail)
+    if state not in {"exited", "stopped"}:
+        facts.append("Repair skipped: container is not in the stopped/exited state")
+        return False, facts
+
+    start_cmd = [docker, "start", LOCAL_EMBEDDING_CONTAINER]
+    try:
+        start = run(start_cmd, capture_output=True, text=True, timeout=30, check=False)
+    except Exception as exc:
+        facts.append(f"Repair failed: docker start {LOCAL_EMBEDDING_CONTAINER} failed: {exc}")
+        return False, facts
+    if start.returncode != 0:
+        facts.append(
+            f"Repair failed: docker start {LOCAL_EMBEDDING_CONTAINER} failed: "
+            f"{(start.stderr or start.stdout).strip()[:500]}"
+        )
+        return False, facts
+    facts.append(f"Repair attempted: docker start {LOCAL_EMBEDDING_CONTAINER}")
+
+    deadline = monotonic() + poll_timeout
+    last_health: object = "not checked"
+    while True:
+        ok_health, last_health = http_get(health_url)
+        if ok_health:
+            facts.append(f"Embeddings health OK at {health_url}: {last_health}")
+            break
+        if monotonic() >= deadline:
+            facts.append(f"Repair failed: health polling timed out at {health_url}: {last_health}")
+            return False, facts
+        sleep(poll_interval)
+
+    ok_llama, llama_detail = _verify_container_llama_server(docker, run=run)
+    facts.append(llama_detail)
+    if not ok_llama:
+        facts.append("Repair failed: container did not pass /app/llama-server verification")
+        return False, facts
+    facts.append("Repair complete: re-enter normal Honcho doctor/status check")
+    return True, facts
+
+
 def _http_post_json(
     url: str,
     payload: dict,
@@ -709,6 +853,34 @@ def _honcho_base_url_health(base_url: str) -> tuple[bool, str]:
     if ok:
         return True, str(detail)
     return False, f"{url} unavailable: {detail}"
+
+
+def repair_honcho_embeddings_for_base_url_health(
+    base_url: str,
+    detail: object,
+    *,
+    port: int = LOCAL_EMBEDDING_PORT,
+) -> tuple[bool, list[str]]:
+    if not _is_local_url(base_url):
+        return False, ["Repair skipped: Honcho base URL is not local"]
+    if not _is_connection_refused(detail):
+        return False, [
+            f"Local Honcho health failed: {detail}",
+            "Repair skipped: Honcho health failure is not a connection-refused error",
+        ]
+    repaired, facts = auto_repair_honcho_embeddings_container(port=port)
+    return repaired, [f"Local Honcho health failed: {detail}", *facts]
+
+
+def repair_honcho_embeddings_for_local_base_url(
+    base_url: str,
+    *,
+    port: int = LOCAL_EMBEDDING_PORT,
+) -> tuple[bool, list[str]]:
+    if not _is_local_url(base_url):
+        return False, ["Repair skipped: Honcho base URL is not local"]
+    repaired, facts = auto_repair_honcho_embeddings_container(port=port)
+    return repaired, facts
 
 
 def _embedding_pid_path() -> Path:
@@ -1602,9 +1774,27 @@ def cmd_status(args) -> None:
         if hcfg.base_url:
             ok, detail = _honcho_base_url_health(hcfg.base_url)
             if not ok:
-                print(f"\n  Connection... FAILED ({detail})")
-                print("  Fix: start local Honcho at the configured Base URL before using recall/search.\n")
-                return
+                repaired, repair_facts = repair_honcho_embeddings_for_base_url_health(
+                    hcfg.base_url,
+                    detail,
+                )
+                if repaired:
+                    print("\n  Embeddings repair... OK")
+                    for fact in repair_facts:
+                        print(f"    - {fact}")
+                    ok, detail = _honcho_base_url_health(hcfg.base_url)
+                    if ok:
+                        print("  Recheck: local Honcho health OK; continuing full status check")
+                    else:
+                        print(f"  Recheck: local Honcho health FAILED ({detail})")
+                elif repair_facts:
+                    print("\n  Embeddings repair... not completed")
+                    for fact in repair_facts:
+                        print(f"    - {fact}")
+                if not ok:
+                    print(f"\n  Connection... FAILED ({detail})")
+                    print("  Fix: start local Honcho at the configured Base URL before using recall/search.\n")
+                    return
         print("\n  Connection... ", end="", flush=True)
         try:
             client = get_honcho_client(hcfg)

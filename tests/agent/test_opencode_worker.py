@@ -415,6 +415,7 @@ def test_nested_text_part_is_used_as_final_text(monkeypatch, tmp_path):
 
 def test_sparse_json_output_recovers_final_text_from_export(monkeypatch, tmp_path):
     calls = []
+    export_envs = []
     monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
 
     def fake_process(cmd, **_kwargs):
@@ -426,6 +427,7 @@ def test_sparse_json_output_recovers_final_text_from_export(monkeypatch, tmp_pat
     def fake_run(cmd, **_kwargs):
         calls.append(cmd)
         if cmd[1] == "export":
+            export_envs.append(_kwargs.get("env"))
             return SimpleNamespace(
                 returncode=0,
                 stdout="Exporting session: ses-export\n"
@@ -462,6 +464,10 @@ def test_sparse_json_output_recovers_final_text_from_export(monkeypatch, tmp_pat
     assert result.thread_id == "ses-export"
     export_calls = [cmd for cmd in calls if len(cmd) > 1 and cmd[1] == "export"]
     assert export_calls == [["/bin/opencode", "export", "ses-export"]]
+    assert export_envs[0] is not None
+    assert Path(export_envs[0]["XDG_CONFIG_HOME"]).name.startswith(
+        "hermes-opencode-config-"
+    )
 
 
 def test_no_output_success_recovers_final_text_from_discovered_session(monkeypatch, tmp_path):
