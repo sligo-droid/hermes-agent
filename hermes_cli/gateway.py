@@ -3357,8 +3357,19 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
         print("\nGateway stopped.")
         return
     except SystemExit as e:
-        _exit_diag("asyncio.run.SystemExit", code=getattr(e, "code", None),
-                   traceback=_traceback.format_exc())
+        code = getattr(e, "code", None)
+        if replace and code == GATEWAY_SERVICE_RESTART_EXIT_CODE:
+            # Code 75 is the intentional service-manager restart signal used
+            # by gateway replace/drain flows, not a crash traceback.
+            _exit_diag(
+                "gateway.replace_exit",
+                code=code,
+                expected=True,
+                replace=True,
+            )
+        else:
+            _exit_diag("asyncio.run.SystemExit", code=code,
+                       traceback=_traceback.format_exc())
         raise
     except BaseException as e:
         # Absolutely everything else: Exception, asyncio.CancelledError,
