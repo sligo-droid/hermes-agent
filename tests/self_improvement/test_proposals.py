@@ -172,6 +172,24 @@ def test_self_improvement_discord_initial_reaction_url_encodes_unicode(monkeypat
     ]
 
 
+def test_self_improvement_discord_approval_embed_links_worker_board():
+    card = {
+        "proposal_id": "hermes-worker-link-123",
+        "project": "hermes",
+        "prong": "daily-retrospective",
+        "title": "Fix worker board links",
+        "summary": "Approved cron embeds should open the specific worker board.",
+        "priority": "high",
+    }
+
+    embed = discord_publish._feature_embed(card, "https://sligo.sligolabs.com/workers/1512960023947378698")
+
+    assert embed["url"] == "https://sligo.sligolabs.com/workers/1512960023947378698"
+    assert embed["url"].rstrip("/") != "https://sligo.sligolabs.com/workers"
+    fields = {field["name"]: field["value"] for field in embed["fields"]}
+    assert fields["Worker board"] == "https://sligo.sligolabs.com/workers/1512960023947378698"
+
+
 def test_self_improvement_activation_uses_planner_flow_with_board_criteria(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://example.test")

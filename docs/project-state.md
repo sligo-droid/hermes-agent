@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-06 23:25 UTC
+Last updated: 2026-06-07 00:53 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -30,6 +30,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Preserved the existing Command Center architecture doc as the focused product-model reference instead of duplicating it here.
 - [x] Patched the installed default-profile `hermes-agent`, `hermes-operations`, and Command Center UI skill/reference pointers so they route current-state material back to repo docs.
 - [x] Tightened completed Discord worker-board terminal summaries: merged PRs are inferred from PR state/merge evidence even when GitHub reports post-merge `mergeStateStatus=UNKNOWN`, deployment status falls back to done for merged+green PRs when no separate deployment check exists, recovered reviewer verdict metadata is surfaced, stale summary sidecars are rebuilt on terminal-board views, and concise outcomes are included in the terminal block.
+- [x] Fixed self-improvement Discord approval embeds and Command Center artifacts so approved cron-origin worker jobs link to the specific worker board instead of a bare `/workers` index; existing audit metadata can now repair legacy worker URLs without creating duplicate Work Items.
 
 ## In Progress
 

@@ -230,6 +230,7 @@ def publish_approved_proposal(
             source_message_id=existing_message,
             board_slug=existing_board,
         )
+        _update_feature_embed(channel_id, existing_message, card, board.public_url)
         return DiscordApprovalRoute(
             channel_id=channel_id,
             top_level_message_id=existing_message,
@@ -279,6 +280,7 @@ def publish_approved_proposal(
             request_id=message_id,
             source_message_id=message_id,
         )
+        _update_feature_embed(channel_id, message_id, card, board.public_url)
         _add_reaction(token, channel_id, message_id, "👀")
         return DiscordApprovalRoute(
             channel_id=channel_id,
@@ -327,6 +329,7 @@ def activate_approved_proposal(
             acceptance_criteria=criteria,
         )
         mark_dispatch_dirty(board=board.slug, reason="self-improvement-approved")
+        _update_feature_embed(route.channel_id, route.top_level_message_id, card, board.public_url)
         return replace(route, board=board.slug, board_public_url=board.public_url)
     except Exception as exc:
         log.warning("self-improvement Discord worker activation failed: %s", exc)
@@ -444,7 +447,7 @@ def _coerce_criteria(value: object) -> list[str]:
     return criteria
 
 
-def _feature_embed(card: dict[str, Any]) -> dict[str, Any]:
+def _feature_embed(card: dict[str, Any], board_public_url: str = "") -> dict[str, Any]:
     title = _truncate(str(card.get("title") or "Self-improvement proposal").strip(), 256)
     description = _truncate(str(card.get("summary") or card.get("body") or "").strip(), 4096)
     fields = [
@@ -453,15 +456,41 @@ def _feature_embed(card: dict[str, Any]) -> dict[str, Any]:
         {"name": "Priority", "value": _field(card.get("priority") or "medium"), "inline": True},
         {"name": "Proposal ID", "value": _field(card.get("proposal_id")), "inline": False},
     ]
+    board_public_url = str(board_public_url or "").strip().rstrip("/")
+    if board_public_url:
+        fields.append({"name": "Worker board", "value": _truncate(board_public_url, 1024), "inline": False})
     rationale = str(card.get("rationale") or "").strip()
     if rationale:
         fields.append({"name": "Rationale", "value": _truncate(rationale, 1024), "inline": False})
-    return {
+    embed = {
         "title": title,
         "description": description or "Approved self-improvement proposal.",
         "color": 0x22C55E,
         "fields": fields,
     }
+    if board_public_url:
+        embed["url"] = board_public_url
+    return embed
+
+
+def _update_feature_embed(channel_id: str, message_id: str, card: dict[str, Any], board_public_url: str) -> None:
+    board_public_url = str(board_public_url or "").strip()
+    if not channel_id or not message_id or not board_public_url:
+        return
+    try:
+        from tools.discord_tool import _discord_request, _get_bot_token
+
+        token = _get_bot_token()
+        if not token:
+            return
+        _discord_request(
+            "PATCH",
+            f"/channels/{channel_id}/messages/{message_id}",
+            token,
+            body={"embeds": [_feature_embed(card, board_public_url)]},
+        )
+    except Exception as exc:
+        log.debug("self-improvement Discord approval embed update failed: %s", exc)
 
 
 def _add_reaction(token: str, channel_id: str, message_id: str, emoji: str) -> None:

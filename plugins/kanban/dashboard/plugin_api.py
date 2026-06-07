@@ -45,7 +45,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
@@ -1031,7 +1031,10 @@ def _worker_url(task_id: str) -> str:
 def _worker_board_url(*, board: str | None = None, board_public_url: str | None = None) -> str:
     public_url = str(board_public_url or "").strip()
     if public_url:
-        return public_url.rstrip("/")
+        candidate = public_url.rstrip("/")
+        path = urlsplit(candidate).path.rstrip("/")
+        if path not in {"/workers", "workers"}:
+            return candidate
     if board:
         return f"/workers/{quote(str(board), safe='')}"
     return ""
@@ -2100,13 +2103,15 @@ def _latest_discord_approval_metadata(proposal_id: str) -> dict[str, Any]:
         events = proposal_storage.list_audit_events(proposal_id)
     except Exception:
         return {}
-    for event in reversed(events):
+    merged: dict[str, Any] = {}
+    for event in events:
         if event.get("action") != "approved":
             continue
         metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
-        if metadata.get("discord_thread_id") and metadata.get("discord_top_level_message_id"):
-            return dict(metadata)
-    return {}
+        for key, value in metadata.items():
+            if value is not None and value != "":
+                merged[key] = value
+    return merged
 
 
 @router.post("/self-improvement/proposals/{proposal_id}/reject")

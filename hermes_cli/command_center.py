@@ -696,6 +696,7 @@ def _artifacts_from_metadata(metadata: dict[str, Any], *, fallback_worker_url: A
     enriched = dict(metadata)
     if fallback_worker_url and not enriched.get("worker_url"):
         enriched["worker_url"] = fallback_worker_url
+    board = enriched.get("discord_board") or enriched.get("board")
     artifacts: list[dict[str, Any]] = []
     for key, kind, label in (
         ("discord_thread_url", "discord_thread", "Discord thread"),
@@ -705,6 +706,8 @@ def _artifacts_from_metadata(metadata: dict[str, Any], *, fallback_worker_url: A
     ):
         url = enriched.get(key)
         if url:
+            if kind == "worker_board":
+                url = _worker_board_url(str(board or "") or None, str(url)) or url
             artifacts.append({"kind": kind, "label": label, "url": str(url)})
     return artifacts
 
