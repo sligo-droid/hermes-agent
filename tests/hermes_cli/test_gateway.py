@@ -1,11 +1,19 @@
 """Tests for hermes_cli.gateway."""
 
+import json
 import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
 import hermes_cli.gateway as gateway
+
+
+def _exit_diag_lines():
+    from hermes_constants import get_hermes_home
+
+    path = get_hermes_home() / "logs" / "gateway-exit-diag.log"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 def _install_fake_gateway_run(monkeypatch, start_gateway):
@@ -65,6 +73,56 @@ def test_run_gateway_exits_nonzero_when_start_gateway_reports_failure(monkeypatc
 
     assert exc_info.value.code == 1
     assert calls == [(True, None)]
+
+
+def test_run_gateway_replace_exit_75_writes_compact_expected_diag(monkeypatch):
+    def fake_start_gateway(*, replace, verbosity):
+        return object()
+
+    def fake_asyncio_run(coro):
+        raise SystemExit(gateway.GATEWAY_SERVICE_RESTART_EXIT_CODE)
+
+    _install_fake_gateway_run(monkeypatch, fake_start_gateway)
+    monkeypatch.setattr(gateway.asyncio, "run", fake_asyncio_run)
+
+    with pytest.raises(SystemExit) as exc_info:
+        gateway.run_gateway(replace=True)
+
+    assert exc_info.value.code == gateway.GATEWAY_SERVICE_RESTART_EXIT_CODE
+    diag = _exit_diag_lines()[-1]
+    assert diag["tag"] == "gateway.replace_exit"
+    assert diag["code"] == gateway.GATEWAY_SERVICE_RESTART_EXIT_CODE
+    assert diag["expected"] is True
+    assert diag["replace"] is True
+    assert "traceback" not in diag
+
+
+@pytest.mark.parametrize(
+    ("replace", "code"),
+    [
+        (False, gateway.GATEWAY_SERVICE_RESTART_EXIT_CODE),
+        (True, 2),
+    ],
+)
+def test_run_gateway_unexpected_system_exit_keeps_loud_diag(monkeypatch, replace, code):
+    def fake_start_gateway(*, replace, verbosity):
+        return object()
+
+    def fake_asyncio_run(coro):
+        raise SystemExit(code)
+
+    _install_fake_gateway_run(monkeypatch, fake_start_gateway)
+    monkeypatch.setattr(gateway.asyncio, "run", fake_asyncio_run)
+
+    with pytest.raises(SystemExit) as exc_info:
+        gateway.run_gateway(replace=replace)
+
+    assert exc_info.value.code == code
+    diag = _exit_diag_lines()[-1]
+    assert diag["tag"] == "asyncio.run.SystemExit"
+    assert diag["code"] == code
+    assert "traceback" in diag
+    assert "SystemExit" in diag["traceback"]
 
 
 def test_run_gateway_refuses_root_in_official_docker(monkeypatch, tmp_path, capsys):
