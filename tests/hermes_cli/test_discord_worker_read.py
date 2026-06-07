@@ -222,6 +222,7 @@ def test_update_board_mutates_status_and_summary_flags(monkeypatch, tmp_path):
     assert worker["concise_outcome"] == "PR #136 is merged."
     assert worker["terminal_summary_sync_pending"] is True
     assert worker["terminal_reaction_sync_pending"] is True
+    assert worker["terminal_completion_message_pending"] is True
     assert boards.read_board_run_summary(board.slug)["goal_status"] == "done"
 
 

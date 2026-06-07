@@ -2214,11 +2214,12 @@ def _merge_criteria(board: Optional[str], criteria: list[str]) -> None:
 def _update_phase(board: Optional[str], phase: str, *, goal_status: str) -> None:
     if not board:
         return
-    from hermes_cli.discord_worker_boards import DISCORD_WORKER_META_KEY
+    from hermes_cli.discord_worker_boards import DISCORD_WORKER_META_KEY, mark_completion_notice_pending_on_done_transition
     from utils import atomic_json_write
 
     metadata = kanban_db.read_board_metadata(board)
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    previous = dict(worker)
     if worker.get("cancelled") or worker.get("goal_status") == "cancelled":
         return
     worker["phase"] = phase
@@ -2227,8 +2228,7 @@ def _update_phase(board: Optional[str], phase: str, *, goal_status: str) -> None
     if goal_status in {"done", "blocked"}:
         worker["terminal_reaction_sync_pending"] = True
         worker["terminal_summary_sync_pending"] = True
-    if goal_status == "done":
-        worker["terminal_completion_message_pending"] = True
+    mark_completion_notice_pending_on_done_transition(worker, previous)
     metadata[DISCORD_WORKER_META_KEY] = worker
     metadata.pop("db_path", None)
     atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)

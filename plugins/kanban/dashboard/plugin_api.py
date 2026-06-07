@@ -2982,6 +2982,12 @@ def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete
                         status_code=409,
                         detail="Discord worker terminal reaction has not synced yet; retry archive after sync",
                     )
+                if terminal_before_archive and dwb.board_has_pending_terminal_completion_notice(normed):
+                    dwb.mark_dispatch_dirty(board=normed, reason="archive-waiting-for-terminal-completion-notice")
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Discord worker completion follow-up has not posted yet; retry archive after sync",
+                    )
                 if not terminal_before_archive:
                     dwb.stop_board_execution(normed, reason="archived-from-command-center")
                     if dwb.board_has_unsynced_terminal_reaction(normed):
@@ -2989,6 +2995,12 @@ def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete
                         raise HTTPException(
                             status_code=409,
                             detail="Discord worker terminal reaction has not synced yet; retry archive after sync",
+                        )
+                    if dwb.board_has_pending_terminal_completion_notice(normed):
+                        dwb.mark_dispatch_dirty(board=normed, reason="archive-waiting-for-terminal-completion-notice")
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Discord worker completion follow-up has not posted yet; retry archive after sync",
                         )
             else:
                 _stop_generic_board_for_archive(normed, reason="archived-from-command-center")

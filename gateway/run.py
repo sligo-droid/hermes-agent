@@ -7265,6 +7265,40 @@ class GatewayRunner:
         return now - synced_at >= _DISCORD_KANBAN_REACTION_RESYNC_SECS
 
     @staticmethod
+    def _discord_kanban_completion_notice_only(target: Dict[str, Any]) -> bool:
+        if not target.get("terminal_completion_message_pending"):
+            return False
+        state = str(target.get("state") or "").strip()
+        if state not in {"done", "blocked", "errored"}:
+            return False
+        if str(target.get("source_state") or "").strip():
+            return False
+        if str(target.get("reaction_state") or "").strip() == "foreman":
+            return False
+        return not bool(
+            target.get("terminal_reaction_sync_pending")
+            or target.get("terminal_summary_sync_pending")
+            or target.get("terminal_reaction_sync_needed")
+        )
+
+    @staticmethod
+    def _discord_kanban_completion_notice_ready(target: Dict[str, Any]) -> bool:
+        if not target.get("terminal_completion_message_pending"):
+            return False
+        if target.get("foreman_generated"):
+            return True
+        try:
+            from hermes_cli.discord_time import discord_message_exceeds_age_limit
+
+            if discord_message_exceeds_age_limit(target.get("source_message_id") or target.get("thread_id")):
+                return True
+        except Exception:
+            pass
+        board_summary = target.get("board_summary") if isinstance(target.get("board_summary"), dict) else {}
+        final_response = board_summary.get("final_response") if isinstance(board_summary.get("final_response"), dict) else {}
+        return bool(str(final_response.get("text") or "").strip())
+
+    @staticmethod
     def _discord_foreman_clamped_int(
         value: Any,
         default: int,
@@ -8052,6 +8086,8 @@ class GatewayRunner:
                             self._discord_kanban_reaction_states = reaction_cache
                         now = time.monotonic()
                         for target in reaction_targets:
+                            if self._discord_kanban_completion_notice_only(target):
+                                continue
                             board = str(target.get("board") or "")
                             state = str(target.get("reaction_state") or target.get("state") or "")
                             cache_key = self._discord_kanban_target_cache_key(target)
@@ -8094,6 +8130,8 @@ class GatewayRunner:
                             summary_cache = {}
                             self._discord_kanban_summary_states = summary_cache
                         for target in reaction_targets:
+                            if self._discord_kanban_completion_notice_only(target):
+                                continue
                             board = str(target.get("board") or "")
                             if not board:
                                 continue
@@ -8134,6 +8172,8 @@ class GatewayRunner:
                     for target in reaction_targets:
                         board = str(target.get("board") or "")
                         if not board or not target.get("terminal_completion_message_pending"):
+                            continue
+                        if not self._discord_kanban_completion_notice_ready(target):
                             continue
                         if callable(completion_notice):
                             try:
