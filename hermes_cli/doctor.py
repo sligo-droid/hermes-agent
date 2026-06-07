@@ -1993,6 +1993,9 @@ def run_doctor(args):
                     for fact in repair_facts:
                         check_info(fact)
 
+                def _honcho_endpoint_repair_failed(repaired: bool, repair_facts: list[str]) -> bool:
+                    return bool(repair_facts) and not repaired and any("Repair failed:" in fact for fact in repair_facts)
+
                 def _repair_honcho_embeddings_from_connection(detail: object) -> bool:
                     if not hcfg.base_url:
                         return False
@@ -2009,23 +2012,37 @@ def run_doctor(args):
                         check_warn("Honcho embeddings auto-repair", f"failed: {repair_exc}")
                         return False
 
-                def _repair_honcho_embeddings_from_endpoint() -> bool:
+                def _repair_honcho_embeddings_from_endpoint() -> str:
                     if not hcfg.base_url:
-                        return False
+                        return "skipped"
                     try:
                         from plugins.memory.honcho.cli import repair_honcho_embeddings_for_local_base_url
 
                         repaired, repair_facts = repair_honcho_embeddings_for_local_base_url(hcfg.base_url)
                         _report_honcho_embeddings_repair(repaired, repair_facts)
-                        return repaired
+                        if repaired:
+                            return "repaired"
+                        if _honcho_endpoint_repair_failed(repaired, repair_facts):
+                            fix = "Honcho embeddings auto-repair failed; inspect the repair facts above and restore the local embeddings container"
+                            _fail_and_issue("Honcho embeddings auto-repair failed", "endpoint-triggered repair did not complete", fix, issues)
+                            return "failed"
+                        return "skipped"
                     except Exception as repair_exc:
-                        check_warn("Honcho embeddings auto-repair", f"failed: {repair_exc}")
-                        return False
+                        _fail_and_issue(
+                            "Honcho embeddings auto-repair failed",
+                            str(repair_exc),
+                            f"Honcho embeddings auto-repair raised an exception: {repair_exc}",
+                            issues,
+                        )
+                        return "failed"
 
                 reset_honcho_client()
                 try:
                     get_honcho_client(hcfg)
-                    _repair_honcho_embeddings_from_endpoint()
+                    endpoint_repair = _repair_honcho_embeddings_from_endpoint()
+                    if endpoint_repair == "repaired":
+                        reset_honcho_client()
+                        get_honcho_client(hcfg)
                     check_ok(
                         "Honcho connected",
                         f"workspace={hcfg.workspace_id} mode={hcfg.recall_mode} freq={hcfg.write_frequency}",
@@ -2036,7 +2053,10 @@ def run_doctor(args):
                         reset_honcho_client()
                         try:
                             get_honcho_client(hcfg)
-                            _repair_honcho_embeddings_from_endpoint()
+                            endpoint_repair = _repair_honcho_embeddings_from_endpoint()
+                            if endpoint_repair == "repaired":
+                                reset_honcho_client()
+                                get_honcho_client(hcfg)
                             check_ok(
                                 "Honcho connected",
                                 f"workspace={hcfg.workspace_id} mode={hcfg.recall_mode} freq={hcfg.write_frequency}",
