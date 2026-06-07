@@ -333,7 +333,7 @@ hermes bundles reload
 
 - **当 slug 冲突时，捆绑包优先于单个 skills。** 如果你将捆绑包命名为 `research`，同时也有一个名为 `research` 的 skill，`/research` 会调用捆绑包。这是有意为之——你通过命名选择了捆绑包。
 - **缺失的 skills 会被跳过，而不是致命错误。** 如果捆绑包列出了 `skill-foo` 但你未安装它，捆绑包仍会加载能解析的 skills，agent 会收到一条列出跳过内容的说明。
-- **捆绑包在每个界面都有效**——交互式 CLI 以及每个 gateway 平台（Telegram、Discord、Slack……）——因为调度与单个 skill 命令集中在同一位置。
+- **捆绑包在每个界面都有效**——交互式 CLI、TUI、仪表板聊天以及每个 gateway 平台（Telegram、Discord、Slack……）——因为调度与单个 skill 命令集中在同一位置。
 - **捆绑包不会使 prompt 缓存失效。** 它们在调用时生成一条新的用户消息，与 `/<skill-name>` 的方式相同——不修改系统提示词。
 
 ### 捆绑包优于逐个手动安装 skill 的场景
@@ -538,7 +538,7 @@ hermes skills install https://example.com/my-skill/SKILL.md --category productiv
 1. SKILL.md YAML frontmatter 中的 `name:` 字段（推荐——每个格式良好的 skill 都有）。
 2. URL 路径中的父目录名称（例如 `.../my-skill/SKILL.md` → `my-skill`，或 `.../my-skill.md` → `my-skill`），当它是有效标识符（`^[a-z][a-z0-9_-]*$`）时。
 3. 在有 TTY 的终端上的交互式提示。
-4. 在非交互式界面（gateway 平台、脚本）上，给出指向 `--name` 覆盖的清晰错误。
+4. 在非交互式界面（TUI 内的 `/skills install` 斜杠命令、gateway 平台、脚本）上，给出指向 `--name` 覆盖的清晰错误。
 
 ```bash
 # Frontmatter 没有名称且 URL slug 无意义——手动提供：
@@ -733,7 +733,7 @@ hermes skills reset google-workspace
 # 当你想要恢复原始上游 skill 时使用此选项。
 hermes skills reset google-workspace --restore
 
-# 非交互式（例如在脚本中）——跳过 --restore 确认。
+# 非交互式（例如在脚本或 TUI 模式中）——跳过 --restore 确认。
 hermes skills reset google-workspace --restore --yes
 ```
 

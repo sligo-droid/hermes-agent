@@ -144,7 +144,29 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
           echo "ok" > $out/result
         '';
 
+        # Verify bundled TUI is present and compiled
+        bundled-tui = pkgs.runCommand "hermes-bundled-tui" { } ''
+          set -e
+          echo "=== Checking bundled TUI ==="
+          test -d ${hermes-agent}/ui-tui || (echo "FAIL: ui-tui directory missing"; exit 1)
+          echo "PASS: ui-tui directory exists"
+
+          test -f ${hermes-agent}/ui-tui/dist/entry.js || (echo "FAIL: compiled entry.js missing"; exit 1)
+          echo "PASS: compiled entry.js present"
+
+          # self-contained bundle; no runtime node_modules expected
+
+          grep -q "HERMES_TUI_DIR" ${hermes-agent}/bin/hermes || \
+            (echo "FAIL: HERMES_TUI_DIR not in wrapper"; exit 1)
+          echo "PASS: HERMES_TUI_DIR set in wrapper"
+
+          echo "=== All bundled TUI checks passed ==="
+          mkdir -p $out
+          echo "ok" > $out/result
+        '';
+
         # Verify HERMES_NODE is set in wrapper and points to Node 20+
+        # (string-width uses the /v regex flag which requires Node 20+)
         hermes-node = pkgs.runCommand "hermes-node-version" { } ''
           set -e
           echo "=== Checking HERMES_NODE in wrapper ==="
@@ -158,7 +180,7 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
 
           NODE_MAJOR=$("$HERMES_NODE" --version | sed 's/^v//' | cut -d. -f1)
           test "$NODE_MAJOR" -ge 20 || \
-            (echo "FAIL: Node v$NODE_MAJOR < 20"; exit 1)
+            (echo "FAIL: Node v$NODE_MAJOR < 20, TUI needs /v regex flag support"; exit 1)
           echo "PASS: Node v$NODE_MAJOR >= 20"
 
           echo "=== All HERMES_NODE checks passed ==="

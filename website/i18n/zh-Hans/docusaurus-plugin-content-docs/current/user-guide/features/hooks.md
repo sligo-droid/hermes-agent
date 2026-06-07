@@ -917,7 +917,7 @@ def register(ctx):
 
 ### `pre_approval_request`
 
-在审批请求向用户展示**之前立即**触发——覆盖所有界面：交互式 CLI、gateway 平台（Telegram、Discord、Slack、WhatsApp、Matrix 等）以及 ACP 客户端（VS Code、Zed、JetBrains）。
+在审批请求向用户展示**之前立即**触发——覆盖所有界面：交互式 CLI、Ink TUI、gateway 平台（Telegram、Discord、Slack、WhatsApp、Matrix 等）以及 ACP 客户端（VS Code、Zed、JetBrains）。
 
 这是接入自定义通知器的正确位置——例如弹出允许/拒绝通知的 macOS 菜单栏应用，或记录每个带上下文审批请求的审计日志。
 
@@ -942,7 +942,7 @@ def my_callback(
 | `pattern_key` | `str` | 触发审批的主要模式键（如 `"rm_rf"`、`"sudo"`） |
 | `pattern_keys` | `list[str]` | 所有匹配的模式键 |
 | `session_key` | `str` | 会话标识符，用于按聊天限定通知范围 |
-| `surface` | `str` | 交互式 CLI 提示为 `"cli"`，异步平台审批为 `"gateway"` |
+| `surface` | `str` | 交互式 CLI/TUI 提示为 `"cli"`，异步平台审批为 `"gateway"` |
 
 **返回值：** 忽略。此处的 hook 仅作观察用途；不能否决或预先回答审批。使用 [`pre_tool_call`](#pre_tool_call) 在工具到达审批系统前阻断它。
 

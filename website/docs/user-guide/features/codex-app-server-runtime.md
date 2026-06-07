@@ -400,7 +400,7 @@ If you find a bug, [open an issue](https://github.com/NousResearch/hermes-agent/
 ## Architecture
 
 ```
-                ┌─── Hermes shell (CLI / gateway) ───┐
+                ┌─── Hermes shell (CLI / TUI / gateway) ───┐
                 │  sessions DB · slash commands · memory   │
                 │  & skill review · cron · session pickers │
                 └──┬──────────────────────────────────────┬┘

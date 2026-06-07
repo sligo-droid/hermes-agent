@@ -40,7 +40,8 @@ def test_dashboard_run_does_not_derive_insecure_from_bind_host() -> None:
     assert "HERMES_DASHBOARD_INSECURE" in text, (
         "Explicit HERMES_DASHBOARD_INSECURE opt-in is missing."
     )
-    # Truthy values aligned with the rest of the s6 scripts.
+    # Truthy values aligned with the rest of the s6 scripts
+    # (HERMES_DASHBOARD, HERMES_DASHBOARD_TUI).
     for truthy in ("1", "true", "TRUE", "True", "yes", "YES", "Yes"):
         assert truthy in text, (
             f"HERMES_DASHBOARD_INSECURE should accept truthy value {truthy!r}"

@@ -14,9 +14,10 @@ ignored:
   # superseded patch releases. Same rationale as nearly every distro-
   # base official image (python, node, debian).
   - DL3008
-  # Use WORKDIR to switch to a directory. The image uses inline subshells
-  # for one-off build steps because they don't affect later RUN commands;
-  # promoting them to full WORKDIR switches with restores would obscure intent.
+  # Use WORKDIR to switch to a directory. The image uses `(cd web && …)`
+  # / `(cd ../ui-tui && …)` inline subshells for one-off build steps
+  # because they don't affect later RUN commands; promoting them to
+  # full WORKDIR switches with restores would obscure intent.
   - DL3003
   # Multiple consecutive RUN instructions. The `touch README.md` + `uv
   # sync` split is intentional — `touch` is cheap, `uv sync` is the

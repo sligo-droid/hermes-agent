@@ -79,6 +79,7 @@ docker run -d \
 | `HERMES_DASHBOARD` | 设为 `1`（或 `true` / `yes`）以在主命令旁启动 dashboard | *（未设置——不启动 dashboard）* |
 | `HERMES_DASHBOARD_HOST` | dashboard HTTP 服务器的绑定地址 | `127.0.0.1` |
 | `HERMES_DASHBOARD_PORT` | dashboard HTTP 服务器的端口 | `9119` |
+| `HERMES_DASHBOARD_TUI` | 设为 `1` 以启用浏览器内 Chat 标签页（通过 PTY/WebSocket 嵌入 `hermes --tui`） | *（未设置）* |
 | `HERMES_DASHBOARD_INSECURE` | 设为 `1`（或 `true` / `yes`）以在不启用 OAuth 鉴权门控的情况下绑定。仅在可信网络（且通过没有 OAuth 契约的反向代理时）使用——dashboard 会暴露 API 密钥与会话数据 | *（未设置——当注册了 `DashboardAuthProvider` 时启用门控）* |
 
 默认情况下，dashboard 保持在回环地址（`127.0.0.1`），以避免将
@@ -302,7 +303,7 @@ docker run -d \
    主程序退出时容器退出，并使用其退出码。
 
 :::warning 与 pre-s6 镜像的破坏性变更
-容器 ENTRYPOINT 现在是 `/init`（s6-overlay），而非 `/usr/bin/tini`。已记录的 `docker run` 调用模式（无参数、`chat -q "…"`、`sleep infinity`、`bash`）的行为与基于 tini 的镜像完全相同。如果你有依赖 tini 特定信号行为或硬编码 `/usr/bin/tini --` 调用的下游封装，请固定到之前的镜像标签。
+容器 ENTRYPOINT 现在是 `/init`（s6-overlay），而非 `/usr/bin/tini`。所有五种已记录的 `docker run` 调用模式（无参数、`chat -q "…"`、`sleep infinity`、`bash`、`--tui`）的行为与基于 tini 的镜像完全相同。如果你有依赖 tini 特定信号行为或硬编码 `/usr/bin/tini --` 调用的下游封装，请固定到之前的镜像标签。
 :::
 
 :::warning 权限模型

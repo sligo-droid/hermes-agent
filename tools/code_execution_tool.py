@@ -1571,10 +1571,11 @@ def _load_config() -> dict:
     """Load code_execution config without importing the interactive CLI.
 
     This helper is called while building the module-level execute_code schema
-    during tool discovery. Importing ``cli`` here pulls prompt_toolkit/Rich and
-    a large chunk of the classic REPL onto every agent startup path. Read the
-    lightweight raw config instead; the config layer already caches by (mtime,
-    size), and an absent key cleanly falls back to DEFAULT_EXECUTION_MODE.
+    during tool discovery.  Importing ``cli`` here pulls prompt_toolkit/Rich and
+    a large chunk of the classic REPL onto every agent startup path, including
+    ``hermes --tui`` where it is never used.  Read the lightweight raw config
+    instead; the config layer already caches by (mtime, size), and an absent
+    key cleanly falls back to DEFAULT_EXECUTION_MODE.
     """
     try:
         from hermes_cli.config import read_raw_config

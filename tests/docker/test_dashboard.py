@@ -388,7 +388,8 @@ def test_dashboard_insecure_env_var_opts_out_of_gate(
 ) -> None:
     """``HERMES_DASHBOARD_INSECURE=1`` re-enables the legacy no-gate mode
     for operators running on trusted LANs behind a reverse proxy without
-    the OAuth contract. Same opt-out shape as the rest of the s6 boolean envs.
+    the OAuth contract. Same opt-out shape as the rest of the s6 boolean
+    envs (``HERMES_DASHBOARD``, ``HERMES_DASHBOARD_TUI``).
 
     With the gate off, ``/api/status`` (a public endpoint under the
     legacy ``_SESSION_TOKEN`` middleware) returns 200 with the

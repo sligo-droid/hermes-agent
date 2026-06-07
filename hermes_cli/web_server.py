@@ -93,6 +93,10 @@ _DASHBOARD_DEFAULT_USERNAME = "hermes"
 _DASHBOARD_EPHEMERAL_PASSWORD = secrets.token_urlsafe(18)
 _DASHBOARD_PASSWORD_ANNOUNCED = False
 
+# In-browser Chat tab (/chat, /api/pty, …).  Off unless ``hermes dashboard --tui``
+# or HERMES_DASHBOARD_TUI=1.  Set from :func:`start_server`.
+_DASHBOARD_EMBEDDED_CHAT_ENABLED = False
+
 # Simple rate limiter for the reveal endpoint
 _reveal_timestamps: List[float] = []
 _REVEAL_MAX_PER_WINDOW = 5
@@ -1439,7 +1443,8 @@ def get_model_info():
 
 # ---------------------------------------------------------------------------
 # Model assignment — pick provider+model for main slot or auxiliary slots.
-# REST endpoint used by the Models page to drive provider/model pickers.
+# Mirrors the model.options JSON-RPC from tui_gateway but uses REST so the
+# Models page (which has no chat PTY open) can drive it.
 # ---------------------------------------------------------------------------
 
 # Canonical auxiliary task slots. Keep in sync with DEFAULT_CONFIG["auxiliary"]
@@ -1463,8 +1468,10 @@ _AUX_TASK_SLOTS: Tuple[str, ...] = (
 def get_model_options():
     """Return authenticated providers + their curated model lists.
 
-    The dashboard Models page can render the picker without a live chat
-    session. The response shape is consumed by ``ModelPickerDialog``.
+    REST equivalent of the ``model.options`` JSON-RPC on tui_gateway, so the
+    dashboard Models page can render the picker without a live chat session.
+    The response shape matches ``model.options`` 1:1 so ``ModelPickerDialog``
+    can share the same types.
     """
     try:
         from hermes_cli.inventory import build_models_payload, load_picker_context
@@ -3877,11 +3884,43 @@ async def get_models_analytics(days: int = 30):
         db.close()
 
 
+# ---------------------------------------------------------------------------
+# /api/pty — PTY-over-WebSocket bridge for the dashboard "Chat" tab.
+#
+# The endpoint spawns the same ``hermes --tui`` binary the CLI uses, behind
+# a POSIX pseudo-terminal, and forwards bytes + resize escapes across a
+# WebSocket.  The browser renders the ANSI through xterm.js (see
+# web/src/pages/ChatPage.tsx).
+#
+# Auth: ``?token=<session_token>`` query param (browsers can't set
+# Authorization on the WS upgrade).  Same ephemeral ``_SESSION_TOKEN`` as
+# REST.  Localhost-only — we defensively reject non-loopback clients even
+# though uvicorn binds to 127.0.0.1.
+# ---------------------------------------------------------------------------
+
 import re
 
+# PTY bridge is POSIX-only (depends on fcntl/termios/ptyprocess).  On native
+# Windows the import raises; catch and leave PtyBridge=None so the rest of
+# the dashboard (sessions, jobs, metrics, config editor) still loads and the
+# /api/pty endpoint cleanly refuses with a WSL-suggested message.
+try:
+    from hermes_cli.pty_bridge import PtyBridge, PtyUnavailableError
+    _PTY_BRIDGE_AVAILABLE = PtyBridge.is_available()
+except ImportError as _pty_import_err:  # pragma: no cover - Windows-only path
+    PtyBridge = None  # type: ignore[assignment]
+    _PTY_BRIDGE_AVAILABLE = False
+
+    class PtyUnavailableError(RuntimeError):  # type: ignore[no-redef]
+        """Stub on platforms where pty_bridge can't be imported."""
+        pass
+
+_RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
+_PTY_READ_CHUNK_TIMEOUT = 0.2
 _WORKER_CONSOLE_POLL_SECONDS = 0.5
 _WORKER_CONSOLE_INITIAL_TAIL_BYTES = 256_000
 _WORKER_CONSOLE_READ_CHUNK_BYTES = 64_000
+_VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 # Starlette's TestClient reports the peer as "testclient"; treat it as
 # loopback so tests don't need to rewrite request scope.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
@@ -4002,6 +4041,59 @@ def _ws_auth_ok(ws: "WebSocket") -> bool:
 
     token = ws.query_params.get("token", "")
     return hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode())
+
+# Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
+# and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
+# the chat tab generates on mount; entries auto-evict when the last subscriber
+# drops AND the publisher has disconnected.
+_event_channels: dict[str, set] = {}
+_event_lock = asyncio.Lock()
+
+
+def _resolve_chat_argv(
+    resume: Optional[str] = None,
+    sidecar_url: Optional[str] = None,
+) -> tuple[list[str], Optional[str], Optional[dict]]:
+    """Resolve the argv + cwd + env for the chat PTY.
+
+    Default: whatever ``hermes --tui`` would run.  Tests monkeypatch this
+    function to inject a tiny fake command (``cat``, ``sh -c 'printf …'``)
+    so nothing has to build Node or the TUI bundle.
+
+    Session resume is propagated via the ``HERMES_TUI_RESUME`` env var —
+    matching what ``hermes_cli.main._launch_tui`` does for the CLI path.
+    Appending ``--resume <id>`` to argv doesn't work because ``ui-tui`` does
+    not parse its argv.
+
+    `sidecar_url` (when set) is forwarded as ``HERMES_TUI_SIDECAR_URL`` so
+    the spawned ``tui_gateway.entry`` can mirror dispatcher emits to the
+    dashboard's ``/api/pub`` endpoint (see :func:`pub_ws`).
+    """
+    from hermes_cli.main import PROJECT_ROOT, _make_tui_argv
+
+    argv, cwd = _make_tui_argv(PROJECT_ROOT / "ui-tui", tui_dev=False)
+    env = os.environ.copy()
+    env.setdefault("NODE_ENV", "production")
+    # Browser-embedded chat should prefer stable wheel-based scrollback over
+    # native terminal mouse tracking. When mouse tracking is enabled, wheel
+    # events are consumed by the TUI and forwarded as terminal input, which
+    # makes browser-side transcript scrolling feel broken. Keep the terminal
+    # build unchanged for native CLI usage; only disable mouse tracking for
+    # the dashboard PTY path.
+    env.setdefault("HERMES_TUI_DISABLE_MOUSE", "1")
+    env.setdefault("HERMES_TUI_INLINE", "1")
+
+    if resume:
+        latest_resume, _latest_path = _session_latest_descendant(resume)
+        if latest_resume:
+            resume = latest_resume
+        env["HERMES_TUI_RESUME"] = resume
+
+    if sidecar_url:
+        env["HERMES_TUI_SIDECAR_URL"] = sidecar_url
+
+    return list(argv), str(cwd) if cwd else None, env
+
 
 def _resolve_worker_console_log(
     session_id: str,
@@ -4655,6 +4747,176 @@ async def _drain_worker_console_client(ws: WebSocket) -> None:
             return
 
 
+def _build_sidecar_url(channel: str) -> Optional[str]:
+    """ws:// URL the PTY child should publish events to, or None when unbound.
+
+    Loopback / ``--insecure``: uses ``?token=<_SESSION_TOKEN>``.
+
+    Gated mode: mints a single-use ticket via the dashboard-auth ticket
+    store (server-side mint, no HTTP round trip — the PTY child is a
+    server-spawned process and we trust it). The ticket binds to the
+    pseudo-user ``"pty-sidecar"`` so audit logs can distinguish these from
+    browser-initiated tickets.
+
+    The single-use lifetime means the PTY child cannot reconnect without a
+    new sidecar URL. PTY children open ``/api/pub`` once at startup; if
+    reconnect semantics ever become important, this should be upgraded to
+    a long-lived process-scoped token.
+    """
+    host = getattr(app.state, "bound_host", None)
+    port = getattr(app.state, "bound_port", None)
+
+    if not host or not port:
+        return None
+
+    if host == "0.0.0.0":
+        host = "127.0.0.1"
+    elif host == "::":
+        host = "::1"
+
+    netloc = f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
+
+    if getattr(app.state, "auth_required", False):
+        # Gated mode — mint a ticket so the WS upgrade survives _ws_auth_ok.
+        from hermes_cli.dashboard_auth.ws_tickets import mint_ticket
+
+        ticket = mint_ticket(user_id="pty-sidecar", provider="server-internal")
+        qs = urllib.parse.urlencode({"ticket": ticket, "channel": channel})
+    else:
+        qs = urllib.parse.urlencode({"token": _SESSION_TOKEN, "channel": channel})
+
+    return f"ws://{netloc}/api/pub?{qs}"
+
+
+async def _broadcast_event(channel: str, payload: str) -> None:
+    """Fan out one publisher frame to every subscriber on `channel`."""
+    async with _event_lock:
+        subs = list(_event_channels.get(channel, ()))
+
+    for sub in subs:
+        try:
+            await sub.send_text(payload)
+        except Exception:
+            # Subscriber went away mid-send; the /api/events finally clause
+            # will remove it from the registry on its next iteration.
+            _log.warning("broadcast send failed for subscriber on %s", channel, exc_info=True)
+
+
+def _channel_or_close_code(ws: WebSocket) -> Optional[str]:
+    """Return the channel id from the query string or None if invalid."""
+    channel = ws.query_params.get("channel", "")
+
+    return channel if _VALID_CHANNEL_RE.match(channel) else None
+
+
+@app.websocket("/api/pty")
+async def pty_ws(ws: WebSocket) -> None:
+    if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
+        await ws.close(code=4403)
+        return
+
+    # --- auth + loopback check (before accept so we can close cleanly) ---
+    if not _ws_auth_ok(ws):
+        await ws.close(code=4401)
+        return
+
+    if not _ws_request_is_allowed(ws):
+        await ws.close(code=4403)
+        return
+
+    await ws.accept()
+
+    # On native Windows, the POSIX PTY bridge can't be imported.  Tell the
+    # client and close cleanly rather than pretending the feature works.
+    if not _PTY_BRIDGE_AVAILABLE:
+        await ws.send_text(
+            "\r\n\x1b[31mChat unavailable: the embedded terminal requires a "
+            "POSIX PTY, which native Windows Python doesn't provide.\x1b[0m\r\n"
+            "\x1b[33mInstall Hermes inside WSL2 to use the dashboard's /chat "
+            "tab — the rest of the dashboard works here.\x1b[0m\r\n"
+        )
+        await ws.close(code=1011)
+        return
+
+    # --- spawn PTY ------------------------------------------------------
+    resume = ws.query_params.get("resume") or None
+    channel = _channel_or_close_code(ws)
+    sidecar_url = _build_sidecar_url(channel) if channel else None
+
+    try:
+        argv, cwd, env = _resolve_chat_argv(resume=resume, sidecar_url=sidecar_url)
+    except SystemExit as exc:
+        # _make_tui_argv calls sys.exit(1) when node/npm is missing.
+        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
+        await ws.close(code=1011)
+        return
+
+
+    try:
+        bridge = PtyBridge.spawn(argv, cwd=cwd, env=env)
+    except PtyUnavailableError as exc:
+        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
+        await ws.close(code=1011)
+        return
+    except (FileNotFoundError, OSError) as exc:
+        await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
+        await ws.close(code=1011)
+        return
+
+    loop = asyncio.get_running_loop()
+
+    # --- reader task: PTY master → WebSocket ----------------------------
+    async def pump_pty_to_ws() -> None:
+        while True:
+            chunk = await loop.run_in_executor(
+                None, bridge.read, _PTY_READ_CHUNK_TIMEOUT
+            )
+            if chunk is None:  # EOF
+                return
+            if not chunk:  # no data this tick; yield control and retry
+                await asyncio.sleep(0)
+                continue
+            try:
+                await ws.send_bytes(chunk)
+            except Exception:
+                return
+
+    reader_task = asyncio.create_task(pump_pty_to_ws())
+
+    # --- writer loop: WebSocket → PTY master ----------------------------
+    try:
+        while True:
+            msg = await ws.receive()
+            msg_type = msg.get("type")
+            if msg_type == "websocket.disconnect":
+                break
+            raw = msg.get("bytes")
+            if raw is None:
+                text = msg.get("text")
+                raw = text.encode("utf-8") if isinstance(text, str) else b""
+            if not raw:
+                continue
+
+            # Resize escape is consumed locally, never written to the PTY.
+            match = _RESIZE_RE.match(raw)
+            if match and match.end() == len(raw):
+                cols = int(match.group(1))
+                rows = int(match.group(2))
+                bridge.resize(cols=cols, rows=rows)
+                continue
+
+            bridge.write(raw)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        reader_task.cancel()
+        try:
+            await reader_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        bridge.close()
+
+
 # The path keeps the original /console/pty suffix for deployed clients, but the
 # operator console is now a read-only worker log stream rather than a shell PTY.
 @app.websocket("/api/workers/{session_id}/tickets/{task_id}/console/pty")
@@ -4714,6 +4976,117 @@ async def worker_console_log_ws(ws: WebSocket, session_id: str, task_id: str) ->
             drain_task.cancel()
 
 
+# ---------------------------------------------------------------------------
+# /api/ws — JSON-RPC WebSocket sidecar for dashboard metadata.
+#
+# This is a separate tui_gateway transport from the visible PTY child. The
+# sidebar uses it for structured metadata and option loading; commands that
+# must affect the visible TUI are sent through /api/pty as terminal input.
+# ---------------------------------------------------------------------------
+
+
+@app.websocket("/api/ws")
+async def gateway_ws(ws: WebSocket) -> None:
+    if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
+        await ws.close(code=4403)
+        return
+
+    if not _ws_auth_ok(ws):
+        await ws.close(code=4401)
+        return
+
+    if not _ws_request_is_allowed(ws):
+        await ws.close(code=4403)
+        return
+
+    from tui_gateway.ws import handle_ws
+
+    await handle_ws(ws)
+
+
+# ---------------------------------------------------------------------------
+# /api/pub + /api/events — chat-tab event broadcast.
+#
+# The PTY-side ``tui_gateway.entry`` opens /api/pub at startup (driven by
+# HERMES_TUI_SIDECAR_URL set in /api/pty's PTY env) and writes every
+# dispatcher emit through it.  The dashboard fans those frames out to any
+# subscriber that opened /api/events on the same channel id.  This is what
+# gives the React sidebar its tool-call feed without breaking the PTY
+# child's stdio handshake with Ink.
+# ---------------------------------------------------------------------------
+
+
+@app.websocket("/api/pub")
+async def pub_ws(ws: WebSocket) -> None:
+    if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
+        await ws.close(code=4403)
+        return
+
+    if not _ws_auth_ok(ws):
+        await ws.close(code=4401)
+        return
+
+    if not _ws_request_is_allowed(ws):
+        await ws.close(code=4403)
+        return
+
+    channel = _channel_or_close_code(ws)
+    if not channel:
+        await ws.close(code=4400)
+        return
+
+    await ws.accept()
+
+    try:
+        while True:
+            await _broadcast_event(channel, await ws.receive_text())
+    except WebSocketDisconnect:
+        pass
+
+
+@app.websocket("/api/events")
+async def events_ws(ws: WebSocket) -> None:
+    if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
+        await ws.close(code=4403)
+        return
+
+    if not _ws_auth_ok(ws):
+        await ws.close(code=4401)
+        return
+
+    if not _ws_request_is_allowed(ws):
+        await ws.close(code=4403)
+        return
+
+    channel = _channel_or_close_code(ws)
+    if not channel:
+        await ws.close(code=4400)
+        return
+
+    await ws.accept()
+
+    async with _event_lock:
+        _event_channels.setdefault(channel, set()).add(ws)
+
+    try:
+        while True:
+            # Subscribers don't speak — the receive() just blocks until
+            # disconnect so the connection stays open as long as the
+            # browser holds it.
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        async with _event_lock:
+            subs = _event_channels.get(channel)
+
+            if subs is not None:
+                subs.discard(ws)
+
+                if not subs:
+                    _event_channels.pop(channel, None)
+
+
 def _normalise_prefix(raw: Optional[str]) -> str:
     """Normalise an X-Forwarded-Prefix header value.
 
@@ -4763,9 +5136,10 @@ def mount_spa(application: FastAPI):
         the legacy ``_SESSION_TOKEN`` is NOT injected — the SPA reads
         identity from ``/api/auth/me`` over cookie auth instead.  The
         ``__HERMES_AUTH_REQUIRED__`` flag lets the SPA pick the right
-        auth scheme for WebSocket ticket vs token auth.
+        auth scheme for /api/pty and /api/ws (ticket vs token).
         """
         html = _index_path.read_text()
+        chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
         gated = bool(getattr(app.state, "auth_required", False))
         gated_js = "true" if gated else "false"
         surface_js = json.dumps(
@@ -4777,6 +5151,7 @@ def mount_spa(application: FastAPI):
         if gated:
             bootstrap_script = (
                 f"<script>"
+                f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
                 f"window.__HERMES_DASHBOARD_SURFACE__={surface_js};"
@@ -4786,6 +5161,7 @@ def mount_spa(application: FastAPI):
         else:
             bootstrap_script = (
                 f'<script>window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";'
+                f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
                 f"window.__HERMES_DASHBOARD_SURFACE__={surface_js};"
@@ -5757,7 +6133,8 @@ def start_server(
     """Start the web UI server."""
     import uvicorn
 
-    global _DASHBOARD_PASSWORD_ANNOUNCED
+    global _DASHBOARD_EMBEDDED_CHAT_ENABLED, _DASHBOARD_PASSWORD_ANNOUNCED
+    _DASHBOARD_EMBEDDED_CHAT_ENABLED = embedded_chat
 
     # Phase 0: stash the auth-gate flag on app.state so middleware / SPA-token
     # injection / WS-auth paths can branch on it consistently.  Phase 3.5
@@ -5825,7 +6202,8 @@ def start_server(
 
     # Record the bound host so host_header_middleware can validate incoming
     # Host headers against it. Defends against DNS rebinding (GHSA-ppp5-vxwm-4cf7).
-    # bound_port is stashed for dashboard runtime metadata and future URL helpers.
+    # bound_port is also stashed so /api/pty can build the back-WS URL the
+    # PTY child uses to publish events to the dashboard sidebar.
     app.state.bound_host = host
     app.state.bound_port = port
 

@@ -50,7 +50,7 @@ Hermes 现在将粘贴处理为分层流程：
 
 ### `/terminal-setup`（适用于 VS Code / Cursor / Windsurf）
 
-如果你在 macOS 上的 VS Code 系列集成终端中运行 CLI，Hermes 可以安装推荐的 `workbench.action.terminal.sendSequence` 绑定，以获得更好的多行输入及撤销/重做一致性：
+如果你在 macOS 上的 VS Code 系列集成终端中运行 TUI，Hermes 可以安装推荐的 `workbench.action.terminal.sendSequence` 绑定，以获得更好的多行输入及撤销/重做一致性：
 
 ```text
 /terminal-setup
