@@ -505,6 +505,11 @@ function WorkItemCard({
         </div>
       ) : null}
       <div aria-busy={rowBusy} className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3">
+        {workerUrl && (
+          <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-cyan-100/20 px-3 text-xs font-semibold text-cyan-100 transition hover:border-cyan-100/35 hover:bg-cyan-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/30" href={workerUrl} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank">
+            Worker board <ExternalLink className="h-3.5 w-3.5" /><span className="sr-only">opens in a new tab</span>
+          </a>
+        )}
         {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && (
           <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/[0.07] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" href={item.execution.task_url} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank">
             Ticket <ExternalLink className="h-3.5 w-3.5" /><span className="sr-only">opens in a new tab</span>
