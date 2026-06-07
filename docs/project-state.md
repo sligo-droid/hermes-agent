@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-06 21:03 UTC
+Last updated: 2026-06-06 23:25 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -44,7 +44,7 @@ This is product intention, so it belongs in repo state/docs, not in a skill. If 
 - **Rows are Work Items:** show proposed recommendations, decision/intake items, and board-level worker rollups. Do not show individual Kanban task/ticket rows or accepted downstream proposal rows without a canonical Work Item/board rollup.
 - **Board execution stays child-level:** worker boards, Kanban tasks, task runs, PRs, logs, and deploys are execution artifacts attached to Work Items, not a competing ledger.
 - **Layout target:** Sligo shell header with one refresh/control area; left work list plus right detail/audit pane; source/status chips before title; created-date footer; active/running work visibly above quieter proposed/non-running work.
-- **Action target:** compact icon row actions with real affordances. Proposed items show Approve plus Archive; Archive uses the existing halt/archive flow for unapproved proposals and is one-click for archiveable non-default boards. Pause/replay/cancel/revert are shown only when source and lifecycle state make them real.
+- **Action target:** compact icon row actions with real affordances. Proposed items show Approve plus Archive; completed jobs still show Revert plus Archive when those actions are real. Archive uses the existing halt/archive flow for unapproved proposals and is one-click for archiveable non-default boards. Pause/replay/cancel/revert are shown only when source and lifecycle state make them real.
 - **Worker/source links:** show a Worker pill only after execution starts, point it directly to the worker board URL, and never use bare `/workers` as a per-item destination. Show direct Discord source/thread links when metadata exists.
 - **Archive target:** Archive is a historical ledger, including boards moved under `boards/_archived/`; archived rows are not actionable as live worker boards.
 

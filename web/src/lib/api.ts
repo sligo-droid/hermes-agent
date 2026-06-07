@@ -370,6 +370,15 @@ export const api = {
         body: JSON.stringify(body),
       },
     ),
+  requestKanbanBoardUndoFollowup: (slug: string, reason?: string) =>
+    fetchJSON<{ created: boolean; task: Record<string, unknown>; worker_url: string | null }>(
+      `/api/plugins/kanban/boards/${encodeURIComponent(slug)}/undo-followup`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: reason || undefined }),
+      },
+    ),
 
   // Self-improvement proposal board
   getSelfImprovementProposals: () =>
@@ -942,6 +951,7 @@ export interface CommandCenterExecution {
   pause_action?: string | null;
   resume_action?: string | null;
   repair_action?: string | null;
+  undo_followup_action?: string | null;
   repairable?: boolean;
   repair_task_id?: string | null;
   repair_task_status?: string | null;

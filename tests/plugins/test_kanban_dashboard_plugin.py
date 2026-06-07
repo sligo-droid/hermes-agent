@@ -751,6 +751,29 @@ def test_self_improvement_undo_followup_inherits_completed_task_workspace(client
     assert followup["workspace_path"] == workspace_path
 
 
+def test_board_undo_followup_for_completed_board_is_idempotent(client):
+    board = "discord-board-revert-followup"
+    kb.write_board_metadata(board, name="Discord Board Revert Followup")
+    conn = kb.connect(board=board)
+    try:
+        task_id = kb.create_task(conn, title="Completed board task", tenant="hermes", board=board)
+        kb.complete_task(conn, task_id, summary="implemented")
+    finally:
+        conn.close()
+
+    first = client.post(f"/api/plugins/kanban/boards/{board}/undo-followup", json={"reason": "bad rollout"})
+    second = client.post(f"/api/plugins/kanban/boards/{board}/undo-followup", json={"reason": "retry"})
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["created"] is True
+    assert second.json()["created"] is False
+    assert first.json()["task"]["id"] == second.json()["task"]["id"]
+    assert first.json()["task"]["status"] == "blocked"
+    assert first.json()["task"]["created_by"] == "command-center-revert"
+    assert first.json()["idempotency_key"] == f"command-center-revert:{board}"
+
+
 def test_self_improvement_approve_creates_task_on_discord_thread_board(client, monkeypatch):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
