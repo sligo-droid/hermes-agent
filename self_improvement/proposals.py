@@ -268,6 +268,8 @@ def build_cron_proposal_guidance(
         "## Self-Improvement Proposal Output\n"
         f"Project: `{project}`. Prong: `{prong}` ({label}). Focus: {focus}\n\n"
         f"Emit at most {max_cards} proposal cards. Prefer zero cards over weak, duplicate, or wall-of-text output. "
+        "When checking whether an issue is already manifested in Command Center, treat only active Command Center Inbox items as duplicate sources; "
+        "Completed/shipped/done and Archive/rejected/archived Command Center sections are historical feedback only and must not suppress a new proposal as an active duplicate. "
         "Each card must be independently approvable as a future Kanban task. Do not create Kanban tasks, mutate dashboards, or approve/reject proposals.\n\n"
         "Return both: (1) a concise human markdown summary, and (2) one strict JSON block fenced as ```json containing a proposal run matching "
         f"`{CONTRACT_VERSION}`. The JSON root fields are: `contract_version`, `project`, `prong`, `run`, `generated_at`, `human_markdown`, and `cards`. "

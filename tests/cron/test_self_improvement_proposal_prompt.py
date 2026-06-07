@@ -24,6 +24,9 @@ def test_cron_job_prompt_includes_self_improvement_proposal_guidance():
     assert CONTRACT_VERSION in prompt
     assert "```json" in prompt
     assert "at most 5 proposal cards" in prompt
+    assert "only active Command Center Inbox items as duplicate sources" in prompt
+    assert "Completed/shipped/done and Archive/rejected/archived Command Center sections" in prompt
+    assert "must not suppress a new proposal as an active duplicate" in prompt
     assert "Do not create Kanban tasks" in prompt
     assert "Review yesterday's PID admin dogfood notes." in prompt
 
