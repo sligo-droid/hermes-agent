@@ -3945,7 +3945,11 @@ class DiscordAdapter(BasePlatformAdapter):
             try:
                 from hermes_cli.discord_worker_boards import mark_thread_status_synced
 
-                mark_thread_status_synced(str(target.get("board") or ""), reaction=True)
+                mark_thread_status_synced(
+                    str(target.get("board") or ""),
+                    reaction=True,
+                    metadata_path=target.get("metadata_path"),
+                )
             except Exception:
                 logger.debug("[%s] Failed to clear Discord terminal reaction sync flag", self.name, exc_info=True)
         return state if targets_final else None
@@ -3963,7 +3967,11 @@ class DiscordAdapter(BasePlatformAdapter):
             try:
                 from hermes_cli.discord_worker_boards import mark_thread_status_synced
 
-                mark_thread_status_synced(board, completion_message=True)
+                mark_thread_status_synced(
+                    board,
+                    completion_message=True,
+                    metadata_path=target.get("metadata_path"),
+                )
             except Exception:
                 logger.debug("[%s] Failed to clear stale Discord completion notice flag", self.name, exc_info=True)
                 return None
@@ -3972,7 +3980,11 @@ class DiscordAdapter(BasePlatformAdapter):
             try:
                 from hermes_cli.discord_worker_boards import mark_thread_status_synced
 
-                mark_thread_status_synced(board, completion_message=True)
+                mark_thread_status_synced(
+                    board,
+                    completion_message=True,
+                    metadata_path=target.get("metadata_path"),
+                )
             except Exception:
                 logger.debug("[%s] Failed to clear foreman completion notice flag", self.name, exc_info=True)
                 return None
@@ -4000,6 +4012,7 @@ class DiscordAdapter(BasePlatformAdapter):
             mark_thread_completion_notice_sent(
                 board,
                 message_id=str(getattr(first_message, "id", "") or "") or None,
+                metadata_path=target.get("metadata_path"),
             )
         except Exception:
             logger.debug("[%s] Failed to record Discord terminal completion notice send", self.name, exc_info=True)
@@ -4034,7 +4047,12 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             from hermes_cli.discord_worker_boards import mark_thread_status_synced
 
-            mark_thread_status_synced(board, reaction=reaction, summary=summary)
+            mark_thread_status_synced(
+                board,
+                reaction=reaction,
+                summary=summary,
+                metadata_path=target.get("metadata_path"),
+            )
         except Exception:
             logger.debug("[%s] Failed to clear unreachable Discord terminal sync flag", self.name, exc_info=True)
             return False

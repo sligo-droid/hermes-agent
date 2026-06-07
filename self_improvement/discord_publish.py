@@ -217,29 +217,19 @@ def publish_approved_proposal(
     existing_message = str(existing.get("discord_top_level_message_id") or "").strip()
     existing_board = str(existing.get("discord_board") or "").strip()
     if existing_thread and existing_message and existing_board:
-        from hermes_cli.discord_worker_boards import ensure_discord_thread_board
-
-        board = ensure_discord_thread_board(
-            thread_id=existing_thread,
-            chat_id=channel_id,
-            guild_id=str(existing.get("discord_guild_id") or ""),
-            parent_channel_id=channel_id,
-            initial_request=_initial_request(card),
-            project_context=_project_context(card, channel_id),
-            request_id=existing_message,
-            source_message_id=existing_message,
-            board_slug=existing_board,
-        )
-        _update_feature_embed(channel_id, existing_message, card, board.public_url)
-        return DiscordApprovalRoute(
+        route = DiscordApprovalRoute(
             channel_id=channel_id,
             top_level_message_id=existing_message,
             thread_id=existing_thread,
             thread_url=str(existing.get("discord_thread_url") or _thread_url(str(existing.get("discord_guild_id") or ""), existing_thread)),
-            board=board.slug,
-            board_public_url=board.public_url,
+            board=existing_board,
+            board_public_url=str(existing.get("discord_board_public_url") or ""),
             guild_id=str(existing.get("discord_guild_id") or ""),
         )
+        route = ensure_approval_route_board(card, route)
+        if route and route.board_public_url:
+            _update_feature_embed(channel_id, existing_message, card, route.board_public_url)
+        return route
 
     try:
         from tools.discord_tool import _discord_request, _get_bot_token
@@ -268,29 +258,20 @@ def publish_approved_proposal(
         if not thread_id:
             return None
 
-        from hermes_cli.discord_worker_boards import ensure_discord_thread_board
-
-        board = ensure_discord_thread_board(
-            thread_id=thread_id,
-            chat_id=channel_id,
-            guild_id=guild_id,
-            parent_channel_id=channel_id,
-            initial_request=_initial_request(card),
-            project_context=_project_context(card, channel_id),
-            request_id=message_id,
-            source_message_id=message_id,
-        )
-        _update_feature_embed(channel_id, message_id, card, board.public_url)
         _add_reaction(token, channel_id, message_id, "👀")
-        return DiscordApprovalRoute(
+        route = DiscordApprovalRoute(
             channel_id=channel_id,
             top_level_message_id=message_id,
             thread_id=thread_id,
             thread_url=_thread_url(guild_id, thread_id),
-            board=board.slug,
-            board_public_url=board.public_url,
+            board="",
+            board_public_url="",
             guild_id=guild_id,
         )
+        route = ensure_approval_route_board(card, route)
+        if route and route.board_public_url:
+            _update_feature_embed(channel_id, message_id, card, route.board_public_url)
+        return route
     except Exception as exc:
         log.warning("self-improvement Discord approval publish failed: %s", exc)
         return DiscordApprovalRoute(
@@ -302,6 +283,37 @@ def publish_approved_proposal(
             board_public_url="",
             error=str(exc),
         )
+
+
+def ensure_approval_route_board(
+    card: dict[str, Any],
+    route: DiscordApprovalRoute | None,
+) -> DiscordApprovalRoute | None:
+    """Ensure local durable board state exists for an approval Discord route."""
+
+    if route is None or not route.thread_id or not route.top_level_message_id:
+        return route
+    try:
+        from hermes_cli.discord_worker_boards import ensure_discord_thread_board
+
+        board = ensure_discord_thread_board(
+            thread_id=route.thread_id,
+            chat_id=route.channel_id,
+            guild_id=route.guild_id,
+            parent_channel_id=route.channel_id,
+            initial_request=_initial_request(card),
+            project_context=_project_context(card, route.channel_id),
+            request_id=route.top_level_message_id,
+            source_message_id=route.top_level_message_id,
+            board_slug=route.board or None,
+        )
+        return replace(route, board=board.slug, board_public_url=board.public_url)
+    except Exception as exc:
+        log.warning("self-improvement Discord approval board ensure failed: %s", exc)
+        error = str(exc)
+        if route.error:
+            error = f"{route.error}; board: {error}"
+        return replace(route, error=error)
 
 
 def activate_approved_proposal(

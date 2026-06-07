@@ -1,4 +1,6 @@
 import asyncio
+import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -64,6 +66,7 @@ class CompletionNoticeAdapter(DiscordStatusSyncAdapter):
         dwb.mark_thread_completion_notice_sent(
             str(target.get("board") or ""),
             message_id="completion-message-1",
+            metadata_path=target.get("metadata_path"),
         )
         return target.get("board")
 
@@ -1223,6 +1226,74 @@ def test_discord_kanban_typing_watcher_sends_completion_notice(tmp_path, monkeyp
     assert "terminal_completion_message_pending" not in worker
     assert worker["terminal_completion_message_id"] == "completion-message-1"
     assert isinstance(worker["terminal_completion_message_sent_at"], int)
+
+
+def test_record_final_discord_response_rearms_done_board_completion_notice(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(
+        thread_id="99023",
+        goal="Announce completed goal after final response arrives late",
+        chat_id="parent-99023",
+    )
+    dwb._update_worker_meta(board.slug, {"goal_status": "done", "phase": "complete"})
+    dwb.mark_thread_status_synced(board.slug, completion_message=True)
+
+    worker = kb.read_board_metadata(board.slug)["discord_worker"]
+    assert "terminal_completion_message_pending" not in worker
+
+    dwb.record_final_discord_response(
+        board.slug,
+        final_response="Done after the ledger produced the final Discord response.",
+        session_id="session-99023",
+    )
+
+    adapter = CompletionNoticeAdapter()
+    runner = _make_discord_runner(adapter)
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert len(adapter.completions) == 1
+    assert adapter.completions[0]["board_summary"]["final_response"]["text"] == "Done after the ledger produced the final Discord response."
+    worker = kb.read_board_metadata(board.slug)["discord_worker"]
+    assert "terminal_completion_message_pending" not in worker
+    assert worker["terminal_completion_message_id"] == "completion-message-1"
+
+
+def test_archived_pending_terminal_board_is_completion_notice_target(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    thread_id = str(int((time.time() + 1_000 - 1_420_070_400) * 1000) << 22)
+    board = dwb.set_goal(
+        thread_id=thread_id,
+        goal="Archived board still owes final Discord response",
+        chat_id="parent-99024",
+    )
+    dwb._update_worker_meta(board.slug, {"goal_status": "done", "phase": "complete"})
+    dwb.record_final_discord_response(board.slug, final_response="Archived board completed.")
+    kb.remove_board(board.slug, archive=True)
+
+    targets = dwb.thread_status_targets()
+
+    assert len(targets) == 1
+    assert targets[0]["board"] == board.slug
+    assert targets[0]["archived"] is True
+    assert targets[0]["metadata_path"].endswith("/board.json")
+    assert targets[0]["terminal_completion_message_pending"] is True
+    assert targets[0]["board_summary"]["final_response"]["text"] == "Archived board completed."
+
+    dwb.mark_thread_completion_notice_sent(
+        board.slug,
+        message_id="archived-completion-message",
+        metadata_path=targets[0]["metadata_path"],
+    )
+
+    assert dwb.thread_status_targets() == []
+    archived_meta = json.loads(Path(targets[0]["metadata_path"]).read_text(encoding="utf-8"))
+    archived_worker = archived_meta["discord_worker"]
+    assert "terminal_completion_message_pending" not in archived_worker
+    assert archived_worker["terminal_completion_message_id"] == "archived-completion-message"
 
 
 def test_discord_worker_new_goal_clears_prior_completion_notice_proof(tmp_path, monkeypatch):

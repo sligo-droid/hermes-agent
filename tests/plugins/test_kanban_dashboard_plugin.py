@@ -1000,6 +1000,66 @@ def test_self_improvement_approve_falls_back_when_discord_publish_fails(client, 
     assert audit[-1]["metadata"]["discord_publish_error"] == "network unavailable"
 
 
+def test_self_improvement_approve_fails_visibly_when_discord_thread_has_no_board(client, monkeypatch):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+
+    monkeypatch.setattr(discord_publish, "configured_project_channel_id", lambda project: "12345")
+    monkeypatch.setattr(
+        discord_publish,
+        "publish_approved_proposal",
+        lambda card_arg, *, channel_id, existing=None: discord_publish.DiscordApprovalRoute(
+            channel_id=channel_id,
+            top_level_message_id="555",
+            thread_id="777",
+            thread_url="https://discord.com/channels/999/777",
+            board="",
+            board_public_url="",
+            guild_id="999",
+            error="board creation failed",
+        ),
+    )
+
+    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+
+    assert response.status_code == 500, response.text
+    assert "Discord worker board failed" in response.json()["detail"]
+    default_conn = kb.connect()
+    try:
+        assert default_conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        default_conn.close()
+    audit = proposal_storage.list_audit_events(card["proposal_id"])
+    assert audit[-1]["action"] == "approval_discord_worker_failed"
+    assert audit[-1]["metadata"]["discord_top_level_message_id"] == "555"
+    assert audit[-1]["metadata"]["discord_thread_id"] == "777"
+    assert audit[-1]["metadata"]["discord_publish_error"] == "board creation failed"
+
+
+def test_discord_approval_route_board_can_be_reconciled_from_existing_metadata(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://example.test")
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    route = discord_publish.DiscordApprovalRoute(
+        channel_id="12345",
+        top_level_message_id="555",
+        thread_id="777",
+        thread_url="https://discord.com/channels/999/777",
+        board="discord-777-m-555",
+        board_public_url="https://example.test/workers/777",
+        guild_id="999",
+    )
+
+    reconciled = discord_publish.ensure_approval_route_board(card, route)
+
+    assert reconciled is not None
+    assert reconciled.board == "discord-777-m-555"
+    worker = kb.read_board_metadata("discord-777-m-555")["discord_worker"]
+    assert worker["thread_id"] == "777"
+    assert worker["source_message_id"] == "555"
+
+
 def test_self_improvement_approve_maps_critical_priority_above_high(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]

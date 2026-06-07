@@ -219,6 +219,22 @@ def test_tick_records_malformed_self_improvement_cron_output(tmp_path, monkeypat
     assert "proposal JSON parse error" in failures[0]["parse_error"]
 
 
+def test_tick_does_not_ingest_silent_self_improvement_cron_output(tmp_path, monkeypatch):
+    from cron.scheduler import SILENT_MARKER
+
+    _run_tick_with_response(tmp_path, monkeypatch, _proposal_job(), SILENT_MARKER)
+
+    assert proposal_storage.list_runs()["runs"] == []
+    assert proposal_storage.list_parse_failures()["failures"] == []
+
+
+def test_tick_does_not_ingest_empty_self_improvement_cron_output(tmp_path, monkeypatch):
+    _run_tick_with_response(tmp_path, monkeypatch, _proposal_job(), "")
+
+    assert proposal_storage.list_runs()["runs"] == []
+    assert proposal_storage.list_parse_failures()["failures"] == []
+
+
 def test_tick_reingests_same_self_improvement_output_idempotently(tmp_path, monkeypatch):
     job = _proposal_job()
     response = json.dumps(_proposal_payload())

@@ -2296,8 +2296,6 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     )
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
-                _ingest_self_improvement_proposal_output(job, output, Path(output_file), final_response)
-
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but
                 # output is already saved above).  Failed jobs always deliver.
@@ -2309,6 +2307,9 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                     should_deliver = False
+
+                if should_deliver:
+                    _ingest_self_improvement_proposal_output(job, output, Path(output_file), final_response)
 
                 delivery_error = None
                 if should_deliver:
