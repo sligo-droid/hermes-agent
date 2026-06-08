@@ -5650,6 +5650,35 @@ def _recover_approved_reviewer_finalizer(board: str, worker: dict[str, Any], con
     return "approved_reviewer_finalizer_blocked"
 
 
+def _recover_blocked_approved_reviewer_finalizer(
+    board: str,
+    worker: dict[str, Any],
+    conn: Any,
+    tasks: list[Any],
+) -> Optional[str]:
+    if str(worker.get("phase") or "").strip().lower() != "blocked":
+        return None
+    if str(worker.get("goal_status") or "").strip().lower() != "blocked":
+        return None
+    if str(worker.get("blocked_reason") or "").strip() != "approved reviewer PR finalization failed":
+        return None
+    if worker.get("execution_mode") != "kanban_pipeline" or _worker_source_message_too_old(worker):
+        return None
+    if _completed_approved_reviewer_task(conn, tasks) is None:
+        return None
+
+    blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "approved reviewer PR finalization failed").strip()
+    if _pr_finalizer_failure_is_failed_checks(worker):
+        _create_pr_checks_recovery_task(board, worker, conn)
+        _reactivate_after_pr_finalizer_recovery(board, worker, blocker)
+        return "approved_reviewer_finalizer_checks_recovery_created"
+    if _pr_finalizer_failure_is_merge_conflict(worker):
+        _create_pr_merge_conflict_recovery_task(board, worker, conn)
+        _reactivate_after_pr_finalizer_recovery(board, worker, blocker)
+        return "approved_reviewer_finalizer_merge_conflict_recovery_created"
+    return None
+
+
 def reconcile_board(board: str) -> Optional[str]:
     """Advance deterministic Discord worker board phases.
 
@@ -5659,9 +5688,10 @@ def reconcile_board(board: str) -> Optional[str]:
     worker = _read_worker_meta(board)
     if worker.get("kind") != "discord_worker_board":
         return None
-    if not is_executable_worker_board(board):
+    goal_status = str(worker.get("goal_status") or "").strip().lower()
+    if worker.get("paused") or worker.get("cancelled") or goal_status in {"done", "cancelled"}:
         return None
-    if worker.get("paused") or worker.get("cancelled") or worker.get("goal_status") in {"done", "blocked", "cancelled"}:
+    if goal_status != "blocked" and not is_executable_worker_board(board):
         return None
 
     conn = kanban_db.connect(board=board)
@@ -5674,6 +5704,8 @@ def reconcile_board(board: str) -> Optional[str]:
         }
         if ROLE_PLANNER in active_roles or ROLE_DEV in active_roles or ROLE_REVIEWER in active_roles:
             return None
+        if goal_status == "blocked":
+            return _recover_blocked_approved_reviewer_finalizer(board, worker, conn, tasks)
         if not tasks:
             _ensure_planner_task(board, worker)
             return "planner_created"
