@@ -1433,6 +1433,158 @@ def test_dispatch_recovers_recorded_role_result_before_expired_claim_reclaim(mon
     assert runs[-1].summary == "Reviewer approved expired run."
 
 
+def test_dispatch_recovers_blocked_dead_pid_recorded_role_result(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+    from hermes_cli.discord_worker_state import record_codex_worker_result
+
+    board = dwb.start_direct_goal(thread_id="recover-blocked-review", goal="Review blocked result")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Review",
+            assignee=ROLE_REVIEWER,
+            tenant=board.slug,
+            workspace_kind="dir",
+            workspace_path=str(tmp_path / "repo"),
+        )
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+        conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'blocked',
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   current_run_id = ?,
+                   consecutive_failures = 2,
+                   last_failure_error = ?
+             WHERE id = ?
+            """,
+            (claimed.current_run_id, "pid 4141493 not alive", task_id),
+        )
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status = 'crashed', outcome = 'crashed', error = ?
+             WHERE id = ?
+            """,
+            ("pid 4141493 not alive", claimed.current_run_id),
+        )
+        conn.commit()
+        record_codex_worker_result(
+            task_id,
+            board=board.slug,
+            result=SimpleNamespace(
+                backend="codex",
+                final_text=json.dumps(
+                    {
+                        "status": "approved",
+                        "summary": "Reviewer approved after blocked reclaim.",
+                        "findings": [],
+                        "new_tasks": [],
+                    }
+                ),
+                error=None,
+            ),
+        )
+
+        result = kanban_db.dispatch_once(conn, board=board.slug, max_spawn=0)
+        task = kanban_db.get_task(conn, task_id)
+        runs = kanban_db.list_runs(conn, task_id)
+    finally:
+        conn.close()
+
+    assert result.crashed == []
+    assert result.auto_blocked == []
+    assert task is not None
+    assert task.status == "done"
+    assert task.last_failure_error is None
+    assert runs[-1].outcome == "completed"
+    assert runs[-1].summary == "Reviewer approved after blocked reclaim."
+
+
+def test_dispatch_does_not_recover_blocked_dead_pid_from_stale_sidecar(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+    from hermes_cli.discord_worker_state import record_codex_worker_result, write_codex_worker_state
+
+    board = dwb.start_direct_goal(thread_id="recover-blocked-stale", goal="Review stale result")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Review",
+            assignee=ROLE_REVIEWER,
+            tenant=board.slug,
+            workspace_kind="dir",
+            workspace_path=str(tmp_path / "repo"),
+        )
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+        conn.execute(
+            "UPDATE task_runs SET started_at = ? WHERE id = ?",
+            (int(time.time()) + 60, claimed.current_run_id),
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'blocked',
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   current_run_id = ?,
+                   consecutive_failures = 2,
+                   last_failure_error = ?
+             WHERE id = ?
+            """,
+            (claimed.current_run_id, "pid 4141493 not alive", task_id),
+        )
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status = 'crashed', outcome = 'crashed', error = ?
+             WHERE id = ?
+            """,
+            ("pid 4141493 not alive", claimed.current_run_id),
+        )
+        conn.commit()
+        record_codex_worker_result(
+            task_id,
+            board=board.slug,
+            result=SimpleNamespace(
+                backend="codex",
+                final_text=json.dumps(
+                    {
+                        "status": "approved",
+                        "summary": "Stale reviewer approval.",
+                        "findings": [],
+                        "new_tasks": [],
+                    }
+                ),
+                error=None,
+            ),
+        )
+        write_codex_worker_state(task_id, board=board.slug, update={"updated_at": int(time.time()) - 60})
+
+        result = kanban_db.dispatch_once(conn, board=board.slug, max_spawn=0)
+        task = kanban_db.get_task(conn, task_id)
+        runs = kanban_db.list_runs(conn, task_id)
+    finally:
+        conn.close()
+
+    assert result.crashed == []
+    assert task is not None
+    assert task.status == "blocked"
+    assert runs[-1].outcome == "crashed"
+
+
 def test_opencode_adaptive_dev_reasoning_does_not_override_raw_config(monkeypatch):
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli import config as config_mod
