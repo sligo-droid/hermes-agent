@@ -129,6 +129,220 @@ def test_board_metadata_non_utf8_bytes_fall_back_to_synthesized_metadata(kanban_
     assert any(row["slug"] == board for row in kb.list_boards(include_archived=True))
 
 
+def _inject_invalid_utf8_task_field(conn: sqlite3.Connection, task_id: str, field: str) -> None:
+    conn.execute(
+        f"UPDATE tasks SET {field} = CAST(x'ff' AS TEXT) WHERE id = ?",
+        (task_id,),
+    )
+
+
+class _PostInitDatabaseErrorConnection:
+    """Proxy a real initialized connection, failing only selected reads."""
+
+    def __init__(self, conn: sqlite3.Connection, fail_on: str):
+        self._conn = conn
+        self._fail_on = fail_on
+        self.failures = 0
+
+    def execute(self, sql, *args, **kwargs):
+        if self._fail_on in str(sql):
+            self.failures += 1
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _assert_post_init_database_error_quarantine(
+    monkeypatch,
+    board: str,
+    exc: kb.KanbanDbCorruptError,
+    *,
+    context: str,
+    integrity_paths: list[Path],
+) -> dict:
+    incident = kb.is_board_paused_for_corruption(board)
+    assert incident is not None
+    assert incident == exc.incident
+    assert incident["pause_reason"] == "kanban_db_corruption"
+    assert incident["fingerprint"]
+    assert incident["quarantine_path"]
+    assert "database disk image is malformed" in incident["reason"]
+    assert f"post-init task-row read corruption in {context}" in incident["reason"]
+    assert "integrity_check=ok" in incident["reason"]
+    assert integrity_paths == [kb.kanban_db_path(board).resolve()]
+    meta = kb.read_board_metadata(board)
+    assert meta["paused"] is True
+    assert meta["pause_reason"] == "kanban_db_corruption"
+    assert meta["corruption_incident"] == incident
+    return incident
+
+
+def test_list_tasks_quarantines_post_init_database_error(monkeypatch, kanban_home):
+    board = "db-error-list-board"
+    integrity_paths: list[Path] = []
+    monkeypatch.setattr(
+        kb,
+        "_integrity_check_db",
+        lambda path: integrity_paths.append(path.resolve()) or "ok",
+    )
+
+    with kb.connect(board=board) as real_conn:
+        kb.create_task(real_conn, title="post init malformed", assignee="alice")
+        conn = _PostInitDatabaseErrorConnection(real_conn, "SELECT * FROM tasks WHERE")
+        with pytest.raises(kb.KanbanDbCorruptError) as exc_info:
+            kb.list_tasks(conn)
+
+    incident = _assert_post_init_database_error_quarantine(
+        monkeypatch,
+        board,
+        exc_info.value,
+        context="list_tasks",
+        integrity_paths=integrity_paths,
+    )
+
+    with kb.connect(board=board) as real_conn:
+        conn = _PostInitDatabaseErrorConnection(real_conn, "SELECT * FROM tasks WHERE")
+        with pytest.raises(kb.KanbanDbCorruptError) as repeat:
+            kb.list_tasks(conn)
+    assert repeat.value.incident == incident
+    assert conn.failures == 0
+    assert integrity_paths == [kb.kanban_db_path(board).resolve()]
+
+
+def test_get_task_quarantines_post_init_database_error(monkeypatch, kanban_home):
+    board = "db-error-get-board"
+    integrity_paths: list[Path] = []
+    monkeypatch.setattr(
+        kb,
+        "_integrity_check_db",
+        lambda path: integrity_paths.append(path.resolve()) or "ok",
+    )
+
+    with kb.connect(board=board) as real_conn:
+        task_id = kb.create_task(real_conn, title="post init malformed", assignee="alice")
+        conn = _PostInitDatabaseErrorConnection(real_conn, "SELECT * FROM tasks WHERE id = ?")
+        with pytest.raises(kb.KanbanDbCorruptError) as exc_info:
+            kb.get_task(conn, task_id)
+
+    incident = _assert_post_init_database_error_quarantine(
+        monkeypatch,
+        board,
+        exc_info.value,
+        context="get_task",
+        integrity_paths=integrity_paths,
+    )
+
+    with kb.connect(board=board) as real_conn:
+        conn = _PostInitDatabaseErrorConnection(real_conn, "SELECT * FROM tasks WHERE id = ?")
+        with pytest.raises(kb.KanbanDbCorruptError) as repeat:
+            kb.get_task(conn, task_id)
+    assert repeat.value.incident == incident
+    assert conn.failures == 0
+    assert integrity_paths == [kb.kanban_db_path(board).resolve()]
+
+
+def test_dispatch_once_quarantines_post_init_database_error(
+    monkeypatch, kanban_home, all_assignees_spawnable,
+):
+    board = "db-error-dispatch-board"
+    spawns = []
+    integrity_paths: list[Path] = []
+    monkeypatch.setattr(
+        kb,
+        "_integrity_check_db",
+        lambda path: integrity_paths.append(path.resolve()) or "ok",
+    )
+
+    with kb.connect(board=board) as real_conn:
+        kb.create_task(real_conn, title="post init malformed", assignee="alice")
+        conn = _PostInitDatabaseErrorConnection(real_conn, "WHERE status = 'ready'")
+        with pytest.raises(kb.KanbanDbCorruptError) as exc_info:
+            kb.dispatch_once(conn, board=board, spawn_fn=lambda task, workspace: spawns.append(task.id))
+
+    assert spawns == []
+    incident = _assert_post_init_database_error_quarantine(
+        monkeypatch,
+        board,
+        exc_info.value,
+        context="dispatch_once.ready_rows",
+        integrity_paths=integrity_paths,
+    )
+
+    with kb.connect(board=board) as real_conn:
+        conn = _PostInitDatabaseErrorConnection(real_conn, "WHERE status = 'ready'")
+        with pytest.raises(kb.KanbanDbCorruptError) as repeat:
+            kb.dispatch_once(conn, board=board, spawn_fn=lambda task, workspace: spawns.append(task.id))
+    assert repeat.value.incident == incident
+    assert conn.failures == 0
+    assert spawns == []
+    assert integrity_paths == [kb.kanban_db_path(board).resolve()]
+
+
+def test_list_tasks_quarantines_post_init_invalid_utf8_body(kanban_home):
+    board = "utf8-body-board"
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(conn, title="bad body", assignee="alice")
+        _inject_invalid_utf8_task_field(conn, task_id, "body")
+
+        with pytest.raises(kb.KanbanDbCorruptError) as exc_info:
+            kb.list_tasks(conn)
+
+    incident = kb.is_board_paused_for_corruption(board)
+    assert incident is not None
+    assert incident["fingerprint"] == exc_info.value.incident["fingerprint"]
+    assert incident["quarantine_path"]
+    assert "post-init task-row read corruption in list_tasks" in incident["reason"]
+    assert "integrity_check=" in incident["reason"]
+
+    with kb.connect(board=board) as conn:
+        with pytest.raises(kb.KanbanDbCorruptError) as repeat:
+            kb.list_tasks(conn)
+    assert repeat.value.incident == incident
+
+
+def test_get_task_quarantines_post_init_invalid_utf8_status(kanban_home):
+    board = "utf8-status-board"
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(conn, title="bad status", assignee="alice")
+        _inject_invalid_utf8_task_field(conn, task_id, "status")
+
+        with pytest.raises(kb.KanbanDbCorruptError) as exc_info:
+            kb.get_task(conn, task_id)
+
+    incident = kb.is_board_paused_for_corruption(board)
+    assert incident is not None
+    assert incident == exc_info.value.incident
+    assert "post-init task-row read corruption in get_task" in incident["reason"]
+    assert incident["quarantine_path"]
+
+
+def test_dispatch_once_quarantines_post_init_invalid_utf8_ready_row(
+    kanban_home, all_assignees_spawnable,
+):
+    board = "utf8-dispatch-board"
+    spawns = []
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(conn, title="bad dispatch", assignee="alice")
+        _inject_invalid_utf8_task_field(conn, task_id, "assignee")
+
+        with pytest.raises(kb.KanbanDbCorruptError) as exc_info:
+            kb.dispatch_once(conn, board=board, spawn_fn=lambda task, workspace: spawns.append(task.id))
+
+    assert spawns == []
+    incident = kb.is_board_paused_for_corruption(board)
+    assert incident is not None
+    assert incident == exc_info.value.incident
+    assert "post-init task-row read corruption in dispatch_once.ready_rows" in incident["reason"]
+
+    with kb.connect(board=board) as conn:
+        with pytest.raises(kb.KanbanDbCorruptError) as repeat:
+            kb.dispatch_once(conn, board=board, spawn_fn=lambda task, workspace: spawns.append(task.id))
+    assert repeat.value.incident == incident
+    assert spawns == []
+
+
 def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     """Legacy DBs missing additive indexed columns must migrate cleanly.
 
@@ -4258,6 +4472,49 @@ def test_corrupt_board_incident_records_pause_and_reuses_quarantine(kanban_home)
     meta = kb.read_board_metadata(board)
     assert meta["paused"] is True
     assert meta["pause_reason"] == "kanban_db_corruption"
+
+
+def test_active_discord_corrupt_board_incident_includes_one_time_recovery_note(kanban_home):
+    board = "discord-1513050159653589093"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    original = _write_corrupt_db(db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+        kb.connect(board=board)
+
+    incident = kb.is_board_paused_for_corruption(board)
+    assert incident is not None
+    assert incident == excinfo.value.incident
+    assert incident["fingerprint"] == kb._db_content_fingerprint(db_path)
+    assert incident["repair_command"] == f"hermes kanban repair --board {board}"
+    assert f"One-time recovery for active Discord worker board {board}" in incident["recovery_note"]
+    assert f"hermes kanban repair --board {board}" in incident["recovery_note"]
+    assert "known-good backup" in incident["recovery_note"]
+    assert "quarantine_path" in incident["recovery_note"]
+    assert db_path.read_bytes() == original
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with pytest.raises(kb.KanbanDbCorruptError) as repeat:
+        kb.connect(board=board)
+    assert repeat.value.incident == incident
+
+
+def test_other_corrupt_board_incident_does_not_get_active_recovery_note(kanban_home):
+    board = "some-other-corrupt-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    _write_corrupt_db(db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    with pytest.raises(kb.KanbanDbCorruptError):
+        kb.connect(board=board)
+
+    incident = kb.is_board_paused_for_corruption(board)
+    assert incident is not None
+    assert "recovery_note" not in incident
+    assert "repair_command" not in incident
 
 
 def test_invalid_header_board_incident_records_pause_and_reuses_quarantine(kanban_home):

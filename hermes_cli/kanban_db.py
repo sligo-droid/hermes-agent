@@ -189,6 +189,7 @@ _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
 # ---------------------------------------------------------------------------
 
 DEFAULT_BOARD = "default"
+_ACTIVE_CORRUPT_DISCORD_BOARD_RECOVERY = "discord-1513050159653589093"
 
 # Slug validator: lowercase alphanumerics, digits, hyphens; 1–64 chars.
 # Strict enough to stop traversal (`..`) and embedded path separators, loose
@@ -1534,6 +1535,15 @@ def record_corrupt_board_incident(
         "first_seen": first_seen,
         "last_seen": now,
     }
+    if slug == _ACTIVE_CORRUPT_DISCORD_BOARD_RECOVERY:
+        incident["recovery_note"] = (
+            "One-time recovery for active Discord worker board "
+            f"{slug}: restore a known-good backup if available or run "
+            f"`hermes kanban repair --board {slug}`. Evidence is preserved in "
+            "quarantine_path; dispatcher/notifier retries remain suppressed "
+            "while this DB fingerprint is unchanged."
+        )
+        incident["repair_command"] = f"hermes kanban repair --board {slug}"
     meta["paused"] = True
     meta["pause_reason"] = "kanban_db_corruption"
     meta["corruption_incident"] = incident
@@ -1605,6 +1615,86 @@ def _raise_corrupt_existing_db(
         fingerprint=fingerprint,
     )
     raise KanbanDbCorruptError(resolved, backup, reason, incident=incident)
+
+
+def _is_task_row_decode_corruption(exc: Exception) -> bool:
+    """Conservatively classify post-open task-row read corruption."""
+    if isinstance(exc, sqlite3.OperationalError):
+        msg = str(exc).lower()
+        return "could not decode to utf-8" in msg
+    if isinstance(exc, sqlite3.DatabaseError):
+        msg = str(exc).lower()
+        return (
+            "database disk image is malformed" in msg
+            or "malformed database" in msg
+            or "file is not a database" in msg
+        )
+    return False
+
+
+def _connection_db_path(conn: sqlite3.Connection) -> Path:
+    db_name = conn.execute("PRAGMA database_list").fetchone()[2]
+    db_path = Path(str(db_name))
+    try:
+        return db_path.resolve()
+    except OSError:
+        return db_path
+
+
+def _raise_if_paused_for_unchanged_corruption(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> None:
+    resolved = _connection_db_path(conn)
+    slug = _board_for_db_path(resolved, board)
+    if not slug:
+        return
+    incident = is_board_paused_for_corruption(slug)
+    if not incident:
+        return
+    try:
+        current_fingerprint = _db_content_fingerprint(resolved)
+    except Exception:
+        current_fingerprint = None
+    if incident.get("fingerprint") != current_fingerprint:
+        return
+    backup_path = (
+        Path(str(incident["quarantine_path"]))
+        if incident.get("quarantine_path") else None
+    )
+    reason = str(incident.get("reason") or "kanban DB corruption incident")
+    raise KanbanDbCorruptError(resolved, backup_path, reason, incident=incident)
+
+
+def _quarantine_task_row_read_corruption(
+    conn: sqlite3.Connection,
+    exc: Exception,
+    *,
+    board: Optional[str] = None,
+    context: str,
+) -> None:
+    if not _is_task_row_decode_corruption(exc):
+        raise exc
+    resolved = _connection_db_path(conn)
+    fingerprint = _db_content_fingerprint(resolved)
+    backup = _backup_corrupt_db(resolved, fingerprint=fingerprint)
+    try:
+        integrity = _integrity_check_db(resolved)
+    except Exception as integrity_exc:
+        integrity = f"integrity_check failed: {integrity_exc}"
+    reason = (
+        f"post-init task-row read corruption in {context}: {exc}; "
+        f"integrity_check={integrity}"
+    )
+    incident = record_corrupt_board_incident(
+        board,
+        resolved,
+        reason,
+        backup_path=backup,
+        fingerprint=fingerprint,
+    )
+    raise KanbanDbCorruptError(resolved, backup, reason, incident=incident) from exc
 
 
 def _is_index_only_integrity_failure(message: str) -> bool:
@@ -2884,8 +2974,12 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
-    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    return Task.from_row(row) if row else None
+    _raise_if_paused_for_unchanged_corruption(conn)
+    try:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return Task.from_row(row) if row else None
+    except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
+        _quarantine_task_row_read_corruption(conn, exc, context="get_task")
 
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
@@ -2915,6 +3009,7 @@ def list_tasks(
     workflow_template_id: Optional[str] = None,
     current_step_key: Optional[str] = None,
 ) -> list[Task]:
+    _raise_if_paused_for_unchanged_corruption(conn)
     query = "SELECT * FROM tasks WHERE 1=1"
     params: list[Any] = []
     if assignee is not None:
@@ -2950,8 +3045,11 @@ def list_tasks(
         query += " ORDER BY priority DESC, created_at ASC"
     if limit:
         query += f" LIMIT {int(limit)}"
-    rows = conn.execute(query, params).fetchall()
-    return [Task.from_row(r) for r in rows]
+    try:
+        rows = conn.execute(query, params).fetchall()
+        return [Task.from_row(r) for r in rows]
+    except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
+        _quarantine_task_row_read_corruption(conn, exc, context="list_tasks")
 
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
@@ -6907,6 +7005,11 @@ def dispatch_once(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
+    def _quarantine_dispatch_read(exc: Exception, context: str) -> None:
+        _quarantine_task_row_read_corruption(conn, exc, board=board, context=context)
+
+    _raise_if_paused_for_unchanged_corruption(conn, board=board)
+
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
@@ -6919,11 +7022,17 @@ def dispatch_once(
             recover_recorded_role_outputs_for_running_tasks(conn, board=board)
         except Exception:
             pass
-    result.reclaimed = release_stale_claims(conn)
-    result.stale = detect_stale_running(
-        conn, stale_timeout_seconds=stale_timeout_seconds,
-    )
-    result.crashed = detect_crashed_workers(conn)
+    try:
+        result.reclaimed = release_stale_claims(conn)
+    except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
+        _quarantine_dispatch_read(exc, "dispatch_once.release_stale_claims")
+    try:
+        result.stale = detect_stale_running(
+            conn, stale_timeout_seconds=stale_timeout_seconds,
+        )
+        result.crashed = detect_crashed_workers(conn)
+    except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
+        _quarantine_dispatch_read(exc, "dispatch_once.prep")
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -6932,8 +7041,11 @@ def dispatch_once(
     )
     if _crash_auto_blocked:
         result.auto_blocked.extend(_crash_auto_blocked)
-    result.timed_out = enforce_max_runtime(conn)
-    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    try:
+        result.timed_out = enforce_max_runtime(conn)
+        result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
+        _quarantine_dispatch_read(exc, "dispatch_once.ready_prep")
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -6944,30 +7056,39 @@ def dispatch_once(
     # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
     running_count = 0
     if max_spawn is not None:
-        running_count = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-            ).fetchone()[0]
-        )
+        try:
+            running_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                ).fetchone()[0]
+            )
+        except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
+            _quarantine_dispatch_read(exc, "dispatch_once.running_count")
 
     additional_spawnable = {
         str(a).strip().lower()
         for a in (additional_spawnable_assignees or ())
         if str(a).strip()
     }
-    ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
+    try:
+        ready_rows = conn.execute(
+            "SELECT id, assignee FROM tasks "
+            "WHERE status = 'ready' AND claim_lock IS NULL "
+            "ORDER BY priority DESC, created_at ASC"
+        ).fetchall()
+    except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
+        _quarantine_dispatch_read(exc, "dispatch_once.ready_rows")
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks
     # pile up and time out.
     if max_in_progress is not None and ready_rows:
-        in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-        ).fetchone()[0]
+        try:
+            in_progress = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+            ).fetchone()[0]
+        except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
+            _quarantine_dispatch_read(exc, "dispatch_once.in_progress_count")
         if in_progress >= max_in_progress:
             return result
         # Only spawn enough to reach the cap, respecting max_spawn too.
@@ -6989,12 +7110,15 @@ def dispatch_once(
     ) else None
     _per_profile_running: dict[str, int] = {}
     if _per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            _per_profile_running[prow["assignee"]] = int(prow["n"])
+        try:
+            for prow in conn.execute(
+                "SELECT assignee, COUNT(*) AS n FROM tasks "
+                "WHERE status = 'running' AND assignee IS NOT NULL "
+                "GROUP BY assignee"
+            ):
+                _per_profile_running[prow["assignee"]] = int(prow["n"])
+        except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
+            _quarantine_dispatch_read(exc, "dispatch_once.profile_counts")
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -7204,11 +7328,14 @@ def dispatch_once(
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
-    review_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'review' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
+    try:
+        review_rows = conn.execute(
+            "SELECT id, assignee FROM tasks "
+            "WHERE status = 'review' AND claim_lock IS NULL "
+            "ORDER BY priority DESC, created_at ASC"
+        ).fetchall()
+    except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
+        _quarantine_dispatch_read(exc, "dispatch_once.review_rows")
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
