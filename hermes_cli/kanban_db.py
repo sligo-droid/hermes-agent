@@ -190,6 +190,8 @@ _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
 
 DEFAULT_BOARD = "default"
 _ACTIVE_CORRUPT_DISCORD_BOARD_RECOVERY = "discord-1513050159653589093"
+_TRANSIENT_DISK_IO_ATTEMPTS = 3
+_TRANSIENT_DISK_IO_BACKOFF_SECONDS = (0.05, 0.15)
 
 # Slug validator: lowercase alphanumerics, digits, hyphens; 1–64 chars.
 # Strict enough to stop traversal (`..`) and embedded path separators, loose
@@ -1641,6 +1643,113 @@ def _connection_db_path(conn: sqlite3.Connection) -> Path:
         return db_path
 
 
+def _is_transient_disk_io_error(exc: Exception) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "disk i/o error" in str(exc).lower()
+
+
+def _connection_board_slug(conn: sqlite3.Connection, board: Optional[str] = None) -> Optional[str]:
+    try:
+        return _board_for_db_path(_connection_db_path(conn), board)
+    except Exception:
+        if board is not None:
+            try:
+                return _normalize_board_slug(board) or DEFAULT_BOARD
+            except Exception:
+                return str(board)
+        return None
+
+
+def _env_expected_run_id() -> Optional[int]:
+    raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _run_transient_disk_io_retry(
+    operation,
+    *,
+    conn: sqlite3.Connection,
+    task_id: Optional[str],
+    operation_name: str,
+    board: Optional[str] = None,
+    run_id: Optional[int] = None,
+    attempts: int = _TRANSIENT_DISK_IO_ATTEMPTS,
+    success_probe=None,
+):
+    """Retry one narrow class of transient SQLite EIO failures.
+
+    This is intentionally not a general SQLite retry policy. It is used at the
+    Kanban worker completion/recovery boundary where retrying a rolled-back
+    transaction or immediate read preserves worker handoff data without hiding
+    corruption or persistent storage failures.
+    """
+    board_slug = _connection_board_slug(conn, board)
+    effective_run_id = run_id if run_id is not None else _env_expected_run_id()
+    max_attempts = max(1, int(attempts))
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = operation()
+        except sqlite3.OperationalError as exc:
+            if not _is_transient_disk_io_error(exc):
+                raise
+            final = attempt >= max_attempts
+            if success_probe is not None:
+                try:
+                    probed = success_probe()
+                except Exception:
+                    probed = None
+                if probed is not None:
+                    _log.info(
+                        "kanban sqlite transient disk I/O retry resolved by durable state probe: "
+                        "board=%s task_id=%s run_id=%s operation=%s attempt=%s/%s "
+                        "outcome=already_applied error=%s",
+                        board_slug or "unknown",
+                        task_id or "unknown",
+                        effective_run_id if effective_run_id is not None else "unknown",
+                        operation_name,
+                        attempt,
+                        max_attempts,
+                        exc,
+                    )
+                    return probed
+            _log.warning(
+                "kanban sqlite transient disk I/O error: board=%s task_id=%s run_id=%s "
+                "operation=%s attempt=%s/%s outcome=%s error=%s",
+                board_slug or "unknown",
+                task_id or "unknown",
+                effective_run_id if effective_run_id is not None else "unknown",
+                operation_name,
+                attempt,
+                max_attempts,
+                "final_failure" if final else "retrying",
+                exc,
+            )
+            if final:
+                raise
+            backoff_index = min(
+                attempt - 1,
+                len(_TRANSIENT_DISK_IO_BACKOFF_SECONDS) - 1,
+            )
+            time.sleep(_TRANSIENT_DISK_IO_BACKOFF_SECONDS[backoff_index])
+            continue
+        if attempt > 1:
+            _log.info(
+                "kanban sqlite transient disk I/O retry succeeded: board=%s task_id=%s run_id=%s "
+                "operation=%s attempt=%s/%s outcome=success",
+                board_slug or "unknown",
+                task_id or "unknown",
+                effective_run_id if effective_run_id is not None else "unknown",
+                operation_name,
+                attempt,
+                max_attempts,
+            )
+        return result
+
+
 def _raise_if_paused_for_unchanged_corruption(
     conn: sqlite3.Connection,
     *,
@@ -2980,6 +3089,24 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
         return Task.from_row(row) if row else None
     except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
         _quarantine_task_row_read_corruption(conn, exc, context="get_task")
+
+
+def get_task_with_transient_retry(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+    operation_name: str = "get_task",
+    run_id: Optional[int] = None,
+) -> Optional[Task]:
+    return _run_transient_disk_io_retry(
+        lambda: get_task(conn, task_id),
+        conn=conn,
+        task_id=task_id,
+        operation_name=operation_name,
+        board=board,
+        run_id=run_id,
+    )
 
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
@@ -4485,6 +4612,38 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    return _run_transient_disk_io_retry(
+        lambda: _complete_task_once(
+            conn,
+            task_id,
+            result=result,
+            summary=summary,
+            metadata=metadata,
+            created_cards=created_cards,
+            expected_run_id=expected_run_id,
+        ),
+        conn=conn,
+        task_id=task_id,
+        operation_name="complete_task",
+        run_id=expected_run_id,
+        success_probe=lambda: _complete_task_success_probe(
+            conn,
+            task_id,
+            expected_run_id=expected_run_id,
+        ),
+    )
+
+
+def _complete_task_once(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    created_cards: Optional[Iterable[str]] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
     now = int(time.time())
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
@@ -4629,6 +4788,34 @@ def complete_task(
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     return True
+
+
+def _complete_task_success_probe(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int] = None,
+) -> Optional[bool]:
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["status"] != "done":
+        return None
+    if expected_run_id is not None and row["current_run_id"] is not None:
+        return None
+    if expected_run_id is None:
+        run = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'completed' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    else:
+        run = conn.execute(
+            "SELECT 1 FROM task_runs WHERE id = ? AND task_id = ? "
+            "AND outcome = 'completed' AND ended_at IS NOT NULL",
+            (int(expected_run_id), task_id),
+        ).fetchone()
+    return True if run is not None else None
 
 
 # ---------------------------------------------------------------------------
