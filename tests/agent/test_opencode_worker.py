@@ -5,6 +5,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -222,6 +223,66 @@ def test_hermes_codex_model_inlines_worker_brief(monkeypatch, tmp_path):
     }
     assert seen_payload["mcp"] == {}
     assert not (workspace / ".hermes-opencode").exists()
+
+
+def test_opencode_jsonc_user_config_allows_comments_and_trailing_commas(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    config_dir = home / ".config" / "opencode"
+    config_dir.mkdir(parents=True)
+    (config_dir / "opencode.jsonc").write_text(
+        """
+        {
+          // normal JSONC line comment
+          "provider": {
+            "hermes-codex": {
+              "npm": "@ai-sdk/openai-compatible",
+              "options": {
+                "baseURL": "http://127.0.0.1:9999/v1", // trailing field comment
+              },
+              "models": {
+                "gpt-5.5": {},
+              },
+            },
+          },
+          /* block comments are accepted in opencode.jsonc */
+          "model": "hermes-codex/gpt-5.5",
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+
+    assert ow._opencode_provider_config_for_model("hermes-codex/gpt-5.5") == {
+        "npm": "@ai-sdk/openai-compatible",
+        "options": {"baseURL": "http://127.0.0.1:9999/v1"},
+        "models": {"gpt-5.5": {}},
+    }
+
+
+def test_invalid_opencode_json_warns_with_path_and_json_remains_strict(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    config_dir = home / ".config" / "opencode"
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "opencode.json"
+    config_path.write_text(
+        '{"provider": {"hermes-codex": {"models": {"gpt-5.5": {},},},}}',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert ow._read_opencode_user_config() == {}
+
+    assert len(caught) == 1
+    assert caught[0].category is RuntimeWarning
+    message = str(caught[0].message)
+    assert str(config_path) in message
+    assert "Ignoring invalid OpenCode config" in message
 
 
 def test_isolated_config_can_be_disabled(monkeypatch, tmp_path):
