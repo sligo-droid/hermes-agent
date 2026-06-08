@@ -5672,6 +5672,21 @@ def _recover_blocked_approved_reviewer_finalizer(
     if _completed_approved_reviewer_task(conn, tasks) is None:
         return None
 
+    # A blocked board may have been recovered by a previously-created dev task.
+    # Do not trust the stored PR blocker blindly: it can still say DIRTY even
+    # after the worker branch was pushed clean. Refresh/finalize first, but only
+    # for recoverable finalizer failures. Non-recoverable failures such as PR
+    # creation errors intentionally remain inert.
+    from hermes_cli import kanban_codex_worker
+
+    if finalizer_failure_evidence:
+        if kanban_codex_worker._ensure_pr(board, str(worker.get("worktree_path") or "")):
+            _update_worker_meta(board, {"blocked_reason": "", "pr_blocker": "", "pr_error": None})
+            kanban_codex_worker._update_phase(board, "complete", goal_status="done")
+            return "approved_reviewer_finalized"
+        metadata = kanban_db.read_board_metadata(board)
+        worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or worker)
+
     blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "approved reviewer PR finalization failed").strip()
     if _pr_finalizer_failure_is_failed_checks(worker):
         _create_pr_checks_recovery_task(board, worker, conn)
