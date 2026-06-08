@@ -19,6 +19,7 @@ This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork
 | Open PRs | verified | `gh pr list --state open --limit 10` returned no rows after PR #320 merged. |
 | Repo-state transition | merged | PR #320 added `docs/project-state.md`, `docs/context.md`, and `docs/decisions/0001-repo-backed-project-state.md`; `AGENTS.md` now routes workers here. |
 | Command Center model | merged | `docs/sligo-command-center.md` records the Work Item / Source / Worker Run model, Hermes/PID project scoping, and current UX contract. The primary lanes are Overview, Inbox, Active, Completed, and Archive. Live runtime must still be smoked separately when code changes. |
+| Autonomous operations loop | planned | `docs/plans/2026-06-08-autonomous-operations-loop-goalplan.md` defines the complete Observe -> Diagnose -> Decide -> Execute -> Verify -> Learn loop, with Command Center as the canonical ledger and policy-gated autonomy boundaries. |
 | Skills boundary | in_progress | Installed default-profile pointers were patched for `hermes-agent`, `hermes-operations`, and `general-coding/references/operator-command-center-ui.md`; intention-setting material should keep moving into this repo state/doc set. |
 
 Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `merged`, `deployed`, `verified`, `superseded`.
@@ -40,6 +41,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 
 - **Skill-to-repo transition:** remove current-state and target-setting prose from installed Hermes skills over time. Leave short pointers from `hermes-agent`, `hermes-operations`, and related references to this file and `docs/context.md`.
 - **Command Center as operator ledger:** keep Hermes (`#dev`) and PID as project tabs over one Work Item / Source / Worker Run model. Do not reintroduce competing self-improvement/worker-board ledgers.
+- **Autonomous operations loop goalplan:** use `docs/plans/2026-06-08-autonomous-operations-loop-goalplan.md` as the durable completeness target for policy-gated Observe -> Diagnose -> Decide -> Execute -> Verify -> Learn autonomy.
 
 ## Current Command Center UX Intent
 
