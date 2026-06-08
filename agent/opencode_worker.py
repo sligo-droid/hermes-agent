@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import uuid
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -133,12 +134,92 @@ def _read_opencode_user_config() -> dict[str, Any]:
         if not path.is_file():
             continue
         try:
-            parsed = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
+            text = path.read_text(encoding="utf-8")
+            parsed = json.loads(_strip_jsonc(text) if path.suffix == ".jsonc" else text)
+        except (OSError, json.JSONDecodeError) as exc:
+            warnings.warn(
+                f"Ignoring invalid OpenCode config {path}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             continue
         if isinstance(parsed, dict):
             return parsed
+        warnings.warn(
+            f"Ignoring unsupported OpenCode config {path}: expected JSON object.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return {}
+
+
+def _strip_jsonc(text: str) -> str:
+    """Strip JSONC comments and trailing commas without touching strings."""
+    out: list[str] = []
+    in_string = False
+    escape = False
+
+    def next_significant_index(index: int) -> int:
+        while index < len(text):
+            char = text[index]
+            nxt = text[index + 1] if index + 1 < len(text) else ""
+            if char.isspace():
+                index += 1
+                continue
+            if char == "/" and nxt == "/":
+                index += 2
+                while index < len(text) and text[index] not in "\r\n":
+                    index += 1
+                continue
+            if char == "/" and nxt == "*":
+                index += 2
+                while index + 1 < len(text) and not (
+                    text[index] == "*" and text[index + 1] == "/"
+                ):
+                    index += 1
+                index = min(index + 2, len(text))
+                continue
+            break
+        return index
+
+    i = 0
+    while i < len(text):
+        char = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if in_string:
+            out.append(char)
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            i += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            i += 1
+            continue
+        if char == "/" and nxt == "/":
+            i += 2
+            while i < len(text) and text[i] not in "\r\n":
+                i += 1
+            continue
+        if char == "/" and nxt == "*":
+            i += 2
+            while i + 1 < len(text) and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i = min(i + 2, len(text))
+            continue
+        if char == "," and next_significant_index(i + 1) < len(text):
+            if text[next_significant_index(i + 1)] in "}]":
+                i += 1
+                continue
+        out.append(char)
+        i += 1
+
+    return "".join(out)
 
 
 def _opencode_provider_config_for_model(model: Any) -> dict[str, Any]:
