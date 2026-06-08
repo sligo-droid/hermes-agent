@@ -11,6 +11,7 @@ import pytest
 
 from agent.auxiliary_client import (
     get_text_auxiliary_client,
+    get_async_text_auxiliary_client,
     get_available_vision_backends,
     resolve_vision_provider_client,
     resolve_provider_client,
@@ -1534,10 +1535,120 @@ class TestAuxiliaryFallbackLayering:
         assert resolve_calls[1][2]["explicit_base_url"] == ""
         assert resolve_calls[1][2]["explicit_api_key"] == ""
 
+    def test_compression_anthropic_unavailable_falls_back_to_codex_mini_resolution(self):
+        """Redaction-safe smoke: unavailable Anthropic resolves to configured Codex mini."""
+        chain_client = MagicMock()
+        resolve_calls = []
+
+        def fake_resolve(provider, model="", **kwargs):
+            resolve_calls.append((provider, model, kwargs))
+            if provider == "anthropic":
+                return None, None
+            if provider == "openai-codex":
+                return chain_client, model
+            return None, None
+
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("anthropic", "claude-sonnet-4-6", None, None, None)), \
+             patch("agent.auxiliary_client._get_auxiliary_task_config",
+                   return_value={"fallback_chain": [
+                       {"provider": "openai-codex", "model": "gpt-5.4-mini"},
+                   ]}), \
+             patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve):
+            client, model = get_text_auxiliary_client("compression")
+
+        assert client is chain_client
+        assert model == "gpt-5.4-mini"
+        assert resolve_calls == [
+            ("anthropic", "claude-sonnet-4-6", resolve_calls[0][2]),
+            ("openai-codex", "gpt-5.4-mini", resolve_calls[1][2]),
+        ]
+        assert resolve_calls[1][2]["explicit_base_url"] == ""
+        assert resolve_calls[1][2]["explicit_api_key"] == ""
+
+    def test_call_llm_compression_anthropic_unavailable_calls_codex_mini_fallback(self):
+        """call_llm() should honor fallback_chain when explicit primary has no client."""
+        chain_client = MagicMock()
+        chain_client.base_url = "https://chatgpt.com/backend-api/codex"
+        chain_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from configured chain"))
+        ])
+        resolve_calls = []
+
+        def fake_resolve(provider, model="", *args, **kwargs):
+            resolve_calls.append((provider, model, args, kwargs))
+            if provider == "anthropic":
+                return None, None
+            if provider == "openai-codex":
+                return chain_client, model
+            return None, None
+
+        with patch("agent.auxiliary_client._client_cache", {}), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("anthropic", "claude-sonnet-4-6", None, None, None)), \
+             patch("agent.auxiliary_client._get_auxiliary_task_config",
+                   return_value={"fallback_chain": [
+                       {"provider": "openai-codex", "model": "gpt-5.4-mini"},
+                   ]}), \
+             patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from configured chain"
+        chain_client.chat.completions.create.assert_called_once()
+        assert chain_client.chat.completions.create.call_args.kwargs["model"] == "gpt-5.4-mini"
+        assert [(call[0], call[1]) for call in resolve_calls] == [
+            ("anthropic", "claude-sonnet-4-6"),
+            ("openai-codex", "gpt-5.4-mini"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_async_call_llm_compression_anthropic_unavailable_calls_codex_mini_fallback(self):
+        """async_call_llm() should mirror no-client fallback_chain behavior."""
+        chain_client = MagicMock()
+        chain_client.base_url = "https://chatgpt.com/backend-api/codex"
+        async_chain_client = MagicMock()
+        async_chain_client.base_url = "https://chatgpt.com/backend-api/codex"
+        async_chain_client.chat.completions.create = AsyncMock(return_value=MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from async configured chain"))
+        ]))
+        resolve_calls = []
+
+        def fake_resolve(provider, model="", *args, **kwargs):
+            resolve_calls.append((provider, model, args, kwargs))
+            if provider == "anthropic":
+                return None, None
+            if provider == "openai-codex":
+                return chain_client, model
+            return None, None
+
+        with patch("agent.auxiliary_client._client_cache", {}), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("anthropic", "claude-sonnet-4-6", None, None, None)), \
+             patch("agent.auxiliary_client._get_auxiliary_task_config",
+                   return_value={"fallback_chain": [
+                       {"provider": "openai-codex", "model": "gpt-5.4-mini"},
+                   ]}), \
+             patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve), \
+             patch("agent.auxiliary_client._to_async_client",
+                   return_value=(async_chain_client, "gpt-5.4-mini")):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from async configured chain"
+        assert async_chain_client.chat.completions.create.await_count == 1
+        assert async_chain_client.chat.completions.create.call_args.kwargs["model"] == "gpt-5.4-mini"
+        assert [(call[0], call[1]) for call in resolve_calls] == [
+            ("anthropic", "claude-sonnet-4-6"),
+            ("openai-codex", "gpt-5.4-mini"),
+        ]
+
     def test_explicit_provider_unavailable_async_converts_configured_chain(self):
         """Async text helper mirrors resolution-time configured fallback."""
-        from agent.auxiliary_client import get_async_text_auxiliary_client
-
         chain_client = MagicMock()
         async_chain_client = MagicMock()
 
