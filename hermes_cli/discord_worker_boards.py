@@ -2361,14 +2361,13 @@ def board_thread_state(board: str) -> str:
         tasks = kanban_db.list_tasks(conn, include_archived=False)
         if tasks:
             blocked_tasks = [task for task in tasks if task.status == "blocked"]
-            for task in blocked_tasks:
-                latest = kanban_db.latest_run(conn, task.id)
-                if (
-                    (latest and latest.outcome in {"spawn_failed", "crashed", "timed_out", "gave_up"})
-                    or (latest is None and task.last_failure_error)
-                ):
-                    return "errored"
             if blocked_tasks:
+                # The public Discord marker should reflect the current board
+                # state, not the run outcome that explained how it got there.
+                # A crashed/timed-out role worker parks the ticket in Kanban's
+                # blocked lane for operator attention; leaving the source
+                # message on ⏳ hides that stall, while showing ❌ implies a
+                # terminal failure rather than a human-actionable blocker.
                 return "blocked"
             if is_terminal and all(task.status == "done" for task in tasks):
                 return "done"
@@ -3352,9 +3351,14 @@ def thread_status_targets() -> list[dict[str, Any]]:
                 reaction_state in {"done", "blocked", "errored"}
                 and reaction_state != _terminal_reaction_synced_state(worker)
             )
+        non_terminal_attention_state = (
+            not is_terminal_worker
+            and state in {"blocked", "errored"}
+        )
         if (
             visible_state not in {"active", "running"}
             and not source_state
+            and not non_terminal_attention_state
             and not (
                 is_terminal_worker
                 and state in {"done", "blocked", "errored"}
@@ -5451,6 +5455,60 @@ def clear_subgoals(board: str) -> int:
     return count
 
 
+def _completed_approved_reviewer_task(conn: Any, tasks: list[Any]) -> Optional[Any]:
+    completed_reviewers = [
+        task
+        for task in tasks
+        if str(getattr(task, "assignee", "") or "").strip().lower() == ROLE_REVIEWER
+        and str(getattr(task, "status", "") or "").strip().lower() == "done"
+    ]
+    for task in sorted(completed_reviewers, key=_task_sort_timestamp, reverse=True):
+        runs = kanban_db.list_runs(conn, str(task.id), include_active=False)
+        for run in reversed(runs):
+            metadata = run.metadata if isinstance(run.metadata, dict) else {}
+            raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
+            status = str(raw.get("status") or "").strip().lower()
+            if status == "approved":
+                return task
+            if metadata.get("filtered_pr_lifecycle_tasks") and not metadata.get("created_tasks"):
+                return task
+    return None
+
+
+def _recover_approved_reviewer_finalizer(board: str, worker: dict[str, Any], conn: Any, tasks: list[Any]) -> Optional[str]:
+    if str(worker.get("phase") or "").strip().lower() not in {"active", "reviewing", "review"}:
+        return None
+    if str(worker.get("goal_status") or "").strip().lower() != "active":
+        return None
+    if _completed_approved_reviewer_task(conn, tasks) is None:
+        return None
+
+    from hermes_cli import kanban_codex_worker
+
+    if kanban_codex_worker._ensure_pr(board, str(worker.get("worktree_path") or "")):
+        kanban_codex_worker._update_phase(board, "complete", goal_status="done")
+        return "approved_reviewer_finalized"
+
+    metadata = kanban_db.read_board_metadata(board)
+    refreshed = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    blocker = str(refreshed.get("pr_blocker") or refreshed.get("pr_error") or "approved reviewer PR finalization failed").strip()
+    refreshed.update(
+        {
+            "phase": "blocked",
+            "goal_status": "blocked",
+            "blocked_reason": "approved reviewer PR finalization failed",
+            "pr_blocker": blocker,
+            "terminal_reaction_sync_pending": True,
+            "terminal_summary_sync_pending": True,
+        }
+    )
+    if not str(refreshed.get("pr_error") or "").strip():
+        refreshed["pr_error"] = blocker
+    _update_worker_meta(board, refreshed)
+    persist_board_run_summary(board)
+    return "approved_reviewer_finalizer_blocked"
+
+
 def reconcile_board(board: str) -> Optional[str]:
     """Advance deterministic Discord worker board phases.
 
@@ -5478,6 +5536,10 @@ def reconcile_board(board: str) -> Optional[str]:
         if not tasks:
             _ensure_planner_task(board, worker)
             return "planner_created"
+
+        recovered = _recover_approved_reviewer_finalizer(board, worker, conn, tasks)
+        if recovered:
+            return recovered
 
         loops = int(worker.get("review_loop_count") or 0)
         loop_limit = _review_loop_limit_for_worker(worker)

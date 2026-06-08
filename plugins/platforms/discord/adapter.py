@@ -4067,17 +4067,184 @@ class DiscordAdapter(BasePlatformAdapter):
             lines.extend(self._kanban_completion_notice_link_lines(target, board_summary, existing_text=final_response))
             return "\n".join(lines)
 
-        outcome = str(target.get("outcome") or "").strip()
-        rendered_summary = self._kanban_completion_rendered_summary(board_summary)
-        lines = ["Completed."]
-        if outcome:
-            lines.extend(["", "Outcome:", outcome])
-        elif not rendered_summary:
-            lines.extend(["", "Kanban work completed."])
-        if rendered_summary:
-            lines.extend(["", "Board summary:", rendered_summary])
-        lines.extend(self._kanban_completion_notice_link_lines(target, board_summary, existing_text="\n".join(lines)))
+        return self._kanban_completion_fallback_content(target, board_summary)
+
+    def _kanban_completion_fallback_content(
+        self,
+        target: Dict[str, Any],
+        board_summary: Dict[str, Any],
+    ) -> str:
+        """Render a human-facing completion notice when no final response was captured."""
+        outcome = str(target.get("outcome") or board_summary.get("outcome") or "").strip()
+        lines = ["Completed.", "", "What changed:"]
+
+        changed = self._kanban_completion_changed_lines(outcome, board_summary)
+        if changed:
+            lines.extend(changed)
+        else:
+            title = str(board_summary.get("title") or target.get("title") or "Kanban work").strip()
+            lines.append(f"- {title} completed.")
+
+        verification = self._kanban_completion_verification_lines(board_summary)
+        if verification:
+            lines.extend(["", "Verification:", *verification])
+
+        shipped = self._kanban_completion_shipped_lines(target, board_summary)
+        if shipped:
+            lines.extend(["", "Shipped:", *shipped])
+
         return "\n".join(lines)
+
+    @classmethod
+    def _kanban_completion_changed_lines(
+        cls,
+        outcome: str,
+        board_summary: Dict[str, Any],
+    ) -> list[str]:
+        bullets: list[str] = []
+        for text in cls._kanban_completion_candidate_change_texts(outcome, board_summary):
+            cleaned = cls._kanban_completion_clean_bullet(text, max_chars=320)
+            if not cleaned:
+                continue
+            if cleaned.lower() in {item[2:].lower() for item in bullets if item.startswith("- ")}:
+                continue
+            bullets.append(f"- {cleaned}")
+            if len(bullets) >= 5:
+                break
+        return bullets
+
+    @classmethod
+    def _kanban_completion_candidate_change_texts(
+        cls,
+        outcome: str,
+        board_summary: Dict[str, Any],
+    ) -> list[str]:
+        candidates: list[str] = []
+        stripped_outcome = cls._kanban_completion_strip_status_prefix(outcome)
+
+        latest_tasks = board_summary.get("latest_tasks") if isinstance(board_summary, dict) else []
+        task_candidates: list[str] = []
+        if isinstance(latest_tasks, list):
+            # Prefer implementation/planning summaries before reviewer summaries; the review verdict
+            # gets its own line below when it is the only useful signal.
+            task_rows = [item for item in latest_tasks if isinstance(item, dict)]
+            task_rows.sort(
+                key=lambda item: (
+                    str(item.get("assignee") or "").strip().lower() == "reviewer",
+                    str(item.get("status") or "").strip().lower() != "done",
+                )
+            )
+            for item in task_rows:
+                summary = str(item.get("latest_summary") or "").strip()
+                if summary:
+                    task_candidates.append(summary)
+
+        if task_candidates:
+            candidates.extend(task_candidates)
+            if stripped_outcome and not cls._kanban_completion_status_only_change(stripped_outcome):
+                candidates.append(stripped_outcome)
+        elif stripped_outcome:
+            candidates.append(stripped_outcome)
+
+        review = board_summary.get("review") if isinstance(board_summary.get("review"), dict) else {}
+        verdict = review.get("final_verdict") if isinstance(review.get("final_verdict"), dict) else {}
+        verdict_summary = str(verdict.get("summary") or "").strip()
+        verdict_status = str(verdict.get("status") or "").strip()
+        if verdict_summary:
+            prefix = f"Review {verdict_status}: " if verdict_status and verdict_status != "unknown" else "Review: "
+            candidates.append(prefix + verdict_summary)
+        elif verdict_status and verdict_status != "unknown":
+            candidates.append(f"Review verdict: {verdict_status}.")
+
+        return candidates
+
+    @staticmethod
+    def _kanban_completion_strip_status_prefix(text: str) -> str:
+        cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+        cleaned = re.sub(
+            r"^(?:done|completed)\.\s*(?:tasks:\s*[^.]+\.\s*)?",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        cleaned = re.sub(r"^kanban work completed\.?:?\s*", "", cleaned, flags=re.IGNORECASE).strip()
+        return cleaned
+
+    @staticmethod
+    def _kanban_completion_status_only_change(text: str) -> bool:
+        lowered = str(text or "").strip().lower()
+        return bool(re.match(r"^(?:pr\b|checks?\b|deployment\b|merged\b|branch\b|worker\b)", lowered))
+
+    @staticmethod
+    def _kanban_completion_clean_bullet(text: str, *, max_chars: int = 320) -> str:
+        cleaned = str(text or "").strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = cleaned.lstrip("-• ").strip()
+        if not cleaned:
+            return ""
+        if len(cleaned) > max_chars:
+            cleaned = cleaned[: max_chars - 1].rstrip() + "…"
+        return cleaned
+
+    @classmethod
+    def _kanban_completion_verification_lines(cls, board_summary: Dict[str, Any]) -> list[str]:
+        lines: list[str] = []
+        commands = board_summary.get("verification_commands") if isinstance(board_summary.get("verification_commands"), list) else []
+        for item in commands[:5]:
+            if not isinstance(item, dict):
+                continue
+            command = cls._kanban_completion_clean_bullet(item.get("command"), max_chars=260)
+            if not command:
+                continue
+            result = cls._kanban_completion_clean_bullet(item.get("result") or "unknown", max_chars=80)
+            lines.append(f"- `{command}` → `{result}`")
+
+        pr = board_summary.get("pr") if isinstance(board_summary.get("pr"), dict) else {}
+        checks_status = str(pr.get("checks_status") or "").strip()
+        if checks_status and checks_status.lower() not in {"not checked", "unknown", "unchecked"}:
+            checks_total = pr.get("checks_total")
+            suffix = f" ({checks_total} checks)" if checks_total else ""
+            lines.append(f"- PR checks: `{checks_status}`{suffix}")
+
+        deployment_status = str(board_summary.get("deployment_status") or "").strip()
+        if deployment_status and deployment_status.lower() not in {"not checked", "unknown", "unchecked"}:
+            lines.append(f"- Deployment: `{deployment_status}`")
+        return lines
+
+    @staticmethod
+    def _kanban_completion_shipped_lines(
+        target: Dict[str, Any],
+        board_summary: Dict[str, Any],
+    ) -> list[str]:
+        lines: list[str] = []
+        pr = board_summary.get("pr") if isinstance(board_summary.get("pr"), dict) else {}
+        pr_url = str(target.get("pr_url") or pr.get("url") or "").strip()
+        merge_state = str(pr.get("merge_state") or "").strip().lower()
+        merge_commit = str(pr.get("merge_commit") or "").strip()
+        if pr_url:
+            lines.append(f"- PR: {pr_url}")
+        if merge_state == "merged" or merge_commit:
+            if merge_commit:
+                lines.append(f"- Merged: `{merge_commit[:12]}`")
+            else:
+                lines.append("- Merged: yes")
+        branch = str(target.get("branch") or board_summary.get("branch") or "").strip()
+        if branch:
+            lines.append(f"- Branch: `{branch}`")
+
+        task_counts = board_summary.get("task_counts") if isinstance(board_summary.get("task_counts"), dict) else {}
+        done = int(task_counts.get("done") or 0) if task_counts else 0
+        total = int(task_counts.get("total") or 0) if task_counts else 0
+        if done or total:
+            if total and total != done:
+                lines.append(f"- Worker tasks: `{done}/{total} done`")
+            else:
+                lines.append(f"- Worker tasks: `{done} done`")
+
+        public_url = str(target.get("public_url") or board_summary.get("public_url") or "").strip()
+        if public_url:
+            lines.append(f"- Worker: {public_url}")
+        return lines
 
     @staticmethod
     def _kanban_completion_final_response(board_summary: Dict[str, Any]) -> str:
@@ -4085,17 +4252,6 @@ class DiscordAdapter(BasePlatformAdapter):
         if not isinstance(final, dict):
             return ""
         return str(final.get("text") or "").strip()
-
-    @staticmethod
-    def _kanban_completion_rendered_summary(board_summary: Dict[str, Any]) -> str:
-        if not board_summary:
-            return ""
-        try:
-            from hermes_cli.discord_worker_boards import render_board_run_summary_text
-
-            return str(render_board_run_summary_text(board_summary) or "").strip()
-        except Exception:
-            return ""
 
     @staticmethod
     def _kanban_completion_notice_link_lines(

@@ -1395,13 +1395,13 @@ def test_discord_thread_status_targets_mark_foreman_generated_completion(tmp_pat
     assert target["terminal_completion_message_pending"] is True
 
 
-def test_discord_kanban_typing_watcher_skips_blocked_status_sync(tmp_path, monkeypatch):
+def test_discord_kanban_typing_watcher_syncs_non_terminal_blocked_status(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb
 
     board = dwb.set_goal(
         thread_id="99008",
-        goal="Do not touch blocked Discord thread",
+        goal="Sync blocked Discord thread",
         chat_id="parent-997",
     )
     conn = kb.connect(board=board.slug)
@@ -1411,21 +1411,32 @@ def test_discord_kanban_typing_watcher_skips_blocked_status_sync(tmp_path, monke
     finally:
         conn.close()
 
+    target = dwb.thread_status_targets()[0]
+    assert target["board"] == board.slug
+    assert target["state"] == "blocked"
+    assert target.get("reaction_state", target["state"]) == "blocked"
+
     adapter = DiscordStatusSyncAdapter()
     runner = _make_discord_runner(adapter)
 
     asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
 
-    assert adapter.synced == []
+    assert len(adapter.synced) == 2
+    assert adapter.synced[0]["board"] == board.slug
+    assert adapter.synced[0]["state"] == "blocked"
+    assert adapter.synced[0].get("reaction_state", adapter.synced[0]["state"]) == "blocked"
+    assert adapter.synced[1]["board"] == board.slug
+    assert adapter.synced[1]["state"] == "blocked"
+    assert adapter.synced[1].get("reaction_state", adapter.synced[1]["state"]) == "blocked"
 
 
-def test_discord_kanban_typing_watcher_skips_errored_status_sync(tmp_path, monkeypatch):
+def test_discord_kanban_typing_watcher_syncs_spawn_failure_as_blocked_status(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb
 
     board = dwb.set_goal(
         thread_id="99009",
-        goal="Do not touch errored Discord thread",
+        goal="Sync failed worker as blocked Discord thread",
         chat_id="parent-998",
     )
     conn = kb.connect(board=board.slug)
@@ -1443,12 +1454,25 @@ def test_discord_kanban_typing_watcher_skips_errored_status_sync(tmp_path, monke
     finally:
         conn.close()
 
+    assert dwb.board_thread_state(board.slug) == "blocked"
+    assert dwb.board_thread_reaction_state(board.slug) == "blocked"
+    target = dwb.thread_status_targets()[0]
+    assert target["board"] == board.slug
+    assert target["state"] == "blocked"
+    assert target.get("reaction_state", target["state"]) == "blocked"
+
     adapter = DiscordStatusSyncAdapter()
     runner = _make_discord_runner(adapter)
 
     asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
 
-    assert adapter.synced == []
+    assert len(adapter.synced) == 2
+    assert adapter.synced[0]["board"] == board.slug
+    assert adapter.synced[0]["state"] == "blocked"
+    assert adapter.synced[0].get("reaction_state", adapter.synced[0]["state"]) == "blocked"
+    assert adapter.synced[1]["board"] == board.slug
+    assert adapter.synced[1]["state"] == "blocked"
+    assert adapter.synced[1].get("reaction_state", adapter.synced[1]["state"]) == "blocked"
 
 
 def test_discord_worker_status_sync_is_inference_free(tmp_path, monkeypatch):

@@ -35,7 +35,7 @@ from hermes_cli.discord_worker_boards import (
     record_codex_worker_result,
 )
 
-_OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV}
+_OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER}
 _COMMAND_CENTER_REPAIR_CREATED_BY = "command-center-repair"
 _CODEX_AUTH_RETRY_LIMIT = 2
 _PR_GUARDED_ROLES = {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER}
@@ -185,6 +185,7 @@ def _recover_completed_role_output(
     *,
     board: Optional[str],
     workspace: str,
+    allow_blocked: bool = False,
 ) -> bool:
     """Apply an already-produced role JSON after cleanup/transient failures.
 
@@ -206,9 +207,11 @@ def _recover_completed_role_output(
         return False
     if task is None:
         return False
-    if task.status in {"done", "blocked", "scheduled", "archived"}:
+    if task.status in {"done", "scheduled", "archived"}:
         return True
-    if task.status not in {"running", "ready"}:
+    if task.status == "blocked" and not allow_blocked:
+        return True
+    if task.status not in {"running", "ready", "blocked"}:
         return False
     try:
         payload = _parse_json(final_text)
@@ -239,6 +242,7 @@ def _recover_completed_role_output_fresh(
     *,
     board: Optional[str],
     workspace: str,
+    allow_blocked: bool = False,
 ) -> bool:
     """Retry terminal-result recording through a new SQLite connection.
 
@@ -260,6 +264,7 @@ def _recover_completed_role_output_fresh(
             result,
             board=board,
             workspace=workspace,
+            allow_blocked=allow_blocked,
         )
     finally:
         try:
@@ -274,6 +279,7 @@ def _recover_recorded_role_output_fresh(
     *,
     board: Optional[str],
     workspace: str,
+    allow_blocked: bool = False,
 ) -> bool:
     """Recover a role result that was persisted before an exception escaped.
 
@@ -304,22 +310,50 @@ def _recover_recorded_role_output_fresh(
         SimpleNamespace(final_text=final_text, error=None),
         board=board,
         workspace=workspace,
+        allow_blocked=allow_blocked,
     )
 
 
+_DEAD_PID_FAILURE_RE = re.compile(r"\bpid\s+\d+\s+not\s+alive\b", re.IGNORECASE)
+
+
 def recover_recorded_role_outputs_for_running_tasks(conn: Any, *, board: Optional[str]) -> list[str]:
-    """Apply durable role results before dispatcher dead-PID crash accounting."""
+    """Apply durable role results before dispatcher dead-PID crash accounting.
+
+    Also revisits tasks that already tripped the dead-PID circuit breaker. Older
+    dispatchers could mark a role task blocked before noticing its recorded
+    result sidecar; if the sidecar belongs to the current run, recover it on the
+    next tick instead of leaving the board permanently stuck.
+    """
     rows = conn.execute(
-        "SELECT id, assignee, workspace_path FROM tasks "
-        "WHERE status = 'running' AND current_run_id IS NOT NULL"
+        "SELECT t.id, t.assignee, t.workspace_path, t.status, "
+        "       t.current_run_id, t.last_failure_error, "
+        "       r.error AS run_error "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE (t.status = 'running' AND t.current_run_id IS NOT NULL) "
+        "   OR (t.status = 'blocked' AND t.current_run_id IS NOT NULL)"
     ).fetchall()
     recovered: list[str] = []
     for row in rows:
         role = str(row["assignee"] or "").strip().lower()
         if role not in {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER, ROLE_FOREMAN}:
             continue
+        if row["status"] == "blocked":
+            failure_text = "\n".join(
+                str(value or "")
+                for value in (row["last_failure_error"], row["run_error"])
+            )
+            if not _DEAD_PID_FAILURE_RE.search(failure_text):
+                continue
         workspace = str(row["workspace_path"] or os.getcwd())
-        if _recover_recorded_role_output_fresh(row["id"], role, board=board, workspace=workspace):
+        if _recover_recorded_role_output_fresh(
+            row["id"],
+            role,
+            board=board,
+            workspace=workspace,
+            allow_blocked=row["status"] == "blocked",
+        ):
             recovered.append(row["id"])
     return recovered
 
@@ -342,9 +376,9 @@ def _recorded_result_is_fresh_for_current_run(
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             return False
-        if task.status in {"done", "blocked", "scheduled", "archived"}:
+        if task.status in {"done", "scheduled", "archived"}:
             return True
-        if task.status not in {"running", "ready"}:
+        if task.status not in {"running", "ready", "blocked"}:
             return False
         if not task.current_run_id:
             return True
