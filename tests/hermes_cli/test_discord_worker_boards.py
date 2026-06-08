@@ -3177,6 +3177,94 @@ def test_reconcile_board_creates_pr_checks_recovery_task(monkeypatch, tmp_path):
     assert actionable == recovery_tasks
 
 
+def test_reconcile_board_creates_pr_merge_conflict_recovery_task(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="review-finalizer-conflict", goal="Ship it")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "phase": "reviewing",
+            "goal_status": "active",
+            "worktree_path": str(tmp_path / "repo"),
+            "review_loop_count": 1,
+            "merge_policy": "auto",
+            "pr_open_policy": "after_review_approval",
+        },
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        reviewer_id = kanban_db.create_task(
+            conn,
+            title="R1: Review Discord implementation",
+            assignee=dwb.ROLE_REVIEWER,
+            tenant=board.slug,
+        )
+        claimed = kanban_db.claim_task(conn, reviewer_id)
+        assert claimed is not None
+        kanban_db.complete_task(
+            conn,
+            reviewer_id,
+            summary="Approved.",
+            metadata={"raw": {"status": "approved"}},
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    def fake_ensure_pr(board_arg, workspace_arg):
+        dwb._update_worker_meta(
+            board_arg,
+            {
+                "pr_url": "https://github.com/sligo-labs/PID/pull/306",
+                "pr_number": "306",
+                "pr_state": "OPEN",
+                "pr_merge_state": "DIRTY",
+                "pr_mergeable": "CONFLICTING",
+                "pr_checks_status": "passed",
+                "pr_checks_failed": [],
+                "pr_blocker": "merge state: DIRTY",
+                "pr_error": "merge state: DIRTY",
+            },
+        )
+        return False
+
+    monkeypatch.setattr(kanban_codex_worker, "_ensure_pr", fake_ensure_pr)
+
+    assert dwb.reconcile_board(board.slug) == "approved_reviewer_finalizer_merge_conflict_recovery_created"
+    assert dwb.reconcile_board(board.slug) is None
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["phase"] == "dev"
+    assert worker["goal_status"] == "active"
+    assert worker["blocked_reason"] == ""
+    assert worker["pr_blocker"] == "merge state: DIRTY"
+
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+
+    recovery_tasks = [
+        task
+        for task in tasks
+        if task.assignee == dwb.ROLE_DEV and task.created_by == "discord-pr-finalizer-recovery"
+    ]
+    assert len(recovery_tasks) == 1
+    assert recovery_tasks[0].status in {"todo", "ready", "running"}
+    assert "https://github.com/sligo-labs/PID/pull/306" in recovery_tasks[0].body
+    assert "DIRTY" in recovery_tasks[0].body
+    assert "CONFLICTING" in recovery_tasks[0].body
+    assert "resolve the PR merge conflicts" in recovery_tasks[0].body
+    assert "push the branch" in recovery_tasks[0].body
+    actionable = [task for task in tasks if task.status in {"triage", "todo", "ready", "running", "blocked"}]
+    assert actionable == recovery_tasks
+
+
 def test_reconcile_board_reviewer_body_includes_context_pack_and_requirements(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

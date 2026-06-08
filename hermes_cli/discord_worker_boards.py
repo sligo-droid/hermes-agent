@@ -5481,25 +5481,44 @@ def _pr_finalizer_failure_is_failed_checks(worker: dict[str, Any]) -> bool:
     return checks_status == "failed" or "checks failed" in blocker
 
 
-def _create_pr_checks_recovery_task(board: str, worker: dict[str, Any], conn: Any) -> str:
+def _pr_finalizer_failure_is_merge_conflict(worker: dict[str, Any]) -> bool:
+    merge_state = str(worker.get("pr_merge_state") or worker.get("merge_state") or "").strip().upper()
+    mergeable = str(worker.get("pr_mergeable") or worker.get("mergeable") or "").strip().upper()
+    blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "").strip().lower()
+    return (
+        merge_state in {"DIRTY", "CONFLICTING"}
+        or mergeable == "CONFLICTING"
+        or "merge state: dirty" in blocker
+        or "merge conflict" in blocker
+        or "conflicting" in blocker
+    )
+
+
+def _create_pr_finalizer_recovery_task(
+    board: str,
+    worker: dict[str, Any],
+    conn: Any,
+    *,
+    recovery_kind: str,
+    title: str,
+    instructions: list[str],
+    extra_payload: Optional[dict[str, Any]] = None,
+) -> str:
     pr_url = str(worker.get("pr_url") or "").strip() or "not recorded"
-    failed_checks = [str(item) for item in (worker.get("pr_checks_failed") or []) if str(item).strip()]
-    blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "checks failed").strip()
+    blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "PR finalization failed").strip()
+    payload = {
+        "role": ROLE_DEV,
+        "root_goal": worker.get("root_goal") or worker.get("initial_request") or "",
+        "pr_url": pr_url,
+        "blocker": blocker,
+        "instructions": instructions,
+        "context_pack": _context_pack_summary(board),
+        "requirements": worker.get("requirements") or [],
+    }
+    if extra_payload:
+        payload.update(extra_payload)
     body = json.dumps(
-        {
-            "role": ROLE_DEV,
-            "root_goal": worker.get("root_goal") or worker.get("initial_request") or "",
-            "pr_url": pr_url,
-            "failed_checks": failed_checks,
-            "blocker": blocker,
-            "instructions": [
-                "The implementation review was already approved; do not restart the architecture review.",
-                "Inspect the failing PR checks, fix the failures, and push the fixes to the worker branch.",
-                "After checks pass, let the reviewer/finalizer loop continue so the PR can be finalized.",
-            ],
-            "context_pack": _context_pack_summary(board),
-            "requirements": worker.get("requirements") or [],
-        },
+        payload,
         indent=2,
         ensure_ascii=False,
     )
@@ -5514,7 +5533,7 @@ def _create_pr_checks_recovery_task(board: str, worker: dict[str, Any], conn: An
           AND status != 'archived'
         ORDER BY created_at ASC, id ASC
         """,
-        (ROLE_DEV, "discord-pr-finalizer-recovery", f"{board}:pr-finalizer-checks-recovery:{key_source}%"),
+        (ROLE_DEV, "discord-pr-finalizer-recovery", f"{board}:pr-finalizer-{recovery_kind}-recovery:{key_source}%"),
     ).fetchall()
     for row in existing:
         if str(row["status"] or "") in {"triage", "todo", "ready", "running", "blocked"}:
@@ -5522,7 +5541,7 @@ def _create_pr_checks_recovery_task(board: str, worker: dict[str, Any], conn: An
     attempt = len(existing) + 1
     return kanban_db.create_task(
         conn,
-        title=format_role_round_title("Fix failing PR checks", active_dev_round(worker)),
+        title=format_role_round_title(title, active_dev_round(worker)),
         body=body,
         assignee=ROLE_DEV,
         created_by="discord-pr-finalizer-recovery",
@@ -5530,9 +5549,62 @@ def _create_pr_checks_recovery_task(board: str, worker: dict[str, Any], conn: An
         workspace_path=str(worker.get("worktree_path") or ""),
         tenant=board,
         priority=90,
-        idempotency_key=f"{board}:pr-finalizer-checks-recovery:{key_source}:{attempt}",
+        idempotency_key=f"{board}:pr-finalizer-{recovery_kind}-recovery:{key_source}:{attempt}",
         max_runtime_seconds=_role_runtime_seconds(ROLE_DEV),
     )
+
+
+def _create_pr_checks_recovery_task(board: str, worker: dict[str, Any], conn: Any) -> str:
+    failed_checks = [str(item) for item in (worker.get("pr_checks_failed") or []) if str(item).strip()]
+    return _create_pr_finalizer_recovery_task(
+        board,
+        worker,
+        conn,
+        recovery_kind="checks",
+        title="Fix failing PR checks",
+        instructions=[
+            "The implementation review was already approved; do not restart the architecture review.",
+            "Inspect the failing PR checks, fix the failures, and push the fixes to the worker branch.",
+            "After checks pass, let the reviewer/finalizer loop continue so the PR can be finalized.",
+        ],
+        extra_payload={"failed_checks": failed_checks},
+    )
+
+
+def _create_pr_merge_conflict_recovery_task(board: str, worker: dict[str, Any], conn: Any) -> str:
+    return _create_pr_finalizer_recovery_task(
+        board,
+        worker,
+        conn,
+        recovery_kind="merge-conflict",
+        title="Resolve PR merge conflicts",
+        instructions=[
+            "The implementation review was already approved; do not restart the architecture review.",
+            "Update the worker branch against the current base branch, resolve the PR merge conflicts, and push the branch.",
+            "Rerun focused checks after resolving conflicts, then let the reviewer/finalizer loop continue so the PR can be finalized.",
+        ],
+        extra_payload={
+            "merge_state": str(worker.get("pr_merge_state") or worker.get("merge_state") or "").strip(),
+            "mergeable": str(worker.get("pr_mergeable") or worker.get("mergeable") or "").strip(),
+        },
+    )
+
+
+def _reactivate_after_pr_finalizer_recovery(board: str, worker: dict[str, Any], blocker: str) -> None:
+    worker.update(
+        {
+            "phase": "dev",
+            "goal_status": "active",
+            "blocked_reason": "",
+            "pr_blocker": blocker,
+            "terminal_reaction_sync_pending": True,
+            "terminal_summary_sync_pending": True,
+        }
+    )
+    if not str(worker.get("pr_error") or "").strip():
+        worker["pr_error"] = blocker
+    _clear_board_run_summary(board, worker)
+    _update_worker_meta(board, worker)
 
 
 def _recover_approved_reviewer_finalizer(board: str, worker: dict[str, Any], conn: Any, tasks: list[Any]) -> Optional[str]:
@@ -5554,21 +5626,12 @@ def _recover_approved_reviewer_finalizer(board: str, worker: dict[str, Any], con
     blocker = str(refreshed.get("pr_blocker") or refreshed.get("pr_error") or "approved reviewer PR finalization failed").strip()
     if _pr_finalizer_failure_is_failed_checks(refreshed):
         _create_pr_checks_recovery_task(board, refreshed, conn)
-        refreshed.update(
-            {
-                "phase": "dev",
-                "goal_status": "active",
-                "blocked_reason": "",
-                "pr_blocker": blocker,
-                "terminal_reaction_sync_pending": True,
-                "terminal_summary_sync_pending": True,
-            }
-        )
-        if not str(refreshed.get("pr_error") or "").strip():
-            refreshed["pr_error"] = blocker
-        _clear_board_run_summary(board, refreshed)
-        _update_worker_meta(board, refreshed)
+        _reactivate_after_pr_finalizer_recovery(board, refreshed, blocker)
         return "approved_reviewer_finalizer_checks_recovery_created"
+    if _pr_finalizer_failure_is_merge_conflict(refreshed):
+        _create_pr_merge_conflict_recovery_task(board, refreshed, conn)
+        _reactivate_after_pr_finalizer_recovery(board, refreshed, blocker)
+        return "approved_reviewer_finalizer_merge_conflict_recovery_created"
 
     refreshed.update(
         {
