@@ -3,7 +3,12 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
-from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX, _MIN_SUMMARY_TOKENS
+from agent.context_compressor import (
+    ContextCompressor,
+    SUMMARY_PREFIX,
+    _MIN_SUMMARY_TOKENS,
+    _sanitize_summary_error,
+)
 
 
 @pytest.fixture()
@@ -1161,6 +1166,30 @@ class TestAbortOnSummaryFailure:
             isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
             for m in result
         )
+
+    def test_abort_records_runtime_error_cause_instead_of_unknown_error(self):
+        c = self._make_compressor()
+        msgs = self._make_msgs()
+        cause = (
+            "Provider 'anthropic' is set in config.yaml but no API key was found. "
+            "Set ANTHROPIC_API_KEY, or switch providers."
+        )
+
+        with patch("agent.context_compressor.call_llm", side_effect=RuntimeError(cause)):
+            result = c.compress(msgs)
+
+        assert result == msgs
+        assert c._last_compress_aborted is True
+        assert c._last_summary_error == cause
+        assert c._last_summary_error != "unknown error"
+
+    def test_summary_error_sanitizer_redacts_secret_values(self):
+        sanitized = _sanitize_summary_error(
+            "upstream failed with Authorization: Bearer sk-ant-secret123456789"
+        )
+
+        assert "sk-ant-secret123456789" not in sanitized
+        assert "Authorization" in sanitized
 
     def test_compress_clears_abort_flag_on_subsequent_success(self):
         mock_response = MagicMock()

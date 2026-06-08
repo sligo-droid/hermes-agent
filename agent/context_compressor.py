@@ -34,6 +34,16 @@ from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
+
+def _sanitize_summary_error(error: Any) -> str:
+    """Return a short, user-safe compression failure cause."""
+    text = str(error).strip() or error.__class__.__name__
+    text = redact_sensitive_text(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > 220:
+        text = text[:217].rstrip() + "..."
+    return text or "unknown error"
+
 SUMMARY_PREFIX = (
     "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
     "into the summary below. This is a handoff from a previous context "
@@ -1519,16 +1529,19 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             self._summary_model_fallen_back = False
             self._last_summary_error = None
             return self._with_summary_prefix(summary)
-        except RuntimeError:
+        except RuntimeError as e:
             # No provider configured — long cooldown, unlikely to self-resolve
             self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
-            self._last_summary_error = "no auxiliary LLM provider configured"
+            err_text = _sanitize_summary_error(e)
+            if not err_text or err_text == "RuntimeError":
+                err_text = "no auxiliary LLM provider configured"
+            self._last_summary_error = err_text
             log_auxiliary_health_warning(
                 self.provider or "auto",
                 "compression_no_provider",
-                "Context compression: no provider available for "
-                "summary. Middle turns will be dropped without summary "
-                "for %d seconds.",
+                "Context compression: no provider available for summary (%s). "
+                "Middle turns will be dropped without summary for %d seconds.",
+                err_text,
                 _SUMMARY_FAILURE_COOLDOWN_SECONDS,
             )
             return None
@@ -1619,9 +1632,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             # streaming-closed since those conditions can self-resolve quickly.
             _transient_cooldown = 30 if (_is_json_decode or _is_streaming_closed) else 60
             self._summary_failure_cooldown_until = time.monotonic() + _transient_cooldown
-            err_text = str(e).strip() or e.__class__.__name__
-            if len(err_text) > 220:
-                err_text = err_text[:217].rstrip() + "..."
+            err_text = _sanitize_summary_error(e)
             self._last_summary_error = err_text
             log_auxiliary_health_warning(
                 self.provider or "auto",
