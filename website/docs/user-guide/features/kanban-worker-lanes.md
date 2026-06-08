@@ -88,13 +88,29 @@ When you create profiles for your fleet, choose names that match the *role* you 
 
 A specialisation of the profile lane: an orchestrator is a Hermes profile whose toolset includes `kanban` but excludes `terminal` / `file` / `code` / `web` for implementation. Its job is decomposing a high-level goal into child tasks via `kanban_create` + `kanban_link` and stepping back. The orchestrator skill encodes the anti-temptation rules.
 
-### Discord Codex role lanes
+### Discord coding role lanes
 
 Discord feature threads can create a dedicated public worker board whose assignees are fixed role lanes: `planner`, `dev`, and `reviewer`. These boards share the Kanban lifecycle and dispatcher, but they are intentionally not generic profile-roster orchestration. The generic `kanban.auto_decompose` flow skips them; their behavior is controlled by `kanban.discord_worker.*` config and their worker board metadata.
 
+Role-lane backend support today:
+
+| Role | Codex backend | OpenCode backend |
+|---|---|---|
+| `planner` | Supported | Supported when `coding_worker.backend` resolves to `opencode` |
+| `dev` | Supported | Supported when `coding_worker.backend` resolves to `opencode` |
+| `reviewer` | Supported | Supported when `coding_worker.backend` resolves to `opencode` |
+
+The dispatcher resolves the configured coding backend once, then applies role routing before spawning `hermes_cli/kanban_codex_worker.py`. For OpenCode role lanes, the worker runs on the host runner only; Docker role workers remain Codex-backed. If OpenCode is requested but the binary check fails, the dispatcher raises a backend error instead of silently running another CLI.
+
+Operator-safe inspection:
+
+- Check the configured backend name without printing secrets by inspecting the non-secret `coding_worker.backend` / `kanban.discord_worker.*` keys in `config.yaml`; use `hermes config path` if you need the active config file location.
+- Confirm effective role routing from worker logs: scheduled lines include `scheduled OpenCode role worker` or `scheduled Codex role worker`, plus `role=...`, reasoning, and mode. They should not require dumping `.env`, API tokens, OAuth files, or Discord credentials.
+- For code-level audits, cross-check `_OPENCODE_ROLES`, `_coding_backend()`, and `_role_backend()` in `hermes_cli/kanban_codex_workers.py`; spawned workers also receive the non-secret effective value in `HERMES_CODING_WORKER_BACKEND`.
+
 ## Adding an external CLI worker lane
 
-Wiring a non-Hermes CLI tool (Codex CLI, Claude Code CLI, OpenCode CLI, a local coding-model runner, etc.) as a kanban worker lane is *not yet a paved path*. The dispatcher's spawn function is pluggable (`spawn_fn` is a parameter on `dispatch_once`), and a plugin could register its own `spawn_fn` for a non-Hermes assignee, but the surrounding integration work — wrapping the CLI's exit code into `kanban_complete` / `kanban_block` calls, mapping the CLI's workspace/sandbox conventions onto the dispatcher's `HERMES_KANBAN_WORKSPACE` env, handling auth and per-CLI policy — is still per-integration design work.
+Wiring an arbitrary non-Hermes CLI tool (Claude Code CLI, a local coding-model runner, or a custom OpenCode/Codex lane outside the built-in Discord coding role backend) as a kanban worker lane is *not yet a paved path*. The dispatcher's spawn function is pluggable (`spawn_fn` is a parameter on `dispatch_once`), and a plugin could register its own `spawn_fn` for a non-Hermes assignee, but the surrounding integration work — wrapping the CLI's exit code into `kanban_complete` / `kanban_block` calls, mapping the CLI's workspace/sandbox conventions onto the dispatcher's `HERMES_KANBAN_WORKSPACE` env, handling auth and per-CLI policy — is still per-integration design work.
 
 If you're considering adding a CLI lane, open an issue describing the specific CLI and the workflow you're trying to enable. The contract above is the constraints any such lane must satisfy; the implementation shape (one plugin per CLI vs a generic CLI-runner plugin parameterised by config) is open.
 
