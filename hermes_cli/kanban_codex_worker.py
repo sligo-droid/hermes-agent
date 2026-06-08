@@ -98,7 +98,12 @@ def main() -> int:
     result: Any = None
     conn = kanban_db.connect(board=board)
     try:
-        task = kanban_db.get_task(conn, task_id)
+        task = kanban_db.get_task_with_transient_retry(
+            conn,
+            task_id,
+            board=board,
+            operation_name="codex_worker.initial_get_task",
+        )
         if task is None:
             return 2
         prompt = _build_prompt(conn, task_id, role)
@@ -202,7 +207,12 @@ def _recover_completed_role_output(
     if not final_text:
         return False
     try:
-        task = kanban_db.get_task(conn, task_id)
+        task = kanban_db.get_task_with_transient_retry(
+            conn,
+            task_id,
+            board=board,
+            operation_name="codex_worker.recovery_get_task",
+        )
     except Exception:
         return False
     if task is None:
@@ -229,7 +239,13 @@ def _recover_completed_role_output(
     except Exception:
         return False
     try:
-        task = kanban_db.get_task(conn, task_id)
+        task = kanban_db.get_task_with_transient_retry(
+            conn,
+            task_id,
+            board=board,
+            operation_name="codex_worker.recovery_confirm_get_task",
+            run_id=task.current_run_id,
+        )
     except Exception:
         return False
     return bool(task and task.status in {"done", "blocked", "scheduled", "archived"})
@@ -373,7 +389,12 @@ def _recorded_result_is_fresh_for_current_run(
     except Exception:
         return False
     try:
-        task = kanban_db.get_task(conn, task_id)
+        task = kanban_db.get_task_with_transient_retry(
+            conn,
+            task_id,
+            board=board,
+            operation_name="codex_worker.recorded_result_get_task",
+        )
         if task is None:
             return False
         if task.status in {"done", "scheduled", "archived"}:

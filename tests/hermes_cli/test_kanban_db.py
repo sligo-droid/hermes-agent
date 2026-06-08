@@ -464,6 +464,157 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
+class _DiskIoOnceConnection:
+    def __init__(self, conn: sqlite3.Connection, fail_sql: str, *, failures: int = 1):
+        self._conn = conn
+        self._fail_sql = fail_sql
+        self._remaining = failures
+        self.failures = 0
+
+    def execute(self, sql, *args, **kwargs):
+        if self._remaining > 0 and self._fail_sql in str(sql):
+            self._remaining -= 1
+            self.failures += 1
+            raise sqlite3.OperationalError("disk I/O error")
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_complete_task_retries_transient_disk_io_once(monkeypatch, kanban_home, caplog):
+    monkeypatch.setattr(kb.time, "sleep", lambda _seconds: None)
+    with kb.connect() as real_conn:
+        tid = kb.create_task(real_conn, title="finish with retry", assignee="dev")
+        claimed = kb.claim_task(real_conn, tid, claimer="test:1")
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        conn = _DiskIoOnceConnection(real_conn, "BEGIN IMMEDIATE", failures=1)
+
+        completed = kb.complete_task(
+            conn,
+            tid,
+            summary="handoff summary",
+            metadata={"changed_files": ["a.py"], "tests": ["unit"]},
+            expected_run_id=run_id,
+        )
+
+        task = kb.get_task(real_conn, tid)
+        runs = kb.list_runs(real_conn, tid)
+        events = [event for event in kb.list_events(real_conn, tid) if event.kind == "completed"]
+
+    assert completed is True
+    assert conn.failures == 1
+    assert task is not None
+    assert task.status == "done"
+    completed_runs = [run for run in runs if run.outcome == "completed"]
+    assert len(completed_runs) == 1
+    assert completed_runs[0].id == run_id
+    assert completed_runs[0].summary == "handoff summary"
+    assert completed_runs[0].metadata == {"changed_files": ["a.py"], "tests": ["unit"]}
+    assert len(events) == 1
+    assert events[0].run_id == run_id
+    assert "operation=complete_task attempt=1/3 outcome=retrying error=disk I/O error" in caplog.text
+
+
+def test_complete_task_persistent_disk_io_surfaces_without_false_completion(monkeypatch, kanban_home, caplog):
+    monkeypatch.setattr(kb.time, "sleep", lambda _seconds: None)
+    with kb.connect() as real_conn:
+        tid = kb.create_task(real_conn, title="persistent failure", assignee="dev")
+        claimed = kb.claim_task(real_conn, tid, claimer="test:1")
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        conn = _DiskIoOnceConnection(real_conn, "BEGIN IMMEDIATE", failures=3)
+
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="should not persist",
+                metadata={"handoff": "lost"},
+                expected_run_id=run_id,
+            )
+
+        task = kb.get_task(real_conn, tid)
+        runs = kb.list_runs(real_conn, tid)
+        events = [event for event in kb.list_events(real_conn, tid) if event.kind == "completed"]
+
+    assert conn.failures == 3
+    assert task is not None
+    assert task.status == "running"
+    assert len(runs) == 1
+    assert runs[0].id == run_id
+    assert runs[0].ended_at is None
+    assert events == []
+    assert "operation=complete_task attempt=3/3 outcome=final_failure error=disk I/O error" in caplog.text
+
+
+def test_complete_task_disk_io_after_commit_returns_existing_completion(monkeypatch, kanban_home, caplog):
+    monkeypatch.setattr(kb.time, "sleep", lambda _seconds: None)
+
+    class _CommitErrorConnection:
+        def __init__(self, conn: sqlite3.Connection):
+            self._conn = conn
+            self.failures = 0
+
+        def execute(self, sql, *args, **kwargs):
+            result = self._conn.execute(sql, *args, **kwargs)
+            if str(sql) == "COMMIT" and self.failures == 0:
+                self.failures += 1
+                raise sqlite3.OperationalError("disk I/O error")
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    with kb.connect() as real_conn:
+        tid = kb.create_task(real_conn, title="post commit eio", assignee="dev")
+        claimed = kb.claim_task(real_conn, tid, claimer="test:1")
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        conn = _CommitErrorConnection(real_conn)
+
+        completed = kb.complete_task(
+            conn,
+            tid,
+            summary="durable handoff",
+            metadata={"changed_files": ["b.py"]},
+            expected_run_id=run_id,
+        )
+
+        task = kb.get_task(real_conn, tid)
+        runs = kb.list_runs(real_conn, tid)
+        events = [event for event in kb.list_events(real_conn, tid) if event.kind == "completed"]
+
+    assert completed is True
+    assert conn.failures == 1
+    assert task is not None
+    assert task.status == "done"
+    assert len([run for run in runs if run.outcome == "completed"]) == 1
+    assert len(events) == 1
+    assert events[0].run_id == run_id
+    assert "operation=complete_task attempt=1/3 outcome=already_applied error=disk I/O error" in caplog.text
+
+
+def test_get_task_with_transient_retry_recovers_immediate_read(monkeypatch, kanban_home, caplog):
+    monkeypatch.setattr(kb.time, "sleep", lambda _seconds: None)
+    with kb.connect() as real_conn:
+        tid = kb.create_task(real_conn, title="read retry", assignee="dev")
+        conn = _DiskIoOnceConnection(real_conn, "SELECT * FROM tasks WHERE id = ?", failures=1)
+
+        task = kb.get_task_with_transient_retry(
+            conn,
+            tid,
+            board="default",
+            operation_name="codex_worker.recovery_get_task",
+        )
+
+    assert conn.failures == 1
+    assert task is not None
+    assert task.id == tid
+    assert "operation=codex_worker.recovery_get_task attempt=1/3 outcome=retrying error=disk I/O error" in caplog.text
+
+
 def _write_discord_worker_meta(board: str, *, worktree_path: str, default_workdir: str | None = None) -> None:
     kb.create_board(board)
     meta_path = kb.board_metadata_path(board)
