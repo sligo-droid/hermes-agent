@@ -581,6 +581,41 @@ class TestDelegateObservability(unittest.TestCase):
             trace = result["results"][0]["tool_trace"]
             self.assertEqual(trace[0]["status"], "error")
 
+    def test_tool_trace_handles_non_string_tool_content(self):
+        """Tool results with structured content should be coerced before trace metadata."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            list_content = ["ok"]
+            dict_content = {"status": "ok"}
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [
+                    {"role": "assistant", "tool_calls": [
+                        {"id": "tc_list", "function": {"name": "list_tool", "arguments": "{}"}},
+                        {"id": "tc_dict", "function": {"name": "dict_tool", "arguments": "{}"}},
+                    ]},
+                    {"role": "tool", "tool_call_id": "tc_list", "content": list_content},
+                    {"role": "tool", "tool_call_id": "tc_dict", "content": dict_content},
+                ],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test non-string trace", parent_agent=parent))
+            trace = result["results"][0]["tool_trace"]
+
+            self.assertEqual(trace[0]["status"], "ok")
+            self.assertEqual(trace[0]["result_bytes"], len(str(list_content)))
+            self.assertEqual(trace[1]["status"], "ok")
+            self.assertEqual(trace[1]["result_bytes"], len(str(dict_content)))
+
     def test_parallel_tool_calls_paired_correctly(self):
         """Parallel tool calls should each get their own result via tool_call_id matching."""
         parent = _make_mock_parent(depth=0)
