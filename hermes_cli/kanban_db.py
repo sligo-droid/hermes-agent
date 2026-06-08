@@ -189,6 +189,7 @@ _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
 # ---------------------------------------------------------------------------
 
 DEFAULT_BOARD = "default"
+_ACTIVE_CORRUPT_DISCORD_BOARD_RECOVERY = "discord-1513050159653589093"
 
 # Slug validator: lowercase alphanumerics, digits, hyphens; 1–64 chars.
 # Strict enough to stop traversal (`..`) and embedded path separators, loose
@@ -1534,6 +1535,15 @@ def record_corrupt_board_incident(
         "first_seen": first_seen,
         "last_seen": now,
     }
+    if slug == _ACTIVE_CORRUPT_DISCORD_BOARD_RECOVERY:
+        incident["recovery_note"] = (
+            "One-time recovery for active Discord worker board "
+            f"{slug}: restore a known-good backup if available or run "
+            f"`hermes kanban repair --board {slug}`. Evidence is preserved in "
+            "quarantine_path; dispatcher/notifier retries remain suppressed "
+            "while this DB fingerprint is unchanged."
+        )
+        incident["repair_command"] = f"hermes kanban repair --board {slug}"
     meta["paused"] = True
     meta["pause_reason"] = "kanban_db_corruption"
     meta["corruption_incident"] = incident

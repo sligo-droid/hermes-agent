@@ -4474,6 +4474,49 @@ def test_corrupt_board_incident_records_pause_and_reuses_quarantine(kanban_home)
     assert meta["pause_reason"] == "kanban_db_corruption"
 
 
+def test_active_discord_corrupt_board_incident_includes_one_time_recovery_note(kanban_home):
+    board = "discord-1513050159653589093"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    original = _write_corrupt_db(db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+        kb.connect(board=board)
+
+    incident = kb.is_board_paused_for_corruption(board)
+    assert incident is not None
+    assert incident == excinfo.value.incident
+    assert incident["fingerprint"] == kb._db_content_fingerprint(db_path)
+    assert incident["repair_command"] == f"hermes kanban repair --board {board}"
+    assert f"One-time recovery for active Discord worker board {board}" in incident["recovery_note"]
+    assert f"hermes kanban repair --board {board}" in incident["recovery_note"]
+    assert "known-good backup" in incident["recovery_note"]
+    assert "quarantine_path" in incident["recovery_note"]
+    assert db_path.read_bytes() == original
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with pytest.raises(kb.KanbanDbCorruptError) as repeat:
+        kb.connect(board=board)
+    assert repeat.value.incident == incident
+
+
+def test_other_corrupt_board_incident_does_not_get_active_recovery_note(kanban_home):
+    board = "some-other-corrupt-board"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    _write_corrupt_db(db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    with pytest.raises(kb.KanbanDbCorruptError):
+        kb.connect(board=board)
+
+    incident = kb.is_board_paused_for_corruption(board)
+    assert incident is not None
+    assert "recovery_note" not in incident
+    assert "repair_command" not in incident
+
+
 def test_invalid_header_board_incident_records_pause_and_reuses_quarantine(kanban_home):
     board = "invalid-header-board"
     kb.create_board(board)
