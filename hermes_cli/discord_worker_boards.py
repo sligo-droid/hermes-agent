@@ -5475,6 +5475,66 @@ def _completed_approved_reviewer_task(conn: Any, tasks: list[Any]) -> Optional[A
     return None
 
 
+def _pr_finalizer_failure_is_failed_checks(worker: dict[str, Any]) -> bool:
+    checks_status = str(worker.get("pr_checks_status") or "").strip().lower()
+    blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "").strip().lower()
+    return checks_status == "failed" or "checks failed" in blocker
+
+
+def _create_pr_checks_recovery_task(board: str, worker: dict[str, Any], conn: Any) -> str:
+    pr_url = str(worker.get("pr_url") or "").strip() or "not recorded"
+    failed_checks = [str(item) for item in (worker.get("pr_checks_failed") or []) if str(item).strip()]
+    blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "checks failed").strip()
+    body = json.dumps(
+        {
+            "role": ROLE_DEV,
+            "root_goal": worker.get("root_goal") or worker.get("initial_request") or "",
+            "pr_url": pr_url,
+            "failed_checks": failed_checks,
+            "blocker": blocker,
+            "instructions": [
+                "The implementation review was already approved; do not restart the architecture review.",
+                "Inspect the failing PR checks, fix the failures, and push the fixes to the worker branch.",
+                "After checks pass, let the reviewer/finalizer loop continue so the PR can be finalized.",
+            ],
+            "context_pack": _context_pack_summary(board),
+            "requirements": worker.get("requirements") or [],
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+    key_source = str(worker.get("pr_number") or pr_url or "unknown").strip() or "unknown"
+    existing = conn.execute(
+        """
+        SELECT id, status
+        FROM tasks
+        WHERE assignee = ?
+          AND created_by = ?
+          AND idempotency_key LIKE ?
+          AND status != 'archived'
+        ORDER BY created_at ASC, id ASC
+        """,
+        (ROLE_DEV, "discord-pr-finalizer-recovery", f"{board}:pr-finalizer-checks-recovery:{key_source}%"),
+    ).fetchall()
+    for row in existing:
+        if str(row["status"] or "") in {"triage", "todo", "ready", "running", "blocked"}:
+            return str(row["id"])
+    attempt = len(existing) + 1
+    return kanban_db.create_task(
+        conn,
+        title=format_role_round_title("Fix failing PR checks", active_dev_round(worker)),
+        body=body,
+        assignee=ROLE_DEV,
+        created_by="discord-pr-finalizer-recovery",
+        workspace_kind="dir",
+        workspace_path=str(worker.get("worktree_path") or ""),
+        tenant=board,
+        priority=90,
+        idempotency_key=f"{board}:pr-finalizer-checks-recovery:{key_source}:{attempt}",
+        max_runtime_seconds=_role_runtime_seconds(ROLE_DEV),
+    )
+
+
 def _recover_approved_reviewer_finalizer(board: str, worker: dict[str, Any], conn: Any, tasks: list[Any]) -> Optional[str]:
     if str(worker.get("phase") or "").strip().lower() not in {"active", "reviewing", "review"}:
         return None
@@ -5492,6 +5552,24 @@ def _recover_approved_reviewer_finalizer(board: str, worker: dict[str, Any], con
     metadata = kanban_db.read_board_metadata(board)
     refreshed = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
     blocker = str(refreshed.get("pr_blocker") or refreshed.get("pr_error") or "approved reviewer PR finalization failed").strip()
+    if _pr_finalizer_failure_is_failed_checks(refreshed):
+        _create_pr_checks_recovery_task(board, refreshed, conn)
+        refreshed.update(
+            {
+                "phase": "dev",
+                "goal_status": "active",
+                "blocked_reason": "",
+                "pr_blocker": blocker,
+                "terminal_reaction_sync_pending": True,
+                "terminal_summary_sync_pending": True,
+            }
+        )
+        if not str(refreshed.get("pr_error") or "").strip():
+            refreshed["pr_error"] = blocker
+        _clear_board_run_summary(board, refreshed)
+        _update_worker_meta(board, refreshed)
+        return "approved_reviewer_finalizer_checks_recovery_created"
+
     refreshed.update(
         {
             "phase": "blocked",
