@@ -238,6 +238,7 @@ def test_opencode_jsonc_user_config_allows_comments_and_trailing_commas(monkeypa
               "npm": "@ai-sdk/openai-compatible",
               "options": {
                 "baseURL": "http://127.0.0.1:9999/v1", // trailing field comment
+                "literal": "literal,}",
               },
               "models": {
                 "gpt-5.5": {},
@@ -256,7 +257,10 @@ def test_opencode_jsonc_user_config_allows_comments_and_trailing_commas(monkeypa
 
     assert ow._opencode_provider_config_for_model("hermes-codex/gpt-5.5") == {
         "npm": "@ai-sdk/openai-compatible",
-        "options": {"baseURL": "http://127.0.0.1:9999/v1"},
+        "options": {
+            "baseURL": "http://127.0.0.1:9999/v1",
+            "literal": "literal,}",
+        },
         "models": {"gpt-5.5": {}},
     }
 

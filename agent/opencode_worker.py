@@ -158,6 +158,30 @@ def _strip_jsonc(text: str) -> str:
     out: list[str] = []
     in_string = False
     escape = False
+
+    def next_significant_index(index: int) -> int:
+        while index < len(text):
+            char = text[index]
+            nxt = text[index + 1] if index + 1 < len(text) else ""
+            if char.isspace():
+                index += 1
+                continue
+            if char == "/" and nxt == "/":
+                index += 2
+                while index < len(text) and text[index] not in "\r\n":
+                    index += 1
+                continue
+            if char == "/" and nxt == "*":
+                index += 2
+                while index + 1 < len(text) and not (
+                    text[index] == "*" and text[index + 1] == "/"
+                ):
+                    index += 1
+                index = min(index + 2, len(text))
+                continue
+            break
+        return index
+
     i = 0
     while i < len(text):
         char = text[i]
@@ -188,10 +212,14 @@ def _strip_jsonc(text: str) -> str:
                 i += 1
             i = min(i + 2, len(text))
             continue
+        if char == "," and next_significant_index(i + 1) < len(text):
+            if text[next_significant_index(i + 1)] in "}]":
+                i += 1
+                continue
         out.append(char)
         i += 1
 
-    return re.sub(r",\s*([}\]])", r"\1", "".join(out))
+    return "".join(out)
 
 
 def _opencode_provider_config_for_model(model: Any) -> dict[str, Any]:
