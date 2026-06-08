@@ -5660,7 +5660,12 @@ def _recover_blocked_approved_reviewer_finalizer(
         return None
     if str(worker.get("goal_status") or "").strip().lower() != "blocked":
         return None
-    if str(worker.get("blocked_reason") or "").strip() != "approved reviewer PR finalization failed":
+    blocked_reason = str(worker.get("blocked_reason") or "").strip()
+    finalizer_blocked_reason = blocked_reason == "approved reviewer PR finalization failed"
+    finalizer_failure_evidence = _pr_finalizer_failure_is_failed_checks(
+        worker
+    ) or _pr_finalizer_failure_is_merge_conflict(worker)
+    if not finalizer_blocked_reason and not finalizer_failure_evidence:
         return None
     if worker.get("execution_mode") != "kanban_pipeline" or _worker_source_message_too_old(worker):
         return None
