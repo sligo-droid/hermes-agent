@@ -94,6 +94,43 @@ def _write_pool_auth(hermes_home: Path, entries: list[dict]) -> None:
     )
 
 
+def test_dev_role_prompt_includes_autoreview_closeout_contract(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_DEV, ROLE_PLANNER
+
+    board = "discord-worker-autoreview-closeout"
+    kanban_db.create_board(board, name="Autoreview closeout")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    conn = kanban_db.connect(board=board)
+    try:
+        dev_task_id = kanban_db.create_task(
+            conn,
+            title="Implement parser fix",
+            body="Goal: fix parser\nSuccess means: tests pass\nStop when: local verification recorded",
+            assignee=ROLE_DEV,
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        planner_task_id = kanban_db.create_task(
+            conn,
+            title="Plan parser fix",
+            assignee=ROLE_PLANNER,
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        dev_prompt = worker._build_prompt(conn, dev_task_id, ROLE_DEV)
+        planner_prompt = worker._build_prompt(conn, planner_task_id, ROLE_PLANNER)
+    finally:
+        conn.close()
+
+    assert "Autoreview closeout contract for dev workers" in dev_prompt
+    assert "apply the OpenClaw `autoreview` skill" in dev_prompt
+    assert "Record the autoreview command/result" in dev_prompt
+    assert "Autoreview closeout contract for dev workers" not in planner_prompt
+
+
 def test_coding_worker_activity_heartbeat_rate_limits_and_uses_run_id(monkeypatch):
     from hermes_cli import kanban_codex_worker as worker
 

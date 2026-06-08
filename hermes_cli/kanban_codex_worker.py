@@ -435,6 +435,7 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
         "- Prefer `python -m hermes_cli.worker_frontend_smoke --url <exact-url> --cmd '<preview command with that host:port>' --route /` when practical.\n\n"
     )
     pr_policy = _pr_policy_prompt_note(role)
+    autoreview = _dev_autoreview_prompt(role)
     return (
         f"You are the Discord Kanban {role} worker.\n"
         "Use the repository, shell, files, and worker helper commands available in this worker environment to complete the task.\n"
@@ -443,6 +444,7 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
         f"{outcome}\n\n"
         f"{discord_access}"
         f"{frontend_smoke}"
+        f"{autoreview}"
         f"{schema}\n\n"
         f"Git context:\n{git}\n\n"
         f"Kanban context:\n{context}"
@@ -554,6 +556,19 @@ def _build_reviewer_context(conn: Any, task_id: str) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _dev_autoreview_prompt(role: str) -> str:
+    if role != ROLE_DEV:
+        return ""
+    return (
+        "Autoreview closeout contract for dev workers:\n"
+        "- After non-trivial code edits and focused checks, apply the OpenClaw `autoreview` skill as the final closeout review before returning JSON.\n"
+        "- Prefer a repo-local helper when present: `.agents/skills/autoreview/scripts/autoreview --mode local` or `skills/autoreview/scripts/autoreview --mode local`; otherwise use the installed helper path if available.\n"
+        "- Treat review findings as advisory: verify each actionable finding in the real code path, fix only concrete in-scope issues, rerun affected checks, and rerun autoreview after review-triggered edits until no accepted/actionable findings remain.\n"
+        "- If the autoreview helper/skill is unavailable in this worker environment, record that explicitly in `handoff.notes` and continue with the normal focused verification you can run.\n"
+        "- Record the autoreview command/result, or the unavailable reason, in `tests` or `handoff.notes` so the reviewer can audit closeout.\n\n"
+    )
+
+
 def _role_outcome_frame(role: str) -> str:
     if role == ROLE_PLANNER:
         return (
@@ -596,6 +611,7 @@ def _role_outcome_frame(role: str) -> str:
         "Success means:\n"
         "- The smallest correct change within ticket scope is implemented.\n"
         "- Focused verification is run when available and recorded in tests.\n"
+        "- Autoreview closeout is applied after non-trivial code edits when available, with command/result or unavailable reason recorded for reviewers.\n"
         "- changed_files, tests, handoff, pr_ready, and blocker reflect the actual repository state.\n"
         "- Remote push and PR lifecycle work are not attempted by this role.\n"
         "Stop when: Return the JSON completion, checkpoint, or blocker object."
@@ -669,7 +685,7 @@ def _schema_instructions(role: str) -> str:
         '"handoff":{"changed_files":["..."],"tests":[{"command":"...","result":"passed|failed|not_run","output":"..."}],'
         '"verification":["..."],"preview":{"url":"...","command":"...","status":"passed|failed|not_run"},'
         '"smoke_routes":["..."],"known_warnings":["..."],"notes":"..."},"blocker":null,"pr_ready":false} '
-        "Always include handoff so reviewers can audit the exact changed files, checks, preview URL/command, smoke routes, warnings, and notes. "
+        "Always include handoff so reviewers can audit the exact changed files, checks, autoreview closeout command/result or unavailable reason, preview URL/command, smoke routes, warnings, and notes. "
         "Never push to a remote branch and never create, update, or merge a PR; stop after local code and verification."
     )
 
