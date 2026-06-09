@@ -8430,6 +8430,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
 
+    annotation_context = _worker_command_center_annotation_context(conn, task)
+    if annotation_context:
+        lines.append("## Command Center operator annotations")
+        lines.append(annotation_context)
+        lines.append("")
+
     # Attachments — files uploaded to this task (PDFs, source docs,
     # images). Surface the absolute on-disk path so the worker, which has
     # full file-tool access, can read them directly (read_file, terminal
@@ -8587,6 +8593,63 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _worker_command_center_annotation_context(conn: sqlite3.Connection, task: Task) -> str:
+    """Return audited Command Center annotations relevant to this worker task."""
+    try:
+        from hermes_cli import command_center_annotations
+    except Exception:
+        return ""
+
+    blocks: list[str] = []
+    seen: set[str] = set()
+    for work_item_id in _worker_command_center_annotation_ids(conn, task):
+        if work_item_id in seen:
+            continue
+        seen.add(work_item_id)
+        block = command_center_annotations.operator_context_block(work_item_id)
+        if block:
+            blocks.append(block)
+    return "\n\n".join(blocks)
+
+
+def _worker_command_center_annotation_ids(conn: sqlite3.Connection, task: Task) -> list[str]:
+    board = _board_slug_for_connection(conn)
+    ids: list[str] = []
+    if board:
+        ids.append(f"kanban-board:{board}")
+        ids.append(f"kanban:{board}:{task.id}")
+    ids.append(f"kanban:{task.id}")
+    if task.idempotency_key:
+        ids.append(str(task.idempotency_key))
+    return ids
+
+
+def _board_slug_for_connection(conn: sqlite3.Connection) -> str:
+    try:
+        db_row = conn.execute("PRAGMA database_list").fetchone()
+        db_path = Path(str(db_row["file"] if isinstance(db_row, sqlite3.Row) else db_row[2])).resolve()
+    except Exception:
+        return get_current_board()
+
+    candidates = [get_current_board(), DEFAULT_BOARD]
+    try:
+        candidates.extend(str(board.get("slug") or "") for board in list_boards(include_archived=False))
+    except Exception:
+        pass
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            if kanban_db_path(board=candidate).resolve() == db_path:
+                return candidate
+        except Exception:
+            continue
+    return get_current_board()
 
 
 # ---------------------------------------------------------------------------
