@@ -879,6 +879,46 @@ class TestGatewaySystemServiceRouting:
         assert ("wait", False, 777) in calls
         assert "restarting gracefully (pid 777)" in capsys.readouterr().out.lower()
 
+    def test_systemd_restart_stops_after_graceful_handoff_deferred_by_watcher(self, monkeypatch, capsys):
+        calls = []
+
+        monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
+        monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 10.0)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 654)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout: calls.append(("graceful", pid, timeout)) or True,
+        )
+        monkeypatch.setattr(gateway_cli, "_systemd_service_is_start_limited", lambda system=False: False)
+
+        def fake_run_systemctl(args, **kwargs):
+            calls.append(tuple(args))
+            return SimpleNamespace(stdout="", returncode=0)
+
+        monkeypatch.setattr(gateway_cli, "_run_systemctl", fake_run_systemctl)
+
+        def fake_wait(system=False, previous_pid=None):
+            calls.append(("wait", system, previous_pid))
+            print("⏳ User service restart deferred: active_agents=1; blocking_direct_children=none")
+            return False
+
+        monkeypatch.setattr(gateway_cli, "_wait_for_systemd_service_restart", fake_wait)
+
+        gateway_cli.systemd_restart()
+
+        assert calls == [
+            ("graceful", 654, 15.0),
+            ("reset-failed", gateway_cli.get_service_name()),
+            ("restart", gateway_cli.get_service_name()),
+            ("wait", False, 654),
+        ]
+        out = capsys.readouterr().out.lower()
+        assert "restart deferred" in out
+        assert "forcing a service restart" not in out
+
     def test_wait_for_systemd_restart_waits_for_runtime_running(self, monkeypatch, capsys):
         monkeypatch.setattr(
             gateway_cli,
@@ -895,11 +935,81 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(
             gateway_cli,
             "_gateway_runtime_status_for_pid",
-            lambda pid: {"pid": pid, "gateway_state": "running"},
+            lambda pid: {
+                "pid": pid,
+                "gateway_state": "running",
+                "platforms": {"discord": {"state": "connected"}},
+            },
         )
 
         assert gateway_cli._wait_for_systemd_service_restart(previous_pid=777, timeout=0.1) is True
         assert "restarted (pid 999)" in capsys.readouterr().out.lower()
+
+    def test_wait_for_systemd_restart_defers_on_blocker_evidence(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            gateway_cli,
+            "_read_systemd_unit_properties",
+            lambda system=False: {
+                "ActiveState": "active",
+                "SubState": "running",
+                "Result": "success",
+                "ExecMainStatus": "0",
+                "MainPID": "999",
+            },
+        )
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_gateway_runtime_status_for_pid",
+            lambda pid: {"pid": pid, "gateway_state": "draining", "active_agents": 2},
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "restart_blocker_evidence",
+            lambda previous_pid, runtime_state=None: SimpleNamespace(
+                active_agents=2,
+                blockers=[SimpleNamespace(pid=4321, cmdline="python run_agent.py")],
+                blocker_summary=lambda: "pid=4321 cmd=python run_agent.py",
+            ),
+        )
+
+        assert gateway_cli._wait_for_systemd_service_restart(previous_pid=777, timeout=0.1) is False
+        out = capsys.readouterr().out.lower()
+        assert "restart deferred" in out
+        assert "active_agents=2" in out
+        assert "pid=4321" in out
+
+    def test_wait_for_systemd_restart_timeout_reports_last_evidence(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            gateway_cli,
+            "_read_systemd_unit_properties",
+            lambda system=False: {
+                "ActiveState": "activating",
+                "SubState": "start",
+                "Result": "success",
+                "ExecMainStatus": "0",
+                "MainPID": "0",
+            },
+        )
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_read_gateway_runtime_status",
+            lambda: {"gateway_state": "draining", "active_agents": 0},
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "restart_blocker_evidence",
+            lambda previous_pid, runtime_state=None: SimpleNamespace(
+                active_agents=0,
+                blockers=[],
+                blocker_summary=lambda: "none",
+            ),
+        )
+
+        assert gateway_cli._wait_for_systemd_service_restart(previous_pid=777, timeout=0.01) is False
+        out = capsys.readouterr().out.lower()
+        assert "last evidence: active_agents=0; blocking_direct_children=none" in out
 
     def test_systemd_restart_reports_start_limit_hit(self, monkeypatch, capsys):
         calls = []
