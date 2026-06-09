@@ -1029,6 +1029,77 @@ def test_set_goal_expands_discord_thread_reference_for_planner(monkeypatch, tmp_
     assert "1511799412559708283" in pack["source_message_ids"]
 
 
+def test_saved_discord_plan_artifact_path_reaches_planner_and_reviewer(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker, kanban_db
+    from hermes_cli.discord_plan_artifacts import persist_discord_plan_artifact
+    from hermes_cli.discord_thread_context import DiscordThreadPlanExpansion
+
+    referenced_thread = "1511795999700680744"
+    bot_message = "1511799412559708283"
+    plan_text = "## Implementation plan\n" + "\n".join(
+        f"{idx}. Phase {idx}: preserve the durable artifact filepath."
+        for idx in range(1, 20)
+    )
+    artifact = persist_discord_plan_artifact(
+        plan_text,
+        thread_id=referenced_thread,
+        channel_id=referenced_thread,
+        guild_id="1502787243230756904",
+        parent_channel_id="1504252294495998043",
+        source_message_id=referenced_thread,
+        bot_message_ids=[bot_message],
+        force=True,
+    )
+    assert artifact is not None
+
+    def fake_expand(text):
+        assert referenced_thread in text
+        return [
+            DiscordThreadPlanExpansion(
+                source=referenced_thread,
+                thread_id=referenced_thread,
+                thread_name="plan-thread",
+                selected_message_ids=(bot_message,),
+                content="[Sligo Labs [bot] msg:1511799412559708283]\n## Plan\nFlattened fallback context.",
+                artifact_path=artifact.artifact_path,
+                content_sha256=artifact.content_sha256,
+            )
+        ]
+
+    monkeypatch.setattr(dwb, "expand_discord_thread_references", fake_expand)
+    board = dwb.set_goal(
+        thread_id="7794",
+        goal=f"Use plan from {referenced_thread}",
+        request_id="msg-7794",
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+        reviewer_id = kanban_db.create_task(
+            conn,
+            title="Review implementation",
+            assignee=dwb.ROLE_REVIEWER,
+            tenant=board.slug,
+        )
+        reviewer_context = kanban_codex_worker._build_reviewer_context(conn, reviewer_id)
+    finally:
+        conn.close()
+
+    planner_payload = json.loads(tasks[0].body or "{}")
+    assert planner_payload["discord_plan_artifacts"][0]["artifact_path"] == artifact.artifact_path
+    assert planner_payload["context_pack"]["plan_artifacts"][0]["artifact_path"] == artifact.artifact_path
+    pack = json.loads(Path(planner_payload["context_pack"]["json_path"]).read_text(encoding="utf-8"))
+    assert pack["plan_artifacts"][0]["artifact_path"] == artifact.artifact_path
+    assert artifact.artifact_path in Path(planner_payload["context_pack"]["markdown_path"]).read_text(
+        encoding="utf-8"
+    )
+    assert artifact.artifact_path in reviewer_context
+    assert "Durable Discord plan artifact paths:" in reviewer_context
+
+
 def test_start_planner_request_context_pack_version_only_changes_on_material_context(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

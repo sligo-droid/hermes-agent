@@ -30,6 +30,7 @@ from hermes_cli.discord_thread_context import (
     format_discord_thread_expansions,
     has_discord_thread_reference,
 )
+from hermes_cli.discord_plan_artifacts import lookup_discord_plan_artifact
 from hermes_cli.discord_worker_roles import (
     BOARD_RUN_SUMMARY_FILENAME,
     DEV_TICKET_BODY_GUIDANCE,
@@ -180,12 +181,18 @@ def context_pack_markdown_path(board: str) -> Path:
     return kanban_db.board_dir(board) / _CONTEXT_PACK_MARKDOWN_FILENAME
 
 
-def _context_pack_digest(root_goal: str, request: str, thread_context: str) -> str:
+def _context_pack_digest(
+    root_goal: str,
+    request: str,
+    thread_context: str,
+    plan_artifacts: Optional[list[dict[str, Any]]] = None,
+) -> str:
     payload = json.dumps(
         {
             "root_goal": str(root_goal or ""),
             "request": str(request or ""),
             "discord_thread_context": str(thread_context or ""),
+            "plan_artifacts": _normalize_discord_plan_artifacts(plan_artifacts),
         },
         sort_keys=True,
         ensure_ascii=False,
@@ -210,9 +217,62 @@ def _context_pack_source_message_ids(text: str) -> list[str]:
     return ids
 
 
+def _normalize_discord_plan_artifacts(value: Any) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in (value if isinstance(value, list) else []):
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("artifact_path") or "").strip()
+        artifact_id = str(item.get("artifact_id") or "").strip()
+        content_sha256 = str(item.get("content_sha256") or "").strip()
+        source_url = str(item.get("source_url") or "").strip()
+        thread_id = str(item.get("thread_id") or "").strip()
+        channel_id = str(item.get("channel_id") or "").strip()
+        source_message_id = str(item.get("source_message_id") or "").strip()
+        bot_message_ids = [str(mid).strip() for mid in item.get("bot_message_ids") or [] if str(mid).strip()]
+        matched_identifier = str(item.get("matched_identifier") or "").strip()
+        key = artifact_id or path or content_sha256
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        artifacts.append(
+            {
+                "artifact_id": artifact_id,
+                "artifact_path": path,
+                "content_sha256": content_sha256,
+                "kind": str(item.get("kind") or "discord_plan"),
+                "created_at": str(item.get("created_at") or ""),
+                "updated_at": str(item.get("updated_at") or ""),
+                "thread_id": thread_id,
+                "channel_id": channel_id,
+                "source_message_id": source_message_id,
+                "source_url": source_url,
+                "bot_message_ids": bot_message_ids,
+                "matched_identifier": matched_identifier,
+            }
+        )
+    return artifacts
+
+
+def _format_plan_artifact_markdown(item: dict[str, Any]) -> str:
+    path = str(item.get("artifact_path") or "").strip()
+    artifact_id = str(item.get("artifact_id") or "").strip()
+    source_url = str(item.get("source_url") or "").strip()
+    label = path or artifact_id or source_url
+    suffix = []
+    if artifact_id:
+        suffix.append(f"artifact_id={artifact_id}")
+    if source_url:
+        suffix.append(f"source={source_url}")
+    return f"- {label}" + (f" ({'; '.join(suffix)})" if suffix else "")
+
+
 def render_context_pack_markdown(pack: dict[str, Any]) -> str:
     warnings = [str(item) for item in pack.get("warnings") or [] if str(item).strip()]
     source_ids = [str(item) for item in pack.get("source_message_ids") or [] if str(item).strip()]
+    plan_artifacts = _normalize_discord_plan_artifacts(pack.get("plan_artifacts"))
+    plan_artifact_lines = [_format_plan_artifact_markdown(item) for item in plan_artifacts]
     lines = [
         "# Discord Goal Context Pack",
         "",
@@ -229,6 +289,9 @@ def render_context_pack_markdown(pack: dict[str, Any]) -> str:
         "",
         "## Source Message IDs",
         ", ".join(source_ids) if source_ids else "None detected.",
+        "",
+        "## Durable Discord Plan Artifacts",
+        "\n".join(plan_artifact_lines) if plan_artifact_lines else "None detected.",
         "",
         "## Warnings",
         "\n".join(f"- {item}" for item in warnings) if warnings else "None.",
@@ -265,12 +328,26 @@ def _context_pack_summary(board: str, pack: Optional[dict[str, Any]] = None) -> 
         "source_message_ids": [
             str(item) for item in data.get("source_message_ids") or [] if str(item).strip()
         ],
+        "plan_artifacts": _normalize_discord_plan_artifacts(data.get("plan_artifacts")),
     }
 
 
-def write_context_pack(board: str, *, root_goal: str, request: str, thread_context: str) -> dict[str, Any]:
+def write_context_pack(
+    board: str,
+    *,
+    root_goal: str,
+    request: str,
+    thread_context: str,
+    plan_artifacts: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
     existing = read_context_pack(board)
-    digest = _context_pack_digest(root_goal, request, thread_context)
+    normalized_artifacts = _normalize_discord_plan_artifacts(plan_artifacts)
+    digest = _context_pack_digest(
+        root_goal,
+        request,
+        thread_context,
+        normalized_artifacts,
+    )
     version = int(existing.get("version") or 0) if existing else 0
     if existing.get("content_digest") != digest:
         version += 1
@@ -288,6 +365,7 @@ def write_context_pack(board: str, *, root_goal: str, request: str, thread_conte
         "message_count": _context_pack_message_count(thread_context),
         "truncated": truncated,
         "source_message_ids": _context_pack_source_message_ids("\n".join([root_goal, request, thread_context])),
+        "plan_artifacts": normalized_artifacts,
         "warnings": warnings,
         "content_digest": digest,
     }
@@ -4734,6 +4812,7 @@ def start_planner_request(
         raw_request,
         str(thread_context or ""),
     )
+    plan_artifacts = _discord_plan_artifact_context(raw_request, worker)
     if request_changed:
         _clear_generated_summary_title(worker)
     if starts_new_goal_run:
@@ -4763,6 +4842,7 @@ def start_planner_request(
         root_goal=raw_request,
         request=raw_request,
         thread_context=thread_context_text,
+        plan_artifacts=plan_artifacts,
     )
     worker.update(
         {
@@ -4773,6 +4853,10 @@ def start_planner_request(
             "context_truncated": bool(context_pack.get("truncated")),
         }
     )
+    if plan_artifacts:
+        worker["discord_plan_artifacts"] = plan_artifacts
+    else:
+        worker.pop("discord_plan_artifacts", None)
     metadata = _update_worker_meta(board.slug, worker)
     planner_task_id = _ensure_planner_task(
         board.slug,
@@ -4906,6 +4990,65 @@ def _fetch_discord_message_reference(channel_id: str, message_id: str) -> Option
     return None
 
 
+def _discord_plan_artifact_context(request: str, worker: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve durable Discord plan artifacts relevant to this planner request.
+
+    Thread-reference expansion is the fallback path when a user says things like
+    "pursue this goalplan" after Hermes already posted a long plan.  The expanded
+    text is useful, but workers also need the original artifact filepath for
+    provenance and audit/review.  Look up artifacts by the current thread/source
+    identifiers plus explicit Discord message references in the request.
+    """
+    candidates: list[str] = []
+    for key in (
+        "thread_id",
+        "source_message_id",
+        "request_id",
+        "summary_message_id",
+        "chat_id",
+        "parent_channel_id",
+    ):
+        value = str(worker.get(key) or "").strip()
+        if value:
+            candidates.append(value)
+    for match in _DISCORD_MESSAGE_URL_RE.finditer(str(request or "")):
+        candidates.extend([match.group("channel"), match.group("message")])
+    request_text = str(request or "")
+    for match in _DISCORD_MESSAGE_ID_RE.finditer(request_text):
+        candidates.append(match.group("message"))
+    candidates.extend(re.findall(r"\b\d{16,24}\b", request_text))
+
+    artifacts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for identifier in candidates:
+        try:
+            record = lookup_discord_plan_artifact(identifier)
+        except Exception as exc:
+            logger.debug(
+                "discord_plan_artifact_lookup_failed identifier=%s error=%s",
+                identifier,
+                exc,
+                exc_info=True,
+            )
+            continue
+        if not record:
+            continue
+        data = record.as_dict(include_content=False)
+        data["matched_identifier"] = identifier
+        normalized = _normalize_discord_plan_artifacts([data])
+        if not normalized:
+            continue
+        item = normalized[0]
+        key = item.get("artifact_id") or item.get("artifact_path") or item.get("content_sha256")
+        if not key or key in seen:
+            continue
+        seen.add(str(key))
+        artifacts.append(item)
+        if len(artifacts) >= 8:
+            break
+    return artifacts
+
+
 def _discord_reference_context(request: str, worker: dict[str, Any]) -> list[dict[str, Any]]:
     """Resolve Discord message links/ids into planner-visible read context."""
     text = str(request or "")
@@ -4996,6 +5139,9 @@ def _ensure_planner_task(
                     existing,
                     thread_context_text,
                     context_pack=_context_pack_summary(board),
+                    discord_plan_artifacts=_normalize_discord_plan_artifacts(
+                        worker.get("discord_plan_artifacts")
+                    ),
                     acceptance_criteria=worker.get("criteria") or [],
                     planner_instructions=_planner_instructions(),
                 )
@@ -5007,6 +5153,9 @@ def _ensure_planner_task(
                 "request": planner_request,
                 "discord_thread_context": thread_context_text,
                 "context_pack": _context_pack_summary(board),
+                "discord_plan_artifacts": _normalize_discord_plan_artifacts(
+                    worker.get("discord_plan_artifacts")
+                ),
                 "discord_references": _discord_reference_context(planner_request, worker),
                 "planner_instructions": _planner_instructions(),
                 "acceptance_criteria": worker.get("criteria") or [],
@@ -5040,6 +5189,7 @@ def _set_planner_thread_context(
     thread_context: str,
     *,
     context_pack: Optional[dict[str, Any]] = None,
+    discord_plan_artifacts: Optional[list[dict[str, Any]]] = None,
     acceptance_criteria: Optional[list[Any]] = None,
     planner_instructions: Optional[list[str]] = None,
 ) -> None:
@@ -5059,6 +5209,11 @@ def _set_planner_thread_context(
     if context_pack:
         payload["context_pack"] = context_pack
         changed = True
+    if discord_plan_artifacts is not None:
+        normalized_artifacts = _normalize_discord_plan_artifacts(discord_plan_artifacts)
+        if payload.get("discord_plan_artifacts") != normalized_artifacts:
+            payload["discord_plan_artifacts"] = normalized_artifacts
+            changed = True
     if acceptance_criteria is not None and payload.get("acceptance_criteria") != acceptance_criteria:
         payload["acceptance_criteria"] = acceptance_criteria
         changed = True

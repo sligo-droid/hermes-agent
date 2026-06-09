@@ -494,6 +494,25 @@ def _build_reviewer_context(conn: Any, task_id: str) -> str:
     if context_paths:
         lines.append("Context pack paths:")
         lines.extend(f"- {path}" for path in context_paths)
+    plan_artifacts = [item for item in worker.get("discord_plan_artifacts") or [] if isinstance(item, dict)]
+    artifact_paths = []
+    seen_artifact_paths: set[str] = set()
+    for item in plan_artifacts:
+        path = str(item.get("artifact_path") or "").strip()
+        if not path or path in seen_artifact_paths:
+            continue
+        seen_artifact_paths.add(path)
+        artifact_id = str(item.get("artifact_id") or "").strip()
+        source_url = str(item.get("source_url") or "").strip()
+        suffix = []
+        if artifact_id:
+            suffix.append(f"artifact_id={artifact_id}")
+        if source_url:
+            suffix.append(f"source={source_url}")
+        artifact_paths.append(f"- {path}" + (f" ({'; '.join(suffix)})" if suffix else ""))
+    if artifact_paths:
+        lines.append("Durable Discord plan artifact paths:")
+        lines.extend(artifact_paths[:8])
     lines.append("")
 
     parent_rows = conn.execute(
