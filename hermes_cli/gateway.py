@@ -2737,6 +2737,7 @@ def systemd_restart(system: bool = False):
                 return
             if _systemd_service_is_start_limited(system=system):
                 return
+            return
 
         print(
             f"⚠ Graceful restart did not complete within {int(drain_timeout + 5)}s; "

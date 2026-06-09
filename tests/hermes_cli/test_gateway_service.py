@@ -879,6 +879,46 @@ class TestGatewaySystemServiceRouting:
         assert ("wait", False, 777) in calls
         assert "restarting gracefully (pid 777)" in capsys.readouterr().out.lower()
 
+    def test_systemd_restart_stops_after_graceful_handoff_deferred_by_watcher(self, monkeypatch, capsys):
+        calls = []
+
+        monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
+        monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 10.0)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 654)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout: calls.append(("graceful", pid, timeout)) or True,
+        )
+        monkeypatch.setattr(gateway_cli, "_systemd_service_is_start_limited", lambda system=False: False)
+
+        def fake_run_systemctl(args, **kwargs):
+            calls.append(tuple(args))
+            return SimpleNamespace(stdout="", returncode=0)
+
+        monkeypatch.setattr(gateway_cli, "_run_systemctl", fake_run_systemctl)
+
+        def fake_wait(system=False, previous_pid=None):
+            calls.append(("wait", system, previous_pid))
+            print("⏳ User service restart deferred: active_agents=1; blocking_direct_children=none")
+            return False
+
+        monkeypatch.setattr(gateway_cli, "_wait_for_systemd_service_restart", fake_wait)
+
+        gateway_cli.systemd_restart()
+
+        assert calls == [
+            ("graceful", 654, 15.0),
+            ("reset-failed", gateway_cli.get_service_name()),
+            ("restart", gateway_cli.get_service_name()),
+            ("wait", False, 654),
+        ]
+        out = capsys.readouterr().out.lower()
+        assert "restart deferred" in out
+        assert "forcing a service restart" not in out
+
     def test_wait_for_systemd_restart_waits_for_runtime_running(self, monkeypatch, capsys):
         monkeypatch.setattr(
             gateway_cli,
