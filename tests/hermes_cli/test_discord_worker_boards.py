@@ -273,6 +273,73 @@ def test_ensure_code_island_blocks_active_board_on_checkout_error(monkeypatch, t
     assert "not a git repository" in worker["blocked_reason"]
 
 
+def test_ensure_code_island_logs_active_error_for_active_board(monkeypatch, tmp_path, caplog):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    board = dwb.set_goal(
+        thread_id="12350",
+        goal="Ship it",
+        project_context={"project_path": str(project)},
+    )
+
+    def fake_ensure(worker):
+        worker["code_island_ready"] = False
+        worker["code_island_pending"] = False
+        worker["code_island_error"] = "checkout failed"
+
+    monkeypatch.setattr(dwb, "_ensure_code_island", fake_ensure)
+
+    with caplog.at_level("INFO", logger="hermes_cli.discord_worker_boards"):
+        assert dwb.ensure_code_island_for_board(board.slug) is False
+
+    assert f"discord_worker_code_island board={board.slug}" in caplog.text
+    assert "error=True" in caplog.text
+
+
+def test_ensure_code_island_suppresses_terminal_stale_error_health(monkeypatch, tmp_path, caplog):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    board = dwb.set_goal(
+        thread_id="12351",
+        goal="Ship it",
+        project_context={"project_path": str(project)},
+    )
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "code_island_ready": False,
+            "code_island_pending": False,
+            "code_island_error": "stale historical checkout failure",
+        },
+    )
+
+    def fake_ensure(worker):
+        worker["code_island_ready"] = False
+        worker["code_island_pending"] = False
+
+    monkeypatch.setattr(dwb, "_ensure_code_island", fake_ensure)
+
+    with caplog.at_level("INFO", logger="hermes_cli.discord_worker_boards"):
+        assert dwb.ensure_code_island_for_board(board.slug) is False
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["goal_status"] == "done"
+    assert worker["phase"] == "complete"
+    assert worker["code_island_error"] == "stale historical checkout failure"
+    assert "blocked_reason" not in worker
+    assert f"discord_worker_code_island board={board.slug}" in caplog.text
+    assert "error=False" in caplog.text
+
+
 def test_prepare_existing_code_island_quarantines_plans_before_recreate(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
