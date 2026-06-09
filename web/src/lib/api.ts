@@ -341,6 +341,15 @@ export const api = {
       `/api/plugins/kanban/command-center/snapshot${suffix ? `?${suffix}` : ""}`,
     );
   },
+  createCommandCenterAnnotation: (workItemId: string, body: CommandCenterAnnotationRequest) =>
+    fetchJSON<CommandCenterAnnotationResponse>(
+      `/api/plugins/kanban/command-center/work-items/${encodeURIComponent(workItemId)}/annotations`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
   archiveKanbanBoard: (slug: string) =>
     fetchJSON<{ result: Record<string, unknown>; current: string }>(
       `/api/plugins/kanban/boards/${encodeURIComponent(slug)}`,
@@ -965,6 +974,41 @@ export interface CommandCenterExecution {
   run_count?: number;
 }
 
+export type CommandCenterAnnotationMode = "note" | "correction";
+
+export interface CommandCenterAnnotation {
+  id: number;
+  work_item_id: string;
+  mode: CommandCenterAnnotationMode;
+  text: string;
+  title?: string | null;
+  actor?: string | null;
+  created_at?: string | number | null;
+  target_kind?: string | null;
+  target_id?: string | null;
+  previous_title?: string | null;
+  previous_summary?: string | null;
+  previous_status?: string | null;
+  source_ref?: Record<string, unknown> | null;
+  execution_snapshot?: Record<string, unknown> | null;
+  pause_result?: Record<string, unknown> | null;
+}
+
+export interface CommandCenterAnnotationRequest {
+  mode: CommandCenterAnnotationMode;
+  text: string;
+  title?: string;
+  pause_current?: boolean;
+}
+
+export interface CommandCenterAnnotationResponse {
+  annotation: CommandCenterAnnotation;
+  work_item_id: string;
+  followup_task: Record<string, unknown> | null;
+  worker_url: string | null;
+  errors?: Record<string, string>;
+}
+
 export interface CommandCenterWorkItem {
   id: string;
   title: string;
@@ -991,6 +1035,10 @@ export interface CommandCenterWorkItem {
     undo_followup_action?: string | null;
   };
   execution?: CommandCenterExecution | null;
+  annotations?: CommandCenterAnnotation[];
+  operator_note_count?: number;
+  latest_operator_note?: CommandCenterAnnotation | null;
+  latest_correction?: CommandCenterAnnotation | null;
   runs?: CommandCenterRun[];
   artifacts?: Array<{ kind: string; label: string; url?: string | null }>;
   source_excerpts?: SelfImprovementProposalCard["source_excerpts"];

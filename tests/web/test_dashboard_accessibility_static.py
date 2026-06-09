@@ -211,6 +211,77 @@ def test_command_center_worker_url_has_real_row_action_link():
     assert 'to="/workers"' not in card_source
 
 
+def test_command_center_annotation_controls_are_accessible_and_do_not_open_cards():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    api_source = (ROOT / "web/src/lib/api.ts").read_text(encoding="utf-8")
+    card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
+    button_source = source.split("function AnnotationButton", 1)[1].split("function AnnotationSummary", 1)[0]
+
+    assert "createCommandCenterAnnotation" in api_source
+    assert 'CommandCenterAnnotationMode = "note" | "correction"' in api_source
+    assert "annotations?: CommandCenterAnnotation[];" in api_source
+    assert "operator_note_count?: number;" in api_source
+    assert "latest_operator_note?: CommandCenterAnnotation | null;" in api_source
+    assert "latest_correction?: CommandCenterAnnotation | null;" in api_source
+    assert "<AnnotationButton item={item} mode=\"note\" onOpen={onAnnotate} />" in card_source
+    assert "<AnnotationButton item={item} mode=\"correction\" onOpen={onAnnotate} />" in card_source
+    assert "Add operator note" in button_source
+    assert "Correct or redirect work" in button_source
+    assert "event.stopPropagation();" in button_source
+    assert "onAnnotate={openAnnotationDraft}" in source
+
+
+def test_command_center_annotation_modal_accessibility_and_pause_condition():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    modal_source = source.split("function AnnotationModal", 1)[1].split("function SourceBadge", 1)[0]
+
+    assert "useModalBehavior({ open: true, onClose })" in modal_source
+    assert 'role="dialog"' in modal_source
+    assert 'aria-modal="true"' in modal_source
+    assert "aria-labelledby={titleId}" in modal_source
+    assert "aria-describedby={descriptionId}" in modal_source
+    assert "data-autofocus" in modal_source
+    assert "Note / clarification" in modal_source
+    assert "Correction / redirect" in modal_source
+    assert "Annotation text" in modal_source
+    assert "required" in modal_source
+    assert "Optional correction title" in modal_source
+    assert 'selectedMode === "correction" ?' in modal_source
+    assert "const canPauseCurrent = isRunningWorkItem(item);" in modal_source
+    assert 'selectedMode === "correction" && canPauseCurrent ?' in modal_source
+    assert "Pause current work while applying this correction" in modal_source
+    assert "pause_current: selectedMode === \"correction\" && canPauseCurrent && pauseCurrent" in modal_source
+
+
+def test_command_center_annotations_render_as_safe_plain_text():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    summary_source = source.split("function AnnotationSummary", 1)[1].split("function AnnotationModal", 1)[0]
+
+    assert "<AnnotationSummary item={item} />" in source
+    assert "Latest correction" in summary_source
+    assert "{latestCorrection.title}" in summary_source
+    assert "{latestCorrection.text}" in summary_source
+    assert "operator {noteCount === 1 ? \"note\" : \"notes\"}" in summary_source
+    assert "Latest note: {latestNote.text}" in summary_source
+    assert "dangerouslySetInnerHTML" not in source
+    assert "marked(" not in source
+    assert "markdown" not in summary_source.lower()
+
+
+def test_command_center_annotation_submit_surfaces_partial_failures_and_refreshes():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    submit_source = source.split("const submitAnnotation = useCallback", 1)[1].split("const runActionForItem = useCallback", 1)[0]
+
+    assert "await api.createCommandCenterAnnotation(annotationDraft.item.id, payload);" in submit_source
+    assert "await refresh();" in submit_source
+    assert "result.errors" in submit_source
+    assert "followup_task" in submit_source
+    assert "pause_current" in source
+    assert "setAnnotationError(err instanceof Error ? err.message : String(err));" in submit_source
+    assert "setError(warnings);" in submit_source
+    assert "role=\"status\"" in source
+
+
 def test_sligo_shell_has_no_duplicate_top_tab_navigation():
     source = (ROOT / "web/src/App.tsx").read_text(encoding="utf-8")
     shell_source = source.split("function SligoSurfaceShell", 1)[1].split("export default function App", 1)[0]
