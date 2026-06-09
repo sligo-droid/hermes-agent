@@ -1086,6 +1086,12 @@ def _code_island_blocker(worker: dict[str, Any]) -> str:
     return ""
 
 
+def _active_code_island_health_error(worker: dict[str, Any], *, active_pipeline: bool) -> bool:
+    if not active_pipeline:
+        return False
+    return bool(_code_island_blocker(worker))
+
+
 def _block_worker_board_for_code_island(board: str, worker: dict[str, Any], reason: str) -> None:
     worker.update(
         {
@@ -1212,6 +1218,7 @@ def ensure_code_island_for_board(board: str) -> bool:
         )
     elapsed_ms = int((time.time() - started) * 1000)
     blocker = _code_island_blocker(worker) if active_pipeline else ""
+    health_error = _active_code_island_health_error(worker, active_pipeline=active_pipeline)
     if blocker:
         _block_worker_board_for_code_island(board, worker, blocker)
     logger.info(
@@ -1220,7 +1227,7 @@ def ensure_code_island_for_board(board: str) -> bool:
         bool(worker.get("code_island_ready")),
         bool(worker.get("code_island_pending")),
         elapsed_ms,
-        bool(worker.get("code_island_error")),
+        health_error,
     )
     if blocker:
         return False
