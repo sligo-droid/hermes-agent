@@ -355,7 +355,20 @@ def _initial_request(card: dict[str, Any]) -> str:
     title = str(card.get("title") or "Self-improvement proposal").strip()
     summary = str(card.get("summary") or "").strip()
     body = str(card.get("body") or "").strip()
-    return "\n\n".join(part for part in (title, summary, body) if part).strip()
+    annotation_context = _operator_annotation_context(card)
+    return "\n\n".join(part for part in (title, summary, body, annotation_context) if part).strip()
+
+
+def _operator_annotation_context(card: dict[str, Any]) -> str:
+    proposal_id = str(card.get("proposal_id") or "").strip()
+    if not proposal_id:
+        return ""
+    try:
+        from hermes_cli import command_center_annotations
+
+        return command_center_annotations.operator_context_block(f"self-improvement:{proposal_id}")
+    except Exception:
+        return ""
 
 
 def _project_context(card: dict[str, Any], channel_id: str) -> dict[str, Any]:

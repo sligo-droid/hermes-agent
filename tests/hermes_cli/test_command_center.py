@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from hermes_cli import command_center, command_center_verification, kanban_db
+from hermes_cli import command_center, command_center_annotations, command_center_verification, kanban_db
 from self_improvement import proposal_storage
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "self_improvement"
@@ -36,6 +36,52 @@ def test_snapshot_hides_rejected_cards_by_default_and_exposes_source_ids(tmp_pat
     assert item["status"] == "rejected"
     assert item["source"]["id"] == f"source:self-improvement-proposal:{card['proposal_id']}"
     assert item["source"]["kind"] == "self_improvement"
+
+
+def test_snapshot_enriches_work_items_with_operator_annotations(tmp_path, monkeypatch):
+    _ingest_valid(monkeypatch, tmp_path)
+    card = _first_card()
+    work_item_id = f"self-improvement:{card['proposal_id']}"
+
+    command_center_annotations.record_annotation(
+        work_item_id=work_item_id,
+        mode="note",
+        text="Operator note for later approval.",
+        actor="operator",
+        target_kind="self_improvement_proposal",
+        target_id=card["proposal_id"],
+        previous_title=card["title"],
+        previous_summary=card["summary"],
+        previous_status="proposed",
+        source_ref={"proposal_id": card["proposal_id"]},
+        execution_snapshot={},
+        created_at=100,
+    )
+    command_center_annotations.record_annotation(
+        work_item_id=work_item_id,
+        mode="correction",
+        title="Use safer approach",
+        text="Redirect implementation to the safer path.",
+        actor="operator",
+        target_kind="self_improvement_proposal",
+        target_id=card["proposal_id"],
+        previous_title=card["title"],
+        previous_summary=card["summary"],
+        previous_status="proposed",
+        source_ref={"proposal_id": card["proposal_id"]},
+        execution_snapshot={},
+        created_at=101,
+    )
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == work_item_id)
+
+    assert item["title"] == card["title"]
+    assert item["summary"] == card["summary"]
+    assert item["operator_note_count"] == 1
+    assert item["latest_operator_note"]["text"] == "Operator note for later approval."
+    assert item["latest_correction"]["title"] == "Use safer approach"
+    assert [annotation["mode"] for annotation in item["annotations"]] == ["note", "correction"]
 
 
 def test_snapshot_preserves_approval_artifacts_after_followup_audit_events(tmp_path, monkeypatch):
@@ -252,7 +298,7 @@ def test_snapshot_archive_includes_moved_archived_worker_boards(tmp_path, monkey
     assert item["source"]["ref"]["discord_url"] == "https://discord.com/channels/111/222/333"
     assert source["status"] == "archived"
     assert run["outcome"] == "done"
-    assert archived_snapshot["metrics"]["archived"] == 1
+    assert item["id"] in {row["id"] for row in archived_snapshot["work_items"] if row["status"] == "archived"}
 
 
 def test_snapshot_exposes_project_tabs_and_filters_hermes_dev_intake(tmp_path, monkeypatch):

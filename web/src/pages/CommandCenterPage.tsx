@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import type { FormEvent } from "react";
 import { Link, useLocation } from "react-router-dom";
 import {
   Activity,
@@ -12,7 +13,9 @@ import {
   Clock3,
   ExternalLink,
   Inbox,
+  MessageSquarePlus,
   PauseCircle,
+  PencilLine,
   RefreshCw,
   RotateCcw,
   Wrench,
@@ -22,18 +25,21 @@ import { Card, CardContent, CardHeader, CardTitle } from "@nous-research/ui/ui/c
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { api } from "@/lib/api";
 import type {
+  CommandCenterAnnotationMode,
   CommandCenterProject,
   CommandCenterRun,
   CommandCenterSnapshot,
   CommandCenterSource,
   CommandCenterWorkItem,
 } from "@/lib/api";
+import { useModalBehavior } from "@/hooks/useModalBehavior";
 import { cn } from "@/lib/utils";
 
 type ViewKey = "overview" | "inbox" | "work" | "completed" | "archive" | "runs" | "recommendations" | "sources";
 type PaginatedViewKey = "overview" | "inbox" | "work" | "completed" | "archive";
 type ActionKind = "approve" | "pause" | "replay" | "repair" | "undo" | "archive";
 type ActiveAction = { ids: string[]; kind: ActionKind };
+type AnnotationDraft = { item: CommandCenterWorkItem; mode: CommandCenterAnnotationMode };
 type InboxPageItem = { type: "work"; item: CommandCenterWorkItem } | { type: "source"; source: CommandCenterSource };
 type VisualStatus = "proposed" | "queued" | "running" | "review" | "blocked" | "mega_blocked" | "paused" | "shipped" | "rejected" | "archived" | "unknown";
 type CommandCenterPagination = { project: string; pages: Record<PaginatedViewKey, number> };
@@ -365,6 +371,157 @@ function ActionButton({
   );
 }
 
+function AnnotationButton({
+  item,
+  mode,
+  onOpen,
+}: {
+  item: CommandCenterWorkItem;
+  mode: CommandCenterAnnotationMode;
+  onOpen: (item: CommandCenterWorkItem, mode: CommandCenterAnnotationMode) => void;
+}) {
+  const config = mode === "note"
+    ? { label: "Add operator note", short: "Note", icon: MessageSquarePlus }
+    : { label: "Correct or redirect work", short: "Correct", icon: PencilLine };
+  const Icon = config.icon;
+  return (
+    <button
+      aria-label={`${config.label} for ${item.title || item.id}`}
+      className="inline-flex h-8 items-center gap-1.5 rounded-full border border-white/10 px-2.5 text-xs font-semibold text-slate-200 transition hover:border-cyan-100/35 hover:bg-cyan-100/[0.08] hover:text-cyan-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/30"
+      onClick={(event) => {
+        event.stopPropagation();
+        onOpen(item, mode);
+      }}
+      type="button"
+    >
+      <Icon aria-hidden="true" className="h-3.5 w-3.5" />
+      {config.short}
+    </button>
+  );
+}
+
+function AnnotationSummary({ item }: { item: CommandCenterWorkItem }) {
+  const latestCorrection = item.latest_correction;
+  const latestNote = item.latest_operator_note;
+  const noteCount = item.operator_note_count || 0;
+  return (
+    <>
+      {latestCorrection ? (
+        <div className="mt-3 rounded-xl border border-amber-200/25 bg-amber-300/[0.08] px-3 py-2 text-left">
+          <div className="text-[0.65rem] font-black uppercase tracking-[0.18em] text-amber-100">Latest correction</div>
+          {latestCorrection.title ? <div className="mt-1 text-xs font-semibold text-amber-50">{latestCorrection.title}</div> : null}
+          <p className="mt-1 line-clamp-3 text-xs leading-5 text-amber-50/85">{latestCorrection.text}</p>
+        </div>
+      ) : null}
+      {noteCount > 0 ? (
+        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+          <span className="rounded-full border border-cyan-100/20 bg-cyan-100/[0.06] px-2 py-0.5 font-semibold text-cyan-50">
+            {noteCount} operator {noteCount === 1 ? "note" : "notes"}
+          </span>
+          {latestNote ? <span className="line-clamp-1 min-w-0 flex-1 text-slate-400">Latest note: {latestNote.text}</span> : null}
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function AnnotationModal({
+  busy,
+  error,
+  item,
+  mode,
+  onClose,
+  onSubmit,
+}: {
+  busy: boolean;
+  error: string | null;
+  item: CommandCenterWorkItem;
+  mode: CommandCenterAnnotationMode;
+  onClose: () => void;
+  onSubmit: (payload: { mode: CommandCenterAnnotationMode; text: string; title?: string; pause_current?: boolean }) => Promise<void>;
+}) {
+  const [selectedMode, setSelectedMode] = useState<CommandCenterAnnotationMode>(mode);
+  const [text, setText] = useState("");
+  const [title, setTitle] = useState("");
+  const [pauseCurrent, setPauseCurrent] = useState(false);
+  const modalRef = useModalBehavior({ open: true, onClose });
+  const canPauseCurrent = isRunningWorkItem(item);
+  const titleId = useId();
+  const descriptionId = useId();
+  const textareaId = useId();
+  const correctionTitleId = useId();
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const cleanText = text.trim();
+    if (!cleanText || busy) return;
+    await onSubmit({
+      mode: selectedMode,
+      text: cleanText,
+      title: selectedMode === "correction" && title.trim() ? title.trim() : undefined,
+      pause_current: selectedMode === "correction" && canPauseCurrent && pauseCurrent,
+    });
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 py-6" onClick={onClose} role="presentation">
+      <div
+        ref={modalRef}
+        aria-describedby={descriptionId}
+        aria-labelledby={titleId}
+        aria-modal="true"
+        className="w-full max-w-lg rounded-2xl border border-white/10 bg-[#08090a] p-5 text-slate-100 shadow-2xl shadow-black/50"
+        onClick={(event) => event.stopPropagation()}
+        role="dialog"
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h2 className="text-lg font-semibold text-white" id={titleId}>Add Operator Annotation</h2>
+            <p className="mt-1 text-sm leading-5 text-slate-400" id={descriptionId}>Record a note or correction for {item.title} without changing the original title or summary.</p>
+          </div>
+          <button className="rounded-full border border-white/10 px-3 py-1 text-xs font-semibold text-slate-300 hover:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/30" onClick={onClose} type="button">Close</button>
+        </div>
+        <form className="mt-5 grid gap-4" onSubmit={submit}>
+          <fieldset className="grid gap-2">
+            <legend className="text-xs font-bold uppercase tracking-[0.16em] text-slate-400">Annotation mode</legend>
+            <label className="inline-flex items-center gap-2 text-sm text-slate-200">
+              <input checked={selectedMode === "note"} name="annotation-mode" onChange={() => setSelectedMode("note")} type="radio" />
+              Note / clarification
+            </label>
+            <label className="inline-flex items-center gap-2 text-sm text-slate-200">
+              <input checked={selectedMode === "correction"} name="annotation-mode" onChange={() => setSelectedMode("correction")} type="radio" />
+              Correction / redirect
+            </label>
+          </fieldset>
+          {selectedMode === "correction" ? (
+            <label className="grid gap-1 text-sm font-semibold text-slate-200" htmlFor={correctionTitleId}>
+              Optional correction title
+              <input className="rounded-xl border border-white/10 bg-slate-950 px-3 py-2 text-sm text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/30" id={correctionTitleId} maxLength={200} onChange={(event) => setTitle(event.target.value)} value={title} />
+            </label>
+          ) : null}
+          <label className="grid gap-1 text-sm font-semibold text-slate-200" htmlFor={textareaId}>
+            Annotation text <span className="text-red-200">required</span>
+            <textarea className="min-h-32 rounded-xl border border-white/10 bg-slate-950 px-3 py-2 text-sm leading-6 text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/30" data-autofocus id={textareaId} maxLength={4000} onChange={(event) => setText(event.target.value)} required value={text} />
+          </label>
+          {selectedMode === "correction" && canPauseCurrent ? (
+            <label className="inline-flex items-start gap-2 rounded-xl border border-orange-200/20 bg-orange-300/[0.06] px-3 py-2 text-sm text-orange-50">
+              <input checked={pauseCurrent} className="mt-1" onChange={(event) => setPauseCurrent(event.target.checked)} type="checkbox" />
+              Pause current work while applying this correction
+            </label>
+          ) : null}
+          {error ? <div className="rounded-xl border border-red-300/30 bg-red-950/30 px-3 py-2 text-sm text-red-100" role="alert">{error}</div> : null}
+          <div className="flex flex-wrap justify-end gap-2">
+            <button className="rounded-full border border-white/10 px-4 py-2 text-sm font-semibold text-slate-300 hover:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" onClick={onClose} type="button">Cancel</button>
+            <button className="inline-flex items-center gap-2 rounded-full border border-cyan-100/40 bg-cyan-300 px-4 py-2 text-sm font-semibold text-cyan-950 hover:bg-cyan-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/60 disabled:cursor-not-allowed disabled:opacity-60" disabled={busy || !text.trim()} type="submit">
+              {busy ? <Spinner /> : null} Submit annotation
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function SourceBadge({ source }: { source: CommandCenterSource }) {
   const label = source.kind === "self_improvement" ? "self-improvement" : source.kind === "discord" ? "discord" : source.kind.replaceAll("_", " ");
   return (
@@ -406,6 +563,7 @@ function WorkItemCard({
   multiSelectActionCommon,
   multiSelectActionUnion,
   onAction,
+  onAnnotate,
   onToggleSelected,
   selected,
   selectionActive,
@@ -416,6 +574,7 @@ function WorkItemCard({
   multiSelectActionCommon: Set<ActionKind>;
   multiSelectActionUnion: Set<ActionKind>;
   onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
+  onAnnotate: (item: CommandCenterWorkItem, mode: CommandCenterAnnotationMode) => void;
   onToggleSelected: (id: string) => void;
   selected: boolean;
   selectionActive: boolean;
@@ -492,6 +651,7 @@ function WorkItemCard({
         ) : null}
       </div>
       <div className="mt-3 block w-full text-left">
+        <AnnotationSummary item={item} />
         <p className="text-sm leading-6 text-slate-300">{item.summary || item.body_preview || "No summary yet."}</p>
       </div>
       {repairBlocked ? (
@@ -515,6 +675,8 @@ function WorkItemCard({
             Ticket <ExternalLink className="h-3.5 w-3.5" /><span className="sr-only">opens in a new tab</span>
           </a>
         )}
+        <AnnotationButton item={item} mode="note" onOpen={onAnnotate} />
+        <AnnotationButton item={item} mode="correction" onOpen={onAnnotate} />
         {rowBusy && activeAction && (
           <span className="inline-flex h-9 items-center gap-2 rounded-full border border-cyan-100/25 bg-cyan-100/10 px-3 text-xs font-semibold text-cyan-50" aria-live="polite">
             <Spinner /> {ACTION_PROGRESS_LABELS[activeAction.kind]}…
@@ -634,6 +796,7 @@ function WorkList({
   multiSelectActionCommon,
   multiSelectActionUnion,
   onAction,
+  onAnnotate,
   onToggleSelected,
   selectedIds,
   selectionActive,
@@ -646,6 +809,7 @@ function WorkList({
   multiSelectActionCommon: Set<ActionKind>;
   multiSelectActionUnion: Set<ActionKind>;
   onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
+  onAnnotate: (item: CommandCenterWorkItem, mode: CommandCenterAnnotationMode) => void;
   onToggleSelected: (id: string) => void;
   selectedIds: Set<string>;
   selectionActive: boolean;
@@ -662,6 +826,7 @@ function WorkList({
           multiSelectActionCommon={multiSelectActionCommon}
           multiSelectActionUnion={multiSelectActionUnion}
           onAction={onAction}
+          onAnnotate={onAnnotate}
           onToggleSelected={onToggleSelected}
           selected={selectedIds.has(item.id)}
           selectionActive={selectionActive}
@@ -679,6 +844,7 @@ function InboxList({
   multiSelectActionCommon,
   multiSelectActionUnion,
   onAction,
+  onAnnotate,
   onToggleSelected,
   selectedIds,
   selectionActive,
@@ -689,6 +855,7 @@ function InboxList({
   multiSelectActionCommon: Set<ActionKind>;
   multiSelectActionUnion: Set<ActionKind>;
   onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
+  onAnnotate: (item: CommandCenterWorkItem, mode: CommandCenterAnnotationMode) => void;
   onToggleSelected: (id: string) => void;
   selectedIds: Set<string>;
   selectionActive: boolean;
@@ -704,6 +871,7 @@ function InboxList({
           multiSelectActionCommon={multiSelectActionCommon}
           multiSelectActionUnion={multiSelectActionUnion}
           onAction={onAction}
+          onAnnotate={onAnnotate}
           onToggleSelected={onToggleSelected}
           selected={selectedIds.has(entry.item.id)}
           selectionActive={selectionActive}
@@ -722,6 +890,7 @@ function OverviewWorkList({
   multiSelectActionCommon,
   multiSelectActionUnion,
   onAction,
+  onAnnotate,
   onToggleSelected,
   selectedIds,
   selectionActive,
@@ -732,6 +901,7 @@ function OverviewWorkList({
   multiSelectActionCommon: Set<ActionKind>;
   multiSelectActionUnion: Set<ActionKind>;
   onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
+  onAnnotate: (item: CommandCenterWorkItem, mode: CommandCenterAnnotationMode) => void;
   onToggleSelected: (id: string) => void;
   selectedIds: Set<string>;
   selectionActive: boolean;
@@ -748,6 +918,7 @@ function OverviewWorkList({
       multiSelectActionCommon={multiSelectActionCommon}
       multiSelectActionUnion={multiSelectActionUnion}
       onAction={onAction}
+      onAnnotate={onAnnotate}
       onToggleSelected={onToggleSelected}
       selected={selectedIds.has(item.id)}
       selectionActive={selectionActive}
@@ -780,6 +951,10 @@ export default function CommandCenterPage() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [activeAction, setActiveAction] = useState<ActiveAction | null>(null);
+  const [annotationDraft, setAnnotationDraft] = useState<AnnotationDraft | null>(null);
+  const [annotationBusy, setAnnotationBusy] = useState(false);
+  const [annotationError, setAnnotationError] = useState<string | null>(null);
+  const [annotationStatus, setAnnotationStatus] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [pagination, setPagination] = useState<CommandCenterPagination>(() => ({
     project: selectedProject,
@@ -955,6 +1130,40 @@ export default function CommandCenterPage() {
       return next;
     });
   }, [allVisibleSelected, visibleSelectableIds]);
+  const openAnnotationDraft = useCallback((item: CommandCenterWorkItem, mode: CommandCenterAnnotationMode) => {
+    setAnnotationDraft({ item, mode });
+    setAnnotationError(null);
+    setAnnotationStatus(null);
+  }, []);
+  const closeAnnotationDraft = useCallback(() => {
+    if (annotationBusy) return;
+    setAnnotationDraft(null);
+    setAnnotationError(null);
+  }, [annotationBusy]);
+  const submitAnnotation = useCallback(async (payload: { mode: CommandCenterAnnotationMode; text: string; title?: string; pause_current?: boolean }) => {
+    if (!annotationDraft || annotationBusy) return;
+    setAnnotationBusy(true);
+    setAnnotationError(null);
+    setError(null);
+    try {
+      const result = await api.createCommandCenterAnnotation(annotationDraft.item.id, payload);
+      await refresh();
+      const warnings = result.errors ? Object.entries(result.errors).map(([key, value]) => `${key}: ${value}`).join("; ") : "";
+      const statusParts = [
+        payload.mode === "correction" ? "Correction recorded." : "Note recorded.",
+        result.followup_task ? "Follow-up task created." : "",
+        result.worker_url ? "Worker link returned." : "",
+        warnings ? `Warning: ${warnings}` : "",
+      ].filter(Boolean);
+      setAnnotationStatus(statusParts.join(" "));
+      setAnnotationDraft(null);
+      if (warnings) setError(warnings);
+    } catch (err) {
+      setAnnotationError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAnnotationBusy(false);
+    }
+  }, [annotationBusy, annotationDraft, refresh]);
   const runActionForItem = useCallback(async (kind: ActionKind, item: CommandCenterWorkItem) => {
     const proposalId = item.decision?.proposal_id;
     const board = item.execution?.board;
@@ -1030,6 +1239,15 @@ export default function CommandCenterPage() {
         </Card>
       )}
 
+      {annotationStatus && (
+        <Card className="border-cyan-100/25 bg-cyan-950/20">
+          <CardContent className="flex items-start gap-3 py-4 text-sm text-cyan-50" role="status">
+            <Check className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>{annotationStatus}</span>
+          </CardContent>
+        </Card>
+      )}
+
       {loading && !snapshot ? (
         <Card className="border-white/10 bg-white/[0.035]">
           <CardContent className="flex items-center justify-center gap-3 py-20 text-slate-300">
@@ -1059,35 +1277,35 @@ export default function CommandCenterPage() {
           )}
           {activeView === "overview" && (
             <>
-              <OverviewWorkList activeAction={activeAction} emptyMessage="No recent decisions, worker boards, or active work yet." items={pagedOverviewItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+              <OverviewWorkList activeAction={activeAction} emptyMessage="No recent decisions, worker boards, or active work yet." items={pagedOverviewItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
               <PaginationControls label="overview" onPageChange={(page) => setPage("overview", page)} page={pages.overview} totalItems={pageTotals.overview} />
             </>
           )}
           {activeView === "inbox" && (
             <>
-              <InboxList activeAction={activeAction} emptyMessage="Inbox is clear. Finished, blocked, and archiveable boards stay on Overview or Active." items={pagedInboxItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+              <InboxList activeAction={activeAction} emptyMessage="Inbox is clear. Finished, blocked, and archiveable boards stay on Overview or Active." items={pagedInboxItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
               <PaginationControls label="inbox" onPageChange={(page) => setPage("inbox", page)} page={pages.inbox} totalItems={pageTotals.inbox} />
             </>
           )}
           {activeView === "work" && (
             <>
-              <WorkList activeAction={activeAction} emptyMessage="No active or recently shipped work is visible." items={pagedWorkItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+              <WorkList activeAction={activeAction} emptyMessage="No active or recently shipped work is visible." items={pagedWorkItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
               <PaginationControls label="work" onPageChange={(page) => setPage("work", page)} page={pages.work} totalItems={pageTotals.work} />
             </>
           )}
           {activeView === "completed" && (
             <>
-              <WorkList activeAction={activeAction} emptyLabel="completed items" emptyMessage="Completed and shipped work items will appear here." items={pagedCompletedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+              <WorkList activeAction={activeAction} emptyLabel="completed items" emptyMessage="Completed and shipped work items will appear here." items={pagedCompletedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
               <PaginationControls label="completed" onPageChange={(page) => setPage("completed", page)} page={pages.completed} totalItems={pageTotals.completed} />
             </>
           )}
           {activeView === "archive" && (
             <>
-              <WorkList activeAction={activeAction} emptyLabel="archived items" emptyMessage="Archived worker boards and work items will appear here." items={pagedArchivedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} showActions={false} />
+              <WorkList activeAction={activeAction} emptyLabel="archived items" emptyMessage="Archived worker boards and work items will appear here." items={pagedArchivedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} showActions={false} />
               <PaginationControls label="archive" onPageChange={(page) => setPage("archive", page)} page={pages.archive} totalItems={pageTotals.archive} />
             </>
           )}
-          {activeView === "recommendations" && <WorkList activeAction={activeAction} emptyLabel="recommendations" emptyMessage="No self-improvement recommendations are waiting." items={recommendations} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />}
+          {activeView === "recommendations" && <WorkList activeAction={activeAction} emptyLabel="recommendations" emptyMessage="No self-improvement recommendations are waiting." items={recommendations} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />}
           {activeView === "runs" && (
             <div className="grid gap-3">
               {snapshot?.runs.length ? snapshot.runs.map((run) => (
@@ -1104,6 +1322,17 @@ export default function CommandCenterPage() {
           )}
         </section>
       )}
+
+      {annotationDraft ? (
+        <AnnotationModal
+          busy={annotationBusy}
+          error={annotationError}
+          item={annotationDraft.item}
+          mode={annotationDraft.mode}
+          onClose={closeAnnotationDraft}
+          onSubmit={submitAnnotation}
+        />
+      ) : null}
 
     </div>
   );

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_cli import command_center_annotations
 from hermes_cli import kanban_db as kb
 
 
@@ -2021,6 +2022,118 @@ def test_worker_context_includes_parent_results_and_comments(kanban_home):
     assert "CLARIFICATION_MARKER" in ctx
     assert c in ctx
     assert "child" in ctx
+
+
+def test_worker_context_includes_board_work_item_annotations_without_mutating_body(kanban_home):
+    board = "annotated-board"
+    kb.write_board_metadata(board, name="Annotated Board")
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(conn, title="queued worker", body="ORIGINAL_BODY_MARKER", assignee="dev", board=board)
+        command_center_annotations.record_annotation(
+            work_item_id=f"kanban-board:{board}",
+            mode="note",
+            text="Queued board note for future worker.",
+            actor="operator",
+            target_kind="kanban_board",
+            target_id=board,
+            previous_title="Annotated Board",
+            previous_summary="Original board goal",
+            previous_status="queued",
+            source_ref={"board": board},
+            execution_snapshot={"board": board},
+            created_at=100,
+        )
+        command_center_annotations.record_annotation(
+            work_item_id=f"kanban-board:{board}",
+            mode="correction",
+            title="Correct board direction",
+            text="Queued board correction for future worker.",
+            actor="operator",
+            target_kind="kanban_board",
+            target_id=board,
+            previous_title="Annotated Board",
+            previous_summary="Original board goal",
+            previous_status="queued",
+            source_ref={"board": board},
+            execution_snapshot={"board": board},
+            created_at=101,
+        )
+
+        ctx = kb.build_worker_context(conn, task_id)
+        stored = kb.get_task(conn, task_id)
+
+    assert "## Command Center operator annotations" in ctx
+    assert "Operator annotations for Command Center Work Item" in ctx
+    assert f"work_item_id: kanban-board:{board}" in ctx
+    assert "Correct board direction" in ctx
+    assert "Queued board correction for future worker." in ctx
+    assert "Queued board note for future worker." in ctx
+    assert stored is not None
+    assert stored.body == "ORIGINAL_BODY_MARKER"
+
+
+def test_worker_context_includes_task_work_item_annotations_for_running_task(kanban_home):
+    board = "annotated-running"
+    kb.write_board_metadata(board, name="Annotated Running Board")
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(conn, title="running worker", body="RUNNING_BODY_MARKER", assignee="dev", initial_status="running", board=board)
+        command_center_annotations.record_annotation(
+            work_item_id=f"kanban:{board}:{task_id}",
+            mode="correction",
+            title="Correct active task",
+            text="Running task correction for next context.",
+            actor="operator",
+            target_kind="kanban_task",
+            target_id=task_id,
+            previous_title="running worker",
+            previous_summary="RUNNING_BODY_MARKER",
+            previous_status="running",
+            source_ref={"board": board, "task_id": task_id},
+            execution_snapshot={"board": board, "task_id": task_id},
+            created_at=100,
+        )
+
+        ctx = kb.build_worker_context(conn, task_id)
+        stored = kb.get_task(conn, task_id)
+
+    assert f"work_item_id: kanban:{board}:{task_id}" in ctx
+    assert "Correct active task" in ctx
+    assert "Running task correction for next context." in ctx
+    assert stored is not None
+    assert stored.body == "RUNNING_BODY_MARKER"
+
+
+def test_worker_context_includes_self_improvement_annotations_without_mutating_body(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="approved proposal worker",
+            body="APPROVED_PROPOSAL_BODY_MARKER",
+            assignee="dev",
+            idempotency_key="self-improvement:proposal-123",
+        )
+        command_center_annotations.record_annotation(
+            work_item_id="self-improvement:proposal-123",
+            mode="note",
+            text="Approval-context note must remain visible.",
+            actor="operator",
+            target_kind="self_improvement_proposal",
+            target_id="proposal-123",
+            previous_title="approved proposal worker",
+            previous_summary="APPROVED_PROPOSAL_BODY_MARKER",
+            previous_status="queued",
+            source_ref={"proposal_id": "proposal-123"},
+            execution_snapshot={"board": kb.DEFAULT_BOARD, "task_id": task_id},
+            created_at=100,
+        )
+
+        ctx = kb.build_worker_context(conn, task_id)
+        stored = kb.get_task(conn, task_id)
+
+    assert "work_item_id: self-improvement:proposal-123" in ctx
+    assert "Approval-context note must remain visible." in ctx
+    assert stored is not None
+    assert stored.body == "APPROVED_PROPOSAL_BODY_MARKER"
 
 
 # ---------------------------------------------------------------------------

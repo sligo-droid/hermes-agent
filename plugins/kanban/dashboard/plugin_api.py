@@ -51,7 +51,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, Web
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from hermes_cli import command_center, kanban_db
+from hermes_cli import command_center, command_center_annotations, kanban_db
 from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY, ROLE_FOREMAN, ROLE_PLANNER
 from hermes_cli import kanban_diagnostics as kd
 from self_improvement import discord_publish, proposal_storage
@@ -606,6 +606,13 @@ class BoardUndoFollowupBody(BaseModel):
     reason: Optional[str] = Field(default=None, max_length=2000)
 
 
+class CommandCenterAnnotationBody(BaseModel):
+    mode: str
+    text: str = Field(..., min_length=1, max_length=4000)
+    title: Optional[str] = Field(default=None, max_length=200)
+    pause_current: bool = False
+
+
 def _proposal_actor() -> str:
     return os.environ.get("USER") or os.environ.get("USERNAME") or "dashboard"
 
@@ -623,28 +630,185 @@ def _proposal_task_body(card: dict[str, Any]) -> str:
     source_block = "\n".join(source_lines[:3]) or "- No source excerpt recorded."
     tags = task.get("tags") if isinstance(task.get("tags"), list) else []
     tag_line = ", ".join(str(tag) for tag in tags) if tags else "none"
+    parts = [
+        str(task.get("body") or card.get("body") or "").strip(),
+        "",
+        "Self-improvement proposal metadata:",
+        f"- proposal_id: {card['proposal_id']}",
+        f"- project: {card['project']}",
+        f"- prong: {card['prong']}",
+        f"- priority: {card.get('priority') or 'medium'}",
+        f"- severity: {card.get('severity') or 'unspecified'}",
+        f"- cron_job_id: {card.get('cron_job_id') or 'unknown'}",
+        f"- run_id: {card.get('run_id') or card.get('run_db_id')}",
+        f"- cron_output_path: {card.get('cron_output_path') or 'unknown'}",
+        f"- tags: {tag_line}",
+        "",
+        "Rationale:",
+        str(card.get("rationale") or "No rationale recorded.").strip(),
+        "",
+        "Source excerpts:",
+        source_block,
+    ]
+    annotation_context = command_center_annotations.operator_context_block(f"self-improvement:{card['proposal_id']}")
+    if annotation_context:
+        parts.extend(["", annotation_context])
+    return "\n".join(parts)
+
+
+def _annotation_target_from_work_item(item: dict[str, Any]) -> tuple[str, str]:
+    work_item_id = str(item.get("id") or "")
+    execution = item.get("execution") if isinstance(item.get("execution"), dict) else {}
+    if work_item_id.startswith("self-improvement:"):
+        return "self_improvement_proposal", work_item_id.split(":", 1)[1]
+    if work_item_id.startswith("kanban-board:"):
+        return "kanban_board", str(execution.get("board") or work_item_id.split(":", 1)[1])
+    if work_item_id.startswith("kanban:"):
+        return "kanban_task", str(execution.get("task_id") or work_item_id.rsplit(":", 1)[-1])
+    raise HTTPException(status_code=409, detail="unsupported Command Center Work Item kind")
+
+
+def _find_command_center_work_item(work_item_id: str) -> dict[str, Any]:
+    snapshot = command_center.build_command_center_snapshot(include_archived=True)
+    for item in snapshot.get("work_items", []):
+        if str(item.get("id") or "") == work_item_id:
+            return item
+    if work_item_id.startswith("self-improvement:"):
+        proposal_id = work_item_id.split(":", 1)[1]
+        card = proposal_storage.get_card(proposal_id)
+        if card and card.get("kanban_task_id"):
+            task_id = str(card.get("kanban_task_id") or "")
+            board = _latest_self_improvement_board(proposal_id)
+            board_meta = kanban_db.read_board_metadata(board)
+            task = None
+            runs: list[dict[str, Any]] = []
+            try:
+                conn = _conn(board=_resolve_board(board))
+                try:
+                    task = kanban_db.get_task(conn, task_id)
+                    runs = [{"id": run.id, "status": run.status, "ended_at": run.ended_at} for run in kanban_db.list_runs(conn, task_id)]
+                finally:
+                    conn.close()
+            except HTTPException:
+                task = None
+            status = "blocked"
+            if task is not None:
+                if task.status == "done":
+                    status = "shipped"
+                elif task.status == "archived":
+                    status = "archived"
+                elif task.status in {"running", "review", "blocked"}:
+                    status = task.status
+                else:
+                    status = "queued"
+            return {
+                "id": work_item_id,
+                "title": card.get("title") or proposal_id,
+                "summary": card.get("summary") or card.get("body"),
+                "status": status,
+                "source": {"kind": "self_improvement", "ref": {"proposal_id": proposal_id}},
+                "execution": {
+                    "board": board,
+                    "board_name": board_meta.get("name") or board,
+                    "task_id": task_id,
+                    "task_status": task.status if task else None,
+                    "workspace_path": task.workspace_path if task else None,
+                    "runs": runs,
+                },
+            }
+    raise HTTPException(status_code=404, detail=f"Command Center Work Item {work_item_id!r} not found")
+
+
+def _annotation_followup_body(*, annotation: dict[str, Any], item: dict[str, Any]) -> str:
+    source = item.get("source") if isinstance(item.get("source"), dict) else {}
+    execution = item.get("execution") if isinstance(item.get("execution"), dict) else {}
     return "\n".join(
         [
-            str(task.get("body") or card.get("body") or "").strip(),
+            "Implement operator correction follow-up for a Command Center Work Item.",
             "",
-            "Self-improvement proposal metadata:",
-            f"- proposal_id: {card['proposal_id']}",
-            f"- project: {card['project']}",
-            f"- prong: {card['prong']}",
-            f"- priority: {card.get('priority') or 'medium'}",
-            f"- severity: {card.get('severity') or 'unspecified'}",
-            f"- cron_job_id: {card.get('cron_job_id') or 'unknown'}",
-            f"- run_id: {card.get('run_id') or card.get('run_db_id')}",
-            f"- cron_output_path: {card.get('cron_output_path') or 'unknown'}",
-            f"- tags: {tag_line}",
+            "Original Work Item:",
+            f"- work_item_id: {item.get('id')}",
+            f"- source_ref: {json.dumps(source.get('ref') or source, sort_keys=True)}",
+            f"- previous_title: {annotation.get('previous_title') or ''}",
+            f"- previous_summary: {annotation.get('previous_summary') or ''}",
+            f"- previous_status: {annotation.get('previous_status') or ''}",
+            f"- execution: {json.dumps(execution, sort_keys=True)}",
             "",
-            "Rationale:",
-            str(card.get("rationale") or "No rationale recorded.").strip(),
+            "Operator correction:",
+            f"- title: {annotation.get('title') or 'none'}",
+            f"- text: {annotation.get('text')}",
             "",
-            "Source excerpts:",
-            source_block,
+            "Instructions:",
+            "- Treat this correction as audited operator context.",
+            "- Do not mutate original source text, proposal payload JSON, board root goals, or existing task bodies silently.",
+            "- Create the smallest safe follow-up work needed to honor the correction and report the outcome.",
         ]
     )
+
+
+def _create_annotation_followup(*, item: dict[str, Any], annotation: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    execution = item.get("execution") if isinstance(item.get("execution"), dict) else {}
+    board = str(execution.get("board") or "").strip()
+    if not board:
+        return None, None, "Work Item has no active execution board for correction follow-up"
+    if board == kanban_db.DEFAULT_BOARD:
+        return None, None, "default board correction follow-up is not supported for Command Center Work Items"
+    if not kanban_db.board_exists(board):
+        return None, None, "Work Item execution board does not exist for correction follow-up"
+    board_meta = kanban_db.read_board_metadata(board)
+    worker = _discord_worker_meta(board)
+    idempotency_key = f"command-center-correction:{annotation['id']}"
+    conn = _conn(board=board)
+    try:
+        workspace = _dashboard_worker_workspace(board_meta, execution.get("workspace_path"))
+        title = annotation.get("title") or f"Operator correction: {item.get('title') or item.get('id')}"
+        task_id = kanban_db.create_task(
+            conn,
+            title=str(title)[:200],
+            body=_annotation_followup_body(annotation=annotation, item=item),
+            assignee=ROLE_FOREMAN,
+            created_by="command-center-correction",
+            workspace_kind=workspace["workspace_kind"],
+            workspace_path=workspace["workspace_path"],
+            tenant=str(board_meta.get("project") or board_meta.get("tenant") or board),
+            priority=command_center.COMMAND_CENTER_REPAIR_PRIORITY,
+            idempotency_key=idempotency_key,
+            max_runtime_seconds=1800,
+        )
+        task = kanban_db.get_task(conn, task_id)
+    finally:
+        conn.close()
+    if worker:
+        try:
+            from hermes_cli import discord_worker_boards as dwb
+
+            dwb.mark_dispatch_dirty(board=board, reason="command-center-correction")
+        except Exception:
+            pass
+    return _task_dict(task) if task else None, _worker_ticket_url(task_id, board=board, board_public_url=worker.get("public_url") if worker else None), None
+
+
+def _pause_annotation_target(item: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    execution = item.get("execution") if isinstance(item.get("execution"), dict) else {}
+    board = str(execution.get("board") or "").strip()
+    task_id = str(execution.get("task_id") or "").strip()
+    if not board:
+        return None, "Work Item has no execution board to pause"
+    try:
+        worker = _discord_worker_meta(board)
+        if worker:
+            from hermes_cli import discord_worker_boards as dwb
+
+            return dwb.pause_board(board, reason="command-center-correction"), None
+        if task_id:
+            conn = _conn(board=board)
+            try:
+                return {"board": board, "task_id": task_id, "paused": _pause_generic_task(conn, task_id, reason="command-center-correction")}, None
+            finally:
+                conn.close()
+        return _pause_generic_board(board, reason="command-center-correction"), None
+    except Exception as exc:
+        return None, str(exc)
 
 
 def _repair_task_body(
@@ -1672,6 +1836,61 @@ def command_center_snapshot(
         recent_run_limit_per_board=recent_run_limit_per_board,
         project=project,
     )
+
+
+@router.post("/command-center/work-items/{work_item_id}/annotations")
+def command_center_work_item_annotation(work_item_id: str, payload: CommandCenterAnnotationBody):
+    try:
+        mode, text, title = command_center_annotations.validate_annotation(
+            mode=payload.mode,
+            text=payload.text,
+            title=payload.title,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    item = _find_command_center_work_item(work_item_id)
+    status = str(item.get("status") or "").lower()
+    if mode == "correction" and status == "archived":
+        raise HTTPException(status_code=409, detail="archived Work Items must be reopened before correction")
+    target_kind, target_id = _annotation_target_from_work_item(item)
+    source = item.get("source") if isinstance(item.get("source"), dict) else {}
+    execution = item.get("execution") if isinstance(item.get("execution"), dict) else {}
+    annotation = command_center_annotations.record_annotation(
+        work_item_id=work_item_id,
+        mode=mode,
+        text=text,
+        title=title,
+        actor=_proposal_actor(),
+        target_kind=target_kind,
+        target_id=target_id,
+        previous_title=item.get("title"),
+        previous_summary=item.get("summary"),
+        previous_status=item.get("status"),
+        source_ref=source.get("ref") if isinstance(source.get("ref"), dict) else source,
+        execution_snapshot=execution,
+    )
+    followup_task = None
+    worker_url = None
+    errors: dict[str, str] = {}
+    if mode == "correction" and status not in {"proposed", "queued", "accepted", "paused", "rejected"}:
+        followup_task, worker_url, error = _create_annotation_followup(item=item, annotation=annotation)
+        if error:
+            errors["followup_task"] = error
+    if mode == "correction" and payload.pause_current:
+        pause_result, pause_error = _pause_annotation_target(item)
+        if pause_error:
+            errors["pause_current"] = pause_error
+        else:
+            annotation["pause_result"] = pause_result
+    response = {
+        "annotation": annotation,
+        "work_item_id": work_item_id,
+        "followup_task": followup_task,
+        "worker_url": worker_url,
+    }
+    if errors:
+        response["errors"] = errors
+    return response
 
 
 # ---------------------------------------------------------------------------

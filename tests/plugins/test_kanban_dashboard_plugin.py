@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import command_center_annotations
 from self_improvement import discord_publish, proposal_storage
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "self_improvement"
@@ -363,6 +364,135 @@ def test_self_improvement_approve_is_idempotent_and_audited(client):
     audit = proposal_storage.list_audit_events(card["proposal_id"])
     assert [event["action"] for event in audit] == ["approved", "approved"]
     assert {event["kanban_task_id"] for event in audit} == {first.json()["task"]["id"]}
+
+
+def test_command_center_annotation_validates_and_persists_proposed_without_approval(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    work_item_id = f"self-improvement:{card['proposal_id']}"
+
+    bad = client.post(f"/api/plugins/kanban/command-center/work-items/{work_item_id}/annotations", json={"mode": "bad", "text": "x"})
+    assert bad.status_code == 400, bad.text
+
+    response = client.post(
+        f"/api/plugins/kanban/command-center/work-items/{work_item_id}/annotations",
+        json={"mode": "correction", "title": "Retitle later", "text": "Use audited correction context."},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["work_item_id"] == work_item_id
+    assert body["followup_task"] is None
+    assert body["worker_url"] is None
+    assert body["annotation"]["mode"] == "correction"
+    assert body["annotation"]["previous_title"] == card["title"]
+    assert proposal_storage.get_card(card["proposal_id"])["status"] == "proposed"
+
+    snapshot = client.get("/api/plugins/kanban/command-center/snapshot")
+    item = next(item for item in snapshot.json()["work_items"] if item["id"] == work_item_id)
+    assert item["latest_correction"]["text"] == "Use audited correction context."
+    assert item["title"] == card["title"]
+
+
+def test_command_center_annotation_context_is_included_on_later_approval(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    work_item_id = f"self-improvement:{card['proposal_id']}"
+    created = client.post(
+        f"/api/plugins/kanban/command-center/work-items/{work_item_id}/annotations",
+        json={"mode": "note", "text": "Remember the operator constraint."},
+    )
+    assert created.status_code == 200, created.text
+
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+
+    assert approved.status_code == 200, approved.text
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, approved.json()["task"]["id"])
+    finally:
+        conn.close()
+    assert task is not None
+    assert "Operator annotations for Command Center Work Item" in (task.body or "")
+    assert "Remember the operator constraint." in (task.body or "")
+
+
+def test_command_center_running_correction_creates_followup_and_can_pause(client):
+    board = "annotation-running-board"
+    kb.write_board_metadata(board, name="Annotation Running Board")
+    conn = kb.connect(board=board)
+    try:
+        task_id = kb.create_task(conn, title="Active work", body="Original body", assignee="dev", initial_status="running")
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (task_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    response = client.post(
+        f"/api/plugins/kanban/command-center/work-items/kanban-board:{board}/annotations",
+        json={"mode": "correction", "title": "Correct active work", "text": "Do the corrected follow-up.", "pause_current": True},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["annotation"]["target_kind"] == "kanban_board"
+    assert "errors" not in body
+    assert body["followup_task"]["created_by"] == "command-center-correction"
+    assert body["followup_task"]["priority"] == 1_000_000
+    assert body["worker_url"].endswith(f"/workers/{board}/tickets/{body['followup_task']['id']}")
+    assert body["annotation"]["pause_result"]["board"] == board
+    conn = kb.connect(board=board)
+    try:
+        assert kb.get_task(conn, task_id).status == "blocked"
+        followup = kb.get_task(conn, body["followup_task"]["id"])
+    finally:
+        conn.close()
+    assert followup is not None
+    assert "Do not mutate original source text" in (followup.body or "")
+
+
+def test_command_center_archived_correction_returns_409(client):
+    board = "annotation-archive-board"
+    kb.write_board_metadata(board, name="Annotation Archive Board")
+    conn = kb.connect(board=board)
+    try:
+        kb.create_task(conn, title="Done work", initial_status="blocked")
+    finally:
+        conn.close()
+    archived = client.delete(f"/api/plugins/kanban/boards/{board}")
+    assert archived.status_code == 200, archived.text
+
+    response = client.post(
+        f"/api/plugins/kanban/command-center/work-items/kanban-board:{board}/annotations",
+        json={"mode": "correction", "text": "Cannot correct archived item."},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "reopened" in response.text
+
+
+def test_command_center_completed_correction_reports_followup_failure(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    assert approved.status_code == 200, approved.text
+    conn = kb.connect()
+    try:
+        assert kb.complete_task(conn, approved.json()["task"]["id"], summary="done") is True
+    finally:
+        conn.close()
+
+    response = client.post(
+        f"/api/plugins/kanban/command-center/work-items/self-improvement:{card['proposal_id']}/annotations",
+        json={"mode": "correction", "text": "Follow up on completed default-board task."},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["annotation"]["mode"] == "correction"
+    assert body["followup_task"] is None
+    assert body["errors"]["followup_task"]
+    assert command_center_annotations.list_annotations(f"self-improvement:{card['proposal_id']}")
 
 
 def test_self_improvement_cards_include_downstream_task_status(client):
