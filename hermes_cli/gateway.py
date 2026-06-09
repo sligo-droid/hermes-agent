@@ -22,6 +22,7 @@ from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_restart_drain_timeout,
+    restart_blocker_evidence,
 )
 from hermes_cli.config import (
     get_env_value,
@@ -814,6 +815,43 @@ def _gateway_runtime_status_for_pid(pid: int | None) -> dict | None:
     return state if state_pid == pid else None
 
 
+def _runtime_has_connected_configured_platform(state: dict | None) -> bool:
+    if not state:
+        return False
+
+    try:
+        from gateway.config import Platform, load_gateway_config
+
+        config = load_gateway_config()
+        configured = {
+            platform.value
+            for platform in config.get_connected_platforms()
+            if platform not in {Platform.LOCAL, Platform.API_SERVER, Platform.WEBHOOK}
+        }
+    except Exception:
+        configured = None
+
+    platforms = state.get("platforms", {}) or {}
+    connected = {
+        str(name)
+        for name, pdata in platforms.items()
+        if isinstance(pdata, dict) and pdata.get("state") in {"connected", "running"}
+    }
+
+    if configured is None:
+        return bool(connected)
+    if not configured:
+        return True
+    return bool(connected & configured)
+
+
+def _format_restart_blocker_evidence(evidence) -> str:
+    return (
+        f"active_agents={evidence.active_agents}; "
+        f"blocking_direct_children={evidence.blocker_summary()}"
+    )
+
+
 def _wait_for_systemd_service_restart(
     *,
     system: bool = False,
@@ -827,6 +865,7 @@ def _wait_for_systemd_service_restart(
     scope_label = _service_scope_label(system).capitalize()
     deadline = time.monotonic() + timeout
     printed_runtime_wait = False
+    last_evidence = None
 
     while time.monotonic() < deadline:
         props = _read_systemd_unit_properties(system=system)
@@ -842,11 +881,30 @@ def _wait_for_systemd_service_restart(
         if not new_pid:
             new_pid = _systemd_main_pid_from_props(props)
 
+        runtime_state = _gateway_runtime_status_for_pid(new_pid) if new_pid else None
+        last_observed_state = runtime_state or _read_gateway_runtime_status()
+        evidence = restart_blocker_evidence(
+            previous_pid,
+            runtime_state=last_observed_state,
+        )
+        last_evidence = evidence
+
+        if evidence.active_agents > 0 or evidence.blockers:
+            print(
+                f"⏳ {scope_label} service restart deferred: "
+                f"{_format_restart_blocker_evidence(evidence)}"
+            )
+            return False
+
         if active_state == "active":
             if new_pid and (previous_pid is None or new_pid != previous_pid):
-                runtime_state = _gateway_runtime_status_for_pid(new_pid)
                 gateway_state = (runtime_state or {}).get("gateway_state")
-                if gateway_state == "running":
+                restart_requested = bool((runtime_state or {}).get("restart_requested"))
+                if (
+                    gateway_state == "running"
+                    and not restart_requested
+                    and _runtime_has_connected_configured_platform(runtime_state)
+                ):
                     print(f"✓ {scope_label} service restarted (PID {new_pid})")
                     return True
                 if gateway_state == "startup_failed":
@@ -869,6 +927,7 @@ def _wait_for_systemd_service_restart(
 
     print(
         f"⚠ {scope_label} service did not become active within {int(timeout)}s.\n"
+        f"  Last evidence: {_format_restart_blocker_evidence(last_evidence) if last_evidence else 'unavailable'}\n"
         f"  Check status: {'sudo ' if system else ''}hermes gateway status\n"
         f"  Check logs:   journalctl {'--user ' if not system else ''}-u {svc} -l --since '2 min ago'"
     )
