@@ -64,6 +64,40 @@ def _claimed_planner(monkeypatch, tmp_path: Path):
     return board, claimed
 
 
+def test_check_rollup_summary_uses_latest_duplicate_check_run():
+    from hermes_cli import kanban_codex_worker as worker
+
+    status, total, failed = worker._check_rollup_summary(
+        [
+            {
+                "name": "basic",
+                "workflowName": "Basic Tests",
+                "status": "COMPLETED",
+                "conclusion": "CANCELLED",
+                "startedAt": "2026-06-09T15:00:00Z",
+            },
+            {
+                "name": "supply-chain",
+                "workflowName": "Supply Chain Audit",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "startedAt": "2026-06-09T15:01:00Z",
+            },
+            {
+                "name": "basic",
+                "workflowName": "Basic Tests",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "startedAt": "2026-06-09T15:02:00Z",
+            },
+        ]
+    )
+
+    assert status == "passed"
+    assert total == 2
+    assert failed == []
+
+
 def _write_codex_auth(path: Path, *, access: str, refresh: str, id_token: str) -> None:
     path.mkdir(parents=True, exist_ok=True)
     (path / "auth.json").write_text(

@@ -207,3 +207,23 @@ async def test_tracked_thread_backfill_replays_reply_to_bot(adapter):
 
     adapter._handle_message.assert_awaited_once_with(missed_reply)
     assert reply_ref.resolved is bot_response
+
+
+@pytest.mark.asyncio
+async def test_tracked_thread_backfill_default_limit_covers_older_tracked_threads(adapter):
+    target = FakeThread(thread_id=1000)
+    bot_response = make_message(thread=target, message_id=110, content="working", author=BOT_USER)
+    missed = make_message(thread=target, message_id=120, content="<@999> follow up", mentions=[])
+    target._messages = [bot_response, missed]
+    adapter._client = SimpleNamespace(
+        user=BOT_USER,
+        get_channel=lambda channel_id: target if int(channel_id) == int(target.id) else None,
+        fetch_channel=AsyncMock(return_value=None),
+    )
+    adapter._threads.mark(str(target.id))
+    for thread_id in range(1001, 1061):
+        adapter._threads.mark(str(thread_id))
+
+    await adapter._backfill_missed_tracked_thread_messages()
+
+    adapter._handle_message.assert_awaited_once_with(missed)

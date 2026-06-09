@@ -5686,7 +5686,7 @@ def _recover_blocked_approved_reviewer_finalizer(
     # creation errors intentionally remain inert.
     from hermes_cli import kanban_codex_worker
 
-    if finalizer_failure_evidence:
+    if finalizer_blocked_reason or finalizer_failure_evidence:
         if kanban_codex_worker._ensure_pr(board, str(worker.get("worktree_path") or "")):
             _update_worker_meta(board, {"blocked_reason": "", "pr_blocker": "", "pr_error": None})
             kanban_codex_worker._update_phase(board, "complete", goal_status="done")
