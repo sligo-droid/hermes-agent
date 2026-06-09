@@ -20,6 +20,7 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 from hermes_cli import kanban_db
+from hermes_cli import command_center_annotations
 from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
 from self_improvement import proposal_storage
 
@@ -1052,6 +1053,10 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
             runs=runs,
             boards=boards,
         )
+
+    for item in work_items:
+        if "annotations" not in item:
+            command_center_annotations.enrich_work_item(item)
 
     work_items.sort(key=_work_item_sort_key)
     sources.sort(key=_source_sort_key)

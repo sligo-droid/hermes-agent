@@ -81,6 +81,58 @@ Important invariants:
 4. Approval artifacts such as Discord thread URLs and worker-board URLs survive later halt/undo audit events.
 5. Stored legacy `proposal_cards.worker_url` values remain visible as execution/artifact fallbacks.
 
+## Operator Annotations
+
+Command Center Work Items support audited operator annotations through:
+
+```text
+POST /api/plugins/kanban/command-center/work-items/{work_item_id}/annotations
+```
+
+Request shape:
+
+```text
+{
+  mode: "note" | "correction",
+  text: string,          // required, <= 4000 chars, stored as plain text
+  title?: string,        // optional correction title, <= 200 chars
+  pause_current?: bool   // optional, applies to correction requests
+}
+```
+
+Response shape:
+
+```text
+{
+  annotation,
+  work_item_id,
+  followup_task,
+  worker_url,
+  errors?              // separate follow-up/pause failures after persistence
+}
+```
+
+Annotations are persisted under the active profile's Hermes home in the Command Center annotation store. They never rewrite proposal text, proposal payload JSON, board root goals, or existing task bodies. Every annotation records actor, timestamp, mode, Work Item id, target kind/id, previous title/summary/status, source ref, and execution board/task snapshot.
+
+Snapshot Work Items include:
+
+```text
+annotations[]
+operator_note_count
+latest_operator_note
+latest_correction
+```
+
+The original `title`, `summary`, and source fields remain unchanged; the UI should render annotation text as plain text and present the latest correction as operator context above the original summary.
+
+Lifecycle rules:
+
+1. Proposed/unapproved Work Items persist notes and corrections without auto-approval. Later approval-generated task context includes the audited annotation context.
+2. Queued Work Items persist notes/corrections for future worker context without rewriting existing task bodies.
+3. Running Work Items persist notes. Corrections also create a high-priority follow-up task on the same execution board; `pause_current` attempts to pause the active board/task and reports pause failure separately.
+4. Completed Work Items persist corrections and attempt to create a follow-up task when a durable execution board exists. If no such board exists, persistence still succeeds and the response includes a follow-up error.
+5. Archived Work Items may receive notes, but corrections return `409` until the Work Item is reopened.
+
 ## Frontend
 
 `web/src/pages/CommandCenterPage.tsx` renders all Command Center views. The old page modules are compatibility wrappers that export this page so stale imports cannot resurrect the previous UI.
