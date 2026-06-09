@@ -1856,23 +1856,68 @@ def _branch_has_commits(root: Path, *, base: str, branch: str) -> Optional[bool]
         return None
 
 
+def _check_rollup_item_name(item: dict[str, Any]) -> str:
+    return str(
+        item.get("name")
+        or item.get("context")
+        or item.get("workflowName")
+        or item.get("__typename")
+        or "check"
+    )
+
+
+def _check_rollup_item_identity(item: dict[str, Any]) -> tuple[str, str, str]:
+    """Stable identity for one logical PR check across reruns.
+
+    GitHub's statusCheckRollup can include stale attempts for the same
+    workflow/context. Counting every historical CANCELLED/FAILURE entry keeps
+    an otherwise green PR blocked after a rerun succeeds. Group by the visible
+    check identity and summarize only the newest item in each group.
+    """
+
+    raw_app = item.get("app")
+    app_name = str(raw_app.get("name") or "") if isinstance(raw_app, dict) else ""
+    return (
+        str(item.get("workflowName") or ""),
+        _check_rollup_item_name(item),
+        app_name,
+    )
+
+
+def _check_rollup_item_sort_key(item: dict[str, Any], index: int) -> tuple[str, str, str, int]:
+    timestamp = str(
+        item.get("completedAt")
+        or item.get("startedAt")
+        or item.get("updatedAt")
+        or item.get("createdAt")
+        or ""
+    )
+    numeric = item.get("databaseId") or item.get("runNumber") or item.get("id") or 0
+    numeric_text = str(numeric)
+    return (timestamp, numeric_text, str(item.get("url") or item.get("detailsUrl") or ""), index)
+
+
+def _latest_check_rollup_items(items: list[Any]) -> list[dict[str, Any]]:
+    latest: dict[tuple[str, str, str], tuple[tuple[str, str, str, int], dict[str, Any]]] = {}
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        identity = _check_rollup_item_identity(item)
+        sort_key = _check_rollup_item_sort_key(item, index)
+        if identity not in latest or sort_key > latest[identity][0]:
+            latest[identity] = (sort_key, item)
+    return [value[1] for value in latest.values()]
+
+
 def _check_rollup_summary(items: Any) -> tuple[str, int, list[str]]:
     if not isinstance(items, list) or not items:
         return "not checked", 0, []
     failed: list[str] = []
     pending = 0
     total = 0
-    for item in items:
-        if not isinstance(item, dict):
-            continue
+    for item in _latest_check_rollup_items(items):
         total += 1
-        name = str(
-            item.get("name")
-            or item.get("context")
-            or item.get("workflowName")
-            or item.get("__typename")
-            or "check"
-        )
+        name = _check_rollup_item_name(item)
         status = str(item.get("status") or item.get("state") or "").strip().upper()
         conclusion = str(item.get("conclusion") or item.get("conclusionState") or "").strip().upper()
         if conclusion in {"FAILURE", "FAILED", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"} or status in {"FAILURE", "FAILED"}:
