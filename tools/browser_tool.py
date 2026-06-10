@@ -3584,9 +3584,41 @@ def _chromium_search_roots() -> List[str]:
     return roots
 
 
+def _playwright_chromium_preflight_roots() -> List[str]:
+    """Cache paths that ad-hoc Playwright launch code will use for Chromium."""
+    env_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if env_path and env_path != "0":
+        return [env_path]
+
+    profile_home = _profile_browser_home()
+    roots = [os.path.join(profile_home, ".cache", "ms-playwright")]
+    if sys.platform == "darwin":
+        roots.append(os.path.join(profile_home, "Library", "Caches", "ms-playwright"))
+    if sys.platform == "win32":
+        roots.append(os.path.join(profile_home, "AppData", "Local", "ms-playwright"))
+    return roots
+
+
+def _playwright_chromium_cache_installed() -> bool:
+    """Return True when Playwright's configured/profile Chromium cache exists."""
+    for root in _playwright_chromium_preflight_roots():
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            entries = os.listdir(root)
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.startswith("chromium-") or entry.startswith(
+                "chromium_headless_shell-"
+            ):
+                return True
+    return False
+
+
 def format_chromium_preflight_message() -> str:
     """Return a stable, actionable Chromium preflight message for workers/cron."""
-    searched = "\n".join(f"  - {root}" for root in _chromium_search_roots()) or "  - (no candidate paths)"
+    searched = "\n".join(f"  - {root}" for root in _playwright_chromium_preflight_roots()) or "  - (no candidate paths)"
     install_command = f"HOME={shlex.quote(_profile_browser_home())} npx playwright install --with-deps chromium"
     docker_note = ""
     if _running_in_docker():
@@ -3611,11 +3643,13 @@ def format_chromium_preflight_message() -> str:
 
 def check_playwright_chromium_preflight() -> tuple[bool, str]:
     """Check Chromium availability for ad-hoc Playwright worker/cron tasks."""
-    if _chromium_installed():
+    if _playwright_chromium_cache_installed():
         return True, (
             "Playwright Chromium preflight passed.\n"
             f"Hermes profile HOME: {display_hermes_home()}\n"
-            f"Browser subprocess HOME: {_profile_browser_home()}"
+            f"Browser subprocess HOME: {_profile_browser_home()}\n"
+            "Searched Playwright browser cache paths:\n"
+            + "\n".join(f"  - {root}" for root in _playwright_chromium_preflight_roots())
         )
     return False, format_chromium_preflight_message()
 

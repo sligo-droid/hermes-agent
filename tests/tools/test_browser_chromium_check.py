@@ -128,6 +128,27 @@ class TestRunBrowserCommandChromiumGuard:
 
 
 class TestPlaywrightChromiumPreflight:
+    def test_fails_when_profile_cache_empty_even_with_system_chromium(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        cache = hermes_home / "home" / ".cache" / "ms-playwright"
+        cache.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+        monkeypatch.setattr(
+            bt.shutil,
+            "which",
+            lambda name: "/usr/bin/chromium-browser" if name == "chromium-browser" else None,
+        )
+        monkeypatch.setattr(bt, "_running_in_docker", lambda: False)
+
+        ok, message = bt.check_playwright_chromium_preflight()
+
+        assert ok is False
+        assert "Playwright Chromium preflight failed" in message
+        assert f"Hermes profile HOME: {hermes_home}" in message
+        assert f"Browser subprocess HOME: {hermes_home / 'home'}" in message
+        assert str(cache) in message
+
     def test_missing_message_includes_profile_paths_and_install(self, monkeypatch, tmp_path):
         hermes_home = tmp_path / "hermes"
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
