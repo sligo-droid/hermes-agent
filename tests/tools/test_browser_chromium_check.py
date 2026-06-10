@@ -38,6 +38,15 @@ class TestChromiumSearchRoots:
         home = os.path.expanduser("~")
         assert any(r == os.path.join(home, ".cache", "ms-playwright") for r in roots)
 
+    def test_includes_profile_home_ms_playwright_cache(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+
+        roots = bt._chromium_search_roots()
+
+        assert str(hermes_home / "home" / ".cache" / "ms-playwright") == roots[0]
+
 
 class TestChromiumInstalled:
     def test_true_when_plain_chromium_on_path(self, monkeypatch):
@@ -117,3 +126,33 @@ class TestRunBrowserCommandChromiumGuard:
     """
 
 
+
+class TestPlaywrightChromiumPreflight:
+    def test_missing_message_includes_profile_paths_and_install(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+        monkeypatch.setattr(bt.shutil, "which", lambda name: None)
+        monkeypatch.setattr(bt, "_running_in_docker", lambda: False)
+
+        ok, message = bt.check_playwright_chromium_preflight()
+
+        assert ok is False
+        assert "Playwright Chromium preflight failed" in message
+        assert f"Hermes profile HOME: {hermes_home}" in message
+        assert f"Browser subprocess HOME: {hermes_home / 'home'}" in message
+        assert str(hermes_home / "home" / ".cache" / "ms-playwright") in message
+        assert "npx playwright install --with-deps chromium" in message
+        assert "never installs browsers automatically" in message
+
+    def test_cli_returns_nonzero_when_missing(self, monkeypatch, tmp_path, capsys):
+        from hermes_cli import browser_preflight
+
+        hermes_home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+        monkeypatch.setattr(bt.shutil, "which", lambda name: None)
+        monkeypatch.setattr(bt, "_running_in_docker", lambda: False)
+
+        assert browser_preflight.main(["chromium"]) == 1
+        assert str(hermes_home / "home" / ".cache" / "ms-playwright") in capsys.readouterr().out
