@@ -1,0 +1,57 @@
+{
+  "contract_version": "self_improvement.proposal_run.v1",
+  "project": "pid",
+  "prong": "admin_dogfood_ux_bugfix",
+  "run": {
+    "run_id": "cron-run-2026-06-09T04:00:17Z",
+    "cron_job_id": "cron_95478c11e1c8_20260609_040017",
+    "cron_job_name": "Daily PID admin dogfood UX bugfix",
+    "cron_output_path": "/tmp/hermes/cron/output/cron_95478c11e1c8_20260609_040017/20260609.md",
+    "created_at": "2026-06-09T04:00:17Z",
+    "completed_at": "2026-06-09T04:12:00Z"
+  },
+  "generated_at": "2026-06-09T04:12:10Z",
+  "human_markdown": "One source-backed proposal. Missing live evidence: authenticated admin browser dogfood was blocked because safe admin credentials were unavailable.",
+  "cards": [
+    {
+      "idempotency_key": "pid-admin-copy-source-backed-2026-06-09",
+      "title": "Clarify PID admin empty-state copy",
+      "summary": "Source templates show unclear empty-state copy; live evidence was not available.",
+      "body": "Update the PID admin empty-state template copy based on the checked-in template and source excerpt. Missing live evidence: safe admin credentials were unavailable.",
+      "rationale": "The static template independently shows the confusing copy, so this is a source-backed recommendation rather than a browser-dogfood finding.",
+      "priority": "medium",
+      "severity": "minor",
+      "status": "proposed",
+      "created_at": "2026-06-09T04:12:10Z",
+      "source_excerpts": [
+        {
+          "label": "admin template",
+          "text": "No records found. Try again later.",
+          "cron_output_path": "/tmp/hermes/cron/output/cron_95478c11e1c8_20260609_040017/20260609.md",
+          "line_start": 44,
+          "line_end": 45
+        },
+        {
+          "label": "delegated live stream",
+          "text": "INSUFFICIENT_EVIDENCE: authenticated admin browser dogfood blocked; safe admin credentials unavailable.",
+          "cron_output_path": "/tmp/hermes/cron/output/cron_95478c11e1c8_20260609_040017/20260609.md",
+          "line_start": 70,
+          "line_end": 72
+        }
+      ],
+      "evidence_basis": {
+        "type": "source_static_log",
+        "summary": "Supported by checked-in admin template/source excerpts only; authenticated live/browser dogfood is explicitly not claimed.",
+        "missing_live_evidence": [
+          "authenticated admin browser dogfood blocked because safe admin credentials were unavailable"
+        ]
+      },
+      "kanban_task": {
+        "title": "Clarify PID admin empty-state copy",
+        "body": "Update the admin empty-state copy using the source-backed template finding. Do not describe this as live-browser verified unless a future run performs authenticated admin dogfood.",
+        "assignee": "dev",
+        "tags": ["pid", "admin", "ux"]
+      }
+    }
+  ]
+}
