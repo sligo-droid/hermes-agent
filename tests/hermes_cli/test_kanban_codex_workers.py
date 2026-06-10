@@ -2284,6 +2284,8 @@ def test_worker_prompt_is_read_only_for_normal_roles(monkeypatch):
         assert "python -m hermes_cli.discord_worker_read sync-summary" not in prompt
         assert "exact host:port" in prompt
         assert "worker_frontend_smoke" in prompt
+        assert "python -m hermes_cli.browser_preflight chromium" in prompt
+        assert "do not install browsers" in prompt
 
 
 def test_planner_output_links_parent_dependencies(monkeypatch, tmp_path):
