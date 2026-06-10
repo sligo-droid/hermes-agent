@@ -258,6 +258,20 @@ def _validate_card(value: Any, path: str, run: dict[str, Any], project: str, pro
     return normalized
 
 
+def _validate_human_markdown_evidence_claims(human_markdown: str, cards: list[dict[str, Any]]) -> None:
+    if not human_markdown or not _LIVE_CLAIM_RE.search(human_markdown):
+        return
+
+    non_live_cards = [
+        card for card in cards if card.get("evidence_basis", {}).get("type") != "live_browser"
+    ]
+    if non_live_cards:
+        raise ProposalValidationError(
+            "human_markdown must not imply authenticated live/browser dogfood verification "
+            "for cards without live_browser evidence_basis"
+        )
+
+
 def validate_proposal_run(
     payload: dict[str, Any],
     config: dict[str, Any] | None = None,
@@ -301,13 +315,16 @@ def validate_proposal_run(
         raise ProposalValidationError("cards must have unique proposal_id values")
 
     generated_at = root.get("generated_at")
+    human_markdown = _optional_text(root.get("human_markdown"), "human_markdown", max_len=12000) or ""
+    _validate_human_markdown_evidence_claims(human_markdown, normalized_cards)
+
     normalized = {
         "contract_version": version,
         "project": project,
         "prong": prong,
         "run": normalized_run,
         "generated_at": _require_datetime(generated_at, "generated_at") if generated_at else datetime.now(timezone.utc).isoformat(),
-        "human_markdown": _optional_text(root.get("human_markdown"), "human_markdown", max_len=12000) or "",
+        "human_markdown": human_markdown,
         "cards": normalized_cards,
     }
     return normalized

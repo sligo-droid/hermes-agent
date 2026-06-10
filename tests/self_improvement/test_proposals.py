@@ -286,6 +286,9 @@ def test_blocked_live_stream_source_backed_card_names_missing_live_evidence():
 
     card = normalized["cards"][0]
     basis = card["evidence_basis"]
+    assert "safe admin credentials were unavailable" in normalized["human_markdown"]
+    assert "authenticated admin dogfood completed" not in normalized["human_markdown"].lower()
+    assert "live-verified" not in normalized["human_markdown"].lower()
     assert basis["type"] == "source_static_log"
     assert basis["missing_live_evidence"] == [
         "authenticated admin browser dogfood blocked because safe admin credentials were unavailable"
@@ -304,6 +307,16 @@ def test_live_claim_requires_live_browser_evidence_basis():
         validate_proposal_run(payload)
 
     assert "evidence_basis.type must be live_browser" in str(excinfo.value)
+
+
+def test_human_markdown_live_claim_requires_live_browser_card_evidence_basis():
+    payload = _fixture("proposal_run_pid_blocked_live_source_backed.json")
+    payload["human_markdown"] = "Status: RECOMMENDED after authenticated admin dogfood completed."
+
+    with pytest.raises(ProposalValidationError) as excinfo:
+        validate_proposal_run(payload)
+
+    assert "human_markdown must not imply authenticated live/browser dogfood verification" in str(excinfo.value)
 
 
 def test_blocked_missing_live_basis_must_name_missing_live_evidence():
