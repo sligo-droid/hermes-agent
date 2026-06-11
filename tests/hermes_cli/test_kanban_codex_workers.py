@@ -98,6 +98,41 @@ def test_check_rollup_summary_uses_latest_duplicate_check_run():
     assert failed == []
 
 
+def test_run_gh_bridges_real_gh_config_dir_when_home_is_isolated(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+
+    isolated_home = tmp_path / "hermes-home" / "home"
+    real_gh_config = tmp_path / "real-home" / ".config" / "gh"
+    real_gh_config.mkdir(parents=True)
+    captured: dict[str, object] = {}
+
+    monkeypatch.setenv("HOME", str(isolated_home))
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(
+        worker,
+        "get_github_cli_config_dir",
+        lambda env: str(real_gh_config) if env.get("HOME") == str(isolated_home) else "",
+    )
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        captured["env"] = kwargs.get("env")
+        captured["cwd"] = kwargs.get("cwd")
+        return subprocess.CompletedProcess(args, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    result = worker._run_gh(["auth", "status"], root=tmp_path, timeout=5)
+
+    assert result.returncode == 0
+    assert captured["args"] == ["gh", "auth", "status"]
+    assert captured["cwd"] == tmp_path
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["HOME"] == str(isolated_home)
+    assert env["GH_CONFIG_DIR"] == str(real_gh_config)
+
+
 def _write_codex_auth(path: Path, *, access: str, refresh: str, id_token: str) -> None:
     path.mkdir(parents=True, exist_ok=True)
     (path / "auth.json").write_text(
