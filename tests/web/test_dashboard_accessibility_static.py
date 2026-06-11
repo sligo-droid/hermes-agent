@@ -223,10 +223,11 @@ def test_command_center_annotation_controls_are_accessible_and_do_not_open_cards
     assert "operator_note_count?: number;" in api_source
     assert "latest_operator_note?: CommandCenterAnnotation | null;" in api_source
     assert "latest_correction?: CommandCenterAnnotation | null;" in api_source
-    assert "<AnnotationButton item={item} mode=\"note\" onOpen={onAnnotate} />" in card_source
-    assert "<AnnotationButton item={item} mode=\"correction\" onOpen={onAnnotate} />" in card_source
+    assert card_source.count("<AnnotationButton item={item} onOpen={onAnnotate} />") == 1
+    assert "mode=\"correction\"" not in card_source
     assert "Add operator note" in button_source
-    assert "Correct or redirect work" in button_source
+    assert "Correct or redirect work" not in button_source
+    assert 'onOpen(item, "note");' in button_source
     assert "event.stopPropagation();" in button_source
     assert "onAnnotate={openAnnotationDraft}" in source
 

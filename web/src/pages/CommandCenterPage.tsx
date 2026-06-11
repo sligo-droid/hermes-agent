@@ -15,7 +15,6 @@ import {
   Inbox,
   MessageSquarePlus,
   PauseCircle,
-  PencilLine,
   RefreshCw,
   RotateCcw,
   Wrench,
@@ -373,29 +372,23 @@ function ActionButton({
 
 function AnnotationButton({
   item,
-  mode,
   onOpen,
 }: {
   item: CommandCenterWorkItem;
-  mode: CommandCenterAnnotationMode;
   onOpen: (item: CommandCenterWorkItem, mode: CommandCenterAnnotationMode) => void;
 }) {
-  const config = mode === "note"
-    ? { label: "Add operator note", short: "Note", icon: MessageSquarePlus }
-    : { label: "Correct or redirect work", short: "Correct", icon: PencilLine };
-  const Icon = config.icon;
   return (
     <button
-      aria-label={`${config.label} for ${item.title || item.id}`}
+      aria-label={`Add operator note for ${item.title || item.id}`}
       className="inline-flex h-8 items-center gap-1.5 rounded-full border border-white/10 px-2.5 text-xs font-semibold text-slate-200 transition hover:border-cyan-100/35 hover:bg-cyan-100/[0.08] hover:text-cyan-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/30"
       onClick={(event) => {
         event.stopPropagation();
-        onOpen(item, mode);
+        onOpen(item, "note");
       }}
       type="button"
     >
-      <Icon aria-hidden="true" className="h-3.5 w-3.5" />
-      {config.short}
+      <MessageSquarePlus aria-hidden="true" className="h-3.5 w-3.5" />
+      Note
     </button>
   );
 }
@@ -675,8 +668,7 @@ function WorkItemCard({
             Ticket <ExternalLink className="h-3.5 w-3.5" /><span className="sr-only">opens in a new tab</span>
           </a>
         )}
-        <AnnotationButton item={item} mode="note" onOpen={onAnnotate} />
-        <AnnotationButton item={item} mode="correction" onOpen={onAnnotate} />
+        <AnnotationButton item={item} onOpen={onAnnotate} />
         {rowBusy && activeAction && (
           <span className="inline-flex h-9 items-center gap-2 rounded-full border border-cyan-100/25 bg-cyan-100/10 px-3 text-xs font-semibold text-cyan-50" aria-live="polite">
             <Spinner /> {ACTION_PROGRESS_LABELS[activeAction.kind]}…
