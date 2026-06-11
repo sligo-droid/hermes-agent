@@ -2119,7 +2119,7 @@ def test_public_session_board_does_not_auto_refresh(monkeypatch, tmp_path):
     assert "window.history.pushState" in html
     assert "const startupTicketId = initialTicketId || ticketIdFromPath();" in html
     assert "Unable to load ticket details" in html
-    assert '<a class="brand" href="/workers">Hermes<br>Kanban</a>' in html
+    assert '<a class="brand" href="/command-center">Command<br>Center</a>' in html
     assert "Codex result" not in html
     assert "Recent internals" not in html
     assert "codex_state" not in html
@@ -2224,6 +2224,8 @@ def test_public_session_board_links_discord_thread_and_workers_index(monkeypatch
 
     html = dwb.render_public_session_board_html("6162")
 
+    assert '<a class="brand" href="/command-center">Command<br>Center</a>' in html
+    assert '<a class="brand" href="/workers">Hermes<br>Kanban</a>' not in html
     assert '<a class="back-link" href="/workers">Worker Boards</a>' in html
     assert (
         '<span>Discord: <a href="https://discord.com/channels/111/6162" '

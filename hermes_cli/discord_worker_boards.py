@@ -4202,7 +4202,7 @@ def _render_public_board_html(
 <body>
   <header>
     <div class="top-nav">
-      <a class="brand" href="/workers">Hermes<br>Kanban</a>
+      <a class="brand" href="/command-center">Command<br>Center</a>
       <a class="back-link" href="/workers">Worker Boards</a>
     </div>
     <div class="hero">
