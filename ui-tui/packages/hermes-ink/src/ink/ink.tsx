@@ -7,6 +7,7 @@ import throttle from 'lodash-es/throttle.js'
 import React, { type ReactNode } from 'react'
 import type { FiberRoot } from 'react-reconciler'
 import { ConcurrentRoot } from 'react-reconciler/constants.js'
+import { onExit } from 'signal-exit'
 
 import { flushInteractionTime } from '../bootstrap/state.js'
 import { getYogaCounters } from '../native-ts/yoga-layout/index.js'
@@ -90,8 +91,7 @@ import {
   ENABLE_KITTY_KEYBOARD,
   ENABLE_MODIFY_OTHER_KEYS,
   ERASE_SCREEN,
-  ERASE_SCROLLBACK,
-  RESET_SCROLL_REGION
+  ERASE_SCROLLBACK
 } from './termio/csi.js'
 import {
   DBP,
@@ -375,10 +375,10 @@ export default class Ink {
     // Ignore last render after unmounting a tree to prevent empty output before exit
     this.isUnmounted = false
 
-    // Unmount when process exits. Avoid signal-exit here: the CommonJS
-    // package has hung during TUI startup under some Node/bundler
-    // combinations, leaving the alternate screen blank before first render.
-    this.unsubscribeExit = this.registerExitHandlers()
+    // Unmount when process exits
+    this.unsubscribeExit = onExit(this.unmount, {
+      alwaysLast: false
+    })
 
     if (options.stdout.isTTY) {
       options.stdout.on('resize', this.handleResize)
@@ -598,32 +598,6 @@ export default class Ink {
   resolveExitPromise: () => void = () => {}
   rejectExitPromise: (reason?: Error) => void = () => {}
   unsubscribeExit: () => void = () => {}
-  private readonly exitSignalHandlers: Array<[NodeJS.Signals, () => void]> = []
-
-  private registerExitHandlers(): () => void {
-    const onProcessExit = () => this.unmount()
-    process.once('exit', onProcessExit)
-
-    const signals: NodeJS.Signals[] = ['SIGHUP', 'SIGINT', 'SIGTERM']
-
-    for (const signal of signals) {
-      const handler = () => {
-        this.unmount()
-        process.kill(process.pid, signal)
-      }
-
-      this.exitSignalHandlers.push([signal, handler])
-      process.once(signal, handler)
-    }
-
-    return () => {
-      process.off('exit', onProcessExit)
-
-      for (const [signal, handler] of this.exitSignalHandlers.splice(0)) {
-        process.off(signal, handler)
-      }
-    }
-  }
 
   /**
    * Pause Ink and hand the terminal over to an external TUI (e.g. git
@@ -644,8 +618,6 @@ export default class Ink {
         // disable mouse (no-op if off)
         (this.altScreenActive ? '' : '\x1b[?1049h') +
         // enter alt (already in alt if fullscreen)
-        RESET_SCROLL_REGION +
-        // reset inherited/private scroll margins
         '\x1b[?1004l' +
         // disable focus reporting
         '\x1b[0m' +
@@ -674,8 +646,6 @@ export default class Ink {
     this.options.stdout.write(
       (this.altScreenActive ? ENTER_ALT_SCREEN : '') +
         // re-enter alt — vim's rmcup dropped us to main
-        RESET_SCROLL_REGION +
-        // reset scroll margins before clearing/repainting Ink
         '\x1b[2J' +
         // clear screen (now alt if fullscreen)
         '\x1b[H' +
@@ -1278,28 +1248,6 @@ export default class Ink {
    * onRender resets the flag at frame end so it's one-shot.
    */
   invalidatePrevFrame(): void {
-    this.prevFrameContaminated = true
-  }
-
-  /**
-   * Request an erase-backed repaint on the next alt-screen render.
-   *
-   * Use when a large floating overlay has just appeared/disappeared:
-   * diff-only repaint can miss cells that are already blank in the virtual
-   * buffers but still contain stale physical terminal glyphs.
-   */
-  requestRepaint(): void {
-    if (!this.options.stdout.isTTY || this.isUnmounted || this.isPaused) {
-      return
-    }
-
-    if (this.altScreenActive) {
-      this.resetFramesForAltScreen()
-      this.needsEraseBeforePaint = true
-
-      return
-    }
-
     this.prevFrameContaminated = true
   }
 
@@ -2456,7 +2404,7 @@ export default class Ink {
       if (this.altScreenActive) {
         // <AlternateScreen>'s unmount effect won't run during signal-exit.
         // Exit alt screen FIRST so other cleanup sequences go to the main screen.
-        writeSync(1, EXIT_ALT_SCREEN + RESET_SCROLL_REGION)
+        writeSync(1, EXIT_ALT_SCREEN)
       }
 
       // Disable mouse tracking — unconditional because altScreenActive can be

@@ -62,25 +62,17 @@ function generateChannelId(): string {
   return `chat-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
 }
 
-function cssVar(name: string, fallback: string): string {
-  if (typeof window === "undefined") return fallback;
-  const value = getComputedStyle(document.documentElement)
-    .getPropertyValue(name)
-    .trim();
-  return value || fallback;
-}
-
-function terminalTheme() {
-  const background = cssVar("--background-base", "#041c1c");
-  const foreground = cssVar("--midground-base", "#ffe6cb");
-  return {
-    background,
-    foreground,
-    cursor: foreground,
-    cursorAccent: background,
-    selectionBackground: `${foreground}44`,
-  };
-}
+// Colors for the terminal body.  Matches the dashboard's dark teal canvas
+// with cream foreground — we intentionally don't pick monokai or a loud
+// theme, because the TUI's skin engine already paints the content; the
+// terminal chrome just needs to sit quietly inside the dashboard.
+const TERMINAL_THEME = {
+  background: "#0d2626",
+  foreground: "#f0e6d2",
+  cursor: "#f0e6d2",
+  cursorAccent: "#0d2626",
+  selectionBackground: "#f0e6d244",
+};
 
 /**
  * CSS width for xterm font tiers.
@@ -138,9 +130,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       : null,
   );
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
-  const [ptyConnected, setPtyConnected] = useState(false);
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const terminalChrome = useMemo(() => terminalTheme(), []);
   // Raw state for the mobile side-sheet + a derived value that force-
   // closes whenever the chat tab isn't active.  The *derived* value is
   // what side-effects (body-scroll lock, keydown listener, portal render)
@@ -286,18 +276,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     termRef.current?.focus();
   };
 
-  const sendSlashToVisibleTui = useCallback((slashCommand: string) => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    ws.send(slashCommand);
-    setTimeout(() => {
-      const s = wsRef.current;
-      if (s && s.readyState === WebSocket.OPEN) s.send("\r");
-    }, 100);
-    termRef.current?.focus();
-    return true;
-  }, []);
-
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
@@ -337,7 +315,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // Browser-embedded chat runs the TUI in inline mode. Keep transcript
       // history in xterm.js so the browser wheel can scroll it directly.
       scrollback: 5000,
-      theme: terminalChrome,
+      theme: TERMINAL_THEME,
     });
     termRef.current = term;
 
@@ -598,21 +576,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       wsRef.current = ws;
 
     ws.onopen = () => {
-      setPtyConnected(true);
       setBanner(null);
       // Send the initial RESIZE immediately so Ink has *a* size to lay
       // out against on its first paint.  The double-rAF block above will
       // follow up with the authoritative measurement — at worst Ink
       // reflows once after the PTY boots, which is imperceptible.
       ws.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
-    };
-
-    ws.onerror = () => {
-      if (!unmounting) {
-        setBanner(
-          "Chat connection error. The embedded TUI may have stopped; reload to reconnect.",
-        );
-      }
     };
 
     ws.onmessage = (ev) => {
@@ -625,7 +594,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     ws.onclose = (ev) => {
       wsRef.current = null;
-      setPtyConnected(false);
       if (unmounting) {
         return;
       }
@@ -639,16 +607,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       }
       if (ev.code === 1011) {
         // Server already wrote an ANSI error frame.
-        return;
-      }
-      if (ev.code === 1006 || ev.wasClean === false) {
-        const reason = ev.reason ? `: ${ev.reason}` : "";
-        setBanner(
-          `Chat connection dropped unexpectedly (${ev.code || "abnormal"})${reason}. The dashboard or TUI process may have restarted; reload to reconnect.`,
-        );
-        term.write(
-          "\r\n\x1b[31m[chat connection dropped unexpectedly]\x1b[0m\r\n",
-        );
         return;
       }
       term.write("\r\n\x1b[90m[session ended]\x1b[0m\r\n");
@@ -711,7 +669,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // the ticket fetch resolves and ``wsRef.current`` was never assigned.
       wsRef.current?.close();
       wsRef.current = null;
-      setPtyConnected(false);
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
@@ -720,7 +677,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         copyResetRef.current = null;
       }
     };
-  }, [channel, resumeParam, terminalChrome]);
+  }, [channel, resumeParam]);
 
   // When the user returns to the chat tab (isActive: false → true), the
   // terminal host just transitioned from display:none to display:flex.
@@ -849,11 +806,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               "border-t border-current/10",
             )}
           >
-            <ChatSidebar
-              channel={channel}
-              ptyConnected={ptyConnected}
-              onVisibleTuiSlash={sendSlashToVisibleTui}
-            />
+            <ChatSidebar channel={channel} />
           </div>
         </div>
       </>,
@@ -878,7 +831,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             "p-2 sm:p-3",
           )}
           style={{
-            backgroundColor: terminalChrome.background,
+            backgroundColor: TERMINAL_THEME.background,
             boxShadow: "0 8px 32px rgba(0, 0, 0, 0.4)",
           }}
         >
@@ -902,7 +855,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               "bottom-2 right-2 px-2 py-1 text-xs sm:bottom-3 sm:right-3 sm:px-2.5 sm:py-1.5",
               "lg:bottom-4 lg:right-4",
             )}
-            style={{ color: terminalChrome.foreground }}
+            style={{ color: TERMINAL_THEME.foreground }}
           >
             <span className="inline-flex items-center gap-1.5">
               <Copy className="h-3 w-3 shrink-0" />
@@ -921,11 +874,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             className="flex min-h-0 shrink-0 flex-col overflow-hidden lg:h-full lg:w-80"
           >
             <div className="min-h-0 flex-1 overflow-hidden">
-              <ChatSidebar
-                channel={channel}
-                ptyConnected={ptyConnected}
-                onVisibleTuiSlash={sendSlashToVisibleTui}
-              />
+              <ChatSidebar channel={channel} />
             </div>
           </div>
         )}

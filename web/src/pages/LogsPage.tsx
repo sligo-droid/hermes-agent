@@ -19,7 +19,7 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 
 const FILES = ["live", "workers", "gateway", "agent", "errors"] as const;
-const LEVELS = ["ALL", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] as const;
+const LEVELS = ["ALL", "DEBUG", "INFO", "WARNING", "ERROR"] as const;
 const COMPONENTS = ["all", "gateway", "agent", "tools", "cli", "cron"] as const;
 const LINE_COUNTS = [50, 100, 200, 500] as const;
 

@@ -16,8 +16,4 @@ describe('virtual history clamp bounds', () => {
       false
     )
   })
-
-  it('does not clamp when virtualization clamp is disabled', () => {
-    expect(shouldSetVirtualClamp({ enabled: false, itemCount: 20, sticky: false, viewportHeight: 10 })).toBe(false)
-  })
 })

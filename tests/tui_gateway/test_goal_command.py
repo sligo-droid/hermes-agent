@@ -148,26 +148,6 @@ def test_goal_set_parses_subgoal_lines(server, session):
     assert mgr.state.subgoals == ["Write tests", "Update docs"]
 
 
-def test_goal_rejects_unexpanded_paste_placeholder(server, session):
-    sid, _, data = session
-    session_key = "tui-goal-placeholder-session"
-    data["session_key"] = session_key
-    r = _call(
-        server,
-        "command.dispatch",
-        name="goal",
-        arg="[[ /goal Goal Plan.. [80 lines] .. optional. ]]",
-        session_id=sid,
-    )
-    assert "error" in r
-    assert r["error"]["code"] == 4004
-    assert "paste placeholder" in r["error"]["message"]
-
-    from hermes_cli.goals import GoalManager
-
-    assert GoalManager(session_key).state is None
-
-
 def test_goal_pause_after_set(server, session):
     sid, session_key, _ = session
     _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)

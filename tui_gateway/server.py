@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import queue
-import re
 import subprocess
 import sys
 import threading
@@ -918,13 +917,6 @@ def _load_service_tier() -> str | None:
     if raw in {"fast", "priority", "on"}:
         return "priority"
     return None
-
-
-def _fast_display(session: dict | None) -> str:
-    agent = session.get("agent") if session else None
-    if agent is not None:
-        return "on" if getattr(agent, "service_tier", None) == "priority" else "off"
-    return "on" if _load_service_tier() == "priority" else "off"
 
 
 def _load_show_reasoning() -> bool:
@@ -2227,24 +2219,6 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
     messages = []
     tool_call_args = {}
 
-    def _reasoning_text(m: dict) -> str:
-        parts: list[str] = []
-        for key in ("reasoning", "reasoning_content"):
-            value = m.get(key)
-            if isinstance(value, str) and value.strip() and value not in parts:
-                parts.append(value.strip())
-
-        details = m.get("reasoning_details")
-        if isinstance(details, list):
-            for detail in details:
-                if not isinstance(detail, dict):
-                    continue
-                value = detail.get("summary") or detail.get("text") or detail.get("content")
-                if isinstance(value, str) and value.strip() and value not in parts:
-                    parts.append(value.strip())
-
-        return "\n\n".join(parts)
-
     for m in history:
         if not isinstance(m, dict):
             continue
@@ -2252,7 +2226,6 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if role not in {"user", "assistant", "tool", "system"}:
             continue
         content_text = _content_display_text(m.get("content"))
-        reasoning_text = _reasoning_text(m) if role == "assistant" else ""
         if role == "assistant" and m.get("tool_calls"):
             for tc in m["tool_calls"]:
                 fn = tc.get("function", {})
@@ -2263,7 +2236,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                     except (json.JSONDecodeError, TypeError):
                         args = {}
                     tool_call_args[tc_id] = (fn["name"], args)
-            if not content_text.strip() and not reasoning_text.strip():
+            if not content_text.strip():
                 continue
         if role == "tool":
             tc_id = m.get("tool_call_id", "")
@@ -2271,20 +2244,12 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             name = (tc_info[0] if tc_info else None) or m.get("tool_name") or "tool"
             args = (tc_info[1] if tc_info else None) or {}
             messages.append(
-                {
-                    "role": "tool",
-                    "name": name,
-                    "context": _tool_ctx(name, args),
-                    "text": content_text,
-                }
+                {"role": "tool", "name": name, "context": _tool_ctx(name, args)}
             )
             continue
-        if not content_text.strip() and not reasoning_text.strip():
+        if not content_text.strip():
             continue
-        row = {"role": role, "text": content_text}
-        if reasoning_text:
-            row["thinking"] = reasoning_text
-        messages.append(row)
+        messages.append({"role": role, "text": content_text})
 
     return messages
 
@@ -2511,16 +2476,12 @@ def _(rid, params: dict) -> dict:
     sid = uuid.uuid4().hex[:8]
     _enable_gateway_prompts()
     try:
-        compression_tip = db.get_compression_tip(target)
-        if compression_tip and compression_tip != target:
-            target = compression_tip
-        else:
-            resolved = db.resolve_resume_session_id(target)
-            if resolved:
-                target = resolved
         db.reopen_session(target)
-        history = db.get_messages_as_conversation(target, include_ancestors=True)
-        messages = _history_to_messages(history)
+        history = db.get_messages_as_conversation(target)
+        display_history = db.get_messages_as_conversation(
+            target, include_ancestors=True
+        )
+        messages = _history_to_messages(display_history)
         tokens = _set_session_context(target)
         try:
             agent = _make_agent(sid, target, session_id=target)
@@ -4337,10 +4298,6 @@ def _(rid, params: dict) -> dict:
             arg = str(value or "").strip().lower()
             if arg in {"show", "on"}:
                 cfg = _load_cfg()
-                effort = str(
-                    (cfg.get("agent") or {}).get("reasoning_effort", "medium")
-                    or "medium"
-                )
                 display = (
                     cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
                 )
@@ -4356,22 +4313,9 @@ def _(rid, params: dict) -> dict:
                 _save_cfg(cfg)
                 if session:
                     session["show_reasoning"] = True
-                return _ok(
-                    rid,
-                    {
-                        "key": key,
-                        "value": "show",
-                        "effort": effort,
-                        "display": "show",
-                        "fast": _fast_display(session),
-                    },
-                )
+                return _ok(rid, {"key": key, "value": "show"})
             if arg in {"hide", "off"}:
                 cfg = _load_cfg()
-                effort = str(
-                    (cfg.get("agent") or {}).get("reasoning_effort", "medium")
-                    or "medium"
-                )
                 display = (
                     cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
                 )
@@ -4387,16 +4331,7 @@ def _(rid, params: dict) -> dict:
                 _save_cfg(cfg)
                 if session:
                     session["show_reasoning"] = False
-                return _ok(
-                    rid,
-                    {
-                        "key": key,
-                        "value": "hide",
-                        "effort": effort,
-                        "display": "hide",
-                        "fast": _fast_display(session),
-                    },
-                )
+                return _ok(rid, {"key": key, "value": "hide"})
 
             parsed = parse_reasoning_effort(arg)
             if parsed is None:
@@ -4404,16 +4339,7 @@ def _(rid, params: dict) -> dict:
             _write_config_key("agent.reasoning_effort", arg)
             if session and session.get("agent") is not None:
                 session["agent"].reasoning_config = parsed
-            return _ok(
-                rid,
-                {
-                    "key": key,
-                    "value": arg,
-                    "effort": arg,
-                    "display": "show" if _load_show_reasoning() else "hide",
-                    "fast": _fast_display(session),
-                },
-            )
+            return _ok(rid, {"key": key, "value": arg})
         except Exception as e:
             return _err(rid, 5001, str(e))
 
@@ -4636,7 +4562,6 @@ def _(rid, params: dict) -> dict:
         )
     if key == "reasoning":
         cfg = _load_cfg()
-        session = _sessions.get(params.get("session_id", ""))
         effort = str(
             (cfg.get("agent") or {}).get("reasoning_effort", "medium") or "medium"
         )
@@ -4645,10 +4570,7 @@ def _(rid, params: dict) -> dict:
             if bool((cfg.get("display") or {}).get("show_reasoning", False))
             else "hide"
         )
-        return _ok(
-            rid,
-            {"value": effort, "display": display, "fast": _fast_display(session)},
-        )
+        return _ok(rid, {"value": effort, "display": display})
     if key == "fast":
         return _ok(
             rid,
@@ -5247,13 +5169,6 @@ def _(rid, params: dict) -> dict:
             )
 
         # Otherwise — treat the remaining text as the new goal.
-        if _is_unresolved_paste_placeholder_arg(arg):
-            return _err(
-                rid,
-                4004,
-                "invalid goal: large paste placeholder was not expanded; retry after updating the TUI",
-            )
-
         try:
             state = mgr.set(arg)
         except ValueError as exc:
@@ -5298,11 +5213,6 @@ def _(rid, params: dict) -> dict:
 # ── Methods: paste ────────────────────────────────────────────────────
 
 _paste_counter = 0
-_UNRESOLVED_PASTE_ARG_RE = re.compile(r"^\s*(?:\[\[[^\n]*?\]\]\s*)+$")
-
-
-def _is_unresolved_paste_placeholder_arg(arg: str) -> bool:
-    return bool(_UNRESOLVED_PASTE_ARG_RE.fullmatch(arg or ""))
 
 
 @method("paste.collapse")

@@ -6,13 +6,6 @@ React + Ink terminal UI for Hermes. TypeScript owns the screen. Python owns sess
 hermes --tui
 ```
 
-Inline mode renders into the terminal's primary buffer so native scrollback
-captures the transcript:
-
-```bash
-HERMES_TUI_INLINE=1 hermes --tui
-```
-
 ## What runs
 
 The client entrypoint is `src/entry.tsx`. It exits early if `stdin` is not a TTY, starts `GatewayClient`, then renders `App`.
