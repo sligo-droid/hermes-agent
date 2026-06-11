@@ -239,6 +239,31 @@ def _inject_github_cli_config_dir(env: dict) -> None:
         pass
 
 
+def _inject_real_home_profile_config_paths(env: dict, explicit_keys: set[str]) -> None:
+    """Bridge real-home CLI config roots into profile-isolated subprocesses."""
+    real_home = Path.home()
+
+    if "GH_CONFIG_DIR" not in explicit_keys and not env.get("GH_CONFIG_DIR"):
+        gh_config = real_home / ".config" / "gh"
+        if (gh_config / "hosts.yml").is_file():
+            env["GH_CONFIG_DIR"] = str(gh_config)
+
+    if "GIT_CONFIG_GLOBAL" not in explicit_keys and not env.get("GIT_CONFIG_GLOBAL"):
+        git_config = real_home / ".gitconfig"
+        if git_config.is_file():
+            env["GIT_CONFIG_GLOBAL"] = str(git_config)
+
+    if "DOCKER_CONFIG" not in explicit_keys and not env.get("DOCKER_CONFIG"):
+        docker_config = real_home / ".docker"
+        if (docker_config / "config.json").is_file():
+            env["DOCKER_CONFIG"] = str(docker_config)
+
+    if "CODEX_HOME" not in explicit_keys and not env.get("CODEX_HOME"):
+        codex_home = real_home / ".codex"
+        if codex_home.is_dir():
+            env["CODEX_HOME"] = str(codex_home)
+
+
 def _append_path_entry(path_value: str, entry: Path) -> str:
     entry_str = str(entry)
     separator = os.pathsep
@@ -271,6 +296,7 @@ def _bootstrap_profile_subprocess_env(
     if "PATH" not in explicit_keys and real_user_bin.is_dir():
         env["PATH"] = _append_path_entry(env.get("PATH", ""), real_user_bin)
 
+    _inject_real_home_profile_config_paths(env, explicit_keys)
     _inject_github_cli_config_dir(env)
 
     if "CLOUDSDK_CONFIG" not in explicit_keys and not env.get("CLOUDSDK_CONFIG"):
