@@ -55,10 +55,13 @@ Fixes #
 <!-- Check all that apply. It's OK to check "N/A" if a category doesn't apply to your change. -->
 
 - [ ] I've updated relevant documentation (README, `docs/`, docstrings) — or N/A
+- [ ] For operational Hermes changes, I've updated `docs/project-state.md` — or added `Project-state: not needed` with a short reason in this PR body
 - [ ] I've updated `cli-config.yaml.example` if I added/changed config keys — or N/A
 - [ ] I've updated `CONTRIBUTING.md` or `AGENTS.md` if I changed architecture or workflows — or N/A
 - [ ] I've considered cross-platform impact (Windows, macOS) per the [compatibility guide](https://github.com/NousResearch/hermes-agent/blob/main/CONTRIBUTING.md#cross-platform-compatibility) — or N/A
 - [ ] I've updated tool descriptions/schemas if I changed tool behavior — or N/A
+
+Project-state: not needed <!-- If applicable, replace this comment with a short reason. -->
 
 ## For New Skills
 
@@ -72,4 +75,3 @@ Fixes #
 ## Screenshots / Logs
 
 <!-- If applicable, add screenshots or log output showing the fix/feature in action. -->
-
