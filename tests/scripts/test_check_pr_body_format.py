@@ -60,3 +60,94 @@ def test_loads_body_from_github_event(tmp_path):
 
     assert mod.load_body_from_event(event_path) == r"Summary:\n- escaped body"
     assert mod.main(["--event-path", str(event_path)]) == 1
+
+
+def test_project_state_requirement_passes_when_operational_change_updates_state():
+    mod = _load_module()
+
+    ok, message = mod.check_project_state_requirement(
+        "## Summary\n- Update gateway behavior",
+        ["gateway/run.py", "docs/project-state.md"],
+    )
+
+    assert ok is True
+    assert "docs/project-state.md" in message
+
+
+def test_project_state_requirement_passes_with_not_needed_justification():
+    mod = _load_module()
+    body = "## Summary\n- Update kanban command\n\nProject-state: not needed - test-only CLI plumbing"
+
+    ok, message = mod.check_project_state_requirement(
+        body,
+        ["hermes_cli/kanban.py"],
+    )
+
+    assert ok is True
+    assert "Project-state: not needed" in message
+
+
+def test_project_state_requirement_rejects_placeholder_not_needed_marker():
+    mod = _load_module()
+    body = "Project-state: not needed <!-- If applicable, replace this comment with a short reason. -->"
+
+    ok, message = mod.check_project_state_requirement(
+        body,
+        ["cron/jobs.py"],
+    )
+
+    assert ok is False
+    assert "Operational PRs must update docs/project-state.md" in message
+
+
+def test_project_state_requirement_fails_operational_change_without_evidence():
+    mod = _load_module()
+
+    ok, message = mod.check_project_state_requirement(
+        "## Summary\n- Change gateway runtime behavior",
+        ["gateway/run.py"],
+    )
+
+    assert ok is False
+    assert "Project-state: not needed" in message
+
+
+def test_project_state_requirement_allows_docs_only_non_operational_change():
+    mod = _load_module()
+
+    ok, message = mod.check_project_state_requirement(
+        "## Summary\n- Fix docs typo",
+        ["docs/usage.md"],
+    )
+
+    assert ok is True
+    assert "No operational" in message
+
+
+def test_project_state_requirement_allows_tests_only_change():
+    mod = _load_module()
+
+    ok, message = mod.check_project_state_requirement(
+        "## Summary\n- Add tests",
+        ["tests/gateway/test_run.py"],
+    )
+
+    assert ok is True
+    assert "No operational" in message
+
+
+def test_main_checks_changed_files_file(tmp_path):
+    mod = _load_module()
+    changed_files = tmp_path / "changed-files.txt"
+    changed_files.write_text("gateway/run.py\n", encoding="utf-8")
+
+    result = mod.main(
+        [
+            "--body",
+            "## Summary\n- Change gateway runtime behavior",
+            "--changed-files",
+            str(changed_files),
+        ]
+    )
+
+    assert result == 1
