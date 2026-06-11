@@ -170,6 +170,7 @@ class TestMakeRunEnvHomeInjection:
         result = _make_run_env({})
 
         assert result["HOME"] == str(hermes_home / "home")
+        assert result["HERMES_HOME"] == str(hermes_home)
 
     def test_no_injection_when_home_dir_missing(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
@@ -237,6 +238,73 @@ class TestMakeRunEnvHomeInjection:
         assert "GH_TOKEN" not in result
         assert "GITHUB_TOKEN" not in result
 
+    def test_bridges_real_home_cli_paths_when_home_is_isolated(self, tmp_path, monkeypatch):
+        real_home = tmp_path / "real-home"
+        hermes_home = tmp_path / "hermes"
+        real_bin = real_home / ".local" / "bin"
+        gh_dir = real_home / ".config" / "gh"
+        gcloud_dir = real_home / ".config" / "gcloud"
+        npmrc = real_home / ".npmrc"
+        real_bin.mkdir(parents=True)
+        gh_dir.mkdir(parents=True)
+        gcloud_dir.mkdir(parents=True)
+        npmrc.write_text("registry=https://registry.npmjs.org/\n", encoding="utf-8")
+        (gh_dir / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
+        hermes_home.mkdir()
+        (hermes_home / "home").mkdir()
+        monkeypatch.setattr(Path, "home", lambda: real_home)
+        monkeypatch.setenv("HOME", str(real_home))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+        monkeypatch.delenv("NPM_CONFIG_USERCONFIG", raising=False)
+
+        from tools.environments.local import _make_run_env
+        result = _make_run_env({})
+
+        assert result["HOME"] == str(hermes_home / "home")
+        assert result["HERMES_HOME"] == str(hermes_home)
+        assert str(real_bin) in result["PATH"].split(os.pathsep)
+        assert result["GH_CONFIG_DIR"] == str(gh_dir)
+        assert result["CLOUDSDK_CONFIG"] == str(gcloud_dir)
+        assert result["NPM_CONFIG_USERCONFIG"] == str(npmrc)
+
+    def test_explicit_profile_bridge_values_are_not_overridden(self, tmp_path, monkeypatch):
+        real_home = tmp_path / "real-home"
+        hermes_home = tmp_path / "hermes"
+        real_bin = real_home / ".local" / "bin"
+        gh_dir = real_home / ".config" / "gh"
+        gcloud_dir = real_home / ".config" / "gcloud"
+        npmrc = real_home / ".npmrc"
+        real_bin.mkdir(parents=True)
+        gh_dir.mkdir(parents=True)
+        gcloud_dir.mkdir(parents=True)
+        npmrc.write_text("registry=https://registry.npmjs.org/\n", encoding="utf-8")
+        (gh_dir / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
+        hermes_home.mkdir()
+        (hermes_home / "home").mkdir()
+        monkeypatch.setattr(Path, "home", lambda: real_home)
+        monkeypatch.setenv("HOME", str(real_home))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+        from tools.environments.local import _make_run_env
+        result = _make_run_env({
+            "HERMES_HOME": "/explicit/hermes",
+            "PATH": "/explicit/bin",
+            "GH_CONFIG_DIR": "/explicit/gh",
+            "CLOUDSDK_CONFIG": "/explicit/gcloud",
+            "NPM_CONFIG_USERCONFIG": "/explicit/npmrc",
+        })
+
+        assert result["HOME"] == str(hermes_home / "home")
+        assert result["HERMES_HOME"] == "/explicit/hermes"
+        assert result["PATH"] == "/explicit/bin"
+        assert result["GH_CONFIG_DIR"] == "/explicit/gh"
+        assert result["CLOUDSDK_CONFIG"] == "/explicit/gcloud"
+        assert result["NPM_CONFIG_USERCONFIG"] == "/explicit/npmrc"
+
     def test_strips_kanban_routing_env_from_terminal_run_env(self, tmp_path, monkeypatch):
         """Terminal commands must not inherit a worker's live board DB scope."""
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
@@ -288,6 +356,7 @@ class TestSanitizeSubprocessEnvHomeInjection:
         result = _sanitize_subprocess_env(base_env)
 
         assert result["HOME"] == str(hermes_home / "home")
+        assert result["HERMES_HOME"] == str(hermes_home)
 
     def test_no_injection_when_home_dir_missing(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
@@ -348,6 +417,78 @@ class TestSanitizeSubprocessEnvHomeInjection:
         assert result["GH_CONFIG_DIR"] == str(gh_dir)
         assert "GH_TOKEN" not in result
         assert "GITHUB_TOKEN" not in result
+
+    def test_background_bridges_real_home_cli_paths_when_home_is_isolated(
+        self, tmp_path, monkeypatch
+    ):
+        real_home = tmp_path / "real-home"
+        hermes_home = tmp_path / "hermes"
+        real_bin = real_home / ".local" / "bin"
+        gh_dir = real_home / ".config" / "gh"
+        gcloud_dir = real_home / ".config" / "gcloud"
+        npmrc = real_home / ".npmrc"
+        real_bin.mkdir(parents=True)
+        gh_dir.mkdir(parents=True)
+        gcloud_dir.mkdir(parents=True)
+        npmrc.write_text("registry=https://registry.npmjs.org/\n", encoding="utf-8")
+        (gh_dir / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
+        hermes_home.mkdir()
+        (hermes_home / "home").mkdir()
+        monkeypatch.setattr(Path, "home", lambda: real_home)
+        monkeypatch.setenv("HOME", str(real_home))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("CLOUDSDK_CONFIG", raising=False)
+        monkeypatch.delenv("NPM_CONFIG_USERCONFIG", raising=False)
+
+        base_env = {"HOME": str(real_home), "PATH": "/usr/bin:/bin"}
+        from tools.environments.local import _sanitize_subprocess_env
+        result = _sanitize_subprocess_env(base_env)
+
+        assert result["HOME"] == str(hermes_home / "home")
+        assert result["HERMES_HOME"] == str(hermes_home)
+        assert str(real_bin) in result["PATH"].split(os.pathsep)
+        assert result["GH_CONFIG_DIR"] == str(gh_dir)
+        assert result["CLOUDSDK_CONFIG"] == str(gcloud_dir)
+        assert result["NPM_CONFIG_USERCONFIG"] == str(npmrc)
+
+    def test_background_explicit_profile_bridge_values_are_not_overridden(
+        self, tmp_path, monkeypatch
+    ):
+        real_home = tmp_path / "real-home"
+        hermes_home = tmp_path / "hermes"
+        real_bin = real_home / ".local" / "bin"
+        gh_dir = real_home / ".config" / "gh"
+        gcloud_dir = real_home / ".config" / "gcloud"
+        npmrc = real_home / ".npmrc"
+        real_bin.mkdir(parents=True)
+        gh_dir.mkdir(parents=True)
+        gcloud_dir.mkdir(parents=True)
+        npmrc.write_text("registry=https://registry.npmjs.org/\n", encoding="utf-8")
+        (gh_dir / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
+        hermes_home.mkdir()
+        (hermes_home / "home").mkdir()
+        monkeypatch.setattr(Path, "home", lambda: real_home)
+        monkeypatch.setenv("HOME", str(real_home))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        base_env = {"HOME": str(real_home), "PATH": "/usr/bin:/bin"}
+        extra_env = {
+            "HERMES_HOME": "/explicit/hermes",
+            "PATH": "/explicit/bin",
+            "GH_CONFIG_DIR": "/explicit/gh",
+            "CLOUDSDK_CONFIG": "/explicit/gcloud",
+            "NPM_CONFIG_USERCONFIG": "/explicit/npmrc",
+        }
+        from tools.environments.local import _sanitize_subprocess_env
+        result = _sanitize_subprocess_env(base_env, extra_env)
+
+        assert result["HOME"] == str(hermes_home / "home")
+        assert result["HERMES_HOME"] == "/explicit/hermes"
+        assert result["PATH"] == "/explicit/bin"
+        assert result["GH_CONFIG_DIR"] == "/explicit/gh"
+        assert result["CLOUDSDK_CONFIG"] == "/explicit/gcloud"
+        assert result["NPM_CONFIG_USERCONFIG"] == "/explicit/npmrc"
 
     def test_strips_kanban_routing_env_from_background_env(self, tmp_path, monkeypatch):
         control_values = {
