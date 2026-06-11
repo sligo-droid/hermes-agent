@@ -67,16 +67,26 @@ export function isProgressReportingAvailable(): boolean {
  * Checks if the terminal supports DEC mode 2026 (synchronized output).
  * When supported, BSU/ESU sequences prevent visible flicker during redraws.
  */
-export function isSynchronizedOutputSupported(): boolean {
+export function isCmuxSession(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(env.CMUX_WORKSPACE_ID || env.CMUX_SURFACE_ID)
+}
+
+export function isSynchronizedOutputSupported(env: NodeJS.ProcessEnv = process.env): boolean {
   // tmux parses and proxies every byte but doesn't implement DEC 2026.
   // BSU/ESU pass through to the outer terminal but tmux has already
   // broken atomicity by chunking. Skip to save 16 bytes/frame + parser work.
-  if (process.env.TMUX) {
+  if (env.TMUX) {
     return false
   }
 
-  const termProgram = process.env.TERM_PROGRAM
-  const term = process.env.TERM
+  const termProgram = env.TERM_PROGRAM
+  const term = env.TERM
+
+  // cmux is Ghostty-backed. Some local shells/remotes strip Ghostty's
+  // TERM_PROGRAM/TERM markers but preserve CMUX_*; keep atomic redraws on.
+  if (isCmuxSession(env)) {
+    return true
+  }
 
   // Modern terminals with known DEC 2026 support
   if (
@@ -92,7 +102,7 @@ export function isSynchronizedOutputSupported(): boolean {
   }
 
   // kitty sets TERM=xterm-kitty or KITTY_WINDOW_ID
-  if (term?.includes('kitty') || process.env.KITTY_WINDOW_ID) {
+  if (term?.includes('kitty') || env.KITTY_WINDOW_ID) {
     return true
   }
 
@@ -112,17 +122,17 @@ export function isSynchronizedOutputSupported(): boolean {
   }
 
   // Zed uses the alacritty_terminal crate which supports DEC 2026
-  if (process.env.ZED_TERM) {
+  if (env.ZED_TERM) {
     return true
   }
 
   // Windows Terminal
-  if (process.env.WT_SESSION) {
+  if (env.WT_SESSION) {
     return true
   }
 
   // VTE-based terminals (GNOME Terminal, Tilix, etc.) since VTE 0.68
-  const vteVersion = process.env.VTE_VERSION
+  const vteVersion = env.VTE_VERSION
 
   if (vteVersion) {
     const version = parseInt(vteVersion, 10)
