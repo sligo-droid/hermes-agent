@@ -130,6 +130,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       : null,
   );
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
+  const [ptyConnected, setPtyConnected] = useState(false);
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Raw state for the mobile side-sheet + a derived value that force-
   // closes whenever the chat tab isn't active.  The *derived* value is
@@ -275,6 +276,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
     termRef.current?.focus();
   };
+
+  const sendSlashToVisibleTui = useCallback((slashCommand: string) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(slashCommand);
+    setTimeout(() => {
+      const s = wsRef.current;
+      if (s && s.readyState === WebSocket.OPEN) s.send("\r");
+    }, 100);
+    termRef.current?.focus();
+    return true;
+  }, []);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -576,6 +589,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       wsRef.current = ws;
 
     ws.onopen = () => {
+      setPtyConnected(true);
       setBanner(null);
       // Send the initial RESIZE immediately so Ink has *a* size to lay
       // out against on its first paint.  The double-rAF block above will
@@ -594,6 +608,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     ws.onclose = (ev) => {
       wsRef.current = null;
+      setPtyConnected(false);
       if (unmounting) {
         return;
       }
@@ -806,7 +821,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               "border-t border-current/10",
             )}
           >
-            <ChatSidebar channel={channel} />
+            <ChatSidebar
+              channel={channel}
+              ptyConnected={ptyConnected}
+              onVisibleTuiSlash={sendSlashToVisibleTui}
+            />
           </div>
         </div>
       </>,
@@ -874,7 +893,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             className="flex min-h-0 shrink-0 flex-col overflow-hidden lg:h-full lg:w-80"
           >
             <div className="min-h-0 flex-1 overflow-hidden">
-              <ChatSidebar channel={channel} />
+              <ChatSidebar
+                channel={channel}
+                ptyConnected={ptyConnected}
+                onVisibleTuiSlash={sendSlashToVisibleTui}
+              />
             </div>
           </div>
         )}
