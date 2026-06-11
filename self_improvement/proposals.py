@@ -19,6 +19,13 @@ _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _STATUS_VALUES = {"proposed"}
 _PRIORITY_VALUES = {"low", "medium", "high", "critical"}
 _SEVERITY_VALUES = {"info", "minor", "major", "critical"}
+_EVIDENCE_BASIS_TYPES = {"source_static_log", "live_browser", "blocked_missing_live"}
+_LIVE_CLAIM_RE = re.compile(
+    r"\b(live[- ]verified|live verification completed|verified live|reproduced live|"
+    r"authenticated (?:admin )?(?:browser )?dogfood (?:occurred|completed|verified|passed|performed|was performed)|"
+    r"admin dogfood (?:occurred|completed|verified|passed))\b",
+    re.IGNORECASE,
+)
 
 
 class ProposalValidationError(ValueError):
@@ -150,6 +157,51 @@ def _validate_source_excerpt(value: Any, path: str) -> dict[str, Any]:
     return excerpt
 
 
+def _validate_evidence_basis(
+    value: Any,
+    path: str,
+    *,
+    source_excerpts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if value is None:
+        summary = "Supported by source, static, or log evidence in source_excerpts; no live/browser evidence claimed."
+        if not source_excerpts:
+            summary = "No explicit evidence basis supplied; normalized as source/static/log with no live/browser evidence claimed."
+        return {
+            "type": "source_static_log",
+            "summary": summary,
+            "missing_live_evidence": [],
+        }
+
+    basis = _require_dict(value, path)
+    basis_type = _require_text(basis.get("type"), f"{path}.type")
+    if basis_type not in _EVIDENCE_BASIS_TYPES:
+        raise ProposalValidationError(f"{path}.type must be one of {sorted(_EVIDENCE_BASIS_TYPES)}")
+
+    normalized: dict[str, Any] = {
+        "type": basis_type,
+        "summary": _require_text(basis.get("summary"), f"{path}.summary", max_len=1000),
+    }
+
+    missing_live = basis.get("missing_live_evidence", [])
+    missing_live_items = [
+        _require_text(item, f"{path}.missing_live_evidence[{idx}]", max_len=300)
+        for idx, item in enumerate(_require_list(missing_live, f"{path}.missing_live_evidence"))
+    ]
+    normalized["missing_live_evidence"] = missing_live_items
+
+    if basis.get("blocker") is not None:
+        normalized["blocker"] = _require_text(basis["blocker"], f"{path}.blocker", max_len=500)
+
+    if basis_type == "blocked_missing_live" and not missing_live_items:
+        raise ProposalValidationError(f"{path}.missing_live_evidence must name blocked or missing live evidence")
+    if basis_type == "live_browser" and missing_live_items:
+        raise ProposalValidationError(f"{path}.missing_live_evidence must be empty for live_browser evidence")
+    if basis_type == "live_browser" and not source_excerpts:
+        raise ProposalValidationError(f"{path} live_browser evidence requires at least one source_excerpts audit excerpt")
+    return normalized
+
+
 def _validate_card(value: Any, path: str, run: dict[str, Any], project: str, prong: str) -> dict[str, Any]:
     card = _require_dict(value, path)
     normalized: dict[str, Any] = {
@@ -184,6 +236,14 @@ def _validate_card(value: Any, path: str, run: dict[str, Any], project: str, pro
     source_excerpts = [_validate_source_excerpt(item, f"{path}.source_excerpts[{idx}]") for idx, item in enumerate(_require_list(card.get("source_excerpts", []), f"{path}.source_excerpts"))]
     normalized["source_excerpts"] = source_excerpts
 
+    evidence_basis = _validate_evidence_basis(card.get("evidence_basis"), f"{path}.evidence_basis", source_excerpts=source_excerpts)
+    card_text = "\n".join(str(normalized.get(key, "")) for key in ("summary", "body", "rationale"))
+    if evidence_basis["type"] != "live_browser" and _LIVE_CLAIM_RE.search(card_text):
+        raise ProposalValidationError(
+            f"{path}.evidence_basis.type must be live_browser before card text can imply authenticated live/browser dogfood verification"
+        )
+    normalized["evidence_basis"] = evidence_basis
+
     kanban = _require_dict(card.get("kanban_task"), f"{path}.kanban_task")
     normalized["kanban_task"] = {
         "title": _require_text(kanban.get("title"), f"{path}.kanban_task.title", max_len=140),
@@ -196,6 +256,20 @@ def _validate_card(value: Any, path: str, run: dict[str, Any], project: str, pro
         tags = [_require_slug(tag, f"{path}.kanban_task.tags[{idx}]") for idx, tag in enumerate(_require_list(kanban["tags"], f"{path}.kanban_task.tags"))]
         normalized["kanban_task"]["tags"] = tags
     return normalized
+
+
+def _validate_human_markdown_evidence_claims(human_markdown: str, cards: list[dict[str, Any]]) -> None:
+    if not human_markdown or not _LIVE_CLAIM_RE.search(human_markdown):
+        return
+
+    non_live_cards = [
+        card for card in cards if card.get("evidence_basis", {}).get("type") != "live_browser"
+    ]
+    if non_live_cards:
+        raise ProposalValidationError(
+            "human_markdown must not imply authenticated live/browser dogfood verification "
+            "for cards without live_browser evidence_basis"
+        )
 
 
 def validate_proposal_run(
@@ -241,13 +315,16 @@ def validate_proposal_run(
         raise ProposalValidationError("cards must have unique proposal_id values")
 
     generated_at = root.get("generated_at")
+    human_markdown = _optional_text(root.get("human_markdown"), "human_markdown", max_len=12000) or ""
+    _validate_human_markdown_evidence_claims(human_markdown, normalized_cards)
+
     normalized = {
         "contract_version": version,
         "project": project,
         "prong": prong,
         "run": normalized_run,
         "generated_at": _require_datetime(generated_at, "generated_at") if generated_at else datetime.now(timezone.utc).isoformat(),
-        "human_markdown": _optional_text(root.get("human_markdown"), "human_markdown", max_len=12000) or "",
+        "human_markdown": human_markdown,
         "cards": normalized_cards,
     }
     return normalized
@@ -280,7 +357,14 @@ def build_cron_proposal_guidance(
         "Each card needs `proposal_id` or a deterministic string `idempotency_key` (not an object), `title`, `summary`, `body`, `rationale`, "
         "`priority` as one of `critical`, `high`, `medium`, or `low` (do not use P0/P1/P2 labels), optional `severity` as one of "
         "`critical`, `major`, `minor`, or `info` (do not use high/medium/low severity labels), "
-        "`source_excerpts` as objects with a `text` field, `status: proposed`, `created_at`, and `kanban_task` with enough title/body detail to construct a later Kanban task. "
+        "`source_excerpts` as objects with a `text` field, `evidence_basis`, `status: proposed`, `created_at`, and `kanban_task` with enough title/body detail to construct a later Kanban task. "
+        "For every card, set `evidence_basis` to an object with `type`, `summary`, and `missing_live_evidence`. The `type` must be one of "
+        "`source_static_log`, `live_browser`, or `blocked_missing_live`. Use `source_static_log` for source, static analysis, or log-backed evidence, including strong evidence that remains sufficient without live dogfood. "
+        "Use `live_browser` only when the run actually used authenticated live/browser evidence and `source_excerpts` includes a safe audit excerpt for that verification. "
+        "Use `blocked_missing_live` when delegated live evidence, browser dogfood, or authenticated admin verification returned `INSUFFICIENT_EVIDENCE` or an explicit blocker; `missing_live_evidence` must name the missing live check without credential details, for example safe admin credentials unavailable. "
+        "If a live-evidence stream is blocked, affected cards must be omitted, downgraded to clearly source/static/log-backed, or labeled with the missing live evidence; do not silently convert blocked live streams into normal live-verified recommendations. "
+        "`source_excerpts` alone are not a live verification claim. Card body/rationale/evidence basis and summary/status language such as RECOMMENDED must not imply authenticated live dogfood occurred unless `evidence_basis.type` is `live_browser`. "
+        "If the proposed work depends on live reproduction and there is no independent source/static/log evidence, omit the card or mark the basis as insufficient instead of proposing it. "
         "Hard length limits: card `title` <= 140 chars, card `summary` <= 500 chars, card `body` <= 6000 chars, card `rationale` <= 2000 chars, "
         "each `source_excerpts[].text` <= 2000 chars, `kanban_task.title` <= 140 chars, and `kanban_task.body` <= 6000 chars. Keep summaries short; put detail in `body` and excerpts."
     )

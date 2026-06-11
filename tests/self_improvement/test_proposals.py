@@ -274,6 +274,63 @@ def test_valid_pid_proposal_run_is_accepted_and_gets_stable_id():
     assert normalized["prong"] == "airflow_scraper_doctor"
     assert normalized["cards"][0]["proposal_id"].startswith("pid-airflow_scraper_doctor-")
     assert validate_proposal_run(payload)["cards"][0]["proposal_id"] == normalized["cards"][0]["proposal_id"]
+    assert normalized["cards"][0]["evidence_basis"] == {
+        "type": "source_static_log",
+        "summary": "Supported by PID Airflow scraper cron logs; no authenticated live/browser dogfood verification is claimed.",
+        "missing_live_evidence": [],
+    }
+
+
+def test_blocked_live_stream_source_backed_card_names_missing_live_evidence():
+    normalized = validate_proposal_run(_fixture("proposal_run_pid_blocked_live_source_backed.json"))
+
+    card = normalized["cards"][0]
+    basis = card["evidence_basis"]
+    assert "safe admin credentials were unavailable" in normalized["human_markdown"]
+    assert "authenticated admin dogfood completed" not in normalized["human_markdown"].lower()
+    assert "live-verified" not in normalized["human_markdown"].lower()
+    assert basis["type"] == "source_static_log"
+    assert basis["missing_live_evidence"] == [
+        "authenticated admin browser dogfood blocked because safe admin credentials were unavailable"
+    ]
+    combined = " ".join([card["summary"], card["body"], card["rationale"], basis["summary"]])
+    assert "safe admin credentials were unavailable" in combined
+    assert "live-verified" not in combined.lower()
+    assert "authenticated live/browser dogfood is explicitly not claimed" in basis["summary"]
+
+
+def test_live_claim_requires_live_browser_evidence_basis():
+    payload = _fixture("proposal_run_pid_blocked_live_source_backed.json")
+    payload["cards"][0]["summary"] = "RECOMMENDED after authenticated admin dogfood completed."
+
+    with pytest.raises(ProposalValidationError) as excinfo:
+        validate_proposal_run(payload)
+
+    assert "evidence_basis.type must be live_browser" in str(excinfo.value)
+
+
+def test_human_markdown_live_claim_requires_live_browser_card_evidence_basis():
+    payload = _fixture("proposal_run_pid_blocked_live_source_backed.json")
+    payload["human_markdown"] = "Status: RECOMMENDED after authenticated admin dogfood completed."
+
+    with pytest.raises(ProposalValidationError) as excinfo:
+        validate_proposal_run(payload)
+
+    assert "human_markdown must not imply authenticated live/browser dogfood verification" in str(excinfo.value)
+
+
+def test_blocked_missing_live_basis_must_name_missing_live_evidence():
+    payload = _fixture("proposal_run_pid_blocked_live_source_backed.json")
+    payload["cards"][0]["evidence_basis"] = {
+        "type": "blocked_missing_live",
+        "summary": "Live verification was blocked.",
+        "missing_live_evidence": [],
+    }
+
+    with pytest.raises(ProposalValidationError) as excinfo:
+        validate_proposal_run(payload)
+
+    assert "missing_live_evidence" in str(excinfo.value)
 
 
 def test_empty_pid_proposal_run_is_accepted():
@@ -327,6 +384,12 @@ def test_cron_proposal_guidance_requests_json_and_no_kanban_mutation():
     assert "`critical`, `major`, `minor`, or `info`" in guidance
     assert "deterministic string `idempotency_key`" in guidance
     assert "source_excerpts` as objects with a `text` field" in guidance
+    assert "`evidence_basis`" in guidance
+    assert "`source_static_log`, `live_browser`, or `blocked_missing_live`" in guidance
+    assert "INSUFFICIENT_EVIDENCE" in guidance
+    assert "safe admin credentials unavailable" in guidance
+    assert "source_excerpts` alone are not a live verification claim" in guidance
+    assert "must not imply authenticated live dogfood occurred" in guidance
     assert "card `summary` <= 500 chars" in guidance
     assert "card `body` <= 6000 chars" in guidance
     assert "`kanban_task.body` <= 6000 chars" in guidance

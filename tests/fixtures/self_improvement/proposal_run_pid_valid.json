@@ -32,6 +32,11 @@
           "line_end": 14
         }
       ],
+      "evidence_basis": {
+        "type": "source_static_log",
+        "summary": "Supported by PID Airflow scraper cron logs; no authenticated live/browser dogfood verification is claimed.",
+        "missing_live_evidence": []
+      },
       "kanban_task": {
         "title": "Instrument PID scraper timeout retry backoff",
         "body": "Add logging for each timeout retry attempt, backoff duration, and final source URL in the PID Airflow scraper. Include a small regression test or log fixture proving the fields appear.",

@@ -28,6 +28,10 @@ def test_cron_job_prompt_includes_self_improvement_proposal_guidance():
     assert "Completed/shipped/done and Archive/rejected/archived Command Center sections" in prompt
     assert "must not suppress a new proposal as an active duplicate" in prompt
     assert "Do not create Kanban tasks" in prompt
+    assert "`evidence_basis`" in prompt
+    assert "`source_static_log`, `live_browser`, or `blocked_missing_live`" in prompt
+    assert "INSUFFICIENT_EVIDENCE" in prompt
+    assert "must not imply authenticated live dogfood occurred" in prompt
     assert "Review yesterday's PID admin dogfood notes." in prompt
 
 
