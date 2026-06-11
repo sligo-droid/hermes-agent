@@ -12,7 +12,7 @@ import type {
 } from '../gatewayTypes.js'
 import { asRpcResult } from '../lib/rpc.js'
 import { hasInterpolation, INTERPOLATION_RE } from '../protocol/interpolation.js'
-import { expandPasteSnippets } from '../protocol/paste.js'
+import { PASTE_SNIPPET_RE } from '../protocol/paste.js'
 import type { Msg } from '../types.js'
 
 import type { ComposerActions, ComposerRefs, ComposerState, PasteSnippet } from './interfaces.js'
@@ -24,7 +24,16 @@ const SESSION_BUSY_RE = /session busy|waiting for model response/i
 
 const isSessionBusyError = (e: unknown) => e instanceof Error && SESSION_BUSY_RE.test(e.message)
 
-const expandSnips = (snips: PasteSnippet[]) => (value: string) => expandPasteSnippets(value, snips)
+const expandSnips = (snips: PasteSnippet[]) => {
+  const byLabel = new Map<string, string[]>()
+
+  for (const { label, text } of snips) {
+    const hit = byLabel.get(label)
+    hit ? hit.push(text) : byLabel.set(label, [text])
+  }
+
+  return (value: string) => value.replace(PASTE_SNIPPET_RE, tok => byLabel.get(tok)?.shift() ?? tok)
+}
 
 const spliceMatches = (text: string, matches: RegExpMatchArray[], results: string[]) =>
   matches.reduceRight((acc, m, i) => acc.slice(0, m.index!) + results[i] + acc.slice(m.index! + m[0].length), text)
@@ -103,7 +112,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
             composerActions.enqueue(submitText)
             patchUiState({ busy: true, status: 'queued for next turn' })
 
-            return
+            return sys(`queued: "${submitText.slice(0, 50)}${submitText.length > 50 ? '…' : ''}"`)
           }
 
           sys(`error: ${e.message}`)
@@ -278,12 +287,10 @@ export function useSubmission(opts: UseSubmissionOptions) {
         return
       }
 
-      const slashText = expandPasteSnippets(full, composerState.pasteSnips)
-
-      if (looksLikeSlashCommand(slashText)) {
+      if (looksLikeSlashCommand(full)) {
         appendMessage({ kind: 'slash', role: 'system', text: full })
         composerActions.pushHistory(full)
-        slashRef.current(slashText)
+        slashRef.current(full)
         composerActions.clearIn()
 
         return
@@ -348,18 +355,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
       send(full)
     },
-    [
-      appendMessage,
-      composerActions,
-      composerRefs,
-      composerState.pasteSnips,
-      handleBusyInput,
-      interpolate,
-      send,
-      sendQueued,
-      shellExec,
-      slashRef
-    ]
+    [appendMessage, composerActions, composerRefs, handleBusyInput, interpolate, send, sendQueued, shellExec, slashRef]
   )
 
   const submit = useCallback(

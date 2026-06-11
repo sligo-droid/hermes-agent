@@ -470,10 +470,7 @@ export function useVirtualHistory(
     // If clamp used immediate bounds, render-node-to-output's drain-gate
     // would drain past the deferred children's span → viewport lands in
     // spacer → white flash.
-    if (
-      s &&
-      shouldSetVirtualClamp({ enabled: virtualClamp, itemCount: n, liveTailActive, sticky, viewportHeight: vp })
-    ) {
+    if (s && shouldSetVirtualClamp({ enabled: virtualClamp, itemCount: n, liveTailActive, sticky, viewportHeight: vp })) {
       const effTopSpacer = offsets[effStart] ?? 0
       const effBottom = offsets[effEnd] ?? total
       // At effEnd=n there's no bottomSpacer — use Infinity so render-node-
@@ -536,20 +533,7 @@ export function useVirtualHistory(
     if (heightDirty) {
       bumpMeasuredHeightVersion(n => n + 1)
     }
-  }, [
-    effEnd,
-    effStart,
-    items,
-    liveTailActive,
-    measuredHeightVersion,
-    n,
-    offsets,
-    scrollRef,
-    sticky,
-    total,
-    virtualClamp,
-    vp
-  ])
+  }, [effEnd, effStart, items, liveTailActive, measuredHeightVersion, n, offsets, scrollRef, sticky, total, virtualClamp, vp])
 
   return {
     bottomSpacer: Math.max(0, total - (offsets[effEnd] ?? total)),

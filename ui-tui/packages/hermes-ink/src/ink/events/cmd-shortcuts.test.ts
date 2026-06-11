@@ -62,33 +62,4 @@ describe('enhanced keyboard modifier parsing', () => {
     expect(right.key.rightArrow).toBe(true)
     expect(right.key.super).toBe(true)
   })
-
-  it('detects Kitty-enhanced PageUp and PageDown special-key sequences', () => {
-    const pageUp = new InputEvent(parseOne('\u001b[5;1:1~'))
-    const pageDown = new InputEvent(parseOne('\u001b[6;1:1~'))
-
-    expect(pageUp.key.pageUp).toBe(true)
-    expect(pageUp.input).toBe('')
-
-    expect(pageDown.key.pageDown).toBe(true)
-    expect(pageDown.input).toBe('')
-  })
-
-  it('preserves modifiers on Kitty-enhanced special-key sequences', () => {
-    const ctrlPageUp = new InputEvent(parseOne('\u001b[5;5:1~'))
-
-    expect(ctrlPageUp.key.pageUp).toBe(true)
-    expect(ctrlPageUp.key.ctrl).toBe(true)
-  })
-
-  it('maps Kitty keypad navigation codepoints to navigation keys', () => {
-    const keypadPageUp = new InputEvent(parseOne('\u001b[57421u'))
-    const keypadPageDown = new InputEvent(parseOne('\u001b[57422u'))
-
-    expect(keypadPageUp.key.pageUp).toBe(true)
-    expect(keypadPageUp.input).toBe('')
-
-    expect(keypadPageDown.key.pageDown).toBe(true)
-    expect(keypadPageDown.input).toBe('')
-  })
 })

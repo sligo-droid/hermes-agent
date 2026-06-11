@@ -19,10 +19,9 @@ import { useModalBehavior } from "@/hooks/useModalBehavior";
  * Two invocation modes:
  *
  * 1. Chat-session mode (ChatSidebar) — pass `gw` + `sessionId`. The picker
- *    loads options via the sidebar's JSON-RPC sidecar and emits the result
- *    as a slash command string (`/model <model> --provider <slug> [--global]`)
- *    through `onSubmit`. ChatPage then injects that command into the visible
- *    PTY TUI session; the sidecar is not used to mutate visible chat state.
+ *    loads options via `model.options` JSON-RPC and emits the result as a
+ *    slash command string (`/model <model> --provider <slug> [--global]`)
+ *    through `onSubmit`, which the ChatPage pipes to `slashExec`.
  *
  * 2. Standalone mode (ModelsPage, Config settings) — pass a `loader` and
  *    `onApply`. The picker fetches options via the REST endpoint and calls
@@ -222,14 +221,9 @@ export function ModelPickerDialog(props: Props) {
             {title}
           </h2>
           <p className="text-xs text-muted-foreground mt-1 font-mono">
-            {standalone ? "current" : "sidecar reports"}: {currentModel || "(unknown)"}
+            current: {currentModel || "(unknown)"}
             {currentProviderSlug && ` · ${currentProviderSlug}`}
           </p>
-          {!standalone && (
-            <p className="text-xs text-muted-foreground mt-1">
-              Switches are sent to the visible TUI terminal session.
-            </p>
-          )}
         </header>
 
         <div className="px-5 pt-3 pb-2 border-b border-border">

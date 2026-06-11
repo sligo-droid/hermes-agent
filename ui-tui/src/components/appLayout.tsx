@@ -25,7 +25,7 @@ import { Banner, Panel, SessionPanel } from './branding.js'
 import { FpsOverlay } from './fpsOverlay.js'
 import { HelpHint } from './helpHint.js'
 import { MessageLine } from './messageLine.js'
-import { QueuedMessages, queueSummaryText } from './queuedMessages.js'
+import { QueuedMessages } from './queuedMessages.js'
 import { LiveTodoPanel, StreamingAssistant } from './streamingAssistant.js'
 import { TextInput, type TextInputMouseApi } from './textInput.js'
 
@@ -54,27 +54,12 @@ const PromptPrefix = memo(function PromptPrefix({
   )
 })
 
-export const shouldStickTranscriptToBottom = ({ empty }: Pick<AppLayoutProps['composer'], 'empty'>) => !empty
-
-export const shouldRenderTranscriptScrollBox = (inlineMode: boolean) => !inlineMode
-
-export const transcriptRowsForMode = (
-  transcript: Pick<AppLayoutProps['transcript'], 'virtualHistory' | 'virtualRows'>,
-  inlineMode: boolean
-) =>
-  inlineMode
-    ? transcript.virtualRows
-    : transcript.virtualRows.slice(transcript.virtualHistory.start, transcript.virtualHistory.end)
-
-const TranscriptRows = memo(function TranscriptRows({
+const TranscriptPane = memo(function TranscriptPane({
+  actions,
   composer,
-  measureRows,
-  rows,
+  progress,
   transcript
-}: Pick<AppLayoutProps, 'composer' | 'transcript'> & {
-  measureRows: boolean
-  rows: AppLayoutProps['transcript']['virtualRows']
-}) {
+}: Pick<AppLayoutProps, 'actions' | 'composer' | 'progress' | 'transcript'>) {
   const ui = useStore($uiState)
 
   // LiveTodoPanel rides as a child of the latest user-message row so it
@@ -103,103 +88,6 @@ const TranscriptRows = memo(function TranscriptRows({
 
   return (
     <>
-      {rows.map(row => (
-        <Box
-          flexDirection="column"
-          key={row.key}
-          ref={measureRows ? transcript.virtualHistory.measureRef(row.key) : undefined}
-        >
-          {row.msg.role === 'user' && firstUserIdx >= 0 && row.index > firstUserIdx && (
-            <Box marginTop={1}>
-              <Text color={ui.theme.color.border}>───</Text>
-            </Box>
-          )}
-
-          {row.msg.kind === 'intro' ? (
-            <Box flexDirection="column" paddingTop={1}>
-              <Banner t={ui.theme} />
-
-              {row.msg.info && <SessionPanel info={row.msg.info} sid={ui.sid} t={ui.theme} />}
-            </Box>
-          ) : row.msg.kind === 'panel' && row.msg.panelData ? (
-            <Panel sections={row.msg.panelData.sections} t={ui.theme} title={row.msg.panelData.title} />
-          ) : (
-            <MessageLine
-              cols={composer.cols}
-              compact={ui.compact}
-              detailsMode={ui.detailsMode}
-              detailsModeCommandOverride={ui.detailsModeCommandOverride}
-              limitHistoryRender={row.index < transcript.historyItems.length - FULL_RENDER_TAIL_ITEMS}
-              msg={row.msg}
-              sections={ui.sections}
-              t={ui.theme}
-            />
-          )}
-
-          {row.index === lastUserIdx && <LiveTodoPanel />}
-        </Box>
-      ))}
-    </>
-  )
-})
-
-const TranscriptStreaming = memo(function TranscriptStreaming({
-  composer,
-  progress
-}: Pick<AppLayoutProps, 'composer' | 'progress'>) {
-  const ui = useStore($uiState)
-
-  return (
-    <Box flexDirection="column" paddingX={1}>
-      <StreamingAssistant
-        cols={composer.cols}
-        compact={ui.compact}
-        detailsMode={ui.detailsMode}
-        detailsModeCommandOverride={ui.detailsModeCommandOverride}
-        progress={progress}
-        sections={ui.sections}
-      />
-    </Box>
-  )
-})
-
-const TranscriptPane = memo(function TranscriptPane({
-  actions,
-  composer,
-  progress,
-  transcript
-}: Pick<AppLayoutProps, 'actions' | 'composer' | 'progress' | 'transcript'>) {
-  const ui = useStore($uiState)
-  const useScrollBox = shouldRenderTranscriptScrollBox(INLINE_MODE)
-
-  if (!useScrollBox) {
-    return (
-      <Box
-        flexDirection="column"
-        flexGrow={1}
-        flexShrink={1}
-        onClick={(e: { cellIsBlank?: boolean }) => {
-          if (e.cellIsBlank) {
-            actions.clearSelection()
-          }
-        }}
-      >
-        <Box flexDirection="column" paddingX={1}>
-          <TranscriptRows
-            composer={composer}
-            measureRows={false}
-            rows={transcriptRowsForMode(transcript, true)}
-            transcript={transcript}
-          />
-        </Box>
-
-        <TranscriptStreaming composer={composer} progress={progress} />
-      </Box>
-    )
-  }
-
-  return (
-    <>
       <ScrollBox
         flexDirection="column"
         flexGrow={1}
@@ -210,22 +98,55 @@ const TranscriptPane = memo(function TranscriptPane({
           }
         }}
         ref={transcript.scrollRef}
-        stickyScroll={shouldStickTranscriptToBottom(composer)}
+        stickyScroll
       >
         <Box flexDirection="column" paddingX={1}>
           {transcript.virtualHistory.topSpacer > 0 ? <Box height={transcript.virtualHistory.topSpacer} /> : null}
 
-          <TranscriptRows
-            composer={composer}
-            measureRows
-            rows={transcriptRowsForMode(transcript, false)}
-            transcript={transcript}
-          />
+          {transcript.virtualRows.slice(transcript.virtualHistory.start, transcript.virtualHistory.end).map(row => (
+            <Box flexDirection="column" key={row.key} ref={transcript.virtualHistory.measureRef(row.key)}>
+              {row.msg.role === 'user' && firstUserIdx >= 0 && row.index > firstUserIdx && (
+                <Box marginTop={1}>
+                  <Text color={ui.theme.color.border}>───</Text>
+                </Box>
+              )}
+
+              {row.msg.kind === 'intro' ? (
+                <Box flexDirection="column" paddingTop={1}>
+                  <Banner t={ui.theme} />
+
+                  {row.msg.info && <SessionPanel info={row.msg.info} sid={ui.sid} t={ui.theme} />}
+                </Box>
+              ) : row.msg.kind === 'panel' && row.msg.panelData ? (
+                <Panel sections={row.msg.panelData.sections} t={ui.theme} title={row.msg.panelData.title} />
+              ) : (
+                <MessageLine
+                  cols={composer.cols}
+                  compact={ui.compact}
+                  detailsMode={ui.detailsMode}
+                  detailsModeCommandOverride={ui.detailsModeCommandOverride}
+                  limitHistoryRender={row.index < transcript.historyItems.length - FULL_RENDER_TAIL_ITEMS}
+                  msg={row.msg}
+                  sections={ui.sections}
+                  t={ui.theme}
+                />
+              )}
+
+              {row.index === lastUserIdx && <LiveTodoPanel />}
+            </Box>
+          ))}
 
           {transcript.virtualHistory.bottomSpacer > 0 ? <Box height={transcript.virtualHistory.bottomSpacer} /> : null}
-        </Box>
 
-        <TranscriptStreaming composer={composer} progress={progress} />
+          <StreamingAssistant
+            cols={composer.cols}
+            compact={ui.compact}
+            detailsMode={ui.detailsMode}
+            detailsModeCommandOverride={ui.detailsModeCommandOverride}
+            progress={progress}
+            sections={ui.sections}
+          />
+        </Box>
       </ScrollBox>
 
       <NoSelect flexShrink={0} marginLeft={1}>
@@ -256,7 +177,6 @@ const ComposerPane = memo(function ComposerPane({
   const inputColumns = stableComposerColumns(composer.cols, promptWidth, TERMUX_TUI_MODE)
   const inputHeight = inputVisualHeight(composer.input, inputColumns)
   const inputMouseRef = useRef<null | TextInputMouseApi>(null)
-  const queueSummary = queueSummaryText(composer.queuedDisplay, composer.cols)
 
   const captureInputDrag = (e: GutterMouseEvent) => {
     if (e.button !== 0) {
@@ -322,10 +242,6 @@ const ComposerPane = memo(function ComposerPane({
           <Text color={ui.theme.color.label}>↳ </Text>
 
           {status.stickyPrompt}
-        </Text>
-      ) : queueSummary ? (
-        <Text color={ui.theme.color.muted} wrap="truncate-end">
-          {queueSummary}
         </Text>
       ) : (
         <Box height={1} onMouseDown={captureInputDrag} onMouseDrag={dragFromSpacer} onMouseUp={endInputDrag} />

@@ -85,8 +85,6 @@ describe('shouldPassThroughToGlobalHandler', () => {
     expect(shouldPassThroughToGlobalHandler('', key({ tab: true }))).toBe(true)
     expect(shouldPassThroughToGlobalHandler('', key({ pageUp: true }))).toBe(true)
     expect(shouldPassThroughToGlobalHandler('', key({ pageDown: true }))).toBe(true)
-    expect(shouldPassThroughToGlobalHandler('', key({ meta: true, upArrow: true }))).toBe(true)
-    expect(shouldPassThroughToGlobalHandler('', key({ alt: true, downArrow: true }))).toBe(true)
   })
 })
 

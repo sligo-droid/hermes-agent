@@ -13,7 +13,7 @@ describe('toTranscriptMessages', () => {
   it('preserves assistant tool-call rows so resume does not drop prior turns', () => {
     const rows = [
       { role: 'user', text: 'first prompt' },
-      { role: 'tool', context: 'repo', name: 'search_files' },
+      { role: 'tool', context: 'repo', name: 'search_files', text: 'ignored raw result' },
       { role: 'assistant', text: 'first answer' },
       { role: 'user', text: 'second prompt' }
     ]
@@ -24,46 +24,6 @@ describe('toTranscriptMessages', () => {
       ['user', 'second prompt']
     ])
     expect(toTranscriptMessages(rows)[1]?.tools?.[0]).toContain('Search Files')
-  })
-
-  it('keeps tool result text visible when resuming sessions with output-only rows', () => {
-    const rows = [
-      { role: 'user', text: 'run pwd' },
-      { role: 'tool', context: 'pwd', name: 'terminal', text: '/home/droid/hermes' }
-    ]
-
-    expect(toTranscriptMessages(rows).map(msg => [msg.role, msg.text])).toEqual([
-      ['user', 'run pwd'],
-      ['tool', '/home/droid/hermes'],
-      ['system', '']
-    ])
-    expect(toTranscriptMessages(rows)[2]?.tools?.[0]).toContain('Terminal')
-  })
-
-  it('flushes trailing resumed tool calls into a collapsed details row', () => {
-    const rows = [
-      { role: 'user', text: 'inspect files' },
-      { role: 'tool', context: 'src', name: 'search_files' }
-    ]
-
-    const messages = toTranscriptMessages(rows)
-
-    expect(messages.map(msg => [msg.kind, msg.role, msg.text])).toEqual([
-      [undefined, 'user', 'inspect files'],
-      ['trail', 'system', '']
-    ])
-    expect(messages[1]?.tools?.[0]).toContain('Search Files')
-  })
-
-  it('preserves resumed assistant reasoning as collapsed details', () => {
-    const messages = toTranscriptMessages([{ role: 'assistant', text: 'answer', thinking: 'private chain' }])
-
-    expect(messages[0]).toMatchObject({
-      role: 'assistant',
-      text: 'answer',
-      thinking: 'private chain',
-      detailsCollapsedByDefault: true
-    })
   })
 })
 

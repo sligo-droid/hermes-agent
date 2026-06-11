@@ -1,5 +1,4 @@
 import { EventEmitter } from 'events'
-
 import React from 'react'
 import { describe, expect, it } from 'vitest'
 
@@ -41,33 +40,6 @@ describe('Ink resize healing', () => {
     stdout.chunks = []
 
     stdout.emit('resize')
-    ink.onRender()
-    await tick()
-
-    expect(stdout.chunks.join('')).toContain(ERASE_SCREEN + CURSOR_HOME)
-
-    ink.unmount()
-  })
-
-  it('heals requested alt-screen repaints with an erase before repaint', async () => {
-    const stdout = new FakeTty()
-    const stdin = new FakeTty()
-    const stderr = new FakeTty()
-    const ink = new Ink({
-      exitOnCtrlC: false,
-      patchConsole: false,
-      stderr: stderr as unknown as NodeJS.WriteStream,
-      stdin: stdin as unknown as NodeJS.ReadStream,
-      stdout: stdout as unknown as NodeJS.WriteStream
-    })
-
-    ink.setAltScreenActive(true)
-    ink.render(React.createElement(Text, null, 'hello'))
-    ink.onRender()
-    stdout.chunks = []
-
-    ink.requestRepaint()
-    ink.render(React.createElement(Text, null, 'hello'))
     ink.onRender()
     await tick()
 
