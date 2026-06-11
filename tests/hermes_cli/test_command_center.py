@@ -728,6 +728,40 @@ def test_snapshot_active_stub_with_nonterminal_archive_requires_repair(tmp_path,
     assert "Matching non-terminal board evidence is archived" in item["execution"]["repair_reason"]
 
 
+def test_snapshot_readable_active_stub_with_empty_db_and_nonterminal_archive_requires_repair(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "discord-readable-stub-empty-db"
+    kanban_db.write_board_metadata(board, name="Archived Empty Stub")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Archived active task", board=board, initial_status="running")
+        with conn:
+            conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                (task_id, "running", 100, None, None),
+            )
+            run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
+    finally:
+        conn.close()
+    archived_result = kanban_db.remove_board(board)
+
+    kanban_db.write_board_metadata(board, name="Archived Empty Stub")
+    empty_conn = kanban_db.connect(board=board)
+    empty_conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+
+    assert item["status"] == "blocked"
+    assert item["status_detail"] == "repair_required"
+    assert item["execution"]["worker_url"] is None
+    assert item["execution"]["repair_required"] is True
+    assert item["execution"]["archived_board_path"] == archived_result["new_path"]
+    assert "Kanban database has no tasks or runs" in item["execution"]["repair_reason"]
+    assert "Matching non-terminal board evidence is archived" in item["execution"]["repair_reason"]
+
+
 def test_snapshot_terminal_archived_board_stays_historical(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     board = "discord-terminal-archive"

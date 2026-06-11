@@ -293,6 +293,32 @@ def _active_board_repair_context(
     return context
 
 
+def _empty_active_board_repair_context(
+    board: str,
+    board_meta: dict[str, Any],
+    *,
+    tasks: list[dict[str, Any]],
+    runs: list[dict[str, Any]],
+    archived_by_slug: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any] | None:
+    if board == kanban_db.DEFAULT_BOARD or board_meta.get("archived") or tasks or runs:
+        return None
+    worker = _board_worker_meta(board_meta)
+    goal_status = str(worker.get("goal_status") or "").lower()
+    phase = str(worker.get("phase") or "").lower()
+    if goal_status in {"done", "shipped", "complete", "completed", "cancelled", "canceled"} or phase == "complete":
+        return None
+    archived_meta = _matching_nonterminal_archive(board, archived_by_slug)
+    if not archived_meta:
+        return None
+    reason = "active worker board Kanban database has no tasks or runs."
+    return {
+        "repair_required": True,
+        "archived_board_path": archived_meta.get("archive_path") or archived_meta.get("archived_path"),
+        "repair_reason": f"{reason} Matching non-terminal board evidence is archived.",
+    }
+
+
 def _board_identity(board: str, board_meta: dict[str, Any]) -> str:
     return str(board_meta.get("archive_id") or board)
 
@@ -1144,6 +1170,13 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
                 task_dict["latest_summary"] = summaries.get(task.id)
                 task_dicts.append(task_dict)
             board_runs = _recent_board_runs(conn, board=board, limit=recent_run_limit_per_board)
+            repair_context = repair_context or _empty_active_board_repair_context(
+                board,
+                board_meta,
+                tasks=task_dicts,
+                runs=board_runs,
+                archived_by_slug=archived_by_slug,
+            )
             if board != kanban_db.DEFAULT_BOARD:
                 work_items.append(
                     _board_work_item(
