@@ -5752,6 +5752,21 @@ def _create_pr_merge_conflict_recovery_task(board: str, worker: dict[str, Any], 
     )
 
 
+def _create_pr_finalizer_manual_recovery_task(board: str, worker: dict[str, Any], conn: Any) -> str:
+    return _create_pr_finalizer_recovery_task(
+        board,
+        worker,
+        conn,
+        recovery_kind="manual",
+        title="Recover PR finalization",
+        instructions=[
+            "The implementation review was already approved and no role work is active; do not restart the architecture review.",
+            "Inspect the recorded PR/finalizer blocker, restore any missing GitHub/auth/runtime prerequisite, then rerun the PR finalizer path.",
+            "If the PR is already clean and merged, transition the board to done and let the Discord terminal follow-up/reaction sync complete.",
+        ],
+    )
+
+
 def _reactivate_after_pr_finalizer_recovery(board: str, worker: dict[str, Any], blocker: str) -> None:
     worker.update(
         {
@@ -5827,7 +5842,8 @@ def _recover_blocked_approved_reviewer_finalizer(
     finalizer_failure_evidence = _pr_finalizer_failure_is_failed_checks(
         worker
     ) or _pr_finalizer_failure_is_merge_conflict(worker)
-    if not finalizer_blocked_reason and not finalizer_failure_evidence:
+    finalizer_blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "").strip()
+    if not finalizer_blocked_reason and not finalizer_failure_evidence and not finalizer_blocker:
         return None
     if worker.get("execution_mode") != "kanban_pipeline" or _worker_source_message_too_old(worker):
         return None
@@ -5836,12 +5852,12 @@ def _recover_blocked_approved_reviewer_finalizer(
 
     # A blocked board may have been recovered by a previously-created dev task.
     # Do not trust the stored PR blocker blindly: it can still say DIRTY even
-    # after the worker branch was pushed clean. Refresh/finalize first, but only
-    # for recoverable finalizer failures. Non-recoverable failures such as PR
-    # creation errors intentionally remain inert.
+    # after the worker branch was pushed clean. Refresh/finalize first; if an
+    # opaque PR finalizer blocker remains, create visible manual recovery work
+    # instead of leaving the approved board silently inert.
     from hermes_cli import kanban_codex_worker
 
-    if finalizer_blocked_reason or finalizer_failure_evidence:
+    if finalizer_blocked_reason or finalizer_failure_evidence or finalizer_blocker:
         if kanban_codex_worker._ensure_pr(board, str(worker.get("worktree_path") or "")):
             _update_worker_meta(board, {"blocked_reason": "", "pr_blocker": "", "pr_error": None})
             kanban_codex_worker._update_phase(board, "complete", goal_status="done")
@@ -5858,6 +5874,10 @@ def _recover_blocked_approved_reviewer_finalizer(
         _create_pr_merge_conflict_recovery_task(board, worker, conn)
         _reactivate_after_pr_finalizer_recovery(board, worker, blocker)
         return "approved_reviewer_finalizer_merge_conflict_recovery_created"
+    if finalizer_blocker:
+        _create_pr_finalizer_manual_recovery_task(board, worker, conn)
+        _reactivate_after_pr_finalizer_recovery(board, worker, blocker)
+        return "approved_reviewer_finalizer_manual_recovery_created"
     return None
 
 

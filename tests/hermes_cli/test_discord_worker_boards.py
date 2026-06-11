@@ -3315,6 +3315,181 @@ def test_reconcile_board_creates_pr_checks_recovery_task(monkeypatch, tmp_path):
     assert actionable == recovery_tasks
 
 
+def test_reconcile_blocked_approved_board_with_generic_pr_blocker_creates_manual_recovery(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="review-finalizer-auth", goal="Ship it")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "phase": "blocked",
+            "goal_status": "blocked",
+            "blocked_reason": "",
+            "worktree_path": str(tmp_path / "repo"),
+            "review_loop_count": 2,
+            "merge_policy": "auto",
+            "pr_open_policy": "after_review_approval",
+            "pr_error": "HTTP 401: Requires authentication",
+            "pr_blocker": "HTTP 401: Requires authentication",
+            "pr_checks_status": "not checked",
+            "pr_merge_state": "unknown",
+        },
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        planner_id = kanban_db.create_task(conn, title="R1: Plan", assignee=dwb.ROLE_PLANNER, tenant=board.slug)
+        claimed = kanban_db.claim_task(conn, planner_id)
+        assert claimed is not None
+        kanban_db.complete_task(conn, planner_id, summary="planned", expected_run_id=claimed.current_run_id)
+        dev_id = kanban_db.create_task(conn, title="R1: Build", assignee=dwb.ROLE_DEV, tenant=board.slug)
+        claimed = kanban_db.claim_task(conn, dev_id)
+        assert claimed is not None
+        kanban_db.complete_task(conn, dev_id, summary="built", expected_run_id=claimed.current_run_id)
+        reviewer_id = kanban_db.create_task(conn, title="R2: Review", assignee=dwb.ROLE_REVIEWER, tenant=board.slug)
+        claimed = kanban_db.claim_task(conn, reviewer_id)
+        assert claimed is not None
+        kanban_db.complete_task(
+            conn,
+            reviewer_id,
+            summary="Approved.",
+            metadata={
+                "raw": {"status": "approved"},
+                "tests": [{"command": "scripts/run_tests.sh tests/hermes_cli/test_discord_worker_boards.py", "result": "passed"}],
+            },
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    ensure_calls = []
+
+    def fake_ensure_pr(board_arg, workspace_arg):
+        ensure_calls.append((board_arg, workspace_arg))
+        return False
+
+    monkeypatch.setattr(kanban_codex_worker, "_ensure_pr", fake_ensure_pr)
+
+    assert dwb.reconcile_board(board.slug) == "approved_reviewer_finalizer_manual_recovery_created"
+    assert dwb.reconcile_board(board.slug) is None
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert ensure_calls == [(board.slug, str(tmp_path / "repo"))]
+    assert worker["phase"] == "dev"
+    assert worker["goal_status"] == "active"
+    assert worker["blocked_reason"] == ""
+    assert worker["pr_error"] == "HTTP 401: Requires authentication"
+    assert worker["pr_blocker"] == "HTTP 401: Requires authentication"
+    assert "terminal_reaction_sync_pending" not in worker
+    assert "terminal_summary_sync_pending" not in worker
+
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+
+    recovery_tasks = [
+        task
+        for task in tasks
+        if task.assignee == dwb.ROLE_DEV and task.created_by == "discord-pr-finalizer-recovery"
+    ]
+    assert len(recovery_tasks) == 1
+    assert recovery_tasks[0].status in {"todo", "ready", "running"}
+    assert "Requires authentication" in recovery_tasks[0].body
+    assert "restore any missing GitHub/auth/runtime prerequisite" in recovery_tasks[0].body
+    assert "Discord terminal follow-up/reaction sync" in recovery_tasks[0].body
+    actionable = [task for task in tasks if task.status in {"triage", "todo", "ready", "running", "blocked"}]
+    assert actionable == recovery_tasks
+
+
+def test_reconcile_blocked_approved_board_finalizes_after_generic_pr_blocker_clears(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker
+    from hermes_cli import kanban_db
+    from gateway.platforms.base import PlatformConfig
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    board = dwb.start_direct_goal(thread_id="review-finalizer-auth-cleared", goal="Ship it")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "phase": "blocked",
+            "goal_status": "blocked",
+            "blocked_reason": "",
+            "worktree_path": str(tmp_path / "repo"),
+            "review_loop_count": 2,
+            "pr_error": "HTTP 401: Requires authentication",
+            "pr_blocker": "HTTP 401: Requires authentication",
+        },
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        dev_id = kanban_db.create_task(conn, title="R2: Build", assignee=dwb.ROLE_DEV, tenant=board.slug)
+        claimed = kanban_db.claim_task(conn, dev_id)
+        assert claimed is not None
+        kanban_db.complete_task(
+            conn,
+            dev_id,
+            summary="Built.",
+            metadata={"tests": [{"command": "scripts/run_tests.sh tests/hermes_cli/test_discord_worker_boards.py", "result": "passed"}]},
+            expected_run_id=claimed.current_run_id,
+        )
+        reviewer_id = kanban_db.create_task(conn, title="R2: Review", assignee=dwb.ROLE_REVIEWER, tenant=board.slug)
+        claimed = kanban_db.claim_task(conn, reviewer_id)
+        assert claimed is not None
+        kanban_db.complete_task(
+            conn,
+            reviewer_id,
+            summary="Approved.",
+            metadata={
+                "raw": {"status": "approved"},
+                "tests": [{"command": "scripts/run_tests.sh tests/hermes_cli/test_discord_worker_boards.py", "result": "passed"}],
+            },
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    def fake_ensure_pr(board_arg, workspace_arg):
+        dwb._update_worker_meta(
+            board_arg,
+            {
+                "pr_url": "https://github.com/acme/hermes/pull/401",
+                "pr_number": "401",
+                "pr_error": "",
+                "pr_blocker": "",
+            },
+        )
+        return True
+
+    monkeypatch.setattr(kanban_codex_worker, "_ensure_pr", fake_ensure_pr)
+
+    assert dwb.reconcile_board(board.slug) == "approved_reviewer_finalized"
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["phase"] == "complete"
+    assert worker["goal_status"] == "done"
+    assert worker["blocked_reason"] == ""
+    assert worker["pr_blocker"] == ""
+    assert worker["terminal_reaction_sync_pending"] is True
+    assert worker["terminal_summary_sync_pending"] is True
+    assert worker["terminal_completion_message_pending"] is True
+
+    target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
+    assert target["state"] == "done"
+    assert target["terminal_completion_message_pending"] is True
+    assert target["board_summary"]["final_response"]["text"] == ""
+    assert target["outcome"]
+    content = DiscordAdapter(PlatformConfig(enabled=True, token="fake-token"))._kanban_completion_notice_content(target)
+    assert content.startswith("Completed.\n\nWhat changed:")
+    assert "Verification:" in content
+    assert "Shipped:" in content
+
+
 def test_reconcile_board_creates_pr_merge_conflict_recovery_task(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -3830,10 +4005,6 @@ def test_reconcile_board_keeps_other_blocked_finalizer_states_inert(monkeypatch,
     for board in [
         make_blocked_board("review-loop-limit-blocked", {"blocked_reason": dwb.REVIEW_LOOP_LIMIT_BLOCKED_REASON}),
         make_blocked_board(
-            "pr-create-blocked",
-            {"pr_error": "gh pr create failed", "pr_blocker": "gh pr create failed"},
-        ),
-        make_blocked_board(
             "paused-finalizer-blocked",
             {
                 "paused": True,
@@ -3857,6 +4028,24 @@ def test_reconcile_board_keeps_other_blocked_finalizer_states_inert(monkeypatch,
         finally:
             conn.close()
         assert recovery_tasks == []
+
+    pr_create_board = make_blocked_board(
+        "pr-create-blocked",
+        {"pr_error": "gh pr create failed", "pr_blocker": "gh pr create failed"},
+    )
+    assert dwb.reconcile_board(pr_create_board.slug) == "approved_reviewer_finalizer_manual_recovery_created"
+    conn = kanban_db.connect(board=pr_create_board.slug)
+    try:
+        recovery_tasks = [
+            task
+            for task in kanban_db.list_tasks(conn, include_archived=False)
+            if task.created_by == "discord-pr-finalizer-recovery"
+        ]
+    finally:
+        conn.close()
+    assert len(recovery_tasks) == 1
+    assert "Recover PR finalization" in recovery_tasks[0].title
+    assert "Discord terminal follow-up/reaction sync" in str(recovery_tasks[0].body or "")
 
 
 def test_reconcile_board_keeps_terminal_finalizer_states_inert(monkeypatch, tmp_path):

@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 from agent.transports.codex_app_server_session import CodexAppServerSession
+from hermes_constants import get_github_cli_config_dir
 from hermes_cli import kanban_db
 from hermes_cli.discord_worker_boards import (
     DEV_TICKET_BODY_GUIDANCE,
@@ -84,6 +85,36 @@ KANBAN_CONTROL_ENV_VARS = frozenset(
     }
 )
 _last_activity_heartbeat_at: dict[tuple[str, str], float] = {}
+
+
+def _github_cli_env() -> dict[str, str]:
+    """Return an env that lets deterministic PR finalization see gh auth.
+
+    Kanban worker processes can run with a profile-isolated ``HOME`` such as
+    ``$HERMES_HOME/home``. That is good for tool-state isolation, but Sligo's
+    host-level GitHub CLI auth often lives under the real user's
+    ``~/.config/gh``. The terminal tool already bridges this via
+    ``GH_CONFIG_DIR``; PR finalization uses direct subprocess calls and must do
+    the same or approved worker boards block forever on ``gh`` 401s after all
+    role tasks are done.
+    """
+
+    env = os.environ.copy()
+    gh_config_dir = get_github_cli_config_dir(env)
+    if gh_config_dir:
+        env["GH_CONFIG_DIR"] = gh_config_dir
+    return env
+
+
+def _run_gh(args: list[str], *, root: Path, timeout: int | float) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["gh", *args],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=_github_cli_env(),
+    )
 
 
 def main() -> int:
@@ -2052,9 +2083,8 @@ def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None
         number = _pr_number_from_url(str(worker.get("pr_url") or ""))
         if number:
             worker["pr_number"] = number
-    viewed = subprocess.run(
+    viewed = _run_gh(
         [
-            "gh",
             "pr",
             "view",
             pr_ref,
@@ -2063,9 +2093,7 @@ def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None
             "--json",
             "number,url,state,mergedAt,mergeCommit,mergeStateStatus,mergeable,isDraft,reviewDecision,statusCheckRollup",
         ],
-        cwd=root,
-        capture_output=True,
-        text=True,
+        root=root,
         timeout=30,
     )
     if viewed.returncode != 0:
@@ -2132,9 +2160,8 @@ def _ensure_pr_open(
 
     existing_url = str(worker.get("pr_url") or "").strip()
     if not existing_url:
-        existing = subprocess.run(
+        existing = _run_gh(
             [
-                "gh",
                 "pr",
                 "list",
                 "--repo",
@@ -2150,9 +2177,7 @@ def _ensure_pr_open(
                 "--jq",
                 ".[0].url",
             ],
-            cwd=root,
-            capture_output=True,
-            text=True,
+            root=root,
             timeout=20,
         )
         existing_url = (existing.stdout or "").strip()
@@ -2169,9 +2194,8 @@ def _ensure_pr_open(
             f"Board: {worker.get('public_url') or board}\n\n"
             f"Goal:\n{worker.get('root_goal') or worker.get('initial_request') or ''}"
         )
-        created = subprocess.run(
+        created = _run_gh(
             [
-                "gh",
                 "pr",
                 "create",
                 "--repo",
@@ -2185,9 +2209,7 @@ def _ensure_pr_open(
                 "--body",
                 body,
             ],
-            cwd=root,
-            capture_output=True,
-            text=True,
+            root=root,
             timeout=60,
         )
         if created.returncode == 0 and (created.stdout or "").strip():
@@ -2225,11 +2247,9 @@ def _ensure_pr_merged(worker: dict[str, Any], *, root: Path, repo: str) -> bool:
 
         blocker = _pr_blocker(worker)
         if not blocker:
-            merged = subprocess.run(
-                ["gh", "pr", "merge", pr_ref, "--repo", repo, "--merge", "--delete-branch"],
-                cwd=root,
-                capture_output=True,
-                text=True,
+            merged = _run_gh(
+                ["pr", "merge", pr_ref, "--repo", repo, "--merge", "--delete-branch"],
+                root=root,
                 timeout=300,
             )
             if merged.returncode != 0:
