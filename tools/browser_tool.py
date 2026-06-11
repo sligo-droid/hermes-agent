@@ -55,6 +55,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import shutil
 import sys
@@ -65,7 +66,7 @@ import requests
 from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
 from agent.auxiliary_client import call_llm
-from hermes_constants import get_hermes_home
+from hermes_constants import display_hermes_home, get_hermes_home, get_subprocess_home
 from utils import is_truthy_value
 from hermes_cli.config import cfg_get
 
@@ -3540,6 +3541,16 @@ def cleanup_all_browsers() -> None:
 _cached_chromium_installed: Optional[bool] = None
 
 
+def _profile_browser_home() -> str:
+    """Return the HOME directory Playwright should use for profile-scoped browsers."""
+    return get_subprocess_home() or str(get_hermes_home() / "home")
+
+
+def _append_unique_path(paths: List[str], path: str) -> None:
+    if path and path not in paths:
+        paths.append(path)
+
+
 def _chromium_search_roots() -> List[str]:
     """Directories to scan for a Chromium / headless-shell build.
 
@@ -3556,16 +3567,91 @@ def _chromium_search_roots() -> List[str]:
     env_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
     if env_path and env_path != "0":
         roots.append(env_path)
+    profile_home = _profile_browser_home()
+    _append_unique_path(roots, os.path.join(profile_home, ".cache", "ms-playwright"))
     home = os.path.expanduser("~")
-    roots.append(os.path.join(home, ".cache", "ms-playwright"))
+    _append_unique_path(roots, os.path.join(home, ".cache", "ms-playwright"))
     if sys.platform == "darwin":
-        roots.append(os.path.join(home, "Library", "Caches", "ms-playwright"))
+        _append_unique_path(roots, os.path.join(profile_home, "Library", "Caches", "ms-playwright"))
+        _append_unique_path(roots, os.path.join(home, "Library", "Caches", "ms-playwright"))
     if sys.platform == "win32":
         local = os.environ.get("LOCALAPPDATA") or os.path.join(
             home, "AppData", "Local"
         )
-        roots.append(os.path.join(local, "ms-playwright"))
+        profile_local = os.path.join(profile_home, "AppData", "Local")
+        _append_unique_path(roots, os.path.join(profile_local, "ms-playwright"))
+        _append_unique_path(roots, os.path.join(local, "ms-playwright"))
     return roots
+
+
+def _playwright_chromium_preflight_roots() -> List[str]:
+    """Cache paths that ad-hoc Playwright launch code will use for Chromium."""
+    env_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if env_path and env_path != "0":
+        return [env_path]
+
+    profile_home = _profile_browser_home()
+    roots = [os.path.join(profile_home, ".cache", "ms-playwright")]
+    if sys.platform == "darwin":
+        roots.append(os.path.join(profile_home, "Library", "Caches", "ms-playwright"))
+    if sys.platform == "win32":
+        roots.append(os.path.join(profile_home, "AppData", "Local", "ms-playwright"))
+    return roots
+
+
+def _playwright_chromium_cache_installed() -> bool:
+    """Return True when Playwright's configured/profile Chromium cache exists."""
+    for root in _playwright_chromium_preflight_roots():
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            entries = os.listdir(root)
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.startswith("chromium-") or entry.startswith(
+                "chromium_headless_shell-"
+            ):
+                return True
+    return False
+
+
+def format_chromium_preflight_message() -> str:
+    """Return a stable, actionable Chromium preflight message for workers/cron."""
+    searched = "\n".join(f"  - {root}" for root in _playwright_chromium_preflight_roots()) or "  - (no candidate paths)"
+    install_command = f"HOME={shlex.quote(_profile_browser_home())} npx playwright install --with-deps chromium"
+    docker_note = ""
+    if _running_in_docker():
+        docker_note = (
+            "\nDocker image note: if this image should include Chromium, pull the latest image:\n"
+            "  docker pull ghcr.io/nousresearch/hermes-agent:latest\n"
+        )
+    return (
+        "Playwright Chromium preflight failed: no Chromium/headless-shell browser was found.\n"
+        f"Hermes profile HOME: {display_hermes_home()}\n"
+        f"Browser subprocess HOME: {_profile_browser_home()}\n"
+        "Searched Playwright browser cache paths:\n"
+        f"{searched}\n"
+        "Install command for this profile HOME:\n"
+        f"  {install_command}\n"
+        "Alternative agent-browser install command:\n"
+        "  npx agent-browser install --with-deps\n"
+        f"{docker_note}"
+        "This preflight never installs browsers automatically."
+    )
+
+
+def check_playwright_chromium_preflight() -> tuple[bool, str]:
+    """Check Chromium availability for ad-hoc Playwright worker/cron tasks."""
+    if _playwright_chromium_cache_installed():
+        return True, (
+            "Playwright Chromium preflight passed.\n"
+            f"Hermes profile HOME: {display_hermes_home()}\n"
+            f"Browser subprocess HOME: {_profile_browser_home()}\n"
+            "Searched Playwright browser cache paths:\n"
+            + "\n".join(f"  - {root}" for root in _playwright_chromium_preflight_roots())
+        )
+    return False, format_chromium_preflight_message()
 
 
 def _chromium_installed() -> bool:

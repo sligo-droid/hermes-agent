@@ -434,6 +434,11 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
         "- Do not fall back to framework defaults, stale browser tabs, or another worker's port.\n"
         "- Prefer `python -m hermes_cli.worker_frontend_smoke --url <exact-url> --cmd '<preview command with that host:port>' --route /` when practical.\n\n"
     )
+    browser_preflight = (
+        "Browser-task preflight contract:\n"
+        "- Before launching ad-hoc Playwright/Chromium browser scripts or browser dogfood from this worker, run `python -m hermes_cli.browser_preflight chromium`.\n"
+        "- Treat a nonzero preflight as an environment blocker for that browser-dependent check only; do not install browsers or fail unrelated non-browser work.\n\n"
+    )
     pr_policy = _pr_policy_prompt_note(role)
     autoreview = _dev_autoreview_prompt(role)
     return (
@@ -444,6 +449,7 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
         f"{outcome}\n\n"
         f"{discord_access}"
         f"{frontend_smoke}"
+        f"{browser_preflight}"
         f"{autoreview}"
         f"{schema}\n\n"
         f"Git context:\n{git}\n\n"
