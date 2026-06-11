@@ -14,22 +14,8 @@ export function getQueueWindow(queueLen: number, queueEditIdx: number | null) {
   return { end, showLead: start > 0, showTail: end < queueLen, start }
 }
 
-export function queueSummaryText(queued: readonly string[], cols: number) {
-  if (!queued.length) {
-    return ''
-  }
-
-  const prefix = `queued (${queued.length}) · next: `
-  const preview = compactPreview(queued[0] ?? '', Math.max(1, cols - prefix.length))
-
-  return `${prefix}${preview}`
-}
-
-export const shouldRenderQueueDetails = (queued: readonly string[], queueEditIdx: number | null) =>
-  queued.length > 0 && queueEditIdx !== null
-
 export function QueuedMessages({ cols, queueEditIdx, queued, t }: QueuedMessagesProps) {
-  if (!shouldRenderQueueDetails(queued, queueEditIdx)) {
+  if (!queued.length) {
     return null
   }
 

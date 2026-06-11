@@ -30,13 +30,6 @@ const CSI_U_RE = /^\x1b\[(\d+)(?:;(\d+))?u/
 // eslint-disable-next-line no-control-regex
 const MODIFY_OTHER_KEYS_RE = /^\x1b\[27;(\d+);(\d+)~/
 
-// Kitty-enhanced PageUp/PageDown: CSI number ; modifiers : eventType ~
-// Examples: ESC[5;1:1~ = PageUp press, ESC[6;5:1~ = Ctrl+PageDown.
-// Event type is intentionally ignored here; callers only consume keydown-like
-// input events today, and this keeps parity with the existing key shape.
-// eslint-disable-next-line no-control-regex
-const KITTY_PAGE_KEY_RE = /^\x1b\[(5|6);(\d+):\d+~$/
-
 // -- Terminal response patterns (inbound sequences from the terminal itself) --
 // DECRPM: CSI ? Ps ; Pm $ y  — response to DECRQM (request mode)
 // eslint-disable-next-line no-control-regex
@@ -546,12 +539,6 @@ function keycodeToName(keycode: number): string | undefined {
     case 57415: // KP_EQUAL
       return '='
 
-    case 57421: // KP_PAGE_UP
-      return 'pageup'
-
-    case 57422: // KP_PAGE_DOWN
-      return 'pagedown'
-
     default:
       // Printable ASCII characters
       if (keycode >= 32 && keycode <= 126) {
@@ -764,24 +751,6 @@ function parseKeypress(s: string = ''): ParsedKey {
     return {
       kind: 'key',
       name,
-      fn: false,
-      ctrl: mods.ctrl,
-      meta: mods.meta,
-      shift: mods.shift,
-      option: false,
-      super: mods.super,
-      sequence: s,
-      raw: s,
-      isPasted: false
-    }
-  }
-
-  if ((match = KITTY_PAGE_KEY_RE.exec(s))) {
-    const mods = decodeModifier(parseInt(match[2]!, 10))
-
-    return {
-      kind: 'key',
-      name: match[1] === '5' ? 'pageup' : 'pagedown',
       fn: false,
       ctrl: mods.ctrl,
       meta: mods.meta,

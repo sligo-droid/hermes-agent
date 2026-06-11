@@ -3,7 +3,6 @@ import { useEffect, useState } from 'react'
 import unicodeSpinners from 'unicode-animations'
 
 import { artWidth, caduceus, CADUCEUS_WIDTH, logo, LOGO_WIDTH } from '../banner.js'
-import { INLINE_MODE } from '../config/env.js'
 import { flat } from '../lib/text.js'
 import type { Theme } from '../theme.js'
 import type { PanelSection, SessionInfo } from '../types.js'
@@ -168,15 +167,11 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
   const lineBudget = Math.max(12, w - 2)
   const strip = (s: string) => (s.endsWith('_tools') ? s.slice(0, -6) : s)
 
-  // Inline mode cannot use Ink's alt-screen click hit-testing, so open every
-  // startup accordion by default there instead of showing inert chevrons.
-  const startOpen = INLINE_MODE
-
   // ── Local collapse state for each section ──
   const [toolsOpen, setToolsOpen] = useState(true)
-  const [skillsOpen, setSkillsOpen] = useState(startOpen)
-  const [systemOpen, setSystemOpen] = useState(startOpen)
-  const [mcpOpen, setMcpOpen] = useState(startOpen)
+  const [skillsOpen, setSkillsOpen] = useState(false)
+  const [systemOpen, setSystemOpen] = useState(false)
+  const [mcpOpen, setMcpOpen] = useState(false)
 
   const truncLine = (pfx: string, items: string[]) => {
     let line = ''

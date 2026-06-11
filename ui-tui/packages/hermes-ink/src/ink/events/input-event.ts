@@ -3,7 +3,7 @@ import { nonAlphanumericKeys, type ParsedKey } from '../parse-keypress.js'
 import { Event } from './event.js'
 
 const inputForSpecialSequence = (name: string): string =>
-  name === 'space' ? ' ' : name === 'return' || name === 'escape' || nonAlphanumericKeys.includes(name) ? '' : name
+  name === 'space' ? ' ' : name === 'return' || name === 'escape' ? '' : name
 
 export type Key = {
   upArrow: boolean

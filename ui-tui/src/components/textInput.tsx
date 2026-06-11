@@ -1367,7 +1367,6 @@ export const shouldPassThroughToGlobalHandler = (
   (key.shift && key.tab) ||
   key.pageUp ||
   key.pageDown ||
-  ((key.alt || key.meta) && (key.upArrow || key.downArrow)) ||
   key.escape ||
   isVoiceToggleKey(key, input, voiceRecordKey)
 

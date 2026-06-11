@@ -106,11 +106,6 @@ declare module '@hermes/ink' {
   export const Text: React.ComponentType<any>
   export const TextInput: React.ComponentType<any>
   export const stringWidth: (s: string) => number
-  export const wrapAnsi: (
-    input: string,
-    columns: number,
-    options?: { hard?: boolean; trim?: boolean; wordWrap?: boolean }
-  ) => string
   export function isXtermJs(): boolean
 
   export type ScrollFastPathStats = {
@@ -139,7 +134,6 @@ declare module '@hermes/ink' {
   export function evictInkCaches(level?: EvictLevel): InkCacheSizes
 
   export function forceRedraw(stdout?: NodeJS.WriteStream): boolean
-  export function requestRepaint(stdout?: NodeJS.WriteStream): boolean
   export function render(node: React.ReactNode, options?: NodeJS.WriteStream | RenderOptions): Instance
 
   export function useApp(): { readonly exit: (error?: Error) => void }

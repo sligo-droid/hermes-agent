@@ -301,12 +301,6 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
         def get_session_by_title(self, _title):
             return None
 
-        def get_compression_tip(self, sid):
-            return sid
-
-        def resolve_resume_session_id(self, sid):
-            return sid
-
         def reopen_session(self, _sid):
             return None
 
@@ -338,7 +332,7 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
     assert resp["result"]["messages"] == [
         {"role": "user", "text": "hello"},
         {"role": "assistant", "text": "yo"},
-        {"role": "tool", "name": "tool", "context": "", "text": "searched"},
+        {"role": "tool", "name": "tool", "context": ""},
     ]
 
 

@@ -2725,30 +2725,6 @@ class TestPtyWebSocket:
         assert "channel=abc-123" in url
         assert "token=" in url
 
-    def test_sidecar_url_uses_loopback_for_ipv4_wildcard_bind(self, monkeypatch):
-        monkeypatch.setattr(
-            self.ws_module.app.state, "bound_host", "0.0.0.0", raising=False
-        )
-        monkeypatch.setattr(self.ws_module.app.state, "bound_port", 9119, raising=False)
-
-        url = self.ws_module._build_sidecar_url("wildcard-v4")
-
-        assert url is not None
-        assert url.startswith("ws://127.0.0.1:9119/api/pub?")
-        assert "channel=wildcard-v4" in url
-
-    def test_sidecar_url_uses_loopback_for_ipv6_wildcard_bind(self, monkeypatch):
-        monkeypatch.setattr(
-            self.ws_module.app.state, "bound_host", "::", raising=False
-        )
-        monkeypatch.setattr(self.ws_module.app.state, "bound_port", 9119, raising=False)
-
-        url = self.ws_module._build_sidecar_url("wildcard-v6")
-
-        assert url is not None
-        assert url.startswith("ws://[::1]:9119/api/pub?")
-        assert "channel=wildcard-v6" in url
-
     def test_pub_broadcasts_to_events_subscribers(self, monkeypatch):
         """Frame written to /api/pub is rebroadcast verbatim to every
         /api/events subscriber on the same channel."""

@@ -573,7 +573,7 @@ def test_history_to_messages_preserves_tool_calls_for_resume_display():
 
     assert server._history_to_messages(history) == [
         {"role": "user", "text": "first prompt"},
-        {"context": "resume", "name": "search_files", "role": "tool", "text": "{}"},
+        {"context": "resume", "name": "search_files", "role": "tool"},
         {"role": "assistant", "text": "first answer"},
         {"role": "user", "text": "second prompt"},
     ]
@@ -603,14 +603,6 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
     class FakeDB:
         def get_session(self, target):
             return {"id": target}
-
-        def get_compression_tip(self, target):
-            captured.setdefault("resolve_calls", []).append(("compression", target))
-            return target
-
-        def resolve_resume_session_id(self, target):
-            captured.setdefault("resolve_calls", []).append(("resume", target))
-            return target
 
         def reopen_session(self, target):
             captured["reopened"] = target
@@ -652,48 +644,7 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
         {"role": "user", "text": "root prompt"},
         {"role": "assistant", "text": "root answer"},
     ]
-    assert captured["resolve_calls"] == [("compression", "tip"), ("resume", "tip")]
-    assert captured["history_calls"] == [("tip", True)]
-
-
-def test_session_resume_reopens_compression_tip(monkeypatch):
-    captured = {}
-
-    class FakeDB:
-        def get_session(self, target):
-            return {"id": target}
-
-        def get_compression_tip(self, target):
-            captured.setdefault("resolve_calls", []).append(("compression", target))
-            return "compressed-tip"
-
-        def resolve_resume_session_id(self, target):
-            captured.setdefault("resolve_calls", []).append(("resume", target))
-            return target
-
-        def reopen_session(self, target):
-            captured["reopened"] = target
-
-        def get_messages_as_conversation(self, target, include_ancestors=False):
-            captured.setdefault("history_calls", []).append((target, include_ancestors))
-            return [{"role": "user", "content": "root prompt"}]
-
-    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
-    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
-    monkeypatch.setattr(server, "_set_session_context", lambda target: [])
-    monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
-    monkeypatch.setattr(server, "_make_agent", lambda *args, **kwargs: types.SimpleNamespace(model="test"))
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": "test", "tools": {}, "skills": {}})
-    monkeypatch.setattr(server, "_init_session", lambda sid, key, agent, history, cols=80: None)
-
-    resp = server.handle_request(
-        {"id": "1", "method": "session.resume", "params": {"session_id": "root"}}
-    )
-
-    assert "error" not in resp
-    assert captured["resolve_calls"] == [("compression", "root")]
-    assert captured["reopened"] == "compressed-tip"
-    assert captured["history_calls"] == [("compressed-tip", True)]
+    assert captured["history_calls"] == [("tip", False), ("tip", True)]
 
 
 def test_status_callback_emits_kind_and_text():
@@ -1727,7 +1678,7 @@ def test_complete_slash_details_args():
 
 def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
-    agent = types.SimpleNamespace(reasoning_config=None, service_tier="priority")
+    agent = types.SimpleNamespace(reasoning_config=None)
     server._sessions["sid"] = _session(agent=agent)
 
     resp_effort = server.handle_request(
@@ -1748,9 +1699,6 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
         }
     )
     assert resp_show["result"]["value"] == "show"
-    assert resp_show["result"]["effort"] == "low"
-    assert resp_show["result"]["display"] == "show"
-    assert resp_show["result"]["fast"] == "on"
     assert server._sessions["sid"]["show_reasoning"] is True
     assert server._load_cfg()["display"]["sections"]["thinking"] == "expanded"
 
@@ -1762,9 +1710,6 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
         }
     )
     assert resp_hide["result"]["value"] == "hide"
-    assert resp_hide["result"]["effort"] == "low"
-    assert resp_hide["result"]["display"] == "hide"
-    assert resp_hide["result"]["fast"] == "on"
     assert server._sessions["sid"]["show_reasoning"] is False
     assert server._load_cfg()["display"]["sections"]["thinking"] == "hidden"
 

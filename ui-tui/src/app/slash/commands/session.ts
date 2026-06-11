@@ -37,9 +37,6 @@ const modelValueForConfigSet = (arg: string) => {
   return trimmed
 }
 
-const reasoningStatus = (r: ConfigGetValueResponse | ConfigSetResponse) =>
-  `reasoning: ${r.effort || r.value} · fast ${r.fast || 'off'}`
-
 export const sessionCommands: SlashCommand[] = [
   {
     aliases: ['bg', 'btw'],
@@ -379,10 +376,10 @@ export const sessionCommands: SlashCommand[] = [
     run: (arg, ctx) => {
       if (!arg) {
         return ctx.gateway
-          .rpc<ConfigGetValueResponse>('config.get', { key: 'reasoning', session_id: ctx.sid })
+          .rpc<ConfigGetValueResponse>('config.get', { key: 'reasoning' })
           .then(
             ctx.guarded<ConfigGetValueResponse>(
-              r => r.value && ctx.transcript.sys(reasoningStatus(r))
+              r => r.value && ctx.transcript.sys(`reasoning: ${r.value} · display ${r.display || 'hide'}`)
             )
           )
       }
@@ -409,11 +406,7 @@ export const sessionCommands: SlashCommand[] = [
               }))
             }
 
-            if (r.effort || r.display) {
-              ctx.transcript.sys(reasoningStatus(r))
-            } else {
-              ctx.transcript.sys(`reasoning: ${r.value}`)
-            }
+            ctx.transcript.sys(`reasoning: ${r.value}`)
           })
         )
     }
