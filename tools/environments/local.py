@@ -227,6 +227,8 @@ def _inject_context_hermes_home(env: dict) -> None:
 
 def _inject_github_cli_config_dir(env: dict) -> None:
     """Expose gh's config dir when HOME isolation would otherwise hide it."""
+    if env.get("GH_CONFIG_DIR"):
+        return
     try:
         from hermes_constants import get_github_cli_config_dir
 
@@ -235,6 +237,77 @@ def _inject_github_cli_config_dir(env: dict) -> None:
             env["GH_CONFIG_DIR"] = value
     except Exception:
         pass
+
+
+def _inject_real_home_profile_config_paths(env: dict, explicit_keys: set[str]) -> None:
+    """Bridge real-home CLI config roots into profile-isolated subprocesses."""
+    real_home = Path.home()
+
+    if "GH_CONFIG_DIR" not in explicit_keys and not env.get("GH_CONFIG_DIR"):
+        gh_config = real_home / ".config" / "gh"
+        if (gh_config / "hosts.yml").is_file():
+            env["GH_CONFIG_DIR"] = str(gh_config)
+
+    if "GIT_CONFIG_GLOBAL" not in explicit_keys and not env.get("GIT_CONFIG_GLOBAL"):
+        git_config = real_home / ".gitconfig"
+        if git_config.is_file():
+            env["GIT_CONFIG_GLOBAL"] = str(git_config)
+
+    if "DOCKER_CONFIG" not in explicit_keys and not env.get("DOCKER_CONFIG"):
+        docker_config = real_home / ".docker"
+        if (docker_config / "config.json").is_file():
+            env["DOCKER_CONFIG"] = str(docker_config)
+
+    if "CODEX_HOME" not in explicit_keys and not env.get("CODEX_HOME"):
+        codex_home = real_home / ".codex"
+        if codex_home.is_dir():
+            env["CODEX_HOME"] = str(codex_home)
+
+
+def _append_path_entry(path_value: str, entry: Path) -> str:
+    entry_str = str(entry)
+    separator = os.pathsep
+    parts = [part for part in path_value.split(separator) if part]
+    if entry_str in parts:
+        return path_value
+    return separator.join([*parts, entry_str]) if parts else entry_str
+
+
+def _bootstrap_profile_subprocess_env(
+    env: dict[str, str], explicit_keys: set[str] | None = None
+) -> None:
+    """Add profile-HOME subprocess defaults without copying credentials."""
+    explicit_keys = explicit_keys or set()
+
+    try:
+        from hermes_constants import get_hermes_home, get_subprocess_home
+
+        profile_home = get_subprocess_home()
+        if not profile_home:
+            return
+
+        env["HOME"] = profile_home
+        if "HERMES_HOME" not in explicit_keys:
+            env["HERMES_HOME"] = str(get_hermes_home())
+    except Exception:
+        return
+
+    real_user_bin = Path.home() / ".local" / "bin"
+    if "PATH" not in explicit_keys and real_user_bin.is_dir():
+        env["PATH"] = _append_path_entry(env.get("PATH", ""), real_user_bin)
+
+    _inject_real_home_profile_config_paths(env, explicit_keys)
+    _inject_github_cli_config_dir(env)
+
+    if "CLOUDSDK_CONFIG" not in explicit_keys and not env.get("CLOUDSDK_CONFIG"):
+        gcloud_config = Path.home() / ".config" / "gcloud"
+        if gcloud_config.is_dir():
+            env["CLOUDSDK_CONFIG"] = str(gcloud_config)
+
+    if "NPM_CONFIG_USERCONFIG" not in explicit_keys and not env.get("NPM_CONFIG_USERCONFIG"):
+        npm_config = Path.home() / ".npmrc"
+        if npm_config.is_file():
+            env["NPM_CONFIG_USERCONFIG"] = str(npm_config)
 
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
@@ -265,15 +338,16 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
             sanitized[key] = value
 
-    _inject_context_hermes_home(sanitized)
+    explicit_keys = set((extra_env or {}).keys())
+    explicit_keys.update(
+        key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
+        for key in (extra_env or {})
+        if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX)
+    )
 
-    # Per-profile HOME isolation for background processes (same as _make_run_env).
-    from hermes_constants import get_subprocess_home
-    _profile_home = get_subprocess_home()
-    if _profile_home:
-        sanitized["HOME"] = _profile_home
-
-    _inject_github_cli_config_dir(sanitized)
+    if "HERMES_HOME" not in explicit_keys:
+        _inject_context_hermes_home(sanitized)
+    _bootstrap_profile_subprocess_env(sanitized, explicit_keys)
 
     return sanitized
 
@@ -370,20 +444,19 @@ def _make_run_env(env: dict) -> dict:
     # on Windows; the native PATH already points at whatever shell
     # Hermes is driving via _find_bash (Git Bash), and Git Bash itself
     # prepends its MSYS2 /usr/bin equivalent via the shell-init files.
-    if not _IS_WINDOWS and "/usr/bin" not in existing_path.split(":"):
+    if not _IS_WINDOWS and "PATH" not in env and "/usr/bin" not in existing_path.split(":"):
         run_env["PATH"] = f"{existing_path}:{_SANE_PATH}" if existing_path else _SANE_PATH
 
-    _inject_context_hermes_home(run_env)
+    explicit_keys = set(env.keys())
+    explicit_keys.update(
+        key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
+        for key in env
+        if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX)
+    )
 
-    # Per-profile HOME isolation: redirect system tool configs (git, ssh, gh,
-    # npm …) into {HERMES_HOME}/home/ when that directory exists.  Only the
-    # subprocess sees the override — the Python process keeps the real HOME.
-    from hermes_constants import get_subprocess_home
-    _profile_home = get_subprocess_home()
-    if _profile_home:
-        run_env["HOME"] = _profile_home
-
-    _inject_github_cli_config_dir(run_env)
+    if "HERMES_HOME" not in explicit_keys:
+        _inject_context_hermes_home(run_env)
+    _bootstrap_profile_subprocess_env(run_env, explicit_keys)
 
     # Inject ContextVar-based session vars into subprocess env.
     # ContextVars don't propagate to child processes, so we bridge them here.

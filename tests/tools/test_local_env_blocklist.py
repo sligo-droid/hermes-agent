@@ -200,6 +200,18 @@ class TestProviderEnvBlocklist:
         assert "USER" in result_env
         assert "PATH" in result_env
 
+    def test_profile_config_bridge_vars_are_preserved(self):
+        """Credential/config roots are path bridges, not provider secrets."""
+        config_vars = {
+            "GIT_CONFIG_GLOBAL": "/home/user/.gitconfig",
+            "DOCKER_CONFIG": "/home/user/.docker",
+            "CODEX_HOME": "/home/user/.codex",
+        }
+        result_env = _run_with_env(extra_os_env=config_vars)
+
+        for var, value in config_vars.items():
+            assert result_env.get(var) == value
+
     def test_self_env_blocked_vars_also_stripped(self):
         """Blocked vars in self.env are stripped; non-blocked vars pass through."""
         result_env = _run_with_env(self_env={
