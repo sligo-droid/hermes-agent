@@ -210,6 +210,115 @@ def _archived_board_metadata() -> list[dict[str, Any]]:
     return entries
 
 
+def _archived_boards_by_slug() -> dict[str, list[dict[str, Any]]]:
+    archived: dict[str, list[dict[str, Any]]] = {}
+    for meta in _archived_board_metadata():
+        slug = str(meta.get("slug") or "").strip()
+        if slug:
+            archived.setdefault(slug, []).append(meta)
+    for entries in archived.values():
+        entries.sort(key=lambda item: _epoch_or_none(item.get("archived_at")) or 0, reverse=True)
+    return archived
+
+
+def _archived_board_has_nonterminal_evidence(board_meta: dict[str, Any]) -> bool:
+    worker = _board_worker_meta(board_meta)
+    goal_status = str(worker.get("goal_status") or "").lower()
+    phase = str(worker.get("phase") or "").lower()
+    if goal_status in {"done", "shipped", "complete", "completed", "cancelled", "canceled"} or phase == "complete":
+        return False
+    db_path = board_meta.get("db_path")
+    if not db_path or not Path(str(db_path)).exists():
+        return bool(goal_status or phase)
+    try:
+        conn = kanban_db.connect(db_path=Path(str(db_path)))
+    except Exception:
+        return bool(goal_status or phase)
+    try:
+        tasks = [_task_to_dict(task) for task in kanban_db.list_tasks(conn, include_archived=True, order_by="updated")]
+        runs = _recent_board_runs(conn, board=str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD), limit=20)
+    except Exception:
+        return bool(goal_status or phase)
+    finally:
+        conn.close()
+    if any(_is_active_run(run) for run in runs):
+        return True
+    statuses = {str(task.get("status") or "").lower() for task in tasks}
+    return any(status and status not in _TERMINAL_TASK_STATUSES for status in statuses)
+
+
+def _matching_nonterminal_archive(board: str, archived_by_slug: dict[str, list[dict[str, Any]]]) -> dict[str, Any] | None:
+    for archived_meta in archived_by_slug.get(board, []):
+        if _archived_board_has_nonterminal_evidence(archived_meta):
+            return archived_meta
+    return None
+
+
+def _metadata_file_is_readable(board: str) -> bool:
+    path = kanban_db.board_metadata_path(board)
+    if not path.exists():
+        return False
+    try:
+        return isinstance(json.loads(path.read_text(encoding="utf-8")), dict)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+
+def _active_board_repair_context(
+    board: str,
+    board_meta: dict[str, Any],
+    *,
+    archived_by_slug: dict[str, list[dict[str, Any]]],
+    error: Exception | None = None,
+) -> dict[str, Any] | None:
+    if board == kanban_db.DEFAULT_BOARD or board_meta.get("archived"):
+        return None
+    reason: str | None = None
+    if error is not None:
+        reason = f"active worker board cannot be opened: {error}"
+    elif not kanban_db.board_dir(board).is_dir():
+        reason = "active worker board directory is missing."
+    elif not _metadata_file_is_readable(board):
+        reason = "active worker board metadata is missing or unreadable."
+    elif not Path(str(board_meta.get("db_path") or kanban_db.kanban_db_path(board))).exists():
+        reason = "active worker board Kanban database is missing."
+    if not reason:
+        return None
+
+    context: dict[str, Any] = {"repair_required": True, "repair_reason": reason}
+    archived_meta = _matching_nonterminal_archive(board, archived_by_slug)
+    if archived_meta:
+        context["archived_board_path"] = archived_meta.get("archive_path") or archived_meta.get("archived_path")
+        context["repair_reason"] = f"{reason} Matching non-terminal board evidence is archived."
+    return context
+
+
+def _empty_active_board_repair_context(
+    board: str,
+    board_meta: dict[str, Any],
+    *,
+    tasks: list[dict[str, Any]],
+    runs: list[dict[str, Any]],
+    archived_by_slug: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any] | None:
+    if board == kanban_db.DEFAULT_BOARD or board_meta.get("archived") or tasks or runs:
+        return None
+    worker = _board_worker_meta(board_meta)
+    goal_status = str(worker.get("goal_status") or "").lower()
+    phase = str(worker.get("phase") or "").lower()
+    if goal_status in {"done", "shipped", "complete", "completed", "cancelled", "canceled"} or phase == "complete":
+        return None
+    archived_meta = _matching_nonterminal_archive(board, archived_by_slug)
+    if not archived_meta:
+        return None
+    reason = "active worker board Kanban database has no tasks or runs."
+    return {
+        "repair_required": True,
+        "archived_board_path": archived_meta.get("archive_path") or archived_meta.get("archived_path"),
+        "repair_reason": f"{reason} Matching non-terminal board evidence is archived.",
+    }
+
+
 def _board_identity(board: str, board_meta: dict[str, Any]) -> str:
     return str(board_meta.get("archive_id") or board)
 
@@ -576,6 +685,7 @@ def _execution_from_board(
     board_meta: dict[str, Any],
     tasks: list[dict[str, Any]],
     runs: list[dict[str, Any]],
+    repair_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     worker = _board_worker_meta(board_meta)
     public_url = worker.get("public_url") if isinstance(worker, dict) else None
@@ -596,18 +706,20 @@ def _execution_from_board(
         "task_id": None,
         "task_status": None,
         "task_url": None,
-        "worker_url": None if archived else _worker_board_url(board, public_url),
+        "worker_url": None if archived or repair_context else _worker_board_url(board, public_url),
         "console_url": None,
         "active_run_id": active_run.get("id") if active_run else None,
         "pause_action": f"/api/plugins/kanban/boards/{quote(board, safe='')}/pause",
         "resume_action": f"/api/plugins/kanban/boards/{quote(board, safe='')}/resume",
         "archive_action": f"/api/plugins/kanban/boards/{quote(board, safe='')}",
         "paused": paused,
-        "resumable": board != kanban_db.DEFAULT_BOARD and not archived and resumable,
-        "archiveable": board != kanban_db.DEFAULT_BOARD and not archived,
+        "resumable": board != kanban_db.DEFAULT_BOARD and not archived and not repair_context and resumable,
+        "archiveable": board != kanban_db.DEFAULT_BOARD and not archived and not repair_context,
         "task_counts": _task_status_counts(tasks),
         "run_count": len(runs),
     }
+    if repair_context:
+        execution.update(repair_context)
     if board != kanban_db.DEFAULT_BOARD and not archived and canonical_status == "shipped":
         execution["undo_followup_action"] = f"/api/plugins/kanban/boards/{quote(board, safe='')}/undo-followup"
     return _with_repair_metadata(execution, status=canonical_status, tasks=tasks)
@@ -764,9 +876,13 @@ def _board_work_item(
     tasks: list[dict[str, Any]],
     runs: list[dict[str, Any]],
     proposal_action_context: dict[str, Any] | None = None,
+    repair_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     canonical_status, status_detail = _canonical_status_from_board(tasks, board_meta=board_meta, runs=runs)
-    execution = _execution_from_board(board=board, board_meta=board_meta, tasks=tasks, runs=runs)
+    if repair_context and canonical_status in {"running", "accepted", "queued", "review"}:
+        canonical_status = "blocked"
+        status_detail = "repair_required"
+    execution = _execution_from_board(board=board, board_meta=board_meta, tasks=tasks, runs=runs, repair_context=repair_context)
     if canonical_status == "blocked" and execution.get("repair_blocked"):
         canonical_status = "mega_blocked"
         status_detail = "repair_blocked"
@@ -988,13 +1104,27 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
     for run in proposal_runs:
         sources.append(_source_from_proposal_run(run))
 
+    archived_by_slug = _archived_boards_by_slug()
     boards = kanban_db.list_boards(include_archived=include_archived)
     if include_archived:
-        boards.extend(_archived_board_metadata())
+        boards.extend(meta for entries in archived_by_slug.values() for meta in entries)
     for board_meta in boards:
         board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
         if _is_discord_board(board, board_meta):
             sources.append(_source_from_discord_board(board, board_meta))
+        repair_context = _active_board_repair_context(board, board_meta, archived_by_slug=archived_by_slug)
+        if repair_context and board != kanban_db.DEFAULT_BOARD and not board_meta.get("archived"):
+            work_items.append(
+                _board_work_item(
+                    board=board,
+                    board_meta=board_meta,
+                    tasks=[],
+                    runs=[],
+                    proposal_action_context=board_proposal_action_context.get(board),
+                    repair_context=repair_context,
+                )
+            )
+            continue
         try:
             db_path = board_meta.get("db_path")
             if board_meta.get("archive_path") and db_path:
@@ -1003,9 +1133,20 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
                     raise FileNotFoundError(str(archive_db_path))
                 conn = kanban_db.connect(db_path=archive_db_path)
             else:
-                kanban_db.init_db(board=board)
                 conn = kanban_db.connect(board=board)
         except Exception as exc:
+            repair_context = _active_board_repair_context(board, board_meta, archived_by_slug=archived_by_slug, error=exc)
+            if repair_context and board != kanban_db.DEFAULT_BOARD and not board_meta.get("archived"):
+                work_items.append(
+                    _board_work_item(
+                        board=board,
+                        board_meta=board_meta,
+                        tasks=[],
+                        runs=[],
+                        proposal_action_context=board_proposal_action_context.get(board),
+                        repair_context=repair_context,
+                    )
+                )
             sources.append(
                 {
                     "id": f"source:kanban-board-error:{_board_identity(board, board_meta)}",
@@ -1029,6 +1170,13 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
                 task_dict["latest_summary"] = summaries.get(task.id)
                 task_dicts.append(task_dict)
             board_runs = _recent_board_runs(conn, board=board, limit=recent_run_limit_per_board)
+            repair_context = repair_context or _empty_active_board_repair_context(
+                board,
+                board_meta,
+                tasks=task_dicts,
+                runs=board_runs,
+                archived_by_slug=archived_by_slug,
+            )
             if board != kanban_db.DEFAULT_BOARD:
                 work_items.append(
                     _board_work_item(
@@ -1037,6 +1185,7 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
                         tasks=task_dicts,
                         runs=board_runs,
                         proposal_action_context=board_proposal_action_context.get(board),
+                        repair_context=repair_context,
                     )
                 )
             runs.extend(board_runs)
