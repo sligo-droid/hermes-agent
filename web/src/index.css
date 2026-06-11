@@ -413,6 +413,107 @@ code { font-size: 0.875rem; }
   }
 }
 
+.command-center-annotation-modal-backdrop {
+  background: rgb(0 0 0 / 0.7);
+}
+
+.command-center-annotation-modal {
+  background: linear-gradient(145deg, rgb(8 9 10 / 0.98), rgb(15 23 42 / 0.96));
+  border-color: rgb(255 255 255 / 0.1);
+  color: rgb(226 232 240);
+  box-shadow: 0 24px 70px rgb(0 0 0 / 0.54), inset 0 1px 0 rgb(255 255 255 / 0.05);
+}
+
+.command-center-annotation-modal-title {
+  color: rgb(255 255 255);
+}
+
+.command-center-annotation-modal-description,
+.command-center-annotation-modal-legend {
+  color: rgb(148 163 184);
+}
+
+.command-center-annotation-modal-label,
+.command-center-annotation-modal-choice {
+  color: rgb(226 232 240);
+}
+
+.command-center-annotation-modal-radio,
+.command-center-annotation-modal-warning input[type="checkbox"] {
+  accent-color: rgb(103 232 249);
+}
+
+.command-center-annotation-modal-input,
+.command-center-annotation-modal-textarea {
+  background: rgb(2 6 23 / 0.92);
+  border-color: rgb(255 255 255 / 0.1);
+  color: rgb(248 250 252);
+}
+
+.command-center-annotation-modal-input::placeholder,
+.command-center-annotation-modal-textarea::placeholder {
+  color: rgb(148 163 184);
+}
+
+.command-center-annotation-modal-button,
+.command-center-annotation-modal-input,
+.command-center-annotation-modal-textarea,
+.command-center-annotation-modal-radio,
+.command-center-annotation-modal-warning input[type="checkbox"] {
+  transition: background-color 150ms ease, border-color 150ms ease, box-shadow 150ms ease, color 150ms ease;
+}
+
+.command-center-annotation-modal-button:focus-visible,
+.command-center-annotation-modal-input:focus-visible,
+.command-center-annotation-modal-textarea:focus-visible,
+.command-center-annotation-modal-radio:focus-visible,
+.command-center-annotation-modal-warning input[type="checkbox"]:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgb(103 232 249 / 0.28);
+}
+
+.command-center-annotation-modal-input:focus-visible,
+.command-center-annotation-modal-textarea:focus-visible {
+  border-color: rgb(103 232 249 / 0.44);
+}
+
+.command-center-annotation-modal-required {
+  color: rgb(254 202 202);
+}
+
+.command-center-annotation-modal-warning {
+  background: rgb(251 146 60 / 0.08);
+  border-color: rgb(253 186 116 / 0.24);
+  color: rgb(255 237 213);
+}
+
+.command-center-annotation-modal-error {
+  background: rgb(127 29 29 / 0.34);
+  border-color: rgb(252 165 165 / 0.32);
+  color: rgb(254 226 226);
+}
+
+.command-center-annotation-modal-button-secondary {
+  background: transparent;
+  border-color: rgb(255 255 255 / 0.1);
+  color: rgb(203 213 225);
+}
+
+.command-center-annotation-modal-button-secondary:hover {
+  background: rgb(255 255 255 / 0.06);
+  border-color: rgb(255 255 255 / 0.18);
+}
+
+.command-center-annotation-modal-button-primary {
+  background: rgb(103 232 249);
+  border-color: rgb(165 243 252 / 0.44);
+  color: rgb(8 51 68);
+}
+
+.command-center-annotation-modal-button-primary:hover:not(:disabled) {
+  background: rgb(165 243 252);
+}
+
 /* Scoped light mode for the Sligo Command Center shell only. */
 .sligo-light [class*="border-white/10"],
 .sligo-light [class*="border-white/15"] {
@@ -547,6 +648,105 @@ code { font-size: 0.875rem; }
   background-color: rgb(226 232 240 / 0.86) !important;
   border-color: rgb(148 163 184 / 0.72) !important;
   color: rgb(71 85 105) !important;
+}
+.sligo-light .command-center-annotation-modal-backdrop,
+[data-sligo-theme="light"] .command-center-annotation-modal-backdrop {
+  background: rgb(15 23 42 / 0.38);
+}
+.sligo-light .command-center-annotation-modal,
+[data-sligo-theme="light"] .command-center-annotation-modal {
+  background: linear-gradient(145deg, rgb(255 255 255 / 0.98), rgb(240 253 250 / 0.96));
+  border-color: rgb(14 116 144 / 0.22) !important;
+  color: rgb(15 23 42);
+  box-shadow: 0 24px 70px rgb(15 23 42 / 0.22), inset 0 1px 0 rgb(255 255 255 / 0.92);
+}
+.sligo-light .command-center-annotation-modal-title,
+[data-sligo-theme="light"] .command-center-annotation-modal-title,
+.sligo-light .command-center-annotation-modal-label,
+[data-sligo-theme="light"] .command-center-annotation-modal-label,
+.sligo-light .command-center-annotation-modal-choice,
+[data-sligo-theme="light"] .command-center-annotation-modal-choice {
+  color: rgb(15 23 42);
+}
+.sligo-light .command-center-annotation-modal-description,
+[data-sligo-theme="light"] .command-center-annotation-modal-description,
+.sligo-light .command-center-annotation-modal-legend,
+[data-sligo-theme="light"] .command-center-annotation-modal-legend {
+  color: rgb(71 85 105);
+}
+.sligo-light .command-center-annotation-modal-radio,
+[data-sligo-theme="light"] .command-center-annotation-modal-radio,
+.sligo-light .command-center-annotation-modal-warning input[type="checkbox"],
+[data-sligo-theme="light"] .command-center-annotation-modal-warning input[type="checkbox"] {
+  accent-color: rgb(14 116 144);
+}
+.sligo-light .command-center-annotation-modal-input,
+[data-sligo-theme="light"] .command-center-annotation-modal-input,
+.sligo-light .command-center-annotation-modal-textarea,
+[data-sligo-theme="light"] .command-center-annotation-modal-textarea {
+  background: rgb(255 255 255 / 0.94);
+  border-color: rgb(148 163 184 / 0.72) !important;
+  color: rgb(15 23 42);
+}
+.sligo-light .command-center-annotation-modal-input::placeholder,
+[data-sligo-theme="light"] .command-center-annotation-modal-input::placeholder,
+.sligo-light .command-center-annotation-modal-textarea::placeholder,
+[data-sligo-theme="light"] .command-center-annotation-modal-textarea::placeholder {
+  color: rgb(100 116 139);
+}
+.sligo-light .command-center-annotation-modal-button:focus-visible,
+[data-sligo-theme="light"] .command-center-annotation-modal-button:focus-visible,
+.sligo-light .command-center-annotation-modal-input:focus-visible,
+[data-sligo-theme="light"] .command-center-annotation-modal-input:focus-visible,
+.sligo-light .command-center-annotation-modal-textarea:focus-visible,
+[data-sligo-theme="light"] .command-center-annotation-modal-textarea:focus-visible,
+.sligo-light .command-center-annotation-modal-radio:focus-visible,
+[data-sligo-theme="light"] .command-center-annotation-modal-radio:focus-visible,
+.sligo-light .command-center-annotation-modal-warning input[type="checkbox"]:focus-visible,
+[data-sligo-theme="light"] .command-center-annotation-modal-warning input[type="checkbox"]:focus-visible {
+  box-shadow: 0 0 0 3px rgb(14 116 144 / 0.22);
+}
+.sligo-light .command-center-annotation-modal-input:focus-visible,
+[data-sligo-theme="light"] .command-center-annotation-modal-input:focus-visible,
+.sligo-light .command-center-annotation-modal-textarea:focus-visible,
+[data-sligo-theme="light"] .command-center-annotation-modal-textarea:focus-visible {
+  border-color: rgb(14 116 144 / 0.54) !important;
+}
+.sligo-light .command-center-annotation-modal-required,
+[data-sligo-theme="light"] .command-center-annotation-modal-required {
+  color: rgb(185 28 28);
+}
+.sligo-light .command-center-annotation-modal-warning,
+[data-sligo-theme="light"] .command-center-annotation-modal-warning {
+  background: rgb(255 247 237 / 0.96);
+  border-color: rgb(194 65 12 / 0.24) !important;
+  color: rgb(154 52 18);
+}
+.sligo-light .command-center-annotation-modal-error,
+[data-sligo-theme="light"] .command-center-annotation-modal-error {
+  background: rgb(254 242 242 / 0.98);
+  border-color: rgb(185 28 28 / 0.26) !important;
+  color: rgb(153 27 27);
+}
+.sligo-light .command-center-annotation-modal-button-secondary,
+[data-sligo-theme="light"] .command-center-annotation-modal-button-secondary {
+  border-color: rgb(148 163 184 / 0.72) !important;
+  color: rgb(15 23 42);
+}
+.sligo-light .command-center-annotation-modal-button-secondary:hover,
+[data-sligo-theme="light"] .command-center-annotation-modal-button-secondary:hover {
+  background: rgb(226 232 240 / 0.72);
+  border-color: rgb(14 116 144 / 0.3) !important;
+}
+.sligo-light .command-center-annotation-modal-button-primary,
+[data-sligo-theme="light"] .command-center-annotation-modal-button-primary {
+  background: rgb(14 116 144);
+  border-color: rgb(8 145 178 / 0.62) !important;
+  color: rgb(240 253 250);
+}
+.sligo-light .command-center-annotation-modal-button-primary:hover:not(:disabled),
+[data-sligo-theme="light"] .command-center-annotation-modal-button-primary:hover:not(:disabled) {
+  background: rgb(8 145 178);
 }
 
 /* Subtle grain overlay for badges. */

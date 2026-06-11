@@ -464,55 +464,55 @@ function AnnotationModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 py-6" onClick={onClose} role="presentation">
+    <div className="command-center-annotation-modal-backdrop fixed inset-0 z-50 flex items-center justify-center px-4 py-6" onClick={onClose} role="presentation">
       <div
         ref={modalRef}
         aria-describedby={descriptionId}
         aria-labelledby={titleId}
         aria-modal="true"
-        className="w-full max-w-lg rounded-2xl border border-white/10 bg-[#08090a] p-5 text-slate-100 shadow-2xl shadow-black/50"
+        className="command-center-annotation-modal w-full max-w-lg rounded-2xl border p-5 shadow-2xl"
         onClick={(event) => event.stopPropagation()}
         role="dialog"
       >
         <div className="flex items-start justify-between gap-3">
           <div>
-            <h2 className="text-lg font-semibold text-white" id={titleId}>Add Operator Annotation</h2>
-            <p className="mt-1 text-sm leading-5 text-slate-400" id={descriptionId}>Record a note or correction for {item.title} without changing the original title or summary.</p>
+            <h2 className="command-center-annotation-modal-title text-lg font-semibold" id={titleId}>Add Operator Annotation</h2>
+            <p className="command-center-annotation-modal-description mt-1 text-sm leading-5" id={descriptionId}>Record a note or correction for {item.title} without changing the original title or summary.</p>
           </div>
-          <button className="rounded-full border border-white/10 px-3 py-1 text-xs font-semibold text-slate-300 hover:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/30" onClick={onClose} type="button">Close</button>
+          <button className="command-center-annotation-modal-button command-center-annotation-modal-button-secondary rounded-full border px-3 py-1 text-xs font-semibold" onClick={onClose} type="button">Close</button>
         </div>
         <form className="mt-5 grid gap-4" onSubmit={submit}>
           <fieldset className="grid gap-2">
-            <legend className="text-xs font-bold uppercase tracking-[0.16em] text-slate-400">Annotation mode</legend>
-            <label className="inline-flex items-center gap-2 text-sm text-slate-200">
-              <input checked={selectedMode === "note"} name="annotation-mode" onChange={() => setSelectedMode("note")} type="radio" />
+            <legend className="command-center-annotation-modal-legend text-xs font-bold uppercase tracking-[0.16em]">Annotation mode</legend>
+            <label className="command-center-annotation-modal-choice inline-flex items-center gap-2 text-sm">
+              <input checked={selectedMode === "note"} className="command-center-annotation-modal-radio" name="annotation-mode" onChange={() => setSelectedMode("note")} type="radio" />
               Note / clarification
             </label>
-            <label className="inline-flex items-center gap-2 text-sm text-slate-200">
-              <input checked={selectedMode === "correction"} name="annotation-mode" onChange={() => setSelectedMode("correction")} type="radio" />
+            <label className="command-center-annotation-modal-choice inline-flex items-center gap-2 text-sm">
+              <input checked={selectedMode === "correction"} className="command-center-annotation-modal-radio" name="annotation-mode" onChange={() => setSelectedMode("correction")} type="radio" />
               Correction / redirect
             </label>
           </fieldset>
           {selectedMode === "correction" ? (
-            <label className="grid gap-1 text-sm font-semibold text-slate-200" htmlFor={correctionTitleId}>
+            <label className="command-center-annotation-modal-label grid gap-1 text-sm font-semibold" htmlFor={correctionTitleId}>
               Optional correction title
-              <input className="rounded-xl border border-white/10 bg-slate-950 px-3 py-2 text-sm text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/30" id={correctionTitleId} maxLength={200} onChange={(event) => setTitle(event.target.value)} value={title} />
+              <input className="command-center-annotation-modal-input rounded-xl border px-3 py-2 text-sm" id={correctionTitleId} maxLength={200} onChange={(event) => setTitle(event.target.value)} value={title} />
             </label>
           ) : null}
-          <label className="grid gap-1 text-sm font-semibold text-slate-200" htmlFor={textareaId}>
-            Annotation text <span className="text-red-200">required</span>
-            <textarea className="min-h-32 rounded-xl border border-white/10 bg-slate-950 px-3 py-2 text-sm leading-6 text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/30" data-autofocus id={textareaId} maxLength={4000} onChange={(event) => setText(event.target.value)} required value={text} />
+          <label className="command-center-annotation-modal-label grid gap-1 text-sm font-semibold" htmlFor={textareaId}>
+            Annotation text <span className="command-center-annotation-modal-required">required</span>
+            <textarea className="command-center-annotation-modal-textarea min-h-32 rounded-xl border px-3 py-2 text-sm leading-6" data-autofocus id={textareaId} maxLength={4000} onChange={(event) => setText(event.target.value)} required value={text} />
           </label>
           {selectedMode === "correction" && canPauseCurrent ? (
-            <label className="inline-flex items-start gap-2 rounded-xl border border-orange-200/20 bg-orange-300/[0.06] px-3 py-2 text-sm text-orange-50">
+            <label className="command-center-annotation-modal-warning inline-flex items-start gap-2 rounded-xl border px-3 py-2 text-sm">
               <input checked={pauseCurrent} className="mt-1" onChange={(event) => setPauseCurrent(event.target.checked)} type="checkbox" />
               Pause current work while applying this correction
             </label>
           ) : null}
-          {error ? <div className="rounded-xl border border-red-300/30 bg-red-950/30 px-3 py-2 text-sm text-red-100" role="alert">{error}</div> : null}
+          {error ? <div className="command-center-annotation-modal-error rounded-xl border px-3 py-2 text-sm" role="alert">{error}</div> : null}
           <div className="flex flex-wrap justify-end gap-2">
-            <button className="rounded-full border border-white/10 px-4 py-2 text-sm font-semibold text-slate-300 hover:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" onClick={onClose} type="button">Cancel</button>
-            <button className="inline-flex items-center gap-2 rounded-full border border-cyan-100/40 bg-cyan-300 px-4 py-2 text-sm font-semibold text-cyan-950 hover:bg-cyan-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/60 disabled:cursor-not-allowed disabled:opacity-60" disabled={busy || !text.trim()} type="submit">
+            <button className="command-center-annotation-modal-button command-center-annotation-modal-button-secondary rounded-full border px-4 py-2 text-sm font-semibold" onClick={onClose} type="button">Cancel</button>
+            <button className="command-center-annotation-modal-button command-center-annotation-modal-button-primary inline-flex items-center gap-2 rounded-full border px-4 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-60" disabled={busy || !text.trim()} type="submit">
               {busy ? <Spinner /> : null} Submit annotation
             </button>
           </div>
