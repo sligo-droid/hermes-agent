@@ -10,6 +10,7 @@ exit codes.
 from __future__ import annotations
 
 import argparse
+import socket
 import sys
 from unittest.mock import patch, MagicMock
 
@@ -156,6 +157,31 @@ class TestLifecycleFlagsTakePrecedence:
              pytest.raises(SystemExit):
             cmd_dashboard(_ns(stop=True))
         assert called["start"] is False
+
+
+class TestDashboardStartPreflight:
+    def test_occupied_port_exits_before_dependency_import_or_start(self, capsys):
+        called = {"start": False}
+
+        def fake_start_server(**kw):
+            called["start"] = True
+
+        fake_ws = MagicMock()
+        fake_ws.start_server = fake_start_server
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            port = sock.getsockname()[1]
+            with patch.dict(sys.modules, {"hermes_cli.web_server": fake_ws}), pytest.raises(SystemExit) as exc:
+                cmd_dashboard(_ns(port=port))
+
+        assert exc.value.code == 1
+        assert called["start"] is False
+        err = capsys.readouterr().err
+        assert f"127.0.0.1:{port}" in err
+        assert "hermes dashboard --stop" in err
+        assert "hermes-dashboard.service" in err
 
 
 class TestDashboardRestart:

@@ -10831,6 +10831,17 @@ def cmd_dashboard(args):
         sys.exit(0 if restarted else 0)
 
     try:
+        from hermes_cli.dashboard_lifecycle import (
+            DashboardPortInUse,
+            ensure_dashboard_port_available,
+        )
+
+        ensure_dashboard_port_available(args.host, args.port)
+    except (DashboardPortInUse, OSError) as exc:
+        print(f"Dashboard cannot start: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
         import fastapi  # noqa: F401
         import uvicorn  # noqa: F401
     except ImportError as e:
