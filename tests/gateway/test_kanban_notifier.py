@@ -16,6 +16,13 @@ from gateway.run import (
 from hermes_cli import kanban_db as kb
 
 
+DISCORD_EPOCH_SECONDS = 1_420_070_400.0
+
+
+def _discord_snowflake_at(timestamp: float) -> str:
+    return str(int((timestamp - DISCORD_EPOCH_SECONDS) * 1000) << 22)
+
+
 class RecordingAdapter:
     def __init__(self):
         self.sent = []
@@ -845,10 +852,11 @@ def test_discord_completed_worker_board_reaction_stays_done_with_stale_active_so
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb
 
+    thread_id = _discord_snowflake_at(time.time())
     board = dwb.set_goal(
-        thread_id="1512532369897160735",
+        thread_id=thread_id,
         goal="Quarantine and self-heal Kanban SQLite corruption instead of log-storming",
-        chat_id="parent-1512532369897160735",
+        chat_id=f"parent-{thread_id}",
     )
     conn = kb.connect(board=board.slug)
     try:
@@ -891,10 +899,11 @@ def test_discord_completed_worker_board_reaction_ignores_stale_active_source_tas
     finally:
         source_conn.close()
 
+    thread_id = _discord_snowflake_at(time.time())
     board = dwb.set_goal(
-        thread_id="1512532369897160735",
+        thread_id=thread_id,
         goal=f"Completed worker with stale source\n- Board: {kb.DEFAULT_BOARD}\n- Task: {source_task_id}",
-        chat_id="parent-1512532369897160735",
+        chat_id=f"parent-{thread_id}",
     )
     conn = kb.connect(board=board.slug)
     try:

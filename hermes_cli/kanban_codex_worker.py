@@ -23,6 +23,7 @@ from hermes_cli.discord_worker_boards import (
     MERGE_POLICY_MANUAL,
     MERGE_POLICY_NEVER,
     PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL,
+    PR_OPEN_POLICY_NEVER,
     ROLE_DEV,
     ROLE_FOREMAN,
     ROLE_PLANNER,
@@ -2041,6 +2042,11 @@ def _merge_policy(worker: dict[str, Any]) -> str:
     return policy if policy in VALID_MERGE_POLICIES else MERGE_POLICY_AUTO
 
 
+def _pr_open_policy(worker: dict[str, Any]) -> str:
+    policy = str(worker.get("pr_open_policy") or PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL).strip().lower()
+    return policy if policy in {PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL, PR_OPEN_POLICY_NEVER} else PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL
+
+
 def _pr_blocker(worker: dict[str, Any]) -> str:
     if worker.get("pr_error"):
         return str(worker.get("pr_error") or "")
@@ -2279,6 +2285,7 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
     if not board:
         return True
     from hermes_cli.discord_worker_boards import DISCORD_WORKER_META_KEY
+    from hermes_cli.discord_worker_boards import effective_pr_policy_for_worker
     from utils import atomic_json_write
 
     metadata = kanban_db.read_board_metadata(board)
@@ -2287,52 +2294,69 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
     branch = str(worker.get("worker_branch") or "").strip()
     base = str(worker.get("base_branch") or "main").strip() or "main"
     repo = _resolve_github_repo(worker, root)
+    effective_policy = effective_pr_policy_for_worker(worker)
+    worker.update(effective_policy)
     policy = _merge_policy(worker)
-    worker["pr_open_policy"] = str(worker.get("pr_open_policy") or PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL)
+    open_policy = _pr_open_policy(worker)
+    worker["pr_open_policy"] = open_policy
     worker["merge_policy"] = policy
     _reset_pr_status_fields(worker)
     try:
-        missing = []
-        if not repo:
-            missing.append("GitHub repository")
-        if not branch:
-            missing.append("worker branch")
-        if missing:
-            worker["pr_error"] = f"Cannot create PR: missing {', '.join(missing)}"
-            worker["pr_checks_status"] = "not checked"
-            worker["pr_merge_state"] = "unknown"
-            worker["pr_blocker"] = worker["pr_error"]
-            raise RuntimeError(worker["pr_error"])
-        assert repo is not None
-        has_commits = _branch_has_commits(root, base=base, branch=branch)
-        if _is_foreman_generated_worker(worker) and has_commits is False:
+        skip_pr_lifecycle = False
+        if open_policy == PR_OPEN_POLICY_NEVER:
             worker["pr_skipped_no_changes"] = True
             worker["pr_state"] = "not_needed"
             worker["pr_checks_status"] = "passed"
             worker["pr_checks_total"] = 0
             worker["pr_checks_failed"] = []
-            worker["pr_merge_state"] = "clean"
-            worker["pr_mergeable"] = True
+            worker["pr_merge_state"] = "not_needed"
+            worker["pr_mergeable"] = "not_needed"
+            worker["pr_merge_skipped"] = True
+            worker["pr_merge_skipped_reason"] = "pr_open_policy_never"
             worker["pr_blocker"] = ""
-        else:
-            opened = _ensure_pr_open(
-                worker,
-                root=root,
-                repo=repo,
-                branch=branch,
-                base=base,
-                board=board,
-            )
-            if opened and policy == MERGE_POLICY_AUTO:
-                _ensure_pr_merged(worker, root=root, repo=repo)
-            elif opened and policy in {MERGE_POLICY_MANUAL, MERGE_POLICY_NEVER}:
-                worker["pr_merge_skipped"] = True
-                worker["pr_merge_skipped_reason"] = policy
-                worker["pr_blocker"] = _pr_open_blocker(worker)
-            elif not worker.get("pr_skipped_no_changes"):
-                worker.setdefault("pr_checks_status", "not checked")
-                worker.setdefault("pr_merge_state", "unknown")
-                worker["pr_blocker"] = _pr_open_blocker(worker)
+            skip_pr_lifecycle = True
+        if not skip_pr_lifecycle:
+            missing = []
+            if not repo:
+                missing.append("GitHub repository")
+            if not branch:
+                missing.append("worker branch")
+            if missing:
+                worker["pr_error"] = f"Cannot create PR: missing {', '.join(missing)}"
+                worker["pr_checks_status"] = "not checked"
+                worker["pr_merge_state"] = "unknown"
+                worker["pr_blocker"] = worker["pr_error"]
+                raise RuntimeError(worker["pr_error"])
+            assert repo is not None
+            has_commits = _branch_has_commits(root, base=base, branch=branch)
+            if _is_foreman_generated_worker(worker) and has_commits is False:
+                worker["pr_skipped_no_changes"] = True
+                worker["pr_state"] = "not_needed"
+                worker["pr_checks_status"] = "passed"
+                worker["pr_checks_total"] = 0
+                worker["pr_checks_failed"] = []
+                worker["pr_merge_state"] = "clean"
+                worker["pr_mergeable"] = True
+                worker["pr_blocker"] = ""
+            else:
+                opened = _ensure_pr_open(
+                    worker,
+                    root=root,
+                    repo=repo,
+                    branch=branch,
+                    base=base,
+                    board=board,
+                )
+                if opened and policy == MERGE_POLICY_AUTO:
+                    _ensure_pr_merged(worker, root=root, repo=repo)
+                elif opened and policy in {MERGE_POLICY_MANUAL, MERGE_POLICY_NEVER}:
+                    worker["pr_merge_skipped"] = True
+                    worker["pr_merge_skipped_reason"] = policy
+                    worker["pr_blocker"] = _pr_open_blocker(worker)
+                elif not worker.get("pr_skipped_no_changes"):
+                    worker.setdefault("pr_checks_status", "not checked")
+                    worker.setdefault("pr_merge_state", "unknown")
+                    worker["pr_blocker"] = _pr_open_blocker(worker)
     except Exception as exc:
         worker.setdefault("pr_error", str(exc))
         worker.setdefault("pr_checks_status", "not checked")

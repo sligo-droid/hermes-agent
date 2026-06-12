@@ -36,6 +36,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Fixed terminal Discord worker reaction sync so paused/cancelled boards with pending terminal sync remain status targets before archive; archive no longer gets stuck forever on the “retry after sync” guard when a stale paused board still needs its final Discord reaction.
 - [x] Changed Discord worker-board completion follow-ups without a captured final response to render like normal feature-request shipped summaries: `What changed`, `Verification`, and `Shipped` sections from board metadata instead of raw Kanban internals.
 - [x] Hardened Kanban role-worker recovery so reviewer/planner/dev/foreman tasks already blocked by the dead-PID race can still apply a fresh recorded sidecar result instead of leaving the board permanently stuck.
+- [x] Hardened Discord worker PR finalization for blocked boards: explicit local-only/no-PR contracts now skip PR creation/merge cleanly, and blocked approved-reviewer boards with existing PR-conflict recovery tasks are reactivated as actionable dev work instead of staying terminally blocked.
 
 ## In Progress
 
