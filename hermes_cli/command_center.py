@@ -9,6 +9,7 @@ underlying proposal/Kanban/Discord lifecycles.
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import sqlite3
@@ -43,6 +44,7 @@ _PROJECT_ALIASES = {
     "pid": "pid",
 }
 _ARCHIVED_BOARD_DIR_RE = re.compile(r"^(?P<slug>.+)-(?P<timestamp>\d{9,})(?:-\d+)?$")
+_ARCHIVED_BOARD_METADATA_CACHE: tuple[tuple[str, int], list[dict[str, Any]]] | None = None
 
 
 def _normalize_project_key(value: Any) -> str | None:
@@ -199,15 +201,23 @@ def _read_archived_board_metadata(path: Path) -> dict[str, Any] | None:
 
 
 def _archived_board_metadata() -> list[dict[str, Any]]:
+    global _ARCHIVED_BOARD_METADATA_CACHE
+
     archive_root = kanban_db.boards_root() / "_archived"
     if not archive_root.is_dir():
+        _ARCHIVED_BOARD_METADATA_CACHE = None
         return []
+    cache_key = (str(archive_root), archive_root.stat().st_mtime_ns)
+    if _ARCHIVED_BOARD_METADATA_CACHE and _ARCHIVED_BOARD_METADATA_CACHE[0] == cache_key:
+        return copy.deepcopy(_ARCHIVED_BOARD_METADATA_CACHE[1])
+
     entries: list[dict[str, Any]] = []
     for child in sorted(archive_root.iterdir(), key=lambda p: p.name.lower()):
         meta = _read_archived_board_metadata(child)
         if meta is not None:
             entries.append(meta)
-    return entries
+    _ARCHIVED_BOARD_METADATA_CACHE = (cache_key, copy.deepcopy(entries))
+    return copy.deepcopy(entries)
 
 
 def _archived_boards_by_slug() -> dict[str, list[dict[str, Any]]]:

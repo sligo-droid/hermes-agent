@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 from hermes_cli import command_center, command_center_annotations, command_center_verification, kanban_db
@@ -859,6 +860,81 @@ def test_snapshot_terminal_archived_board_stays_historical(tmp_path, monkeypatch
     assert item["status"] == "archived"
     assert item["execution"]["worker_url"] is None
     assert "repair_required" not in item["execution"]
+
+
+def test_archived_board_metadata_cache_reuses_until_archive_root_mtime_changes(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    archive_root = kanban_db.boards_root() / "_archived"
+    archive_root.mkdir(parents=True)
+    first = archive_root / "discord-cache-1000000000"
+    first.mkdir()
+    (first / "kanban.db").touch()
+    (first / "board.json").write_text(json.dumps({"slug": "discord-cache", "name": "Cached"}), encoding="utf-8")
+    ignored = archive_root / "ignored-entry"
+    ignored.mkdir()
+    malformed = archive_root / "discord-malformed-1000000001"
+    malformed.mkdir()
+    (malformed / "kanban.db").touch()
+    (malformed / "board.json").write_text("{not json", encoding="utf-8")
+
+    original_read = command_center._read_archived_board_metadata
+    read_paths: list[str] = []
+
+    def counted_read(path: Path):
+        read_paths.append(path.name)
+        return original_read(path)
+
+    monkeypatch.setattr(command_center, "_read_archived_board_metadata", counted_read)
+
+    first_result = command_center._archived_board_metadata()
+    first_result[0]["name"] = "mutated caller copy"
+    second_result = command_center._archived_board_metadata()
+
+    assert read_paths == ["discord-cache-1000000000", "discord-malformed-1000000001", "ignored-entry"]
+    assert [meta["slug"] for meta in second_result] == ["discord-cache", "discord-malformed"]
+    assert second_result[0]["name"] == "Cached"
+    assert second_result[1]["name"] == "discord-malformed"
+
+    new_archived = archive_root / "discord-cache-1000000002"
+    new_archived.mkdir()
+    (new_archived / "kanban.db").touch()
+    (new_archived / "board.json").write_text(json.dumps({"slug": "discord-cache", "archived_at": 1000000002}), encoding="utf-8")
+    next_ns = archive_root.stat().st_mtime_ns + 1_000_000_000
+    os.utime(archive_root, ns=(next_ns, next_ns))
+
+    refreshed_by_slug = command_center._archived_boards_by_slug()
+
+    assert read_paths == [
+        "discord-cache-1000000000",
+        "discord-malformed-1000000001",
+        "ignored-entry",
+        "discord-cache-1000000000",
+        "discord-cache-1000000002",
+        "discord-malformed-1000000001",
+        "ignored-entry",
+    ]
+    assert [meta["archive_dir"] for meta in refreshed_by_slug["discord-cache"]] == [
+        "discord-cache-1000000002",
+        "discord-cache-1000000000",
+    ]
+
+
+def test_archived_board_metadata_cache_handles_missing_archive_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    archive_root = kanban_db.boards_root() / "_archived"
+    archive_root.mkdir(parents=True)
+    archived = archive_root / "discord-cache-1000000000"
+    archived.mkdir()
+    (archived / "kanban.db").touch()
+
+    assert command_center._archived_board_metadata()
+    for child in archive_root.iterdir():
+        for file_path in child.iterdir():
+            file_path.unlink()
+        child.rmdir()
+    archive_root.rmdir()
+
+    assert command_center._archived_board_metadata() == []
 
 
 def test_snapshot_corrupt_active_board_metadata_requires_repair_without_dead_worker_url(tmp_path, monkeypatch):
