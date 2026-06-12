@@ -78,7 +78,7 @@ def test_record_compression_route_results_reports_failing_routes_only():
     facts = {}
     issues = []
 
-    results = doctor.record_compression_route_results(
+    results = doctor.check_compression_routes(
         {"exit": 1, "output": output},
         issues,
         facts,

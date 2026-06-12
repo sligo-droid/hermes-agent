@@ -95,3 +95,12 @@ def record_compression_route_results(
         )
 
     return route_results
+
+
+def check_compression_routes(
+    routes_smoke: dict[str, Any],
+    issues: list[dict[str, str]],
+    facts: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Doctor route-smoke path for configured compression providers."""
+    return record_compression_route_results(routes_smoke, issues, facts)
