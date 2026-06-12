@@ -150,6 +150,23 @@ class TestGetGitHubCliConfigDir:
 
         assert get_github_cli_config_dir({"HOME": str(child_home)}) == str(child_gh)
 
+    def test_falls_back_to_os_account_home_when_child_home_is_isolated(self, tmp_path, monkeypatch):
+        real_home = tmp_path / "real-home"
+        child_home = tmp_path / "isolated-home"
+        real_gh = real_home / ".config" / "gh"
+        child_home.mkdir()
+        real_gh.mkdir(parents=True)
+        (real_gh / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
+        monkeypatch.setenv("HOME", str(child_home))
+        monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+
+        import hermes_constants
+        from hermes_constants import get_github_cli_config_dir
+
+        monkeypatch.setattr(hermes_constants, "_process_user_home", lambda: real_home)
+
+        assert get_github_cli_config_dir({"HOME": str(child_home)}) == str(real_gh)
+
 
 # ---------------------------------------------------------------------------
 # _make_run_env() injection
