@@ -29,6 +29,8 @@ from hermes_cli.discord_worker_boards import (
     ROLE_PLANNER,
     ROLE_REVIEWER,
     VALID_MERGE_POLICIES,
+    _format_plan_artifact_markdown,
+    _normalize_discord_plan_artifacts,
     active_dev_round_for_board,
     format_role_round_title,
     is_cancelled,
@@ -489,6 +491,21 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
     )
 
 
+def _worker_plan_artifact_lines(worker: dict[str, Any]) -> list[str]:
+    artifacts = _normalize_discord_plan_artifacts(worker.get("discord_plan_artifacts"))
+    if not artifacts:
+        pack_path = str(worker.get("context_pack_path") or "").strip()
+        if pack_path:
+            try:
+                with Path(pack_path).open("r", encoding="utf-8") as fh:
+                    pack = json.load(fh)
+                if isinstance(pack, dict):
+                    artifacts = _normalize_discord_plan_artifacts(pack.get("plan_artifacts"))
+            except (OSError, json.JSONDecodeError):
+                artifacts = []
+    return [_format_plan_artifact_markdown(item) for item in artifacts[:8]]
+
+
 def _build_reviewer_context(conn: Any, task_id: str) -> str:
     task = kanban_db.get_task(conn, task_id)
     if not task:
@@ -532,25 +549,10 @@ def _build_reviewer_context(conn: Any, task_id: str) -> str:
     if context_paths:
         lines.append("Context pack paths:")
         lines.extend(f"- {path}" for path in context_paths)
-    plan_artifacts = [item for item in worker.get("discord_plan_artifacts") or [] if isinstance(item, dict)]
-    artifact_paths = []
-    seen_artifact_paths: set[str] = set()
-    for item in plan_artifacts:
-        path = str(item.get("artifact_path") or "").strip()
-        if not path or path in seen_artifact_paths:
-            continue
-        seen_artifact_paths.add(path)
-        artifact_id = str(item.get("artifact_id") or "").strip()
-        source_url = str(item.get("source_url") or "").strip()
-        suffix = []
-        if artifact_id:
-            suffix.append(f"artifact_id={artifact_id}")
-        if source_url:
-            suffix.append(f"source={source_url}")
-        artifact_paths.append(f"- {path}" + (f" ({'; '.join(suffix)})" if suffix else ""))
+    artifact_paths = _worker_plan_artifact_lines(worker)
     if artifact_paths:
         lines.append("Durable Discord plan artifact paths:")
-        lines.extend(artifact_paths[:8])
+        lines.extend(artifact_paths)
     lines.append("")
 
     parent_rows = conn.execute(
@@ -1642,13 +1644,19 @@ def _add_context_headers(specs: list[dict[str, Any]], *, board: Optional[str]) -
 
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
     context_path = str(worker.get("context_pack_markdown_path") or worker.get("context_pack_path") or "").strip()
-    if not context_path:
+    artifact_paths = _worker_plan_artifact_lines(worker)
+    if not context_path and not artifact_paths:
         return
     for spec in specs:
         requirement_ids = _string_list(spec.get("requirement_ids"))
-        lines = ["Context pack:", f"- {context_path}"]
-        if worker.get("context_pack_path") and str(worker.get("context_pack_path")) != context_path:
-            lines.append(f"- JSON: {worker.get('context_pack_path')}")
+        lines = []
+        if context_path:
+            lines.extend(["Context pack:", f"- {context_path}"])
+            if worker.get("context_pack_path") and str(worker.get("context_pack_path")) != context_path:
+                lines.append(f"- JSON: {worker.get('context_pack_path')}")
+        if artifact_paths:
+            lines.append("Durable Discord plan artifact paths:")
+            lines.extend(artifact_paths)
         if requirement_ids:
             lines.append("Requirement IDs: " + ", ".join(requirement_ids))
         header = "\n".join(lines).strip()

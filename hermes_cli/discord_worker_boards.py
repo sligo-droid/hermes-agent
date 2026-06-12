@@ -319,6 +319,91 @@ def _normalize_discord_plan_artifacts(value: Any) -> list[dict[str, Any]]:
     return artifacts
 
 
+def _clean_artifact_path_candidate(value: str) -> str:
+    return str(value or "").strip().rstrip(".:")
+
+
+def _looks_like_plan_artifact_path(value: str) -> bool:
+    path = _clean_artifact_path_candidate(value)
+    if not path:
+        return False
+    lowered = path.replace("\\", "/").casefold()
+    suffix_ok = lowered.endswith((".md", ".markdown", ".txt"))
+    return suffix_ok and (
+        "/plans/" in lowered
+        or "/artifacts/discord-plans/" in lowered
+        or lowered.endswith("/plans/readme.md")
+    )
+
+
+def _plan_artifact_path_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for regex in (_POSIX_PATH_RE, _WINDOWS_PATH_RE):
+        for match in regex.finditer(str(text or "")):
+            value = _clean_artifact_path_candidate(match.group(0))
+            if not value or value in seen or not _looks_like_plan_artifact_path(value):
+                continue
+            seen.add(value)
+            candidates.append(value)
+    return candidates
+
+
+def _local_plan_artifact_from_path(path: str) -> Optional[dict[str, Any]]:
+    value = _clean_artifact_path_candidate(path)
+    if not value or not _looks_like_plan_artifact_path(value):
+        return None
+    try:
+        resolved = Path(value).expanduser()
+        if not resolved.is_absolute() or not resolved.is_file():
+            return None
+        content_sha256 = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    except OSError:
+        return None
+    return {
+        "artifact_id": "",
+        "artifact_path": str(resolved),
+        "content_sha256": content_sha256,
+        "kind": "local_plan",
+        "created_at": "",
+        "updated_at": "",
+        "thread_id": "",
+        "channel_id": "",
+        "source_message_id": "",
+        "source_url": "",
+        "bot_message_ids": [],
+        "matched_identifier": value,
+    }
+
+
+def _artifact_context_texts(request: str, worker: dict[str, Any]) -> list[str]:
+    texts: list[str] = [str(request or "")]
+    for key in (
+        "root_goal",
+        "initial_request",
+        "latest_planner_request",
+        "latest_goal_thread_context",
+    ):
+        value = str(worker.get(key) or "").strip()
+        if value:
+            texts.append(value)
+    for item in worker.get("criteria") or []:
+        if isinstance(item, dict):
+            value = str(item.get("text") or item.get("title") or "").strip()
+        else:
+            value = str(item or "").strip()
+        if value:
+            texts.append(value)
+    for item in worker.get("requirements") or []:
+        if isinstance(item, dict):
+            value = str(item.get("text") or "").strip()
+        else:
+            value = str(item or "").strip()
+        if value:
+            texts.append(value)
+    return texts
+
+
 def _format_plan_artifact_markdown(item: dict[str, Any]) -> str:
     path = str(item.get("artifact_path") or "").strip()
     artifact_id = str(item.get("artifact_id") or "").strip()
@@ -4876,7 +4961,12 @@ def start_planner_request(
         raw_request,
         str(thread_context or ""),
     )
-    plan_artifacts = _discord_plan_artifact_context(raw_request, worker)
+    artifact_worker = dict(worker)
+    if acceptance_criteria is not None:
+        artifact_worker["criteria"] = acceptance_criteria
+    if thread_context_text:
+        artifact_worker["latest_goal_thread_context"] = thread_context_text
+    plan_artifacts = _discord_plan_artifact_context(raw_request, artifact_worker)
     if request_changed:
         _clear_generated_summary_title(worker)
     if starts_new_goal_run:
@@ -5088,6 +5178,18 @@ def _discord_plan_artifact_context(request: str, worker: dict[str, Any]) -> list
 
     artifacts: list[dict[str, Any]] = []
     seen: set[str] = set()
+
+    def add_artifact(raw: dict[str, Any]) -> None:
+        normalized = _normalize_discord_plan_artifacts([raw])
+        if not normalized:
+            return
+        item = normalized[0]
+        key = item.get("artifact_id") or item.get("artifact_path") or item.get("content_sha256")
+        if not key or str(key) in seen:
+            return
+        seen.add(str(key))
+        artifacts.append(item)
+
     for identifier in candidates:
         try:
             record = lookup_discord_plan_artifact(identifier)
@@ -5103,17 +5205,20 @@ def _discord_plan_artifact_context(request: str, worker: dict[str, Any]) -> list
             continue
         data = record.as_dict(include_content=False)
         data["matched_identifier"] = identifier
-        normalized = _normalize_discord_plan_artifacts([data])
-        if not normalized:
-            continue
-        item = normalized[0]
-        key = item.get("artifact_id") or item.get("artifact_path") or item.get("content_sha256")
-        if not key or key in seen:
-            continue
-        seen.add(str(key))
-        artifacts.append(item)
+        add_artifact(data)
         if len(artifacts) >= 8:
             break
+    if len(artifacts) < 8:
+        for text in _artifact_context_texts(request, worker):
+            for path in _plan_artifact_path_candidates(text):
+                item = _local_plan_artifact_from_path(path)
+                if not item:
+                    continue
+                add_artifact(item)
+                if len(artifacts) >= 8:
+                    break
+            if len(artifacts) >= 8:
+                break
     return artifacts
 
 

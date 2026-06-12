@@ -2465,10 +2465,20 @@ def test_planner_output_persists_requirements_and_adds_dev_context_header(monkey
     board, task = _claimed_planner(monkeypatch, tmp_path)
     metadata = kanban_db.read_board_metadata(board.slug)
     board_worker = dict(metadata["discord_worker"])
+    artifact_path = tmp_path / "plans" / "004-worker-pid-identity.md"
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_text("# Worker PID identity plan\n", encoding="utf-8")
     board_worker.update(
         {
             "context_pack_path": str(tmp_path / "context-pack.json"),
             "context_pack_markdown_path": str(tmp_path / "context-pack.md"),
+            "discord_plan_artifacts": [
+                {
+                    "artifact_path": str(artifact_path),
+                    "content_sha256": "sha256-plan",
+                    "kind": "local_plan",
+                }
+            ],
         }
     )
     from hermes_cli import discord_worker_boards as dwb
@@ -2512,8 +2522,11 @@ def test_planner_output_persists_requirements_and_adds_dev_context_header(monkey
     finally:
         conn.close()
 
+    assert dev_task.body is not None
     assert "Context pack:" in dev_task.body
     assert str(tmp_path / "context-pack.md") in dev_task.body
+    assert "Durable Discord plan artifact paths:" in dev_task.body
+    assert str(artifact_path) in dev_task.body
     assert "Requirement IDs: REQ-1" in dev_task.body
     worker_meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert worker_meta["requirements"][0]["id"] == "REQ-1"
@@ -2528,7 +2541,23 @@ def test_reviewer_output_creates_next_round_dev_ticket(monkeypatch, tmp_path):
     from hermes_cli.discord_worker_boards import ROLE_REVIEWER
 
     board = dwb.start_direct_goal(thread_id="review-followup", goal="Ship it")
-    dwb._update_worker_meta(board.slug, {**board.worker, "review_loop_count": 1})
+    artifact_path = tmp_path / "plans" / "reviewer-followup.md"
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_text("# Reviewer follow-up plan\n", encoding="utf-8")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            **board.worker,
+            "review_loop_count": 1,
+            "discord_plan_artifacts": [
+                {
+                    "artifact_path": str(artifact_path),
+                    "content_sha256": "reviewer-sha",
+                    "kind": "local_plan",
+                }
+            ],
+        },
+    )
     conn = kanban_db.connect(board=board.slug)
     try:
         reviewer_id = kanban_db.create_task(
@@ -2563,6 +2592,9 @@ def test_reviewer_output_creates_next_round_dev_ticket(monkeypatch, tmp_path):
         conn.close()
 
     assert [item.title for item in dev_tasks] == ["R2: Fix follow-up"]
+    assert dev_tasks[0].body is not None
+    assert "Durable Discord plan artifact paths:" in dev_tasks[0].body
+    assert str(artifact_path) in dev_tasks[0].body
 
 
 def test_reviewer_pr_lifecycle_task_finalizes_without_dev_ticket(monkeypatch, tmp_path):

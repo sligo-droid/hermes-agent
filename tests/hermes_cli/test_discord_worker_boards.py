@@ -1100,6 +1100,32 @@ def test_saved_discord_plan_artifact_path_reaches_planner_and_reviewer(monkeypat
     assert "Durable Discord plan artifact paths:" in reviewer_context
 
 
+def test_acceptance_criteria_plan_file_path_reaches_board_context_pack(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    plan_path = tmp_path / "repo" / "plans" / "004-worker-pid-identity.md"
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text("# Worker PID identity plan\nVerify proc start ticks.\n", encoding="utf-8")
+
+    board = dwb.start_planner_request(
+        thread_id="7795",
+        request="Implement the accepted plan.",
+        request_id="msg-7795",
+        acceptance_criteria=[f"Follow the plan artifact at {plan_path}"],
+    )
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    artifacts = worker["discord_plan_artifacts"]
+    assert artifacts[0]["artifact_path"] == str(plan_path)
+    assert artifacts[0]["kind"] == "local_plan"
+    context_pack = json.loads(Path(worker["context_pack_path"]).read_text(encoding="utf-8"))
+    assert context_pack["plan_artifacts"][0]["artifact_path"] == str(plan_path)
+    assert str(plan_path) in Path(worker["context_pack_markdown_path"]).read_text(encoding="utf-8")
+
+
 def test_start_planner_request_context_pack_version_only_changes_on_material_context(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
