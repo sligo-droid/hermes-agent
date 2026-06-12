@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-08 01:49 UTC
+Last updated: 2026-06-12 19:30 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -38,6 +38,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Hardened Kanban role-worker recovery so reviewer/planner/dev/foreman tasks already blocked by the dead-PID race can still apply a fresh recorded sidecar result instead of leaving the board permanently stuck.
 - [x] Hardened Discord worker PR finalization for blocked boards: explicit local-only/no-PR contracts now skip PR creation/merge cleanly, and blocked approved-reviewer boards with existing PR-conflict recovery tasks are reactivated as actionable dev work instead of staying terminally blocked.
 - [x] Hardened Kanban worker liveness checks to verify worker process identity with PID start ticks instead of bare PID liveness, preventing recycled unrelated PIDs from extending dead worker claims until the heartbeat backstop.
+- [x] Made self-improvement proposal approval idempotent across Discord partial failures: route breadcrumbs are recorded before worker-board activation, retries can reuse existing Discord route metadata, already-approved cards short-circuit safely, and final approval persistence failures leave an audit breadcrumb telling operators that retry will reattach.
 
 ## In Progress
 
