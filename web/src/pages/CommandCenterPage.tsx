@@ -948,6 +948,7 @@ export default function CommandCenterPage() {
   const [annotationError, setAnnotationError] = useState<string | null>(null);
   const [annotationStatus, setAnnotationStatus] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const refreshSequenceRef = useRef(0);
   const [pagination, setPagination] = useState<CommandCenterPagination>(() => ({
     project: selectedProject,
     pages: { overview: 1, inbox: 1, work: 1, completed: 1, archive: 1 },
@@ -961,6 +962,7 @@ export default function CommandCenterPage() {
   };
 
   const refresh = useCallback(async (options?: { delayBeforeApplyMs?: number; settleAfterApplyMs?: number }) => {
+    const refreshSequence = ++refreshSequenceRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -968,14 +970,18 @@ export default function CommandCenterPage() {
       if (options?.delayBeforeApplyMs) {
         await waitForActionSettle(options.delayBeforeApplyMs);
       }
+      if (refreshSequence !== refreshSequenceRef.current) return;
       setSnapshot(next);
       if (options?.settleAfterApplyMs) {
         await waitForActionSettle(options.settleAfterApplyMs);
       }
     } catch (err) {
+      if (refreshSequence !== refreshSequenceRef.current) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (refreshSequence === refreshSequenceRef.current) {
+        setLoading(false);
+      }
     }
   }, [selectedProject]);
 
@@ -1062,6 +1068,10 @@ export default function CommandCenterPage() {
       },
     }));
   }, [pageTotals, selectedProject]);
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- project switches must drop stale cross-project selections before user actions continue.
+    setSelectedIds(new Set());
+  }, [selectedProject]);
   const recommendations = useMemo(
     () => snapshot?.work_items.filter((item) => item.source.kind === "self_improvement") ?? [],
     [snapshot],
@@ -1134,21 +1144,27 @@ export default function CommandCenterPage() {
   }, [annotationBusy]);
   const submitAnnotation = useCallback(async (payload: { mode: CommandCenterAnnotationMode; text: string; title?: string; pause_current?: boolean }) => {
     if (!annotationDraft || annotationBusy) return;
+    const draft = annotationDraft;
+    const submittedMode = payload.mode;
     setAnnotationBusy(true);
     setAnnotationError(null);
     setError(null);
     try {
-      const result = await api.createCommandCenterAnnotation(annotationDraft.item.id, payload);
+      let result: Awaited<ReturnType<typeof api.createCommandCenterAnnotation>>;
+      {
+        const annotationDraft = draft;
+        result = await api.createCommandCenterAnnotation(annotationDraft.item.id, payload);
+      }
       await refresh();
       const warnings = result.errors ? Object.entries(result.errors).map(([key, value]) => `${key}: ${value}`).join("; ") : "";
       const statusParts = [
-        payload.mode === "correction" ? "Correction recorded." : "Note recorded.",
+        submittedMode === "correction" ? "Correction recorded." : "Note recorded.",
         result.followup_task ? "Follow-up task created." : "",
         result.worker_url ? "Worker link returned." : "",
         warnings ? `Warning: ${warnings}` : "",
       ].filter(Boolean);
       setAnnotationStatus(statusParts.join(" "));
-      setAnnotationDraft(null);
+      setAnnotationDraft((current) => (current === draft ? null : current));
       if (warnings) setError(warnings);
     } catch (err) {
       setAnnotationError(err instanceof Error ? err.message : String(err));
