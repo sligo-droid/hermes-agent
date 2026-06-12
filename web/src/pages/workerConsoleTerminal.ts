@@ -60,7 +60,7 @@ export function snapshotConsoleText(snapshot: WorkerConsoleSnapshot, reason: str
     lines.push("[worker log]");
     lines.push(snapshot.worker_log_tail.trimEnd());
   } else {
-    lines.push("[backend activity] waiting for Codex/OpenCode events");
+    lines.push("[backend activity] waiting for coding worker backend events");
   }
   return normalizeTerminalText(`${lines.join("\n")}\n`);
 }

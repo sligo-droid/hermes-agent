@@ -2359,6 +2359,33 @@ def test_worker_console_operator_text_preserves_failure_snippet():
     assert "chars truncated" in text
 
 
+def test_worker_console_empty_activity_uses_backend_neutral_copy():
+    import hermes_cli.web_server as ws
+
+    text = ws.worker_console_operator_text({})
+
+    assert "[backend activity] waiting for coding worker backend events" in text
+    assert "Codex/OpenCode" not in text
+
+
+def test_worker_console_intro_uses_backend_neutral_stream_copy(tmp_path):
+    import hermes_cli.web_server as ws
+
+    intro = ws._worker_console_intro(
+        {
+            "task": {"id": "t_1", "title": "Ticket", "status": "running"},
+            "backend": "opencode",
+            "workspace": {"path": str(tmp_path)},
+            "current_run": {"id": 7, "worker_pid": 123},
+        },
+        tmp_path / "worker.log",
+        tmp_path / "worker.codex-state.json",
+    ).decode("utf-8", errors="replace")
+
+    assert "stream: readable coding worker backend activity plus worker stdout/stderr" in intro
+    assert "Codex/OpenCode" not in intro
+
+
 @skip_on_windows
 class TestPtyWebSocket:
     @pytest.fixture(autouse=True)
