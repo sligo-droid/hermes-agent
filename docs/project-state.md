@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-12 20:05 UTC
+Last updated: 2026-06-12 23:35 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -40,6 +40,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Hardened Kanban worker liveness checks to verify worker process identity with PID start ticks instead of bare PID liveness, preventing recycled unrelated PIDs from extending dead worker claims until the heartbeat backstop.
 - [x] Made self-improvement proposal approval idempotent across Discord partial failures: route breadcrumbs are recorded before worker-board activation, retries can reuse existing Discord route metadata, already-approved cards short-circuit safely, and final approval persistence failures leave an audit breadcrumb telling operators that retry will reattach.
 - [x] Hardened Command Center page state so project switches clear bulk selections, overlapping snapshot refreshes cannot apply stale state, and annotation submission uses the submitted draft after async work.
+- [x] Reduced Command Center snapshot read cost with batched annotation enrichment, short in-process snapshot caching with mutation invalidation, and archived-board metadata caching keyed by archive directory mtime.
 - [x] Serialized Discord worker-board `board.json` metadata mutations behind a per-board sidecar lock so concurrent gateway, dashboard, CLI, worker, and foreman writers do not drop one-shot terminal sync flags.
 - [x] Reduced the default Kanban dispatcher tick from 10 seconds to 5 seconds and corrected stale CLI guidance that still claimed the embedded gateway dispatcher ticked every 60 seconds.
 

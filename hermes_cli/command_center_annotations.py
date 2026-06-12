@@ -138,8 +138,33 @@ def list_annotations(work_item_id: str | None = None) -> list[dict[str, Any]]:
     return [_row_to_annotation(row) for row in rows]
 
 
-def enrich_work_item(item: dict[str, Any]) -> dict[str, Any]:
-    annotations = list_annotations(str(item.get("id") or ""))
+def annotations_by_work_item(work_item_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+    ids = [str(work_item_id) for work_item_id in dict.fromkeys(work_item_ids) if str(work_item_id)]
+    if not ids:
+        return {}
+
+    placeholders = ", ".join("?" for _ in ids)
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM command_center_annotations
+            WHERE work_item_id IN ({placeholders})
+            ORDER BY work_item_id ASC, created_at ASC, id ASC
+            """,
+            ids,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    grouped: dict[str, list[dict[str, Any]]] = {work_item_id: [] for work_item_id in ids}
+    for row in rows:
+        annotation = _row_to_annotation(row)
+        grouped.setdefault(str(annotation.get("work_item_id") or ""), []).append(annotation)
+    return grouped
+
+
+def apply_annotations(item: dict[str, Any], annotations: list[dict[str, Any]]) -> dict[str, Any]:
     notes = [annotation for annotation in annotations if annotation.get("mode") == "note"]
     corrections = [annotation for annotation in annotations if annotation.get("mode") == "correction"]
     item["annotations"] = annotations
@@ -147,6 +172,19 @@ def enrich_work_item(item: dict[str, Any]) -> dict[str, Any]:
     item["latest_operator_note"] = notes[-1] if notes else None
     item["latest_correction"] = corrections[-1] if corrections else None
     return item
+
+
+def enrich_work_item(item: dict[str, Any]) -> dict[str, Any]:
+    annotations = list_annotations(str(item.get("id") or ""))
+    return apply_annotations(item, annotations)
+
+
+def enrich_work_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items_to_enrich = [item for item in items if "annotations" not in item]
+    annotations_by_id = annotations_by_work_item([str(item.get("id") or "") for item in items_to_enrich])
+    for item in items_to_enrich:
+        apply_annotations(item, annotations_by_id.get(str(item.get("id") or ""), []))
+    return items
 
 
 def operator_context_block(work_item_id: str) -> str:

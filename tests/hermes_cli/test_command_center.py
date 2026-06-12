@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 from hermes_cli import command_center, command_center_annotations, command_center_verification, kanban_db
@@ -21,6 +22,60 @@ def _first_card() -> dict:
     cards = proposal_storage.list_cards()["cards"]
     assert cards
     return cards[0]
+
+
+def test_snapshot_cache_reuses_snapshot_until_ttl_or_force_refresh(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    command_center.invalidate_snapshot_cache()
+    call_count = 0
+    monotonic_now = 100.0
+    original_list_boards = kanban_db.list_boards
+
+    def counted_list_boards(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original_list_boards(*args, **kwargs)
+
+    monkeypatch.setattr(kanban_db, "list_boards", counted_list_boards)
+    monkeypatch.setattr(command_center.time, "monotonic", lambda: monotonic_now)
+
+    first = command_center.get_cached_command_center_snapshot()
+    first["work_items"].append({"id": "mutated-caller-copy"})
+    second = command_center.get_cached_command_center_snapshot()
+
+    assert call_count == 1
+    assert all(item.get("id") != "mutated-caller-copy" for item in second["work_items"])
+
+    command_center.get_cached_command_center_snapshot(force_refresh=True)
+    assert call_count == 2
+
+    monotonic_now += 3.1
+    command_center.get_cached_command_center_snapshot()
+    assert call_count == 3
+
+
+def test_snapshot_cache_keys_include_project_archived_and_recent_run_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    command_center.invalidate_snapshot_cache()
+    call_count = 0
+    original_list_boards = kanban_db.list_boards
+
+    monkeypatch.setattr(command_center.time, "monotonic", lambda: 200.0)
+
+    def counted_list_boards(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original_list_boards(*args, **kwargs)
+
+    monkeypatch.setattr(kanban_db, "list_boards", counted_list_boards)
+
+    command_center.get_cached_command_center_snapshot(project="hermes", include_archived=False, recent_run_limit_per_board=20)
+    command_center.get_cached_command_center_snapshot(project="hermes", include_archived=False, recent_run_limit_per_board=20)
+    command_center.get_cached_command_center_snapshot(project="pid", include_archived=False, recent_run_limit_per_board=20)
+    command_center.get_cached_command_center_snapshot(project="hermes", include_archived=True, recent_run_limit_per_board=20)
+    command_center.get_cached_command_center_snapshot(project="hermes", include_archived=False, recent_run_limit_per_board=5)
+
+    assert call_count == 4
 
 
 def test_snapshot_hides_rejected_cards_by_default_and_exposes_source_ids(tmp_path, monkeypatch):
@@ -73,15 +128,89 @@ def test_snapshot_enriches_work_items_with_operator_annotations(tmp_path, monkey
         created_at=101,
     )
 
+    original_connect = command_center_annotations._connect
+    connect_count = 0
+
+    def counted_connect():
+        nonlocal connect_count
+        connect_count += 1
+        return original_connect()
+
+    monkeypatch.setattr(command_center_annotations, "_connect", counted_connect)
+
     snapshot = command_center.build_command_center_snapshot()
     item = next(item for item in snapshot["work_items"] if item["id"] == work_item_id)
 
+    assert connect_count == 1
     assert item["title"] == card["title"]
     assert item["summary"] == card["summary"]
     assert item["operator_note_count"] == 1
     assert item["latest_operator_note"]["text"] == "Operator note for later approval."
     assert item["latest_correction"]["title"] == "Use safer approach"
     assert [annotation["mode"] for annotation in item["annotations"]] == ["note", "correction"]
+
+
+def test_batch_annotation_enrichment_handles_multiple_and_missing_items(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    first_id = "self-improvement:first"
+    second_id = "kanban-board:second"
+    missing_id = "kanban-board:missing"
+
+    command_center_annotations.record_annotation(
+        work_item_id=first_id,
+        mode="note",
+        text="First note.",
+        actor="operator",
+        target_kind="self_improvement_proposal",
+        target_id="first",
+        previous_title="First",
+        previous_summary="First summary",
+        previous_status="proposed",
+        source_ref={},
+        execution_snapshot={},
+        created_at=100,
+    )
+    command_center_annotations.record_annotation(
+        work_item_id=second_id,
+        mode="correction",
+        title="Second correction",
+        text="Second correction text.",
+        actor="operator",
+        target_kind="kanban_board",
+        target_id="second",
+        previous_title="Second",
+        previous_summary="Second summary",
+        previous_status="running",
+        source_ref={},
+        execution_snapshot={},
+        created_at=101,
+    )
+
+    items = [{"id": first_id}, {"id": second_id}, {"id": missing_id}]
+
+    result = command_center_annotations.enrich_work_items(items)
+
+    assert result is items
+    assert items[0]["operator_note_count"] == 1
+    assert items[0]["latest_operator_note"]["text"] == "First note."
+    assert items[0]["latest_correction"] is None
+    assert items[1]["operator_note_count"] == 0
+    assert items[1]["latest_operator_note"] is None
+    assert items[1]["latest_correction"]["title"] == "Second correction"
+    assert items[2]["annotations"] == []
+    assert items[2]["operator_note_count"] == 0
+    assert items[2]["latest_operator_note"] is None
+    assert items[2]["latest_correction"] is None
+
+
+def test_batch_annotation_lookup_empty_list_does_not_query(monkeypatch):
+    def fail_connect():
+        raise AssertionError("empty annotation batch should not open sqlite")
+
+    monkeypatch.setattr(command_center_annotations, "_connect", fail_connect)
+
+    assert command_center_annotations.annotations_by_work_item([]) == {}
+    assert command_center_annotations.enrich_work_items([]) == []
 
 
 def test_snapshot_preserves_approval_artifacts_after_followup_audit_events(tmp_path, monkeypatch):
@@ -785,6 +914,81 @@ def test_snapshot_terminal_archived_board_stays_historical(tmp_path, monkeypatch
     assert item["status"] == "archived"
     assert item["execution"]["worker_url"] is None
     assert "repair_required" not in item["execution"]
+
+
+def test_archived_board_metadata_cache_reuses_until_archive_root_mtime_changes(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    archive_root = kanban_db.boards_root() / "_archived"
+    archive_root.mkdir(parents=True)
+    first = archive_root / "discord-cache-1000000000"
+    first.mkdir()
+    (first / "kanban.db").touch()
+    (first / "board.json").write_text(json.dumps({"slug": "discord-cache", "name": "Cached"}), encoding="utf-8")
+    ignored = archive_root / "ignored-entry"
+    ignored.mkdir()
+    malformed = archive_root / "discord-malformed-1000000001"
+    malformed.mkdir()
+    (malformed / "kanban.db").touch()
+    (malformed / "board.json").write_text("{not json", encoding="utf-8")
+
+    original_read = command_center._read_archived_board_metadata
+    read_paths: list[str] = []
+
+    def counted_read(path: Path):
+        read_paths.append(path.name)
+        return original_read(path)
+
+    monkeypatch.setattr(command_center, "_read_archived_board_metadata", counted_read)
+
+    first_result = command_center._archived_board_metadata()
+    first_result[0]["name"] = "mutated caller copy"
+    second_result = command_center._archived_board_metadata()
+
+    assert read_paths == ["discord-cache-1000000000", "discord-malformed-1000000001", "ignored-entry"]
+    assert [meta["slug"] for meta in second_result] == ["discord-cache", "discord-malformed"]
+    assert second_result[0]["name"] == "Cached"
+    assert second_result[1]["name"] == "discord-malformed"
+
+    new_archived = archive_root / "discord-cache-1000000002"
+    new_archived.mkdir()
+    (new_archived / "kanban.db").touch()
+    (new_archived / "board.json").write_text(json.dumps({"slug": "discord-cache", "archived_at": 1000000002}), encoding="utf-8")
+    next_ns = archive_root.stat().st_mtime_ns + 1_000_000_000
+    os.utime(archive_root, ns=(next_ns, next_ns))
+
+    refreshed_by_slug = command_center._archived_boards_by_slug()
+
+    assert read_paths == [
+        "discord-cache-1000000000",
+        "discord-malformed-1000000001",
+        "ignored-entry",
+        "discord-cache-1000000000",
+        "discord-cache-1000000002",
+        "discord-malformed-1000000001",
+        "ignored-entry",
+    ]
+    assert [meta["archive_dir"] for meta in refreshed_by_slug["discord-cache"]] == [
+        "discord-cache-1000000002",
+        "discord-cache-1000000000",
+    ]
+
+
+def test_archived_board_metadata_cache_handles_missing_archive_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    archive_root = kanban_db.boards_root() / "_archived"
+    archive_root.mkdir(parents=True)
+    archived = archive_root / "discord-cache-1000000000"
+    archived.mkdir()
+    (archived / "kanban.db").touch()
+
+    assert command_center._archived_board_metadata()
+    for child in archive_root.iterdir():
+        for file_path in child.iterdir():
+            file_path.unlink()
+        child.rmdir()
+    archive_root.rmdir()
+
+    assert command_center._archived_board_metadata() == []
 
 
 def test_snapshot_corrupt_active_board_metadata_requires_repair_without_dead_worker_url(tmp_path, monkeypatch):
