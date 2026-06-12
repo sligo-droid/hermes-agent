@@ -1203,9 +1203,7 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
             boards=boards,
         )
 
-    for item in work_items:
-        if "annotations" not in item:
-            command_center_annotations.enrich_work_item(item)
+    command_center_annotations.enrich_work_items(work_items)
 
     work_items.sort(key=_work_item_sort_key)
     sources.sort(key=_source_sort_key)

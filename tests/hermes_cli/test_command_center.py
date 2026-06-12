@@ -73,15 +73,89 @@ def test_snapshot_enriches_work_items_with_operator_annotations(tmp_path, monkey
         created_at=101,
     )
 
+    original_connect = command_center_annotations._connect
+    connect_count = 0
+
+    def counted_connect():
+        nonlocal connect_count
+        connect_count += 1
+        return original_connect()
+
+    monkeypatch.setattr(command_center_annotations, "_connect", counted_connect)
+
     snapshot = command_center.build_command_center_snapshot()
     item = next(item for item in snapshot["work_items"] if item["id"] == work_item_id)
 
+    assert connect_count == 1
     assert item["title"] == card["title"]
     assert item["summary"] == card["summary"]
     assert item["operator_note_count"] == 1
     assert item["latest_operator_note"]["text"] == "Operator note for later approval."
     assert item["latest_correction"]["title"] == "Use safer approach"
     assert [annotation["mode"] for annotation in item["annotations"]] == ["note", "correction"]
+
+
+def test_batch_annotation_enrichment_handles_multiple_and_missing_items(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    first_id = "self-improvement:first"
+    second_id = "kanban-board:second"
+    missing_id = "kanban-board:missing"
+
+    command_center_annotations.record_annotation(
+        work_item_id=first_id,
+        mode="note",
+        text="First note.",
+        actor="operator",
+        target_kind="self_improvement_proposal",
+        target_id="first",
+        previous_title="First",
+        previous_summary="First summary",
+        previous_status="proposed",
+        source_ref={},
+        execution_snapshot={},
+        created_at=100,
+    )
+    command_center_annotations.record_annotation(
+        work_item_id=second_id,
+        mode="correction",
+        title="Second correction",
+        text="Second correction text.",
+        actor="operator",
+        target_kind="kanban_board",
+        target_id="second",
+        previous_title="Second",
+        previous_summary="Second summary",
+        previous_status="running",
+        source_ref={},
+        execution_snapshot={},
+        created_at=101,
+    )
+
+    items = [{"id": first_id}, {"id": second_id}, {"id": missing_id}]
+
+    result = command_center_annotations.enrich_work_items(items)
+
+    assert result is items
+    assert items[0]["operator_note_count"] == 1
+    assert items[0]["latest_operator_note"]["text"] == "First note."
+    assert items[0]["latest_correction"] is None
+    assert items[1]["operator_note_count"] == 0
+    assert items[1]["latest_operator_note"] is None
+    assert items[1]["latest_correction"]["title"] == "Second correction"
+    assert items[2]["annotations"] == []
+    assert items[2]["operator_note_count"] == 0
+    assert items[2]["latest_operator_note"] is None
+    assert items[2]["latest_correction"] is None
+
+
+def test_batch_annotation_lookup_empty_list_does_not_query(monkeypatch):
+    def fail_connect():
+        raise AssertionError("empty annotation batch should not open sqlite")
+
+    monkeypatch.setattr(command_center_annotations, "_connect", fail_connect)
+
+    assert command_center_annotations.annotations_by_work_item([]) == {}
+    assert command_center_annotations.enrich_work_items([]) == []
 
 
 def test_snapshot_preserves_approval_artifacts_after_followup_audit_events(tmp_path, monkeypatch):
