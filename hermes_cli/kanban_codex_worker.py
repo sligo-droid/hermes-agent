@@ -136,7 +136,7 @@ def main() -> int:
             conn,
             task_id,
             board=board,
-            operation_name="codex_worker.initial_get_task",
+            operation_name="coding_worker.initial_get_task",
         )
         if task is None:
             return 2
@@ -245,7 +245,7 @@ def _recover_completed_role_output(
             conn,
             task_id,
             board=board,
-            operation_name="codex_worker.recovery_get_task",
+            operation_name="coding_worker.recovery_get_task",
         )
     except Exception:
         return False
@@ -277,7 +277,7 @@ def _recover_completed_role_output(
             conn,
             task_id,
             board=board,
-            operation_name="codex_worker.recovery_confirm_get_task",
+            operation_name="coding_worker.recovery_confirm_get_task",
             run_id=task.current_run_id,
         )
     except Exception:
@@ -427,7 +427,7 @@ def _recorded_result_is_fresh_for_current_run(
             conn,
             task_id,
             board=board,
-            operation_name="codex_worker.recorded_result_get_task",
+            operation_name="coding_worker.recorded_result_get_task",
         )
         if task is None:
             return False

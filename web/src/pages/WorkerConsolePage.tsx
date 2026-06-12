@@ -303,7 +303,7 @@ export default function WorkerConsolePage() {
       <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,1fr)_390px]">
         <section className="flex min-h-[520px] min-w-0 flex-col overflow-hidden rounded-lg border border-current/20 bg-black/70">
           <div className="flex items-center justify-between border-b border-current/15 px-3 py-2 text-xs text-text-secondary">
-            <span>Codex/OpenCode backend activity (read-only)</span>
+            <span>Coding worker backend activity (read-only)</span>
             <span>{snapshot?.workspace.available ? snapshot.workspace.path : "workspace unavailable"}</span>
           </div>
           <div ref={hostRef} className="min-h-0 flex-1 p-2" />

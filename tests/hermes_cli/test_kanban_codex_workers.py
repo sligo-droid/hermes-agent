@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import os
 import subprocess
 import time
@@ -96,6 +97,18 @@ def test_check_rollup_summary_uses_latest_duplicate_check_run():
     assert status == "passed"
     assert total == 2
     assert failed == []
+
+
+def test_worker_retry_operation_names_are_backend_neutral():
+    from hermes_cli import kanban_codex_worker as worker
+
+    source = inspect.getsource(worker)
+
+    assert 'operation_name="coding_worker.initial_get_task"' in source
+    assert 'operation_name="coding_worker.recovery_get_task"' in source
+    assert 'operation_name="coding_worker.recovery_confirm_get_task"' in source
+    assert 'operation_name="coding_worker.recorded_result_get_task"' in source
+    assert 'operation_name="codex_worker.' not in source
 
 
 def test_run_gh_bridges_real_gh_config_dir_when_home_is_isolated(monkeypatch, tmp_path):

@@ -607,13 +607,13 @@ def test_get_task_with_transient_retry_recovers_immediate_read(monkeypatch, kanb
             conn,
             tid,
             board="default",
-            operation_name="codex_worker.recovery_get_task",
+            operation_name="coding_worker.recovery_get_task",
         )
 
     assert conn.failures == 1
     assert task is not None
     assert task.id == tid
-    assert "operation=codex_worker.recovery_get_task attempt=1/3 outcome=retrying error=disk I/O error" in caplog.text
+    assert "operation=coding_worker.recovery_get_task attempt=1/3 outcome=retrying error=disk I/O error" in caplog.text
 
 
 def _write_discord_worker_meta(board: str, *, worktree_path: str, default_workdir: str | None = None) -> None:

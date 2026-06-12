@@ -4125,7 +4125,7 @@ def _worker_console_intro(snapshot: dict[str, Any], log_path: Path, state_path: 
         f"workspace: {workspace.get('path') or '-'}",
         f"worker log: {log_path}",
         f"backend state: {state_path}",
-        "stream: readable Codex/OpenCode backend activity plus worker stdout/stderr",
+        "stream: readable coding worker backend activity plus worker stdout/stderr",
         "",
     ]
     return _worker_console_bytes("\n".join(lines))
@@ -4608,7 +4608,7 @@ def worker_console_operator_text(snapshot: dict[str, Any]) -> str:
     log_tail = snapshot.get("worker_log_tail")
     if log_tail:
         return "[worker log]\n" + _worker_console_redact(log_tail, max_chars=_WORKER_CONSOLE_OUTPUT_MAX_CHARS) + "\n"
-    return "[backend activity] waiting for Codex/OpenCode events\n"
+    return "[backend activity] waiting for coding worker backend events\n"
 
 
 def _worker_console_json_line(label: str, value: Any) -> bytes:
