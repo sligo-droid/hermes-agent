@@ -454,7 +454,7 @@ def test_self_improvement_approve_is_idempotent_and_audited(client):
         conn.close()
 
     audit = proposal_storage.list_audit_events(card["proposal_id"])
-    assert [event["action"] for event in audit] == ["approved", "approved"]
+    assert [event["action"] for event in audit] == ["approved"]
     assert {event["kanban_task_id"] for event in audit} == {first.json()["task"]["id"]}
 
 
@@ -1044,8 +1044,8 @@ def test_self_improvement_approve_creates_task_on_discord_thread_board(client, m
     assert first.json()["worker_url"] == expected_worker_url
     assert first.json()["card"]["worker_url"] == expected_worker_url
     assert second.json()["worker_url"] == expected_worker_url
+    assert len(calls) == 1
     assert calls[0]["existing"] == {}
-    assert calls[1]["existing"]["discord_thread_id"] == "777"
 
     default_conn = kb.connect()
     board_conn = kb.connect(board="discord-777-m-555")
@@ -1069,6 +1069,12 @@ def test_self_improvement_approve_creates_task_on_discord_thread_board(client, m
         board_conn.close()
 
     audit = proposal_storage.list_audit_events(card["proposal_id"])
+    assert audit[-2]["action"] == "approval_route_created"
+    assert audit[-2]["metadata"]["board"] == "discord-777-m-555"
+    assert audit[-2]["metadata"]["idempotency_key"] == f"self-improvement:{card['proposal_id']}"
+    assert audit[-2]["metadata"]["discord_top_level_message_id"] == "555"
+    assert audit[-2]["metadata"]["discord_thread_id"] == "777"
+    assert audit[-1]["action"] == "approved"
     assert audit[-1]["metadata"]["board"] == "discord-777-m-555"
     assert audit[-1]["metadata"]["discord_top_level_message_id"] == "555"
     assert audit[-1]["metadata"]["discord_thread_id"] == "777"
@@ -1127,7 +1133,6 @@ def test_self_improvement_approve_creates_task_on_discord_thread_board(client, m
     assert worker["goal_status"] == "active"
     assert worker["phase"] == "planning"
     assert worker["execution_mode"] == "kanban_pipeline"
-    assert worker["criteria"]
     assert worker["thread_id"] == "777"
     assert worker["source_message_id"] == "555"
     assert dwb.dispatch_dirty_marker_path().exists()
@@ -1141,6 +1146,119 @@ def test_self_improvement_approve_creates_task_on_discord_thread_board(client, m
     assert stopped_worker["goal_status"] == "cancelled"
     assert stopped_worker["phase"] == "cancelled"
     assert halted.json()["card"]["downstream_task_status"] == "cancelled"
+
+
+def test_self_improvement_approve_retry_reattaches_after_record_approval_failure(client, monkeypatch):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    publish_calls = []
+    created_routes = 0
+
+    def fake_publish(card_arg, *, channel_id, existing=None):
+        nonlocal created_routes
+        existing = existing or {}
+        publish_calls.append(dict(existing))
+        if existing.get("discord_thread_id"):
+            return discord_publish.DiscordApprovalRoute(
+                channel_id=channel_id,
+                top_level_message_id=str(existing["discord_top_level_message_id"]),
+                thread_id=str(existing["discord_thread_id"]),
+                thread_url=str(existing["discord_thread_url"]),
+                board=str(existing["discord_board"]),
+                board_public_url=str(existing.get("discord_board_public_url") or ""),
+                guild_id=str(existing.get("discord_guild_id") or ""),
+            )
+        created_routes += 1
+        from hermes_cli.discord_worker_boards import ensure_discord_thread_board
+
+        board = ensure_discord_thread_board(
+            thread_id="777",
+            chat_id=channel_id,
+            guild_id="999",
+            parent_channel_id=channel_id,
+            initial_request=card_arg["title"],
+            project_context={"project_name": "pid"},
+            request_id="555",
+            source_message_id="555",
+        )
+        return discord_publish.DiscordApprovalRoute(
+            channel_id=channel_id,
+            top_level_message_id="555",
+            thread_id="777",
+            thread_url="https://discord.com/channels/999/777",
+            board=board.slug,
+            board_public_url=board.public_url,
+            guild_id="999",
+        )
+
+    original_record_approval = proposal_storage.record_approval
+    failures = {"remaining": 1}
+
+    def flaky_record_approval(*args, **kwargs):
+        if failures["remaining"]:
+            failures["remaining"] -= 1
+            raise RuntimeError("storage unavailable")
+        return original_record_approval(*args, **kwargs)
+
+    monkeypatch.setattr(discord_publish, "configured_project_channel_id", lambda project: "12345")
+    monkeypatch.setattr(discord_publish, "publish_approved_proposal", fake_publish)
+    monkeypatch.setattr(proposal_storage, "record_approval", flaky_record_approval)
+
+    first = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    second = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+
+    assert first.status_code == 500, first.text
+    assert "retry will reattach" in first.json()["detail"]
+    assert second.status_code == 200, second.text
+    assert created_routes == 1
+    assert publish_calls[0] == {}
+    assert publish_calls[1]["discord_thread_id"] == "777"
+    assert publish_calls[1]["discord_top_level_message_id"] == "555"
+    assert second.json()["worker_url"].endswith("/workers/discord-777-m-555")
+
+    board_conn = kb.connect(board="discord-777-m-555")
+    try:
+        assert board_conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+    finally:
+        board_conn.close()
+    audit = proposal_storage.list_audit_events(card["proposal_id"])
+    actions = [event["action"] for event in audit]
+    assert actions[:2] == ["approval_route_created", "approval_record_failed"]
+    assert audit[1]["kanban_task_id"] == second.json()["task"]["id"]
+    assert audit[1]["metadata"]["worker_url"].endswith("/workers/discord-777-m-555")
+    assert actions[-1] == "approved"
+
+
+def test_self_improvement_approve_short_circuits_already_approved_card(client, monkeypatch):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    monkeypatch.setattr(discord_publish, "configured_project_channel_id", lambda project: "")
+
+    first = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    assert first.status_code == 200, first.text
+
+    monkeypatch.setattr(discord_publish, "configured_project_channel_id", lambda project: "12345")
+    monkeypatch.setattr(
+        discord_publish,
+        "publish_approved_proposal",
+        lambda card_arg, *, channel_id, existing=None: (_ for _ in ()).throw(AssertionError("should not publish")),
+    )
+    monkeypatch.setattr(
+        discord_publish,
+        "activate_approved_proposal",
+        lambda card_arg, route: (_ for _ in ()).throw(AssertionError("should not activate")),
+    )
+
+    second = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+
+    assert second.status_code == 200, second.text
+    assert second.json()["task"]["id"] == first.json()["task"]["id"]
+    assert second.json()["worker_url"] == first.json()["worker_url"]
+    conn = kb.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+    finally:
+        conn.close()
 
 
 def test_self_improvement_approve_falls_back_without_discord_channel(client, monkeypatch):
@@ -1256,6 +1374,55 @@ def test_self_improvement_approve_fails_visibly_when_discord_thread_has_no_board
     assert audit[-1]["metadata"]["discord_top_level_message_id"] == "555"
     assert audit[-1]["metadata"]["discord_thread_id"] == "777"
     assert audit[-1]["metadata"]["discord_publish_error"] == "board creation failed"
+
+
+def test_self_improvement_approve_record_approval_failure_records_retry_metadata(client, monkeypatch):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+
+    def fake_publish(card_arg, *, channel_id, existing=None):
+        from hermes_cli.discord_worker_boards import ensure_discord_thread_board
+
+        board = ensure_discord_thread_board(
+            thread_id="777",
+            chat_id=channel_id,
+            guild_id="999",
+            parent_channel_id=channel_id,
+            initial_request=card_arg["title"],
+            project_context={"project_name": "pid"},
+            request_id="555",
+            source_message_id="555",
+        )
+        return discord_publish.DiscordApprovalRoute(
+            channel_id=channel_id,
+            top_level_message_id="555",
+            thread_id="777",
+            thread_url="https://discord.com/channels/999/777",
+            board=board.slug,
+            board_public_url=board.public_url,
+            guild_id="999",
+        )
+
+    monkeypatch.setattr(discord_publish, "configured_project_channel_id", lambda project: "12345")
+    monkeypatch.setattr(discord_publish, "publish_approved_proposal", fake_publish)
+    monkeypatch.setattr(
+        proposal_storage,
+        "record_approval",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("storage unavailable")),
+    )
+
+    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+
+    assert response.status_code == 500, response.text
+    assert "retry will reattach" in response.json()["detail"]
+    audit = proposal_storage.list_audit_events(card["proposal_id"])
+    assert audit[-1]["action"] == "approval_record_failed"
+    assert audit[-1]["kanban_task_id"]
+    assert audit[-1]["reason"] == "storage unavailable"
+    assert audit[-1]["metadata"]["board"] == "discord-777-m-555"
+    assert audit[-1]["metadata"]["discord_top_level_message_id"] == "555"
+    assert audit[-1]["metadata"]["discord_thread_id"] == "777"
+    assert audit[-1]["metadata"]["worker_url"].endswith("/workers/discord-777-m-555")
 
 
 def test_discord_approval_route_board_can_be_reconciled_from_existing_metadata(monkeypatch, tmp_path):

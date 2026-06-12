@@ -178,7 +178,7 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
         "No gateway is running — the task will sit in 'ready' until you "
         "start it. Run:\n"
         "    hermes gateway start\n"
-        "The gateway hosts an embedded dispatcher (tick interval 60s by "
+        "The gateway hosts an embedded dispatcher (tick interval 5s by "
         "default); your task will be picked up on the next tick after "
         "the gateway comes up."
     )
@@ -649,8 +649,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "daemon",
         help="DEPRECATED — dispatcher now runs in the gateway. Use `hermes gateway start`.",
     )
-    p_daemon.add_argument("--interval", type=float, default=60.0,
-                          help="Seconds between dispatch ticks (default: 60)")
+    p_daemon.add_argument("--interval", type=float, default=5.0,
+                          help="Seconds between dispatch ticks (default: 5)")
     p_daemon.add_argument("--max", type=int, default=None,
                           help="Cap number of spawns per tick")
     p_daemon.add_argument("--failure-limit", type=int,
@@ -1289,7 +1289,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
     print("  hermes gateway start")
     print()
     print(
-        "The gateway hosts an embedded dispatcher that ticks every 60 seconds\n"
+        "The gateway hosts an embedded dispatcher that ticks every 5 seconds\n"
         "by default (config: kanban.dispatch_interval_seconds). Without a\n"
         "running gateway, tasks stay in 'ready' forever."
     )
@@ -2301,11 +2301,11 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             "    hermes gateway start       # starts the gateway + embedded dispatcher\n"
             "\n"
             "Ready tasks will be picked up on the next dispatcher tick\n"
-            "(default: every 60 seconds). Configure via config.yaml:\n"
+            "(default: every 5 seconds). Configure via config.yaml:\n"
             "\n"
             "    kanban:\n"
             "      dispatch_in_gateway: true      # default\n"
-            "      dispatch_interval_seconds: 60\n"
+            "      dispatch_interval_seconds: 5\n"
             "      failure_limit: 2              # consecutive non-success attempts before auto-block\n"
             "\n"
             "Running both the gateway AND this standalone daemon will\n"

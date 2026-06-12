@@ -1220,6 +1220,13 @@ def _approval_worker_url(task_id: str, discord_route: discord_publish.DiscordApp
     return _worker_url(task_id)
 
 
+def _approval_worker_url_from_metadata(task_id: str, metadata: dict[str, Any], board: str | None) -> str:
+    return _worker_board_url(
+        board=str(metadata.get("discord_board") or board or "") or None,
+        board_public_url=str(metadata.get("discord_board_public_url") or "") or None,
+    ) or _worker_url(task_id)
+
+
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
@@ -2003,8 +2010,30 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
         raise HTTPException(status_code=409, detail="rejected proposals cannot be approved")
 
     task_payload = card.get("kanban_task") if isinstance(card.get("kanban_task"), dict) else {}
-    channel_id = discord_publish.configured_project_channel_id(card.get("project"))
     existing_route = _latest_discord_approval_metadata(proposal_id)
+    existing_task_id = str(card.get("kanban_task_id") or "").strip()
+    if card.get("status") == "approved" and existing_task_id:
+        board = str(existing_route.get("discord_board") or existing_route.get("board") or task_payload.get("board") or "").strip()
+        if board == "default":
+            board = ""
+        task = None
+        try:
+            conn = _conn(board=_resolve_board(board or None))
+            try:
+                task = kanban_db.get_task(conn, existing_task_id)
+            finally:
+                conn.close()
+        except HTTPException:
+            task = None
+        enriched = _self_improvement_card_with_downstream(card)
+        worker_url = str((enriched or {}).get("worker_url") or "").strip() or _approval_worker_url_from_metadata(existing_task_id, existing_route, board or None)
+        return {
+            "card": enriched,
+            "task": _task_dict(task) if task else None,
+            "worker_url": worker_url,
+        }
+
+    channel_id = discord_publish.configured_project_channel_id(card.get("project"))
     discord_route = (
         discord_publish.publish_approved_proposal(
             card,
@@ -2035,6 +2064,17 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
             detail=f"Discord worker board failed: {discord_route.error or 'board was not created'}",
         )
     if discord_route and discord_route.board:
+        route_metadata = {
+            "idempotency_key": idempotency_key,
+            "board": discord_route.board or "",
+            **discord_route.metadata(),
+        }
+        proposal_storage.record_audit_event(
+            proposal_id,
+            action="approval_route_created",
+            actor=_proposal_actor(),
+            metadata=route_metadata,
+        )
         discord_route = discord_publish.activate_approved_proposal(card, discord_route)
         board = discord_route.board if discord_route and discord_route.board else _resolve_board(str(task_payload.get("board") or "") or None)
         if discord_route and discord_route.error:
@@ -2087,18 +2127,36 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
         board = discord_route.board
 
     worker_url = _approval_worker_url(task_id, discord_route, board)
-    approved = proposal_storage.record_approval(
-        proposal_id,
-        kanban_task_id=task_id,
-        worker_url=worker_url,
-        actor=_proposal_actor(),
-        metadata={
-            "idempotency_key": idempotency_key,
-            "board": board or "default",
-            **(discord_route.metadata() if discord_route else {}),
-            **({"discord_channel_id": channel_id, "discord_publish": "unavailable"} if channel_id and not discord_route else {}),
-        },
-    )
+    approval_metadata = {
+        "idempotency_key": idempotency_key,
+        "board": board or "default",
+        **(discord_route.metadata() if discord_route else {}),
+        **({"discord_channel_id": channel_id, "discord_publish": "unavailable"} if channel_id and not discord_route else {}),
+    }
+    try:
+        approved = proposal_storage.record_approval(
+            proposal_id,
+            kanban_task_id=task_id,
+            worker_url=worker_url,
+            actor=_proposal_actor(),
+            metadata=approval_metadata,
+        )
+    except Exception as exc:
+        try:
+            proposal_storage.record_audit_event(
+                proposal_id,
+                action="approval_record_failed",
+                actor=_proposal_actor(),
+                kanban_task_id=task_id,
+                reason=str(exc),
+                metadata={**approval_metadata, "worker_url": worker_url},
+            )
+        except Exception:
+            log.exception("failed to record approval_record_failed audit event for proposal %s", proposal_id)
+        raise HTTPException(
+            status_code=500,
+            detail="Approval route was created but final approval persistence failed; retry will reattach to the existing route.",
+        ) from exc
     command_center.invalidate_snapshot_cache()
     return {"card": _self_improvement_card_with_downstream(approved), "task": _task_dict(task) if task else None, "worker_url": worker_url}
 
@@ -2352,6 +2410,9 @@ def _repair_card_worker_url(card: dict[str, Any]) -> None:
         card["worker_url"] = board_url
 
 
+_DISCORD_APPROVAL_METADATA_ACTIONS = {"approved", "approval_route_created", "approval_discord_worker_failed"}
+
+
 def _latest_discord_approval_metadata(proposal_id: str) -> dict[str, Any]:
     try:
         events = proposal_storage.list_audit_events(proposal_id)
@@ -2359,7 +2420,7 @@ def _latest_discord_approval_metadata(proposal_id: str) -> dict[str, Any]:
         return {}
     merged: dict[str, Any] = {}
     for event in events:
-        if event.get("action") != "approved":
+        if event.get("action") not in _DISCORD_APPROVAL_METADATA_ACTIONS:
             continue
         metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
         for key, value in metadata.items():
