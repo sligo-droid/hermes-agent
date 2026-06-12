@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
@@ -149,6 +150,59 @@ def test_done_metadata_update_after_completion_notice_does_not_rearm(monkeypatch
     assert "terminal_completion_message_pending" not in worker
     assert worker["terminal_completion_message_id"] == "done-message"
     assert dwb.board_has_pending_terminal_completion_notice(board.slug) is False
+
+
+def test_worker_metadata_mutator_rereads_under_lock_preserves_stale_updates(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id=_discord_snowflake_at(time.time()), goal="Serialize flags")
+
+    original_lock = dwb._board_metadata_lock
+    injected = False
+
+    @contextlib.contextmanager
+    def interleaving_lock(*args, **kwargs):
+        nonlocal injected
+        with original_lock(*args, **kwargs):
+            if not injected:
+                injected = True
+                metadata = kanban_db.read_board_metadata(board.slug)
+                metadata["discord_worker"]["terminal_reaction_sync_pending"] = True
+                dwb._write_metadata(board.slug, metadata)
+            yield
+
+    monkeypatch.setattr(dwb, "_board_metadata_lock", interleaving_lock)
+
+    dwb._update_worker_meta(board.slug, {"terminal_summary_sync_pending": True})
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["terminal_reaction_sync_pending"] is True
+    assert worker["terminal_summary_sync_pending"] is True
+
+
+def test_worker_metadata_lock_timeout_skips_stale_write(monkeypatch, tmp_path, caplog):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id=_discord_snowflake_at(time.time()), goal="Timeout")
+    original_worker = dict(kanban_db.read_board_metadata(board.slug)["discord_worker"])
+
+    @contextlib.contextmanager
+    def timeout_lock(*args, **kwargs):
+        raise dwb.BoardMetadataLockTimeout("busy")
+        yield
+
+    monkeypatch.setattr(dwb, "_board_metadata_lock", timeout_lock)
+
+    with caplog.at_level("WARNING", logger="hermes_cli.discord_worker_boards"):
+        dwb._update_worker_meta(board.slug, {"terminal_reaction_sync_pending": True})
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker == original_worker
+    assert "Timed out acquiring Discord worker metadata lock" in caplog.text
 
 
 def test_old_discord_worker_boards_are_not_executable(monkeypatch, tmp_path):
