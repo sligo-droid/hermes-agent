@@ -420,25 +420,7 @@ def _project_mapping_for_channel(channel_id: object) -> dict[str, Any]:
 
 
 def _acceptance_criteria(card: dict[str, Any]) -> list[str]:
-    criteria = _explicit_acceptance_criteria(card)
-    if criteria:
-        return criteria
-
-    parts: list[str] = []
-    task = card.get("kanban_task") if isinstance(card.get("kanban_task"), dict) else {}
-    for value in (
-        task.get("body"),
-        card.get("body"),
-        card.get("summary"),
-        card.get("rationale"),
-    ):
-        text = str(value or "").strip()
-        if text:
-            parts.append(text)
-    body = "\n\n".join(parts).strip()
-    if not body:
-        return [_initial_request(card)]
-    return [body]
+    return _explicit_acceptance_criteria(card)
 
 
 def _explicit_acceptance_criteria(card: dict[str, Any]) -> list[str]:

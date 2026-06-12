@@ -207,6 +207,10 @@ def test_self_improvement_activation_uses_planner_flow_with_board_criteria(monke
         "kanban_task": {
             "title": "Route approved proposal through planner",
             "body": "Implement the approval activation so the Discord worker board starts in planning and produces dev tickets.",
+            "acceptance_criteria": [
+                "Approved proposal starts in planning and creates dev tickets.",
+                "Reviewer loop runs before completion.",
+            ],
         },
     }
     route = discord_publish.DiscordApprovalRoute(
@@ -238,9 +242,10 @@ def test_self_improvement_activation_uses_planner_flow_with_board_criteria(monke
     assert worker["goal_status"] == "active"
     assert worker["phase"] == "planning"
     assert worker["execution_mode"] == "kanban_pipeline"
-    assert worker["criteria"]
-    assert "starts in planning" in worker["criteria"][0]
-    assert "reviewer loop" in worker["criteria"][0]
+    assert worker["criteria"] == [
+        "Approved proposal starts in planning and creates dev tickets.",
+        "Reviewer loop runs before completion.",
+    ]
     assert worker["latest_planner_task_id"]
 
     conn = kanban_db.connect(board=activated.board)
@@ -257,11 +262,29 @@ def test_self_improvement_activation_uses_planner_flow_with_board_criteria(monke
     payload = json.loads(task.body or "{}")
     assert payload["role"] == "planner"
     assert payload["acceptance_criteria"] == worker["criteria"]
-    assert "starts in planning" in payload["acceptance_criteria"][0]
+    assert payload["acceptance_criteria"] == [
+        "Approved proposal starts in planning and creates dev tickets.",
+        "Reviewer loop runs before completion.",
+    ]
     instructions = "\n".join(payload["planner_instructions"])
     assert "ticket-specific acceptance criteria" in instructions
     assert "Definition of Done, Success means, and Stop when" in instructions
     assert "Do not copy the board-level acceptance_criteria wholesale" in instructions
+
+
+def test_self_improvement_acceptance_criteria_does_not_fallback_to_task_brief():
+    card = {
+        "title": "Improve worker board approvals",
+        "summary": "Approved self-improvement proposal should use the full worker flow.",
+        "body": "Users can approve a proposal and see planner-created tickets move through review.",
+        "rationale": "Direct dev execution skipped planning and reviewer loop expectations.",
+        "kanban_task": {
+            "title": "Route approved proposal through planner",
+            "body": "Implement the approval activation so the Discord worker board starts in planning and produces dev tickets.",
+        },
+    }
+
+    assert discord_publish._acceptance_criteria(card) == []
 
 
 def test_valid_pid_proposal_run_is_accepted_and_gets_stable_id():
