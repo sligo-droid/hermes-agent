@@ -590,7 +590,7 @@ def create_board(
     return meta
 
 
-def list_boards(*, include_archived: bool = True) -> list[dict]:
+def list_boards(*, include_archived: bool = False) -> list[dict]:
     """Enumerate all boards that exist on disk.
 
     Always includes ``default`` (even when the ``boards/default/``
@@ -4414,6 +4414,7 @@ def reclaim_task(
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, worker_unit=row["worker_unit"], signal_fn=signal_fn,
+        force_signal=signal_fn is not None,
     )
     with write_txn(conn):
         cur = conn.execute(
@@ -6141,6 +6142,7 @@ def _terminate_reclaimed_worker(
     *,
     worker_unit: Optional[str] = None,
     signal_fn=None,
+    force_signal: bool = False,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths."""
     import signal
@@ -6181,7 +6183,7 @@ def _terminate_reclaimed_worker(
             return _process_group_alive(pgid)
         return _pid_alive(pid)
 
-    if not _target_alive():
+    if not force_signal and not _target_alive():
         info["terminated"] = True
         return info
     if kill is None:
@@ -6244,9 +6246,6 @@ def _stop_reclaimed_worker_unit(unit: str) -> dict[str, Any]:
         "unit_stopped": False,
     }
     if not unit_ref:
-        return info
-    if not _systemd_unit_status(unit_ref).active:
-        info["unit_stopped"] = True
         return info
     systemctl = shutil.which("systemctl") or "systemctl"
     info["unit_stop_attempted"] = True

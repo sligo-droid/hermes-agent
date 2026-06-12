@@ -1082,15 +1082,12 @@ def _run_opencode(
     try:
         if role == ROLE_PLANNER:
             cfg = load_opencode_config()
-            reasoning_level = _scheduled_opencode_reasoning(
-                cfg["complex_plan_reasoning_level"]
-            )
             result = run_opencode_single_pass(
                 prompt,
                 workspace,
                 timeout=_role_timeout(role),
                 agent=cfg["plan_agent"],
-                reasoning_level=reasoning_level,
+                reasoning_level=cfg["complex_plan_reasoning_level"],
                 title=f"kanban {task_id}",
                 env=_backend_child_env(runtime_env),
                 on_event=on_event,
