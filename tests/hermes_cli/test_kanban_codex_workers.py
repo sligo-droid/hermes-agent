@@ -3367,6 +3367,74 @@ def test_pr_policy_defaults_auto_but_explicit_do_not_merge_sets_never(monkeypatc
     assert never_meta["merge_policy"] == "never"
 
 
+def test_pr_policy_explicit_local_only_disables_pr_lifecycle(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="local-only-policy",
+        goal=(
+            "Dev work stops at a local verified branch state; it does not open "
+            "pull requests, push remote branches, wait on remote checks, or merge."
+        ),
+    )
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert meta["pr_open_policy"] == "never"
+    assert meta["merge_policy"] == "never"
+
+
+def test_ensure_pr_honors_local_only_criteria_over_stale_pr_metadata(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="local-only-stale-metadata",
+        goal="Implement and verify locally.",
+        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
+    )
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "criteria": [
+                {
+                    "text": (
+                        "Dev work stops at a local verified branch state; it does not open "
+                        "pull requests, push remote branches, wait on remote checks, or merge."
+                    ),
+                    "active": True,
+                }
+            ],
+            "pr_open_policy": "after_review_approval",
+            "merge_policy": "auto",
+        },
+    )
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr(board.slug, str(workspace)) is True
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert meta["pr_open_policy"] == "never"
+    assert meta["merge_policy"] == "never"
+    assert meta["pr_state"] == "not_needed"
+    assert meta["pr_checks_status"] == "passed"
+    assert meta["pr_blocker"] == ""
+    assert meta["pr_merge_skipped_reason"] == "pr_open_policy_never"
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd in calls)
+
+
 def test_ensure_pr_never_policy_opens_without_merging(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

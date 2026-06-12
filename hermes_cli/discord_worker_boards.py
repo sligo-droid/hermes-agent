@@ -69,10 +69,12 @@ DEFAULT_REVIEW_LOOP_LIMIT = 5
 FOREMAN_REVIEW_LOOP_LIMIT = 3
 BOARD_RUN_SUMMARY_SCHEMA_VERSION = 3
 PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL = "after_review_approval"
+PR_OPEN_POLICY_NEVER = "never"
 MERGE_POLICY_AUTO = "auto"
 MERGE_POLICY_MANUAL = "manual"
 MERGE_POLICY_NEVER = "never"
 VALID_MERGE_POLICIES = frozenset({MERGE_POLICY_AUTO, MERGE_POLICY_MANUAL, MERGE_POLICY_NEVER})
+VALID_PR_OPEN_POLICIES = frozenset({PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL, PR_OPEN_POLICY_NEVER})
 _DISCORD_MESSAGE_URL_RE = re.compile(
     r"https?://(?:canary\.|ptb\.)?discord(?:app)?\.com/channels/"
     r"(?P<guild>\d+)/(?P<channel>\d+)/(?P<message>\d+)"
@@ -114,15 +116,77 @@ def pr_policy_for_request(request: object) -> dict[str, str]:
     review-only / do-not-merge wording overrides that default.
     """
     text = re.sub(r"\s+", " ", str(request or "")).strip().casefold()
+    pr_open_policy = PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL
     merge_policy = MERGE_POLICY_AUTO
-    if _request_forbids_merge(text):
+    if _request_forbids_pr_lifecycle(text):
+        pr_open_policy = PR_OPEN_POLICY_NEVER
+        merge_policy = MERGE_POLICY_NEVER
+    elif _request_forbids_merge(text):
         merge_policy = MERGE_POLICY_NEVER
     elif _request_requires_manual_merge(text):
         merge_policy = MERGE_POLICY_MANUAL
     return {
-        "pr_open_policy": PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL,
+        "pr_open_policy": pr_open_policy,
         "merge_policy": merge_policy,
     }
+
+
+def effective_pr_policy_for_worker(worker: dict[str, Any]) -> dict[str, str]:
+    """Resolve PR policy from durable board intent, not only stale metadata."""
+
+    text_parts: list[str] = []
+    for key in ("root_goal", "initial_request", "latest_planner_request"):
+        value = str(worker.get(key) or "").strip()
+        if value:
+            text_parts.append(value)
+    for item in worker.get("criteria") or []:
+        if isinstance(item, dict):
+            if item.get("active", True):
+                value = str(item.get("text") or "").strip()
+                if value:
+                    text_parts.append(value)
+        else:
+            value = str(item or "").strip()
+            if value:
+                text_parts.append(value)
+    for item in worker.get("requirements") or []:
+        if isinstance(item, dict):
+            value = str(item.get("text") or "").strip()
+            if value:
+                text_parts.append(value)
+
+    inferred = pr_policy_for_request("\n".join(text_parts))
+    if inferred["pr_open_policy"] == PR_OPEN_POLICY_NEVER:
+        return inferred
+
+    pr_open_policy = str(worker.get("pr_open_policy") or PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL).strip().lower()
+    if pr_open_policy not in VALID_PR_OPEN_POLICIES:
+        pr_open_policy = PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL
+    merge_policy = str(worker.get("merge_policy") or inferred["merge_policy"]).strip().lower()
+    if merge_policy not in VALID_MERGE_POLICIES:
+        merge_policy = inferred["merge_policy"]
+    if inferred["merge_policy"] == MERGE_POLICY_NEVER:
+        merge_policy = MERGE_POLICY_NEVER
+    elif inferred["merge_policy"] == MERGE_POLICY_MANUAL and merge_policy == MERGE_POLICY_AUTO:
+        merge_policy = MERGE_POLICY_MANUAL
+    return {"pr_open_policy": pr_open_policy, "merge_policy": merge_policy}
+
+
+def _request_forbids_pr_lifecycle(text: str) -> bool:
+    if not text:
+        return False
+    patterns = (
+        r"\bdo\s+not\s+open\s+(?:pull\s+requests?|prs?)\b",
+        r"\bdon['’]?t\s+open\s+(?:pull\s+requests?|prs?)\b",
+        r"\bwithout\s+opening\s+(?:a\s+)?(?:pull\s+request|pr)\b",
+        r"\bno\s+(?:pull\s+requests?|prs?)\b",
+        r"\bno\s+pr\s+lifecycle\b",
+        r"\blocal[-\s]?only\b.{0,160}\b(?:no|without|does\s+not)\b.{0,80}\b(?:pull\s+requests?|prs?|push|merge|remote\s+checks?)\b",
+        r"\blocal\s+verified\b.{0,160}\b(?:no|without|does\s+not)\b.{0,80}\b(?:pull\s+requests?|prs?|push|merge|remote\s+checks?)\b",
+        r"\bdev\s+work\s+stops\s+at\s+(?:a\s+)?local\s+verified\s+branch\s+state\b",
+        r"\bdoes\s+not\s+open\s+pull\s+requests?\b.{0,120}\bpush\b.{0,120}\bmerge\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
 
 
 def _request_forbids_merge(text: str) -> bool:
@@ -5881,6 +5945,15 @@ def _recover_blocked_approved_reviewer_finalizer(
     return None
 
 
+def _active_pr_finalizer_recovery_task(tasks: list[Any]) -> Optional[Any]:
+    for task in tasks:
+        if str(getattr(task, "created_by", "") or "") != "discord-pr-finalizer-recovery":
+            continue
+        if str(getattr(task, "status", "") or "") in {"triage", "todo", "ready", "running", "blocked"}:
+            return task
+    return None
+
+
 def reconcile_board(board: str) -> Optional[str]:
     """Advance deterministic Discord worker board phases.
 
@@ -5904,6 +5977,10 @@ def reconcile_board(board: str) -> Optional[str]:
             for t in tasks
             if t.status in {"triage", "todo", "ready", "running", "blocked"}
         }
+        if goal_status == "blocked" and _active_pr_finalizer_recovery_task(tasks) is not None:
+            blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "approved reviewer PR finalization failed").strip()
+            _reactivate_after_pr_finalizer_recovery(board, worker, blocker)
+            return "approved_reviewer_finalizer_recovery_active"
         if ROLE_PLANNER in active_roles or ROLE_DEV in active_roles or ROLE_REVIEWER in active_roles:
             return None
         if goal_status == "blocked":
