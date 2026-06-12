@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-12 19:20 UTC
+Last updated: 2026-06-12 20:05 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -39,6 +39,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Hardened Discord worker PR finalization for blocked boards: explicit local-only/no-PR contracts now skip PR creation/merge cleanly, and blocked approved-reviewer boards with existing PR-conflict recovery tasks are reactivated as actionable dev work instead of staying terminally blocked.
 - [x] Hardened Kanban worker liveness checks to verify worker process identity with PID start ticks instead of bare PID liveness, preventing recycled unrelated PIDs from extending dead worker claims until the heartbeat backstop.
 - [x] Hardened Command Center page state so project switches clear bulk selections, overlapping snapshot refreshes cannot apply stale state, and annotation submission uses the submitted draft after async work.
+- [x] Serialized Discord worker-board `board.json` metadata mutations behind a per-board sidecar lock so concurrent gateway, dashboard, CLI, worker, and foreman writers do not drop one-shot terminal sync flags.
 
 ## In Progress
 
