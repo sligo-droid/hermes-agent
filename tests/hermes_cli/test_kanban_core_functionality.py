@@ -25,6 +25,12 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban import run_slash
 
 
+def test_default_config_kanban_dispatch_interval_is_five_seconds():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["kanban"]["dispatch_interval_seconds"] == 5
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
