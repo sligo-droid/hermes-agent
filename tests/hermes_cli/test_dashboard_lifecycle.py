@@ -89,6 +89,21 @@ def test_ensure_dashboard_port_available_allows_free_port():
     lifecycle.ensure_dashboard_port_available("127.0.0.1", port)
 
 
+def test_ensure_dashboard_port_available_allows_fast_reuseaddr_rebind():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+            client.connect(("127.0.0.1", port))
+            conn, _addr = listener.accept()
+            conn.close()
+
+    lifecycle.ensure_dashboard_port_available("127.0.0.1", port)
+
+
 def test_scan_dashboard_launches_reads_argv_and_cwd_from_proc(monkeypatch):
     monkeypatch.setattr(lifecycle.os, "getpid", lambda: 999)
     monkeypatch.setattr(
