@@ -280,14 +280,28 @@ def get_subprocess_home() -> str | None:
     return None
 
 
+def _process_user_home() -> Path | None:
+    """Return the OS account home independent of a subprocess HOME override."""
+    try:
+        import pwd
+
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except Exception:
+        home = ""
+    home = str(home or "").strip()
+    if not home:
+        return None
+    return Path(home)
+
+
 def get_github_cli_config_dir(env: dict | None = None) -> str | None:
     """Return a ``GH_CONFIG_DIR`` value when an authenticated gh config exists.
 
     Hermes terminal subprocesses may rewrite ``HOME`` to ``HERMES_HOME/home``
     for profile isolation.  GitHub CLI auth, however, commonly lives in the
     real user's ``~/.config/gh``.  Prefer an explicit ``GH_CONFIG_DIR`` or an
-    already-authenticated child ``HOME`` first, then fall back to the Python
-    process user's gh config.
+    already-authenticated child ``HOME`` first, then fall back to the OS account
+    user's gh config even when ``Path.home()`` has been redirected by ``HOME``.
     """
     source_env = os.environ if env is None else env
 
@@ -303,6 +317,10 @@ def get_github_cli_config_dir(env: dict | None = None) -> str | None:
     child_home = str(source_env.get("HOME", "") or "").strip()
     if child_home:
         candidates.append(Path(child_home).expanduser() / ".config" / "gh")
+
+    process_home = _process_user_home()
+    if process_home is not None:
+        candidates.append(process_home / ".config" / "gh")
 
     candidates.append(Path.home() / ".config" / "gh")
 
