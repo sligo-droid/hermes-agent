@@ -41,6 +41,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Made self-improvement proposal approval idempotent across Discord partial failures: route breadcrumbs are recorded before worker-board activation, retries can reuse existing Discord route metadata, already-approved cards short-circuit safely, and final approval persistence failures leave an audit breadcrumb telling operators that retry will reattach.
 - [x] Hardened Command Center page state so project switches clear bulk selections, overlapping snapshot refreshes cannot apply stale state, and annotation submission uses the submitted draft after async work.
 - [x] Reduced Command Center snapshot read cost with batched annotation enrichment, short in-process snapshot caching with mutation invalidation, and archived-board metadata caching keyed by archive directory mtime.
+- [x] Serialized Discord worker-board `board.json` metadata mutations behind a per-board sidecar lock so concurrent gateway, dashboard, CLI, worker, and foreman writers do not drop one-shot terminal sync flags.
 - [x] Reduced the default Kanban dispatcher tick from 10 seconds to 5 seconds and corrected stale CLI guidance that still claimed the embedded gateway dispatcher ticked every 60 seconds.
 
 ## In Progress

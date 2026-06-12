@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -61,6 +62,48 @@ def test_record_dashboard_runtime_makes_python_source_argv_restartable(tmp_path)
     ]
 
 
+def test_ensure_dashboard_port_available_reports_service_recovery_hint():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        port = sock.getsockname()[1]
+
+        try:
+            lifecycle.ensure_dashboard_port_available("127.0.0.1", port)
+        except lifecycle.DashboardPortInUse as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("expected occupied dashboard port to fail")
+
+    assert f"127.0.0.1:{port}" in message
+    assert "already in use" in message
+    assert "hermes dashboard --stop" in message
+    assert "systemctl --user reset-failed hermes-dashboard.service" in message
+
+
+def test_ensure_dashboard_port_available_allows_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+
+    lifecycle.ensure_dashboard_port_available("127.0.0.1", port)
+
+
+def test_ensure_dashboard_port_available_allows_fast_reuseaddr_rebind():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+            client.connect(("127.0.0.1", port))
+            conn, _addr = listener.accept()
+            conn.close()
+
+    lifecycle.ensure_dashboard_port_available("127.0.0.1", port)
+
+
 def test_scan_dashboard_launches_reads_argv_and_cwd_from_proc(monkeypatch):
     monkeypatch.setattr(lifecycle.os, "getpid", lambda: 999)
     monkeypatch.setattr(
@@ -90,6 +133,33 @@ def test_scan_dashboard_launches_reads_argv_and_cwd_from_proc(monkeypatch):
     assert launches[0].pid == 123
     assert launches[0].argv == ["python", "-m", "hermes_cli.main", "dashboard"]
     assert launches[0].cwd == "/srv/hermes"
+
+
+def test_scan_dashboard_launches_ignores_shell_wrappers_that_mention_dashboard(monkeypatch):
+    monkeypatch.setattr(lifecycle.os, "getpid", lambda: 999)
+    monkeypatch.setattr(
+        lifecycle.subprocess,
+        "run",
+        lambda *args, **kwargs: MagicMock(
+            returncode=0,
+            stdout=(
+                "  123 /usr/bin/bash -c python -m hermes_cli.main dashboard --stop\n"
+                "  456 python /home/droid/hermes/hermes_cli/main.py dashboard --host 127.0.0.1\n"
+            ),
+            stderr="",
+        ),
+    )
+    proc_argv = {
+        123: ["/usr/bin/bash", "-c", "python -m hermes_cli.main dashboard --stop"],
+        456: ["python", "/home/droid/hermes/hermes_cli/main.py", "dashboard"],
+    }
+    monkeypatch.setattr(lifecycle, "_read_proc_argv", lambda pid: proc_argv[pid])
+    monkeypatch.setattr(lifecycle, "_read_proc_cwd", lambda pid: "/srv/hermes")
+
+    launches = lifecycle._scan_dashboard_launches()
+
+    assert [launch.pid for launch in launches] == [456]
+
 
 
 def test_runtime_launch_ignores_stale_pid(monkeypatch):

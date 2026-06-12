@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -35,12 +37,39 @@ class DashboardLaunch:
     source: str
 
 
+class DashboardPortInUse(RuntimeError):
+    """Raised when the requested dashboard listener is already occupied."""
+
+
 def dashboard_runtime_path() -> Path:
     return get_hermes_home() / _RUNTIME_DIRNAME / _RUNTIME_FILENAME
 
 
 def dashboard_log_path() -> Path:
     return get_hermes_home() / "logs" / _LOG_FILENAME
+
+
+def dashboard_port_in_use_message(host: str, port: int) -> str:
+    return (
+        f"Dashboard port {host}:{port} is already in use. "
+        "If hermes-dashboard.service is crash-looping because an unmanaged "
+        "dashboard owns the port, run: hermes dashboard --stop && "
+        "systemctl --user reset-failed hermes-dashboard.service && "
+        "systemctl --user restart hermes-dashboard.service"
+    )
+
+
+def ensure_dashboard_port_available(host: str, port: int) -> None:
+    """Fail before uvicorn when the requested dashboard bind is unavailable."""
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            raise DashboardPortInUse(dashboard_port_in_use_message(host, port)) from exc
+        raise
 
 
 def _restartable_argv(argv: list[str]) -> list[str]:
@@ -55,6 +84,37 @@ def _restartable_argv(argv: list[str]) -> list[str]:
 
 def _command_matches_dashboard(command: str) -> bool:
     return any(pattern in command for pattern in _DASHBOARD_PATTERNS)
+
+
+def _argv_matches_dashboard(argv: list[str]) -> bool:
+    """Return true only for a real dashboard process argv.
+
+    Process-table scans can see wrapper shells whose ``bash -c`` payload
+    mentions ``hermes dashboard --stop``. Matching only the command string can
+    make lifecycle commands terminate their own wrapper instead of just the
+    dashboard server. Keep the broad string match as a cheap prefilter, then
+    validate the actual argv shape before returning a launch.
+    """
+    if not argv:
+        return False
+
+    def _name(part: str) -> str:
+        return Path(part).name.lower()
+
+    first = _name(argv[0])
+    if first in {"hermes", "hermes.exe", "hermes.cmd", "hermes.bat"}:
+        return len(argv) >= 2 and argv[1] == "dashboard"
+
+    if "python" in first or first in {"py", "py.exe"}:
+        if len(argv) >= 4 and argv[1] == "-m" and argv[2] == "hermes_cli.main":
+            return argv[3] == "dashboard"
+        if len(argv) >= 3 and _name(argv[1]) == "main.py":
+            return argv[2] == "dashboard"
+
+    if first == "main.py":
+        return len(argv) >= 2 and argv[1] == "dashboard"
+
+    return False
 
 
 def _read_proc_argv(pid: int) -> list[str] | None:
@@ -120,6 +180,8 @@ def _scan_dashboard_launches() -> list[DashboardLaunch]:
                     if pid == self_pid or not _command_matches_dashboard(current_cmd):
                         continue
                     argv = shlex.split(current_cmd, posix=False)
+                    if not _argv_matches_dashboard(argv):
+                        continue
                     launches.append(
                         DashboardLaunch(
                             pid=pid,
@@ -158,6 +220,8 @@ def _scan_dashboard_launches() -> list[DashboardLaunch]:
                     argv = shlex.split(command)
                 except ValueError:
                     argv = command.split()
+            if not _argv_matches_dashboard(argv):
+                continue
             launches.append(
                 DashboardLaunch(
                     pid=pid,

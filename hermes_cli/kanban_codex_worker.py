@@ -1701,8 +1701,7 @@ def _persist_requirements(
 ) -> None:
     if not board:
         return
-    from hermes_cli.discord_worker_boards import DISCORD_WORKER_META_KEY
-    from utils import atomic_json_write
+    from hermes_cli.discord_worker_boards import _update_worker_meta
 
     raw_to_task = {
         int(spec["raw_index"]): created[idx]
@@ -1719,14 +1718,9 @@ def _persist_requirements(
                 and int(spec["raw_index"]) in raw_to_task
             ]
         req["owner_task_ids"] = owner_ids
-    metadata = kanban_db.read_board_metadata(board)
-    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
     # Planner output is authoritative for the current planning pass. Clear stale
     # requirements when an older/auxiliary planner omits the optional field.
-    worker["requirements"] = requirements
-    metadata[DISCORD_WORKER_META_KEY] = worker
-    metadata.pop("db_path", None)
-    atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
+    _update_worker_meta(board, {"requirements": requirements})
 
 
 def _create_planned_dev_tasks(
@@ -2291,7 +2285,7 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
         return True
     from hermes_cli.discord_worker_boards import DISCORD_WORKER_META_KEY
     from hermes_cli.discord_worker_boards import effective_pr_policy_for_worker
-    from utils import atomic_json_write
+    from hermes_cli.discord_worker_boards import _update_worker_meta
 
     metadata = kanban_db.read_board_metadata(board)
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
@@ -2367,9 +2361,35 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
         worker.setdefault("pr_checks_status", "not checked")
         worker.setdefault("pr_merge_state", "unknown")
         worker["pr_blocker"] = _pr_blocker(worker)
-    metadata[DISCORD_WORKER_META_KEY] = worker
-    metadata.pop("db_path", None)
-    atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
+    _update_worker_meta(
+        board,
+        {
+            key: worker.get(key)
+            for key in (
+                "pr_open_policy",
+                "merge_policy",
+                "pr_skipped_no_changes",
+                "pr_state",
+                "pr_checks_status",
+                "pr_checks_total",
+                "pr_checks_failed",
+                "pr_merge_state",
+                "pr_mergeable",
+                "pr_merge_skipped",
+                "pr_merge_skipped_reason",
+                "pr_blocker",
+                "pr_error",
+                "pr_url",
+                "pr_number",
+                "pr_status_error",
+                "pr_merged_at",
+                "pr_merge_commit",
+                "pr_is_draft",
+                "pr_review_decision",
+            )
+            if key in worker
+        },
+    )
     if worker.get("pr_skipped_no_changes"):
         return not bool(worker.get("pr_error"))
     if policy == MERGE_POLICY_AUTO:
@@ -2380,11 +2400,8 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
 def _merge_criteria(board: Optional[str], criteria: list[str]) -> None:
     if not board or not criteria:
         return
-    from hermes_cli.discord_worker_boards import DISCORD_WORKER_META_KEY
-    from utils import atomic_json_write
+    from hermes_cli.discord_worker_boards import _update_worker_meta
 
-    metadata = kanban_db.read_board_metadata(board)
-    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
     canonical: list[dict[str, Any]] = []
     seen: set[str] = set()
     for text in criteria:
@@ -2396,35 +2413,22 @@ def _merge_criteria(board: Optional[str], criteria: list[str]) -> None:
         seen.add(key)
     if not canonical:
         return
-    worker["criteria"] = canonical
-    worker["criteria_source"] = "planner"
-    metadata[DISCORD_WORKER_META_KEY] = worker
-    path = kanban_db.board_metadata_path(board)
-    metadata.pop("db_path", None)
-    atomic_json_write(path, metadata, indent=2)
+    _update_worker_meta(board, {"criteria": canonical, "criteria_source": "planner"})
 
 
 def _update_phase(board: Optional[str], phase: str, *, goal_status: str) -> None:
     if not board:
         return
-    from hermes_cli.discord_worker_boards import DISCORD_WORKER_META_KEY, mark_completion_notice_pending_on_done_transition
-    from utils import atomic_json_write
+    from hermes_cli.discord_worker_boards import _read_worker_meta, _update_worker_meta
 
-    metadata = kanban_db.read_board_metadata(board)
-    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
-    previous = dict(worker)
+    worker = _read_worker_meta(board)
     if worker.get("cancelled") or worker.get("goal_status") == "cancelled":
         return
-    worker["phase"] = phase
-    worker["goal_status"] = goal_status
-    worker["updated_at"] = int(time.time())
+    updates: dict[str, Any] = {"phase": phase, "goal_status": goal_status, "updated_at": int(time.time())}
     if goal_status in {"done", "blocked"}:
-        worker["terminal_reaction_sync_pending"] = True
-        worker["terminal_summary_sync_pending"] = True
-    mark_completion_notice_pending_on_done_transition(worker, previous)
-    metadata[DISCORD_WORKER_META_KEY] = worker
-    metadata.pop("db_path", None)
-    atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
+        updates["terminal_reaction_sync_pending"] = True
+        updates["terminal_summary_sync_pending"] = True
+    _update_worker_meta(board, updates)
     if goal_status in {"done", "blocked"}:
         try:
             from hermes_cli.discord_worker_boards import persist_board_run_summary
