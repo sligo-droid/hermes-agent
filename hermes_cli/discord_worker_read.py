@@ -315,18 +315,16 @@ def update_board(
         mark_completion_notice_pending_on_done_transition,
         mark_dispatch_dirty,
         persist_board_run_summary,
+        _mutate_worker_metadata,
     )
     from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
-    from utils import atomic_json_write
 
     board = str(board or "").strip()
     if not board:
         raise ValueError("board is required")
-    metadata = kanban_db.read_board_metadata(board)
-    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
-    if worker.get("kind") != "discord_worker_board":
+    existing_worker = dict(kanban_db.read_board_metadata(board).get(DISCORD_WORKER_META_KEY) or {})
+    if existing_worker.get("kind") != "discord_worker_board":
         raise KeyError(f"unknown Discord worker board: {board}")
-    previous = dict(worker)
 
     updates = dict(set_values or {})
     for key, value in (
@@ -346,15 +344,21 @@ def update_board(
         updates["terminal_summary_sync_pending"] = True
     if sync_reaction:
         updates["terminal_reaction_sync_pending"] = True
-    for key, value in updates.items():
-        worker[str(key)] = value
-    for key in delete_keys or []:
-        worker.pop(str(key), None)
-    mark_completion_notice_pending_on_done_transition(worker, previous)
-    worker["updated_at"] = int(time.time())
-    metadata[DISCORD_WORKER_META_KEY] = worker
-    metadata.pop("db_path", None)
-    atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
+    def mutate(metadata: dict[str, Any], worker: dict[str, Any]) -> bool:
+        if worker.get("kind") != "discord_worker_board":
+            return False
+        previous = dict(worker)
+        for key, value in updates.items():
+            worker[str(key)] = value
+        for key in delete_keys or []:
+            worker.pop(str(key), None)
+        mark_completion_notice_pending_on_done_transition(worker, previous)
+        worker["updated_at"] = int(time.time())
+        return True
+
+    written = _mutate_worker_metadata(board, mutate, warning_action="update Discord worker read metadata")
+    if written is None:
+        raise TimeoutError(f"timed out acquiring metadata lock for board {board}")
     if persist_summary:
         persist_board_run_summary(board)
     marker = mark_dispatch_dirty(board=board, reason=dispatch_reason)

@@ -7,6 +7,7 @@ does not expose Hermes tools to workers.
 
 from __future__ import annotations
 
+import contextlib
 import html
 import hashlib
 import json
@@ -20,7 +21,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from hermes_cli import kanban_db
@@ -93,10 +94,16 @@ _WINDOWS_PATH_RE = re.compile(r"(?<![\w:/.-])[A-Za-z]:\\[^\s\"'<>),;{}\[\]]+")
 _CONTEXT_PACK_JSON_FILENAME = "context-pack.json"
 _CONTEXT_PACK_MARKDOWN_FILENAME = "context-pack.md"
 _SKIPPED_BOARD_TARGET_LOG_KEYS: set[tuple[str, str, str]] = set()
+_BOARD_METADATA_LOCK_TIMEOUT_SECONDS = 5.0
+_BOARD_METADATA_LOCK_POLL_SECONDS = 0.05
 
 
 class TicketMoveConflict(RuntimeError):
     """Raised when a ticket status move is valid syntax but refused."""
+
+
+class BoardMetadataLockTimeout(TimeoutError):
+    """Raised when a board metadata RMW lock cannot be acquired in time."""
 
 
 def _now() -> int:
@@ -230,6 +237,54 @@ def active_dev_round_for_board(board: Optional[str]) -> int:
 
 def _metadata_path(board: str) -> Path:
     return kanban_db.board_metadata_path(board)
+
+
+@contextlib.contextmanager
+def _board_metadata_lock(
+    metadata_path: Path,
+    *,
+    timeout_seconds: float = _BOARD_METADATA_LOCK_TIMEOUT_SECONDS,
+):
+    """Serialize read-modify-write updates to a board metadata JSON file."""
+
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = metadata_path.with_name(metadata_path.name + ".lock")
+    handle = lock_path.open("a+b")
+    acquired = False
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    try:
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise BoardMetadataLockTimeout(str(lock_path)) from exc
+                time.sleep(_BOARD_METADATA_LOCK_POLL_SECONDS)
+        yield
+    finally:
+        try:
+            if acquired:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def board_run_summary_path(board: str) -> Path:
@@ -537,6 +592,55 @@ def _write_metadata(board: str, metadata: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _read_metadata_from_path(board: str, path: Path | None = None) -> dict[str, Any]:
+    if path is not None:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return raw
+        except Exception:
+            logger.debug("Failed to read Discord worker metadata from %s", path, exc_info=True)
+    return kanban_db.read_board_metadata(board)
+
+
+def _write_metadata_to_path(board: str, metadata: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
+    if path is None:
+        return _write_metadata(board, metadata)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(metadata)
+    payload.pop("db_path", None)
+    atomic_json_write(path, payload, indent=2)
+    payload["db_path"] = str(kanban_db.kanban_db_path(board))
+    return payload
+
+
+def _mutate_worker_metadata(
+    board: str,
+    mutator: Callable[[dict[str, Any], dict[str, Any]], bool | None],
+    *,
+    metadata_path: Path | None = None,
+    warning_action: str = "update Discord worker metadata",
+) -> dict[str, Any] | None:
+    path = metadata_path or _metadata_path(board)
+    try:
+        with _board_metadata_lock(path):
+            metadata = _read_metadata_from_path(board, metadata_path)
+            worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+            changed = mutator(metadata, worker)
+            if not changed:
+                metadata[DISCORD_WORKER_META_KEY] = worker
+                return metadata
+            metadata[DISCORD_WORKER_META_KEY] = worker
+            return _write_metadata_to_path(board, metadata, metadata_path)
+    except BoardMetadataLockTimeout:
+        logger.warning(
+            "Timed out acquiring Discord worker metadata lock for board %s while trying to %s; skipping stale write",
+            board,
+            warning_action,
+        )
+        return None
+
+
 def dispatch_dirty_marker_path() -> Path:
     """Return the cross-process marker used to wake gateway dispatch."""
     return kanban_db.kanban_home() / "kanban" / DISCORD_WORKER_DISPATCH_DIRTY_FILENAME
@@ -738,30 +842,35 @@ def _arm_terminal_completion_notice_if_ready(worker: dict[str, Any]) -> bool:
 
 
 def _update_worker_meta(board: str, updates: dict[str, Any]) -> dict[str, Any]:
-    metadata = kanban_db.read_board_metadata(board)
-    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
-    previous = dict(worker)
-    for key, value in updates.items():
-        if value is _DELETE_META:
-            worker.pop(key, None)
-        else:
-            worker[key] = value
-    changed_keys = {key for key in set(previous) | set(worker) if previous.get(key) != worker.get(key)}
-    if not changed_keys:
-        metadata[DISCORD_WORKER_META_KEY] = worker
-        return metadata
-    terminal_summary_changed = bool(changed_keys & _TERMINAL_SUMMARY_SYNC_FIELDS)
-    became_terminal = not _is_terminal_worker_meta(previous) and _is_terminal_worker_meta(worker)
-    terminal_reaction_changed = _terminal_worker_reaction_state(previous) != _terminal_worker_reaction_state(worker)
-    if worker.get("kind") == "discord_worker_board" and _is_terminal_worker_meta(worker):
-        if terminal_summary_changed:
-            worker["terminal_summary_sync_pending"] = True
-        if became_terminal or terminal_reaction_changed:
-            worker["terminal_reaction_sync_pending"] = True
-        mark_completion_notice_pending_on_done_transition(worker, previous)
-    worker["updated_at"] = _now()
-    metadata[DISCORD_WORKER_META_KEY] = worker
-    written = _write_metadata(board, metadata)
+    terminal_summary_changed = False
+
+    def mutate(metadata: dict[str, Any], worker: dict[str, Any]) -> bool:
+        nonlocal terminal_summary_changed
+        previous = dict(worker)
+        for key, value in updates.items():
+            if value is _DELETE_META:
+                worker.pop(key, None)
+            else:
+                worker[key] = value
+        changed_keys = {key for key in set(previous) | set(worker) if previous.get(key) != worker.get(key)}
+        if not changed_keys:
+            return False
+        terminal_summary_changed = bool(changed_keys & _TERMINAL_SUMMARY_SYNC_FIELDS)
+        became_terminal = not _is_terminal_worker_meta(previous) and _is_terminal_worker_meta(worker)
+        terminal_reaction_changed = _terminal_worker_reaction_state(previous) != _terminal_worker_reaction_state(worker)
+        if worker.get("kind") == "discord_worker_board" and _is_terminal_worker_meta(worker):
+            if terminal_summary_changed:
+                worker["terminal_summary_sync_pending"] = True
+            if became_terminal or terminal_reaction_changed:
+                worker["terminal_reaction_sync_pending"] = True
+            mark_completion_notice_pending_on_done_transition(worker, previous)
+        worker["updated_at"] = _now()
+        return True
+
+    written = _mutate_worker_metadata(board, mutate)
+    if written is None:
+        return kanban_db.read_board_metadata(board)
+    worker = dict(written.get(DISCORD_WORKER_META_KEY) or {})
     if worker.get("kind") == "discord_worker_board" and _is_terminal_worker_meta(worker) and terminal_summary_changed:
         try:
             persist_board_run_summary(board)
@@ -1042,8 +1151,24 @@ def ensure_discord_thread_board(
         }
     )
     _mark_code_island_deferred(worker)
-    metadata[DISCORD_WORKER_META_KEY] = worker
-    metadata = _write_metadata(slug, metadata)
+    setup_updates = {
+        key: value
+        for key, value in worker.items()
+        if key
+        not in {
+            "terminal_reaction_sync_pending",
+            "terminal_summary_sync_pending",
+            "terminal_completion_message_pending",
+            "terminal_completion_message_sent_at",
+            "terminal_completion_message_id",
+            "terminal_reaction_synced_state",
+        }
+    }
+    metadata = _mutate_worker_metadata(
+        slug,
+        lambda current_metadata, current_worker: (current_worker.update(setup_updates) or True),
+        warning_action="ensure Discord worker board metadata",
+    ) or metadata
     if previous_worktree_path != str(worker.get("worktree_path") or ""):
         _sync_role_task_workspaces(
             slug,
@@ -1425,8 +1550,7 @@ def _ensure_code_island(worker: dict[str, Any]) -> None:
 def ensure_code_island_for_board(board: str) -> bool:
     """Prepare a Discord worker board workspace before dispatch spawns roles."""
     started = time.time()
-    metadata = kanban_db.read_board_metadata(board)
-    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    worker = _read_worker_meta(board)
     if worker.get("kind") != "discord_worker_board":
         return True
     active_pipeline = (
@@ -1435,8 +1559,24 @@ def ensure_code_island_for_board(board: str) -> bool:
     )
     previous_worktree_path = str(worker.get("worktree_path") or "").strip()
     _ensure_code_island(worker)
-    metadata[DISCORD_WORKER_META_KEY] = worker
-    _write_metadata(board, metadata)
+    code_island_updates = {
+        key: worker[key]
+        for key in (
+            "code_island_ready",
+            "code_island_pending",
+            "code_island_error",
+            "worktree_path",
+            "project_path",
+        )
+        if key in worker
+    }
+    written = _mutate_worker_metadata(
+        board,
+        lambda current_metadata, current_worker: (current_worker.update(code_island_updates) or True),
+        warning_action="ensure Discord worker board code island metadata",
+    )
+    if written is None:
+        return False
     if previous_worktree_path != str(worker.get("worktree_path") or ""):
         _sync_role_task_workspaces(
             board,
@@ -3238,15 +3378,15 @@ def persist_board_run_summary(board: str) -> dict[str, Any]:
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_json_write(path, summary, indent=2)
 
-    metadata = kanban_db.read_board_metadata(board)
-    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
-    if worker.get("kind") == "discord_worker_board":
+    def mutate(metadata: dict[str, Any], worker: dict[str, Any]) -> bool:
+        if worker.get("kind") != "discord_worker_board":
+            return False
         worker["board_summary"] = summary
         worker["board_summary_path"] = str(path)
         worker["board_summary_updated_at"] = summary["generated_at"]
-        metadata[DISCORD_WORKER_META_KEY] = worker
-        metadata.pop("db_path", None)
-        atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
+        return True
+
+    _mutate_worker_metadata(board, mutate, warning_action="persist Discord board run summary metadata")
     return summary
 
 
@@ -3261,23 +3401,27 @@ def record_final_discord_response(
     """Persist final Discord-response provenance on a worker board."""
     if not board:
         return
-    metadata = kanban_db.read_board_metadata(board)
-    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
+    worker = _read_worker_meta(board)
     if worker.get("kind") != "discord_worker_board":
         return
-    worker["final_discord_response"] = _cap_state_value(str(final_response or ""), max_text=12000)
-    worker["final_discord_response_at"] = _now()
-    if session_id:
-        worker["final_discord_session_id"] = str(session_id)
-    if work_item_id:
-        worker["final_discord_work_item_id"] = str(work_item_id)
-    if result_message_id:
-        worker["final_discord_message_id"] = str(result_message_id)
-    worker["terminal_summary_sync_pending"] = True
-    _arm_terminal_completion_notice_if_ready(worker)
-    metadata[DISCORD_WORKER_META_KEY] = worker
-    metadata.pop("db_path", None)
-    atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
+
+    def mutate(metadata: dict[str, Any], current_worker: dict[str, Any]) -> bool:
+        if current_worker.get("kind") != "discord_worker_board":
+            return False
+        current_worker["final_discord_response"] = _cap_state_value(str(final_response or ""), max_text=12000)
+        current_worker["final_discord_response_at"] = _now()
+        if session_id:
+            current_worker["final_discord_session_id"] = str(session_id)
+        if work_item_id:
+            current_worker["final_discord_work_item_id"] = str(work_item_id)
+        if result_message_id:
+            current_worker["final_discord_message_id"] = str(result_message_id)
+        current_worker["terminal_summary_sync_pending"] = True
+        _arm_terminal_completion_notice_if_ready(current_worker)
+        return True
+
+    if _mutate_worker_metadata(board, mutate, warning_action="record final Discord response metadata") is None:
+        return
     try:
         persist_board_run_summary(board)
     except Exception:
@@ -3776,11 +3920,7 @@ def _read_thread_sync_metadata(board: str, metadata_path: object = None) -> tupl
 
 
 def _write_thread_sync_metadata(board: str, metadata: dict[str, Any], path: Path | None) -> None:
-    metadata.pop("db_path", None)
-    if path is not None:
-        atomic_json_write(path, metadata, indent=2)
-        return
-    atomic_json_write(kanban_db.board_metadata_path(board), metadata, indent=2)
+    _write_metadata_to_path(board, metadata, path)
 
 
 def mark_thread_status_synced(
@@ -3800,33 +3940,39 @@ def mark_thread_status_synced(
     """
     if not board or not (reaction or summary or completion_message):
         return
-    metadata, sync_path = _read_thread_sync_metadata(board, metadata_path)
-    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
-    if worker.get("kind") != "discord_worker_board":
-        return
-    changed = False
-    if reaction:
-        if worker.pop("terminal_reaction_sync_pending", None) is not None:
+    sync_path = _sync_metadata_path(metadata_path)
+
+    def mutate(metadata: dict[str, Any], worker: dict[str, Any]) -> bool:
+        if worker.get("kind") != "discord_worker_board":
+            return False
+        changed = False
+        if reaction:
+            if worker.pop("terminal_reaction_sync_pending", None) is not None:
+                changed = True
+            if sync_path is not None:
+                reaction_state = _terminal_worker_reaction_state(worker)
+            else:
+                try:
+                    reaction_state = board_thread_reaction_state(board)
+                except Exception:
+                    reaction_state = ""
+            if reaction_state in {"done", "blocked", "errored"} and _terminal_reaction_synced_state(worker) != reaction_state:
+                worker["terminal_reaction_synced_state"] = reaction_state
+                changed = True
+        if summary and worker.pop("terminal_summary_sync_pending", None) is not None:
             changed = True
-        if sync_path is not None:
-            reaction_state = _terminal_worker_reaction_state(worker)
-        else:
-            try:
-                reaction_state = board_thread_reaction_state(board)
-            except Exception:
-                reaction_state = ""
-        if reaction_state in {"done", "blocked", "errored"} and _terminal_reaction_synced_state(worker) != reaction_state:
-            worker["terminal_reaction_synced_state"] = reaction_state
+        if completion_message and worker.pop("terminal_completion_message_pending", None) is not None:
             changed = True
-    if summary and worker.pop("terminal_summary_sync_pending", None) is not None:
-        changed = True
-    if completion_message and worker.pop("terminal_completion_message_pending", None) is not None:
-        changed = True
-    if not changed:
-        return
-    worker["updated_at"] = _now()
-    metadata[DISCORD_WORKER_META_KEY] = worker
-    _write_thread_sync_metadata(board, metadata, sync_path)
+        if changed:
+            worker["updated_at"] = _now()
+        return changed
+
+    _mutate_worker_metadata(
+        board,
+        mutate,
+        metadata_path=sync_path,
+        warning_action="mark Discord thread status synced",
+    )
 
 
 def mark_thread_completion_notice_sent(
@@ -3838,24 +3984,30 @@ def mark_thread_completion_notice_sent(
     """Record durable proof that a terminal completion notice was sent."""
     if not board:
         return
-    metadata, sync_path = _read_thread_sync_metadata(board, metadata_path)
-    worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
-    if worker.get("kind") != "discord_worker_board":
-        return
-    changed = worker.pop("terminal_completion_message_pending", None) is not None
     now = _now()
-    if worker.get("terminal_completion_message_sent_at") != now:
-        worker["terminal_completion_message_sent_at"] = now
-        changed = True
     cleaned_message_id = str(message_id or "").strip()
-    if cleaned_message_id and worker.get("terminal_completion_message_id") != cleaned_message_id:
-        worker["terminal_completion_message_id"] = cleaned_message_id
-        changed = True
-    if not changed:
-        return
-    worker["updated_at"] = now
-    metadata[DISCORD_WORKER_META_KEY] = worker
-    _write_thread_sync_metadata(board, metadata, sync_path)
+    sync_path = _sync_metadata_path(metadata_path)
+
+    def mutate(metadata: dict[str, Any], worker: dict[str, Any]) -> bool:
+        if worker.get("kind") != "discord_worker_board":
+            return False
+        changed = worker.pop("terminal_completion_message_pending", None) is not None
+        if worker.get("terminal_completion_message_sent_at") != now:
+            worker["terminal_completion_message_sent_at"] = now
+            changed = True
+        if cleaned_message_id and worker.get("terminal_completion_message_id") != cleaned_message_id:
+            worker["terminal_completion_message_id"] = cleaned_message_id
+            changed = True
+        if changed:
+            worker["updated_at"] = now
+        return changed
+
+    _mutate_worker_metadata(
+        board,
+        mutate,
+        metadata_path=sync_path,
+        warning_action="mark Discord thread completion notice sent",
+    )
 
 
 def _board_runtime_snapshot(
