@@ -442,8 +442,10 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
     assert "worker_unit" in task_columns
+    assert "worker_pid_start_ticks" in task_columns
     assert "run_id" in event_columns
     assert "worker_unit" in run_columns
+    assert "worker_pid_start_ticks" in run_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes
@@ -1032,6 +1034,107 @@ def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
         assert "reclaimed" not in kinds
 
 
+def test_stale_claim_with_mismatched_pid_start_ticks_reclaims(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="pid reused", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        pid = os.getpid()
+        actual_ticks = _kb._pid_start_ticks(pid) or 100
+        kb._set_worker_pid(conn, t, pid)
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, worker_pid_start_ticks = ? "
+            "WHERE id = ?",
+            (int(time.time()) - 60, actual_ticks + 12345, t),
+        )
+        conn.execute(
+            "UPDATE task_runs SET claim_expires = ?, worker_pid_start_ticks = ? "
+            "WHERE task_id = ?",
+            (int(time.time()) - 60, actual_ticks + 12345, t),
+        )
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        monkeypatch.setattr(_kb, "_pid_start_ticks", lambda _pid: actual_ticks)
+
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+
+        assert reclaimed == 1
+        assert kb.get_task(conn, t).status == "ready"
+        events = [e.kind for e in kb.list_events(conn, t)]
+        assert "reclaimed" in events
+        assert "claim_extended" not in events
+
+
+def test_complete_clears_worker_pid_start_ticks_on_task_and_run(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="pid ticks cleared", assignee="a")
+        kb.claim_task(conn, t, claimer="host:worker")
+        kb._set_worker_pid(conn, t, os.getpid())
+
+        task_before = conn.execute(
+            "SELECT worker_pid, worker_pid_start_ticks FROM tasks WHERE id = ?",
+            (t,),
+        ).fetchone()
+        run_before = conn.execute(
+            "SELECT worker_pid, worker_pid_start_ticks FROM task_runs WHERE task_id = ?",
+            (t,),
+        ).fetchone()
+        assert task_before["worker_pid"] == os.getpid()
+        assert task_before["worker_pid_start_ticks"] is not None
+        assert run_before["worker_pid"] == os.getpid()
+        assert run_before["worker_pid_start_ticks"] is not None
+
+        assert kb.complete_task(conn, t, result="done") is True
+
+        task_after = conn.execute(
+            "SELECT worker_pid, worker_pid_start_ticks FROM tasks WHERE id = ?",
+            (t,),
+        ).fetchone()
+        run_after = conn.execute(
+            "SELECT worker_pid, worker_pid_start_ticks FROM task_runs WHERE task_id = ?",
+            (t,),
+        ).fetchone()
+        assert task_after["worker_pid"] is None
+        assert task_after["worker_pid_start_ticks"] is None
+        assert run_after["worker_pid"] is None
+        assert run_after["worker_pid_start_ticks"] is None
+
+
+def test_stale_claim_with_legacy_null_pid_start_ticks_still_extends(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="legacy pid", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, os.getpid())
+        old_expires = int(time.time()) - 60
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, worker_pid_start_ticks = NULL "
+            "WHERE id = ?",
+            (old_expires, t),
+        )
+        conn.execute(
+            "UPDATE task_runs SET claim_expires = ?, worker_pid_start_ticks = NULL "
+            "WHERE task_id = ?",
+            (old_expires, t),
+        )
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        monkeypatch.setattr(_kb, "_pid_start_ticks", lambda _pid: 123456)
+
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+
+        assert reclaimed == 0
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+        assert task.claim_expires > old_expires
+
+
 def test_claim_leaves_task_and_run_heartbeat_unset_until_worker_reports(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="await heartbeat", assignee="a")
@@ -1339,6 +1442,34 @@ def test_detect_crashed_workers_isolated_failure_normal_retry(
             assert task.status == "ready", (
                 f"task {tid} should stay ready (isolated), got {task.status}"
             )
+
+
+def test_detect_crashed_workers_reclaims_mismatched_pid_start_ticks(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="pid identity crash", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        pid = os.getpid()
+        actual_ticks = _kb._pid_start_ticks(pid) or 100
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, "
+            "worker_pid_start_ticks=?, claim_lock=?, started_at=? WHERE id=?",
+            (pid, actual_ticks + 12345, f"{host}:w", int(time.time()) - 60, tid),
+        )
+        conn.commit()
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        monkeypatch.setattr(_kb, "_pid_start_ticks", lambda _pid: actual_ticks)
+
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert crashed == [tid]
+        assert kb.get_task(conn, tid).status == "ready"
+        event = next(e for e in kb.list_events(conn, tid) if e.kind == "crashed")
+        assert event.payload["worker_pid_start_ticks_expected"] == actual_ticks + 12345
+        assert event.payload["worker_pid_start_ticks_actual"] == actual_ticks
 
 
 def test_detect_crashed_workers_skips_active_unit_with_dead_pid(
