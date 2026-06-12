@@ -1824,6 +1824,7 @@ def command_center_snapshot(
     include_archived: bool = Query(False),
     recent_run_limit_per_board: int = Query(20, ge=0, le=100),
     project: str | None = Query(None),
+    force_refresh: bool = Query(False),
 ):
     """Return Sligo Labs' canonical operator read model.
 
@@ -1831,10 +1832,11 @@ def command_center_snapshot(
     sources of Work Items; worker boards and task runs are execution detail.
     """
 
-    return command_center.build_command_center_snapshot(
+    return command_center.get_cached_command_center_snapshot(
         include_archived=include_archived,
         recent_run_limit_per_board=recent_run_limit_per_board,
         project=project,
+        force_refresh=force_refresh,
     )
 
 
@@ -1890,6 +1892,7 @@ def command_center_work_item_annotation(work_item_id: str, payload: CommandCente
     }
     if errors:
         response["errors"] = errors
+    command_center.invalidate_snapshot_cache()
     return response
 
 
@@ -2096,6 +2099,7 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
             **({"discord_channel_id": channel_id, "discord_publish": "unavailable"} if channel_id and not discord_route else {}),
         },
     )
+    command_center.invalidate_snapshot_cache()
     return {"card": _self_improvement_card_with_downstream(approved), "task": _task_dict(task) if task else None, "worker_url": worker_url}
 
 
@@ -2131,6 +2135,7 @@ def self_improvement_proposal_halt_endpoint(proposal_id: str, payload: ProposalF
             reason=(payload.reason.strip() if payload and payload.reason else None),
             metadata={"board": board, "previous_status": board_status, "stop_result": stop_result},
         )
+        command_center.invalidate_snapshot_cache()
         return {"card": _self_improvement_card_with_downstream(proposal_storage.get_card(proposal_id)), "task": _task_dict(next_task) if next_task else None}
 
     conn = _conn(board=_resolve_board(board))
@@ -2152,6 +2157,7 @@ def self_improvement_proposal_halt_endpoint(proposal_id: str, payload: ProposalF
         reason=(payload.reason.strip() if payload and payload.reason else None),
         metadata={"board": board, "previous_status": task.status},
     )
+    command_center.invalidate_snapshot_cache()
     return {"card": _self_improvement_card_with_downstream(proposal_storage.get_card(proposal_id)), "task": _task_dict(next_task) if next_task else None}
 
 
@@ -2167,6 +2173,7 @@ def self_improvement_proposal_archive_endpoint(proposal_id: str):
         actor=_proposal_actor(),
         metadata={"source": "command-center"},
     )
+    command_center.invalidate_snapshot_cache()
     return {"card": _self_improvement_card_with_downstream(archived)}
 
 
@@ -2373,6 +2380,7 @@ def self_improvement_proposal_reject_endpoint(proposal_id: str, payload: Proposa
         reason=payload.reason.strip(),
         actor=_proposal_actor(),
     )
+    command_center.invalidate_snapshot_cache()
     return {"card": _self_improvement_card_with_downstream(rejected)}
 
 
@@ -3259,6 +3267,7 @@ def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete
         res = kanban_db.remove_board(slug, archive=not delete)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    command_center.invalidate_snapshot_cache()
     return {"result": res, "current": kanban_db.get_current_board()}
 
 

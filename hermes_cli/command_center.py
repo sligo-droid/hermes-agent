@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
 
+from hermes_constants import get_hermes_home
 from hermes_cli import kanban_db
 from hermes_cli import command_center_annotations
 from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
@@ -45,6 +46,24 @@ _PROJECT_ALIASES = {
 }
 _ARCHIVED_BOARD_DIR_RE = re.compile(r"^(?P<slug>.+)-(?P<timestamp>\d{9,})(?:-\d+)?$")
 _ARCHIVED_BOARD_METADATA_CACHE: tuple[tuple[str, int], list[dict[str, Any]]] | None = None
+_SNAPSHOT_CACHE_TTL_SECONDS = 3.0
+_SNAPSHOT_CACHE: dict[tuple[str | None, bool, int], tuple[float, dict[str, Any]]] = {}
+_SNAPSHOT_CACHE_HOME: Path | None = None
+
+
+def invalidate_snapshot_cache() -> None:
+    """Clear cached Command Center snapshots after durable state changes."""
+
+    _SNAPSHOT_CACHE.clear()
+
+
+def _invalidate_snapshot_cache_if_home_changed() -> None:
+    global _SNAPSHOT_CACHE_HOME
+
+    home = get_hermes_home()
+    if _SNAPSHOT_CACHE_HOME != home:
+        invalidate_snapshot_cache()
+        _SNAPSHOT_CACHE_HOME = home
 
 
 def _normalize_project_key(value: Any) -> str | None:
@@ -1056,6 +1075,32 @@ def _source_from_discord_board(board: str, board_meta: dict[str, Any]) -> dict[s
         "updated_at": board_meta.get("archived_at") or worker.get("updated_at") or board_meta.get("created_at"),
         "ref": ref,
     }, project)
+
+
+def get_cached_command_center_snapshot(
+    *,
+    include_archived: bool = False,
+    recent_run_limit_per_board: int = 20,
+    project: str | None = None,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """Return a short-lived cached Command Center snapshot for API polling."""
+
+    cache_key = (_normalize_project_key(project), bool(include_archived), int(recent_run_limit_per_board))
+    _invalidate_snapshot_cache_if_home_changed()
+    monotonic_now = time.monotonic()
+    if not force_refresh:
+        cached = _SNAPSHOT_CACHE.get(cache_key)
+        if cached and monotonic_now - cached[0] < _SNAPSHOT_CACHE_TTL_SECONDS:
+            return copy.deepcopy(cached[1])
+
+    snapshot = build_command_center_snapshot(
+        include_archived=include_archived,
+        recent_run_limit_per_board=recent_run_limit_per_board,
+        project=project,
+    )
+    _SNAPSHOT_CACHE[cache_key] = (monotonic_now, copy.deepcopy(snapshot))
+    return snapshot
 
 
 def build_command_center_snapshot(*, include_archived: bool = False, recent_run_limit_per_board: int = 20, project: str | None = None) -> dict[str, Any]:

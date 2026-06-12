@@ -24,6 +24,60 @@ def _first_card() -> dict:
     return cards[0]
 
 
+def test_snapshot_cache_reuses_snapshot_until_ttl_or_force_refresh(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    command_center.invalidate_snapshot_cache()
+    call_count = 0
+    monotonic_now = 100.0
+    original_list_boards = kanban_db.list_boards
+
+    def counted_list_boards(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original_list_boards(*args, **kwargs)
+
+    monkeypatch.setattr(kanban_db, "list_boards", counted_list_boards)
+    monkeypatch.setattr(command_center.time, "monotonic", lambda: monotonic_now)
+
+    first = command_center.get_cached_command_center_snapshot()
+    first["work_items"].append({"id": "mutated-caller-copy"})
+    second = command_center.get_cached_command_center_snapshot()
+
+    assert call_count == 1
+    assert all(item.get("id") != "mutated-caller-copy" for item in second["work_items"])
+
+    command_center.get_cached_command_center_snapshot(force_refresh=True)
+    assert call_count == 2
+
+    monotonic_now += 3.1
+    command_center.get_cached_command_center_snapshot()
+    assert call_count == 3
+
+
+def test_snapshot_cache_keys_include_project_archived_and_recent_run_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    command_center.invalidate_snapshot_cache()
+    call_count = 0
+    original_list_boards = kanban_db.list_boards
+
+    monkeypatch.setattr(command_center.time, "monotonic", lambda: 200.0)
+
+    def counted_list_boards(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original_list_boards(*args, **kwargs)
+
+    monkeypatch.setattr(kanban_db, "list_boards", counted_list_boards)
+
+    command_center.get_cached_command_center_snapshot(project="hermes", include_archived=False, recent_run_limit_per_board=20)
+    command_center.get_cached_command_center_snapshot(project="hermes", include_archived=False, recent_run_limit_per_board=20)
+    command_center.get_cached_command_center_snapshot(project="pid", include_archived=False, recent_run_limit_per_board=20)
+    command_center.get_cached_command_center_snapshot(project="hermes", include_archived=True, recent_run_limit_per_board=20)
+    command_center.get_cached_command_center_snapshot(project="hermes", include_archived=False, recent_run_limit_per_board=5)
+
+    assert call_count == 4
+
+
 def test_snapshot_hides_rejected_cards_by_default_and_exposes_source_ids(tmp_path, monkeypatch):
     _ingest_valid(monkeypatch, tmp_path)
     card = _first_card()

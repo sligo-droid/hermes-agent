@@ -70,6 +70,98 @@ def client(kanban_home):
     return TestClient(app)
 
 
+def test_command_center_snapshot_route_accepts_force_refresh(client, monkeypatch):
+    import hermes_cli.command_center as cc
+
+    calls = []
+
+    def fake_snapshot(**kwargs):
+        calls.append(kwargs)
+        return {"schema_version": 1, "work_items": []}
+
+    monkeypatch.setattr(cc, "get_cached_command_center_snapshot", fake_snapshot)
+
+    response = client.get(
+        "/api/plugins/kanban/command-center/snapshot",
+        params={
+            "include_archived": "true",
+            "recent_run_limit_per_board": "7",
+            "project": "Hermes",
+            "force_refresh": "true",
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == [
+        {
+            "include_archived": True,
+            "recent_run_limit_per_board": 7,
+            "project": "Hermes",
+            "force_refresh": True,
+        }
+    ]
+
+
+def test_command_center_annotation_invalidates_snapshot_cache(client, monkeypatch):
+    pa = sys.modules["hermes_dashboard_plugin_kanban_test"]
+
+    invalidations = 0
+
+    def fake_find_work_item(work_item_id):
+        assert work_item_id == "self-improvement:proposal-1"
+        return {
+            "id": work_item_id,
+            "title": "Proposal",
+            "summary": "Summary",
+            "status": "proposed",
+            "source": {"kind": "self_improvement", "ref": {"proposal_id": "proposal-1"}},
+            "execution": {},
+        }
+
+    def fake_record_annotation(**kwargs):
+        return {"id": 1, **kwargs}
+
+    def fake_invalidate():
+        nonlocal invalidations
+        invalidations += 1
+
+    monkeypatch.setattr(pa, "_find_command_center_work_item", fake_find_work_item)
+    monkeypatch.setattr(pa.command_center_annotations, "record_annotation", fake_record_annotation)
+    monkeypatch.setattr(pa.command_center, "invalidate_snapshot_cache", fake_invalidate)
+
+    response = client.post(
+        "/api/plugins/kanban/command-center/work-items/self-improvement:proposal-1/annotations",
+        json={"mode": "note", "text": "Remember this."},
+    )
+
+    assert response.status_code == 200
+    assert invalidations == 1
+
+
+def test_self_improvement_reject_invalidates_snapshot_cache(client, monkeypatch):
+    pa = sys.modules["hermes_dashboard_plugin_kanban_test"]
+
+    invalidations = 0
+
+    monkeypatch.setattr(pa.proposal_storage, "get_card", lambda proposal_id: {"proposal_id": proposal_id, "status": "proposed"})
+    monkeypatch.setattr(pa.proposal_storage, "record_rejection", lambda proposal_id, reason, actor: {"proposal_id": proposal_id, "status": "rejected"})
+    monkeypatch.setattr(pa, "_self_improvement_card_with_downstream", lambda card: card)
+
+    def fake_invalidate():
+        nonlocal invalidations
+        invalidations += 1
+
+    monkeypatch.setattr(pa.command_center, "invalidate_snapshot_cache", fake_invalidate)
+
+    response = client.post(
+        "/api/plugins/kanban/self-improvement/proposals/proposal-1/reject",
+        json={"reason": "not now"},
+    )
+
+    assert response.status_code == 200
+    assert invalidations == 1
+
+
 def test_self_improvement_project_channel_can_resolve_configured_name(monkeypatch):
     monkeypatch.setattr(
         discord_publish,
