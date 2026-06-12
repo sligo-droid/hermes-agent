@@ -2380,16 +2380,19 @@ def _merge_criteria(board: Optional[str], criteria: list[str]) -> None:
 
     metadata = kanban_db.read_board_metadata(board)
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
-    existing = list(worker.get("criteria") or [])
-    seen = {
-        str(item.get("text") if isinstance(item, dict) else item).strip().lower()
-        for item in existing
-    }
+    canonical: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for text in criteria:
-        if text.lower() in seen:
+        normalized = str(text or "").strip()
+        key = normalized.lower()
+        if not normalized or key in seen:
             continue
-        existing.append({"text": text, "active": True})
-    worker["criteria"] = existing
+        canonical.append({"text": normalized, "active": True})
+        seen.add(key)
+    if not canonical:
+        return
+    worker["criteria"] = canonical
+    worker["criteria_source"] = "planner"
     metadata[DISCORD_WORKER_META_KEY] = worker
     path = kanban_db.board_metadata_path(board)
     metadata.pop("db_path", None)

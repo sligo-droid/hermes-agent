@@ -4897,6 +4897,10 @@ def start_planner_request(
     )
     if acceptance_criteria is not None:
         worker["criteria"] = acceptance_criteria
+        if acceptance_criteria:
+            worker["criteria_source"] = "explicit"
+        else:
+            worker.pop("criteria_source", None)
     if thread_context_text:
         worker["latest_goal_thread_context"] = thread_context_text
     else:

@@ -2069,6 +2069,58 @@ def test_opencode_planner_output_creates_dev_ticket(monkeypatch, tmp_path):
     assert [item.title for item in dev_tasks] == ["R1: Clean answer box"]
 
 
+def test_planner_output_replaces_bootstrap_request_criteria(monkeypatch, tmp_path):
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_PLANNER
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    old_request_body = (
+        "Act as the planner for this board. Implement the approval activation so "
+        "the Discord worker board starts in planning and produces dev tickets."
+    )
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            **board.worker,
+            "criteria": [{"text": old_request_body, "active": True}],
+        },
+    )
+    payload = {
+        "status": "planned",
+        "summary": "Planned one step.",
+        "acceptance_criteria": [
+            "Answer box is simplified.",
+            "Answer box is simplified.",
+            "Verification is recorded.",
+        ],
+        "tasks": [{"title": "Clean answer box", "body": "Do it.", "priority": 20}],
+    }
+
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        worker._apply_role_output(
+            conn,
+            task.id,
+            ROLE_PLANNER,
+            payload,
+            board=board.slug,
+            workspace=str(tmp_path / "repo"),
+            expected_run_id=task.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    worker_meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker_meta["criteria"] == [
+        {"text": "Answer box is simplified.", "active": True},
+        {"text": "Verification is recorded.", "active": True},
+    ]
+    assert worker_meta["criteria_source"] == "planner"
+    assert old_request_body not in json.dumps(worker_meta["criteria"])
+
+
 def test_docker_runner_logs_immediate_registry_failure(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_workers as workers
     from hermes_cli import kanban_db
