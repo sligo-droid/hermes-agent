@@ -64,6 +64,7 @@ def ensure_dashboard_port_available(host: str, port: int) -> None:
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
     try:
         with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((host, port))
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
