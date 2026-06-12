@@ -3584,6 +3584,7 @@ def _end_run(
                claim_lock    = NULL,
                claim_expires = NULL,
                worker_pid    = NULL,
+               worker_pid_start_ticks = NULL,
                worker_unit   = NULL
          WHERE id = ?
            AND ended_at IS NULL
@@ -3839,9 +3840,10 @@ def set_status_direct(
             "UPDATE tasks SET status = ?, "
             "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
             "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
-            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
+            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END, "
+            "  worker_pid_start_ticks = CASE WHEN ? = 'running' THEN worker_pid_start_ticks ELSE NULL END "
             "WHERE id = ?",
-            (new_status, new_status, new_status, new_status, task_id),
+            (new_status, new_status, new_status, new_status, new_status, task_id),
         )
         if cur.rowcount != 1:
             return False
@@ -4360,7 +4362,7 @@ def release_stale_claims(
             payload.update(termination)
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL "
+                "claim_expires = NULL, worker_pid = NULL, worker_pid_start_ticks = NULL, worker_unit = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND current_run_id IS ?",
                 (row["id"], row["claim_lock"], row["current_run_id"]),
@@ -4416,7 +4418,7 @@ def reclaim_task(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL "
+            "claim_expires = NULL, worker_pid = NULL, worker_pid_start_ticks = NULL, worker_unit = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?",
             (task_id, prev_lock),
@@ -4724,6 +4726,7 @@ def _complete_task_once(
                        claim_lock   = NULL,
                        claim_expires= NULL,
                        worker_pid   = NULL,
+                       worker_pid_start_ticks = NULL,
                        worker_unit  = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
@@ -4740,6 +4743,7 @@ def _complete_task_once(
                        claim_lock   = NULL,
                        claim_expires= NULL,
                        worker_pid   = NULL,
+                       worker_pid_start_ticks = NULL,
                        worker_unit  = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
@@ -5178,6 +5182,7 @@ def block_task(
                        claim_lock   = NULL,
                        claim_expires= NULL,
                        worker_pid   = NULL,
+                       worker_pid_start_ticks = NULL,
                        worker_unit  = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready')
@@ -5192,6 +5197,7 @@ def block_task(
                        claim_lock   = NULL,
                        claim_expires= NULL,
                        worker_pid   = NULL,
+                       worker_pid_start_ticks = NULL,
                        worker_unit  = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready')
@@ -5312,7 +5318,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                    SET status = 'reclaimed', outcome = 'reclaimed',
                        summary = COALESCE(summary, 'invariant recovery on unblock'),
                        ended_at = ?,
-                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_unit = NULL
+                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_pid_start_ticks = NULL, worker_unit = NULL
                  WHERE id = ? AND ended_at IS NULL
                 """,
                 (now, int(stale["current_run_id"])),
@@ -5641,7 +5647,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
-            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_unit = NULL "
+            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_pid_start_ticks = NULL, worker_unit = NULL "
             "WHERE id = ? AND status != 'archived'",
             (task_id,),
         )
@@ -5812,11 +5818,12 @@ def schedule_task(
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
-               SET status       = 'scheduled',
-                   claim_lock   = NULL,
-                   claim_expires= NULL,
-                   worker_pid   = NULL,
-                   worker_unit  = NULL
+                SET status       = 'scheduled',
+                    claim_lock   = NULL,
+                    claim_expires= NULL,
+                    worker_pid   = NULL,
+                    worker_pid_start_ticks = NULL,
+                    worker_unit  = NULL
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """
@@ -6394,7 +6401,7 @@ def enforce_max_runtime(
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_pid_start_ticks = NULL, worker_unit = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running'",
                 (tid,),
@@ -6540,7 +6547,7 @@ def detect_stale_running(
             payload.update(termination)
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_pid_start_ticks = NULL, worker_unit = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "AND claim_lock IS ? "
@@ -6709,7 +6716,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL "
+                "claim_expires = NULL, worker_pid = NULL, worker_pid_start_ticks = NULL, worker_unit = NULL "
                 "WHERE id = ? AND status = 'running'",
                 (row["id"],),
             )
@@ -6848,7 +6855,7 @@ def _record_task_failure(
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, worker_pid_start_ticks = NULL, worker_unit = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('running', 'ready')",
                     (failures, error[:500], task_id),
@@ -6896,7 +6903,7 @@ def _record_task_failure(
                 # Spawn path: transition running → ready + clear claim.
                 conn.execute(
                     "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, worker_pid_start_ticks = NULL, worker_unit = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
                     (failures, error[:500], task_id),
@@ -6947,7 +6954,7 @@ def _record_spawn_failure(
             failures = int(row["consecutive_failures"] or 0)
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_unit = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_pid_start_ticks = NULL, worker_unit = NULL, "
                 "last_failure_error = ? "
                 "WHERE id = ? AND status = 'running'",
                 (capped_error, task_id),

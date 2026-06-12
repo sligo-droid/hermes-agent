@@ -1068,6 +1068,41 @@ def test_stale_claim_with_mismatched_pid_start_ticks_reclaims(
         assert "claim_extended" not in events
 
 
+def test_complete_clears_worker_pid_start_ticks_on_task_and_run(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="pid ticks cleared", assignee="a")
+        kb.claim_task(conn, t, claimer="host:worker")
+        kb._set_worker_pid(conn, t, os.getpid())
+
+        task_before = conn.execute(
+            "SELECT worker_pid, worker_pid_start_ticks FROM tasks WHERE id = ?",
+            (t,),
+        ).fetchone()
+        run_before = conn.execute(
+            "SELECT worker_pid, worker_pid_start_ticks FROM task_runs WHERE task_id = ?",
+            (t,),
+        ).fetchone()
+        assert task_before["worker_pid"] == os.getpid()
+        assert task_before["worker_pid_start_ticks"] is not None
+        assert run_before["worker_pid"] == os.getpid()
+        assert run_before["worker_pid_start_ticks"] is not None
+
+        assert kb.complete_task(conn, t, result="done") is True
+
+        task_after = conn.execute(
+            "SELECT worker_pid, worker_pid_start_ticks FROM tasks WHERE id = ?",
+            (t,),
+        ).fetchone()
+        run_after = conn.execute(
+            "SELECT worker_pid, worker_pid_start_ticks FROM task_runs WHERE task_id = ?",
+            (t,),
+        ).fetchone()
+        assert task_after["worker_pid"] is None
+        assert task_after["worker_pid_start_ticks"] is None
+        assert run_after["worker_pid"] is None
+        assert run_after["worker_pid_start_ticks"] is None
+
+
 def test_stale_claim_with_legacy_null_pid_start_ticks_still_extends(
     kanban_home, monkeypatch,
 ):
