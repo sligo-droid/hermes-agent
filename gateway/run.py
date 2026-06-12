@@ -6302,7 +6302,7 @@ class GatewayRunner:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
             return
 
-        interval = float(kanban_cfg.get("dispatch_interval_seconds", 10) or 10)
+        interval = float(kanban_cfg.get("dispatch_interval_seconds", 5) or 5)
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
         # Read max_spawn config to limit concurrent kanban tasks

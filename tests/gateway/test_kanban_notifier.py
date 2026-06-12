@@ -426,6 +426,71 @@ def test_kanban_dispatcher_announces_spawned_tasks_with_worker_lifecycle_path(mo
     assert announced == [("discord-1", result)]
 
 
+def test_kanban_dispatcher_missing_interval_falls_back_to_five_seconds(monkeypatch):
+    import hermes_cli.config as cfg
+    from hermes_cli import kanban_db
+    from hermes_cli import discord_worker_dispatch
+
+    monkeypatch.setattr(
+        cfg,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "auto_decompose": False,
+                "discord_worker": {
+                    "max_global_workers": 8,
+                    "max_workers_per_board": 2,
+                },
+            }
+        },
+    )
+    monkeypatch.setattr(kanban_db, "reap_worker_zombies", lambda: [])
+    monkeypatch.setattr(kanban_db, "list_boards", lambda include_archived=False: [])
+    monkeypatch.setattr(discord_worker_dispatch, "running_role_count", lambda board: 0)
+    monkeypatch.setattr(
+        discord_worker_dispatch,
+        "dispatch_discord_worker_boards",
+        lambda *args, **kwargs: [],
+    )
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {}
+    intervals = []
+
+    async def stop_after_tick(interval):
+        intervals.append(interval)
+        runner._running = False
+        return False
+
+    runner._discord_worker_announce_spawned_tasks = AsyncMock()
+    runner._sleep_until_kanban_dispatch_due = stop_after_tick
+
+    asyncio.run(runner._kanban_dispatcher_watcher())
+
+    assert intervals == [5.0]
+
+
+def test_kanban_cli_embedded_dispatcher_guidance_uses_five_second_default(monkeypatch):
+    import argparse
+    import gateway.status as status
+    from hermes_cli.kanban import build_parser, _check_dispatcher_presence
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    kanban_parser = build_parser(subparsers)
+    daemon_interval = kanban_parser.parse_args(["daemon", "--force"]).interval
+
+    monkeypatch.setattr(status, "get_running_pid", lambda: None)
+    ok, guidance = _check_dispatcher_presence()
+
+    assert ok is False
+    assert daemon_interval == 5.0
+    assert "tick interval 5s by default" in guidance
+    assert "60 seconds" not in guidance
+
+
 def _create_completed_subscription(summary="done once"):
     conn = kb.connect()
     try:
