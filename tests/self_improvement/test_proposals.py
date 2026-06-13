@@ -356,6 +356,18 @@ def test_blocked_missing_live_basis_must_name_missing_live_evidence():
     assert "missing_live_evidence" in str(excinfo.value)
 
 
+def test_missing_live_evidence_must_be_array_not_object():
+    payload = _fixture("proposal_run_pid_blocked_live_source_backed.json")
+    payload["cards"][0]["evidence_basis"]["missing_live_evidence"] = {
+        "reason": "safe admin credentials were unavailable"
+    }
+
+    with pytest.raises(ProposalValidationError) as excinfo:
+        validate_proposal_run(payload)
+
+    assert "cards[0].evidence_basis.missing_live_evidence must be an array" in str(excinfo.value)
+
+
 def test_empty_pid_proposal_run_is_accepted():
     normalized = validate_proposal_run(_fixture("proposal_run_pid_empty.json"))
 
@@ -408,6 +420,8 @@ def test_cron_proposal_guidance_requests_json_and_no_kanban_mutation():
     assert "deterministic string `idempotency_key`" in guidance
     assert "source_excerpts` as objects with a `text` field" in guidance
     assert "`evidence_basis`" in guidance
+    assert "`missing_live_evidence` must be an array of non-empty strings" in guidance
+    assert "use `[]` when no live evidence is missing" in guidance
     assert "`source_static_log`, `live_browser`, or `blocked_missing_live`" in guidance
     assert "INSUFFICIENT_EVIDENCE" in guidance
     assert "safe admin credentials unavailable" in guidance

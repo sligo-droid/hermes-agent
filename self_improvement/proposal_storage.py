@@ -211,8 +211,7 @@ def _source_key(payload: dict[str, Any] | None, source_markdown: str, source: di
 def _source_enriched_payload(payload: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
     """Merge trusted scheduler metadata into parsed cron proposal payloads."""
 
-    if not source:
-        return payload
+    source = source or {}
     enriched = dict(payload)
     run = dict(enriched.get("run") or {}) if isinstance(enriched.get("run"), dict) else {}
     source_run_raw = source.get("run")
@@ -260,6 +259,14 @@ def _source_enriched_payload(payload: dict[str, Any], source: dict[str, Any]) ->
                 alias = _SEVERITY_ALIASES.get(severity.strip().lower())
                 if alias:
                     normalized_card["severity"] = alias
+            evidence_basis = normalized_card.get("evidence_basis")
+            if isinstance(evidence_basis, dict):
+                missing_live_evidence = evidence_basis.get("missing_live_evidence")
+                if isinstance(missing_live_evidence, str) and missing_live_evidence.strip():
+                    normalized_card["evidence_basis"] = {
+                        **evidence_basis,
+                        "missing_live_evidence": [missing_live_evidence.strip()],
+                    }
             source_excerpts = normalized_card.get("source_excerpts")
             if isinstance(source_excerpts, list):
                 normalized_excerpts: list[Any] = []

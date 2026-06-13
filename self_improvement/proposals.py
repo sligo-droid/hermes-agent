@@ -358,7 +358,7 @@ def build_cron_proposal_guidance(
         "`priority` as one of `critical`, `high`, `medium`, or `low` (do not use P0/P1/P2 labels), optional `severity` as one of "
         "`critical`, `major`, `minor`, or `info` (do not use high/medium/low severity labels), "
         "`source_excerpts` as objects with a `text` field, `evidence_basis`, `status: proposed`, `created_at`, and `kanban_task` with enough title/body detail to construct a later Kanban task. "
-        "For every card, set `evidence_basis` to an object with `type`, `summary`, and `missing_live_evidence`. The `type` must be one of "
+        "For every card, set `evidence_basis` to an object with `type`, `summary`, and `missing_live_evidence`. `missing_live_evidence` must be an array of non-empty strings; use `[]` when no live evidence is missing. The `type` must be one of "
         "`source_static_log`, `live_browser`, or `blocked_missing_live`. Use `source_static_log` for source, static analysis, or log-backed evidence, including strong evidence that remains sufficient without live dogfood. "
         "Use `live_browser` only when the run actually used authenticated live/browser evidence and `source_excerpts` includes a safe audit excerpt for that verification. "
         "Use `blocked_missing_live` when delegated live evidence, browser dogfood, or authenticated admin verification returned `INSUFFICIENT_EVIDENCE` or an explicit blocker; `missing_live_evidence` must name the missing live check without credential details, for example safe admin credentials unavailable. "

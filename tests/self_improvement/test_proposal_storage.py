@@ -197,6 +197,45 @@ def test_ingest_run_with_audit_metadata_uses_trusted_source_run_metadata(tmp_pat
     assert card["source_excerpts"][1]["line_end"] == 5
 
 
+def test_ingest_normalizes_legacy_non_empty_missing_live_evidence_string(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    payload = _valid_payload()
+    payload["cards"][0]["evidence_basis"]["missing_live_evidence"] = "safe admin credentials were unavailable"
+
+    result = proposal_storage.ingest_proposal_output(json.dumps(payload))
+    run = proposal_storage.get_run(result["run_id"])
+    assert run is not None
+
+    assert result["status"] == "valid"
+    assert run["cards"][0]["payload"]["evidence_basis"]["missing_live_evidence"] == [
+        "safe admin credentials were unavailable"
+    ]
+
+
+def test_ingest_rejects_empty_missing_live_evidence_string(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    payload = _valid_payload()
+    payload["cards"][0]["evidence_basis"]["missing_live_evidence"] = ""
+
+    result = proposal_storage.ingest_proposal_output(json.dumps(payload))
+
+    assert result["status"] == "malformed"
+    assert "missing_live_evidence must be an array" in result["parse_error"]
+
+
+def test_ingest_rejects_object_shaped_missing_live_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    payload = _valid_payload()
+    payload["cards"][0]["evidence_basis"]["missing_live_evidence"] = {
+        "reason": "safe admin credentials were unavailable"
+    }
+
+    result = proposal_storage.ingest_proposal_output(json.dumps(payload))
+
+    assert result["status"] == "malformed"
+    assert "missing_live_evidence must be an array" in result["parse_error"]
+
+
 def test_ingest_run_id_alias_is_used_when_source_has_no_run_id(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     payload = _valid_payload()
