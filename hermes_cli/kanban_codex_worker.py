@@ -38,6 +38,7 @@ from hermes_cli.discord_worker_boards import (
     record_codex_worker_event,
     record_codex_worker_result,
 )
+from hermes_cli.worker_autoreview import materialize_autoreview_helper
 
 _OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER}
 _COMMAND_CENTER_REPAIR_CREATED_BY = "command-center-repair"
@@ -620,10 +621,11 @@ def _dev_autoreview_prompt(role: str) -> str:
         return ""
     return (
         "Autoreview closeout contract for dev workers:\n"
-        "- After non-trivial code edits and focused checks, apply the OpenClaw `autoreview` skill as the final closeout review before returning JSON.\n"
-        "- Prefer a repo-local helper when present: `.agents/skills/autoreview/scripts/autoreview --mode local` or `skills/autoreview/scripts/autoreview --mode local`; otherwise use the installed helper path if available.\n"
+        "- After non-trivial code edits and focused checks, run `.agents/skills/autoreview/scripts/autoreview --mode local` as the final closeout review before returning JSON.\n"
+        "- Hermes materializes this repo-local helper in worker workspaces before launch; report it unavailable only if materialization failed or the file is missing.\n"
+        "- The local helper is deterministic and advisory; do not report it as a model review.\n"
         "- Treat review findings as advisory: verify each actionable finding in the real code path, fix only concrete in-scope issues, rerun affected checks, and rerun autoreview after review-triggered edits until no accepted/actionable findings remain.\n"
-        "- If the autoreview helper/skill is unavailable in this worker environment, record that explicitly in `handoff.notes` and continue with the normal focused verification you can run.\n"
+        "- If the autoreview helper is unavailable in this worker environment, record that explicitly in `handoff.notes` and continue with the normal focused verification you can run.\n"
         "- Record the autoreview command/result, or the unavailable reason, in `tests` or `handoff.notes` so the reviewer can audit closeout.\n\n"
     )
 
@@ -913,9 +915,20 @@ def _run_role_backend(
     task_id: str,
     board: Optional[str],
 ):
+    materialization_note = _materialize_role_autoreview(workspace, role)
+    if materialization_note:
+        prompt = f"{prompt.rstrip()}\n\n{materialization_note}\n"
     if _role_uses_opencode(role, task):
         return _run_opencode(prompt, workspace, role, task=task, task_id=task_id, board=board)
     return _run_codex(prompt, workspace, role, task_id=task_id, board=board)
+
+
+def _materialize_role_autoreview(workspace: str, role: str) -> str:
+    try:
+        materialize_autoreview_helper(workspace)
+    except Exception as exc:
+        return f"Autoreview helper materialization failed before {role} worker start: {exc}"
+    return ""
 
 
 def _run_codex(

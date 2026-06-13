@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -147,8 +148,12 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     assert "Always use the repo test wrapper." in prompt
     assert "Worker boundary" in prompt
     assert "parent Hermes owns all git and PR lifecycle steps" in prompt
-    assert "OpenClaw autoreview skill" in prompt
+    assert "workspace-local autoreview helper" in prompt
+    assert ".agents/skills/autoreview/scripts/autoreview --mode local" in prompt
     assert "after non-trivial code edits and focused checks" in prompt
+    helper = tmp_path / ".agents" / "skills" / "autoreview" / "scripts" / "autoreview"
+    assert helper.exists()
+    assert os.access(helper, os.X_OK)
     assert prompt.index("Open PRs and merge them yourself") < prompt.index("Worker boundary")
     assert result["agents"] == ["build"]
     assert result["plan_used"] is False
@@ -468,6 +473,30 @@ def test_delegate_does_not_add_skill_context_when_parent_has_no_loaded_skills(mo
     assert "General non-skill instruction" not in prompt
 
 
+def test_delegate_reports_autoreview_materialization_failure(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.worker_autoreview.materialize_autoreview_helper",
+        lambda _workdir: (_ for _ in ()).throw(RuntimeError("readonly workspace")),
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix the parser",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "Autoreview helper materialization failed before worker start: readonly workspace" in prompt
+
+
 def test_codex_backend_runs_plan_then_build_for_complex_task(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = [
@@ -571,7 +600,7 @@ def test_delegate_uses_opencode_backend_when_configured(monkeypatch, tmp_path):
     def fake_run(prompt, workspace, **kwargs):
         assert "fix the parser" in prompt
         assert "OpenCode should see repo rules." in prompt
-        assert "OpenClaw autoreview skill" in prompt
+        assert "workspace-local autoreview helper" in prompt
         assert workspace == str(tmp_path)
         assert kwargs["context_for_classification"]
         assert callable(kwargs["on_event"])

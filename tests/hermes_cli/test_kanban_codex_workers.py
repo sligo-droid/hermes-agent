@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import inspect
 import os
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -208,9 +209,105 @@ def test_dev_role_prompt_includes_autoreview_closeout_contract(monkeypatch, tmp_
         conn.close()
 
     assert "Autoreview closeout contract for dev workers" in dev_prompt
-    assert "apply the OpenClaw `autoreview` skill" in dev_prompt
+    assert ".agents/skills/autoreview/scripts/autoreview --mode local" in dev_prompt
+    assert "Hermes materializes this repo-local helper" in dev_prompt
     assert "Record the autoreview command/result" in dev_prompt
     assert "Autoreview closeout contract for dev workers" not in planner_prompt
+
+
+def test_autoreview_helper_materializes_in_hermes_and_pid_like_workspaces(tmp_path):
+    from hermes_cli.worker_autoreview import AUTOREVIEW_RELATIVE_HELPER, AUTOREVIEW_RELATIVE_SKILL
+    from hermes_cli.worker_autoreview import materialize_autoreview_helper
+
+    for name in ("hermes-worker", "pid-worker"):
+        workspace = tmp_path / name
+        workspace.mkdir()
+
+        helper = materialize_autoreview_helper(workspace)
+
+        assert helper == workspace / AUTOREVIEW_RELATIVE_HELPER
+        assert helper.exists()
+        assert stat.S_IMODE(helper.stat().st_mode) & stat.S_IXUSR
+        assert (workspace / AUTOREVIEW_RELATIVE_SKILL).read_text(encoding="utf-8").startswith("---\nname: autoreview")
+        assert "advisory_not_model_review" in helper.read_text(encoding="utf-8")
+
+
+def test_autoreview_helper_is_excluded_from_git_status(tmp_path):
+    from hermes_cli.worker_autoreview import materialize_autoreview_helper
+
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+
+    materialize_autoreview_helper(tmp_path)
+
+    status = subprocess.run(
+        ["git", "status", "--short"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert ".agents/skills/autoreview" not in status
+
+
+def test_autoreview_helper_preserves_existing_repo_helper(tmp_path):
+    from hermes_cli.worker_autoreview import AUTOREVIEW_RELATIVE_HELPER, AUTOREVIEW_RELATIVE_SKILL
+    from hermes_cli.worker_autoreview import materialize_autoreview_helper
+
+    helper = tmp_path / AUTOREVIEW_RELATIVE_HELPER
+    skill = tmp_path / AUTOREVIEW_RELATIVE_SKILL
+    helper.parent.mkdir(parents=True)
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    helper.write_text("custom helper", encoding="utf-8")
+    skill.write_text("custom skill", encoding="utf-8")
+
+    materialize_autoreview_helper(tmp_path)
+
+    assert helper.read_text(encoding="utf-8") == "custom helper"
+    assert skill.read_text(encoding="utf-8") == "custom skill"
+
+
+def test_role_workers_materialize_autoreview_before_backend(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_DEV, ROLE_PLANNER, ROLE_REVIEWER
+
+    calls: list[Path] = []
+
+    def fake_materialize(workspace):
+        calls.append(Path(workspace))
+        return Path(workspace) / ".agents/skills/autoreview/scripts/autoreview"
+
+    monkeypatch.setattr(worker, "materialize_autoreview_helper", fake_materialize)
+    monkeypatch.setattr(worker, "_role_uses_opencode", lambda role, task: False)
+    monkeypatch.setattr(worker, "_run_codex", lambda *args, **kwargs: SimpleNamespace(final_text="{}", error=None))
+
+    worker._run_role_backend("prompt", str(tmp_path), ROLE_DEV, task=SimpleNamespace(), task_id="t1", board="b1")
+    worker._run_role_backend("prompt", str(tmp_path), ROLE_PLANNER, task=SimpleNamespace(), task_id="t2", board="b1")
+    worker._run_role_backend("prompt", str(tmp_path), ROLE_REVIEWER, task=SimpleNamespace(), task_id="t3", board="b1")
+
+    assert calls == [tmp_path, tmp_path, tmp_path]
+
+
+def test_role_worker_reports_autoreview_materialization_failure_to_backend(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+
+    prompts: list[str] = []
+
+    monkeypatch.setattr(
+        worker,
+        "materialize_autoreview_helper",
+        lambda _workspace: (_ for _ in ()).throw(RuntimeError("readonly workspace")),
+    )
+    monkeypatch.setattr(worker, "_role_uses_opencode", lambda role, task: False)
+    monkeypatch.setattr(
+        worker,
+        "_run_codex",
+        lambda prompt, *args, **kwargs: prompts.append(prompt) or SimpleNamespace(final_text="{}", error=None),
+    )
+
+    worker._run_role_backend("prompt", str(tmp_path), ROLE_DEV, task=SimpleNamespace(), task_id="t1", board="b1")
+
+    assert "Autoreview helper materialization failed before dev worker start: readonly workspace" in prompts[0]
 
 
 def test_coding_worker_activity_heartbeat_rate_limits_and_uses_run_id(monkeypatch):

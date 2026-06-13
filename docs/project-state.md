@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-13 10:34 UTC
+Last updated: 2026-06-13 12:48 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -21,6 +21,7 @@ This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork
 | Command Center model | merged | `docs/sligo-command-center.md` records the Work Item / Source / Worker Run model, Hermes/PID project scoping, and current UX contract. The primary lanes are Overview, Inbox, Active, Completed, and Archive. Live runtime must still be smoked separately when code changes. |
 | Autonomous operations loop | planned | `docs/plans/2026-06-08-autonomous-operations-loop-goalplan.md` defines the complete Observe -> Diagnose -> Decide -> Execute -> Verify -> Learn loop, with Command Center as the canonical ledger and policy-gated autonomy boundaries. |
 | Skills boundary | in_progress | Installed default-profile pointers were patched for `hermes-agent`, `hermes-operations`, and `general-coding/references/operator-command-center-ui.md`; intention-setting material should keep moving into this repo state/doc set. |
+| Worker autoreview helper | implemented | Hermes worker bootstrap now materializes `.agents/skills/autoreview/scripts/autoreview` plus `SKILL.md` into worker workspaces for Hermes and PID-style projects before role/delegated worker closeout prompts ask workers to run autoreview. The helper is deterministic/advisory and does not claim model review. |
 
 Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `merged`, `deployed`, `verified`, `superseded`.
 
@@ -45,6 +46,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Reduced the default Kanban dispatcher tick from 10 seconds to 5 seconds and corrected stale CLI guidance that still claimed the embedded gateway dispatcher ticked every 60 seconds.
 - [x] Hardened self-improvement proposal ingestion so fenced proposal JSON is extracted as a whole fenced block, skips non-payload fences, and tolerates earlier bad JSON-looking examples before the real `self_improvement.proposal_run.v1` payload.
 - [x] Updated cron output artifacts to render a compact final-result envelope before large injected prompt/context transcripts while preserving the raw transcript later for audits and parser compatibility.
+- [x] Added reusable worker autoreview helper materialization so Sligo worker-board role workers and delegated coding workers get a repo-local advisory helper by default instead of reporting autoreview discovery as skipped when no external OpenClaw install exists.
 
 ## In Progress
 
