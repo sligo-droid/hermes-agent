@@ -1530,6 +1530,76 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         return _run_job_impl(job)
 
 
+def _cron_output_metadata_value(value: object) -> str:
+    text = str(value if value is not None else "").replace("\r\n", "\n").replace("\r", "\n")
+    return json.dumps(text, ensure_ascii=False)
+
+
+def _render_job_output(
+    job: dict,
+    prompt: str,
+    *,
+    status: str,
+    final_response: str = "",
+    error_text: str = "",
+    run_time: str | None = None,
+) -> str:
+    """Render cron output artifacts with the result envelope before prompt context."""
+    job_id = job["id"]
+    job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    schedule = job.get("schedule_display", "N/A")
+    run_time = run_time or _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+    title_suffix = " (FAILED)" if status != "success" else ""
+
+    metadata = "\n".join(
+        (
+            "---",
+            "artifact_schema: cron-output-v2",
+            "rendering: final-first",
+            f"job_id: {_cron_output_metadata_value(job_id)}",
+            f"job_name: {_cron_output_metadata_value(job_name)}",
+            f"run_time: {_cron_output_metadata_value(run_time)}",
+            f"schedule: {_cron_output_metadata_value(schedule)}",
+            f"status: {_cron_output_metadata_value(status)}",
+            "---",
+        )
+    )
+
+    if status == "success":
+        result_heading = "## Final response"
+        result_body = final_response if final_response else "(No response generated)"
+    else:
+        result_heading = "## Error"
+        result_body = f"```\n{error_text}\n```"
+
+    if status == "success":
+        raw_response_section = f"## Response\n\n{result_body}"
+    else:
+        raw_response_section = f"## Error detail\n\n{result_body}"
+
+    return f"""# Cron Job: {job_name}{title_suffix}
+
+{metadata}
+
+**Job ID:** {job_id}
+**Run Time:** {run_time}
+**Schedule:** {schedule}
+**Status:** {status}
+
+{result_heading}
+
+{result_body}
+
+## Prompt/context transcript
+
+## Prompt
+
+{prompt}
+
+{raw_response_section}
+"""
+
+
 def _resolve_cron_memory_mode(cfg: dict, job_id: str = "") -> tuple[bool, bool]:
     """Return (skip_memory, memory_read_only) for cron.memory_mode."""
     cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
@@ -2119,20 +2189,12 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
         
-        output = f"""# Cron Job: {job_name}
-
-**Job ID:** {job_id}
-**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
-**Schedule:** {job.get('schedule_display', 'N/A')}
-
-## Prompt
-
-{prompt}
-
-## Response
-
-{logged_response}
-"""
+        output = _render_job_output(
+            job,
+            prompt,
+            status="success",
+            final_response=logged_response,
+        )
         
         logger.info("Job '%s' completed successfully", job_name)
         return True, output, final_response, None
@@ -2141,22 +2203,12 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         
-        output = f"""# Cron Job: {job_name} (FAILED)
-
-**Job ID:** {job_id}
-**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
-**Schedule:** {job.get('schedule_display', 'N/A')}
-
-## Prompt
-
-{prompt}
-
-## Error
-
-```
-{error_msg}
-```
-"""
+        output = _render_job_output(
+            job,
+            prompt,
+            status="failed",
+            error_text=error_msg,
+        )
         return False, output, "", error_msg
 
     finally:
