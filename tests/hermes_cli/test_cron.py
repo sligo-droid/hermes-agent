@@ -5,7 +5,7 @@ from argparse import Namespace
 import pytest
 
 from cron.jobs import create_job, get_job, list_jobs
-from hermes_cli.cron import cron_command
+from hermes_cli.cron import _print_overdue_proposal_findings, cron_command
 
 
 @pytest.fixture()
@@ -111,3 +111,35 @@ class TestCronCommandLifecycle:
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
         assert jobs[0]["profile"] == "default"
+
+
+def test_overdue_proposal_findings_render_operator_evidence(capsys):
+    _print_overdue_proposal_findings(
+        [
+            {
+                "job_id": "17abff6b6061",
+                "job_name": "Daily retrospective",
+                "expected_missed_slot": "2026-06-12T06:00:00-04:00",
+                "next_run_at": "2026-06-12T06:00:00-04:00",
+                "last_run_at": "2026-06-11T06:18:08-04:00",
+                "last_output_path": "/tmp/output.md",
+                "session": {
+                    "available": True,
+                    "session_id": "cron_17abff6b6061_20260613_060016",
+                    "stale_open_session": False,
+                },
+                "scheduler_logs": {
+                    "available": True,
+                    "excerpts": ["agent.log: missed its scheduled time"],
+                },
+            }
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert "Overdue self-improvement proposal cron" in out
+    assert "17abff6b6061 (Daily retrospective)" in out
+    assert "Expected missed slot: 2026-06-12T06:00:00-04:00" in out
+    assert "Last output: /tmp/output.md" in out
+    assert "cron_17abff6b6061_20260613_060016" in out
+    assert "agent.log: missed its scheduled time" in out
