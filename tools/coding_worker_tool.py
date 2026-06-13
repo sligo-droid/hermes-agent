@@ -656,8 +656,7 @@ def delegate_coding_task(
         )
         duration = round(time.monotonic() - started, 2)
         success = bool(result.final_text) and not result.error and not result.interrupted
-        return json.dumps(
-            {
+        payload = {
                 "success": success,
                 "status": "completed" if success else "partial",
                 "summary": result.final_text,
@@ -671,9 +670,13 @@ def delegate_coding_task(
                 "thread_id": result.thread_id,
                 "turn_id": result.turn_id,
                 "tool_iterations": result.tool_iterations,
-            },
-            ensure_ascii=False,
-        )
+        }
+        no_final_metadata = getattr(result, "no_final_metadata", None)
+        if no_final_metadata:
+            payload["evidence_status"] = no_final_metadata.get("evidence_status") or "degraded"
+            payload["failure_class"] = no_final_metadata.get("failure_class") or "no_final_text"
+            payload["no_final_metadata"] = no_final_metadata
+        return json.dumps(payload, ensure_ascii=False)
 
     try:
         from agent.opencode_worker import (
