@@ -1572,6 +1572,11 @@ def _render_job_output(
         result_heading = "## Error"
         result_body = f"```\n{error_text}\n```"
 
+    if status == "success":
+        raw_response_section = f"## Response\n\n{result_body}"
+    else:
+        raw_response_section = f"## Error detail\n\n{result_body}"
+
     return f"""# Cron Job: {job_name}{title_suffix}
 
 {metadata}
@@ -1590,6 +1595,8 @@ def _render_job_output(
 ## Prompt
 
 {prompt}
+
+{raw_response_section}
 """
 
 

@@ -45,12 +45,20 @@ def test_success_output_artifact_renders_final_response_before_large_prompt_cont
     assert "## Final response" in output
     assert "## Prompt/context transcript" in output
     assert "## Prompt" in output
+    assert "## Response" in output
 
     final_line = _line_number(output, final_response)
     transcript_line = _line_number(output, "## Prompt/context transcript")
     prompt_line = _line_number(output, prompt_sentinel)
+    raw_response_line = _line_number(output, "## Response")
+    raw_response_content_line = max(
+        idx
+        for idx, line in enumerate(output.splitlines(), start=1)
+        if final_response in line
+    )
     assert final_line <= 50
     assert final_line < transcript_line < prompt_line
+    assert prompt_line < raw_response_line < raw_response_content_line
 
 
 def test_failure_output_artifact_renders_error_before_large_prompt_context():
@@ -79,12 +87,15 @@ def test_failure_output_artifact_renders_error_before_large_prompt_context():
     assert "## Error" in output
     assert "## Prompt/context transcript" in output
     assert "## Prompt" in output
+    assert "## Error detail" in output
 
     error_line = _line_number(output, error_text)
     transcript_line = _line_number(output, "## Prompt/context transcript")
     prompt_line = _line_number(output, prompt_sentinel)
+    error_detail_line = _line_number(output, "## Error detail")
     assert error_line <= 50
     assert error_line < transcript_line < prompt_line
+    assert prompt_line < error_detail_line
 
 
 def test_saved_temp_output_artifact_keeps_final_first_rendering(tmp_path, monkeypatch):
@@ -112,3 +123,7 @@ def test_saved_temp_output_artifact_keeps_final_first_rendering(tmp_path, monkey
     assert _line_number(saved, "## Prompt/context transcript") < _line_number(
         saved, "MANUAL_INSPECTION_PROMPT_SENTINEL"
     )
+    assert _line_number(saved, "MANUAL_INSPECTION_PROMPT_SENTINEL") < _line_number(
+        saved, "## Response"
+    )
+    assert saved.rfind("MANUAL_INSPECTION_FINAL_RESPONSE") > saved.find("## Response")
