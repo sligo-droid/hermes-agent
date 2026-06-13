@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-12 23:35 UTC
+Last updated: 2026-06-13 10:22 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -43,6 +43,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Reduced Command Center snapshot read cost with batched annotation enrichment, short in-process snapshot caching with mutation invalidation, and archived-board metadata caching keyed by archive directory mtime.
 - [x] Serialized Discord worker-board `board.json` metadata mutations behind a per-board sidecar lock so concurrent gateway, dashboard, CLI, worker, and foreman writers do not drop one-shot terminal sync flags.
 - [x] Reduced the default Kanban dispatcher tick from 10 seconds to 5 seconds and corrected stale CLI guidance that still claimed the embedded gateway dispatcher ticked every 60 seconds.
+- [x] Hardened self-improvement proposal ingestion so fenced proposal JSON is extracted as a whole fenced block, skips non-payload fences, and tolerates earlier bad JSON-looking examples before the real `self_improvement.proposal_run.v1` payload.
 
 ## In Progress
 

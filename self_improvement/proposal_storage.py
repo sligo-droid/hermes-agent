@@ -12,9 +12,9 @@ from typing import Any
 
 from hermes_constants import get_hermes_home
 
-from self_improvement.proposals import ProposalValidationError, validate_proposal_run
+from self_improvement.proposals import CONTRACT_VERSION, ProposalValidationError, validate_proposal_run
 
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
 _PRIORITY_ALIASES = {
     "p0": "critical",
     "p1": "critical",
@@ -159,8 +159,30 @@ def _ensure_card_action_columns(conn: sqlite3.Connection) -> None:
 
 
 def _parse_payload(source_markdown: str) -> dict[str, Any]:
-    match = _JSON_FENCE_RE.search(source_markdown)
-    raw = match.group(1) if match else source_markdown.strip()
+    first_payload: dict[str, Any] | None = None
+    first_json_error: json.JSONDecodeError | None = None
+    for match in _JSON_FENCE_RE.finditer(source_markdown):
+        candidate = match.group(1).strip()
+        if not candidate.startswith("{"):
+            continue
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            if first_json_error is None:
+                first_json_error = exc
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("contract_version") == CONTRACT_VERSION:
+            return payload
+        if first_payload is None:
+            first_payload = payload
+    if first_payload is not None:
+        return first_payload
+    if first_json_error is not None:
+        exc = first_json_error
+        raise ProposalValidationError(f"proposal JSON parse error at line {exc.lineno}, column {exc.colno}: {exc.msg}") from exc
+    raw = source_markdown.strip()
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
