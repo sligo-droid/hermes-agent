@@ -126,6 +126,38 @@ def cron_list(show_all: bool = False):
         print()
 
 
+def _print_overdue_proposal_findings(findings):
+    if not findings:
+        return
+
+    print(color("  ⚠  Overdue self-improvement proposal cron(s)", Colors.YELLOW))
+    for finding in findings:
+        print(f"  - {finding['job_id']} ({finding['job_name']})")
+        print(f"    Expected missed slot: {finding.get('expected_missed_slot') or 'unknown'}")
+        print(f"    Next run: {finding.get('next_run_at') or 'unknown'}")
+        print(f"    Last run: {finding.get('last_run_at') or 'never'}")
+        print(f"    Last output: {finding.get('last_output_path') or 'unavailable'}")
+
+        session = finding.get("session") or {}
+        session_id = session.get("session_id") or "unavailable"
+        stale = "yes" if session.get("stale_open_session") else "no"
+        if not session.get("available") and session.get("unavailable_reason"):
+            session_id = f"unavailable ({session['unavailable_reason']})"
+        print(f"    Matching session: {session_id}; stale open: {stale}")
+
+        logs = finding.get("scheduler_logs") or {}
+        excerpts = logs.get("excerpts") or []
+        if excerpts:
+            print("    Scheduler log excerpts:")
+            for excerpt in excerpts[:3]:
+                print(f"      {excerpt}")
+        elif logs.get("unavailable_reason"):
+            print(f"    Scheduler log excerpts: unavailable ({logs['unavailable_reason']})")
+        else:
+            print("    Scheduler log excerpts: none matched")
+    print()
+
+
 def cron_tick():
     """Run due jobs once and exit."""
     from cron.scheduler import tick
@@ -134,7 +166,7 @@ def cron_tick():
 
 def cron_status():
     """Show cron execution status."""
-    from cron.jobs import list_jobs
+    from cron.jobs import audit_overdue_self_improvement_proposals, list_jobs
     from hermes_cli.gateway import find_gateway_pids
 
     print()
@@ -161,6 +193,11 @@ def cron_status():
             print(f"  Next run: {min(next_runs)}")
     else:
         print("  No active jobs")
+
+    findings = audit_overdue_self_improvement_proposals()
+    if findings:
+        print()
+        _print_overdue_proposal_findings(findings)
 
     print()
 

@@ -9,6 +9,7 @@ import copy
 import json
 import logging
 import shutil
+import sqlite3
 import tempfile
 import threading
 import os
@@ -371,6 +372,207 @@ def _compute_grace_seconds(schedule: dict) -> int:
             pass
 
     return MIN_GRACE
+
+
+def _parse_cron_timestamp(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return _ensure_aware(datetime.fromisoformat(str(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _newest_job_output_path(job_id: str, output_root: Optional[Path] = None) -> Optional[str]:
+    try:
+        job_output_dir = (output_root or OUTPUT_DIR) / _job_output_dir(job_id).name
+    except ValueError:
+        return None
+    try:
+        candidates = [path for path in job_output_dir.glob("*.md") if path.is_file()]
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    newest = max(candidates, key=lambda path: (path.stat().st_mtime, path.name))
+    return str(newest)
+
+
+def _session_evidence_for_job(
+    job_id: str,
+    *,
+    session_db_path: Optional[Path] = None,
+    stale_after_seconds: int = 6 * 60 * 60,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    db_path = session_db_path or (get_hermes_home() / "state.db")
+    evidence: Dict[str, Any] = {
+        "session_id": None,
+        "stale_open_session": False,
+        "available": False,
+        "unavailable_reason": None,
+    }
+    if not db_path.exists():
+        evidence["unavailable_reason"] = f"session database not found: {db_path}"
+        return evidence
+
+    uri = f"file:{db_path}?mode=ro"
+    prefix = f"cron_{job_id}_"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                """
+                SELECT id, started_at, ended_at
+                FROM sessions
+                WHERE id LIKE ?
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                (f"{prefix}%",),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        evidence["unavailable_reason"] = f"session database unavailable: {exc}"
+        return evidence
+
+    evidence["available"] = True
+    if not row:
+        return evidence
+
+    evidence["session_id"] = row["id"]
+    if row["ended_at"] is None and row["started_at"] is not None:
+        check_now = now or _hermes_now()
+        try:
+            age = check_now.timestamp() - float(row["started_at"])
+            evidence["stale_open_session"] = age > stale_after_seconds
+        except (TypeError, ValueError, OSError):
+            evidence["stale_open_session"] = True
+    return evidence
+
+
+def _scheduler_log_excerpts(
+    job_id: str,
+    needles: List[str],
+    *,
+    log_root: Optional[Path] = None,
+    max_lines: int = 5,
+) -> Dict[str, Any]:
+    root = log_root or (get_hermes_home() / "logs")
+    evidence: Dict[str, Any] = {
+        "excerpts": [],
+        "available": False,
+        "unavailable_reason": None,
+    }
+    if not root.exists():
+        evidence["unavailable_reason"] = f"log directory not found: {root}"
+        return evidence
+
+    log_files: List[Path] = []
+    for pattern in ("agent.log*", "gateway.log*", "errors.log*"):
+        try:
+            log_files.extend(path for path in root.glob(pattern) if path.is_file())
+        except OSError:
+            evidence["unavailable_reason"] = f"log directory unreadable: {root}"
+            return evidence
+
+    if not log_files:
+        evidence["unavailable_reason"] = f"no scheduler logs found in: {root}"
+        return evidence
+
+    evidence["available"] = True
+    terms = [term for term in [job_id, *needles] if term]
+    excerpts: List[str] = []
+    for log_file in sorted(log_files, key=lambda path: path.stat().st_mtime, reverse=True):
+        try:
+            lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines[-500:]):
+            if any(term in line for term in terms):
+                excerpts.append(f"{log_file.name}: {line[:500]}")
+                if len(excerpts) >= max_lines:
+                    evidence["excerpts"] = list(reversed(excerpts))
+                    return evidence
+    evidence["excerpts"] = list(reversed(excerpts))
+    return evidence
+
+
+def audit_overdue_self_improvement_proposals(
+    *,
+    jobs: Optional[List[Dict[str, Any]]] = None,
+    now: Optional[datetime] = None,
+    output_root: Optional[Path] = None,
+    log_root: Optional[Path] = None,
+    session_db_path: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    """Return read-only overdue-run findings for proposal cron jobs.
+
+    The detector mirrors ``get_due_jobs`` stale-run semantics: a recurring
+    enabled proposal job is overdue only after its stored ``next_run_at`` is
+    older than the scheduler grace window. It does not advance schedules or
+    otherwise mutate cron state.
+    """
+    check_now = now or _hermes_now()
+    source_jobs = jobs if jobs is not None else load_jobs()
+    findings: List[Dict[str, Any]] = []
+
+    for raw_job in source_jobs:
+        job = _normalize_job_record(copy.deepcopy(raw_job))
+        if not isinstance(job.get("self_improvement_proposal"), dict):
+            continue
+        if not job.get("enabled", True) or job.get("state") == "paused":
+            continue
+        if job.get("no_agent"):
+            continue
+
+        schedule = job.get("schedule") or {}
+        if schedule.get("kind") not in {"cron", "interval"}:
+            continue
+
+        next_run_at = job.get("next_run_at")
+        next_run_dt = _parse_cron_timestamp(next_run_at)
+        if next_run_dt is None:
+            continue
+
+        grace_seconds = _compute_grace_seconds(schedule)
+        overdue_after = next_run_dt + timedelta(seconds=grace_seconds)
+        if check_now <= overdue_after:
+            continue
+
+        job_id = job.get("id", "unknown")
+        session_evidence = _session_evidence_for_job(
+            job_id,
+            session_db_path=session_db_path,
+            now=check_now,
+        )
+        needles = [
+            str(next_run_at or ""),
+            str(job.get("last_run_at") or ""),
+            str(session_evidence.get("session_id") or ""),
+            "missed its scheduled time",
+            "Fast-forwarding to next run",
+        ]
+        log_evidence = _scheduler_log_excerpts(job_id, needles, log_root=log_root)
+
+        findings.append(
+            {
+                "job_id": job_id,
+                "job_name": job.get("name") or job_id,
+                "expected_missed_slot": next_run_at,
+                "next_run_at": next_run_at,
+                "last_run_at": job.get("last_run_at"),
+                "last_output_path": _newest_job_output_path(job_id, output_root),
+                "grace_seconds": grace_seconds,
+                "overdue_after": overdue_after.isoformat(),
+                "session": session_evidence,
+                "scheduler_logs": log_evidence,
+            }
+        )
+
+    return findings
 
 
 def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None) -> Optional[str]:
