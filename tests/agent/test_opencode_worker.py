@@ -632,7 +632,82 @@ def test_no_output_success_without_matching_session_does_not_export(monkeypatch,
     assert result.final_text == ""
     assert result.thread_id is None
     assert result.error == "OpenCode completed without producing final text."
+    assert result.no_final_metadata["classification"] == "no_final_text"
+    assert result.no_final_metadata["evidence_status"] == "degraded"
+    assert result.no_final_metadata["failure_class"] == "no_final_text"
+    assert result.no_final_metadata["backend"] == "opencode"
+    assert result.no_final_metadata["cwd"] == str(tmp_path)
+    assert result.no_final_metadata["export_status"] == {
+        "status": "not_attempted",
+        "reason": "no_session_id",
+    }
+    assert result.no_final_metadata["local_file_changes"] is False
+    assert result.no_final_metadata["local_commit_detected"] is False
+    assert result.no_final_metadata["clean_committed_branch"] is False
     assert [cmd for cmd in calls if len(cmd) > 1 and cmd[1] == "export"] == []
+
+
+def test_no_final_with_clean_commit_is_recoverable_degraded(monkeypatch, tmp_path):
+    snapshots = [
+        {
+            "available": True,
+            "cwd": str(tmp_path),
+            "branch": "feature",
+            "commit": "before",
+            "dirty": False,
+            "status_entries": 0,
+            "error": None,
+        },
+        {
+            "available": True,
+            "cwd": str(tmp_path),
+            "branch": "feature",
+            "commit": "after",
+            "dirty": False,
+            "status_entries": 0,
+            "error": None,
+        },
+    ]
+    monkeypatch.setattr(ow.shutil, "which", lambda name: "/bin/opencode")
+    monkeypatch.setattr(ow, "_git_artifact_snapshot", lambda workspace: snapshots.pop(0))
+
+    def fake_process(cmd, **_kwargs):
+        return _process_result(
+            stdout=json.dumps({"type": "step_start", "sessionID": "ses-clean"}) + "\n",
+            stderr="",
+            returncode=0,
+        )
+
+    def fake_run(cmd, **_kwargs):
+        if cmd[1] == "export":
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"messages": []}), stderr="")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(ow, "_run_opencode_process", fake_process)
+    monkeypatch.setattr(ow.subprocess, "run", fake_run)
+
+    result = ow.run_opencode_single_pass(
+        "make a commit but return no final",
+        str(tmp_path),
+        timeout=60,
+        agent="build",
+        reasoning_level="xhigh",
+        config=_cfg(),
+    )
+
+    assert result.error == "OpenCode completed without producing final text."
+    assert result.thread_id == "ses-clean"
+    assert result.no_final_metadata["evidence_status"] == "recoverable_degraded"
+    assert result.no_final_metadata["local_commit_detected"] is True
+    assert result.no_final_metadata["clean_committed_branch"] is True
+    assert result.no_final_metadata["local_file_changes"] is False
+    assert result.no_final_metadata["commit"] == "after"
+    assert result.no_final_metadata["branch"] == "feature"
+    assert result.no_final_metadata["export_status"] == {
+        "status": "empty",
+        "session_id": "ses-clean",
+    }
+    assert result.no_final_metadata["stderr_snippet"] == ""
 
 
 def test_reasoning_levels_are_configurable_by_mode(monkeypatch, tmp_path):

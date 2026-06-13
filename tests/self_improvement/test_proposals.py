@@ -417,3 +417,23 @@ def test_cron_proposal_guidance_requests_json_and_no_kanban_mutation():
     assert "card `body` <= 6000 chars" in guidance
     assert "`kanban_task.body` <= 6000 chars" in guidance
     assert "Do not put audit notes" in guidance
+
+
+def test_cron_proposal_guidance_downgrades_no_final_coding_worker_evidence():
+    guidance = build_cron_proposal_guidance("pid", "admin_dogfood_ux_bugfix")
+
+    assert "coding-worker streams with empty or absent final text" in guidance
+    assert "degraded, non-authoritative evidence" in guidance
+    assert "empty coding-worker final must not by itself satisfy a delegated worker evidence floor" in guidance
+    assert "top-level `evidence_status` and `failure_class`" in guidance
+    assert "`no_final_metadata.classification`" in guidance
+    assert "`no_final_metadata.clean_committed_branch`" in guidance
+    assert "`no_final_metadata.commit`" in guidance
+    assert "no recoverable artifact" in guidance
+    assert "do not cite it as delegated evidence" in guidance
+    assert "`evidence_status: recoverable_degraded`" in guidance
+    assert "`local_commit_detected` and `clean_committed_branch`" in guidance
+    assert "recoverable artifact metadata as source/static/log evidence" in guidance
+    assert "still do not claim the empty final itself is authoritative" in guidance
+    assert "Do not reflexively redo parent verification" in guidance
+    assert "redo direct verification only when the artifact is small enough" in guidance

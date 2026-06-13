@@ -706,6 +706,101 @@ def test_delegate_opencode_retries_when_passthrough_signature_rejects_scope(monk
     assert "scope_session_key" not in calls[1]
 
 
+def test_delegate_opencode_no_final_metadata_is_additive_and_degraded(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    monkeypatch.setattr(ow, "load_coding_worker_backend", lambda: ow.BACKEND_OPENCODE)
+    metadata = {
+        "classification": "no_final_text",
+        "evidence_status": "degraded",
+        "failure_class": "no_final_text",
+        "backend": "opencode",
+        "thread_id": "ses-empty",
+        "turn_id": "ses-empty",
+        "cwd": str(tmp_path),
+        "branch": "feature",
+        "commit": "abc123",
+        "export_status": {"status": "empty", "session_id": "ses-empty"},
+        "stderr_snippet": "",
+        "error_snippet": "OpenCode completed without producing final text.",
+        "local_file_changes": False,
+        "local_commit_detected": False,
+        "clean_committed_branch": False,
+    }
+
+    def fake_run(prompt, workspace, **kwargs):
+        return SimpleNamespace(
+            final_text="",
+            error="OpenCode completed without producing final text.",
+            interrupted=False,
+            agents=["build"],
+            plan_text="",
+            thread_id="ses-empty",
+            turn_id="ses-empty",
+            tool_iterations=1,
+            no_final_metadata=metadata,
+        )
+
+    monkeypatch.setattr(ow, "run_opencode_task", fake_run)
+
+    result = json.loads(cwt.delegate_coding_task(task="fix parser", parent_agent=_parent(tmp_path)))
+
+    assert result["success"] is False
+    assert result["status"] == "partial"
+    assert result["backend"] == "opencode"
+    assert result["summary"] == ""
+    assert result["error"] == "OpenCode completed without producing final text."
+    assert result["evidence_status"] == "degraded"
+    assert result["failure_class"] == "no_final_text"
+    assert result["no_final_metadata"] == metadata
+
+
+def test_delegate_opencode_no_final_clean_commit_is_recoverable(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    monkeypatch.setattr(ow, "load_coding_worker_backend", lambda: ow.BACKEND_OPENCODE)
+    metadata = {
+        "classification": "no_final_text",
+        "evidence_status": "recoverable_degraded",
+        "failure_class": "no_final_text",
+        "backend": "opencode",
+        "thread_id": "ses-committed",
+        "turn_id": "ses-committed",
+        "cwd": str(tmp_path),
+        "branch": "feature",
+        "commit": "def456",
+        "export_status": {"status": "empty", "session_id": "ses-committed"},
+        "stderr_snippet": "",
+        "error_snippet": "OpenCode completed without producing final text.",
+        "local_file_changes": False,
+        "local_commit_detected": True,
+        "clean_committed_branch": True,
+    }
+
+    def fake_run(prompt, workspace, **kwargs):
+        return SimpleNamespace(
+            final_text="",
+            error="OpenCode completed without producing final text.",
+            interrupted=False,
+            agents=["build"],
+            plan_text="",
+            thread_id="ses-committed",
+            turn_id="ses-committed",
+            tool_iterations=1,
+            no_final_metadata=metadata,
+        )
+
+    monkeypatch.setattr(ow, "run_opencode_task", fake_run)
+
+    result = json.loads(cwt.delegate_coding_task(task="fix parser", parent_agent=_parent(tmp_path)))
+
+    assert result["success"] is False
+    assert result["evidence_status"] == "recoverable_degraded"
+    assert result["failure_class"] == "no_final_text"
+    assert result["no_final_metadata"]["local_commit_detected"] is True
+    assert result["no_final_metadata"]["clean_committed_branch"] is True
+
+
 def test_delegate_includes_repo_state_preflight(monkeypatch, tmp_path):
     from agent import opencode_worker as ow
 

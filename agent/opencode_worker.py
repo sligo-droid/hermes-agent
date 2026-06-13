@@ -46,6 +46,8 @@ class OpenCodeRunResult:
     stdout: str = ""
     stderr: str = ""
     run_profile: dict[str, Any] = field(default_factory=dict)
+    export_status: dict[str, Any] = field(default_factory=dict)
+    no_final_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -496,6 +498,7 @@ def run_opencode_task(
     agents: list[str] = []
     run_profile = _task_run_profile(cfg, needs_plan)
     worker_prompt = _prompt_with_repo_state_preflight(prompt, workspace)
+    git_before = _git_artifact_snapshot(workspace)
 
     def _capture(event: dict[str, Any]) -> None:
         events.append(event)
@@ -560,6 +563,8 @@ def run_opencode_task(
     build.timed_out = bool(build.timed_out)
     if build.error is None and not build.final_text.strip():
         build.error = "OpenCode completed without producing final text."
+    if build.error == "OpenCode completed without producing final text.":
+        _attach_no_final_metadata(build, workspace=workspace, git_before=git_before)
     build.exit_code = build.exit_code
     if build.thread_id is None:
         build.thread_id = _last_session_id(events)
@@ -590,6 +595,7 @@ def run_opencode_single_pass(
     selected_reasoning = _normalize_reasoning_level(reasoning_level)
     started = time.monotonic()
     events: list[dict[str, Any]] = []
+    git_before = _git_artifact_snapshot(workspace)
 
     def _capture(event: dict[str, Any]) -> None:
         events.append(event)
@@ -629,6 +635,8 @@ def run_opencode_single_pass(
     result.duration_seconds = round(time.monotonic() - started, 2)
     if result.error is None and not result.final_text.strip():
         result.error = "OpenCode completed without producing final text."
+    if result.error == "OpenCode completed without producing final text.":
+        _attach_no_final_metadata(result, workspace=workspace, git_before=git_before)
     if result.thread_id is None:
         result.thread_id = _last_session_id(result.events)
     result.turn_id = result.thread_id
@@ -791,6 +799,10 @@ def _run_opencode_once(
                 result.error = f"OpenCode {agent} run timed out after {timeout:g}s."
     if proc.returncode == 0 and result.error is None and not result.final_text.strip():
         session_id = result.thread_id or _last_session_id(result.events)
+        export_status: dict[str, Any] = {
+            "status": "not_attempted",
+            "reason": "no_session_id",
+        }
         if (
             not session_id
             and not result.events
@@ -807,11 +819,12 @@ def _run_opencode_once(
             )
         if session_id:
             result.thread_id = session_id
-            result.final_text = _load_final_text_from_export(
+            result.final_text, export_status = _load_final_text_from_export_with_status(
                 binary_or_error,
                 session_id,
                 env=process_env,
             )
+        result.export_status = export_status
     if proc.returncode != 0 and result.error is None:
         result.error = _classify_opencode_error(
             result.stdout,
@@ -1003,9 +1016,16 @@ def _parse_opencode_output(
 def _load_final_text_from_export(
     binary: str, session_id: Optional[str], *, env: Optional[dict[str, str]] = None
 ) -> str:
+    text, _status = _load_final_text_from_export_with_status(binary, session_id, env=env)
+    return text
+
+
+def _load_final_text_from_export_with_status(
+    binary: str, session_id: Optional[str], *, env: Optional[dict[str, str]] = None
+) -> tuple[str, dict[str, Any]]:
     """Recover assistant text from ``opencode export`` when JSONL output is sparse."""
     if not session_id:
-        return ""
+        return "", {"status": "not_attempted", "reason": "no_session_id"}
     try:
         proc = subprocess.run(
             [binary, "export", session_id],
@@ -1017,11 +1037,121 @@ def _load_final_text_from_export(
             errors="replace",
             env=env,
         )
-    except Exception:
-        return ""
+    except Exception as exc:
+        return "", {
+            "status": "failed",
+            "reason": type(exc).__name__,
+            "session_id": session_id,
+        }
     if proc.returncode != 0:
-        return ""
-    return _parse_opencode_export_text(proc.stdout)
+        return "", {
+            "status": "failed",
+            "reason": f"exit_code_{proc.returncode}",
+            "session_id": session_id,
+            "stderr_snippet": _bounded_snippet(proc.stderr, limit=500),
+        }
+    text = _parse_opencode_export_text(proc.stdout)
+    return text, {
+        "status": "recovered" if text else "empty",
+        "session_id": session_id,
+    }
+
+
+def _bounded_snippet(text: str, *, limit: int = 1000) -> str:
+    snippet = (text or "").strip()
+    if len(snippet) <= limit:
+        return snippet
+    return snippet[:limit].rstrip() + "... [truncated]"
+
+
+def _git_artifact_snapshot(workspace: str) -> dict[str, Any]:
+    cwd = str(Path(workspace).expanduser().resolve())
+    base = {
+        "available": False,
+        "cwd": cwd,
+        "branch": None,
+        "commit": None,
+        "dirty": False,
+        "status_entries": 0,
+        "error": None,
+    }
+
+    def run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", cwd, *args],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+    try:
+        root = run_git(["rev-parse", "--show-toplevel"])
+        if root.returncode != 0:
+            base["error"] = _bounded_snippet(root.stderr or root.stdout, limit=300) or "not_git_repository"
+            return base
+        branch = run_git(["rev-parse", "--abbrev-ref", "HEAD"])
+        commit = run_git(["rev-parse", "HEAD"])
+        status = run_git(["status", "--porcelain"])
+    except Exception as exc:
+        base["error"] = type(exc).__name__
+        return base
+
+    status_text = status.stdout if status.returncode == 0 else ""
+    entries = [line for line in status_text.splitlines() if line.strip()]
+    base.update(
+        {
+            "available": True,
+            "branch": (branch.stdout or "").strip() if branch.returncode == 0 else None,
+            "commit": (commit.stdout or "").strip() if commit.returncode == 0 else None,
+            "dirty": bool(entries),
+            "status_entries": len(entries),
+            "error": None if status.returncode == 0 else _bounded_snippet(status.stderr, limit=300),
+        }
+    )
+    return base
+
+
+def _attach_no_final_metadata(
+    result: OpenCodeRunResult,
+    *,
+    workspace: str,
+    git_before: dict[str, Any],
+) -> None:
+    git_after = _git_artifact_snapshot(workspace)
+    commit_changed = bool(
+        git_before.get("available")
+        and git_after.get("available")
+        and git_before.get("commit")
+        and git_after.get("commit")
+        and git_before.get("commit") != git_after.get("commit")
+    )
+    file_changes = bool(git_after.get("available") and git_after.get("dirty"))
+    recoverable = bool(commit_changed and not git_after.get("dirty"))
+    result.no_final_metadata = {
+        "classification": "no_final_text",
+        "evidence_status": "recoverable_degraded" if recoverable else "degraded",
+        "failure_class": "no_final_text",
+        "backend": result.backend or BACKEND_OPENCODE,
+        "thread_id": result.thread_id,
+        "turn_id": result.turn_id,
+        "cwd": str(Path(workspace).expanduser().resolve()),
+        "branch": git_after.get("branch"),
+        "commit": git_after.get("commit"),
+        "export_status": result.export_status or {
+            "status": "not_attempted",
+            "reason": "unavailable",
+        },
+        "stderr_snippet": _bounded_snippet(result.stderr, limit=1000),
+        "error_snippet": _bounded_snippet(result.error or "", limit=1000),
+        "local_file_changes": file_changes,
+        "local_commit_detected": commit_changed,
+        "clean_committed_branch": recoverable,
+        "git_before": git_before,
+        "git_after": git_after,
+    }
 
 
 def _discover_recent_opencode_session_id(
