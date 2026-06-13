@@ -552,6 +552,12 @@ def delegate_coding_task(
     )
     repo_state_notes = _repo_state_guard_notes(workdir)
     dependency_notes = _prepare_pnpm_dependency_links(workdir)
+    try:
+        from hermes_cli.worker_autoreview import autoreview_prompt_note, materialize_autoreview_helper
+
+        autoreview_note = autoreview_prompt_note(materialize_autoreview_helper(workdir))
+    except Exception as exc:
+        autoreview_note = f"Autoreview helper materialization failed before worker start: {exc}"
 
     timeout = (
         float(turn_timeout_seconds)
@@ -574,12 +580,12 @@ def delegate_coding_task(
         "and run focused checks that fit the task.",
         "Do not create commits or pull requests.",
         "Closeout review: after non-trivial code edits and focused checks, "
-        "use the OpenClaw autoreview skill when available "
-        "(https://github.com/openclaw/agent-skills/blob/main/skills/autoreview/SKILL.md). "
+        "run the workspace-local autoreview helper. "
         "Treat findings as advisory, verify actionable findings in the real code path, "
         "fix only concrete in-scope issues, and rerun affected checks after any "
-        "review-triggered edit. If the autoreview helper/skill is unavailable, "
-        "say so in the final summary.",
+        "review-triggered edit. If the helper is unavailable because materialization "
+        "failed, say so in the final summary.",
+        autoreview_note,
         "Final response must summarize changed files, checks run, and any "
         "remaining blockers.",
     ]
