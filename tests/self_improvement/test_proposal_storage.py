@@ -21,6 +21,81 @@ def _valid_payload() -> dict:
     return json.loads(_fixture_text("proposal_run_pid_valid.json"))
 
 
+def test_parse_payload_reads_entire_fenced_json_block_with_nested_values():
+    source = """Human summary before JSON.
+```json
+{
+  "schema": "self_improvement.proposal_run.v1",
+  "cards": [
+    {
+      "evidence_basis": {
+        "missing_live_evidence": [],
+        "supporting_signals": [
+          {"kind": "log", "details": {"nested": true}}
+        ]
+      },
+      "source_excerpts": [
+        {
+          "path": "cron/logs/example.log",
+          "lines": [1, 2],
+          "excerpt": {"text": "nested object"}
+        }
+      ],
+      "kanban_task": {
+        "id": "task-1",
+        "labels": ["self-improvement"],
+        "metadata": {"priority": "normal"}
+      }
+    }
+  ]
+}
+```
+Human summary after JSON.
+"""
+
+    payload = proposal_storage._parse_payload(source)
+
+    card = payload["cards"][0]
+    assert card["evidence_basis"]["supporting_signals"][0]["details"]["nested"] is True
+    assert card["source_excerpts"][0]["excerpt"]["text"] == "nested object"
+    assert card["kanban_task"]["metadata"]["priority"] == "normal"
+
+
+def test_parse_payload_skips_non_json_fences_before_payload():
+    source = """Human summary before JSON.
+```text
+not json and not the proposal payload
+```
+```json
+{"contract_version":"self_improvement.proposal_run.v1","cards":[]}
+```
+"""
+
+    payload = proposal_storage._parse_payload(source)
+
+    assert payload["contract_version"] == "self_improvement.proposal_run.v1"
+    assert payload["cards"] == []
+
+
+def test_parse_payload_prefers_later_proposal_fence_over_bad_candidates():
+    source = """Human summary before JSON.
+```json
+{"not_the_proposal": true}
+```
+```json
+{"not_the_proposal":
+```
+```json
+{"contract_version":"self_improvement.proposal_run.v1","cards":[]}
+```
+"""
+
+    payload = proposal_storage._parse_payload(source)
+
+    assert payload["contract_version"] == "self_improvement.proposal_run.v1"
+    assert payload["cards"] == []
+
+
 def test_profile_safe_db_path_and_initialization(tmp_path, monkeypatch):
     home = tmp_path / "profile-home"
     monkeypatch.setenv("HERMES_HOME", str(home))
