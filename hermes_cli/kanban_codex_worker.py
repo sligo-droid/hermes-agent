@@ -1891,6 +1891,13 @@ def _reset_pr_status_fields(worker: dict[str, Any]) -> None:
         "pr_checks_failed",
         "pr_blocker",
         "pr_skipped_no_changes",
+        "canonical_sync_state",
+        "canonical_sync_error",
+        "canonical_sync_path",
+        "canonical_sync_branch",
+        "canonical_sync_head",
+        "canonical_sync_merge_commit",
+        "canonical_synced_at",
     ):
         worker.pop(key, None)
 
@@ -2293,6 +2300,86 @@ def _ensure_pr_merged(worker: dict[str, Any], *, root: Path, repo: str) -> bool:
         time.sleep(min(poll_seconds, remaining))
 
 
+def _sync_canonical_checkout_after_merge(worker: dict[str, Any], *, branch: str) -> bool:
+    raw_project_path = str(worker.get("project_path") or "").strip()
+    project_path = Path(raw_project_path)
+    merge_commit = str(worker.get("pr_merge_commit") or "").strip()
+    if not raw_project_path or not project_path.is_dir():
+        worker["canonical_sync_state"] = "blocked"
+        worker["canonical_sync_error"] = f"Canonical checkout missing or invalid: {raw_project_path or '(missing)'}"
+        worker["pr_error"] = worker["canonical_sync_error"]
+        worker["pr_blocker"] = worker["pr_error"]
+        return False
+
+    def run_git(args: list[str], *, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=project_path,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    def fail(message: str, result: Optional[subprocess.CompletedProcess[str]] = None) -> bool:
+        detail = ""
+        if result is not None:
+            detail = (result.stderr or result.stdout or "").strip()
+        worker["canonical_sync_state"] = "blocked"
+        worker["canonical_sync_path"] = str(project_path)
+        worker["canonical_sync_branch"] = branch
+        worker["canonical_sync_merge_commit"] = merge_commit
+        worker["pr_error"] = f"{message}: {detail}" if detail else message
+        worker["canonical_sync_error"] = worker["pr_error"]
+        worker["pr_blocker"] = worker["pr_error"]
+        return False
+
+    try:
+        status = run_git(["status", "--porcelain"], timeout=20)
+    except Exception as exc:
+        return fail(f"Canonical checkout status failed: {exc}")
+    if status.returncode != 0:
+        return fail("Canonical checkout status failed", status)
+    if (status.stdout or "").strip():
+        return fail("Canonical checkout is dirty")
+
+    for args, message, timeout in (
+        (["fetch", "origin", "--prune"], "Canonical checkout fetch failed", 120),
+        (["checkout", branch], "Canonical checkout branch checkout failed", 60),
+        (["pull", "--ff-only", "origin", branch], "Canonical checkout fast-forward pull failed", 120),
+    ):
+        try:
+            result = run_git(args, timeout=timeout)
+        except Exception as exc:
+            return fail(f"{message}: {exc}")
+        if result.returncode != 0:
+            return fail(message, result)
+
+    try:
+        head = run_git(["rev-parse", "HEAD"], timeout=20)
+    except Exception as exc:
+        return fail(f"Canonical checkout HEAD lookup failed: {exc}")
+    if head.returncode != 0:
+        return fail("Canonical checkout HEAD lookup failed", head)
+    canonical_head = (head.stdout or "").strip()
+
+    if merge_commit:
+        try:
+            ancestor = run_git(["merge-base", "--is-ancestor", merge_commit, "HEAD"], timeout=20)
+        except Exception as exc:
+            return fail(f"Canonical checkout merge commit verification failed: {exc}")
+        if ancestor.returncode != 0:
+            return fail("Canonical checkout does not contain PR merge commit", ancestor)
+
+    worker["canonical_sync_state"] = "synced"
+    worker["canonical_sync_error"] = ""
+    worker["canonical_sync_path"] = str(project_path)
+    worker["canonical_sync_branch"] = branch
+    worker["canonical_sync_head"] = canonical_head
+    worker["canonical_sync_merge_commit"] = merge_commit
+    worker["canonical_synced_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return True
+
+
 def _ensure_pr(board: Optional[str], workspace: str) -> bool:
     if not board:
         return True
@@ -2360,7 +2447,8 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
                     board=board,
                 )
                 if opened and policy == MERGE_POLICY_AUTO:
-                    _ensure_pr_merged(worker, root=root, repo=repo)
+                    if _ensure_pr_merged(worker, root=root, repo=repo):
+                        _sync_canonical_checkout_after_merge(worker, branch=base)
                 elif opened and policy in {MERGE_POLICY_MANUAL, MERGE_POLICY_NEVER}:
                     worker["pr_merge_skipped"] = True
                     worker["pr_merge_skipped_reason"] = policy
@@ -2399,6 +2487,13 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
                 "pr_merge_commit",
                 "pr_is_draft",
                 "pr_review_decision",
+                "canonical_sync_state",
+                "canonical_sync_error",
+                "canonical_sync_path",
+                "canonical_sync_branch",
+                "canonical_sync_head",
+                "canonical_sync_merge_commit",
+                "canonical_synced_at",
             )
             if key in worker
         },

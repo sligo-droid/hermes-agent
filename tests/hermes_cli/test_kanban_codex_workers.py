@@ -50,6 +50,33 @@ def _pr_view_json(
     )
 
 
+def _canonical_sync_result(
+    cmd: list[str],
+    *,
+    head: str = "def456",
+    dirty: bool = False,
+    pull_failed: bool = False,
+    ancestor_failed: bool = False,
+) -> SimpleNamespace | None:
+    if cmd == ["git", "status", "--porcelain"]:
+        return SimpleNamespace(returncode=0, stdout=" M file.py\n" if dirty else "", stderr="")
+    if cmd == ["git", "fetch", "origin", "--prune"]:
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    if cmd[:2] == ["git", "checkout"]:
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    if cmd[:4] == ["git", "pull", "--ff-only", "origin"]:
+        if pull_failed:
+            return SimpleNamespace(returncode=1, stdout="", stderr="not fast-forward")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    if cmd == ["git", "rev-parse", "HEAD"]:
+        return SimpleNamespace(returncode=0, stdout=f"{head}\n", stderr="")
+    if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+        if ancestor_failed:
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    return None
+
+
 def _claimed_planner(monkeypatch, tmp_path: Path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -3676,6 +3703,7 @@ def test_ensure_pr_never_policy_opens_without_merging(monkeypatch, tmp_path):
     assert meta["pr_merge_skipped"] is True
     assert meta["pr_merge_skipped_reason"] == "never"
     assert meta["pr_blocker"] == ""
+    assert "canonical_sync_state" not in meta
 
 
 def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeypatch, tmp_path):
@@ -3690,7 +3718,10 @@ def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeyp
         project_context={"github_url": "https://github.com/sligo-labs/PID.git", "base_branch": "develop"},
     )
     workspace = tmp_path / "repo"
+    project_path = tmp_path / "canonical"
     workspace.mkdir()
+    project_path.mkdir()
+    dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
     calls = []
     view_states = ["OPEN", "MERGED"]
 
@@ -3705,6 +3736,9 @@ def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeyp
             return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=123, state=state), stderr="")
         if cmd[:3] == ["gh", "pr", "merge"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
+        sync_result = _canonical_sync_result(cmd)
+        if sync_result is not None:
+            return sync_result
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
@@ -3722,10 +3756,128 @@ def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeyp
     pr_merge = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "merge"])
     assert pr_merge[pr_merge.index("--repo") + 1] == "sligo-labs/PID"
     assert ["git", "push", "-u", "origin", "discord/explicit-pr"] in calls
+    sync_commands = [
+        ["git", "status", "--porcelain"],
+        ["git", "fetch", "origin", "--prune"],
+        ["git", "checkout", "develop"],
+        ["git", "pull", "--ff-only", "origin", "develop"],
+        ["git", "rev-parse", "HEAD"],
+        ["git", "merge-base", "--is-ancestor", "abc123", "HEAD"],
+    ]
+    assert [cmd for cmd in calls if cmd in sync_commands] == sync_commands
     meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert meta["pr_url"] == "https://github.com/sligo-labs/PID/pull/123"
     assert meta["pr_state"] == "MERGED"
     assert meta["pr_merge_commit"] == "abc123"
+    assert meta["canonical_sync_state"] == "synced"
+    assert meta["canonical_sync_error"] == ""
+    assert meta["canonical_sync_path"] == str(project_path)
+    assert meta["canonical_sync_branch"] == "develop"
+    assert meta["canonical_sync_head"] == "def456"
+    assert meta["canonical_sync_merge_commit"] == "abc123"
+    assert meta["canonical_synced_at"]
+
+
+def test_ensure_pr_syncs_already_merged_pr(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="already-merged-pr",
+        goal="Ship already merged PR",
+        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
+    )
+    workspace = tmp_path / "repo"
+    project_path = tmp_path / "canonical"
+    workspace.mkdir()
+    project_path.mkdir()
+    dwb._update_worker_meta(
+        board.slug,
+        {"project_path": str(project_path), "pr_url": "https://github.com/sligo-labs/PID/pull/123"},
+    )
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=123, state="MERGED"), stderr="")
+        sync_result = _canonical_sync_result(cmd, head="fedcba")
+        if sync_result is not None:
+            return sync_result
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr(board.slug, str(workspace)) is True
+
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
+    assert ["git", "status", "--porcelain"] in calls
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert meta["pr_state"] == "MERGED"
+    assert meta["canonical_sync_state"] == "synced"
+    assert meta["canonical_sync_head"] == "fedcba"
+
+
+@pytest.mark.parametrize(
+    ("case", "project_exists", "sync_kwargs", "expected"),
+    [
+        ("missing", False, {}, "Canonical checkout missing or invalid"),
+        ("dirty", True, {"dirty": True}, "Canonical checkout is dirty"),
+        ("pull", True, {"pull_failed": True}, "Canonical checkout fast-forward pull failed"),
+        ("ancestor", True, {"ancestor_failed": True}, "Canonical checkout does not contain PR merge commit"),
+    ],
+)
+def test_ensure_pr_blocks_when_canonical_sync_fails(
+    monkeypatch, tmp_path, case, project_exists, sync_kwargs, expected
+):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id=f"sync-blocked-{case}",
+        goal="Ship sync blocked PR",
+        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
+    )
+    workspace = tmp_path / "repo"
+    project_path = tmp_path / "canonical"
+    workspace.mkdir()
+    if project_exists:
+        project_path.mkdir()
+    dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
+    calls = []
+    view_states = ["OPEN", "MERGED"]
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/123\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=123, state=view_states.pop(0)), stderr="")
+        if cmd[:3] == ["gh", "pr", "merge"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        sync_result = _canonical_sync_result(cmd, **sync_kwargs)
+        if sync_result is not None:
+            return sync_result
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr(board.slug, str(workspace)) is False
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert meta["pr_state"] == "MERGED"
+    assert meta["canonical_sync_state"] == "blocked"
+    assert expected in meta["canonical_sync_error"]
+    assert meta["pr_error"] == meta["canonical_sync_error"]
+    assert meta["pr_blocker"] == meta["pr_error"]
+    if not project_exists:
+        assert ["git", "status", "--porcelain"] not in calls
 
 
 def test_ensure_pr_records_merge_checks_and_blocker(monkeypatch, tmp_path):
@@ -3842,7 +3994,10 @@ def test_ensure_pr_falls_back_to_origin_remote_for_repo(monkeypatch, tmp_path):
 
     board = dwb.start_direct_goal(thread_id="remote-pr", goal="Ship remote fallback")
     workspace = tmp_path / "repo"
+    project_path = tmp_path / "canonical"
     workspace.mkdir()
+    project_path.mkdir()
+    dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
     calls = []
 
     def fake_run(cmd, **kwargs):
@@ -3855,6 +4010,9 @@ def test_ensure_pr_falls_back_to_origin_remote_for_repo(monkeypatch, tmp_path):
             return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/124\n", stderr="")
         if cmd[:3] == ["gh", "pr", "view"]:
             return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=124), stderr="")
+        sync_result = _canonical_sync_result(cmd)
+        if sync_result is not None:
+            return sync_result
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
@@ -3878,7 +4036,10 @@ def test_ensure_pr_prefers_checkout_remote_over_stale_project_context(monkeypatc
         project_context={"project_github_url": "https://github.com/sligo-droid/PID"},
     )
     workspace = tmp_path / "repo"
+    project_path = tmp_path / "canonical"
     workspace.mkdir()
+    project_path.mkdir()
+    dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
     calls = []
 
     def fake_run(cmd, **kwargs):
@@ -3891,6 +4052,9 @@ def test_ensure_pr_prefers_checkout_remote_over_stale_project_context(monkeypatc
             return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/124\n", stderr="")
         if cmd[:3] == ["gh", "pr", "view"]:
             return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=124), stderr="")
+        sync_result = _canonical_sync_result(cmd)
+        if sync_result is not None:
+            return sync_result
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
