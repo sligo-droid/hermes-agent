@@ -1033,7 +1033,10 @@ def _source_from_proposal_run(run: dict[str, Any]) -> dict[str, Any]:
         "label": "Self-improvement cron run",
         "title": f"{run.get('project') or 'unknown'} / {run.get('prong') or 'unknown'}",
         "status": status,
-        "bucket": "inbox" if status == "parse_failed" else "sources",
+        # Proposal-run parse failures are source diagnostics, not actionable Work
+        # Items. Keep them visible in the source/runs diagnostics without adding
+        # noise to the decision inbox.
+        "bucket": "sources",
         "created_at": run.get("created_at") or run.get("generated_at") or run.get("ingested_at"),
         "updated_at": run.get("updated_at"),
         "ref": {

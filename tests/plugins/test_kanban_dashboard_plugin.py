@@ -1527,6 +1527,31 @@ def test_self_improvement_runs_endpoint_includes_empty_and_malformed_runs(client
     assert "malformed-run" in failure_keys
 
 
+def test_command_center_keeps_malformed_proposal_runs_out_of_inbox(client):
+    payload = json.loads((FIXTURES / "proposal_run_pid_valid.json").read_text(encoding="utf-8"))
+    payload["project"] = "hermes"
+    payload["prong"] = "system-doctor"
+    payload["cards"][0]["evidence_basis"]["missing_live_evidence"] = {"reason": "browser blocked"}
+    source = "```json\n" + json.dumps(payload) + "\n```"
+
+    result = proposal_storage.ingest_proposal_output(source, source={"source_key": "malformed-hermes-run"})
+    assert result["status"] == "malformed"
+    assert "missing_live_evidence must be an array" in str(result["parse_error"])
+
+    response = client.get(
+        "/api/plugins/kanban/command-center/snapshot",
+        params={"project": "hermes", "force_refresh": "true"},
+    )
+    assert response.status_code == 200, response.text
+    snapshot = response.json()
+    run_sources = [source for source in snapshot["sources"] if source["ref"].get("source_key") == "malformed-hermes-run"]
+
+    assert len(run_sources) == 1
+    assert run_sources[0]["status"] == "parse_failed"
+    assert run_sources[0]["bucket"] == "sources"
+    assert [source for source in snapshot["sources"] if source.get("bucket") == "inbox"] == []
+
+
 def test_scheduled_tasks_have_their_own_column_not_todo(client):
     """Scheduled/time-delay tasks must not be silently bucketed into todo."""
 
