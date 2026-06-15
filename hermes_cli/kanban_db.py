@@ -354,6 +354,12 @@ def board_exists(board: Optional[str] = None) -> bool:
     return _board_db_has_content(d / "kanban.db")
 
 
+def _kanban_db_path_for_slug(slug: str) -> Path:
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
 def _board_db_has_content(path: Path) -> bool:
     """Return True when a board DB exists and is not an empty stub."""
     try:
@@ -407,9 +413,7 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
         )
     if slug is None:
         slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban.db"
-    return board_dir(slug) / "kanban.db"
+    return _kanban_db_path_for_slug(slug)
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
@@ -1508,7 +1512,7 @@ def _board_for_db_path(path: Path, board: Optional[str]) -> Optional[str]:
         return None
     for slug in (get_current_board(), DEFAULT_BOARD):
         try:
-            if kanban_db_path(slug).resolve() == resolved:
+            if _kanban_db_path_for_slug(slug).resolve() == resolved:
                 return slug
         except OSError:
             continue
@@ -2335,19 +2339,21 @@ def connect(
     """
     if db_path is not None:
         path = db_path
+        resolved_board = None
     else:
         path = kanban_db_path(board=board)
+        resolved_board = board
     path.parent.mkdir(parents=True, exist_ok=True)
     with _cross_process_init_lock(path):
         # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
         # and other invalid-header cases without opening a sqlite connection.
         invalid_header_reason = _invalid_sqlite_header_reason(path)
         if invalid_header_reason is not None:
-            _raise_corrupt_existing_db(path, invalid_header_reason, board=board)
+            _raise_corrupt_existing_db(path, invalid_header_reason, board=resolved_board)
         # Full integrity probe — catches corruption past the header (malformed
         # pages, broken internal metadata). Cached per-path after first success
         # via _INITIALIZED_PATHS so it only runs once per process per path.
-        _guard_existing_db_is_healthy(path, board=board)
+        _guard_existing_db_is_healthy(path, board=resolved_board)
         resolved = str(path.resolve())
         conn = _sqlite_connect(path)
         try:
