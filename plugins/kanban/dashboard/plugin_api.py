@@ -113,19 +113,14 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
 def _conn(board: Optional[str] = None):
     """Open a kanban_db connection, creating the schema on first use.
 
-    Every handler that mutates the DB goes through this so the plugin
-    self-heals on a fresh install (no user-visible "no such table"
-    error if somebody hits POST /tasks before GET /board).
-    ``init_db`` is idempotent.
+    Every handler that mutates the DB goes through this. ``kanban_db.connect``
+    is the dashboard source of truth for first-use schema initialization and
+    corruption checks, so callers do not run a second explicit ``init_db`` pass.
 
     ``board`` is the query-param slug (already normalised by
     :func:`_resolve_board`). When ``None`` the active board is used
     via the resolution chain (env var → ``current`` file → ``default``).
     """
-    try:
-        kanban_db.init_db(board=board)
-    except Exception as exc:
-        log.warning("kanban init_db failed: %s", exc)
     return kanban_db.connect(board=board)
 
 
@@ -3055,6 +3050,9 @@ def _board_counts(slug: str) -> dict[str, int]:
     try:
         path = kanban_db.kanban_db_path(board=slug)
         if not path.exists():
+            return {}
+        incident = kanban_db.is_board_paused_for_corruption(slug)
+        if incident and incident.get("fingerprint") == kanban_db._db_content_fingerprint(path):
             return {}
         conn = kanban_db.connect(board=slug)
         try:

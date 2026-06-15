@@ -70,7 +70,7 @@ def client(kanban_home):
     return TestClient(app)
 
 
-def test_conn_initializes_and_connects_once_for_healthy_board(client, monkeypatch):
+def test_conn_uses_connect_as_dashboard_initialization_path(client, monkeypatch):
     pa = sys.modules["hermes_dashboard_plugin_kanban_test"]
     calls: list[tuple[str, str | None]] = []
 
@@ -79,18 +79,18 @@ def test_conn_initializes_and_connects_once_for_healthy_board(client, monkeypatc
 
     fake_conn = FakeConn()
 
-    def fake_init_db(*, board=None):
-        calls.append(("init_db", board))
+    def fail_init_db(*args, **kwargs):
+        raise AssertionError("dashboard _conn must not double-initialize boards")
 
     def fake_connect(*, board=None):
         calls.append(("connect", board))
         return fake_conn
 
-    monkeypatch.setattr(pa.kanban_db, "init_db", fake_init_db)
+    monkeypatch.setattr(pa.kanban_db, "init_db", fail_init_db)
     monkeypatch.setattr(pa.kanban_db, "connect", fake_connect)
 
     assert pa._conn(board="healthy-board") is fake_conn
-    assert calls == [("init_db", "healthy-board"), ("connect", "healthy-board")]
+    assert calls == [("connect", "healthy-board")]
 
 
 def test_board_counts_uses_one_connect_and_no_init_for_healthy_board(client, monkeypatch, tmp_path):
