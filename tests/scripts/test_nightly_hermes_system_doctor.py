@@ -1,4 +1,6 @@
 import json
+import os
+import shutil
 
 from scripts import nightly_hermes_system_doctor as doctor
 
@@ -185,3 +187,113 @@ def test_record_honcho_watchdog_result_accepts_ok_status():
     )
 
     assert issues == []
+
+
+def test_repo_script_is_full_cron_entrypoint_for_live_cron_job():
+    jobs_path = doctor.HERMES_HOME / "cron" / "jobs.json"
+    if jobs_path.exists():
+        jobs = json.loads(jobs_path.read_text()).get("jobs", [])
+        cron_job = next(item for item in jobs if item.get("id") == "2ee992ee65f5")
+        assert cron_job.get("script") == "nightly_hermes_system_doctor.py"
+
+    assert callable(doctor.main)
+    assert callable(doctor.check_hermes_doctor)
+    assert callable(doctor.check_opencode)
+    assert callable(doctor.install_live)
+
+
+def test_script_provenance_records_source_and_live_match(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    hermes_home = tmp_path / "home"
+    source = repo / "scripts" / "nightly_hermes_system_doctor.py"
+    live = hermes_home / "scripts" / "nightly_hermes_system_doctor.py"
+    source.parent.mkdir(parents=True)
+    live.parent.mkdir(parents=True)
+    source.write_text("#!/usr/bin/env python3\nprint('doctor')\n")
+    shutil.copy2(source, live)
+
+    monkeypatch.setattr(doctor, "REPO", repo)
+    monkeypatch.setattr(doctor, "HERMES_HOME", hermes_home)
+    monkeypatch.setattr(doctor, "REPO_SCRIPT", source)
+    monkeypatch.setattr(doctor, "LIVE_SCRIPT", live)
+
+    facts = doctor.script_provenance()
+
+    assert facts["script_live_path"] == str(live)
+    assert facts["script_source_path"] == str(source)
+    assert facts["script_live_sha256"] == facts["script_source_sha256"]
+    assert facts["script_matches_source"] is True
+    assert facts["script_entrypoint_source"] == doctor.ENTRYPOINT_SOURCE_LABEL
+
+
+def test_install_live_backs_up_existing_script_and_preserves_executable(tmp_path, monkeypatch, capsys):
+    repo = tmp_path / "repo"
+    hermes_home = tmp_path / "home"
+    source = repo / "scripts" / "nightly_hermes_system_doctor.py"
+    live = hermes_home / "scripts" / "nightly_hermes_system_doctor.py"
+    source.parent.mkdir(parents=True)
+    live.parent.mkdir(parents=True)
+    source.write_text("#!/usr/bin/env python3\nprint('new doctor')\n")
+    source.chmod(0o755)
+    live.write_text("#!/usr/bin/env python3\nprint('old doctor')\n")
+    live.chmod(0o700)
+
+    monkeypatch.setattr(doctor, "REPO_SCRIPT", source)
+    monkeypatch.setattr(doctor, "LIVE_SCRIPT", live)
+    monkeypatch.setattr(doctor, "HERMES_HOME", hermes_home)
+
+    assert doctor.install_live() == 0
+
+    backups = list((hermes_home / "scripts" / "archive").glob("nightly_hermes_system_doctor.py.*.bak"))
+    assert len(backups) == 1
+    assert backups[0].read_text() == "#!/usr/bin/env python3\nprint('old doctor')\n"
+    assert live.read_text() == source.read_text()
+    assert os.access(live, os.X_OK)
+    assert doctor.sha256_file(live) == doctor.sha256_file(source)
+    output = capsys.readouterr().out
+    assert f"source={source}" in output
+    assert f"destination={live}" in output
+    assert "installed_matches_source=True" in output
+
+
+def test_main_status_persists_provenance_and_normal_healthy_run_is_silent(tmp_path, monkeypatch, capsys):
+    repo = tmp_path / "repo"
+    hermes_home = tmp_path / "home"
+    state = hermes_home / "state" / "nightly-hermes-system-doctor.json"
+    source = repo / "scripts" / "nightly_hermes_system_doctor.py"
+    live = hermes_home / "scripts" / "nightly_hermes_system_doctor.py"
+    source.parent.mkdir(parents=True)
+    live.parent.mkdir(parents=True)
+    source.write_text("doctor source\n")
+    shutil.copy2(source, live)
+
+    def ok_check(_issues, facts):
+        facts["mock_check_ran"] = True
+
+    monkeypatch.setattr(doctor, "REPO", repo)
+    monkeypatch.setattr(doctor, "HERMES_HOME", hermes_home)
+    monkeypatch.setattr(doctor, "STATE", state)
+    monkeypatch.setattr(doctor, "REPO_SCRIPT", source)
+    monkeypatch.setattr(doctor, "LIVE_SCRIPT", live)
+    monkeypatch.setattr(doctor, "check_hermes_doctor", ok_check)
+    monkeypatch.setattr(doctor, "check_auth_list", ok_check)
+    monkeypatch.setattr(doctor, "check_main_inference", ok_check)
+    monkeypatch.setattr(doctor, "check_compression_inference", ok_check)
+    monkeypatch.setattr(doctor, "check_honcho", ok_check)
+    monkeypatch.setattr(doctor, "check_opencode", ok_check)
+
+    monkeypatch.setattr("sys.argv", ["nightly_hermes_system_doctor.py", "--skip-opencode-smoke"])
+    assert doctor.main() == 0
+    assert capsys.readouterr().out == ""
+    facts = json.loads(state.read_text())["facts"]
+    assert facts["script_live_path"] == str(live)
+    assert facts["script_source_path"] == str(source)
+    assert facts["script_live_sha256"] == facts["script_source_sha256"]
+    assert facts["script_matches_source"] is True
+
+    monkeypatch.setattr("sys.argv", ["nightly_hermes_system_doctor.py", "--status", "--skip-opencode-smoke"])
+    assert doctor.main() == 0
+    status_output = capsys.readouterr().out
+    assert "OK Nightly Hermes system doctor" in status_output
+    assert f"source={doctor.ENTRYPOINT_SOURCE_LABEL}" in status_output
+    assert "matches_source=True" in status_output
