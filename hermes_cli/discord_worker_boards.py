@@ -96,6 +96,10 @@ _CONTEXT_PACK_MARKDOWN_FILENAME = "context-pack.md"
 _SKIPPED_BOARD_TARGET_LOG_KEYS: set[tuple[str, str, str]] = set()
 _BOARD_METADATA_LOCK_TIMEOUT_SECONDS = 5.0
 _BOARD_METADATA_LOCK_POLL_SECONDS = 0.05
+_PRE_REVIEW_MAX_TASKS = 5
+_PRE_REVIEW_MAX_LIST_ITEMS = 8
+_PRE_REVIEW_MAX_TEXT_CHARS = 800
+_PRE_REVIEW_SECRET_KEY_RE = re.compile(r"token|secret|password|api[_-]?key|auth|credential", re.IGNORECASE)
 
 
 class TicketMoveConflict(RuntimeError):
@@ -5288,6 +5292,7 @@ def _planner_instructions() -> list[str]:
         "Break the user request into the fewest coherent dev tickets that can be implemented and verified independently.",
         "Use discord_thread_context and context_pack at planning boundaries, but do not paste the full thread context into dev tickets.",
         "Return requirements with stable IDs when the thread/request implies distinct obligations, and put only relevant requirement_ids on each dev ticket.",
+        "Treat live/runtime/deployment/provenance/entrypoint pickup obligations as first-class requirements; the owning dev ticket must include concrete closeout and provenance verification instead of leaving it implicit for reviewer discovery.",
         "Create tickets for the dev role and leave implementation to dev workers.",
         "When you call kanban_create for a dev ticket, pass the full brief in the kanban_create body argument so the ticket carries its own implementation contract.",
         DEV_TICKET_BODY_GUIDANCE,
@@ -6266,6 +6271,125 @@ def _active_pr_finalizer_recovery_task(tasks: list[Any]) -> Optional[Any]:
     return None
 
 
+def _pre_review_safe_text(value: Any, *, max_chars: int = _PRE_REVIEW_MAX_TEXT_CHARS) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if len(text) > max_chars:
+        return text[: max_chars - 3].rstrip() + "..."
+    return text
+
+
+def _pre_review_safe_list(value: Any, allowed: set[str]) -> list[Any]:
+    if not isinstance(value, list):
+        return []
+    items: list[Any] = []
+    for item in value[:_PRE_REVIEW_MAX_LIST_ITEMS]:
+        if isinstance(item, dict):
+            nested = _pre_review_extract_fields(item, allowed)
+            if nested:
+                items.append(nested)
+            continue
+        text = _pre_review_safe_text(item, max_chars=300)
+        if text:
+            items.append(text)
+    return items
+
+
+def _pre_review_extract_fields(data: Any, allowed: set[str]) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    extracted: dict[str, Any] = {}
+    for key, value in data.items():
+        key_text = str(key)
+        normalized = key_text.lower()
+        if normalized not in allowed or _PRE_REVIEW_SECRET_KEY_RE.search(key_text):
+            continue
+        if isinstance(value, list):
+            items = _pre_review_safe_list(value, allowed)
+            if items:
+                extracted[key_text] = items
+        elif isinstance(value, dict):
+            nested = _pre_review_extract_fields(value, allowed)
+            if nested:
+                extracted[key_text] = nested
+        else:
+            text = _pre_review_safe_text(value)
+            if text:
+                extracted[key_text] = text
+    return extracted
+
+
+def _pre_review_readiness_for_completed_dev_runs(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT t.id AS task_id, t.title AS title, r.summary AS summary, r.metadata AS metadata, r.ended_at AS ended_at
+          FROM task_runs r
+          JOIN tasks t ON t.id = r.task_id
+         WHERE t.assignee = ?
+           AND r.outcome = 'completed'
+           AND r.ended_at IS NOT NULL
+         ORDER BY r.ended_at DESC
+         LIMIT ?
+        """,
+        (ROLE_DEV, _PRE_REVIEW_MAX_TASKS),
+    ).fetchall()
+    allowed_fields = {
+        "active_path",
+        "changed_files",
+        "command",
+        "deployment",
+        "handoff",
+        "live_pickup",
+        "notes",
+        "preview",
+        "provenance",
+        "result",
+        "smoke_routes",
+        "source_of_truth",
+        "source_path",
+        "status",
+        "summary",
+        "tests",
+        "url",
+        "verification",
+    }
+    handoffs: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            metadata = json.loads(row["metadata"] or "{}")
+        except Exception:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        evidence = _pre_review_extract_fields(metadata, allowed_fields)
+        raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
+        for key, value in _pre_review_extract_fields(raw, allowed_fields).items():
+            evidence.setdefault(key, value)
+        summary = _pre_review_safe_text(row["summary"], max_chars=500)
+        if summary:
+            evidence.setdefault("summary", summary)
+        if not evidence:
+            continue
+        handoffs.append(
+            {
+                "task_id": str(row["task_id"]),
+                "title": _pre_review_safe_text(row["title"], max_chars=200) or "",
+                "evidence": evidence,
+            }
+        )
+    if not handoffs:
+        return None
+    return {
+        "advisory": (
+            "Reviewer must still inspect the actual diff, tests, and requirements. "
+            "Use these bounded dev handoff snippets to check obvious closeout gaps before spending a review loop, "
+            "especially changed files, tests, provenance, active runtime paths, live pickup, and deployment evidence."
+        ),
+        "dev_handoffs": handoffs,
+    }
+
+
 def reconcile_board(board: str) -> Optional[str]:
     """Advance deterministic Discord worker board phases.
 
@@ -6322,22 +6446,22 @@ def reconcile_board(board: str) -> Optional[str]:
         worker["review_loop_count"] = loops
         worker["phase"] = "reviewing"
         _update_worker_meta(board, worker)
+        reviewer_payload = {
+            "role": ROLE_REVIEWER,
+            "root_goal": worker.get("root_goal") or worker.get("initial_request") or "",
+            "acceptance_criteria": worker.get("criteria") or [],
+            "context_pack": _context_pack_summary(board),
+            "requirements": worker.get("requirements") or [],
+            "review_loop": loops,
+            "loop_limit": loop_limit,
+        }
+        pre_review_readiness = _pre_review_readiness_for_completed_dev_runs(conn)
+        if pre_review_readiness:
+            reviewer_payload["pre_review_readiness"] = pre_review_readiness
         kanban_db.create_task(
             conn,
             title=format_role_round_title("Review Discord implementation", loops),
-            body=json.dumps(
-                {
-                    "role": ROLE_REVIEWER,
-                    "root_goal": worker.get("root_goal") or worker.get("initial_request") or "",
-                    "acceptance_criteria": worker.get("criteria") or [],
-                    "context_pack": _context_pack_summary(board),
-                    "requirements": worker.get("requirements") or [],
-                    "review_loop": loops,
-                    "loop_limit": loop_limit,
-                },
-                indent=2,
-                ensure_ascii=False,
-            ),
+            body=json.dumps(reviewer_payload, indent=2, ensure_ascii=False),
             assignee=ROLE_REVIEWER,
             created_by="discord-worker-harness",
             workspace_kind="dir",
