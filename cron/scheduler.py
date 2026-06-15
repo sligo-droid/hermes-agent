@@ -41,6 +41,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import load_config, _expand_env_vars
+from hermes_cli.codex_auth_incidents import redact as redact_auth_incident_text
+from hermes_cli.codex_auth_incidents import summarize_failure_text
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
@@ -1570,7 +1572,9 @@ def _render_job_output(
         result_body = final_response if final_response else "(No response generated)"
     else:
         result_heading = "## Error"
-        result_body = f"```\n{error_text}\n```"
+        incident_summary = summarize_failure_text(error_text, job=job)
+        error_block = f"```\n{redact_auth_incident_text(error_text)}\n```"
+        result_body = f"{incident_summary}\n\n{error_block}" if incident_summary else error_block
 
     if status == "success":
         raw_response_section = f"## Response\n\n{result_body}"
@@ -2200,7 +2204,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         return True, output, final_response, None
         
     except Exception as e:
-        error_msg = f"{type(e).__name__}: {str(e)}"
+        error_msg = redact_auth_incident_text(f"{type(e).__name__}: {str(e)}")
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         
         output = _render_job_output(

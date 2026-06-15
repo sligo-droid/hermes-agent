@@ -189,6 +189,52 @@ def test_record_honcho_watchdog_result_accepts_ok_status():
     assert issues == []
 
 
+def test_check_codex_auth_incidents_records_one_redacted_issue(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "cron" / "output" / "job-4").mkdir(parents=True)
+    (home / "logs" / "errors.log").write_text(
+        "2026-06-15T03:00:00Z hermes_cli.proxy.adapters.openai_codex AuthenticationError 401 token_invalidated api_key=secret-key\n",
+        encoding="utf-8",
+    )
+    (home / "cron" / "jobs.json").write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "job-4",
+                        "name": "Proposal cron",
+                        "last_status": "error",
+                        "last_error": "openai-codex 401 token_invalidated refresh_token=secret-refresh",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (home / "cron" / "output" / "job-4" / "2026-06-15_03-00-00.md").write_text(
+        "RuntimeError: OpenAI Codex upstream 401 token_invalidated access_token=secret-access\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(doctor, "HERMES_HOME", home)
+    facts = {"hermes_auth_list": "openai-codex: logged in"}
+    issues = []
+
+    doctor.check_codex_auth_incidents(issues, facts)
+
+    assert len(issues) == 1
+    assert issues[0]["severity"] == "warning"
+    assert issues[0]["name"] == "openai-codex credential invalidation incident detected"
+    assert facts["codex_auth_incident"]["provider_route"] == "openai-codex"
+    assert facts["codex_auth_incident"]["current_state"] == "recovered_logged_in"
+    assert facts["codex_auth_incident"]["affected_cron_jobs"] == [{"id": "job-4", "name": "Proposal cron"}]
+    detail = issues[0]["detail"]
+    assert "secret-key" not in detail
+    assert "secret-refresh" not in detail
+    assert "secret-access" not in detail
+    assert "Proposal cron" in detail
+
+
 def test_repo_script_is_full_cron_entrypoint_for_live_cron_job():
     jobs_path = doctor.HERMES_HOME / "cron" / "jobs.json"
     if jobs_path.exists():
@@ -207,15 +253,36 @@ def test_script_provenance_records_source_and_live_match(tmp_path, monkeypatch):
     hermes_home = tmp_path / "home"
     source = repo / "scripts" / "nightly_hermes_system_doctor.py"
     live = hermes_home / "scripts" / "nightly_hermes_system_doctor.py"
+    jobs = hermes_home / "cron" / "jobs.json"
     source.parent.mkdir(parents=True)
     live.parent.mkdir(parents=True)
+    jobs.parent.mkdir(parents=True)
     source.write_text("#!/usr/bin/env python3\nprint('doctor')\n")
     shutil.copy2(source, live)
+    jobs.write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "2ee992ee65f5",
+                        "name": "Nightly Hermes system doctor",
+                        "script": "nightly_hermes_system_doctor.py",
+                        "schedule_display": "0 5 * * *",
+                        "enabled": True,
+                        "state": "scheduled",
+                        "no_agent": False,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
 
     monkeypatch.setattr(doctor, "REPO", repo)
     monkeypatch.setattr(doctor, "HERMES_HOME", hermes_home)
     monkeypatch.setattr(doctor, "REPO_SCRIPT", source)
     monkeypatch.setattr(doctor, "LIVE_SCRIPT", live)
+    monkeypatch.setattr(doctor, "CRON_JOBS", jobs)
 
     facts = doctor.script_provenance()
 
@@ -224,6 +291,75 @@ def test_script_provenance_records_source_and_live_match(tmp_path, monkeypatch):
     assert facts["script_live_sha256"] == facts["script_source_sha256"]
     assert facts["script_matches_source"] is True
     assert facts["script_entrypoint_source"] == doctor.ENTRYPOINT_SOURCE_LABEL
+    assert facts["cron_job_id"] == "2ee992ee65f5"
+    assert facts["cron_job_name"] == "Nightly Hermes system doctor"
+    assert facts["cron_job_script"] == "nightly_hermes_system_doctor.py"
+    assert facts["cron_job_script_resolved_path"] == str(live.resolve())
+    assert facts["cron_job_schedule"] == "0 5 * * *"
+    assert facts["cron_invokes_live_script"] is True
+    assert facts["script_pickup_ready"] is True
+    assert facts["script_pickup_required"] == "none; cron invokes the live script that matches the repo source"
+
+
+def test_script_provenance_records_live_pickup_step_when_source_differs(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    hermes_home = tmp_path / "home"
+    source = repo / "scripts" / "nightly_hermes_system_doctor.py"
+    live = hermes_home / "scripts" / "nightly_hermes_system_doctor.py"
+    jobs = hermes_home / "cron" / "jobs.json"
+    source.parent.mkdir(parents=True)
+    live.parent.mkdir(parents=True)
+    jobs.parent.mkdir(parents=True)
+    source.write_text("new doctor\n", encoding="utf-8")
+    live.write_text("old doctor\n", encoding="utf-8")
+    jobs.write_text(
+        json.dumps({"jobs": [{"id": "2ee992ee65f5", "name": "Nightly Hermes system doctor", "script": "nightly_hermes_system_doctor.py"}]}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(doctor, "REPO", repo)
+    monkeypatch.setattr(doctor, "HERMES_HOME", hermes_home)
+    monkeypatch.setattr(doctor, "REPO_SCRIPT", source)
+    monkeypatch.setattr(doctor, "LIVE_SCRIPT", live)
+    monkeypatch.setattr(doctor, "CRON_JOBS", jobs)
+
+    facts = doctor.script_provenance()
+
+    assert facts["cron_invokes_live_script"] is True
+    assert facts["script_matches_source"] is False
+    assert facts["script_pickup_ready"] is False
+    assert facts["script_pickup_required"] == f"run `{doctor.LIVE_INSTALL_COMMAND}` to copy the repo script to the live cron path"
+
+
+def test_cron_entrypoint_provenance_records_mismatch(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    hermes_home = tmp_path / "home"
+    source = repo / "scripts" / "nightly_hermes_system_doctor.py"
+    live = hermes_home / "scripts" / "nightly_hermes_system_doctor.py"
+    jobs = hermes_home / "cron" / "jobs.json"
+    source.parent.mkdir(parents=True)
+    live.parent.mkdir(parents=True)
+    jobs.parent.mkdir(parents=True)
+    source.write_text("doctor\n", encoding="utf-8")
+    live.write_text("doctor\n", encoding="utf-8")
+    jobs.write_text(
+        json.dumps({"jobs": [{"id": "2ee992ee65f5", "name": "Nightly Hermes system doctor", "script": "/tmp/nightly_hermes_system_doctor.py"}]}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(doctor, "REPO", repo)
+    monkeypatch.setattr(doctor, "HERMES_HOME", hermes_home)
+    monkeypatch.setattr(doctor, "REPO_SCRIPT", source)
+    monkeypatch.setattr(doctor, "LIVE_SCRIPT", live)
+    monkeypatch.setattr(doctor, "CRON_JOBS", jobs)
+
+    facts = doctor.script_provenance()
+
+    assert facts["cron_job_script"] == "/tmp/nightly_hermes_system_doctor.py"
+    assert facts["cron_job_script_resolved_path"] == "/tmp/nightly_hermes_system_doctor.py"
+    assert facts["cron_invokes_live_script"] is False
+    assert facts["script_pickup_ready"] is False
+    assert facts["script_pickup_required"] == "update the Nightly Hermes system doctor cron script entrypoint to the live script path"
 
 
 def test_install_live_backs_up_existing_script_and_preserves_executable(tmp_path, monkeypatch, capsys):

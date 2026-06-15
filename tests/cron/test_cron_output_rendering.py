@@ -98,6 +98,27 @@ def test_failure_output_artifact_renders_error_before_large_prompt_context():
     assert prompt_line < error_detail_line
 
 
+def test_failure_output_artifact_adds_codex_auth_incident_summary():
+    output = _render_job_output(
+        {
+            "id": "codex-auth-job",
+            "name": "Codex auth job",
+            "schedule_display": "daily",
+        },
+        "prompt context",
+        status="failed",
+        error_text="RuntimeError: openai-codex upstream 401 token_invalidated access_token=secret-token",
+        run_time="2026-06-13 12:06:00",
+    )
+
+    assert "### OpenAI Codex auth-route incident" in output
+    assert "Provider route: `openai-codex`" in output
+    assert "codex-auth-job (Codex auth job)" in output
+    assert "access_token=<redacted>" in output
+    assert "secret-token" not in output
+    assert "RuntimeError: openai-codex upstream 401 token_invalidated access_token=<redacted>" in output
+
+
 def test_saved_temp_output_artifact_keeps_final_first_rendering(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     output = _render_job_output(
