@@ -4,6 +4,7 @@ from hermes_cli.codex_auth_incidents import (
     is_codex_auth_failure,
     redact,
     render_codex_auth_incident_summary,
+    summarize_failure_text,
 )
 
 
@@ -114,3 +115,47 @@ def test_collects_bounded_evidence_from_synthetic_home(tmp_path):
     assert incident is not None
     assert incident.historical_evidence_count == 3
     assert incident.affected_cron_jobs == [{"id": "job-3", "name": "Dogfood cron"}]
+
+
+def test_unnamed_cron_jobs_do_not_use_prompt_as_incident_label(tmp_path):
+    home = tmp_path / "home"
+    (home / "cron" / "output" / "job-sensitive").mkdir(parents=True)
+    sensitive_prompt = "Summarize confidential customer escalation with access_token=secret"
+    (home / "cron" / "jobs.json").write_text(
+        '{"jobs":[{"id":"job-sensitive","prompt":"'
+        + sensitive_prompt
+        + '","last_error":"openai-codex 401 token_invalidated"}]}',
+        encoding="utf-8",
+    )
+    (home / "cron" / "output" / "job-sensitive" / "2026-06-15_02-00-00.md").write_text(
+        "RuntimeError: OpenAI Codex 401 token_invalidated\n",
+        encoding="utf-8",
+    )
+
+    evidence = collect_codex_auth_evidence(home)
+    incident = classify_codex_auth_incident(evidence)
+    summary = render_codex_auth_incident_summary(incident)
+
+    assert incident is not None
+    assert incident.affected_cron_jobs == [{"id": "job-sensitive", "name": "job-sensitive"}]
+    assert "job-sensitive (job-sensitive)" in summary
+    assert sensitive_prompt not in summary
+    assert "confidential customer escalation" not in summary
+
+
+def test_summarize_failure_text_uses_explicit_name_or_id_not_prompt():
+    text = "RuntimeError: OpenAI Codex AuthenticationError 401 token_invalidated"
+    sensitive_prompt = "Investigate private Discord message content"
+
+    unnamed_summary = summarize_failure_text(text, job={"id": "job-unnamed", "prompt": sensitive_prompt})
+    named_summary = summarize_failure_text(
+        text,
+        job={"id": "job-named", "name": "Nightly doctor", "prompt": sensitive_prompt},
+    )
+
+    assert unnamed_summary is not None
+    assert "job-unnamed (job-unnamed)" in unnamed_summary
+    assert sensitive_prompt not in unnamed_summary
+    assert named_summary is not None
+    assert "job-named (Nightly doctor)" in named_summary
+    assert sensitive_prompt not in named_summary

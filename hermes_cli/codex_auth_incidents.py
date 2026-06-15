@@ -183,7 +183,7 @@ def summarize_failure_text(text: str, *, job: dict[str, Any] | None = None) -> s
                 "source": "cron.scheduler",
                 "text": text,
                 "cron_job_id": job.get("id"),
-                "cron_job_name": job.get("name") or job.get("prompt"),
+                "cron_job_name": job.get("name"),
             }
         ]
     )
@@ -221,7 +221,7 @@ def collect_codex_auth_evidence(hermes_home: Path, *, max_log_bytes: int = 256_0
                 if not isinstance(job, dict):
                     continue
                 job_id = str(job.get("id") or "")
-                name = str(job.get("name") or job.get("prompt") or job_id)
+                name = str(job.get("name") or job_id)
                 if job_id:
                     job_names[job_id] = name
                 status_text = "\n".join(str(job.get(key) or "") for key in ("last_status", "last_error", "error"))
