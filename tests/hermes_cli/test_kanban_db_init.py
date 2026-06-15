@@ -101,6 +101,53 @@ def test_connect_initialization_is_thread_safe(tmp_path, monkeypatch):
     assert "max_retries" in cols
 
 
+def test_concurrent_fresh_non_default_board_open_is_thread_safe(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    board = "fresh-race-board"
+    db_path = kb.kanban_db_path(board=board)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(12)
+
+    def worker() -> None:
+        try:
+            barrier.wait(timeout=5)
+            conn = kb.connect(board=board)
+            conn.close()
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(12)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert errors == []
+    assert db_path.exists()
+    assert db_path.stat().st_size > 0
+    with kb.connect(board=board) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    assert {"tasks", "task_events"}.issubset(tables)
+
+    empty_stub = kb.boards_root() / "empty-stub" / "kanban.db"
+    empty_stub.parent.mkdir(parents=True)
+    empty_stub.touch()
+    assert [entry["slug"] for entry in kb.list_boards()] == ["default", board]
+    assert kb.board_exists(board)
+    assert not kb.board_exists("empty-stub")
+
+
 def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkeypatch):
     """A pre-AUTOINCREMENT DB is migrated in place: id columns become INTEGER
     PKs, ``last_event_id`` becomes INTEGER, data is preserved, and indexes

@@ -258,6 +258,40 @@ class TestBoardCRUD:
         assert kb.board_exists("legacy-db-only")
         assert kb.board_exists("metadata-only")
 
+    def test_corrupt_board_read_paths_reuse_recorded_incident(self, fresh_home):
+        board = "corrupt-discovered"
+        db_path = kb.kanban_db_path(board=board)
+        db_path.parent.mkdir(parents=True)
+        kb.write_board_metadata(board, name="Corrupt Discovered")
+        original = b"not a sqlite database" * 8
+        db_path.write_bytes(original)
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+        assert any(entry["slug"] == board for entry in kb.list_boards())
+        assert kb.board_exists(board)
+
+        with pytest.raises(kb.KanbanDbCorruptError) as exc_info:
+            kb.connect(board=board)
+        incident = kb.is_board_paused_for_corruption(board)
+        assert incident is not None
+        assert incident == exc_info.value.incident
+        assert incident["fingerprint"] == kb._db_content_fingerprint(db_path)
+        assert incident["quarantine_path"] == str(exc_info.value.backup_path)
+        backups = list(db_path.parent.glob("kanban.db.corrupt.*.bak"))
+        assert backups == [exc_info.value.backup_path]
+        assert backups[0].read_bytes() == original
+
+        for _ in range(3):
+            assert any(entry["slug"] == board for entry in kb.list_boards())
+            assert kb.board_exists(board)
+            kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+            with pytest.raises(kb.KanbanDbCorruptError) as repeat:
+                kb.connect(board=board)
+            assert repeat.value.incident == incident
+            assert repeat.value.backup_path == exc_info.value.backup_path
+            assert list(db_path.parent.glob("kanban.db.corrupt.*.bak")) == backups
+            assert db_path.read_bytes() == original
+
     def test_create_is_idempotent(self, fresh_home):
         kb.create_board("bar")
         kb.create_board("bar")  # no error
