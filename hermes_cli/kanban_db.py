@@ -369,19 +369,34 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
 
     1. Explicit ``board`` arg resolves to that board's deterministic path.
        A stale ambient ``HERMES_KANBAN_DB`` is ignored with a warning.
-    2. When ``board`` arg is None, ``HERMES_KANBAN_DB`` pins the path
-       directly for legacy callers and Hermes-marked worker handoffs.
-    3. When ``board`` arg is None, the active board from
+    2. Hermes-marked worker handoff ``HERMES_KANBAN_DB`` pins the path
+       directly.
+    3. When ``board`` arg is None but ``HERMES_KANBAN_BOARD`` is set,
+       that board resolves to its deterministic path. A stale ambient
+       ``HERMES_KANBAN_DB`` is ignored with a warning.
+    4. When ``board`` arg is None, legacy ``HERMES_KANBAN_DB`` pins the
+       path directly.
+    5. When ``board`` arg is None, the active board from
        :func:`get_current_board` is used.
-    4. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
+    6. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
        Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
     """
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
     slug = _normalize_board_slug(board)
+    marker = os.environ.get(_KANBAN_DB_HANDOFF_MARKER_ENV, "").strip()
+    env_board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    if override and slug is None and marker:
+        return Path(override).expanduser()
+    if override and slug is None and env_board:
+        try:
+            env_slug = _normalize_board_slug(env_board)
+        except ValueError:
+            env_slug = None
+        if env_slug and board_exists(env_slug):
+            slug = env_slug
     if override and slug is None:
         return Path(override).expanduser()
     if override and slug is not None:
-        marker = os.environ.get(_KANBAN_DB_HANDOFF_MARKER_ENV, "").strip()
         marker_hint = " from Hermes worker handoff" if marker else ""
         _log.warning(
             "Ignoring HERMES_KANBAN_DB%s while resolving explicit kanban board=%r; "

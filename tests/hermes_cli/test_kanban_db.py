@@ -3370,6 +3370,27 @@ class TestSharedBoardPaths:
         assert "Ignoring HERMES_KANBAN_DB" in caplog.text
         assert "board='requested'" in caplog.text
 
+    def test_kanban_board_env_ignores_stale_kanban_db_env(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        stale_db = tmp_path / "stale" / "other-board.db"
+        stale_db.parent.mkdir()
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "requested")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(stale_db))
+        kb.create_board("requested")
+
+        with caplog.at_level("WARNING", logger=kb.__name__):
+            resolved = kb.kanban_db_path()
+
+        assert resolved == default_home / "kanban" / "boards" / "requested" / "kanban.db"
+        assert "Ignoring HERMES_KANBAN_DB" in caplog.text
+        assert "board='requested'" in caplog.text
+
     def test_connect_and_init_board_ignore_stale_kanban_db_env(
         self, tmp_path, monkeypatch
     ):
