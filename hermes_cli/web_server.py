@@ -3068,6 +3068,14 @@ def _active_worker_log_lines(*, lines_per_source: int) -> List[str]:
         board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
         conn = None
         try:
+            state = kanban_db.corrupt_board_quarantine_state(board)
+            if state.get("skipped"):
+                out.append(
+                    f"--- worker board={board} degraded: corrupt kanban DB "
+                    f"db_path={state.get('db_path')} next_retry={state.get('next_retry')} "
+                    f"reason={state.get('reason')} ---\n"
+                )
+                continue
             conn = kanban_db.connect(board=board)
             rows = conn.execute(
                 """

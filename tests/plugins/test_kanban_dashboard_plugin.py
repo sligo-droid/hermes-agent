@@ -3122,6 +3122,51 @@ def test_home_channels_empty_when_no_homes_configured(client, monkeypatch):
     assert r.json()["home_channels"] == []
 
 
+def test_boards_endpoint_marks_corrupt_quarantined_board_degraded(client, monkeypatch):
+    board = "dashboard-corrupt"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"not sqlite")
+    monkeypatch.setattr(kb.time, "time", lambda: 3000)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "sqlite refused to open file: file is not a database",
+        fingerprint=kb._db_content_fingerprint(db_path),
+    )
+
+    r = client.get("/api/plugins/kanban/boards")
+
+    assert r.status_code == 200
+    entry = next(b for b in r.json()["boards"] if b["slug"] == board)
+    assert entry["status"] == "degraded"
+    assert entry["counts"] == {}
+    assert entry["corruption"]["next_retry"] == 3000 + kb.CORRUPT_BOARD_RETRY_SECONDS
+    assert "file is not a database" in entry["corruption"]["reason"]
+
+
+def test_stats_endpoint_rejects_corrupt_quarantined_board(client, monkeypatch):
+    board = "dashboard-stats-corrupt"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"not sqlite")
+    monkeypatch.setattr(kb.time, "time", lambda: 4000)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "sqlite refused to open file: file is not a database",
+        fingerprint=kb._db_content_fingerprint(db_path),
+    )
+
+    r = client.get("/api/plugins/kanban/stats", params={"board": board})
+
+    assert r.status_code == 503
+    detail = r.json()["detail"]
+    assert detail["error"] == "kanban_board_corrupt"
+    assert detail["board"] == board
+    assert detail["corruption"]["next_retry"] == 4000 + kb.CORRUPT_BOARD_RETRY_SECONDS
+
+
 # ---------------------------------------------------------------------------
 # Recovery endpoints (reclaim + reassign) and warnings field
 # ---------------------------------------------------------------------------

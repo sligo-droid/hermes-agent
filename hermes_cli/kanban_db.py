@@ -1296,6 +1296,9 @@ class KanbanDbCorruptError(RuntimeError):
         )
 
 
+CORRUPT_BOARD_RETRY_SECONDS = 300
+
+
 def _db_content_fingerprint(path: Path) -> Optional[str]:
     digest = hashlib.sha256()
     try:
@@ -1537,6 +1540,7 @@ def record_corrupt_board_incident(
             Path(str(previous["quarantine_path"]))
             if previous.get("quarantine_path") else None
         )
+    next_retry = now + CORRUPT_BOARD_RETRY_SECONDS
     incident = {
         "status": "paused",
         "repair_status": "not_attempted",
@@ -1547,6 +1551,7 @@ def record_corrupt_board_incident(
         "reason": str(reason),
         "first_seen": first_seen,
         "last_seen": now,
+        "next_retry": next_retry,
     }
     if slug == _ACTIVE_CORRUPT_DISCORD_BOARD_RECOVERY:
         incident["recovery_note"] = (
@@ -1562,6 +1567,88 @@ def record_corrupt_board_incident(
     meta["corruption_incident"] = incident
     _write_board_metadata_raw(slug, meta)
     return incident
+
+
+def is_corrupt_board_db_error(exc: Exception) -> bool:
+    """Conservatively classify DB errors that should pause a board."""
+    if isinstance(exc, KanbanDbCorruptError):
+        return True
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    msg = str(exc).lower()
+    return (
+        "file is not a database" in msg
+        or "database disk image is malformed" in msg
+        or "malformed database" in msg
+    )
+
+
+def corrupt_board_quarantine_state(
+    board: Optional[str] = None,
+    *,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Return whether readers may attempt opening a board DB.
+
+    The check reads only board metadata and the DB bytes fingerprint, so it can
+    safely run before SQLite opens a board already known to be corrupt.
+    """
+    slug = _normalize_board_slug(board) if board is not None else get_current_board()
+    slug = slug or DEFAULT_BOARD
+    db_path = kanban_db_path(slug)
+    try:
+        resolved = db_path.resolve()
+    except OSError:
+        resolved = db_path
+    now = int(time.time()) if now is None else int(now)
+    incident = is_board_paused_for_corruption(slug)
+    try:
+        fingerprint = _db_content_fingerprint(resolved)
+    except Exception:
+        fingerprint = None
+    state: dict[str, Any] = {
+        "board": slug,
+        "db_path": str(resolved),
+        "fingerprint": fingerprint,
+        "incident": incident,
+        "open_allowed": True,
+        "skipped": False,
+        "changed_fingerprint": False,
+        "retry_due": False,
+        "next_retry": None,
+        "reason": None,
+    }
+    if not incident:
+        return state
+    incident_fingerprint = incident.get("fingerprint")
+    state["next_retry"] = incident.get("next_retry")
+    if incident_fingerprint != fingerprint:
+        state["changed_fingerprint"] = True
+        state["reason"] = "db fingerprint changed since corruption incident"
+        return state
+    raw_next_retry = incident.get("next_retry")
+    try:
+        next_retry = int(raw_next_retry or 0)
+    except (TypeError, ValueError):
+        next_retry = 0
+    if raw_next_retry is None:
+        for key in ("last_seen", "first_seen"):
+            try:
+                seen = int(incident.get(key) or 0)
+            except (TypeError, ValueError):
+                seen = 0
+            if seen:
+                next_retry = seen + CORRUPT_BOARD_RETRY_SECONDS
+                break
+    state["next_retry"] = next_retry or None
+    if raw_next_retry is not None and next_retry <= now:
+        state["retry_due"] = True
+        state["reason"] = "corrupt-board retry window expired"
+        return state
+    state["open_allowed"] = False
+    state["skipped"] = True
+    state["reason"] = str(incident.get("reason") or "kanban DB corruption incident")
+    return state
 
 
 def is_board_paused_for_corruption(board: Optional[str] = None) -> Optional[dict[str, Any]]:
@@ -1770,14 +1857,9 @@ def _raise_if_paused_for_unchanged_corruption(
     slug = _board_for_db_path(resolved, board)
     if not slug:
         return
-    incident = is_board_paused_for_corruption(slug)
-    if not incident:
-        return
-    try:
-        current_fingerprint = _db_content_fingerprint(resolved)
-    except Exception:
-        current_fingerprint = None
-    if incident.get("fingerprint") != current_fingerprint:
+    state = corrupt_board_quarantine_state(slug)
+    incident = state.get("incident")
+    if not incident or state.get("open_allowed"):
         return
     backup_path = (
         Path(str(incident["quarantine_path"]))

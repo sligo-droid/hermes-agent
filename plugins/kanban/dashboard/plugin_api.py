@@ -129,6 +129,43 @@ def _conn(board: Optional[str] = None):
     return kanban_db.connect(board=board)
 
 
+def _corrupt_board_payload(state: dict[str, Any]) -> dict[str, Any]:
+    incident = state.get("incident") if isinstance(state.get("incident"), dict) else {}
+    return {
+        "status": "degraded",
+        "reason": state.get("reason") or incident.get("reason") or "kanban DB corruption incident",
+        "db_path": state.get("db_path") or incident.get("db_path"),
+        "fingerprint": state.get("fingerprint") or incident.get("fingerprint"),
+        "first_seen": incident.get("first_seen"),
+        "last_seen": incident.get("last_seen"),
+        "next_retry": state.get("next_retry") or incident.get("next_retry"),
+        "quarantine_path": incident.get("quarantine_path"),
+        "repair_command": incident.get("repair_command") or f"hermes kanban repair --board {state.get('board') or kanban_db.DEFAULT_BOARD}",
+    }
+
+
+def _corrupt_board_state(board: Optional[str]) -> dict[str, Any] | None:
+    try:
+        state = kanban_db.corrupt_board_quarantine_state(board)
+    except Exception:
+        return None
+    return state if state.get("skipped") else None
+
+
+def _raise_if_corrupt_quarantined(board: Optional[str]) -> None:
+    state = _corrupt_board_state(board)
+    if not state:
+        return
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "error": "kanban_board_corrupt",
+            "board": state.get("board") or board or kanban_db.DEFAULT_BOARD,
+            "corruption": _corrupt_board_payload(state),
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Serialization helpers
 # ---------------------------------------------------------------------------
@@ -2941,6 +2978,7 @@ def get_stats(board: Optional[str] = Query(None)):
     board themselves.
     """
     board = _resolve_board(board)
+    _raise_if_corrupt_quarantined(board)
     conn = _conn(board=board)
     try:
         return kanban_db.board_stats(conn)
@@ -3016,6 +3054,7 @@ def dispatch(
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
+    _raise_if_corrupt_quarantined(board)
     conn = _conn(board=board)
     try:
         result = kanban_db.dispatch_once(
@@ -3052,6 +3091,8 @@ class RenameBoardBody(BaseModel):
 
 def _board_counts(slug: str) -> dict[str, int]:
     """Return ``{status: count}`` for a board. Safe on an empty DB."""
+    if _corrupt_board_state(slug):
+        return {}
     try:
         path = kanban_db.kanban_db_path(board=slug)
         if not path.exists():
@@ -3075,7 +3116,13 @@ def list_boards(include_archived: bool = Query(False)):
     current = kanban_db.get_current_board()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
-        b["counts"] = _board_counts(b["slug"])
+        state = _corrupt_board_state(b["slug"])
+        if state:
+            b["status"] = "degraded"
+            b["corruption"] = _corrupt_board_payload(state)
+            b["counts"] = {}
+        else:
+            b["counts"] = _board_counts(b["slug"])
         b["total"] = sum(b["counts"].values())
     return {"boards": boards, "current": current}
 

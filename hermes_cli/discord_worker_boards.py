@@ -4902,6 +4902,36 @@ def public_board_index_snapshot() -> dict[str, Any]:
             worker = _read_worker_meta(slug)
             if worker.get("kind") != "discord_worker_board":
                 continue
+            state = kanban_db.corrupt_board_quarantine_state(slug)
+            if state.get("skipped"):
+                incident = state.get("incident") if isinstance(state.get("incident"), dict) else {}
+                session_id = _public_session_id_for_board(slug, worker)
+                boards.append(
+                    {
+                        "board": slug,
+                        "name": _worker_board_name(worker, board, slug),
+                        "description": board.get("description") or "",
+                        "session_id": session_id,
+                        "public_url": public_session_board_url(session_id),
+                        "worker": _public_worker_meta(worker),
+                        "counts": {},
+                        "running": [],
+                        "runtime": {
+                            "state": "degraded",
+                            "reason": "kanban DB corruption quarantine active",
+                        },
+                        "corruption": {
+                            "status": "degraded",
+                            "reason": state.get("reason") or incident.get("reason"),
+                            "db_path": state.get("db_path") or incident.get("db_path"),
+                            "first_seen": incident.get("first_seen"),
+                            "last_seen": incident.get("last_seen"),
+                            "next_retry": state.get("next_retry") or incident.get("next_retry"),
+                            "quarantine_path": incident.get("quarantine_path"),
+                        },
+                    }
+                )
+                continue
             conn = kanban_db.connect(board=slug)
             try:
                 counts = kanban_db.board_stats(conn).get("by_status", {})
