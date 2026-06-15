@@ -955,6 +955,44 @@ def test_board_thread_state_completed_board_ignores_stale_worker_blocker(monkeyp
     assert dwb.board_thread_state(board.slug) == "done"
 
 
+def test_terminal_non_green_finalization_keeps_summary_and_reaction_blocked(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(thread_id="78011", goal="Do not green-check failed finalization")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        claimed = kanban_db.claim_task(conn, task.id)
+        assert claimed is not None
+        kanban_db.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "summary_message_id": "333",
+            "source_message_id": "111",
+            "pr_url": "https://github.example.test/acme/repo/pull/42",
+            "pr_checks_status": "not checked",
+            "pr_blocker": "GitHub usage limit exceeded",
+        },
+    )
+
+    snapshot = dwb.feature_summary_snapshot(board.slug)
+    target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
+
+    assert dwb.board_thread_state(board.slug) == "blocked"
+    assert dwb.board_thread_reaction_state(board.slug) == "blocked"
+    assert snapshot["state"] == "blocked"
+    assert target["state"] == "blocked"
+    assert "reaction_state" not in target
+
+
 def test_start_direct_goal_activates_board_without_planner(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

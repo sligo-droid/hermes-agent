@@ -744,11 +744,25 @@ def _terminal_worker_reaction_state(worker: dict[str, Any]) -> str:
     phase = str(worker.get("phase") or "").strip().lower()
     if worker.get("cancelled") or status == "cancelled":
         return "errored"
+    if _terminal_worker_has_non_green_finalization(worker):
+        return "blocked"
+    if status == "blocked" and phase != "complete":
+        return "blocked"
     if status == "done" or phase == "complete":
         return "done"
-    if status == "blocked":
-        return "blocked"
     return ""
+
+
+def _terminal_worker_has_non_green_finalization(worker: dict[str, Any]) -> bool:
+    if any(str(worker.get(key) or "").strip() for key in ("pr_blocker", "pr_error", "pr_status_error")):
+        return True
+    if [item for item in worker.get("pr_checks_failed") or [] if str(item).strip()]:
+        return True
+    raw_checks_status = worker.get("pr_checks_status")
+    checks_status = str(raw_checks_status or "").strip().lower()
+    if checks_status in {"failed", "failure", "error", "errored", "cancelled", "timed out", "timed_out"}:
+        return True
+    return False
 
 
 def _terminal_reaction_synced_state(worker: dict[str, Any]) -> str:
@@ -2725,7 +2739,8 @@ def board_thread_state(board: str) -> str:
     worker = _read_worker_meta(board)
     if worker.get("cancelled") or worker.get("goal_status") == "cancelled":
         return "errored"
-    is_terminal = worker.get("goal_status") == "done" or worker.get("phase") == "complete"
+    terminal_state = _terminal_worker_reaction_state(worker)
+    is_terminal = terminal_state in {"done", "blocked", "errored"}
     has_worker_blocker = (
         bool(str(worker.get("blocked_reason") or "").strip())
         or worker.get("goal_status") == "blocked"
@@ -2743,14 +2758,16 @@ def board_thread_state(board: str) -> str:
                 # message on ⏳ hides that stall, while showing ❌ implies a
                 # terminal failure rather than a human-actionable blocker.
                 return "blocked"
+            if terminal_state in {"blocked", "errored"}:
+                return terminal_state
             if is_terminal and all(task.status == "done" for task in tasks):
-                return "done"
+                return terminal_state or "done"
             if any(task.status == "running" for task in tasks):
                 return "running"
             return "active"
 
     if is_terminal:
-        return "done"
+        return terminal_state or "done"
     if has_worker_blocker:
         return "blocked"
     return "active"
