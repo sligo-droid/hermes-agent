@@ -153,6 +153,64 @@ class TestGitHubPrAmendPolicy:
         assert decision.accepted is True
         assert decision.lock_key == "sligo-droid/reserve-index-dtf:feat/irrevocable-fee-recipients"
 
+    def test_exact_repo_allowlists_still_pass_without_wildcards(self):
+        route = json.loads(json.dumps(ROUTE))
+        route["github_pr_amend"].pop("canary_prs")
+        policy = policy_from_route(route)
+        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD)
+        decision = evaluate_request(request, PR_INFO, policy)
+        assert decision.accepted is True
+
+    def test_wildcard_base_org_accepts_other_reserve_repo(self):
+        route = json.loads(json.dumps(ROUTE))
+        route["github_pr_amend"].pop("canary_prs")
+        route["github_pr_amend"]["allowed_base_repos"] = ["reserve-protocol/*"]
+        route["github_pr_amend"]["allowed_head_repos"] = ["sligo-droid/*", "reserve-protocol/*"]
+        payload = json.loads(json.dumps(ISSUE_COMMENT_PAYLOAD))
+        payload["repository"]["full_name"] = "reserve-protocol/other-dtf"
+        payload["issue"]["number"] = 17
+        pr_info = json.loads(json.dumps(PR_INFO))
+        pr_info["base"]["repo"]["full_name"] = "reserve-protocol/other-dtf"
+        pr_info["head"]["repo"]["full_name"] = "reserve-protocol/other-dtf"
+        request = extract_request("issue_comment", payload)
+        decision = evaluate_request(request, pr_info, policy_from_route(route))
+        assert decision.accepted is True
+        assert decision.base_repo == "reserve-protocol/other-dtf"
+        assert decision.head_repo == "reserve-protocol/other-dtf"
+
+    def test_wildcard_base_org_rejects_other_org_before_pr_lookup(self):
+        route = json.loads(json.dumps(ROUTE))
+        route["github_pr_amend"].pop("canary_prs")
+        route["github_pr_amend"]["allowed_base_repos"] = ["reserve-protocol/*"]
+        payload = json.loads(json.dumps(ISSUE_COMMENT_PAYLOAD))
+        payload["repository"]["full_name"] = "someone-else/reserve-index-dtf"
+        request = extract_request("issue_comment", payload)
+        reason = preflight_request(request, policy_from_route(route))
+        assert reason == "base repo 'someone-else/reserve-index-dtf' is not allowlisted"
+
+    def test_wildcard_head_allowlist_rejects_third_party_fork(self):
+        route = json.loads(json.dumps(ROUTE))
+        route["github_pr_amend"].pop("canary_prs")
+        route["github_pr_amend"]["allowed_base_repos"] = ["reserve-protocol/*"]
+        route["github_pr_amend"]["allowed_head_repos"] = ["sligo-droid/*", "reserve-protocol/*"]
+        pr_info = json.loads(json.dumps(PR_INFO))
+        pr_info["head"]["repo"]["full_name"] = "someone-else/reserve-index-dtf"
+        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD)
+        decision = evaluate_request(request, pr_info, policy_from_route(route))
+        assert decision.accepted is False
+        assert "head repo" in decision.reason
+
+    def test_canary_prs_only_narrows_when_configured(self):
+        route = json.loads(json.dumps(ROUTE))
+        route["github_pr_amend"].pop("canary_prs")
+        payload = json.loads(json.dumps(ISSUE_COMMENT_PAYLOAD))
+        payload["issue"]["number"] = 999
+        request = extract_request("issue_comment", payload)
+        assert preflight_request(request, policy_from_route(route)) is None
+
+        route["github_pr_amend"]["canary_prs"] = {"reserve-protocol/reserve-index-dtf": [182]}
+        assert preflight_request(request, policy_from_route(route)) == "PR #999 is outside canary allowlist"
+
     def test_rejects_non_tbrent_sender(self):
         payload = json.loads(json.dumps(ISSUE_COMMENT_PAYLOAD))
         payload["sender"]["login"] = "stranger"
