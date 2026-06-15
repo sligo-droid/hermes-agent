@@ -139,6 +139,68 @@ def test_corrupt_board_quarantine_state_skips_until_retry_window(kanban_home, mo
     assert state["next_retry"] == incident["next_retry"]
 
 
+def test_corrupt_board_quarantine_state_derives_legacy_retry_before_due(kanban_home):
+    board = "legacy-quarantine-window"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"legacy bad sqlite")
+    fingerprint = kb._db_content_fingerprint(db_path)
+    kb._write_board_metadata_raw(
+        board,
+        {
+            "paused": True,
+            "pause_reason": "kanban_db_corruption",
+            "corruption_incident": {
+                "pause_reason": "kanban_db_corruption",
+                "fingerprint": fingerprint,
+                "reason": "legacy corrupt incident",
+                "first_seen": 3000,
+                "last_seen": 3100,
+            },
+        },
+    )
+
+    state = kb.corrupt_board_quarantine_state(board, now=3101)
+
+    assert state["open_allowed"] is False
+    assert state["skipped"] is True
+    assert state["retry_due"] is False
+    assert state["next_retry"] == 3100 + kb.CORRUPT_BOARD_RETRY_SECONDS
+
+
+def test_corrupt_board_quarantine_state_derives_legacy_retry_when_due(kanban_home):
+    board = "legacy-quarantine-due"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"legacy bad sqlite")
+    fingerprint = kb._db_content_fingerprint(db_path)
+    kb._write_board_metadata_raw(
+        board,
+        {
+            "paused": True,
+            "pause_reason": "kanban_db_corruption",
+            "corruption_incident": {
+                "pause_reason": "kanban_db_corruption",
+                "fingerprint": fingerprint,
+                "reason": "legacy corrupt incident",
+                "first_seen": 4000,
+                "last_seen": 4100,
+            },
+        },
+    )
+
+    state = kb.corrupt_board_quarantine_state(
+        board,
+        now=4100 + kb.CORRUPT_BOARD_RETRY_SECONDS,
+    )
+
+    assert state["open_allowed"] is True
+    assert state["skipped"] is False
+    assert state["retry_due"] is True
+    assert state["next_retry"] == 4100 + kb.CORRUPT_BOARD_RETRY_SECONDS
+    assert state["reason"] == "corrupt-board retry window expired"
+
+
 def test_corrupt_board_quarantine_state_allows_retry_when_due_or_changed(kanban_home, monkeypatch):
     board = "quarantine-retry"
     db_path = kb.kanban_db_path(board)

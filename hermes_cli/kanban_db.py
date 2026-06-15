@@ -1641,7 +1641,7 @@ def corrupt_board_quarantine_state(
                 next_retry = seen + CORRUPT_BOARD_RETRY_SECONDS
                 break
     state["next_retry"] = next_retry or None
-    if raw_next_retry is not None and next_retry <= now:
+    if next_retry and next_retry <= now:
         state["retry_due"] = True
         state["reason"] = "corrupt-board retry window expired"
         return state
