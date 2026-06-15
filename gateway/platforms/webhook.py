@@ -864,6 +864,7 @@ class WebhookAdapter(BasePlatformAdapter):
             decision.lock_key,
             delivery_id,
         )
+        await self._safe_github_pr_amend_reaction(request, "eyes")
         return web.json_response(
             {
                 "status": "accepted",
@@ -887,6 +888,7 @@ class WebhookAdapter(BasePlatformAdapter):
     ) -> None:
         """Run the one-shot Hermes worker and release the branch lock."""
         try:
+            await self._safe_github_pr_amend_reaction(request, "rocket")
             result = await self._run_github_pr_amend_subprocess(prompt, policy)
             if result.returncode == 0:
                 logger.info(
@@ -896,6 +898,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     request.pr_number,
                     decision.lock_key,
                 )
+                await self._safe_github_pr_amend_reaction(request, "+1")
                 return
 
             stderr = (result.stderr or result.stdout or "").strip()[-1200:]
@@ -924,6 +927,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     }
                 },
             )
+            await self._safe_github_pr_amend_reaction(request, "+1")
         except asyncio.CancelledError:
             logger.warning(
                 "[github-pr-amend] worker task cancelled route=%s repo=%s pr=%s",
@@ -958,8 +962,108 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
             except Exception:
                 logger.exception("[github-pr-amend] failed to post crash comment")
+            await self._safe_github_pr_amend_reaction(request, "+1")
         finally:
             self._github_pr_amend_locks.discard(decision.lock_key)
+
+    def _github_pr_amend_reaction_endpoint(self, request: Any) -> str:
+        """Return the GitHub reactions endpoint for a PR-amend trigger."""
+        repo = getattr(request, "repo", "")
+        source_kind = getattr(request, "source_kind", "")
+        source_id = getattr(request, "source_id", "")
+        if source_kind == "issue_comment" and source_id:
+            return f"repos/{repo}/issues/comments/{source_id}/reactions"
+        if source_kind == "review_comment" and source_id:
+            return f"repos/{repo}/pulls/comments/{source_id}/reactions"
+        if source_kind == "review":
+            # GitHub does not expose a stable reaction endpoint for PR review
+            # summary objects; react on the PR's issue timeline instead.
+            return f"repos/{repo}/issues/{getattr(request, 'pr_number', '')}/reactions"
+        return ""
+
+    async def _safe_github_pr_amend_reaction(self, request: Any, content: str) -> None:
+        """Best-effort GitHub reaction; never block or fail the amend job."""
+        try:
+            await self._add_github_pr_amend_reaction(request, content)
+        except Exception:
+            logger.exception(
+                "[github-pr-amend] reaction failed unexpectedly repo=%s pr=%s kind=%s id=%s content=%s",
+                getattr(request, "repo", ""),
+                getattr(request, "pr_number", ""),
+                getattr(request, "source_kind", ""),
+                getattr(request, "source_id", ""),
+                content,
+            )
+
+    async def _add_github_pr_amend_reaction(self, request: Any, content: str) -> bool:
+        """Add a GitHub reaction to the triggering object via ``gh api``."""
+        endpoint = self._github_pr_amend_reaction_endpoint(request)
+        if not endpoint:
+            logger.warning(
+                "[github-pr-amend] no reaction endpoint repo=%s pr=%s kind=%s id=%s content=%s",
+                getattr(request, "repo", ""),
+                getattr(request, "pr_number", ""),
+                getattr(request, "source_kind", ""),
+                getattr(request, "source_id", ""),
+                content,
+            )
+            return False
+
+        argv = [
+            "gh",
+            "api",
+            "-X",
+            "POST",
+            endpoint,
+            "-f",
+            f"content={content}",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "X-GitHub-Api-Version: 2022-11-28",
+        ]
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning(
+                "[github-pr-amend] reaction command failed repo=%s pr=%s kind=%s id=%s content=%s error=%s",
+                getattr(request, "repo", ""),
+                getattr(request, "pr_number", ""),
+                getattr(request, "source_kind", ""),
+                getattr(request, "source_id", ""),
+                content,
+                exc,
+            )
+            return False
+
+        if result.returncode != 0:
+            logger.warning(
+                "[github-pr-amend] gh reaction failed repo=%s pr=%s kind=%s id=%s content=%s exit=%s stderr=%s",
+                getattr(request, "repo", ""),
+                getattr(request, "pr_number", ""),
+                getattr(request, "source_kind", ""),
+                getattr(request, "source_id", ""),
+                content,
+                result.returncode,
+                (result.stderr or "").strip()[:500],
+            )
+            return False
+
+        logger.info(
+            "[github-pr-amend] added reaction repo=%s pr=%s kind=%s id=%s content=%s",
+            getattr(request, "repo", ""),
+            getattr(request, "pr_number", ""),
+            getattr(request, "source_kind", ""),
+            getattr(request, "source_id", ""),
+            content,
+        )
+        return True
 
     async def _run_github_pr_amend_subprocess(
         self,

@@ -263,12 +263,50 @@ class TestGitHubPrAmendPolicy:
 
 class TestGitHubPrAmendWebhookRoute:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("event_type", "payload", "endpoint"),
+        [
+            (
+                "issue_comment",
+                ISSUE_COMMENT_PAYLOAD,
+                "repos/reserve-protocol/reserve-index-dtf/issues/comments/4700001/reactions",
+            ),
+            (
+                "pull_request_review_comment",
+                REVIEW_COMMENT_PAYLOAD,
+                "repos/reserve-protocol/reserve-index-dtf/pulls/comments/4800001/reactions",
+            ),
+            (
+                "pull_request_review",
+                REVIEW_PAYLOAD,
+                "repos/reserve-protocol/reserve-index-dtf/issues/182/reactions",
+            ),
+        ],
+    )
+    async def test_github_pr_amend_reaction_endpoint_mapping(
+        self, event_type, payload, endpoint
+    ):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        request = extract_request(event_type, payload)
+        completed = subprocess.CompletedProcess(["gh"], 0, stdout="{}", stderr="")
+
+        with patch("gateway.platforms.webhook.subprocess.run", return_value=completed) as run:
+            assert await adapter._add_github_pr_amend_reaction(request, "eyes") is True
+
+        argv = run.call_args.args[0]
+        assert endpoint in argv
+        assert "content=eyes" in argv
+        assert "Accept: application/vnd.github+json" in argv
+        assert "X-GitHub-Api-Version: 2022-11-28" in argv
+
+    @pytest.mark.asyncio
     async def test_signed_issue_comment_starts_amend_job(self, tmp_path):
         secret = "route-secret"
         route = json.loads(json.dumps(ROUTE))
         route["secret"] = secret
         adapter = _make_adapter({"github-pr-amend": route})
         adapter._run_github_pr_amend_job = AsyncMock()
+        adapter._add_github_pr_amend_reaction = AsyncMock(return_value=True)
 
         body = json.dumps(ISSUE_COMMENT_PAYLOAD).encode()
         sig = _github_signature(body, secret)
@@ -293,6 +331,8 @@ class TestGitHubPrAmendWebhookRoute:
         assert data["status"] == "accepted"
         assert data["lock_key"] == "sligo-droid/reserve-index-dtf:feat/irrevocable-fee-recipients"
         assert adapter._run_github_pr_amend_job.await_count == 1
+        adapter._add_github_pr_amend_reaction.assert_awaited_once()
+        assert adapter._add_github_pr_amend_reaction.await_args.args[1] == "eyes"
 
     @pytest.mark.asyncio
     async def test_non_tbrent_mention_is_ignored(self):
@@ -300,6 +340,7 @@ class TestGitHubPrAmendWebhookRoute:
         payload["sender"]["login"] = "stranger"
         adapter = _make_adapter({"github-pr-amend": ROUTE})
         adapter._run_github_pr_amend_job = AsyncMock()
+        adapter._add_github_pr_amend_reaction = AsyncMock()
 
         with patch("gateway.github_pr_amend.fetch_pr_info") as fetch_pr_info:
             async with TestClient(TestServer(_create_app(adapter))) as cli:
@@ -318,6 +359,31 @@ class TestGitHubPrAmendWebhookRoute:
         assert "not allowlisted" in data["reason"]
         fetch_pr_info.assert_not_called()
         adapter._run_github_pr_amend_job.assert_not_called()
+        adapter._add_github_pr_amend_reaction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_seen_reaction_failure_does_not_prevent_job_start(self, tmp_path):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        adapter._run_github_pr_amend_job = AsyncMock()
+        adapter._add_github_pr_amend_reaction = AsyncMock(side_effect=RuntimeError("gh down"))
+
+        with patch("gateway.github_pr_amend.fetch_pr_info", return_value=PR_INFO), patch(
+            "gateway.github_pr_amend.write_job_brief", return_value=Path(tmp_path / "brief.json")
+        ):
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                resp = await cli.post(
+                    "/webhooks/github-pr-amend",
+                    json=ISSUE_COMMENT_PAYLOAD,
+                    headers={
+                        "X-GitHub-Event": "issue_comment",
+                        "X-GitHub-Delivery": "delivery-reaction-failed",
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 202
+        assert data["status"] == "accepted"
+        assert adapter._run_github_pr_amend_job.await_count == 1
 
     @pytest.mark.asyncio
     async def test_branch_lock_rejects_concurrent_job(self, tmp_path):
@@ -416,6 +482,7 @@ class TestGitHubPrAmendWebhookRoute:
             )
         )
         adapter._deliver_github_comment = AsyncMock()
+        adapter._add_github_pr_amend_reaction = AsyncMock()
 
         await adapter._run_github_pr_amend_job(
             route_name="github-pr-amend",
@@ -431,3 +498,31 @@ class TestGitHubPrAmendWebhookRoute:
         assert "SECRET_STDERR" not in comment
         assert "Tail output" not in comment
         assert "Delivery ID: `delivery-failed`" in comment
+        assert [call.args[1] for call in adapter._add_github_pr_amend_reaction.await_args_list] == [
+            "rocket",
+            "+1",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_worker_success_reactions_mark_working_then_done(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD, delivery_id="delivery-done")
+        policy = policy_from_route(ROUTE)
+        decision = evaluate_request(request, PR_INFO, policy)
+        adapter._run_github_pr_amend_subprocess = AsyncMock(
+            return_value=subprocess.CompletedProcess(["hermes"], 0, stdout="", stderr="")
+        )
+        adapter._add_github_pr_amend_reaction = AsyncMock(side_effect=[False, True])
+
+        await adapter._run_github_pr_amend_job(
+            route_name="github-pr-amend",
+            request=request,
+            decision=decision,
+            policy=policy,
+            prompt="prompt",
+        )
+
+        assert [call.args[1] for call in adapter._add_github_pr_amend_reaction.await_args_list] == [
+            "rocket",
+            "+1",
+        ]
