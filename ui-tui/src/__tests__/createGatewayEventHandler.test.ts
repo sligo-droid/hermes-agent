@@ -44,7 +44,8 @@ const buildCtx = (appended: Msg[], overrides: any = {}) =>
       appendMessage: (msg: Msg) => appended.push(msg),
       panel: (title: string, sections: any[]) =>
         appended.push({ kind: 'panel', panelData: { sections, title }, role: 'system', text: '' }),
-      setHistoryItems: vi.fn()
+      setHistoryItems: vi.fn(),
+      ...(overrides.transcript ?? {})
     },
     voice: {
       setProcessing: vi.fn(),
@@ -100,6 +101,28 @@ describe('createGatewayEventHandler', () => {
     onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
 
     expect(stdout.write).toHaveBeenCalledWith(wrapForMultiplexer(osc777Notify()))
+  })
+
+  it('requests a tail resnap after completed assistant responses enter history', () => {
+    const appended: Msg[] = []
+    const onAssistantComplete = vi.fn()
+    const onEvent = createGatewayEventHandler(buildCtx(appended, { transcript: { onAssistantComplete } }))
+
+    onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
+
+    expect(appended).toContainEqual({ role: 'assistant', text: 'done' })
+    expect(onAssistantComplete).toHaveBeenCalledOnce()
+  })
+
+  it('does not request a tail resnap after interrupted turns', () => {
+    const appended: Msg[] = []
+    const onAssistantComplete = vi.fn()
+    const onEvent = createGatewayEventHandler(buildCtx(appended, { transcript: { onAssistantComplete } }))
+
+    turnController.interrupted = true
+    onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
+
+    expect(onAssistantComplete).not.toHaveBeenCalled()
   })
 
   it('does not write terminal completion notification after interrupted turns', () => {

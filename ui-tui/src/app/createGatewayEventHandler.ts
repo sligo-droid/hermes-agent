@@ -79,7 +79,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   const { rpc } = ctx.gateway
   const { STARTUP_RESUME_ID, newSession, resumeById, setCatalog } = ctx.session
   const { bellOnComplete, stdout, sys, terminalNotifyOnComplete } = ctx.system
-  const { appendMessage, panel, setHistoryItems } = ctx.transcript
+  const { appendMessage, onAssistantComplete, panel, setHistoryItems } = ctx.transcript
   const { setInput } = ctx.composer
   const { submitRef } = ctx.submission
   const { setProcessing: setVoiceProcessing, setRecording: setVoiceRecording, setVoiceEnabled } = ctx.voice
@@ -796,10 +796,12 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (!wasInterrupted) {
           const msgs: Msg[] = finalMessages.length ? finalMessages : [{ role: 'assistant', text: finalText }]
           msgs.forEach(appendMessage)
+          onAssistantComplete?.()
 
           if (bellOnComplete && stdout?.isTTY) {
             stdout.write('\x07')
           }
+
           writeCompletionNotification(stdout, terminalNotifyOnComplete)
         }
 
