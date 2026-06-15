@@ -70,6 +70,98 @@ def client(kanban_home):
     return TestClient(app)
 
 
+def test_conn_uses_connect_as_dashboard_initialization_path(client, monkeypatch):
+    pa = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    calls: list[tuple[str, str | None]] = []
+
+    class FakeConn:
+        pass
+
+    fake_conn = FakeConn()
+
+    def fail_init_db(*args, **kwargs):
+        raise AssertionError("dashboard _conn must not double-initialize boards")
+
+    def fake_connect(*, board=None):
+        calls.append(("connect", board))
+        return fake_conn
+
+    monkeypatch.setattr(pa.kanban_db, "init_db", fail_init_db)
+    monkeypatch.setattr(pa.kanban_db, "connect", fake_connect)
+
+    assert pa._conn(board="healthy-board") is fake_conn
+    assert calls == [("connect", "healthy-board")]
+
+
+def test_board_counts_uses_one_connect_and_no_init_for_healthy_board(client, monkeypatch, tmp_path):
+    pa = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    calls: list[tuple[str, str | None]] = []
+    db_path = tmp_path / "kanban.db"
+    db_path.write_bytes(b"placeholder")
+
+    class FakeConn:
+        def execute(self, sql):
+            assert "FROM tasks" in sql
+            return self
+
+        def fetchall(self):
+            return [{"status": "ready", "n": 2}]
+
+        def close(self):
+            calls.append(("close", None))
+
+    def fail_init_db(*args, **kwargs):
+        raise AssertionError("_board_counts must not init healthy boards")
+
+    def fake_connect(*, board=None):
+        calls.append(("connect", board))
+        return FakeConn()
+
+    monkeypatch.setattr(pa.kanban_db, "kanban_db_path", lambda board=None: db_path)
+    monkeypatch.setattr(pa.kanban_db, "init_db", fail_init_db)
+    monkeypatch.setattr(pa.kanban_db, "connect", fake_connect)
+
+    assert pa._board_counts("healthy-board") == {"ready": 2}
+    assert calls == [("connect", "healthy-board"), ("close", None)]
+
+
+def test_board_counts_skips_unchanged_paused_corrupt_board_without_retrying_connect(
+    client, monkeypatch, tmp_path,
+):
+    pa = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    db_path = tmp_path / "kanban.db"
+    db_path.write_bytes(b"not sqlite")
+    backup_path = tmp_path / "kanban.db.corrupt.test.bak"
+    incident = {
+        "pause_reason": "kanban_db_corruption",
+        "fingerprint": kb._db_content_fingerprint(db_path),
+        "quarantine_path": str(backup_path),
+        "reason": "invalid SQLite header",
+    }
+    connect_calls: list[str | None] = []
+
+    def fail_init_db(*args, **kwargs):
+        raise AssertionError("paused corrupt board counts must not init DB")
+
+    def fake_connect(*, board=None):
+        connect_calls.append(board)
+        raise kb.KanbanDbCorruptError(
+            db_path,
+            backup_path,
+            "invalid SQLite header",
+            incident=incident,
+        )
+
+    monkeypatch.setattr(pa.kanban_db, "kanban_db_path", lambda board=None: db_path)
+    monkeypatch.setattr(pa.kanban_db, "is_board_paused_for_corruption", lambda board=None: incident)
+    monkeypatch.setattr(pa.kanban_db, "init_db", fail_init_db)
+    monkeypatch.setattr(pa.kanban_db, "connect", fake_connect)
+
+    assert pa._board_counts("corrupt-board") == {}
+    assert pa._board_counts("corrupt-board") == {}
+    assert connect_calls == []
+
+
 def test_command_center_snapshot_route_accepts_force_refresh(client, monkeypatch):
     import hermes_cli.command_center as cc
 
@@ -3120,6 +3212,193 @@ def test_home_channels_empty_when_no_homes_configured(client, monkeypatch):
     r = client.get("/api/plugins/kanban/home-channels")
     assert r.status_code == 200
     assert r.json()["home_channels"] == []
+
+
+def test_boards_endpoint_marks_corrupt_quarantined_board_degraded(client, monkeypatch):
+    board = "dashboard-corrupt"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"not sqlite")
+    monkeypatch.setattr(kb.time, "time", lambda: 3000)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "sqlite refused to open file: file is not a database",
+        fingerprint=kb._db_content_fingerprint(db_path),
+    )
+
+    r = client.get("/api/plugins/kanban/boards")
+
+    assert r.status_code == 200
+    entry = next(b for b in r.json()["boards"] if b["slug"] == board)
+    assert entry["status"] == "degraded"
+    assert entry["counts"] == {}
+    assert entry["corruption"]["next_retry"] == 3000 + kb.CORRUPT_BOARD_RETRY_SECONDS
+    assert "file is not a database" in entry["corruption"]["reason"]
+
+
+def test_stats_endpoint_rejects_corrupt_quarantined_board(client, monkeypatch):
+    board = "dashboard-stats-corrupt"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"not sqlite")
+    monkeypatch.setattr(kb.time, "time", lambda: 4000)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "sqlite refused to open file: file is not a database",
+        fingerprint=kb._db_content_fingerprint(db_path),
+    )
+
+    r = client.get("/api/plugins/kanban/stats", params={"board": board})
+
+    assert r.status_code == 503
+    detail = r.json()["detail"]
+    assert detail["error"] == "kanban_board_corrupt"
+    assert detail["board"] == board
+    assert detail["corruption"]["next_retry"] == 4000 + kb.CORRUPT_BOARD_RETRY_SECONDS
+
+
+def test_board_endpoint_rejects_corrupt_quarantined_board_before_open(client, monkeypatch):
+    board = "dashboard-board-corrupt"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"not sqlite")
+    monkeypatch.setattr(kb.time, "time", lambda: 4100)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "sqlite refused to open file: file is not a database",
+        fingerprint=kb._db_content_fingerprint(db_path),
+    )
+
+    r = client.get("/api/plugins/kanban/board", params={"board": board})
+
+    assert r.status_code == 503
+    detail = r.json()["detail"]
+    assert detail["error"] == "kanban_board_corrupt"
+    assert detail["board"] == board
+    assert detail["corruption"]["next_retry"] == 4100 + kb.CORRUPT_BOARD_RETRY_SECONDS
+
+
+def test_specify_endpoint_rejects_corrupt_quarantined_board_before_indirect_open(client, monkeypatch):
+    board = "dashboard-specify-corrupt"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"not sqlite")
+    monkeypatch.setattr(kb.time, "time", lambda: 4300)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "sqlite refused to open file: file is not a database",
+        fingerprint=kb._db_content_fingerprint(db_path),
+    )
+
+    def fail_connect(*args, **kwargs):
+        raise AssertionError("quarantined board should not be opened")
+
+    monkeypatch.setattr(kb, "connect", fail_connect)
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/t_missing/specify",
+        params={"board": board},
+        json={},
+    )
+
+    assert r.status_code == 503
+    detail = r.json()["detail"]
+    assert detail["error"] == "kanban_board_corrupt"
+    assert detail["board"] == board
+
+
+def test_decompose_endpoint_rejects_corrupt_quarantined_board_before_indirect_open(client, monkeypatch):
+    board = "dashboard-decompose-corrupt"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"not sqlite")
+    monkeypatch.setattr(kb.time, "time", lambda: 4400)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "sqlite refused to open file: file is not a database",
+        fingerprint=kb._db_content_fingerprint(db_path),
+    )
+
+    def fail_connect(*args, **kwargs):
+        raise AssertionError("quarantined board should not be opened")
+
+    monkeypatch.setattr(kb, "connect", fail_connect)
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/t_missing/decompose",
+        params={"board": board},
+        json={},
+    )
+
+    assert r.status_code == 503
+    detail = r.json()["detail"]
+    assert detail["error"] == "kanban_board_corrupt"
+    assert detail["board"] == board
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("post", "/api/plugins/kanban/boards/{board}/pause"),
+        ("post", "/api/plugins/kanban/boards/{board}/resume"),
+        ("delete", "/api/plugins/kanban/boards/{board}"),
+    ],
+)
+def test_board_action_endpoint_rejects_corrupt_quarantined_board_before_open(client, monkeypatch, method, path):
+    board = f"dashboard-action-corrupt-{method}-{path.rsplit('/', 1)[-1] or 'archive'}".replace("{board}", "")
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"not sqlite")
+    monkeypatch.setattr(kb.time, "time", lambda: 4500)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "sqlite refused to open file: file is not a database",
+        fingerprint=kb._db_content_fingerprint(db_path),
+    )
+
+    def fail_connect(*args, **kwargs):
+        raise AssertionError("quarantined board should not be opened")
+
+    monkeypatch.setattr(kb, "connect", fail_connect)
+
+    url = path.format(board=board)
+    r = client.delete(url) if method == "delete" else getattr(client, method)(url, json={})
+
+    assert r.status_code == 503
+    detail = r.json()["detail"]
+    assert detail["error"] == "kanban_board_corrupt"
+    assert detail["board"] == board
+
+
+def test_command_center_snapshot_degrades_corrupt_quarantined_board(client, monkeypatch):
+    board = "dashboard-snapshot-corrupt"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"not sqlite")
+    monkeypatch.setattr(kb.time, "time", lambda: 4200)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "sqlite refused to open file: file is not a database",
+        fingerprint=kb._db_content_fingerprint(db_path),
+    )
+
+    r = client.get("/api/plugins/kanban/command-center/snapshot", params={"force_refresh": "true"})
+
+    assert r.status_code == 200, r.text
+    source = next(
+        source for source in r.json()["sources"]
+        if source["id"] == f"source:kanban-board-error:{board}"
+    )
+    assert source["status"] == "degraded"
+    assert source["ref"]["board"] == board
+    assert source["ref"]["corruption"]["next_retry"] == 4200 + kb.CORRUPT_BOARD_RETRY_SECONDS
 
 
 # ---------------------------------------------------------------------------
