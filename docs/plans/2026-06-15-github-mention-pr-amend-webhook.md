@@ -1,10 +1,10 @@
 # GitHub Mention → PR Amendment Webhook
 
-Status: implemented in branch `github-pr-amend-webhook`; awaiting merge + external GitHub webhook setup  
-Owner: Sligo Labs agent  
-Created: 2026-06-15  
-Updated: 2026-06-15  
-Initial canary: `reserve-protocol/reserve-index-dtf#182`
+Status: implemented in branch `github-pr-amend-webhook`; org-scoped policy update in progress; awaiting merge + external GitHub webhook setup
+Owner: Sligo Labs agent
+Created: 2026-06-15
+Updated: 2026-06-15
+Current scope: `reserve-protocol/*` base repos for trusted sender `tbrent`
 
 ## Goal
 
@@ -49,14 +49,13 @@ Hard gates still apply before any coding work starts:
 - `sender.login` is allowlisted, initially only `tbrent`;
 - body contains the configured mention, initially `@sligo-droid`;
 - event targets an open PR;
-- base repo is allowlisted;
-- PR head repo is allowlisted / pushable by `sligo-droid`;
-- canary PR allowlist passes while rollout is scoped;
+- base repo matches the allowlist, including shell-style wildcard entries;
+- PR head repo matches the allowlist / is pushable by `sligo-droid`;
 - no active branch lock exists for the PR head branch.
 
 The coding worker may perform only the explicit PR amendment side effects: clone/fetch/checkout, edit files, run tests/builds, commit, push to the exact PR head branch, and comment the result.
 
-## Initial canary policy
+## Org-scoped policy
 
 ```yaml
 github_pr_amend:
@@ -66,12 +65,10 @@ github_pr_amend:
   allowed_senders:
     - tbrent
   allowed_base_repos:
-    - reserve-protocol/reserve-index-dtf
+    - reserve-protocol/*
   allowed_head_repos:
-    - sligo-droid/reserve-index-dtf
-  canary_prs:
-    reserve-protocol/reserve-index-dtf:
-      - 182
+    - sligo-droid/*
+    - reserve-protocol/*
   trigger_events:
     - issue_comment
     - pull_request_review_comment
@@ -100,7 +97,7 @@ github_pr_amend:
     - email
 ```
 
-After PR #182 proves the flow, remove the canary PR limit while keeping sender/base/head gates.
+This keeps the sender gate narrow while allowing `tbrent` to tag `@sligo-droid` on PRs under the `reserve-protocol` GitHub org. Head repos remain limited to `sligo-droid/*` and `reserve-protocol/*`, not arbitrary third-party forks.
 
 ## GitHub events to support
 
@@ -283,7 +280,7 @@ Implemented pieces in this branch:
 
 - new `gateway/github_pr_amend.py` policy/helper module;
 - specialized webhook route mode: `mode: github_pr_amend`;
-- deterministic preflight gates before PR metadata lookup: event action, sender, mention, base repo, canary PR;
+- deterministic preflight gates before PR metadata lookup: event action, sender, mention, base repo allowlist;
 - PR metadata gates after lookup: open PR, allowlisted base/head repo, non-empty head ref;
 - in-process branch lock keyed as `{head_repo}:{head_ref}`;
 - auditable job brief written under `$HERMES_HOME/github-pr-amend/...`;
@@ -355,12 +352,10 @@ platforms:
             allowed_senders:
               - tbrent
             allowed_base_repos:
-              - reserve-protocol/reserve-index-dtf
+              - reserve-protocol/*
             allowed_head_repos:
-              - sligo-droid/reserve-index-dtf
-            canary_prs:
-              reserve-protocol/reserve-index-dtf:
-                - 182
+              - sligo-droid/*
+              - reserve-protocol/*
             job:
               hermes_command: hermes
               toolsets: terminal,file,web,session_search
@@ -383,7 +378,7 @@ Unit tests:
 - rejects non-PR issue comments;
 - accepts `pull_request_review_comment.created` with mention;
 - accepts `pull_request_review.submitted` with mention and `changes_requested`;
-- rejects events outside allowed repo/head repo/canary PR;
+- rejects events outside allowed base/head repo patterns;
 - lock prevents concurrent jobs for same head branch;
 - final comment formatting includes commit/test/blocker fields.
 
@@ -405,17 +400,17 @@ Runtime verification before enabling upstream webhook:
 ## Rollout
 
 1. Land implementation behind config flag, disabled by default.
-2. Enable locally for canary policy and route.
+2. Enable locally for the org-scoped policy and route.
 3. Give operator exact webhook URL and event list.
 4. Operator adds webhook in GitHub settings.
-5. Test with a harmless tag on PR #182.
+5. Test with a harmless tag on a reserve-protocol PR.
 6. Confirm branch amendment + final comment.
-7. Remove PR #182 canary if desired.
+7. Expand sender/head repo allowlists only if there is a concrete need.
 
 ## Open questions / implementation choices
 
 - Whether to represent accepted webhook jobs as Command Center/Kanban work items in v1 or start with a simpler background job record and add Command Center integration after the core path works.
 - Whether to post an immediate “queued” acknowledgement comment or stay silent until final result.
-- Whether to allow non-PR allowlisted branches after the PR #182 canary.
+- Whether to allow non-PR allowlisted branches after the org-scoped PR path is proven.
 
 Recommendation: start with a simple background job plus branch lock and final comment, then add Command Center/Kanban surfacing once the core end-to-end path is proven.

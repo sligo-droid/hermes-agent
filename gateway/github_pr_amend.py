@@ -13,8 +13,9 @@ import logging
 import re
 import subprocess
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from hermes_constants import get_hermes_home
 
@@ -83,11 +84,9 @@ class GitHubPrAmendPolicy:
 
     mention: str = "@sligo-droid"
     allowed_senders: tuple[str, ...] = ("tbrent",)
-    allowed_base_repos: tuple[str, ...] = ("reserve-protocol/reserve-index-dtf",)
-    allowed_head_repos: tuple[str, ...] = ("sligo-droid/reserve-index-dtf",)
-    canary_prs: dict[str, tuple[int, ...]] = field(
-        default_factory=lambda: {"reserve-protocol/reserve-index-dtf": (182,)}
-    )
+    allowed_base_repos: tuple[str, ...] = ("reserve-protocol/*",)
+    allowed_head_repos: tuple[str, ...] = ("sligo-droid/*", "reserve-protocol/*")
+    canary_prs: dict[str, tuple[int, ...]] = field(default_factory=dict)
     allowed_actions: dict[str, tuple[str, ...]] = field(
         default_factory=lambda: {
             event: tuple(sorted(actions))
@@ -111,6 +110,10 @@ def _as_tuple(value: Any, default: tuple[str, ...] = ()) -> tuple[str, ...]:
     return default
 
 
+def _matches_repo_allowlist(repo: str, patterns: Sequence[str]) -> bool:
+    return bool(repo and patterns and any(fnmatchcase(repo, pattern) for pattern in patterns))
+
+
 def _as_bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
@@ -129,7 +132,7 @@ def _as_bool(value: Any, default: bool = False) -> bool:
 
 def _normalize_canary_prs(value: Any) -> dict[str, tuple[int, ...]]:
     if not isinstance(value, dict):
-        return {"reserve-protocol/reserve-index-dtf": (182,)}
+        return {}
     result: dict[str, tuple[int, ...]] = {}
     for repo, prs in value.items():
         numbers: list[int] = []
@@ -187,10 +190,10 @@ def policy_from_route(route_config: dict[str, Any]) -> GitHubPrAmendPolicy:
         mention=str(raw.get("mention") or "@sligo-droid"),
         allowed_senders=_as_tuple(raw.get("allowed_senders"), ("tbrent",)),
         allowed_base_repos=_as_tuple(
-            raw.get("allowed_base_repos"), ("reserve-protocol/reserve-index-dtf",)
+            raw.get("allowed_base_repos"), ("reserve-protocol/*",)
         ),
         allowed_head_repos=_as_tuple(
-            raw.get("allowed_head_repos"), ("sligo-droid/reserve-index-dtf",)
+            raw.get("allowed_head_repos"), ("sligo-droid/*", "reserve-protocol/*")
         ),
         canary_prs=_normalize_canary_prs(raw.get("canary_prs")),
         allowed_actions=_normalize_actions(raw.get("allowed_actions")),
@@ -321,7 +324,7 @@ def preflight_request(
     if policy.mention.lower() not in request.body.lower():
         return f"missing mention {policy.mention}"
 
-    if request.repo not in policy.allowed_base_repos:
+    if not _matches_repo_allowlist(request.repo, policy.allowed_base_repos):
         return f"base repo '{request.repo}' is not allowlisted"
 
     if policy.canary_prs:
@@ -358,7 +361,7 @@ def evaluate_request(
     if state and state != "open":
         return GitHubPrAmendDecision(False, f"PR is not open (state={state})")
 
-    if base_repo not in policy.allowed_base_repos:
+    if not _matches_repo_allowlist(base_repo, policy.allowed_base_repos):
         return GitHubPrAmendDecision(False, f"base repo '{base_repo}' is not allowlisted")
 
     if policy.canary_prs:
@@ -366,7 +369,7 @@ def evaluate_request(
         if request.pr_number not in allowed_numbers:
             return GitHubPrAmendDecision(False, f"PR #{request.pr_number} is outside canary allowlist")
 
-    if head_repo not in policy.allowed_head_repos:
+    if not _matches_repo_allowlist(head_repo, policy.allowed_head_repos):
         return GitHubPrAmendDecision(False, f"head repo '{head_repo}' is not allowlisted")
 
     if not head_ref:
