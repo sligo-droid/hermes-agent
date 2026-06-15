@@ -1170,6 +1170,38 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
         board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
         if _is_discord_board(board, board_meta):
             sources.append(_source_from_discord_board(board, board_meta))
+        corrupt_state = None
+        if not board_meta.get("archive_path"):
+            try:
+                corrupt_state = kanban_db.corrupt_board_quarantine_state(board)
+            except Exception:
+                corrupt_state = None
+        if corrupt_state and corrupt_state.get("skipped"):
+            incident = corrupt_state.get("incident") if isinstance(corrupt_state.get("incident"), dict) else {}
+            sources.append(
+                {
+                    "id": f"source:kanban-board-error:{_board_identity(board, board_meta)}",
+                    "kind": "kanban_board",
+                    "label": "Kanban board",
+                    "title": board_meta.get("name") or board,
+                    "status": "degraded",
+                    "bucket": "inbox",
+                    "created_at": board_meta.get("created_at"),
+                    "updated_at": incident.get("last_seen") or board_meta.get("created_at"),
+                    "ref": {
+                        "board": board,
+                        "error": corrupt_state.get("reason") or incident.get("reason"),
+                        "corruption": {
+                            "db_path": corrupt_state.get("db_path") or incident.get("db_path"),
+                            "first_seen": incident.get("first_seen"),
+                            "last_seen": incident.get("last_seen"),
+                            "next_retry": corrupt_state.get("next_retry") or incident.get("next_retry"),
+                            "quarantine_path": incident.get("quarantine_path"),
+                        },
+                    },
+                }
+            )
+            continue
         repair_context = _active_board_repair_context(board, board_meta, archived_by_slug=archived_by_slug)
         if repair_context and board != kanban_db.DEFAULT_BOARD and not board_meta.get("archived"):
             work_items.append(

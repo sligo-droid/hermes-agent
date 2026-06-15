@@ -121,7 +121,45 @@ def _conn(board: Optional[str] = None):
     :func:`_resolve_board`). When ``None`` the active board is used
     via the resolution chain (env var → ``current`` file → ``default``).
     """
+    _raise_if_corrupt_quarantined(board)
     return kanban_db.connect(board=board)
+
+
+def _corrupt_board_payload(state: dict[str, Any]) -> dict[str, Any]:
+    incident = state.get("incident") if isinstance(state.get("incident"), dict) else {}
+    return {
+        "status": "degraded",
+        "reason": state.get("reason") or incident.get("reason") or "kanban DB corruption incident",
+        "db_path": state.get("db_path") or incident.get("db_path"),
+        "fingerprint": state.get("fingerprint") or incident.get("fingerprint"),
+        "first_seen": incident.get("first_seen"),
+        "last_seen": incident.get("last_seen"),
+        "next_retry": state.get("next_retry") or incident.get("next_retry"),
+        "quarantine_path": incident.get("quarantine_path"),
+        "repair_command": incident.get("repair_command") or f"hermes kanban repair --board {state.get('board') or kanban_db.DEFAULT_BOARD}",
+    }
+
+
+def _corrupt_board_state(board: Optional[str]) -> dict[str, Any] | None:
+    try:
+        state = kanban_db.corrupt_board_quarantine_state(board)
+    except Exception:
+        return None
+    return state if state.get("skipped") else None
+
+
+def _raise_if_corrupt_quarantined(board: Optional[str]) -> None:
+    state = _corrupt_board_state(board)
+    if not state:
+        return
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "error": "kanban_board_corrupt",
+            "board": state.get("board") or board or kanban_db.DEFAULT_BOARD,
+            "corruption": _corrupt_board_payload(state),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2668,6 +2706,7 @@ def specify_task_endpoint(
     ``async def`` without an explicit ``run_in_executor``.
     """
     board = _resolve_board(board)
+    _raise_if_corrupt_quarantined(board)
     # Pin the board for the duration of this call so the specifier module
     # (which calls ``kb.connect()`` with no args) hits the right DB.
     prev_env = os.environ.get("HERMES_KANBAN_BOARD")
@@ -2936,6 +2975,7 @@ def get_stats(board: Optional[str] = Query(None)):
     board themselves.
     """
     board = _resolve_board(board)
+    _raise_if_corrupt_quarantined(board)
     conn = _conn(board=board)
     try:
         return kanban_db.board_stats(conn)
@@ -3011,6 +3051,7 @@ def dispatch(
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
+    _raise_if_corrupt_quarantined(board)
     conn = _conn(board=board)
     try:
         result = kanban_db.dispatch_once(
@@ -3047,6 +3088,8 @@ class RenameBoardBody(BaseModel):
 
 def _board_counts(slug: str) -> dict[str, int]:
     """Return ``{status: count}`` for a board. Safe on an empty DB."""
+    if _corrupt_board_state(slug):
+        return {}
     try:
         path = kanban_db.kanban_db_path(board=slug)
         if not path.exists():
@@ -3073,7 +3116,13 @@ def list_boards(include_archived: bool = Query(False)):
     current = kanban_db.get_current_board()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
-        b["counts"] = _board_counts(b["slug"])
+        state = _corrupt_board_state(b["slug"])
+        if state:
+            b["status"] = "degraded"
+            b["corruption"] = _corrupt_board_payload(state)
+            b["counts"] = {}
+        else:
+            b["counts"] = _board_counts(b["slug"])
         b["total"] = sum(b["counts"].values())
     return {"boards": boards, "current": current}
 
@@ -3127,6 +3176,7 @@ def pause_board(slug: str, payload: ProposalFollowupBody | None = None):
         raise HTTPException(status_code=400, detail=str(exc))
     if not normed or not kanban_db.board_exists(normed):
         raise HTTPException(status_code=404, detail=f"board {slug!r} does not exist")
+    _raise_if_corrupt_quarantined(normed)
     reason = payload.reason.strip() if payload and payload.reason else "command-center-paused"
     worker = _discord_worker_meta(normed)
     if worker:
@@ -3148,6 +3198,7 @@ def resume_board(slug: str):
         raise HTTPException(status_code=400, detail=str(exc))
     if not normed or not kanban_db.board_exists(normed):
         raise HTTPException(status_code=404, detail=f"board {slug!r} does not exist")
+    _raise_if_corrupt_quarantined(normed)
     worker = _discord_worker_meta(normed)
     if worker:
         from hermes_cli import discord_worker_boards as dwb
@@ -3290,6 +3341,7 @@ def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete
     try:
         normed = kanban_db._normalize_board_slug(slug)
         if not delete and normed and kanban_db.board_exists(normed):
+            _raise_if_corrupt_quarantined(normed)
             worker = _discord_worker_meta(normed)
             if worker:
                 from hermes_cli import discord_worker_boards as dwb
@@ -3487,6 +3539,7 @@ def decompose_task_endpoint(
     can take minutes on reasoning models.
     """
     board = _resolve_board(board)
+    _raise_if_corrupt_quarantined(board)
     from hermes_cli import kanban_decompose  # noqa: WPS433 (intentional)
     outcome = kanban_decompose.decompose_task(
         task_id,
@@ -3658,6 +3711,16 @@ async def stream_events(ws: WebSocket):
             ws_board = None
 
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
+            state = _corrupt_board_state(ws_board)
+            if state:
+                return cursor_val, [{
+                    "id": cursor_val,
+                    "task_id": None,
+                    "run_id": None,
+                    "kind": "kanban_board_corrupt",
+                    "payload": _corrupt_board_payload(state),
+                    "created_at": int(time.time()),
+                }]
             conn = kanban_db.connect(board=ws_board)
             try:
                 rows = conn.execute(

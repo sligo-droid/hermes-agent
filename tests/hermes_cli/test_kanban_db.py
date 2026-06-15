@@ -114,6 +114,163 @@ def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
     assert exc_info.value.backup_path.read_bytes() == corrupt.read_bytes()
 
 
+def test_corrupt_board_quarantine_state_skips_until_retry_window(kanban_home, monkeypatch):
+    board = "quarantine-window"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"not sqlite")
+    fingerprint = kb._db_content_fingerprint(db_path)
+    monkeypatch.setattr(kb.time, "time", lambda: 1000)
+
+    incident = kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "sqlite refused to open file: file is not a database",
+        fingerprint=fingerprint,
+    )
+
+    assert incident is not None
+    assert incident["first_seen"] == 1000
+    assert incident["last_seen"] == 1000
+    assert incident["next_retry"] == 1000 + kb.CORRUPT_BOARD_RETRY_SECONDS
+    state = kb.corrupt_board_quarantine_state(board, now=1001)
+    assert state["open_allowed"] is False
+    assert state["skipped"] is True
+    assert state["next_retry"] == incident["next_retry"]
+
+
+def test_corrupt_board_quarantine_state_derives_legacy_retry_before_due(kanban_home):
+    board = "legacy-quarantine-window"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"legacy bad sqlite")
+    fingerprint = kb._db_content_fingerprint(db_path)
+    kb._write_board_metadata_raw(
+        board,
+        {
+            "paused": True,
+            "pause_reason": "kanban_db_corruption",
+            "corruption_incident": {
+                "pause_reason": "kanban_db_corruption",
+                "fingerprint": fingerprint,
+                "reason": "legacy corrupt incident",
+                "first_seen": 3000,
+                "last_seen": 3100,
+            },
+        },
+    )
+
+    state = kb.corrupt_board_quarantine_state(board, now=3101)
+
+    assert state["open_allowed"] is False
+    assert state["skipped"] is True
+    assert state["retry_due"] is False
+    assert state["next_retry"] == 3100 + kb.CORRUPT_BOARD_RETRY_SECONDS
+
+
+def test_corrupt_board_quarantine_state_derives_legacy_retry_when_due(kanban_home):
+    board = "legacy-quarantine-due"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"legacy bad sqlite")
+    fingerprint = kb._db_content_fingerprint(db_path)
+    kb._write_board_metadata_raw(
+        board,
+        {
+            "paused": True,
+            "pause_reason": "kanban_db_corruption",
+            "corruption_incident": {
+                "pause_reason": "kanban_db_corruption",
+                "fingerprint": fingerprint,
+                "reason": "legacy corrupt incident",
+                "first_seen": 4000,
+                "last_seen": 4100,
+            },
+        },
+    )
+
+    state = kb.corrupt_board_quarantine_state(
+        board,
+        now=4100 + kb.CORRUPT_BOARD_RETRY_SECONDS,
+    )
+
+    assert state["open_allowed"] is True
+    assert state["skipped"] is False
+    assert state["retry_due"] is True
+    assert state["next_retry"] == 4100 + kb.CORRUPT_BOARD_RETRY_SECONDS
+    assert state["reason"] == "corrupt-board retry window expired"
+
+
+def test_corrupt_board_quarantine_state_allows_retry_when_due_or_changed(kanban_home, monkeypatch):
+    board = "quarantine-retry"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"bad sqlite")
+    fingerprint = kb._db_content_fingerprint(db_path)
+    monkeypatch.setattr(kb.time, "time", lambda: 2000)
+    kb.record_corrupt_board_incident(board, db_path, "file is not a database", fingerprint=fingerprint)
+
+    due = kb.corrupt_board_quarantine_state(
+        board,
+        now=2000 + kb.CORRUPT_BOARD_RETRY_SECONDS,
+    )
+    assert due["open_allowed"] is True
+    assert due["retry_due"] is True
+
+    db_path.write_bytes(b"different bad sqlite")
+    changed = kb.corrupt_board_quarantine_state(board, now=2001)
+    assert changed["open_allowed"] is True
+    assert changed["changed_fingerprint"] is True
+
+
+def test_connect_clears_stale_corrupt_incident_after_healthy_retry(kanban_home, monkeypatch):
+    board = "healthy-retry-clears"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    with kb.connect(board=board) as conn:
+        kb.create_task(conn, title="healthy after retry")
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    fingerprint = kb._db_content_fingerprint(db_path)
+    monkeypatch.setattr(kb.time, "time", lambda: 5000)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "previous corrupt retry window",
+        fingerprint=fingerprint,
+    )
+    monkeypatch.setattr(kb.time, "time", lambda: 5000 + kb.CORRUPT_BOARD_RETRY_SECONDS)
+
+    with kb.connect(board=board) as conn:
+        assert [task.title for task in kb.list_tasks(conn)] == ["healthy after retry"]
+
+    assert kb.is_board_paused_for_corruption(board) is None
+
+
+def test_connect_clears_stale_corrupt_incident_after_changed_healthy_fingerprint(kanban_home, monkeypatch):
+    board = "healthy-change-clears"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    db_path.write_bytes(b"previous corrupt bytes")
+    stale_fingerprint = kb._db_content_fingerprint(db_path)
+    monkeypatch.setattr(kb.time, "time", lambda: 6000)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "previous corrupt bytes",
+        fingerprint=stale_fingerprint,
+    )
+    db_path.unlink()
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(board=board) as conn:
+        kb.create_task(conn, title="healthy replacement")
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    with kb.connect(board=board) as conn:
+        assert [task.title for task in kb.list_tasks(conn)] == ["healthy replacement"]
+
+    assert kb.is_board_paused_for_corruption(board) is None
+
+
 def test_board_metadata_non_utf8_bytes_fall_back_to_synthesized_metadata(kanban_home):
     """One corrupt board.json must not take down board discovery/dashboard snapshots."""
     board = "bad-metadata-board"
