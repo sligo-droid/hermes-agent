@@ -1639,10 +1639,39 @@ def public_board_snapshot_for_session(session_id: str) -> dict[str, Any]:
     return _public_board_snapshot_for_board(board)
 
 
+def _retry_public_read_after_corruption(board: str, exc: kanban_db.KanbanDbCorruptError) -> bool:
+    """Run the existing conservative DB repair once for public worker views."""
+
+    try:
+        result = kanban_db.repair_corrupt_board(board)
+    except Exception:
+        logger.warning("public worker-board corruption repair failed for %s", board, exc_info=True)
+        return False
+    if result.get("status") == "repaired":
+        logger.warning(
+            "public worker-board corruption repaired for %s via %s after %s",
+            board,
+            result.get("action") or "unknown",
+            exc.reason,
+        )
+        return True
+    logger.warning(
+        "public worker-board corruption repair unavailable for %s: %s",
+        board,
+        result.get("reason") or exc.reason,
+    )
+    return False
+
+
 def _public_board_snapshot_for_board(board: str) -> dict[str, Any]:
     metadata = kanban_db.read_board_metadata(board)
     worker = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
-    conn = kanban_db.connect(board=board)
+    try:
+        conn = kanban_db.connect(board=board)
+    except kanban_db.KanbanDbCorruptError as exc:
+        if not _retry_public_read_after_corruption(board, exc):
+            raise
+        conn = kanban_db.connect(board=board)
     try:
         tasks = kanban_db.list_tasks(conn, include_archived=False)
         summaries = kanban_db.latest_summaries(conn, [t.id for t in tasks])
@@ -3484,7 +3513,12 @@ def read_board_run_summary(board: str) -> dict[str, Any]:
 
 def board_run_summary_for_session(session_id: str) -> dict[str, Any]:
     board = resolve_public_session_board(session_id)
-    return read_board_run_summary(board) or build_board_run_summary(board)
+    try:
+        return read_board_run_summary(board) or build_board_run_summary(board)
+    except kanban_db.KanbanDbCorruptError as exc:
+        if not _retry_public_read_after_corruption(board, exc):
+            raise
+        return read_board_run_summary(board) or build_board_run_summary(board)
 
 
 def _format_summary_counts(counts: dict[str, Any]) -> str:

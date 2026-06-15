@@ -1548,6 +1548,41 @@ def test_public_board_index_skips_board_with_db_snapshot_failure(monkeypatch, tm
     assert "DatabaseError" in caplog.text
 
 
+def test_public_session_board_repairs_corrupt_db_once(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(thread_id="5155", goal="Repair public route")
+    original_connect = kanban_db.connect
+    calls = {"connect": 0, "repair": 0}
+
+    def connect(*args, **kwargs):
+        if kwargs.get("board") == board.slug:
+            calls["connect"] += 1
+            if calls["connect"] == 1:
+                raise kanban_db.KanbanDbCorruptError(
+                    kanban_db.kanban_db_path(board.slug),
+                    kanban_db.kanban_db_path(board.slug).with_suffix(".bak"),
+                    "integrity_check returned bad pages",
+                )
+        return original_connect(*args, **kwargs)
+
+    def repair_corrupt_board(repair_board):
+        calls["repair"] += 1
+        assert repair_board == board.slug
+        return {"status": "repaired", "action": "salvage_readable_tables"}
+
+    monkeypatch.setattr(kanban_db, "connect", connect)
+    monkeypatch.setattr(kanban_db, "repair_corrupt_board", repair_corrupt_board)
+
+    html = dwb.render_public_session_board_html("5155")
+
+    assert "Repair public route" in html
+    assert calls["connect"] >= 2
+    assert calls["repair"] == 1
+
+
 def test_generated_summary_title_replaces_workers_board_title(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
