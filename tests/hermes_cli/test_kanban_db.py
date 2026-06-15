@@ -161,6 +161,54 @@ def test_corrupt_board_quarantine_state_allows_retry_when_due_or_changed(kanban_
     assert changed["changed_fingerprint"] is True
 
 
+def test_connect_clears_stale_corrupt_incident_after_healthy_retry(kanban_home, monkeypatch):
+    board = "healthy-retry-clears"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    with kb.connect(board=board) as conn:
+        kb.create_task(conn, title="healthy after retry")
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    fingerprint = kb._db_content_fingerprint(db_path)
+    monkeypatch.setattr(kb.time, "time", lambda: 5000)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "previous corrupt retry window",
+        fingerprint=fingerprint,
+    )
+    monkeypatch.setattr(kb.time, "time", lambda: 5000 + kb.CORRUPT_BOARD_RETRY_SECONDS)
+
+    with kb.connect(board=board) as conn:
+        assert [task.title for task in kb.list_tasks(conn)] == ["healthy after retry"]
+
+    assert kb.is_board_paused_for_corruption(board) is None
+
+
+def test_connect_clears_stale_corrupt_incident_after_changed_healthy_fingerprint(kanban_home, monkeypatch):
+    board = "healthy-change-clears"
+    kb.create_board(board)
+    db_path = kb.kanban_db_path(board)
+    db_path.write_bytes(b"previous corrupt bytes")
+    stale_fingerprint = kb._db_content_fingerprint(db_path)
+    monkeypatch.setattr(kb.time, "time", lambda: 6000)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "previous corrupt bytes",
+        fingerprint=stale_fingerprint,
+    )
+    db_path.unlink()
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(board=board) as conn:
+        kb.create_task(conn, title="healthy replacement")
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    with kb.connect(board=board) as conn:
+        assert [task.title for task in kb.list_tasks(conn)] == ["healthy replacement"]
+
+    assert kb.is_board_paused_for_corruption(board) is None
+
+
 def test_board_metadata_non_utf8_bytes_fall_back_to_synthesized_metadata(kanban_home):
     """One corrupt board.json must not take down board discovery/dashboard snapshots."""
     board = "bad-metadata-board"

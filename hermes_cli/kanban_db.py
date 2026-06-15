@@ -2241,7 +2241,15 @@ def _guard_existing_db_is_healthy(path: Path, *, board: Optional[str] = None) ->
             return
     except OSError:
         return
-    if str(resolved) in _INITIALIZED_PATHS:
+    slug = _board_for_db_path(resolved, board)
+    retrying_stale_incident = False
+    if slug:
+        try:
+            state = corrupt_board_quarantine_state(slug)
+            retrying_stale_incident = bool(state.get("incident") and state.get("open_allowed"))
+        except Exception:
+            retrying_stale_incident = False
+    if str(resolved) in _INITIALIZED_PATHS and not retrying_stale_incident:
         return
     sidecar_bytes = _read_db_sidecars(resolved)
     fingerprint_before_repair = _db_content_fingerprint(resolved)
@@ -2270,6 +2278,8 @@ def _guard_existing_db_is_healthy(path: Path, *, board: Optional[str] = None) ->
     except sqlite3.DatabaseError as exc:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
+        if retrying_stale_incident and slug:
+            clear_corrupt_board_incident(slug)
         return
     _raise_corrupt_existing_db(resolved, reason, board=board, sidecar_bytes=sidecar_bytes)
 

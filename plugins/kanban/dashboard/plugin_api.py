@@ -122,6 +122,7 @@ def _conn(board: Optional[str] = None):
     :func:`_resolve_board`). When ``None`` the active board is used
     via the resolution chain (env var → ``current`` file → ``default``).
     """
+    _raise_if_corrupt_quarantined(board)
     try:
         kanban_db.init_db(board=board)
     except Exception as exc:
@@ -3707,6 +3708,16 @@ async def stream_events(ws: WebSocket):
             ws_board = None
 
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
+            state = _corrupt_board_state(ws_board)
+            if state:
+                return cursor_val, [{
+                    "id": cursor_val,
+                    "task_id": None,
+                    "run_id": None,
+                    "kind": "kanban_board_corrupt",
+                    "payload": _corrupt_board_payload(state),
+                    "created_at": int(time.time()),
+                }]
             conn = kanban_db.connect(board=ws_board)
             try:
                 rows = conn.execute(

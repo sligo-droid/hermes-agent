@@ -3167,6 +3167,53 @@ def test_stats_endpoint_rejects_corrupt_quarantined_board(client, monkeypatch):
     assert detail["corruption"]["next_retry"] == 4000 + kb.CORRUPT_BOARD_RETRY_SECONDS
 
 
+def test_board_endpoint_rejects_corrupt_quarantined_board_before_open(client, monkeypatch):
+    board = "dashboard-board-corrupt"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"not sqlite")
+    monkeypatch.setattr(kb.time, "time", lambda: 4100)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "sqlite refused to open file: file is not a database",
+        fingerprint=kb._db_content_fingerprint(db_path),
+    )
+
+    r = client.get("/api/plugins/kanban/board", params={"board": board})
+
+    assert r.status_code == 503
+    detail = r.json()["detail"]
+    assert detail["error"] == "kanban_board_corrupt"
+    assert detail["board"] == board
+    assert detail["corruption"]["next_retry"] == 4100 + kb.CORRUPT_BOARD_RETRY_SECONDS
+
+
+def test_command_center_snapshot_degrades_corrupt_quarantined_board(client, monkeypatch):
+    board = "dashboard-snapshot-corrupt"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"not sqlite")
+    monkeypatch.setattr(kb.time, "time", lambda: 4200)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "sqlite refused to open file: file is not a database",
+        fingerprint=kb._db_content_fingerprint(db_path),
+    )
+
+    r = client.get("/api/plugins/kanban/command-center/snapshot", params={"force_refresh": "true"})
+
+    assert r.status_code == 200, r.text
+    source = next(
+        source for source in r.json()["sources"]
+        if source["id"] == f"source:kanban-board-error:{board}"
+    )
+    assert source["status"] == "degraded"
+    assert source["ref"]["board"] == board
+    assert source["ref"]["corruption"]["next_retry"] == 4200 + kb.CORRUPT_BOARD_RETRY_SECONDS
+
+
 # ---------------------------------------------------------------------------
 # Recovery endpoints (reclaim + reassign) and warnings field
 # ---------------------------------------------------------------------------
