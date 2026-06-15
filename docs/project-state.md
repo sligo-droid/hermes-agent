@@ -25,6 +25,7 @@ This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork
 | Self-improvement proposal cron overdue audit | implemented | `hermes cron status` now surfaces enabled, non-paused `self_improvement_proposal` cron jobs that are overdue beyond scheduler grace, including schedule state, last output, matching session, stale-open-session status, and scheduler log evidence without rerunning or mutating jobs. |
 | Discord worker PR finalization sync | implemented | Autonomous Discord/Kanban auto-merge finalization now treats post-merge canonical checkout fast-forward sync as part of completion: after a PR is verified merged, the recorded `project_path` checkout must be clean, fast-forward to the base branch, and contain the merge commit before the board can complete. Dirty/missing/diverged checkouts block visibly instead of silently leaving `/home/droid/hermes` behind. |
 | Discord worker-board corruption route repair | implemented | Public worker-board reads now invoke the existing conservative Kanban DB repair once when a board DB is paused for corruption, so known repairable worker boards do not stay user-visible as `Kanban not found`. |
+| Kanban board discovery | implemented | Non-default board discovery now treats `board.json` as durable board metadata, keeps non-empty legacy `kanban.db`-only boards discoverable, and ignores incidental zero-byte DB stubs without deleting or repairing them. |
 
 Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `merged`, `deployed`, `verified`, `superseded`.
 
@@ -53,6 +54,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Added read-only overdue-run visibility for enabled self-improvement proposal cron jobs so missed proposal schedules are visible from `hermes cron status` with scheduler/session/output evidence instead of requiring manual absence audits.
 - [x] Closed the Discord worker PR finalization gap that let auto-merged PRs mark boards complete before the canonical `project_path` checkout was fast-forwarded; merged workers now block visibly on dirty, missing, non-fast-forwardable, or merge-commit-missing checkouts.
 - [x] Repaired worker board `discord-1516079773099491498` from a corruption-paused Kanban DB and added public worker-board read repair so future repairable corruption incidents do not surface as `Kanban not found`.
+- [x] Tightened Kanban board discovery so metadata-only boards and non-empty legacy DB-only boards remain visible while zero-byte non-default `kanban.db` stubs without `board.json` are excluded from normal active listings without mutation.
 
 ## In Progress
 
