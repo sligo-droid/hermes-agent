@@ -1586,8 +1586,8 @@ class SessionDB:
 
     def list_sessions_rich(
         self,
-        source: str = None,
-        exclude_sources: List[str] = None,
+        source: Optional[str] = None,
+        exclude_sources: Optional[List[str]] = None,
         limit: int = 20,
         offset: int = 0,
         include_children: bool = False,

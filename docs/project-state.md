@@ -27,6 +27,7 @@ This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork
 | Discord worker-board corruption route repair | implemented | Public worker-board reads now invoke the existing conservative Kanban DB repair once when a board DB is paused for corruption, so known repairable worker boards do not stay user-visible as `Kanban not found`. |
 | Kanban board discovery | implemented | Non-default board discovery now treats `board.json` as durable board metadata, keeps non-empty legacy `kanban.db`-only boards discoverable, and ignores incidental zero-byte DB stubs without deleting or repairing them. |
 | Corrupt Kanban board quarantine | implemented | Dispatcher ticks, readiness/health probes, notifier polling, and dashboard/API board-open paths now share corrupt-board quarantine state keyed by board slug and DB fingerprint. Known-corrupt boards skip repeat SQLite opens until retry expiry unless the DB fingerprint changes, and readers return degraded/corrupt responses where practical without repairing or deleting DB contents. |
+| Kanban board DB routing | implemented | Explicit Kanban `board=` routing now ignores stale ambient `HERMES_KANBAN_DB` values and resolves to deterministic board DB paths, while explicit `db_path=` callers and Hermes-marked dispatcher worker handoff remain supported. |
 
 Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `merged`, `deployed`, `verified`, `superseded`.
 
@@ -57,6 +58,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Repaired worker board `discord-1516079773099491498` from a corruption-paused Kanban DB and added public worker-board read repair so future repairable corruption incidents do not surface as `Kanban not found`.
 - [x] Tightened Kanban board discovery so metadata-only boards and non-empty legacy DB-only boards remain visible while zero-byte non-default `kanban.db` stubs without `board.json` are excluded from normal active listings without mutation.
 - [x] Shared corrupt Kanban board quarantine across gateway dispatcher, readiness/health, notifier, and dashboard/API readers so a known-corrupt DB fingerprint is not reopened repeatedly during the same retry window.
+- [x] Narrowed ambient `HERMES_KANBAN_DB` precedence so stale inherited environment cannot redirect explicit board operations across boards/profiles; unsafe ambient overrides now warn, while explicit `db_path=` and marked dispatcher worker handoff paths are preserved.
 
 ## In Progress
 

@@ -136,6 +136,21 @@ _SLASH_WORKER_TIMEOUT_S = max(5.0, _slash_timeout)
 _DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity")
 _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 
+
+def _is_resumable_history_session(row: dict) -> bool:
+    """Return True when a DB session row has a transcript worth resuming.
+
+    Gateway platforms create session metadata before the first user message so
+    interrupted starts, resets, and tests can leave real rows with no messages.
+    Those rows are useful for diagnostics but are not human resume targets.
+    """
+    try:
+        message_count = int(row.get("message_count") or 0)
+    except (TypeError, ValueError):
+        message_count = 0
+    return message_count > 0
+
+
 # ── Async RPC dispatch (#12546) ──────────────────────────────────────
 # A handful of handlers block the dispatcher loop in entry.py for seconds
 # to minutes (slash.exec, cli.exec, shell.exec, session.resume,
@@ -2385,14 +2400,15 @@ def _(rid, params: dict) -> dict:
         deny = frozenset({"tool"})
 
         limit = int(params.get("limit", 200) or 200)
-        # Over-fetch modestly so per-source filtering doesn't leave us
-        # short; the compression-tip projection in ``list_sessions_rich``
-        # can also merge rows.
-        fetch_limit = max(limit * 2, 200)
+        # Over-fetch so noisy internal/empty rows do not fill the page before
+        # real resumable conversations are reached. The compression-tip
+        # projection in ``list_sessions_rich`` can also merge rows.
+        fetch_limit = max(limit * 5, 1000)
         rows = [
             s
             for s in db.list_sessions_rich(source=None, limit=fetch_limit)
             if (s.get("source") or "").strip().lower() not in deny
+            and _is_resumable_history_session(s)
         ][:limit]
         return _ok(
             rid,
@@ -2438,10 +2454,12 @@ def _(rid, params: dict) -> dict:
         # users (lots of recent ``tool`` rows) don't get a false
         # "no eligible session" answer.  ``session.list`` uses a
         # similar over-fetch strategy.
-        rows = db.list_sessions_rich(source=None, limit=200)
+        rows = db.list_sessions_rich(source=None, limit=1000)
         for row in rows:
             src = (row.get("source") or "").strip().lower()
             if src in deny:
+                continue
+            if not _is_resumable_history_session(row):
                 continue
             return _ok(
                 rid,
