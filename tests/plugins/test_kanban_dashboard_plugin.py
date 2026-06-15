@@ -70,6 +70,98 @@ def client(kanban_home):
     return TestClient(app)
 
 
+def test_conn_uses_connect_as_dashboard_initialization_path(client, monkeypatch):
+    pa = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    calls: list[tuple[str, str | None]] = []
+
+    class FakeConn:
+        pass
+
+    fake_conn = FakeConn()
+
+    def fail_init_db(*args, **kwargs):
+        raise AssertionError("dashboard _conn must not double-initialize boards")
+
+    def fake_connect(*, board=None):
+        calls.append(("connect", board))
+        return fake_conn
+
+    monkeypatch.setattr(pa.kanban_db, "init_db", fail_init_db)
+    monkeypatch.setattr(pa.kanban_db, "connect", fake_connect)
+
+    assert pa._conn(board="healthy-board") is fake_conn
+    assert calls == [("connect", "healthy-board")]
+
+
+def test_board_counts_uses_one_connect_and_no_init_for_healthy_board(client, monkeypatch, tmp_path):
+    pa = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    calls: list[tuple[str, str | None]] = []
+    db_path = tmp_path / "kanban.db"
+    db_path.write_bytes(b"placeholder")
+
+    class FakeConn:
+        def execute(self, sql):
+            assert "FROM tasks" in sql
+            return self
+
+        def fetchall(self):
+            return [{"status": "ready", "n": 2}]
+
+        def close(self):
+            calls.append(("close", None))
+
+    def fail_init_db(*args, **kwargs):
+        raise AssertionError("_board_counts must not init healthy boards")
+
+    def fake_connect(*, board=None):
+        calls.append(("connect", board))
+        return FakeConn()
+
+    monkeypatch.setattr(pa.kanban_db, "kanban_db_path", lambda board=None: db_path)
+    monkeypatch.setattr(pa.kanban_db, "init_db", fail_init_db)
+    monkeypatch.setattr(pa.kanban_db, "connect", fake_connect)
+
+    assert pa._board_counts("healthy-board") == {"ready": 2}
+    assert calls == [("connect", "healthy-board"), ("close", None)]
+
+
+def test_board_counts_skips_unchanged_paused_corrupt_board_without_retrying_connect(
+    client, monkeypatch, tmp_path,
+):
+    pa = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    db_path = tmp_path / "kanban.db"
+    db_path.write_bytes(b"not sqlite")
+    backup_path = tmp_path / "kanban.db.corrupt.test.bak"
+    incident = {
+        "pause_reason": "kanban_db_corruption",
+        "fingerprint": kb._db_content_fingerprint(db_path),
+        "quarantine_path": str(backup_path),
+        "reason": "invalid SQLite header",
+    }
+    connect_calls: list[str | None] = []
+
+    def fail_init_db(*args, **kwargs):
+        raise AssertionError("paused corrupt board counts must not init DB")
+
+    def fake_connect(*, board=None):
+        connect_calls.append(board)
+        raise kb.KanbanDbCorruptError(
+            db_path,
+            backup_path,
+            "invalid SQLite header",
+            incident=incident,
+        )
+
+    monkeypatch.setattr(pa.kanban_db, "kanban_db_path", lambda board=None: db_path)
+    monkeypatch.setattr(pa.kanban_db, "is_board_paused_for_corruption", lambda board=None: incident)
+    monkeypatch.setattr(pa.kanban_db, "init_db", fail_init_db)
+    monkeypatch.setattr(pa.kanban_db, "connect", fake_connect)
+
+    assert pa._board_counts("corrupt-board") == {}
+    assert pa._board_counts("corrupt-board") == {}
+    assert connect_calls == []
+
+
 def test_command_center_snapshot_route_accepts_force_refresh(client, monkeypatch):
     import hermes_cli.command_center as cc
 
