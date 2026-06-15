@@ -112,3 +112,76 @@ def test_record_compression_route_results_reports_missing_only_without_routes():
     assert [issue["name"] for issue in issues] == [
         "compression configured provider routes missing"
     ]
+
+
+def test_record_honcho_watchdog_result_reports_disabled_repair_as_skipped():
+    facts = {}
+    issues = []
+    output = """Honcho health alert: deterministic watchdog found unexpected output, but repair inference failed.
+Inference error: RuntimeError: inference disabled by HONCHO_WATCHDOG_NO_INFERENCE=1
+
+--- Raw watchdog facts ---
+{
+  "anomalies": [
+    "queue errors: 4 queue errors since 2026-06-14T09:00:34.443950Z"
+  ],
+  "checked_at": "2026-06-15T09:00:19.779625Z"
+}
+"""
+
+    doctor.record_honcho_watchdog_result(
+        {"exit": 0, "output": output},
+        issues,
+        facts,
+    )
+
+    assert facts["honcho_watchdog_exit"] == 0
+    assert facts["honcho_watchdog_output"] == output
+    assert [issue["name"] for issue in issues] == [
+        "honcho deterministic watchdog reported anomalies; repair inference skipped"
+    ]
+    assert "queue errors: 4 queue errors since 2026-06-14T09:00:34.443950Z" in issues[0]["detail"]
+    assert "repair inference failed" in issues[0]["detail"]
+
+
+def test_record_honcho_watchdog_result_reports_real_failures():
+    facts = {}
+    issues = []
+
+    doctor.record_honcho_watchdog_result(
+        {"exit": 1, "output": "Honcho watchdog crashed: RuntimeError: boom"},
+        issues,
+        facts,
+    )
+
+    assert [issue["name"] for issue in issues] == ["honcho deterministic watchdog failed"]
+
+
+def test_record_honcho_watchdog_result_does_not_mask_failed_disabled_inference_output():
+    facts = {}
+    issues = []
+    output = (
+        "Honcho watchdog crashed before facts: "
+        "RuntimeError: inference disabled by HONCHO_WATCHDOG_NO_INFERENCE=1"
+    )
+
+    doctor.record_honcho_watchdog_result(
+        {"exit": 1, "output": output},
+        issues,
+        facts,
+    )
+
+    assert [issue["name"] for issue in issues] == ["honcho deterministic watchdog failed"]
+
+
+def test_record_honcho_watchdog_result_accepts_ok_status():
+    facts = {}
+    issues = []
+
+    doctor.record_honcho_watchdog_result(
+        {"exit": 0, "output": "OK Honcho watchdog: services/endpoints passed"},
+        issues,
+        facts,
+    )
+
+    assert issues == []

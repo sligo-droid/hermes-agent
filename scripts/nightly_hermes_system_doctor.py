@@ -13,6 +13,9 @@ from typing import Any
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+HONCHO_INFERENCE_DISABLED_RE = re.compile(
+    r"RuntimeError:\s*inference disabled by HONCHO_WATCHDOG_NO_INFERENCE=1"
+)
 
 
 def clean(text: str, limit: int = 4000) -> str:
@@ -104,3 +107,63 @@ def check_compression_routes(
 ) -> list[dict[str, Any]]:
     """Doctor route-smoke path for configured compression providers."""
     return record_compression_route_results(routes_smoke, issues, facts)
+
+
+def check_honcho_watchdog_status(
+    watchdog_status: dict[str, Any],
+    issues: list[dict[str, str]],
+    facts: dict[str, Any],
+) -> None:
+    """Doctor status path for Honcho deterministic watchdog output."""
+    record_honcho_watchdog_result(watchdog_status, issues, facts)
+
+
+def honcho_watchdog_repair_inference_disabled(output: str) -> bool:
+    """Return True when the Honcho watchdog intentionally skipped repair inference."""
+    return bool(HONCHO_INFERENCE_DISABLED_RE.search(output or ""))
+
+
+def honcho_watchdog_reported_anomaly_with_repair_skipped(
+    exit_code: Any, output: str
+) -> bool:
+    """Return True for deterministic anomaly reports with skipped repair inference."""
+    return (
+        exit_code == 0
+        and output.startswith("Honcho health alert: deterministic watchdog found unexpected output")
+        and "--- Raw watchdog facts ---" in output
+        and honcho_watchdog_repair_inference_disabled(output)
+    )
+
+
+def record_honcho_watchdog_result(
+    result: dict[str, Any],
+    issues: list[dict[str, str]],
+    facts: dict[str, Any],
+) -> None:
+    """Record the deterministic Honcho watchdog status result.
+
+    The nightly system doctor runs the Honcho watchdog with
+    ``HONCHO_WATCHDOG_NO_INFERENCE=1`` so status collection remains
+    deterministic and non-repairing. If the watchdog finds real anomalies in
+    that mode, its output includes a RuntimeError explaining that repair
+    inference was disabled. That is not itself a repair failure; keep the
+    underlying anomaly critical, but report the repair branch as skipped.
+    """
+    output = str(result.get("output") or "")
+    exit_code = result.get("exit")
+    facts["honcho_watchdog_exit"] = exit_code
+    facts["honcho_watchdog_output"] = output
+
+    if exit_code == 0 and output.startswith("OK Honcho watchdog"):
+        return
+
+    if honcho_watchdog_reported_anomaly_with_repair_skipped(exit_code, output):
+        add_issue(
+            issues,
+            "critical",
+            "honcho deterministic watchdog reported anomalies; repair inference skipped",
+            output,
+        )
+        return
+
+    add_issue(issues, "critical", "honcho deterministic watchdog failed", output)
