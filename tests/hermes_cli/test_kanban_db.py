@@ -3351,6 +3351,88 @@ class TestSharedBoardPaths:
         # are independent.
         assert kb.workspaces_root() == umbrella / "kanban" / "workspaces"
 
+    def test_explicit_board_ignores_stale_kanban_db_env(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        stale_db = tmp_path / "stale" / "other-board.db"
+        stale_db.parent.mkdir()
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(stale_db))
+
+        with caplog.at_level("WARNING", logger=kb.__name__):
+            resolved = kb.kanban_db_path(board="requested")
+
+        assert resolved == default_home / "kanban" / "boards" / "requested" / "kanban.db"
+        assert "Ignoring HERMES_KANBAN_DB" in caplog.text
+        assert "board='requested'" in caplog.text
+
+    def test_connect_and_init_board_ignore_stale_kanban_db_env(
+        self, tmp_path, monkeypatch
+    ):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        stale_db = tmp_path / "stale" / "wrong.db"
+        stale_db.parent.mkdir()
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(stale_db))
+
+        created = kb.init_db(board="requested")
+        assert created == default_home / "kanban" / "boards" / "requested" / "kanban.db"
+        with kb.connect(board="requested") as conn:
+            task_id = kb.create_task(conn, title="explicit-board")
+
+        assert created.exists()
+        assert not stale_db.exists()
+        with kb.connect(db_path=created) as conn:
+            assert kb.get_task(conn, task_id).title == "explicit-board"
+
+    def test_explicit_db_path_still_wins_over_board_and_env(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        explicit_db = tmp_path / "explicit" / "kanban.db"
+        stale_db = tmp_path / "stale" / "wrong.db"
+        explicit_db.parent.mkdir()
+        stale_db.parent.mkdir()
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(stale_db))
+
+        returned = kb.init_db(db_path=explicit_db, board="requested")
+        with kb.connect(db_path=explicit_db, board="requested") as conn:
+            kb.create_task(conn, title="explicit-path")
+
+        assert returned == explicit_db
+        assert explicit_db.exists()
+        assert not stale_db.exists()
+        assert "Ignoring HERMES_KANBAN_DB" not in caplog.text
+
+    def test_marked_handoff_no_board_uses_kanban_db_env_without_warning(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        handoff_db = tmp_path / "handoff" / "kanban.db"
+        handoff_db.parent.mkdir()
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "worker-board")
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(handoff_db))
+        monkeypatch.setenv(kb._KANBAN_DB_HANDOFF_MARKER_ENV, "1")
+
+        with caplog.at_level("WARNING", logger=kb.__name__):
+            assert kb.kanban_db_path() == handoff_db
+        assert "Ignoring HERMES_KANBAN_DB" not in caplog.text
+
     def test_hermes_kanban_workspaces_root_pin_beats_kanban_home(
         self, tmp_path, monkeypatch
     ):
@@ -3443,6 +3525,7 @@ class TestSharedBoardPaths:
             "HERMES_PROFILE": "coder",
             "HERMES_KANBAN_TASK": "t_demo",
             "HERMES_KANBAN_DB": "/home/droid/.hermes/kanban.db",
+            kb._KANBAN_DB_HANDOFF_MARKER_ENV: "1",
             "PATH": "/usr/bin",
             "OPENAI_API_KEY": "secret",
             "ANTHROPIC_API_KEY": "secret",
@@ -3453,6 +3536,7 @@ class TestSharedBoardPaths:
         assert out["HERMES_HOME"] == "/home/droid/.hermes/profiles/coder"
         assert out["GH_CONFIG_DIR"] == "/home/droid/.config/gh"
         assert out["HERMES_KANBAN_TASK"] == "t_demo"
+        assert out[kb._KANBAN_DB_HANDOFF_MARKER_ENV] == "1"
         assert out["PATH"] == "/usr/bin"
         assert "OPENAI_API_KEY" not in out
         assert "ANTHROPIC_API_KEY" not in out
