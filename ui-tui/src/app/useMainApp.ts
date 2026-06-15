@@ -41,6 +41,7 @@ import { createGatewayEventHandler } from './createGatewayEventHandler.js'
 import { createSlashHandler } from './createSlashHandler.js'
 import { getInputSelection } from './inputSelectionStore.js'
 import { type GatewayRpc, type TranscriptRow } from './interfaces.js'
+import { liveTailFollowSignal, scheduleStickyTailFollow, shouldFollowLiveTail } from './liveTailFollow.js'
 import { $overlayState, patchOverlayState } from './overlayStore.js'
 import { scrollWithSelectionBy } from './scroll.js'
 import { turnController } from './turnController.js'
@@ -198,6 +199,8 @@ export function useMainApp(gw: GatewayClient) {
       state.todos.length
     )
   )
+
+  const liveTailSignal = useTurnSelector(liveTailFollowSignal)
 
   const slashFlightRef = useRef(0)
   const slashRef = useRef<(cmd: string) => boolean>(() => false)
@@ -416,6 +419,27 @@ export function useMainApp(gw: GatewayClient) {
     },
     [stdout]
   )
+
+  const scheduleTailFollow = useCallback(() => {
+    scheduleStickyTailFollow({
+      requestPaint: () => requestRepaint(stdout ?? process.stdout),
+      scrollRef
+    })
+  }, [stdout])
+
+  const prevLiveTailSignalRef = useRef<null | typeof liveTailSignal>(null)
+
+  useEffect(() => {
+    const previous = prevLiveTailSignalRef.current
+
+    prevLiveTailSignalRef.current = liveTailSignal
+
+    if (!shouldFollowLiveTail(previous, liveTailSignal, scrollRef.current?.isSticky() ?? false)) {
+      return
+    }
+
+    scheduleTailFollow()
+  }, [liveTailSignal, scheduleTailFollow])
 
   const panel = useCallback(
     (title: string, sections: PanelSection[]) =>
@@ -716,7 +740,7 @@ export function useMainApp(gw: GatewayClient) {
         },
         submission: { submitRef },
         system: { bellOnComplete, stdout, sys, terminalNotifyOnComplete: ui.terminalNotifyOnComplete },
-        transcript: { appendMessage, panel, setHistoryItems },
+        transcript: { appendMessage, onAssistantComplete: scheduleTailFollow, panel, setHistoryItems },
         voice: {
           setProcessing: setVoiceProcessing,
           setRecording: setVoiceRecording,
@@ -734,6 +758,7 @@ export function useMainApp(gw: GatewayClient) {
       session.newSession,
       session.resetSession,
       session.resumeById,
+      scheduleTailFollow,
       setVoiceEnabled,
       setVoiceProcessing,
       setVoiceRecording,

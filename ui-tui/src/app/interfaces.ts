@@ -255,6 +255,7 @@ export interface GatewayEventHandlerContext {
   }
   transcript: {
     appendMessage: (msg: Msg) => void
+    onAssistantComplete?: () => void
     panel: (title: string, sections: PanelSection[]) => void
     setHistoryItems: StateSetter<Msg[]>
   }
