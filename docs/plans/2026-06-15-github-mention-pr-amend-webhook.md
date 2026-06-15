@@ -310,7 +310,7 @@ GitHub repo settings:
 
 - Payload URL: `https://sligo.sligolabs.com/webhooks/github-pr-amend`
 - Content type: `application/json`
-- Secret: generated strong shared secret matching Hermes config
+- Secret: generated strong shared secret stored in Hermes `.env` as `GITHUB_PR_WEBHOOK_SECRET`
 - SSL verification: enabled
 - Events: select individual events:
   - Issue comments
@@ -339,36 +339,37 @@ Hermes config shape for the route after this branch is merged/deployed:
 platforms:
   webhook:
     enabled: true
-    host: 127.0.0.1
-    port: 8644
-    routes:
-      github-pr-amend:
-        secret: "<same strong secret configured in GitHub>"
-        events:
-          - issue_comment
-          - pull_request_review_comment
-          - pull_request_review
-        mode: github_pr_amend
-        github_pr_amend:
-          mention: "@sligo-droid"
-          allowed_senders:
-            - tbrent
-          allowed_base_repos:
-            - reserve-protocol/reserve-index-dtf
-          allowed_head_repos:
-            - sligo-droid/reserve-index-dtf
-          canary_prs:
-            reserve-protocol/reserve-index-dtf:
-              - 182
-          job:
-            hermes_command: hermes
-            toolsets: terminal,file,web,session_search
-            max_turns: 120
-            timeout_seconds: 1800
-            workspace_root: /home/droid/workspaces/github-pr-amend
+    extra:
+      host: 127.0.0.1
+      port: 8644
+      routes:
+        github-pr-amend:
+          secret_env: GITHUB_PR_WEBHOOK_SECRET
+          events:
+            - issue_comment
+            - pull_request_review_comment
+            - pull_request_review
+          mode: github_pr_amend
+          github_pr_amend:
+            mention: "@sligo-droid"
+            allowed_senders:
+              - tbrent
+            allowed_base_repos:
+              - reserve-protocol/reserve-index-dtf
+            allowed_head_repos:
+              - sligo-droid/reserve-index-dtf
+            canary_prs:
+              reserve-protocol/reserve-index-dtf:
+                - 182
+            job:
+              hermes_command: hermes
+              toolsets: terminal,file,web,session_search
+              max_turns: 120
+              timeout_seconds: 1800
+              workspace_root: /home/droid/workspaces/github-pr-amend
 ```
 
-Current live state at the time of writing: the route is **not active** on the live gateway yet. `platforms.webhook` is empty in the active Hermes config, and the existing Cloudflare Tunnel routes all `sligo.sligolabs.com` traffic to the dashboard on `127.0.0.1:9119`. After merge/deploy, the remaining operator actions are: enable this route in Hermes config, add the Cloudflare path ingress above, restart the gateway/tunnel, then add the GitHub webhook using the exact Payload URL above.
+Current live state at the time of writing: the route is configured to read its HMAC secret from `.env` via `secret_env: GITHUB_PR_WEBHOOK_SECRET`, but the live gateway has not been restarted for this route yet. The existing Cloudflare Tunnel routes all `sligo.sligolabs.com` traffic to the dashboard on `127.0.0.1:9119`. After merge/deploy, the remaining operator actions are: add the Cloudflare path ingress above, restart the gateway/tunnel, then add the GitHub webhook using the exact Payload URL above.
 
 A public HTTPS route to the Hermes gateway is required, such as Cloudflare Tunnel or a reverse proxy.
 

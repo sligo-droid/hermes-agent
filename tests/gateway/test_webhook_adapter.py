@@ -42,6 +42,7 @@ from gateway.platforms.webhook import (
 def _make_config(
     routes=None,
     secret="",
+    secret_env="",
     rate_limit=30,
     max_body_bytes=1_048_576,
     host="0.0.0.0",
@@ -57,6 +58,8 @@ def _make_config(
     }
     if secret:
         extra["secret"] = secret
+    if secret_env:
+        extra["secret_env"] = secret_env
     return PlatformConfig(enabled=True, extra=extra)
 
 
@@ -513,6 +516,105 @@ class TestHTTPHandling:
             assert data["error"] == "Webhook route is missing an HMAC secret"
 
         adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_route_secret_env_accepts_signed_request_without_raw_config_secret(self, monkeypatch):
+        """Route secret_env resolves from the environment for HMAC validation."""
+        monkeypatch.setenv("WEBHOOK_ROUTE_SECRET", "env-route-secret")
+        routes = {"test": {"secret_env": "WEBHOOK_ROUTE_SECRET", "prompt": "hi"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        body = json.dumps({"data": "value"}).encode()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/test",
+                data=body,
+                headers={"X-Hub-Signature-256": _github_signature(body, "env-route-secret")},
+            )
+            assert resp.status == 202
+
+        assert "secret" not in routes["test"]
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_route_secret_env_missing_rejects_without_processing(self, monkeypatch):
+        """Missing secret_env fails closed rather than disabling auth."""
+        monkeypatch.delenv("WEBHOOK_ROUTE_SECRET", raising=False)
+        routes = {"test": {"secret_env": "WEBHOOK_ROUTE_SECRET", "prompt": "hi"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/webhooks/test", json={"data": "value"})
+            assert resp.status == 403
+            data = await resp.json()
+            assert data["error"] == "Webhook route is missing an HMAC secret"
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_global_secret_env_fallback_accepts_signed_request(self, monkeypatch):
+        """A global secret_env is used when the route has no route-level secret."""
+        monkeypatch.setenv("WEBHOOK_GLOBAL_SECRET", "env-global-secret")
+        routes = {"test": {"prompt": "hi"}}
+        adapter = _make_adapter(routes=routes, secret_env="WEBHOOK_GLOBAL_SECRET")
+        adapter.handle_message = AsyncMock()
+
+        body = json.dumps({"data": "value"}).encode()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/test",
+                data=body,
+                headers={"X-Hub-Signature-256": _github_signature(body, "env-global-secret")},
+            )
+            assert resp.status == 202
+
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_route_secret_precedes_secret_env_and_global_secret(self, monkeypatch):
+        """Explicit route secret remains the highest-priority credential."""
+        monkeypatch.setenv("WEBHOOK_ROUTE_SECRET", "env-route-secret")
+        monkeypatch.setenv("WEBHOOK_GLOBAL_SECRET", "env-global-secret")
+        routes = {
+            "test": {
+                "secret": "explicit-route-secret",
+                "secret_env": "WEBHOOK_ROUTE_SECRET",
+                "prompt": "hi",
+            }
+        }
+        adapter = _make_adapter(
+            routes=routes,
+            secret="global-secret",
+            secret_env="WEBHOOK_GLOBAL_SECRET",
+        )
+        adapter.handle_message = AsyncMock()
+
+        body = json.dumps({"data": "value"}).encode()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            rejected = await cli.post(
+                "/webhooks/test",
+                data=body,
+                headers={"X-Hub-Signature-256": _github_signature(body, "env-route-secret")},
+            )
+            assert rejected.status == 401
+
+            accepted = await cli.post(
+                "/webhooks/test",
+                data=body,
+                headers={
+                    "X-Hub-Signature-256": _github_signature(body, "explicit-route-secret"),
+                    "X-GitHub-Delivery": "explicit-route-secret-delivery",
+                },
+            )
+            assert accepted.status == 202
+
+        adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_health_endpoint(self):
@@ -1031,4 +1133,3 @@ class TestInsecureNoAuthSafetyRail:
             assert result is True
         finally:
             await adapter.disconnect()
-
