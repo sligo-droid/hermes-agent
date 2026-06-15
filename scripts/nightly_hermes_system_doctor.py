@@ -28,6 +28,14 @@ from pathlib import Path
 from typing import Any
 from urllib import request
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from hermes_cli.codex_auth_incidents import (
+    classify_codex_auth_incident,
+    collect_codex_auth_evidence,
+    render_codex_auth_incident_summary,
+)
+
 REPO = Path(os.environ.get("HERMES_REPO", "/home/droid/hermes"))
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/home/droid/.hermes"))
 HERMES = REPO / ".venv" / "bin" / "hermes"
@@ -255,6 +263,23 @@ def check_auth_list(issues: list[dict[str, str]], facts: dict[str, Any]) -> None
     bad = [line.strip() for line in r["output"].splitlines() if re.search(r"(?i)auth failed|expired|exhausted|invalid|401|403", line)]
     if bad:
         add_issue(issues, "critical", "hermes credential pool has unhealthy credentials", "\n".join(bad))
+
+
+def check_codex_auth_incidents(issues: list[dict[str, str]], facts: dict[str, Any]) -> None:
+    """Correlate recent OpenAI Codex auth failures into one route incident."""
+    evidence = collect_codex_auth_evidence(HERMES_HOME)
+    facts["codex_auth_evidence_count"] = len(evidence)
+    incident = classify_codex_auth_incident(evidence, auth_status_text=str(facts.get("hermes_auth_list") or ""))
+    if not incident:
+        facts["codex_auth_incident"] = None
+        return
+    facts["codex_auth_incident"] = incident.to_dict()
+    add_issue(
+        issues,
+        "critical" if incident.current_state == "current_auth_failure" else "warning",
+        "openai-codex credential invalidation incident detected",
+        render_codex_auth_incident_summary(incident),
+    )
 
 
 def python_smoke(code: str, timeout: int = 180) -> dict[str, Any]:
@@ -627,6 +652,7 @@ def main() -> int:
 
     check_hermes_doctor(issues, facts)
     check_auth_list(issues, facts)
+    check_codex_auth_incidents(issues, facts)
     check_main_inference(issues, facts)
     check_compression_inference(issues, facts)
     check_honcho(issues, facts)

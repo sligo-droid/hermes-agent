@@ -189,6 +189,52 @@ def test_record_honcho_watchdog_result_accepts_ok_status():
     assert issues == []
 
 
+def test_check_codex_auth_incidents_records_one_redacted_issue(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "cron" / "output" / "job-4").mkdir(parents=True)
+    (home / "logs" / "errors.log").write_text(
+        "2026-06-15T03:00:00Z hermes_cli.proxy.adapters.openai_codex AuthenticationError 401 token_invalidated api_key=secret-key\n",
+        encoding="utf-8",
+    )
+    (home / "cron" / "jobs.json").write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "job-4",
+                        "name": "Proposal cron",
+                        "last_status": "error",
+                        "last_error": "openai-codex 401 token_invalidated refresh_token=secret-refresh",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (home / "cron" / "output" / "job-4" / "2026-06-15_03-00-00.md").write_text(
+        "RuntimeError: OpenAI Codex upstream 401 token_invalidated access_token=secret-access\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(doctor, "HERMES_HOME", home)
+    facts = {"hermes_auth_list": "openai-codex: logged in"}
+    issues = []
+
+    doctor.check_codex_auth_incidents(issues, facts)
+
+    assert len(issues) == 1
+    assert issues[0]["severity"] == "warning"
+    assert issues[0]["name"] == "openai-codex credential invalidation incident detected"
+    assert facts["codex_auth_incident"]["provider_route"] == "openai-codex"
+    assert facts["codex_auth_incident"]["current_state"] == "recovered_logged_in"
+    assert facts["codex_auth_incident"]["affected_cron_jobs"] == [{"id": "job-4", "name": "Proposal cron"}]
+    detail = issues[0]["detail"]
+    assert "secret-key" not in detail
+    assert "secret-refresh" not in detail
+    assert "secret-access" not in detail
+    assert "Proposal cron" in detail
+
+
 def test_repo_script_is_full_cron_entrypoint_for_live_cron_job():
     jobs_path = doctor.HERMES_HOME / "cron" / "jobs.json"
     if jobs_path.exists():
