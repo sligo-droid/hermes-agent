@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-15 14:20 UTC
+Last updated: 2026-06-15 14:50 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -28,6 +28,7 @@ This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork
 | Kanban board discovery | implemented | Non-default board discovery now treats `board.json` as durable board metadata, keeps non-empty legacy `kanban.db`-only boards discoverable, and ignores incidental zero-byte DB stubs without deleting or repairing them. |
 | Corrupt Kanban board quarantine | implemented | Dispatcher ticks, readiness/health probes, notifier polling, and dashboard/API board-open paths now share corrupt-board quarantine state keyed by board slug and DB fingerprint. Known-corrupt boards skip repeat SQLite opens until retry expiry unless the DB fingerprint changes, and readers return degraded/corrupt responses where practical without repairing or deleting DB contents. |
 | Kanban board DB routing | implemented | Explicit Kanban `board=` routing now ignores stale ambient `HERMES_KANBAN_DB` values and resolves to deterministic board DB paths, while explicit `db_path=` callers and Hermes-marked dispatcher worker handoff remain supported. |
+| Kanban board health diagnostics | implemented | `hermes kanban diagnostics --board-health` now performs a read-only filesystem health scan across discovered boards, reporting DB existence/size, zero-byte stubs, SQLite header classification, read-only integrity status, WAL/SHM sidecars, and corrupt backup counts/latest mtime without initializing missing DBs or repairing files. |
 
 Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `merged`, `deployed`, `verified`, `superseded`.
 
@@ -59,6 +60,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Tightened Kanban board discovery so metadata-only boards and non-empty legacy DB-only boards remain visible while zero-byte non-default `kanban.db` stubs without `board.json` are excluded from normal active listings without mutation.
 - [x] Shared corrupt Kanban board quarantine across gateway dispatcher, readiness/health, notifier, and dashboard/API readers so a known-corrupt DB fingerprint is not reopened repeatedly during the same retry window.
 - [x] Narrowed ambient `HERMES_KANBAN_DB` precedence so stale inherited environment cannot redirect explicit board operations across boards/profiles; unsafe ambient overrides now warn, while explicit `db_path=` and marked dispatcher worker handoff paths are preserved.
+- [x] Added read-only Kanban board health diagnostics so operators can inspect corrupt DBs, zero-byte stubs, WAL/SHM sidecars, and corrupt backups from the existing diagnostics CLI surface without triggering board initialization or remediation.
 
 ## In Progress
 

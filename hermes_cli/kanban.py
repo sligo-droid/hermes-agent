@@ -476,6 +476,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--json", action="store_true",
         help="Emit JSON (structured) instead of the default human table",
     )
+    p_diag.add_argument(
+        "--board-health", action="store_true",
+        help="Read-only filesystem health scan for all discovered Kanban boards",
+    )
 
     # --- repair (board corruption recovery) ---
     p_repair = sub.add_parser(
@@ -934,7 +938,7 @@ def kanban_command(args: argparse.Namespace) -> int:
     # HERMES_HOME. Previously only `init` and `daemon` triggered
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
-    if action != "repair":
+    if action != "repair" and not (action in {"diagnostics", "diag"} and getattr(args, "board_health", False)):
         try:
             kb.init_db()
         except Exception as exc:
@@ -1716,6 +1720,9 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     """List active diagnostics on the board. Wraps the same rule engine
     the dashboard uses, so CLI output matches what the UI shows.
     """
+    if getattr(args, "board_health", False):
+        return _cmd_board_health_diagnostics(args)
+
     from hermes_cli import kanban_diagnostics as kd
     from hermes_cli.config import load_config
 
@@ -1840,6 +1847,32 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 if a.suggested:
                     print(f"       → {a.label}")
         print()
+    return 0
+
+
+def _cmd_board_health_diagnostics(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_board_health as health
+
+    boards = health.scan_boards()
+    if getattr(args, "json", False):
+        print(json.dumps(boards, indent=2, ensure_ascii=False))
+        return 0
+    if not boards:
+        print("No Kanban boards discovered.")
+        return 0
+    print(f"Kanban board health: {len(boards)} board(s) discovered")
+    for board in boards:
+        parts = [
+            f"exists={board['exists']}",
+            f"size={board['size']}",
+            f"zero_byte_stub={board['zero_byte_stub']}",
+            f"header={board['sqlite_header_status']}",
+            f"integrity={board['integrity_status'] or ''}",
+            f"wal={board['wal_present']}",
+            f"shm={board['shm_present']}",
+            f"corrupt_backups={board['corrupt_backup_count']}",
+        ]
+        print(f"  {board['slug']}  {board['db_path']}  " + " | ".join(parts))
     return 0
 
 
