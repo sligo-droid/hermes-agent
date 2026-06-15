@@ -5661,33 +5661,11 @@ class GatewayRunner:
                     def _board_db_path(slug: str) -> Path:
                         return Path(str(_kb.kanban_db_path(slug))).expanduser().resolve()
 
-                    def _paused_corrupt_incident(slug: str) -> Optional[dict]:
+                    def _corrupt_quarantine_state(slug: str) -> dict:
                         try:
-                            incident = _kb.is_board_paused_for_corruption(slug)
+                            return _kb.corrupt_board_quarantine_state(slug)
                         except Exception:
-                            return None
-                        if not incident:
-                            return None
-                        db_path = Path(str(incident.get("db_path") or _kb.kanban_db_path(slug)))
-                        try:
-                            fingerprint = _kb._db_content_fingerprint(db_path)
-                        except Exception:
-                            fingerprint = None
-                        if incident.get("fingerprint") == fingerprint:
-                            return incident
-                        return None
-
-                    def _is_corrupt_board_db_error(exc: Exception) -> bool:
-                        corrupt_guard_error = getattr(_kb, "KanbanDbCorruptError", None)
-                        if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
-                            return True
-                        if not isinstance(exc, sqlite3.DatabaseError):
-                            return False
-                        msg = str(exc).lower()
-                        return (
-                            "file is not a database" in msg
-                            or "database disk image is malformed" in msg
-                        )
+                            return {"open_allowed": True, "skipped": False}
 
                     def _record_corrupt_board(slug: str, exc: Exception) -> Optional[dict]:
                         incident = getattr(exc, "incident", None)
@@ -5737,16 +5715,21 @@ class GatewayRunner:
                             )
                             continue
                         seen_db_paths.add(resolved_db_path)
-                        if _paused_corrupt_incident(slug):
+                        state = _corrupt_quarantine_state(slug)
+                        if state.get("skipped"):
                             logger.debug(
-                                "kanban notifier: board %s paused for unchanged DB corruption; skipping poll",
+                                "kanban notifier: board %s paused for unchanged DB corruption; "
+                                "skipping poll db_path=%s next_retry=%s reason=%s",
                                 slug,
+                                state.get("db_path"),
+                                state.get("next_retry"),
+                                state.get("reason"),
                             )
                             continue
                         try:
                             conn = _kb.connect(board=slug)
                         except Exception as exc:
-                            if _is_corrupt_board_db_error(exc):
+                            if _kb.is_corrupt_board_db_error(exc):
                                 _log_corrupt_board_incident(slug, _record_corrupt_board(slug, exc), exc)
                                 continue
                             logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
@@ -6466,25 +6449,21 @@ class GatewayRunner:
                 fingerprint = None
             return (identity[0], fingerprint)
 
+        def _corrupt_quarantine_state(slug: str) -> dict:
+            try:
+                state = _kb.corrupt_board_quarantine_state(slug)
+            except Exception:
+                return {"open_allowed": True, "skipped": False}
+            if state.get("changed_fingerprint"):
+                logger.info(
+                    "kanban dispatcher: board %s database changed since corruption incident; retrying health checks",
+                    slug,
+                )
+            return state
+
         def _paused_corrupt_incident(slug: str) -> Optional[dict]:
-            try:
-                incident = _kb.is_board_paused_for_corruption(slug)
-            except Exception:
-                return None
-            if not incident:
-                return None
-            incident_db = Path(str(incident.get("db_path") or _kb.kanban_db_path(slug)))
-            try:
-                current_fingerprint = _kb._db_content_fingerprint(incident_db)
-            except Exception:
-                current_fingerprint = None
-            if incident.get("fingerprint") == current_fingerprint:
-                return incident
-            logger.info(
-                "kanban dispatcher: board %s database changed since corruption incident; retrying health checks",
-                slug,
-            )
-            return None
+            state = _corrupt_quarantine_state(slug)
+            return state.get("incident") if state.get("skipped") else None
 
         def _record_corrupt_board(slug: str, exc: Exception) -> Optional[dict]:
             fingerprint = _board_db_fingerprint(slug)
@@ -6517,18 +6496,6 @@ class GatewayRunner:
                 slug,
             )
 
-        def _is_corrupt_board_db_error(exc: Exception) -> bool:
-            corrupt_guard_error = getattr(_kb, "KanbanDbCorruptError", None)
-            if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
-                return True
-            if not isinstance(exc, sqlite3.DatabaseError):
-                return False
-            msg = str(exc).lower()
-            return (
-                "file is not a database" in msg
-                or "database disk image is malformed" in msg
-            )
-
         def _tick_once_for_board(slug: str) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
@@ -6539,10 +6506,15 @@ class GatewayRunner:
             connection handle or accidentally claim across each other.
             """
             conn = None
-            if _paused_corrupt_incident(slug):
+            state = _corrupt_quarantine_state(slug)
+            if state.get("skipped"):
                 logger.debug(
-                    "kanban dispatcher: board %s paused for unchanged DB corruption; skipping dispatch",
+                    "kanban dispatcher: board %s paused for unchanged DB corruption; "
+                    "skipping dispatch db_path=%s next_retry=%s reason=%s",
                     slug,
+                    state.get("db_path"),
+                    state.get("next_retry"),
+                    state.get("reason"),
                 )
                 return None
             try:
@@ -6582,13 +6554,13 @@ class GatewayRunner:
                     max_in_progress_per_profile=max_in_progress_per_profile,
                 )
             except sqlite3.DatabaseError as exc:
-                if _is_corrupt_board_db_error(exc):
+                if _kb.is_corrupt_board_db_error(exc):
                     _log_corrupt_board_incident(slug, _record_corrupt_board(slug, exc), exc)
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
             except Exception as exc:
-                if _is_corrupt_board_db_error(exc):
+                if _kb.is_corrupt_board_db_error(exc):
                     _log_corrupt_board_incident(slug, _record_corrupt_board(slug, exc), exc)
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
