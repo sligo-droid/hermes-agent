@@ -3239,6 +3239,73 @@ def test_reconcile_board_creates_round_prefixed_reviewer_ticket(monkeypatch, tmp
     assert reviewer_tasks[0].title == "R1: Review Discord implementation"
 
 
+def test_reconcile_board_reviewer_body_includes_pre_review_readiness(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(thread_id="review-readiness", goal="Update live cron pickup")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        dev_id = kanban_db.create_task(
+            conn,
+            title="R1: Update cron script",
+            assignee=dwb.ROLE_DEV,
+            tenant=board.slug,
+        )
+        claimed = kanban_db.claim_task(conn, dev_id)
+        assert claimed is not None
+        kanban_db.complete_task(
+            conn,
+            dev_id,
+            summary="Updated source and verified live pickup.",
+            metadata={
+                "changed_files": ["cron/nightly.py"],
+                "tests": [
+                    {
+                        "command": "scripts/run_tests.sh tests/cron",
+                        "result": "passed",
+                        "output": "verbose output should stay out of reviewer payload",
+                        "api_key": "must-not-leak",
+                    }
+                ],
+                "handoff": {
+                    "verification": ["Compared source path with active profile cron path"],
+                    "notes": "Active path /home/droid/.hermes/profiles/default/cron/nightly.py matched source.",
+                    "api_token": "must-not-leak",
+                },
+                "raw": {
+                    "provenance": "source path copied to active runtime path",
+                    "live_pickup": "default profile cron script refreshed",
+                },
+            },
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    assert dwb.reconcile_board(board.slug) == "reviewer_created"
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        reviewer = [task for task in kanban_db.list_tasks(conn, include_archived=False) if task.assignee == "reviewer"][0]
+    finally:
+        conn.close()
+
+    payload = json.loads(reviewer.body or "{}")
+    readiness = payload["pre_review_readiness"]
+    evidence = readiness["dev_handoffs"][0]["evidence"]
+    assert "changed files, tests, provenance" in readiness["advisory"]
+    assert evidence["changed_files"] == ["cron/nightly.py"]
+    assert evidence["tests"] == [{"command": "scripts/run_tests.sh tests/cron", "result": "passed"}]
+    assert evidence["handoff"]["verification"] == ["Compared source path with active profile cron path"]
+    assert evidence["provenance"] == "source path copied to active runtime path"
+    assert evidence["live_pickup"] == "default profile cron script refreshed"
+    readiness_json = json.dumps(readiness)
+    assert "api_token" not in readiness_json
+    assert "api_key" not in readiness_json
+    assert "verbose output" not in readiness_json
+
+
 def test_reconcile_board_recovers_approved_reviewer_finalizer_success(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -4352,6 +4419,18 @@ def test_reconcile_board_reviewer_body_includes_context_pack_and_requirements(mo
     assert payload["context_pack"]["version"] == 1
     assert payload["context_pack"]["markdown_path"].endswith("context-pack.md")
     assert payload["requirements"][0]["id"] == "REQ-1"
+
+
+def test_planner_and_dev_guidance_mentions_live_provenance_readiness():
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli.discord_worker_roles import DEV_TICKET_BODY_GUIDANCE
+
+    planner_text = "\n".join(dwb._planner_instructions())
+    assert "live/runtime/deployment/provenance/entrypoint pickup" in planner_text
+    assert "first-class requirements" in planner_text
+    assert "pre-review readiness checklist" in DEV_TICKET_BODY_GUIDANCE
+    assert "active path" in DEV_TICKET_BODY_GUIDANCE
+    assert "source of truth" in DEV_TICKET_BODY_GUIDANCE
 
 
 def test_dispatch_once_allows_explicit_role_lane_assignees(monkeypatch, tmp_path):

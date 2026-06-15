@@ -651,6 +651,7 @@ def _role_outcome_frame(role: str) -> str:
             "- Findings name concrete issues, or findings is empty when the work is approved.\n"
             "- New dev tasks are outcome-first follow-up briefs when changes are required.\n"
             "- PR lifecycle chores are excluded from new dev tasks; the deterministic finalizer owns push/open/merge after approval.\n"
+            "- Live pickup, deployment, active-path, and provenance gaps are treated as real implementation/closeout gaps, not PR lifecycle chores.\n"
             "- criteria_assessment maps each criterion to evidence or a gap.\n"
             "Stop when: Return the JSON review verdict."
         )
@@ -726,7 +727,9 @@ def _schema_instructions(role: str) -> str:
             '"new_tasks":[{"title":"...","body":"...","priority":0}],"criteria_assessment":{}, "blocker":null} '
             "Assess any requirements included in the Kanban context for coverage gaps. "
             "Use parent task handoff manifests as primary review inputs, along with focused code/tests inspection. "
+            "Use any pre_review_readiness advisory only as evidence to inspect, not as approval. "
             "When requesting changes, each new_tasks body must be a self-contained follow-up brief that opens with Goal, Success means, and Stop when. "
+            "If changes are required for live pickup, deployment, active runtime paths, source-of-truth, or provenance, the follow-up dev task must explicitly ask dev to verify and record the active path and source of truth. "
             "Do not emit new_tasks for pure PR lifecycle chores: git push, gh pr create/view/checks, updating an existing PR, waiting on checks, or merging."
         )
     if role == ROLE_FOREMAN:

@@ -2788,6 +2788,54 @@ def test_reviewer_pr_lifecycle_task_finalizes_without_dev_ticket(monkeypatch, tm
     assert meta["goal_status"] == "done"
 
 
+def test_reviewer_pr_lifecycle_filter_keeps_live_provenance_followup(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+
+    board = dwb.start_direct_goal(thread_id="review-live-provenance", goal="Ship live cron pickup")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        reviewer_id = kanban_db.create_task(
+            conn,
+            title="R2: Review Discord implementation",
+            assignee=ROLE_REVIEWER,
+            tenant=board.slug,
+        )
+        claimed = kanban_db.claim_task(conn, reviewer_id)
+        assert claimed is not None
+
+        worker._apply_role_output(
+            conn,
+            claimed.id,
+            ROLE_REVIEWER,
+            {
+                "status": "changes_requested",
+                "summary": "Live provenance is missing.",
+                "new_tasks": [
+                    {
+                        "title": "Verify live pickup provenance",
+                        "body": "Goal: verify and record the active runtime path, source of truth, and live pickup evidence.",
+                        "priority": 10,
+                    }
+                ],
+            },
+            board=board.slug,
+            workspace=str(tmp_path / "repo"),
+            expected_run_id=claimed.current_run_id,
+        )
+        dev_tasks = [
+            item for item in kanban_db.list_tasks(conn, include_archived=False)
+            if item.assignee == "dev"
+        ]
+    finally:
+        conn.close()
+
+    assert [item.title for item in dev_tasks] == ["R1: Verify live pickup provenance"]
+
+
 def test_reviewer_pr_lifecycle_task_filter_keeps_real_code_followup(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -3051,6 +3099,9 @@ def test_worker_role_frames_are_outcome_first():
     assert "opens with Goal, Success means, and Stop when" in reviewer_schema
     assert "Do not create dev tickets whose goal is to push a branch" in worker._schema_instructions(ROLE_PLANNER)
     assert "Do not emit new_tasks for pure PR lifecycle chores" in reviewer_schema
+    assert "pre_review_readiness advisory only as evidence" in reviewer_schema
+    assert "active runtime paths" in reviewer_schema
+    assert "source of truth" in reviewer_schema
     assert "Never push to a remote branch" in worker._schema_instructions(ROLE_DEV)
 
 

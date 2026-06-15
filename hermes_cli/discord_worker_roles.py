@@ -20,7 +20,11 @@ DEV_TICKET_BODY_GUIDANCE = (
     "Each dev ticket body must be a detailed, self-contained implementation brief "
     "that opens with Goal, Success means, and Stop when, followed by Scope, "
     "Implementation notes, Likely files/subsystems, Dependencies or handoffs, "
-    "Verification, and Out of scope."
+    "Verification, and Out of scope. If the ticket changes a live entrypoint, "
+    "cron job, profile-scoped script, deployment path, generated artifact, or "
+    "any file whose active runtime path can differ from the repo path, include a "
+    "pre-review readiness checklist with closeout evidence for the active path, "
+    "source of truth, provenance, and live pickup/deployment verification."
 )
 GOAL_CONTROL_COMMANDS = frozenset({"status", "pause", "resume", "clear", "stop", "done"})
 TERMINAL_GOAL_STATUSES = frozenset({"done", "blocked", "cancelled"})
