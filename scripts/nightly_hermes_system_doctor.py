@@ -44,8 +44,14 @@ OPENCODE = Path(os.environ.get("OPENCODE_BIN", "/home/droid/.local/bin/opencode"
 STATE = HERMES_HOME / "state" / "nightly-hermes-system-doctor.json"
 LIVE_SCRIPT = HERMES_HOME / "scripts" / "nightly_hermes_system_doctor.py"
 REPO_SCRIPT = REPO / "scripts" / "nightly_hermes_system_doctor.py"
+CRON_JOBS = HERMES_HOME / "cron" / "jobs.json"
 HONCHO_WATCHDOG = HERMES_HOME / "skills" / "devops" / "honcho-health-watchdog" / "scripts" / "honcho_daily_health_watchdog.py"
 ENTRYPOINT_SOURCE_LABEL = "repo-managed-nightly-hermes-system-doctor-v1"
+LIVE_INSTALL_COMMAND = (
+    "HERMES_HOME=/home/droid/.hermes HERMES_REPO=/home/droid/hermes "
+    "/home/droid/hermes/.venv/bin/python "
+    "/home/droid/hermes/scripts/nightly_hermes_system_doctor.py --install-live"
+)
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 HONCHO_INFERENCE_DISABLED_RE = re.compile(
     r"RuntimeError:\s*inference disabled by HONCHO_WATCHDOG_NO_INFERENCE=1"
@@ -102,17 +108,87 @@ def script_provenance() -> dict[str, Any]:
     live_sha = sha256_file(LIVE_SCRIPT)
     source_sha = sha256_file(REPO_SCRIPT)
     running_path = Path(__file__).resolve()
-    return {
+    provenance = {
         "script_entrypoint_source": ENTRYPOINT_SOURCE_LABEL,
         "script_running_path": str(running_path),
         "script_live_path": str(LIVE_SCRIPT),
         "script_source_path": str(REPO_SCRIPT),
+        "script_live_install_command": LIVE_INSTALL_COMMAND,
         "script_live_sha256": live_sha,
         "script_source_sha256": source_sha,
         "script_live_exists": LIVE_SCRIPT.exists(),
         "script_source_exists": REPO_SCRIPT.exists(),
         "script_matches_source": bool(live_sha and source_sha and live_sha == source_sha),
     }
+    provenance.update(cron_entrypoint_provenance())
+    provenance["script_pickup_ready"] = bool(
+        provenance["script_matches_source"] and provenance.get("cron_invokes_live_script")
+    )
+    if provenance["script_pickup_ready"]:
+        provenance["script_pickup_required"] = "none; cron invokes the live script that matches the repo source"
+    elif not provenance.get("cron_invokes_live_script"):
+        provenance["script_pickup_required"] = "update the Nightly Hermes system doctor cron script entrypoint to the live script path"
+    else:
+        provenance["script_pickup_required"] = f"run `{LIVE_INSTALL_COMMAND}` to copy the repo script to the live cron path"
+    return provenance
+
+
+def cron_entrypoint_provenance() -> dict[str, Any]:
+    """Return secret-safe evidence for the cron job that invokes this doctor."""
+    facts: dict[str, Any] = {
+        "cron_jobs_path": str(CRON_JOBS),
+        "cron_jobs_exists": CRON_JOBS.exists(),
+        "cron_entrypoint_resolution": "cron.scheduler._run_job_script resolves relative job script names under $HERMES_HOME/scripts",
+        "cron_job_id": None,
+        "cron_job_name": None,
+        "cron_job_script": None,
+        "cron_job_script_resolved_path": None,
+        "cron_job_schedule": None,
+        "cron_job_enabled": None,
+        "cron_job_state": None,
+        "cron_job_no_agent": None,
+        "cron_invokes_live_script": False,
+    }
+    if not CRON_JOBS.exists():
+        return facts
+    try:
+        payload = json.loads(CRON_JOBS.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - provenance should not break the doctor
+        facts["cron_jobs_read_error"] = f"{type(exc).__name__}: {exc}"
+        return facts
+
+    jobs = payload.get("jobs") if isinstance(payload, dict) else None
+    if not isinstance(jobs, list):
+        facts["cron_jobs_read_error"] = "jobs.json does not contain a jobs list"
+        return facts
+
+    script_name = REPO_SCRIPT.name
+    candidates = [
+        item
+        for item in jobs
+        if isinstance(item, dict) and Path(str(item.get("script") or "")).name == script_name
+    ]
+    if not candidates:
+        return facts
+    job = next((item for item in candidates if item.get("name") == "Nightly Hermes system doctor"), candidates[0])
+    script_value = str(job.get("script") or "")
+    raw_script = Path(script_value).expanduser()
+    resolved_script = raw_script.resolve() if raw_script.is_absolute() else (HERMES_HOME / "scripts" / raw_script).resolve()
+
+    facts.update(
+        {
+            "cron_job_id": job.get("id"),
+            "cron_job_name": job.get("name"),
+            "cron_job_script": script_value,
+            "cron_job_script_resolved_path": str(resolved_script),
+            "cron_job_schedule": job.get("schedule_display") or (job.get("schedule") or {}).get("display"),
+            "cron_job_enabled": job.get("enabled"),
+            "cron_job_state": job.get("state"),
+            "cron_job_no_agent": job.get("no_agent"),
+            "cron_invokes_live_script": resolved_script == LIVE_SCRIPT.resolve(),
+        }
+    )
+    return facts
 
 
 def install_live(*, dry_run: bool = False) -> int:
