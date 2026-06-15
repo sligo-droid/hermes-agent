@@ -2711,6 +2711,7 @@ def specify_task_endpoint(
     ``async def`` without an explicit ``run_in_executor``.
     """
     board = _resolve_board(board)
+    _raise_if_corrupt_quarantined(board)
     # Pin the board for the duration of this call so the specifier module
     # (which calls ``kb.connect()`` with no args) hits the right DB.
     prev_env = os.environ.get("HERMES_KANBAN_BOARD")
@@ -3177,6 +3178,7 @@ def pause_board(slug: str, payload: ProposalFollowupBody | None = None):
         raise HTTPException(status_code=400, detail=str(exc))
     if not normed or not kanban_db.board_exists(normed):
         raise HTTPException(status_code=404, detail=f"board {slug!r} does not exist")
+    _raise_if_corrupt_quarantined(normed)
     reason = payload.reason.strip() if payload and payload.reason else "command-center-paused"
     worker = _discord_worker_meta(normed)
     if worker:
@@ -3198,6 +3200,7 @@ def resume_board(slug: str):
         raise HTTPException(status_code=400, detail=str(exc))
     if not normed or not kanban_db.board_exists(normed):
         raise HTTPException(status_code=404, detail=f"board {slug!r} does not exist")
+    _raise_if_corrupt_quarantined(normed)
     worker = _discord_worker_meta(normed)
     if worker:
         from hermes_cli import discord_worker_boards as dwb
@@ -3340,6 +3343,7 @@ def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete
     try:
         normed = kanban_db._normalize_board_slug(slug)
         if not delete and normed and kanban_db.board_exists(normed):
+            _raise_if_corrupt_quarantined(normed)
             worker = _discord_worker_meta(normed)
             if worker:
                 from hermes_cli import discord_worker_boards as dwb
@@ -3537,6 +3541,7 @@ def decompose_task_endpoint(
     can take minutes on reasoning models.
     """
     board = _resolve_board(board)
+    _raise_if_corrupt_quarantined(board)
     from hermes_cli import kanban_decompose  # noqa: WPS433 (intentional)
     outcome = kanban_decompose.decompose_task(
         task_id,
