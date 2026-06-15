@@ -339,7 +339,7 @@ def board_dir(board: Optional[str] = None) -> Path:
 
 
 def board_exists(board: Optional[str] = None) -> bool:
-    """Return True if the board has persisted metadata or a DB on disk.
+    """Return True if the board has persisted metadata or a non-empty DB.
 
     ``default`` is considered to always exist — its DB is created
     on first :func:`connect` and there's no way for it to be missing
@@ -349,7 +349,17 @@ def board_exists(board: Optional[str] = None) -> bool:
     if slug == DEFAULT_BOARD:
         return True
     d = board_dir(slug)
-    return (d / "board.json").exists() or (d / "kanban.db").exists()
+    if (d / "board.json").exists():
+        return True
+    return _board_db_has_content(d / "kanban.db")
+
+
+def _board_db_has_content(path: Path) -> bool:
+    """Return True when a board DB exists and is not an empty stub."""
+    try:
+        return path.stat().st_size > 0
+    except OSError:
+        return False
 
 
 def kanban_db_path(board: Optional[str] = None) -> Path:
@@ -596,7 +606,7 @@ def list_boards(*, include_archived: bool = False) -> list[dict]:
     Always includes ``default`` (even when the ``boards/default/``
     metadata dir doesn't exist, because its DB is at the legacy path).
     Other boards are discovered by scanning ``boards/`` for subdirectories
-    that either contain a ``kanban.db`` or a ``board.json``.
+    that either contain a ``board.json`` or a non-empty ``kanban.db``.
 
     Returns a list of metadata dicts, sorted with ``default`` first and
     the rest alphabetically.
@@ -623,9 +633,8 @@ def list_boards(*, include_archived: bool = False) -> list[dict]:
                 continue
             if not normed or normed in seen:
                 continue
-            has_db = (child / "kanban.db").exists()
             has_meta = (child / "board.json").exists()
-            if not (has_db or has_meta):
+            if not (has_meta or _board_db_has_content(child / "kanban.db")):
                 continue
             meta = read_board_metadata(normed)
             if meta.get("archived") and not include_archived:

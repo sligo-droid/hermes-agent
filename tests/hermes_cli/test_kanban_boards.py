@@ -219,6 +219,36 @@ class TestBoardCRUD:
         slugs = [b["slug"] for b in kb.list_boards()]
         assert slugs == ["default", "foo"]
 
+    def test_list_discovers_metadata_and_non_empty_legacy_db_but_ignores_empty_stub(self, fresh_home):
+        boards_root = fresh_home / "kanban" / "boards"
+
+        metadata_only = boards_root / "metadata-only"
+        metadata_only.mkdir(parents=True)
+        (metadata_only / "board.json").write_text(
+            json.dumps({"slug": "metadata-only", "name": "Metadata Only"}),
+            encoding="utf-8",
+        )
+
+        legacy_db_only = boards_root / "legacy-db-only"
+        legacy_db_only.mkdir(parents=True)
+        (legacy_db_only / "kanban.db").write_bytes(b"legacy sqlite content")
+
+        empty_stub = boards_root / "empty-stub"
+        empty_stub.mkdir(parents=True)
+        stub_path = empty_stub / "kanban.db"
+        stub_path.touch()
+
+        assert [b["slug"] for b in kb.list_boards()] == [
+            "default",
+            "legacy-db-only",
+            "metadata-only",
+        ]
+        assert stub_path.exists()
+        assert stub_path.stat().st_size == 0
+        assert not kb.board_exists("empty-stub")
+        assert kb.board_exists("legacy-db-only")
+        assert kb.board_exists("metadata-only")
+
     def test_create_is_idempotent(self, fresh_home):
         kb.create_board("bar")
         kb.create_board("bar")  # no error
