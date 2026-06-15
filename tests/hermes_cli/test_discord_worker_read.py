@@ -6,6 +6,18 @@ from urllib import error, request
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _clear_worker_broker_env(monkeypatch):
+    for name in (
+        "HERMES_DISCORD_WORKER_CONTROL_URL",
+        "HERMES_DISCORD_WORKER_CONTROL_TOKEN",
+        "HERMES_DISCORD_WORKER_READ_URL",
+        "HERMES_DISCORD_WORKER_READ_TOKEN",
+        "HERMES_DISCORD_WORKER_READ_ONLY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def test_fetch_message_uses_get_with_bot_token(monkeypatch, capsys):
     from hermes_cli import discord_worker_read as reader
 

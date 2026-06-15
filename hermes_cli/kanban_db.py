@@ -29,9 +29,9 @@ Board resolution order (highest precedence first, all optional):
   ``?board=...`` query param).
 * ``HERMES_KANBAN_BOARD`` env var (used by the dispatcher to pin workers
   to the board their task lives on — workers cannot see other boards).
-* ``HERMES_KANBAN_DB`` env var (pins the DB file path directly — legacy
-  override still honoured; highest precedence when the file path itself
-  is what the caller wants to force).
+* ``HERMES_KANBAN_DB`` env var (pins the DB file path directly for legacy
+  no-board callers and Hermes-marked worker handoffs; explicit ``board=``
+  routing ignores stale ambient DB overrides).
 * ``<root>/kanban/current`` — a one-line text file holding the slug of
   the "currently selected" board. Written by ``hermes kanban boards
   switch <slug>``. When absent, the active board is ``default``.
@@ -46,11 +46,10 @@ overrides still work:
 * ``HERMES_KANBAN_HOME`` — pin the umbrella root that anchors kanban
   paths. Useful for tests and unusual deployments.
 
-The dispatcher injects ``HERMES_KANBAN_DB``,
-``HERMES_KANBAN_WORKSPACES_ROOT``, and ``HERMES_KANBAN_BOARD`` into
-worker subprocess env so workers converge on the exact DB the
-dispatcher used to claim their task — even under unusual symlink or
-Docker layouts.
+The dispatcher injects ``HERMES_KANBAN_DB``, an internal handoff marker,
+``HERMES_KANBAN_WORKSPACES_ROOT``, and ``HERMES_KANBAN_BOARD`` into worker
+subprocess env so workers converge on the exact DB the dispatcher used to
+claim their task — even under unusual symlink or Docker layouts.
 
 Schema is intentionally small: tasks, task_links, task_comments,
 task_events.  The ``workspace_kind`` field decouples coordination from git
@@ -192,6 +191,7 @@ DEFAULT_BOARD = "default"
 _ACTIVE_CORRUPT_DISCORD_BOARD_RECOVERY = "discord-1513050159653589093"
 _TRANSIENT_DISK_IO_ATTEMPTS = 3
 _TRANSIENT_DISK_IO_BACKOFF_SECONDS = (0.05, 0.15)
+_KANBAN_DB_HANDOFF_MARKER_ENV = "_HERMES_KANBAN_DB_HANDOFF"
 
 # Slug validator: lowercase alphanumerics, digits, hyphens; 1–64 chars.
 # Strict enough to stop traversal (`..`) and embedded path separators, loose
@@ -367,19 +367,44 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
 
     Resolution (highest precedence first):
 
-    1. ``HERMES_KANBAN_DB`` env var — pins the path directly. Honoured for
-       back-compat and for the dispatcher→worker handoff (defense in
-       depth: dispatcher injects this into worker env so workers are
-       immune to any path-resolution disagreement).
-    2. When ``board`` arg is None, the active board from
+    1. Explicit ``board`` arg resolves to that board's deterministic path.
+       A stale ambient ``HERMES_KANBAN_DB`` is ignored with a warning.
+    2. Hermes-marked worker handoff ``HERMES_KANBAN_DB`` pins the path
+       directly.
+    3. When ``board`` arg is None but ``HERMES_KANBAN_BOARD`` is set,
+       that board resolves to its deterministic path. A stale ambient
+       ``HERMES_KANBAN_DB`` is ignored with a warning.
+    4. When ``board`` arg is None, legacy ``HERMES_KANBAN_DB`` pins the
+       path directly.
+    5. When ``board`` arg is None, the active board from
        :func:`get_current_board` is used.
-    3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
+    6. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
        Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
     """
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
-    if override:
-        return Path(override).expanduser()
     slug = _normalize_board_slug(board)
+    marker = os.environ.get(_KANBAN_DB_HANDOFF_MARKER_ENV, "").strip()
+    env_board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    if override and slug is None and marker:
+        return Path(override).expanduser()
+    if override and slug is None and env_board:
+        try:
+            env_slug = _normalize_board_slug(env_board)
+        except ValueError:
+            env_slug = None
+        if env_slug and board_exists(env_slug):
+            slug = env_slug
+    if override and slug is None:
+        return Path(override).expanduser()
+    if override and slug is not None:
+        marker_hint = " from Hermes worker handoff" if marker else ""
+        _log.warning(
+            "Ignoring HERMES_KANBAN_DB%s while resolving explicit kanban board=%r; "
+            "use board routing for board DBs, pass db_path= for explicit file paths, "
+            "or rely on the supported Hermes worker handoff path.",
+            marker_hint,
+            slug,
+        )
     if slug is None:
         slug = get_current_board()
     if slug == DEFAULT_BOARD:
@@ -2211,9 +2236,10 @@ def connect(
 
     * ``db_path`` explicit → used as-is (legacy callers, tests).
     * ``board`` explicit → resolves to that board's DB.
-    * Neither → :func:`kanban_db_path` resolves via
+    * Neither → :func:`kanban_db_path` resolves via legacy/worker-handoff
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
-      ``<root>/kanban/current`` → ``default``.
+      ``<root>/kanban/current`` → ``default``. Stale ambient
+      ``HERMES_KANBAN_DB`` is ignored for explicit ``board=`` routing.
     """
     if db_path is not None:
         path = db_path
@@ -8054,6 +8080,7 @@ def _worker_terminal_timeout_env(
 
 
 _SYSTEMD_WORKER_ENV_EXACT = frozenset({
+    _KANBAN_DB_HANDOFF_MARKER_ENV,
     "CODEX_HOME",
     "GH_CONFIG_DIR",
     "HOME",
@@ -8208,9 +8235,10 @@ def _default_spawn(
     the PID check is a safety net for crashes, OOM kills, and Ctrl+C.
 
     ``board`` pins the child's kanban context to that board: the child's
-    ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
-    vars all resolve to the same board the dispatcher claimed the task
-    from. Workers cannot accidentally see other boards.
+    ``HERMES_KANBAN_DB`` / internal handoff marker /
+    ``HERMES_KANBAN_BOARD`` / workspaces_root env vars all resolve to the
+    same board the dispatcher claimed the task from. Workers cannot
+    accidentally see other boards.
     """
     import subprocess
     if not task.assignee:
@@ -8276,6 +8304,7 @@ def _default_spawn(
     # resolution in `kanban_home()` — symmetric resolution is the norm,
     # but unusual symlink / Docker layouts are caught here too.
     env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
+    env[_KANBAN_DB_HANDOFF_MARKER_ENV] = "1"
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
     # Board slug — the final defense-in-depth pin. If the worker ever
     # resolves kanban paths without the DB / workspaces env vars, the

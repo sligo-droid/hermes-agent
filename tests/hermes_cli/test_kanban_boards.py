@@ -51,6 +51,7 @@ def fresh_home(tmp_path, monkeypatch):
         "HERMES_KANBAN_WORKSPACES_ROOT",
         "HERMES_KANBAN_HOME",
         "HERMES_KANBAN_BOARD",
+        kb._KANBAN_DB_HANDOFF_MARKER_ENV,
     ):
         monkeypatch.delenv(var, raising=False)
     # Also reset hermes_constants cache so get_default_hermes_root() re-reads.
@@ -126,12 +127,20 @@ class TestPathResolution:
             fresh_home / "kanban" / "boards" / "other" / "logs"
         )
 
-    def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
-        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg."""
+    def test_env_var_db_override_wins_only_without_explicit_board(
+        self, fresh_home, tmp_path, monkeypatch, caplog
+    ):
+        """``HERMES_KANBAN_DB`` pins legacy no-board callers only."""
         forced = tmp_path / "custom.db"
         monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
         assert kb.kanban_db_path() == forced
-        assert kb.kanban_db_path(board="ignored") == forced
+
+        with caplog.at_level("WARNING", logger=kb.__name__):
+            assert kb.kanban_db_path(board="ignored") == (
+                fresh_home / "kanban" / "boards" / "ignored" / "kanban.db"
+            )
+        assert "Ignoring HERMES_KANBAN_DB" in caplog.text
+        assert "board='ignored'" in caplog.text
 
     def test_env_var_workspaces_override(self, fresh_home, tmp_path, monkeypatch):
         forced = tmp_path / "ws"
@@ -462,6 +471,7 @@ class TestWorkerSpawnEnv:
         # DB path should match the per-board DB, not the legacy default.
         expected_db = fresh_home / "kanban" / "boards" / "spawntest" / "kanban.db"
         assert env["HERMES_KANBAN_DB"] == str(expected_db)
+        assert env[kb._KANBAN_DB_HANDOFF_MARKER_ENV] == "1"
         expected_ws = fresh_home / "kanban" / "boards" / "spawntest" / "workspaces"
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
         assert env["GH_CONFIG_DIR"] == str(gh_dir)
@@ -498,6 +508,7 @@ class TestWorkerSpawnEnv:
         env = captured["env"]
         assert env["HERMES_KANBAN_BOARD"] == "default"
         assert env["HERMES_KANBAN_DB"] == str(fresh_home / "kanban.db")
+        assert env[kb._KANBAN_DB_HANDOFF_MARKER_ENV] == "1"
 
 
 # ---------------------------------------------------------------------------
