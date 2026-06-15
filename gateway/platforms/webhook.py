@@ -8,7 +8,7 @@ source or to another configured platform.
 Configuration lives in config.yaml under platforms.webhook.extra.routes.
 Each route defines:
   - events: which event types to accept (header-based filtering)
-  - secret: HMAC secret for signature validation (REQUIRED)
+  - secret or secret_env: HMAC secret for signature validation (REQUIRED)
   - prompt: template string formatted with the webhook payload
   - skills: optional list of skills to load for the agent
   - deliver: where to send the response (github_comment, telegram, etc.)
@@ -107,6 +107,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._host: str = config.extra.get("host", DEFAULT_HOST)
         self._port: int = int(config.extra.get("port", DEFAULT_PORT))
         self._global_secret: str = config.extra.get("secret", "")
+        self._global_secret_env: str = config.extra.get("secret_env", "")
         self._static_routes: Dict[str, dict] = config.extra.get("routes", {})
         self._dynamic_routes: Dict[str, dict] = {}
         self._dynamic_routes_mtime: float = 0.0
@@ -159,11 +160,11 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Validate routes at startup — secret is required per route
         for name, route in self._routes.items():
-            secret = route.get("secret", self._global_secret)
+            secret = self._resolve_secret(route, name)
             if not secret:
                 raise ValueError(
                     f"[webhook] Route '{name}' has no HMAC secret. "
-                    f"Set 'secret' on the route or globally. "
+                    f"Set 'secret' or 'secret_env' on the route or globally. "
                     f"For testing without auth, set secret to '{_INSECURE_NO_AUTH}'."
                 )
 
@@ -301,6 +302,40 @@ class WebhookAdapter(BasePlatformAdapter):
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "webhook"})
 
+    def _resolve_secret(self, route_config: dict, route_name: str = "") -> str:
+        """Resolve route/global secret values without logging secret contents."""
+        route_secret = route_config.get("secret") or ""
+        if route_secret:
+            return str(route_secret)
+
+        route_secret_env = route_config.get("secret_env") or ""
+        if route_secret_env:
+            secret = os.environ.get(str(route_secret_env), "")
+            if secret:
+                return secret
+            logger.error(
+                "[webhook] Route %s secret_env '%s' is unset or empty",
+                route_name or "(unknown)",
+                route_secret_env,
+            )
+            return ""
+
+        if self._global_secret:
+            return str(self._global_secret)
+
+        if self._global_secret_env:
+            secret = os.environ.get(str(self._global_secret_env), "")
+            if secret:
+                return secret
+            logger.error(
+                "[webhook] Global secret_env '%s' is unset or empty for route %s",
+                self._global_secret_env,
+                route_name or "(unknown)",
+            )
+            return ""
+
+        return ""
+
     def _reload_dynamic_routes(self) -> None:
         """Reload agent-created subscriptions from disk if the file changed."""
         from hermes_constants import get_hermes_home
@@ -327,12 +362,12 @@ class WebhookAdapter(BasePlatformAdapter):
             for k, v in data.items():
                 if k in self._static_routes:
                     continue
-                effective_secret = v.get("secret", self._global_secret)
+                effective_secret = self._resolve_secret(v, k)
                 if not effective_secret:
                     logger.warning(
-                        "[webhook] Dynamic route '%s' skipped: 'secret' is "
-                        "missing or empty. Set a valid HMAC secret, or use "
-                        "'%s' to explicitly disable auth (testing only).",
+                        "[webhook] Dynamic route '%s' skipped: no resolved HMAC secret. "
+                        "Set 'secret' or 'secret_env', or use '%s' to explicitly "
+                        "disable auth (testing only).",
                         k,
                         _INSECURE_NO_AUTH,
                     )
@@ -392,7 +427,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # INSECURE_NO_AUTH mode). Missing/empty secrets must fail closed here,
         # not only during connect(), so direct handler reuse cannot turn a
         # network webhook route into an unauthenticated agent-dispatch surface.
-        secret = route_config.get("secret", self._global_secret)
+        secret = self._resolve_secret(route_config, route_name)
         if not secret:
             logger.error(
                 "[webhook] Route %s has no HMAC secret; refusing request",
