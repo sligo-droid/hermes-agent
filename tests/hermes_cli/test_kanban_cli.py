@@ -638,6 +638,26 @@ def test_run_slash_board_override_restores_prior_env(kanban_home, monkeypatch):
     assert os.environ.get("HERMES_KANBAN_BOARD") == "beta"
 
 
+def test_run_slash_board_override_ignores_stale_kanban_db_env(
+    kanban_home, tmp_path, monkeypatch
+):
+    kb.create_board("alpha")
+    stale_db = tmp_path / "stale" / "wrong.db"
+    stale_db.parent.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(stale_db))
+
+    out = kc.run_slash("--board alpha create cli-board-task --json")
+
+    data = json.loads(out)
+    assert data["title"] == "cli-board-task"
+    assert not stale_db.exists()
+    alpha_db = kanban_home / "kanban" / "boards" / "alpha" / "kanban.db"
+    with kb.connect(db_path=alpha_db) as conn:
+        task = kb.get_task(conn, data["id"])
+    assert task is not None
+    assert task.title == "cli-board-task"
+
+
 def test_run_slash_board_override_does_not_change_boards_show_current(kanban_home):
     kb.create_board("alpha")
     kb.create_board("beta")
