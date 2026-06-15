@@ -33,7 +33,9 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
+import signal
 import subprocess
 import time
 from typing import Any, Dict, List, Optional
@@ -134,6 +136,13 @@ class WebhookAdapter(BasePlatformAdapter):
         # Rate limiting: per-route timestamps in a fixed window.
         self._rate_counts: Dict[str, List[float]] = {}
         self._rate_limit: int = int(config.extra.get("rate_limit", 30))  # per minute
+
+        # GitHub PR amendment routes spawn bounded coding workers that push to
+        # PR head branches.  Keep an in-process branch lock so duplicate/tagged
+        # events cannot race against the same ref while this gateway instance
+        # is alive.  Durable job/lock storage can be added once the core route
+        # has proven itself.
+        self._github_pr_amend_locks: set[str] = set()
 
         # Body size limit (auth-before-body pattern)
         self._max_body_bytes: int = int(
@@ -448,7 +457,51 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "ignored", "event": event_type}
             )
 
-        # Format prompt from template
+        # Build a unique delivery ID
+        delivery_id = request.headers.get(
+            "X-GitHub-Delivery",
+            request.headers.get(
+                "svix-id",
+                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+            ),
+        )
+
+        # ── Idempotency ─────────────────────────────────────────
+        # Skip duplicate deliveries (webhook retries).
+        now = time.time()
+        # Prune expired entries
+        self._seen_deliveries = {
+            k: v
+            for k, v in self._seen_deliveries.items()
+            if now - v < self._idempotency_ttl
+        }
+        if delivery_id in self._seen_deliveries:
+            logger.info(
+                "[webhook] Skipping duplicate delivery %s", delivery_id
+            )
+            return web.json_response(
+                {"status": "duplicate", "delivery_id": delivery_id},
+                status=200,
+            )
+        self._seen_deliveries[delivery_id] = now
+
+        # ── Specialized GitHub PR amendment mode ─────────────────
+        # This route is intentionally not a normal prompt-to-agent webhook. It
+        # performs deterministic sender/repo/branch gates, then starts a
+        # bounded coding worker that may amend and push the PR head branch.
+        if self._is_github_pr_amend_route(route_config):
+            return await self._handle_github_pr_amend(
+                route_name=route_name,
+                route_config=route_config,
+                payload=payload,
+                event_type=event_type,
+                delivery_id=delivery_id,
+            )
+
+        # Format prompt from template for generic prompt/direct-delivery routes.
+        # Specialized routes above intentionally skip this prompt path so
+        # untrusted GitHub comment text cannot accidentally become the top-level
+        # agent instruction before deterministic policy gates run.
         prompt_template = route_config.get("prompt", "")
         prompt = self._render_prompt(
             prompt_template, payload, event_type, route_name
@@ -482,34 +535,6 @@ class WebhookAdapter(BasePlatformAdapter):
                         )
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
-
-        # Build a unique delivery ID
-        delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
-            request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
-            ),
-        )
-
-        # ── Idempotency ─────────────────────────────────────────
-        # Skip duplicate deliveries (webhook retries).
-        now = time.time()
-        # Prune expired entries
-        self._seen_deliveries = {
-            k: v
-            for k, v in self._seen_deliveries.items()
-            if now - v < self._idempotency_ttl
-        }
-        if delivery_id in self._seen_deliveries:
-            logger.info(
-                "[webhook] Skipping duplicate delivery %s", delivery_id
-            )
-            return web.json_response(
-                {"status": "duplicate", "delivery_id": delivery_id},
-                status=200,
-            )
-        self._seen_deliveries[delivery_id] = now
 
         # ── Direct delivery mode (deliver_only) ─────────────────
         # Skip the agent entirely — the rendered prompt IS the message we
@@ -626,6 +651,353 @@ class WebhookAdapter(BasePlatformAdapter):
             },
             status=202,
         )
+
+    # ------------------------------------------------------------------
+    # Specialized GitHub PR amendment mode
+    # ------------------------------------------------------------------
+
+    def _is_github_pr_amend_route(self, route_config: dict) -> bool:
+        """True when a route should use the PR-amend coding-worker path."""
+        mode = str(route_config.get("mode") or route_config.get("type") or "").strip().lower()
+        return mode == "github_pr_amend" or bool(route_config.get("github_pr_amend"))
+
+    async def _handle_github_pr_amend(
+        self,
+        *,
+        route_name: str,
+        route_config: dict,
+        payload: dict,
+        event_type: str,
+        delivery_id: str,
+    ) -> Any:
+        """Gate a GitHub mention event and start a PR amendment worker."""
+        assert web is not None
+        from gateway.github_pr_amend import (
+            GitHubPrAmendError,
+            build_worker_prompt,
+            evaluate_request,
+            extract_request,
+            fetch_pr_info,
+            policy_from_route,
+            preflight_request,
+            write_job_brief,
+        )
+
+        try:
+            policy = policy_from_route(route_config)
+            request = extract_request(
+                event_type,
+                payload,
+                delivery_id=delivery_id,
+            )
+        except GitHubPrAmendError as exc:
+            logger.info(
+                "[github-pr-amend] ignored route=%s delivery=%s reason=%s",
+                route_name,
+                delivery_id,
+                exc,
+            )
+            return web.json_response(
+                {"status": "ignored", "route": route_name, "reason": str(exc)},
+                status=200,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[github-pr-amend] failed to normalize webhook route=%s delivery=%s",
+                route_name,
+                delivery_id,
+            )
+            return web.json_response(
+                {"status": "error", "error": "Failed to normalize GitHub event"},
+                status=400,
+            )
+
+        preflight_reason = preflight_request(request, policy)
+        if preflight_reason:
+            logger.info(
+                "[github-pr-amend] ignored before PR lookup route=%s repo=%s pr=%s delivery=%s reason=%s",
+                route_name,
+                request.repo,
+                request.pr_number,
+                delivery_id,
+                preflight_reason,
+            )
+            return web.json_response(
+                {
+                    "status": "ignored",
+                    "route": route_name,
+                    "reason": preflight_reason,
+                    "delivery_id": delivery_id,
+                },
+                status=200,
+            )
+
+        try:
+            pr_info = await asyncio.to_thread(fetch_pr_info, request.repo, request.pr_number)
+        except Exception as exc:
+            logger.warning(
+                "[github-pr-amend] failed to fetch PR metadata route=%s repo=%s pr=%s delivery=%s: %s",
+                route_name,
+                request.repo,
+                request.pr_number,
+                delivery_id,
+                exc,
+            )
+            self._seen_deliveries.pop(delivery_id, None)
+            return web.json_response(
+                {"status": "error", "error": "Failed to fetch PR metadata"},
+                status=502,
+            )
+
+        decision = evaluate_request(request, pr_info, policy)
+        if not decision.accepted:
+            logger.info(
+                "[github-pr-amend] ignored route=%s repo=%s pr=%s delivery=%s reason=%s",
+                route_name,
+                request.repo,
+                request.pr_number,
+                delivery_id,
+                decision.reason,
+            )
+            return web.json_response(
+                {
+                    "status": "ignored",
+                    "route": route_name,
+                    "reason": decision.reason,
+                    "delivery_id": delivery_id,
+                },
+                status=200,
+            )
+
+        if decision.lock_key in self._github_pr_amend_locks:
+            logger.info(
+                "[github-pr-amend] branch already locked route=%s lock=%s delivery=%s",
+                route_name,
+                decision.lock_key,
+                delivery_id,
+            )
+            return web.json_response(
+                {
+                    "status": "locked",
+                    "route": route_name,
+                    "lock_key": decision.lock_key,
+                    "delivery_id": delivery_id,
+                },
+                status=409,
+            )
+
+        self._github_pr_amend_locks.add(decision.lock_key)
+        try:
+            brief_path = write_job_brief(request, decision, policy, pr_info)
+            prompt = build_worker_prompt(
+                request,
+                decision,
+                policy,
+                pr_info,
+                brief_path=brief_path,
+            )
+        except Exception:
+            self._github_pr_amend_locks.discard(decision.lock_key)
+            self._seen_deliveries.pop(delivery_id, None)
+            logger.exception(
+                "[github-pr-amend] failed to prepare job route=%s delivery=%s",
+                route_name,
+                delivery_id,
+            )
+            return web.json_response(
+                {"status": "error", "error": "Failed to prepare PR amendment job"},
+                status=500,
+            )
+
+        task = asyncio.create_task(
+            self._run_github_pr_amend_job(
+                route_name=route_name,
+                request=request,
+                decision=decision,
+                policy=policy,
+                prompt=prompt,
+            )
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+        logger.info(
+            "[github-pr-amend] accepted route=%s repo=%s pr=%s lock=%s delivery=%s",
+            route_name,
+            request.repo,
+            request.pr_number,
+            decision.lock_key,
+            delivery_id,
+        )
+        return web.json_response(
+            {
+                "status": "accepted",
+                "route": route_name,
+                "event": event_type,
+                "delivery_id": delivery_id,
+                "lock_key": decision.lock_key,
+                "pr": request.pr_number,
+            },
+            status=202,
+        )
+
+    async def _run_github_pr_amend_job(
+        self,
+        *,
+        route_name: str,
+        request: Any,
+        decision: Any,
+        policy: Any,
+        prompt: str,
+    ) -> None:
+        """Run the one-shot Hermes worker and release the branch lock."""
+        try:
+            result = await self._run_github_pr_amend_subprocess(prompt, policy)
+            if result.returncode == 0:
+                logger.info(
+                    "[github-pr-amend] worker completed route=%s repo=%s pr=%s lock=%s",
+                    route_name,
+                    request.repo,
+                    request.pr_number,
+                    decision.lock_key,
+                )
+                return
+
+            stderr = (result.stderr or result.stdout or "").strip()[-1200:]
+            logger.error(
+                "[github-pr-amend] worker failed route=%s repo=%s pr=%s exit=%s stderr=%s",
+                route_name,
+                request.repo,
+                request.pr_number,
+                result.returncode,
+                stderr,
+            )
+            await self._deliver_github_comment(
+                (
+                    "I tried to handle the tagged PR amendment request, but the "
+                    "worker failed before completing. No successful completion was "
+                    "reported, and no commit was confirmed pushed.\n\n"
+                    f"Exit code: `{result.returncode}`\n"
+                    f"Delivery ID: `{request.delivery_id or 'unknown'}`\n\n"
+                    "Details were kept in the private gateway logs/job brief rather "
+                    "than posted publicly."
+                ),
+                {
+                    "deliver_extra": {
+                        "repo": decision.base_repo or request.repo,
+                        "pr_number": str(request.pr_number),
+                    }
+                },
+            )
+        except asyncio.CancelledError:
+            logger.warning(
+                "[github-pr-amend] worker task cancelled route=%s repo=%s pr=%s",
+                route_name,
+                getattr(request, "repo", ""),
+                getattr(request, "pr_number", ""),
+            )
+            raise
+        except Exception as exc:
+            logger.exception(
+                "[github-pr-amend] worker crashed route=%s repo=%s pr=%s",
+                route_name,
+                getattr(request, "repo", ""),
+                getattr(request, "pr_number", ""),
+            )
+            try:
+                await self._deliver_github_comment(
+                    (
+                        "I tried to handle the tagged PR amendment request, but "
+                        "the worker crashed before completing. No commit was "
+                        "confirmed pushed.\n\n"
+                        f"Delivery ID: `{getattr(request, 'delivery_id', '') or 'unknown'}`\n\n"
+                        "Details were kept in the private gateway logs/job brief rather "
+                        "than posted publicly."
+                    ),
+                    {
+                        "deliver_extra": {
+                            "repo": getattr(decision, "base_repo", "") or getattr(request, "repo", ""),
+                            "pr_number": str(getattr(request, "pr_number", "")),
+                        }
+                    },
+                )
+            except Exception:
+                logger.exception("[github-pr-amend] failed to post crash comment")
+        finally:
+            self._github_pr_amend_locks.discard(decision.lock_key)
+
+    async def _run_github_pr_amend_subprocess(
+        self,
+        prompt: str,
+        policy: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a PR-amend worker as a cancellable subprocess."""
+        from gateway.github_pr_amend import build_hermes_command
+
+        argv = build_hermes_command(prompt, policy)
+        logger.info("[github-pr-amend] starting worker command: %s", argv[:6] + ["..."])
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=policy.job.timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            await self._terminate_github_pr_amend_process(proc)
+            return subprocess.CompletedProcess(
+                argv,
+                124,
+                stdout="",
+                stderr=f"Timed out after {policy.job.timeout_seconds} seconds",
+            )
+        except asyncio.CancelledError:
+            await self._terminate_github_pr_amend_process(proc)
+            raise
+
+        return subprocess.CompletedProcess(
+            argv,
+            proc.returncode if proc.returncode is not None else 1,
+            stdout=stdout_b.decode("utf-8", errors="replace"),
+            stderr=stderr_b.decode("utf-8", errors="replace"),
+        )
+
+    async def _terminate_github_pr_amend_process(
+        self,
+        proc: asyncio.subprocess.Process,
+    ) -> None:
+        """Terminate a PR-amend worker process group, escalating if needed."""
+        if proc.returncode is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except Exception:
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+            return
+        except asyncio.TimeoutError:
+            pass
+        except ProcessLookupError:
+            return
+
+        if proc.returncode is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            except Exception:
+                proc.kill()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                logger.warning("[github-pr-amend] worker process did not exit after kill")
 
     # ------------------------------------------------------------------
     # Signature validation
