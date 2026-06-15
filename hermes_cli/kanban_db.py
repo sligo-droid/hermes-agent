@@ -354,6 +354,12 @@ def board_exists(board: Optional[str] = None) -> bool:
     return _board_db_has_content(d / "kanban.db")
 
 
+def _kanban_db_path_for_slug(slug: str) -> Path:
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
 def _board_db_has_content(path: Path) -> bool:
     """Return True when a board DB exists and is not an empty stub."""
     try:
@@ -407,9 +413,7 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
         )
     if slug is None:
         slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban.db"
-    return board_dir(slug) / "kanban.db"
+    return _kanban_db_path_for_slug(slug)
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
@@ -1321,6 +1325,9 @@ class KanbanDbCorruptError(RuntimeError):
         )
 
 
+CORRUPT_BOARD_RETRY_SECONDS = 300
+
+
 def _db_content_fingerprint(path: Path) -> Optional[str]:
     digest = hashlib.sha256()
     try:
@@ -1505,7 +1512,7 @@ def _board_for_db_path(path: Path, board: Optional[str]) -> Optional[str]:
         return None
     for slug in (get_current_board(), DEFAULT_BOARD):
         try:
-            if kanban_db_path(slug).resolve() == resolved:
+            if _kanban_db_path_for_slug(slug).resolve() == resolved:
                 return slug
         except OSError:
             continue
@@ -1562,6 +1569,7 @@ def record_corrupt_board_incident(
             Path(str(previous["quarantine_path"]))
             if previous.get("quarantine_path") else None
         )
+    next_retry = now + CORRUPT_BOARD_RETRY_SECONDS
     incident = {
         "status": "paused",
         "repair_status": "not_attempted",
@@ -1572,6 +1580,7 @@ def record_corrupt_board_incident(
         "reason": str(reason),
         "first_seen": first_seen,
         "last_seen": now,
+        "next_retry": next_retry,
     }
     if slug == _ACTIVE_CORRUPT_DISCORD_BOARD_RECOVERY:
         incident["recovery_note"] = (
@@ -1587,6 +1596,88 @@ def record_corrupt_board_incident(
     meta["corruption_incident"] = incident
     _write_board_metadata_raw(slug, meta)
     return incident
+
+
+def is_corrupt_board_db_error(exc: Exception) -> bool:
+    """Conservatively classify DB errors that should pause a board."""
+    if isinstance(exc, KanbanDbCorruptError):
+        return True
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    msg = str(exc).lower()
+    return (
+        "file is not a database" in msg
+        or "database disk image is malformed" in msg
+        or "malformed database" in msg
+    )
+
+
+def corrupt_board_quarantine_state(
+    board: Optional[str] = None,
+    *,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Return whether readers may attempt opening a board DB.
+
+    The check reads only board metadata and the DB bytes fingerprint, so it can
+    safely run before SQLite opens a board already known to be corrupt.
+    """
+    slug = _normalize_board_slug(board) if board is not None else get_current_board()
+    slug = slug or DEFAULT_BOARD
+    db_path = kanban_db_path(slug)
+    try:
+        resolved = db_path.resolve()
+    except OSError:
+        resolved = db_path
+    now = int(time.time()) if now is None else int(now)
+    incident = is_board_paused_for_corruption(slug)
+    try:
+        fingerprint = _db_content_fingerprint(resolved)
+    except Exception:
+        fingerprint = None
+    state: dict[str, Any] = {
+        "board": slug,
+        "db_path": str(resolved),
+        "fingerprint": fingerprint,
+        "incident": incident,
+        "open_allowed": True,
+        "skipped": False,
+        "changed_fingerprint": False,
+        "retry_due": False,
+        "next_retry": None,
+        "reason": None,
+    }
+    if not incident:
+        return state
+    incident_fingerprint = incident.get("fingerprint")
+    state["next_retry"] = incident.get("next_retry")
+    if incident_fingerprint != fingerprint:
+        state["changed_fingerprint"] = True
+        state["reason"] = "db fingerprint changed since corruption incident"
+        return state
+    raw_next_retry = incident.get("next_retry")
+    try:
+        next_retry = int(raw_next_retry or 0)
+    except (TypeError, ValueError):
+        next_retry = 0
+    if raw_next_retry is None:
+        for key in ("last_seen", "first_seen"):
+            try:
+                seen = int(incident.get(key) or 0)
+            except (TypeError, ValueError):
+                seen = 0
+            if seen:
+                next_retry = seen + CORRUPT_BOARD_RETRY_SECONDS
+                break
+    state["next_retry"] = next_retry or None
+    if next_retry and next_retry <= now:
+        state["retry_due"] = True
+        state["reason"] = "corrupt-board retry window expired"
+        return state
+    state["open_allowed"] = False
+    state["skipped"] = True
+    state["reason"] = str(incident.get("reason") or "kanban DB corruption incident")
+    return state
 
 
 def is_board_paused_for_corruption(board: Optional[str] = None) -> Optional[dict[str, Any]]:
@@ -1795,14 +1886,9 @@ def _raise_if_paused_for_unchanged_corruption(
     slug = _board_for_db_path(resolved, board)
     if not slug:
         return
-    incident = is_board_paused_for_corruption(slug)
-    if not incident:
-        return
-    try:
-        current_fingerprint = _db_content_fingerprint(resolved)
-    except Exception:
-        current_fingerprint = None
-    if incident.get("fingerprint") != current_fingerprint:
+    state = corrupt_board_quarantine_state(slug)
+    incident = state.get("incident")
+    if not incident or state.get("open_allowed"):
         return
     backup_path = (
         Path(str(incident["quarantine_path"]))
@@ -2184,7 +2270,15 @@ def _guard_existing_db_is_healthy(path: Path, *, board: Optional[str] = None) ->
             return
     except OSError:
         return
-    if str(resolved) in _INITIALIZED_PATHS:
+    slug = _board_for_db_path(resolved, board)
+    retrying_stale_incident = False
+    if slug:
+        try:
+            state = corrupt_board_quarantine_state(slug)
+            retrying_stale_incident = bool(state.get("incident") and state.get("open_allowed"))
+        except Exception:
+            retrying_stale_incident = False
+    if str(resolved) in _INITIALIZED_PATHS and not retrying_stale_incident:
         return
     sidecar_bytes = _read_db_sidecars(resolved)
     fingerprint_before_repair = _db_content_fingerprint(resolved)
@@ -2213,6 +2307,8 @@ def _guard_existing_db_is_healthy(path: Path, *, board: Optional[str] = None) ->
     except sqlite3.DatabaseError as exc:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
+        if retrying_stale_incident and slug:
+            clear_corrupt_board_incident(slug)
         return
     _raise_corrupt_existing_db(resolved, reason, board=board, sidecar_bytes=sidecar_bytes)
 
@@ -2243,19 +2339,21 @@ def connect(
     """
     if db_path is not None:
         path = db_path
+        resolved_board = None
     else:
         path = kanban_db_path(board=board)
+        resolved_board = board
     path.parent.mkdir(parents=True, exist_ok=True)
     with _cross_process_init_lock(path):
         # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
         # and other invalid-header cases without opening a sqlite connection.
         invalid_header_reason = _invalid_sqlite_header_reason(path)
         if invalid_header_reason is not None:
-            _raise_corrupt_existing_db(path, invalid_header_reason, board=board)
+            _raise_corrupt_existing_db(path, invalid_header_reason, board=resolved_board)
         # Full integrity probe — catches corruption past the header (malformed
         # pages, broken internal metadata). Cached per-path after first success
         # via _INITIALIZED_PATHS so it only runs once per process per path.
-        _guard_existing_db_is_healthy(path, board=board)
+        _guard_existing_db_is_healthy(path, board=resolved_board)
         resolved = str(path.resolve())
         conn = _sqlite_connect(path)
         try:
