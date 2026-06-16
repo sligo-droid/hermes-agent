@@ -329,6 +329,56 @@ def _looks_like_error_output(content: str) -> bool:
     )
 
 
+def _looks_like_provider_failure_summary(summary: str) -> bool:
+    """Detect framework/provider retry-exhaustion summaries, not model prose."""
+    if not isinstance(summary, str):
+        return False
+    text = summary.strip().lower()
+    return (
+        text.startswith("api call failed after ")
+        or text.startswith("api failed after ")
+        or text.startswith("provider call failed after ")
+    ) and " retr" in text
+
+
+def _classify_child_result(result: Dict[str, Any]) -> Dict[str, str]:
+    """Classify a delegated child using structured run_conversation metadata."""
+    summary = result.get("final_response") or ""
+    if not isinstance(summary, str):
+        summary = str(summary)
+
+    completed = result.get("completed", False) is True
+    failed = result.get("failed", False) is True
+    interrupted = result.get("interrupted", False) is True
+    error = result.get("error")
+    turn_exit_reason = str(result.get("turn_exit_reason") or "").strip()
+
+    if interrupted:
+        return {"status": "interrupted", "exit_reason": "interrupted"}
+    if failed and not completed:
+        return {"status": "failed", "exit_reason": "provider_failure" if error or summary else "failed"}
+    if not completed and _looks_like_provider_failure_summary(summary):
+        return {"status": "failed", "exit_reason": "provider_failure"}
+    if completed and summary:
+        return {"status": "completed", "exit_reason": "completed"}
+    if not summary:
+        return {"status": "failed", "exit_reason": "failed_no_final"}
+    return {"status": "failed", "exit_reason": turn_exit_reason or "failed_no_final"}
+
+
+def _end_failed_child_session(child: Any, end_reason: Optional[str]) -> None:
+    if not end_reason:
+        return
+    session_id = getattr(child, "session_id", None)
+    session_db = getattr(child, "_session_db", None)
+    if not session_id or session_db is None:
+        return
+    try:
+        session_db.end_session(session_id, end_reason)
+    except Exception:
+        logger.debug("Failed to end child session after delegated failure", exc_info=True)
+
+
 def _normalize_role(r: Optional[str]) -> str:
     """Normalise a caller-provided role to 'leaf' or 'orchestrator'.
 
@@ -1359,6 +1409,7 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    child_end_reason: Optional[str] = None
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -1540,6 +1591,7 @@ def _run_single_child(
             if not _is_interpreter_shutdown_error(exc):
                 raise
             duration = round(time.monotonic() - child_start, 2)
+            child_end_reason = "error"
             return {
                 "task_index": task_index,
                 "status": "error",
@@ -1568,6 +1620,7 @@ def _run_single_child(
                 raise
             _timeout_executor.shutdown(wait=False)
             duration = round(time.monotonic() - child_start, 2)
+            child_end_reason = "error"
             return {
                 "task_index": task_index,
                 "status": "error",
@@ -1660,12 +1713,13 @@ def _run_single_child(
             else:
                 _err = str(_timeout_exc)
 
+            child_end_reason = "timeout" if is_timeout else "error"
             return {
                 "task_index": task_index,
                 "status": "timeout" if is_timeout else "error",
                 "summary": None,
                 "error": _err,
-                "exit_reason": "timeout" if is_timeout else "error",
+                "exit_reason": child_end_reason,
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
                 "_child_role": getattr(child, "_delegate_role", None),
@@ -1686,19 +1740,12 @@ def _run_single_child(
         duration = round(time.monotonic() - child_start, 2)
 
         summary = result.get("final_response") or ""
-        completed = result.get("completed", False)
-        interrupted = result.get("interrupted", False)
+        if not isinstance(summary, str):
+            summary = str(summary)
+        classification = _classify_child_result(result)
+        status = classification["status"]
+        exit_reason = classification["exit_reason"]
         api_calls = result.get("api_calls", 0)
-
-        if interrupted:
-            status = "interrupted"
-        elif summary:
-            # A summary means the subagent produced usable output.
-            # exit_reason ("completed" vs "max_iterations") already
-            # tells the parent *how* the task ended.
-            status = "completed"
-        else:
-            status = "failed"
 
         # Build tool trace from conversation messages (already in memory).
         # Uses tool_call_id to correctly pair parallel tool calls with results.
@@ -1737,14 +1784,6 @@ def _run_single_child(
                     elif tool_trace:
                         # Fallback for messages without tool_call_id
                         tool_trace[-1].update(result_meta)
-
-        # Determine exit reason
-        if interrupted:
-            exit_reason = "interrupted"
-        elif completed:
-            exit_reason = "completed"
-        else:
-            exit_reason = "max_iterations"
 
         # Extract token counts (safe for mock objects)
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
@@ -1787,7 +1826,7 @@ def _run_single_child(
             ),
         }
         if status == "failed":
-            entry["error"] = result.get("error", "Subagent did not produce a response.")
+            entry["error"] = result.get("error") or summary or "Subagent did not produce a response."
 
         # Cross-agent file-state reminder.  If this subagent wrote any
         # files the parent had already read, surface it so the parent
@@ -1849,6 +1888,8 @@ def _run_single_child(
         )[:40]
 
         _output_tail = _extract_output_tail(result, max_entries=8, max_chars=600)
+        if status == "failed" and _output_tail:
+            entry["output_tail"] = _output_tail
 
         complete_kwargs: Dict[str, Any] = {
             "preview": summary[:160] if summary else entry.get("error", ""),
@@ -1883,11 +1924,14 @@ def _run_single_child(
             except Exception as e:
                 logger.debug("Progress callback completion failed: %s", e)
 
+        if status != "completed":
+            child_end_reason = exit_reason
         return entry
 
     except Exception as exc:
         duration = round(time.monotonic() - child_start, 2)
         logging.exception(f"[subagent-{task_index}] failed")
+        child_end_reason = "error"
         if child_progress_cb:
             try:
                 child_progress_cb(
@@ -1956,6 +2000,7 @@ def _run_single_child(
         # background processes, httpx clients) so subagent subprocesses
         # don't outlive the delegation.
         try:
+            _end_failed_child_session(child, child_end_reason)
             if hasattr(child, "close"):
                 child.close()
         except Exception:
