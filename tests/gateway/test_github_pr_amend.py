@@ -333,11 +333,11 @@ class TestGitHubPrAmendPolicy:
         def fake_run(cmd, **kwargs):
             calls.append(cmd)
             if "reviews" in cmd[-1]:
-                stdout = '[[{"id": 1}], [{"id": 2}]]'
+                stdout = '[{"id": 1}]\n[{"id": 2}]'
             elif "pulls/182/comments" in cmd[-1]:
-                stdout = '[[{"id": 3}]]'
+                stdout = '[{"id": 3}]'
             else:
-                stdout = '[[{"id": 4}]]'
+                stdout = '[{"id": 4}]'
             return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
 
         monkeypatch.setattr("gateway.github_pr_amend.subprocess.run", fake_run)
@@ -349,27 +349,24 @@ class TestGitHubPrAmendPolicy:
             "review_comments": [{"id": 3}],
             "issue_comments": [{"id": 4}],
         }
-        assert all("--paginate" in cmd and "--slurp" in cmd for cmd in calls)
+        assert all("--paginate" in cmd and "--slurp" not in cmd for cmd in calls)
         assert calls == [
             [
                 "gh",
                 "api",
                 "--paginate",
-                "--slurp",
                 "repos/reserve-protocol/reserve-index-dtf/pulls/182/reviews?per_page=100",
             ],
             [
                 "gh",
                 "api",
                 "--paginate",
-                "--slurp",
                 "repos/reserve-protocol/reserve-index-dtf/pulls/182/comments?per_page=100",
             ],
             [
                 "gh",
                 "api",
                 "--paginate",
-                "--slurp",
                 "repos/reserve-protocol/reserve-index-dtf/issues/182/comments?per_page=100",
             ],
         ]

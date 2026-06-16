@@ -429,6 +429,25 @@ def fetch_pr_info(repo: str, pr_number: int, *, gh_command: str = "gh") -> dict[
     return data
 
 
+def _parse_gh_json_documents(stdout: str) -> list[Any]:
+    """Parse one or more JSON documents emitted by ``gh api --paginate``."""
+
+    decoder = json.JSONDecoder()
+    documents: list[Any] = []
+    index = 0
+    while index < len(stdout):
+        while index < len(stdout) and stdout[index].isspace():
+            index += 1
+        if index >= len(stdout):
+            break
+        try:
+            document, index = decoder.raw_decode(stdout, index)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("gh api returned invalid JSON") from exc
+        documents.append(document)
+    return documents
+
+
 def _fetch_pr_api_json(
     repo: str,
     path: str,
@@ -444,7 +463,6 @@ def _fetch_pr_api_json(
             gh_command,
             "api",
             "--paginate",
-            "--slurp",
             f"{endpoint}{separator}per_page=100",
         ]
     result = subprocess.run(
@@ -455,13 +473,17 @@ def _fetch_pr_api_json(
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"gh api failed with {result.returncode}")
-    try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("gh api returned invalid JSON") from exc
-    if list_response and isinstance(data, list) and all(isinstance(page, list) for page in data):
-        return [item for page in data for item in page]
-    return data
+    if list_response:
+        pages = _parse_gh_json_documents(result.stdout)
+        if len(pages) == 1 and isinstance(pages[0], list) and all(isinstance(page, list) for page in pages[0]):
+            pages = pages[0]
+        if all(isinstance(page, list) for page in pages):
+            return [item for page in pages for item in page]
+    else:
+        pages = _parse_gh_json_documents(result.stdout)
+        if len(pages) == 1:
+            return pages[0]
+    raise RuntimeError("gh api returned invalid JSON")
 
 
 def fetch_pr_related_context(
