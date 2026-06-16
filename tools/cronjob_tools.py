@@ -403,6 +403,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
     }
+    if job.get("disable_on_terminal_success"):
+        result["disable_on_terminal_success"] = True
+    if job.get("last_terminal_output_path"):
+        result["last_terminal_output_path"] = job.get("last_terminal_output_path")
     if job.get("script"):
         result["script"] = job["script"]
     if job.get("no_agent"):
@@ -437,6 +441,7 @@ def cronjob(
     workdir: Optional[str] = None,
     profile: Optional[str] = None,
     no_agent: Optional[bool] = None,
+    disable_on_terminal_success: Optional[bool] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -504,6 +509,7 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 profile=_normalize_optional_job_value(profile),
                 no_agent=_no_agent,
+                disable_on_terminal_success=bool(disable_on_terminal_success),
             )
             return json.dumps(
                 {
@@ -655,6 +661,8 @@ def cronjob(
                             success=False,
                         )
                 updates["no_agent"] = target_no_agent
+            if disable_on_terminal_success is not None:
+                updates["disable_on_terminal_success"] = bool(disable_on_terminal_success)
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -772,6 +780,11 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                     "WHEN TO USE False (default): anything that needs reasoning — summarize a feed, draft a daily briefing, pick interesting items, rephrase data for a human, follow conditional logic based on content."
                 ),
             },
+            "disable_on_terminal_success": {
+                "type": "boolean",
+                "default": False,
+                "description": "Opt-in for finite no_agent script jobs: after a successful run whose stdout begins with DONE: or ends with JSON containing terminal_success=true, pause the job and record the output path. Jobs without this flag keep recurring normally.",
+            },
             "context_from": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -854,6 +867,7 @@ registry.register(
         workdir=args.get("workdir"),
         profile=args.get("profile"),
         no_agent=args.get("no_agent"),
+        disable_on_terminal_success=args.get("disable_on_terminal_success"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

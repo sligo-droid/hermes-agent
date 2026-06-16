@@ -1462,6 +1462,15 @@ def _active_code_island_health_error(worker: dict[str, Any], *, active_pipeline:
     return bool(_code_island_blocker(worker))
 
 
+def _code_island_telemetry_state(worker: dict[str, Any]) -> tuple[bool, bool, str, str]:
+    return (
+        bool(worker.get("code_island_ready")),
+        bool(worker.get("code_island_pending")),
+        str(worker.get("code_island_error") or ""),
+        str(worker.get("worktree_path") or ""),
+    )
+
+
 def _block_worker_board_for_code_island(board: str, worker: dict[str, Any], reason: str) -> None:
     worker.update(
         {
@@ -1575,6 +1584,7 @@ def ensure_code_island_for_board(board: str) -> bool:
         worker.get("execution_mode") == "kanban_pipeline"
         and worker.get("goal_status") == "active"
     )
+    previous_telemetry_state = _code_island_telemetry_state(worker)
     previous_worktree_path = str(worker.get("worktree_path") or "").strip()
     _ensure_code_island(worker)
     code_island_updates = {
@@ -1606,7 +1616,9 @@ def ensure_code_island_for_board(board: str) -> bool:
     health_error = _active_code_island_health_error(worker, active_pipeline=active_pipeline)
     if blocker:
         _block_worker_board_for_code_island(board, worker, blocker)
-    logger.info(
+    telemetry_changed = previous_telemetry_state != _code_island_telemetry_state(worker)
+    log = logger.info if health_error or blocker or telemetry_changed else logger.debug
+    log(
         "discord_worker_code_island board=%s ready=%s pending=%s elapsed_ms=%d error=%s",
         board,
         bool(worker.get("code_island_ready")),
