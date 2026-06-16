@@ -2505,27 +2505,116 @@ def _sync_canonical_checkout_after_merge(worker: dict[str, Any], *, branch: str)
         worker["pr_blocker"] = worker["pr_error"]
         return False
 
-    def run_git(args: list[str], *, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    def run_git(
+        args: list[str],
+        *,
+        timeout: int = 60,
+        cwd: Optional[Path] = None,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["git", *args],
-            cwd=project_path,
+            cwd=cwd or project_path,
             capture_output=True,
             text=True,
             timeout=timeout,
         )
 
-    def fail(message: str, result: Optional[subprocess.CompletedProcess[str]] = None) -> bool:
+    def fail(
+        message: str,
+        result: Optional[subprocess.CompletedProcess[str]] = None,
+        *,
+        sync_path: Optional[Path] = None,
+    ) -> bool:
         detail = ""
         if result is not None:
             detail = (result.stderr or result.stdout or "").strip()
+        effective_path = sync_path or project_path
         worker["canonical_sync_state"] = "blocked"
-        worker["canonical_sync_path"] = str(project_path)
+        worker["canonical_sync_path"] = str(effective_path)
         worker["canonical_sync_branch"] = branch
         worker["canonical_sync_merge_commit"] = merge_commit
         worker["pr_error"] = f"{message}: {detail}" if detail else message
         worker["canonical_sync_error"] = worker["pr_error"]
         worker["pr_blocker"] = worker["pr_error"]
         return False
+
+    def find_existing_branch_worktree() -> Optional[Path]:
+        try:
+            listed = run_git(["worktree", "list", "--porcelain"], timeout=20)
+        except Exception:
+            return None
+        if listed.returncode != 0:
+            return None
+        current_path: Optional[Path] = None
+        wanted_ref = f"refs/heads/{branch}"
+        for raw_line in (listed.stdout or "").splitlines():
+            line = raw_line.strip()
+            if line.startswith("worktree "):
+                current_path = Path(line.split(" ", 1)[1])
+                continue
+            if line.startswith("branch ") and line.split(" ", 1)[1] == wanted_ref:
+                if current_path and current_path.is_dir():
+                    return current_path
+        return None
+
+    def verify_synced_checkout(sync_path: Path, *, state: str) -> bool:
+        try:
+            head = run_git(["rev-parse", "HEAD"], timeout=20, cwd=sync_path)
+        except Exception as exc:
+            return fail(f"Canonical checkout HEAD lookup failed: {exc}", sync_path=sync_path)
+        if head.returncode != 0:
+            return fail("Canonical checkout HEAD lookup failed", head, sync_path=sync_path)
+        canonical_head = (head.stdout or "").strip()
+
+        if merge_commit:
+            try:
+                ancestor = run_git(
+                    ["merge-base", "--is-ancestor", merge_commit, "HEAD"],
+                    timeout=20,
+                    cwd=sync_path,
+                )
+            except Exception as exc:
+                return fail(
+                    f"Canonical checkout merge commit verification failed: {exc}",
+                    sync_path=sync_path,
+                )
+            if ancestor.returncode != 0:
+                return fail(
+                    "Canonical checkout does not contain PR merge commit",
+                    ancestor,
+                    sync_path=sync_path,
+                )
+
+        worker["canonical_sync_state"] = state
+        worker["canonical_sync_error"] = ""
+        worker["canonical_sync_path"] = str(sync_path)
+        worker["canonical_sync_branch"] = branch
+        worker["canonical_sync_head"] = canonical_head
+        worker["canonical_sync_merge_commit"] = merge_commit
+        worker["canonical_synced_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        return True
+
+    def sync_existing_branch_worktree(sync_path: Path) -> bool:
+        try:
+            status = run_git(["status", "--porcelain"], timeout=20, cwd=sync_path)
+        except Exception as exc:
+            return fail(f"Existing branch worktree status failed: {exc}", sync_path=sync_path)
+        if status.returncode != 0:
+            return fail("Existing branch worktree status failed", status, sync_path=sync_path)
+        if (status.stdout or "").strip():
+            return fail("Existing branch worktree is dirty", sync_path=sync_path)
+
+        for args, message, timeout in (
+            (["fetch", "origin", "--prune"], "Existing branch worktree fetch failed", 120),
+            (["pull", "--ff-only", "origin", branch], "Existing branch worktree fast-forward pull failed", 120),
+        ):
+            try:
+                result = run_git(args, timeout=timeout, cwd=sync_path)
+            except Exception as exc:
+                return fail(f"{message}: {exc}", sync_path=sync_path)
+            if result.returncode != 0:
+                return fail(message, result, sync_path=sync_path)
+        return verify_synced_checkout(sync_path, state="synced_existing_worktree")
 
     try:
         status = run_git(["status", "--porcelain"], timeout=20)
@@ -2546,32 +2635,13 @@ def _sync_canonical_checkout_after_merge(worker: dict[str, Any], *, branch: str)
         except Exception as exc:
             return fail(f"{message}: {exc}")
         if result.returncode != 0:
+            if args[:1] == ["checkout"]:
+                existing = find_existing_branch_worktree()
+                if existing is not None:
+                    return sync_existing_branch_worktree(existing)
             return fail(message, result)
 
-    try:
-        head = run_git(["rev-parse", "HEAD"], timeout=20)
-    except Exception as exc:
-        return fail(f"Canonical checkout HEAD lookup failed: {exc}")
-    if head.returncode != 0:
-        return fail("Canonical checkout HEAD lookup failed", head)
-    canonical_head = (head.stdout or "").strip()
-
-    if merge_commit:
-        try:
-            ancestor = run_git(["merge-base", "--is-ancestor", merge_commit, "HEAD"], timeout=20)
-        except Exception as exc:
-            return fail(f"Canonical checkout merge commit verification failed: {exc}")
-        if ancestor.returncode != 0:
-            return fail("Canonical checkout does not contain PR merge commit", ancestor)
-
-    worker["canonical_sync_state"] = "synced"
-    worker["canonical_sync_error"] = ""
-    worker["canonical_sync_path"] = str(project_path)
-    worker["canonical_sync_branch"] = branch
-    worker["canonical_sync_head"] = canonical_head
-    worker["canonical_sync_merge_commit"] = merge_commit
-    worker["canonical_synced_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    return True
+    return verify_synced_checkout(project_path, state="synced")
 
 
 def _ensure_pr(board: Optional[str], workspace: str) -> bool:

@@ -4003,6 +4003,93 @@ def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeyp
     assert meta["canonical_synced_at"]
 
 
+def test_ensure_pr_syncs_existing_worktree_when_base_branch_already_checked_out(
+    monkeypatch, tmp_path
+):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="existing-worktree-pr",
+        goal="Ship explicit PR context",
+        project_context={"github_url": "https://github.com/sligo-labs/PID.git", "base_branch": "develop"},
+    )
+    workspace = tmp_path / "repo"
+    project_path = tmp_path / "canonical"
+    existing_path = tmp_path / "develop-worktree"
+    workspace.mkdir()
+    project_path.mkdir()
+    existing_path.mkdir()
+    dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
+    calls = []
+    view_states = ["OPEN", "MERGED"]
+
+    def fake_run(cmd, **kwargs):
+        cwd = Path(kwargs.get("cwd") or project_path)
+        calls.append((cmd, cwd))
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/123\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            state = view_states.pop(0)
+            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=123, state=state), stderr="")
+        if cmd[:3] == ["gh", "pr", "merge"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd == ["git", "status", "--porcelain"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd == ["git", "fetch", "origin", "--prune"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd == ["git", "checkout", "develop"]:
+            return SimpleNamespace(
+                returncode=128,
+                stdout="",
+                stderr=f"fatal: 'develop' is already used by worktree at '{existing_path}'",
+            )
+        if cmd == ["git", "worktree", "list", "--porcelain"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    f"worktree {project_path}\n"
+                    "HEAD aaaaaa\n"
+                    "branch refs/heads/main\n\n"
+                    f"worktree {existing_path}\n"
+                    "HEAD existinghead\n"
+                    "branch refs/heads/develop\n"
+                ),
+                stderr="",
+            )
+        if cmd == ["git", "pull", "--ff-only", "origin", "develop"]:
+            assert cwd == existing_path
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd == ["git", "rev-parse", "HEAD"]:
+            assert cwd == existing_path
+            return SimpleNamespace(returncode=0, stdout="existinghead\n", stderr="")
+        if cmd == ["git", "merge-base", "--is-ancestor", "abc123", "HEAD"]:
+            assert cwd == existing_path
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr(board.slug, str(workspace)) is True
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert (['git', 'checkout', 'develop'], project_path) in calls
+    assert (['git', 'pull', '--ff-only', 'origin', 'develop'], existing_path) in calls
+    assert meta["pr_state"] == "MERGED"
+    assert meta["pr_merge_commit"] == "abc123"
+    assert meta["canonical_sync_state"] == "synced_existing_worktree"
+    assert meta["canonical_sync_error"] == ""
+    assert meta["canonical_sync_path"] == str(existing_path)
+    assert meta["canonical_sync_branch"] == "develop"
+    assert meta["canonical_sync_head"] == "existinghead"
+    assert meta["canonical_sync_merge_commit"] == "abc123"
+    assert meta["canonical_synced_at"]
+
+
 def test_ensure_pr_create_uses_concise_title_and_body(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_worker as worker
 
