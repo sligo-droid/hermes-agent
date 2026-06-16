@@ -4,8 +4,8 @@ from argparse import Namespace
 
 import pytest
 
-from cron.jobs import create_job, get_job, list_jobs
-from hermes_cli.cron import _print_overdue_proposal_findings, cron_command
+from cron.jobs import create_job, get_job, list_jobs, update_job
+from hermes_cli.cron import _print_overdue_proposal_findings, cron_command, cron_list, cron_status
 
 
 @pytest.fixture()
@@ -111,6 +111,48 @@ class TestCronCommandLifecycle:
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
         assert jobs[0]["profile"] == "default"
+
+    def test_list_renders_terminal_auto_pause_metadata(self, tmp_cron_dir, capsys, monkeypatch):
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [123])
+        job = create_job(prompt="", schedule="every 1h", script="finite.sh", no_agent=True)
+        update_job(
+            job["id"],
+            {
+                "enabled": False,
+                "state": "paused",
+                "paused_reason": "terminal success: DONE marker",
+                "last_terminal_output_path": "/tmp/terminal.md",
+                "disable_on_terminal_success": True,
+            },
+        )
+
+        cron_list(show_all=True)
+
+        out = capsys.readouterr().out
+        assert "auto-pause on DONE/terminal_success marker" in out
+        assert "terminal success: DONE marker" in out
+        assert "/tmp/terminal.md" in out
+
+    def test_status_renders_terminal_auto_paused_jobs(self, tmp_cron_dir, capsys, monkeypatch):
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        monkeypatch.setattr("cron.jobs.audit_overdue_self_improvement_proposals", lambda: [])
+        job = create_job(prompt="", schedule="every 1h", script="finite.sh", no_agent=True)
+        update_job(
+            job["id"],
+            {
+                "enabled": False,
+                "state": "paused",
+                "paused_reason": "terminal success: DONE marker",
+                "last_terminal_output_path": "/tmp/terminal.md",
+            },
+        )
+
+        cron_status()
+
+        out = capsys.readouterr().out
+        assert "Terminal auto-paused job" in out
+        assert "terminal success: DONE marker" in out
+        assert "/tmp/terminal.md" in out
 
 
 def test_overdue_proposal_findings_render_operator_evidence(capsys):

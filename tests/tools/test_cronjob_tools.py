@@ -252,6 +252,46 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["prompt_preview"] == ""
         assert listing["jobs"][0]["schedule"] == "every 60m"
 
+    def test_list_exposes_terminal_success_metadata(self):
+        from cron.jobs import save_jobs
+
+        save_jobs([
+            {
+                "id": "term123",
+                "name": "Finite executor",
+                "prompt": "",
+                "schedule_display": "every 5m",
+                "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
+                "repeat": {"times": None, "completed": 1},
+                "enabled": False,
+                "state": "paused",
+                "paused_reason": "terminal success: DONE marker",
+                "last_terminal_output_path": "/tmp/out.md",
+                "no_agent": True,
+                "disable_on_terminal_success": True,
+            }
+        ])
+
+        listing = json.loads(cronjob(action="list", include_disabled=True))
+
+        job = listing["jobs"][0]
+        assert job["paused_reason"] == "terminal success: DONE marker"
+        assert job["last_terminal_output_path"] == "/tmp/out.md"
+        assert job["disable_on_terminal_success"] is True
+
+    def test_update_sets_terminal_success_opt_in(self):
+        created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                disable_on_terminal_success=True,
+            )
+        )
+
+        assert updated["success"] is True
+        assert updated["job"]["disable_on_terminal_success"] is True
+
     def test_pause_and_resume(self):
         created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
         job_id = created["job_id"]

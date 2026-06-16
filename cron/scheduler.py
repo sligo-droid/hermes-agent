@@ -251,6 +251,7 @@ from cron.jobs import (
     advance_next_run,
     get_due_jobs,
     mark_job_run,
+    mark_job_terminal_success,
     mark_manual_run_finished,
     mark_manual_run_started,
     save_job_output,
@@ -260,6 +261,25 @@ from cron.jobs import (
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+
+
+def _terminal_success_reason(job: dict, success: bool, final_response: str) -> Optional[str]:
+    """Return an auto-pause reason for explicit terminal-success output."""
+    if not success or not job.get("no_agent") or not job.get("disable_on_terminal_success"):
+        return None
+    text = str(final_response or "").strip()
+    if not text:
+        return None
+    first_line = text.splitlines()[0].strip()
+    if first_line.upper().startswith("DONE:"):
+        return "terminal success: DONE marker"
+    try:
+        parsed = json.loads(text.splitlines()[-1])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if isinstance(parsed, dict) and parsed.get("terminal_success") is True:
+        return "terminal success: JSON marker"
+    return None
 
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _hermes_home: Path | None = None
@@ -2388,7 +2408,14 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     success = False
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+                terminal_success_reason = _terminal_success_reason(job, success, final_response)
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                if terminal_success_reason:
+                    mark_job_terminal_success(
+                        job["id"],
+                        output_path=str(output_file),
+                        reason=terminal_success_reason,
+                    )
                 return True
 
             except Exception as e:

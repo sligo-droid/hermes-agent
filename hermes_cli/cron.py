@@ -95,6 +95,12 @@ def cron_list(show_all: bool = False):
             print(f"    Script:    {script}")
         if job.get("no_agent"):
             print(f"    Mode:      {color('no-agent', Colors.DIM)} (script stdout delivered directly)")
+        if job.get("disable_on_terminal_success"):
+            print("    Terminal:  auto-pause on DONE/terminal_success marker")
+        if job.get("paused_reason"):
+            print(f"    Paused:    {job['paused_reason']}")
+        if job.get("last_terminal_output_path"):
+            print(f"    Terminal output: {job['last_terminal_output_path']}")
         workdir = job.get("workdir")
         if workdir:
             print(f"    Workdir:   {workdir}")
@@ -194,6 +200,18 @@ def cron_status():
     else:
         print("  No active jobs")
 
+    paused_terminal_jobs = [
+        j for j in list_jobs(include_disabled=True)
+        if j.get("last_terminal_output_path") or str(j.get("paused_reason") or "").startswith("terminal success:")
+    ]
+    if paused_terminal_jobs:
+        print()
+        print("  Terminal auto-paused job(s)")
+        for job in paused_terminal_jobs:
+            print(f"  - {job.get('id')} ({job.get('name')})")
+            print(f"    Reason: {job.get('paused_reason') or 'terminal success'}")
+            print(f"    Last output: {job.get('last_terminal_output_path') or 'unavailable'}")
+
     findings = audit_overdue_self_improvement_proposals()
     if findings:
         print()
@@ -216,6 +234,7 @@ def cron_create(args):
         workdir=getattr(args, "workdir", None),
         profile=getattr(args, "profile", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        disable_on_terminal_success=getattr(args, "disable_on_terminal_success", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -281,6 +300,7 @@ def cron_edit(args):
         workdir=getattr(args, "workdir", None),
         profile=getattr(args, "profile", None),
         no_agent=getattr(args, "no_agent", None),
+        disable_on_terminal_success=getattr(args, "disable_on_terminal_success", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))

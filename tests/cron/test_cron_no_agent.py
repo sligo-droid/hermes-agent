@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
@@ -329,3 +330,74 @@ def test_run_job_script_path_traversal_still_blocked(hermes_env):
     ok, output = _run_job_script("/etc/passwd")
     assert ok is False
     assert "Blocked" in output or "outside" in output
+
+
+# ---------------------------------------------------------------------------
+# terminal-success auto-pause contract
+# ---------------------------------------------------------------------------
+
+
+def test_tick_pauses_opt_in_no_agent_terminal_success(hermes_env):
+    from cron.jobs import create_job, get_job
+    from cron.scheduler import tick
+
+    script_path = hermes_env / "scripts" / "finite.sh"
+    script_path.write_text("#!/bin/bash\necho 'DONE: executor complete'\n")
+
+    job = create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="finite.sh",
+        no_agent=True,
+        deliver="local",
+        disable_on_terminal_success=True,
+    )
+    job["next_run_at"] = datetime.now(timezone.utc).isoformat()
+    from cron.jobs import save_jobs
+    save_jobs([job])
+
+    assert tick(verbose=False) == 1
+
+    reloaded = get_job(job["id"])
+    assert reloaded["state"] == "paused"
+    assert reloaded["enabled"] is False
+    assert reloaded["next_run_at"] is None
+    assert reloaded["last_status"] == "ok"
+    assert reloaded["paused_reason"] == "terminal success: DONE marker"
+    assert reloaded["last_terminal_output_path"]
+    assert "DONE: executor complete" in reloaded["last_terminal_output_path"] or reloaded["last_terminal_output_path"].endswith(".md")
+
+
+def test_tick_does_not_pause_no_agent_done_without_opt_in(hermes_env):
+    from cron.jobs import create_job, get_job, save_jobs
+    from cron.scheduler import tick
+
+    script_path = hermes_env / "scripts" / "recurring.sh"
+    script_path.write_text("#!/bin/bash\necho 'DONE: normal recurring text'\n")
+
+    job = create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="recurring.sh",
+        no_agent=True,
+        deliver="local",
+    )
+    job["next_run_at"] = datetime.now(timezone.utc).isoformat()
+    save_jobs([job])
+
+    assert tick(verbose=False) == 1
+
+    reloaded = get_job(job["id"])
+    assert reloaded["state"] == "scheduled"
+    assert reloaded["enabled"] is True
+    assert reloaded["next_run_at"] is not None
+    assert reloaded.get("paused_reason") is None
+    assert reloaded.get("last_terminal_output_path") is None
+
+
+def test_terminal_success_json_marker_supported(hermes_env):
+    from cron.scheduler import _terminal_success_reason
+
+    job = {"no_agent": True, "disable_on_terminal_success": True}
+
+    assert _terminal_success_reason(job, True, '{"terminal_success": true}') == "terminal success: JSON marker"
