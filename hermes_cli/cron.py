@@ -202,7 +202,11 @@ def cron_status():
 
     paused_terminal_jobs = [
         j for j in list_jobs(include_disabled=True)
-        if j.get("last_terminal_output_path") or str(j.get("paused_reason") or "").startswith("terminal success:")
+        if (j.get("state") == "paused" or not j.get("enabled", True))
+        and (
+            j.get("last_terminal_output_path")
+            or str(j.get("paused_reason") or "").startswith("terminal success:")
+        )
     ]
     if paused_terminal_jobs:
         print()

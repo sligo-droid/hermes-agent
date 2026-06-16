@@ -4,7 +4,7 @@ from argparse import Namespace
 
 import pytest
 
-from cron.jobs import create_job, get_job, list_jobs, update_job
+from cron.jobs import create_job, get_job, list_jobs, resume_job, update_job
 from hermes_cli.cron import _print_overdue_proposal_findings, cron_command, cron_list, cron_status
 
 
@@ -153,6 +153,50 @@ class TestCronCommandLifecycle:
         assert "Terminal auto-paused job" in out
         assert "terminal success: DONE marker" in out
         assert "/tmp/terminal.md" in out
+
+    def test_status_ignores_resumed_terminal_success_jobs(self, tmp_cron_dir, capsys, monkeypatch):
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        monkeypatch.setattr("cron.jobs.audit_overdue_self_improvement_proposals", lambda: [])
+        job = create_job(prompt="", schedule="every 1h", script="finite.sh", no_agent=True)
+        update_job(
+            job["id"],
+            {
+                "enabled": False,
+                "state": "paused",
+                "paused_reason": "terminal success: DONE marker",
+                "last_terminal_output_path": "/tmp/terminal.md",
+            },
+        )
+        resume_job(job["id"])
+
+        cron_status()
+
+        out = capsys.readouterr().out
+        assert "1 active job" in out
+        assert "Terminal auto-paused job" not in out
+        assert "/tmp/terminal.md" not in out
+
+    def test_list_all_keeps_terminal_output_for_resumed_jobs(self, tmp_cron_dir, capsys, monkeypatch):
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [123])
+        job = create_job(prompt="", schedule="every 1h", script="finite.sh", no_agent=True)
+        update_job(
+            job["id"],
+            {
+                "enabled": False,
+                "state": "paused",
+                "paused_reason": "terminal success: DONE marker",
+                "last_terminal_output_path": "/tmp/terminal.md",
+                "disable_on_terminal_success": True,
+            },
+        )
+        resume_job(job["id"])
+
+        cron_list(show_all=True)
+
+        out = capsys.readouterr().out
+        assert "[active]" in out
+        assert "Paused:" not in out
+        assert "Terminal output: /tmp/terminal.md" in out
 
 
 def test_overdue_proposal_findings_render_operator_evidence(capsys):
