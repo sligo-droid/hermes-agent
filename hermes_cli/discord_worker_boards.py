@@ -1337,7 +1337,7 @@ def _meaningful_worktree_status(worktree_path: str) -> list[str]:
 
 def _worktree_head_merged_into(worktree_path: str, base_branch: str) -> bool:
     refs = [base_branch]
-    if base_branch and "/" not in base_branch:
+    if base_branch and not base_branch.startswith("origin/"):
         refs.append(f"origin/{base_branch}")
     for ref in [r for r in refs if r]:
         try:
@@ -1358,6 +1358,25 @@ def _worktree_head_merged_into(worktree_path: str, base_branch: str) -> bool:
         if merged.returncode == 0:
             return True
     return False
+
+
+def _worktree_base_start_ref(repo_root: str, base_branch: str) -> str:
+    base_branch = str(base_branch or "").strip() or "main"
+    refs = [base_branch]
+    if not base_branch.startswith("origin/"):
+        refs.append(f"origin/{base_branch}")
+    for ref in refs:
+        try:
+            verify = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet", ref],
+                cwd=repo_root,
+                timeout=10,
+            )
+        except Exception:
+            continue
+        if verify.returncode == 0:
+            return ref
+    return base_branch
 
 
 def _remove_clean_merged_worktree(repo_root: str, worktree_path: str) -> Optional[str]:
@@ -1558,7 +1577,8 @@ def _ensure_code_island(worker: dict[str, Any]) -> None:
         if branch_exists:
             cmd = ["git", "worktree", "add", worktree_path, branch]
         else:
-            cmd = ["git", "worktree", "add", "-b", branch, worktree_path, base_branch]
+            start_ref = _worktree_base_start_ref(repo_root, base_branch)
+            cmd = ["git", "worktree", "add", "-b", branch, worktree_path, start_ref]
         result = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True, timeout=120)
         if result.returncode == 0:
             worker["code_island_ready"] = True

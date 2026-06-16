@@ -4118,6 +4118,52 @@ def test_ensure_pr_prefers_checkout_remote_over_stale_project_context(monkeypatc
     assert pr_create[pr_create.index("--repo") + 1] == "sligo-labs/PID"
 
 
+def test_ensure_pr_explicit_target_repo_overrides_checkout_remote(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+
+    board = dwb.start_direct_goal(
+        thread_id="pr-amend-target",
+        goal="Amend upstream PR through fork branch",
+        project_context={
+            "github_pr_target_repo": "sligo-droid/reserve-index-dtf",
+            "base_branch": "feat/irrevocable-fee-recipients",
+            "project_github_url": "https://github.com/reserve-protocol/reserve-index-dtf",
+        },
+    )
+    workspace = tmp_path / "repo"
+    project_path = tmp_path / "canonical"
+    workspace.mkdir()
+    project_path.mkdir()
+    dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "remote", "get-url", "origin"]:
+            return SimpleNamespace(returncode=0, stdout="git@github.com:reserve-protocol/reserve-index-dtf.git\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-droid/reserve-index-dtf/pull/7\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=7), stderr="")
+        sync_result = _canonical_sync_result(cmd)
+        if sync_result is not None:
+            return sync_result
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr(board.slug, str(workspace)) is True
+
+    pr_create = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "create"])
+    assert pr_create[pr_create.index("--repo") + 1] == "sligo-droid/reserve-index-dtf"
+    assert pr_create[pr_create.index("--base") + 1] == "feat/irrevocable-fee-recipients"
+    assert pr_create[pr_create.index("--head") + 1] == "discord/pr-amend-target"
+
+
 def test_ensure_pr_skips_foreman_no_change_branch(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
