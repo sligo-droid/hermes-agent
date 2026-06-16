@@ -75,6 +75,7 @@ _CODE_CHANGE_SIGNAL_RE = re.compile(
     re.IGNORECASE,
 )
 _KANBAN_ACTIVITY_HEARTBEAT_INTERVAL_SECONDS = 10
+_PR_TITLE_MAX_CHARS = 80
 KANBAN_CONTROL_ENV_VARS = frozenset(
     {
         "HERMES_KANBAN_DB",
@@ -94,6 +95,89 @@ _WORKER_PROJECT_STATE_JUSTIFICATION = (
     "Project-state: not needed - Discord worker board implementation; "
     "no current project-state ledger change required."
 )
+
+
+def _single_line_pr_title(value: Any) -> str:
+    title = re.sub(r"\s+", " ", str(value or "implementation")).strip()
+    if not title:
+        title = "implementation"
+    if len(title) <= _PR_TITLE_MAX_CHARS:
+        return title
+    return title[: _PR_TITLE_MAX_CHARS - 3].rstrip(" .,-:;") + "..."
+
+
+def _pr_title_source(worker: dict[str, Any]) -> str:
+    for key in ("summary_title", "initial_request", "root_goal"):
+        value = str(worker.get(key) or "").strip()
+        if not value:
+            continue
+        for line in value.splitlines():
+            candidate = line.strip(" -")
+            if not candidate:
+                continue
+            candidate = re.sub(r"^(goal|title|request):\s*", "", candidate, flags=re.IGNORECASE).strip()
+            if candidate:
+                return candidate
+    return "implementation"
+
+
+def _pr_summary_bullets(worker: dict[str, Any]) -> list[str]:
+    bullets: list[str] = []
+    for key in ("summary", "review_summary"):
+        value = str(worker.get(key) or "").strip()
+        if value:
+            bullets.append(re.sub(r"\s+", " ", value))
+    for item in worker.get("changed_files") or []:
+        text = str(item or "").strip()
+        if text:
+            bullets.append(f"Changed `{text}`")
+    if not bullets:
+        bullets.append("Implemented the approved Kanban worker-board changes.")
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for bullet in bullets:
+        clean = bullet.strip(" -")
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        deduped.append(clean[:200].rstrip())
+        if len(deduped) == 4:
+            break
+    return deduped
+
+
+def _pr_verification_bullets(worker: dict[str, Any]) -> list[str]:
+    bullets: list[str] = []
+    raw_tests = worker.get("tests")
+    if isinstance(raw_tests, list):
+        for item in raw_tests:
+            if isinstance(item, dict):
+                command = str(item.get("command") or "").strip()
+                result = str(item.get("result") or "").strip()
+                output = str(item.get("output") or "").strip()
+                text = command
+                if result:
+                    text = f"{text} {result}".strip()
+                if output and len(text) < 160:
+                    text = f"{text}: {output}".strip(": ")
+            else:
+                text = str(item or "").strip()
+            if text:
+                bullets.append(re.sub(r"\s+", " ", text)[:220].rstrip())
+            if len(bullets) == 4:
+                break
+    if not bullets:
+        bullets.append("See Kanban handoff metadata for verification details.")
+    return bullets
+
+
+def _build_worker_pr_copy(worker: dict[str, Any], *, board: str) -> tuple[str, str]:
+    title = _single_line_pr_title(f"Discord worker: {_pr_title_source(worker)}")
+    board_ref = str(worker.get("public_url") or board).strip() or board
+    summary = "\n".join(f"- {bullet}" for bullet in _pr_summary_bullets(worker))
+    verification = "\n".join(f"- {bullet}" for bullet in _pr_verification_bullets(worker))
+    body = f"Board: {board_ref}\n\n## Summary\n{summary}\n\n## Verification\n{verification}"
+    return title, body
 
 
 def _github_cli_env() -> dict[str, str]:
@@ -1991,10 +2075,7 @@ def _changed_files_for_pr_body(root: Path, *, base: str) -> list[str]:
 
 
 def _worker_pr_body(worker: dict[str, Any], *, board: Optional[str], changed_files: list[str]) -> str:
-    body = (
-        f"Board: {worker.get('public_url') or board}\n\n"
-        f"Goal:\n{worker.get('root_goal') or worker.get('initial_request') or ''}"
-    )
+    _title, body = _build_worker_pr_copy(worker, board=str(board or ""))
     ok, _message = check_project_state_requirement(body, changed_files)
     if ok:
         return body
@@ -2323,12 +2404,7 @@ def _ensure_pr_open(
             changed_files=changed_files,
         )
     else:
-        title_source = str(
-            worker.get("root_goal")
-            or worker.get("initial_request")
-            or "implementation"
-        )
-        title = f"Discord worker: {title_source[:80]}"
+        title, _body_without_project_state_hygiene = _build_worker_pr_copy(worker, board=str(board or ""))
         body = _worker_pr_body(worker, board=board, changed_files=changed_files)
         created = _run_gh(
             [

@@ -1164,6 +1164,14 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "kanban_create" in prompt
     # Anti-shell guidance
     assert "Do not shell out" in prompt or "tools — they work" in prompt
+    # PR copy contract: presentation is concise; detail remains in Kanban.
+    assert "GitHub PR copy" in prompt
+    assert "one short human-readable line" in prompt
+    assert "## Summary" in prompt
+    assert "## Verification" in prompt
+    assert "Do not paste the full Kanban task spec" in prompt
+    assert "acceptance criteria" in prompt
+    assert "Kanban comments/metadata/handoffs" in prompt
 
 
 def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
@@ -1177,7 +1185,7 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 4_096, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 4_500, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 
