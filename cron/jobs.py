@@ -153,6 +153,8 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
 
     profile = _coerce_job_text(normalized.get("profile")).strip()
     normalized["profile"] = profile or None
+    normalized["disable_on_terminal_success"] = bool(normalized.get("disable_on_terminal_success", False))
+    normalized["last_terminal_output_path"] = normalized.get("last_terminal_output_path") or None
 
     return normalized
 
@@ -748,6 +750,7 @@ def create_job(
     workdir: Optional[str] = None,
     profile: Optional[str] = None,
     no_agent: bool = False,
+    disable_on_terminal_success: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -863,6 +866,7 @@ def create_job(
         "base_url": normalized_base_url,
         "script": normalized_script,
         "no_agent": normalized_no_agent,
+        "disable_on_terminal_success": bool(disable_on_terminal_success),
         "context_from": context_from,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
@@ -1274,6 +1278,39 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 return
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+
+
+def mark_job_terminal_success(
+    job_id: str,
+    *,
+    output_path: str,
+    reason: str = "terminal success: DONE marker",
+) -> Optional[Dict[str, Any]]:
+    """Pause an opt-in finite no-agent job after terminal-success output.
+
+    Called after the run output has been persisted and after ``mark_job_run``
+    records last-run status/history, so pausing cannot lose run evidence.
+    """
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            job.update(
+                {
+                    "enabled": False,
+                    "state": "paused",
+                    "paused_at": _hermes_now().isoformat(),
+                    "paused_reason": reason,
+                    "next_run_at": None,
+                    "last_terminal_output_path": str(output_path),
+                }
+            )
+            jobs[i] = job
+            save_jobs(jobs)
+            return _normalize_job_record(job)
+    logger.warning("mark_job_terminal_success: job_id %s not found, skipping save", job_id)
+    return None
 
 
 def advance_next_run(job_id: str) -> bool:

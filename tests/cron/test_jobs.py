@@ -21,6 +21,7 @@ from cron.jobs import (
     mark_job_run,
     mark_manual_run_finished,
     mark_manual_run_started,
+    mark_job_terminal_success,
     reconcile_manual_runs,
     advance_next_run,
     get_due_jobs,
@@ -348,6 +349,31 @@ class TestPauseResumeJob:
         assert resumed["state"] == "scheduled"
         assert resumed["paused_at"] is None
         assert resumed["paused_reason"] is None
+
+    def test_resume_terminal_success_job_preserves_output_evidence(self, tmp_cron_dir):
+        job = create_job(
+            prompt="",
+            schedule="every 1h",
+            script="finite.sh",
+            no_agent=True,
+            disable_on_terminal_success=True,
+        )
+        marked = mark_job_terminal_success(
+            job["id"],
+            output_path="/tmp/terminal.md",
+            reason="terminal success: DONE marker",
+        )
+        assert marked is not None
+        assert marked["state"] == "paused"
+
+        resumed = resume_job(job["id"])
+
+        assert resumed is not None
+        assert resumed["enabled"] is True
+        assert resumed["state"] == "scheduled"
+        assert resumed["paused_at"] is None
+        assert resumed["paused_reason"] is None
+        assert resumed["last_terminal_output_path"] == "/tmp/terminal.md"
 
 
 class TestResolveJobRef:
