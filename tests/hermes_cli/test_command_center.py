@@ -1464,7 +1464,7 @@ def test_snapshot_skips_internal_default_board_foreman_tasks(tmp_path, monkeypat
     assert ordinary_task_id in run_task_ids
 
 
-def test_snapshot_inbox_metric_only_counts_pending_decisions_and_inbox_sources(tmp_path, monkeypatch):
+def test_snapshot_inbox_metric_excludes_source_only_self_improvement_runs(tmp_path, monkeypatch):
     _ingest_valid(monkeypatch, tmp_path)
     proposed_card = _first_card()
     board = "discord-finished-not-inbox"
@@ -1492,9 +1492,12 @@ def test_snapshot_inbox_metric_only_counts_pending_decisions_and_inbox_sources(t
 
     assert board_item["status"] == "shipped"
     assert board_item["execution"]["archiveable"] is True
-    assert snapshot["metrics"]["inbox"] == 2
+    assert snapshot["metrics"]["inbox"] == 1
+    assert snapshot["metrics"]["parse_failures"] == 1
     assert any(item["id"] == f"self-improvement:{proposed_card['proposal_id']}" for item in snapshot["work_items"])
-    assert any(source["bucket"] == "inbox" and source["status"] == "parse_failed" for source in snapshot["sources"])
+    source = next(source for source in snapshot["sources"] if source["kind"] == "self_improvement_run")
+    assert source["bucket"] == "sources"
+    assert source["status"] == "parse_failed"
 
 
 def test_snapshot_exposes_issue_pulse_status_points(tmp_path, monkeypatch):
