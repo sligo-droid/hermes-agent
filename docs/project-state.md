@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-15 15:05 UTC
+Last updated: 2026-06-16 13:00 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -31,6 +31,7 @@ This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork
 | OpenAI Codex auth incident classification | implemented | Nightly Hermes system doctor and cron failure artifacts now group recent `openai-codex` `token_invalidated`/401 evidence into one secret-safe provider-route incident with affected cron IDs/names, proxy/Honcho route labels, recovered/current state, and manual operator guidance. |
 | Kanban lifecycle race regressions | implemented | Focused tests now cover concurrent first opens of fresh non-default boards, corrupt-board quarantine reuse across listing/read paths, and dashboard helper behavior that avoids double initialization or repeated corrupt-DB retries. |
 | Kanban board health diagnostics | implemented | `hermes kanban diagnostics --board-health` now performs a read-only filesystem health scan across discovered boards, reporting DB existence/size, zero-byte stubs, SQLite header classification, read-only integrity status, WAL/SHM sidecars, and corrupt backup counts/latest mtime without initializing missing DBs or repairing files. |
+| Finite no-agent cron auto-pause | implemented | Opted-in no-agent cron jobs that emit terminal-success output now pause after successful completion, preserve the terminal output path/reason for cron list/status/tool surfaces, and keep non-opted-in recurring jobs active. |
 
 Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `merged`, `deployed`, `verified`, `superseded`.
 
@@ -65,6 +66,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Added secret-safe OpenAI Codex auth-route incident classification so token invalidation bursts surface as one operator incident across cron, proxy/Honcho, logs, and doctor output instead of scattered application failures.
 - [x] Added deterministic Kanban lifecycle regression coverage for fresh-board open races, corrupt-board quarantine reuse, and dashboard connection helpers avoiding duplicate initialization/corruption retries.
 - [x] Added read-only Kanban board health diagnostics so operators can inspect corrupt DBs, zero-byte stubs, WAL/SHM sidecars, and corrupt backups from the existing diagnostics CLI surface without triggering board initialization or remediation.
+- [x] Added an explicit finite no-agent cron terminal-success contract so completed executor crons can auto-pause without broad heuristics that would affect watchdogs or recurring maintenance.
 
 ## In Progress
 
