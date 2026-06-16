@@ -242,6 +242,94 @@ def test_dev_role_prompt_includes_autoreview_closeout_contract(monkeypatch, tmp_
     assert "Autoreview closeout contract for dev workers" not in planner_prompt
 
 
+def test_dev_role_prompt_force_loads_board_worker_skill_hints(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import DISCORD_WORKER_META_KEY, ROLE_DEV, ROLE_PLANNER
+
+    board = "discord-worker-solidity-skill"
+    kanban_db.create_board(board, name="Solidity skill")
+    meta = kanban_db.read_board_metadata(board)
+    meta.pop("db_path", None)
+    meta[DISCORD_WORKER_META_KEY] = {
+        "kind": "discord_worker_board",
+        "project_context": {"worker_skill_hints": ["reserve-solidity-style"]},
+    }
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(worker, "_git_summary", lambda _workspace: "clean")
+
+    loaded: list[tuple[str, str]] = []
+
+    def fake_render_skill(name: str, *, task_id: str) -> str:
+        loaded.append((name, task_id))
+        return f"LOADED-SKILL {name} for {task_id}"
+
+    monkeypatch.setattr(worker, "_render_worker_skill", fake_render_skill)
+
+    conn = kanban_db.connect(board=board)
+    try:
+        dev_task_id = kanban_db.create_task(
+            conn,
+            title="Implement Reserve contract amend",
+            body="Goal: update Solidity PR\nSuccess means: follows Reserve style\nStop when: tests recorded",
+            assignee=ROLE_DEV,
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+            tenant=board,
+        )
+        planner_task_id = kanban_db.create_task(
+            conn,
+            title="Plan Reserve amend",
+            assignee=ROLE_PLANNER,
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+            tenant=board,
+        )
+        dev_prompt = worker._build_prompt(conn, dev_task_id, ROLE_DEV)
+        planner_prompt = worker._build_prompt(conn, planner_task_id, ROLE_PLANNER)
+    finally:
+        conn.close()
+
+    assert loaded == [("reserve-solidity-style", dev_task_id)]
+    assert "Force-loaded implementation skills for this dev worker" in dev_prompt
+    assert f"LOADED-SKILL reserve-solidity-style for {dev_task_id}" in dev_prompt
+    assert "reserve-solidity-style" not in planner_prompt
+
+
+def test_dev_role_prompt_force_loads_task_skills_and_deduplicates(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+
+    board = "discord-worker-task-skills"
+    kanban_db.create_board(board, name="Task skills")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(worker, "_git_summary", lambda _workspace: "clean")
+    monkeypatch.setattr(worker, "_render_worker_skill", lambda name, *, task_id: f"SKILL {name}")
+
+    conn = kanban_db.connect(board=board)
+    try:
+        dev_task_id = kanban_db.create_task(
+            conn,
+            title="Implement skilled task",
+            body="Goal: implement\nSuccess means: done\nStop when: verified",
+            assignee=ROLE_DEV,
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+            tenant=board,
+            skills=["general-coding", "reserve-solidity-style", "general-coding"],
+        )
+        dev_prompt = worker._build_prompt(conn, dev_task_id, ROLE_DEV)
+    finally:
+        conn.close()
+
+    assert dev_prompt.count("SKILL general-coding") == 1
+    assert dev_prompt.count("SKILL reserve-solidity-style") == 1
+
+
 def test_autoreview_helper_materializes_in_hermes_and_pid_like_workspaces(tmp_path):
     from hermes_cli.worker_autoreview import AUTOREVIEW_RELATIVE_HELPER, AUTOREVIEW_RELATIVE_SKILL
     from hermes_cli.worker_autoreview import materialize_autoreview_helper

@@ -42,6 +42,7 @@ class GitHubPrAmendRequest:
     body: str
     source_kind: str
     source_id: str
+    source_node_id: str = ""
     source_url: str = ""
     review_state: str = ""
     review_id: str = ""
@@ -242,6 +243,7 @@ def extract_request(
         pr_number = _require_int(_dig(payload, "issue", "number"), "issue.number")
         body = str(_dig(payload, "comment", "body", default="") or "")
         source_id = str(_dig(payload, "comment", "id", default="") or "")
+        source_node_id = str(_dig(payload, "comment", "node_id", default="") or "")
         source_url = str(_dig(payload, "comment", "html_url", default="") or "")
         return GitHubPrAmendRequest(
             event_type=event_type,
@@ -252,6 +254,7 @@ def extract_request(
             body=body,
             source_kind="issue_comment",
             source_id=source_id,
+            source_node_id=source_node_id,
             source_url=source_url,
             delivery_id=delivery_id,
         )
@@ -275,6 +278,7 @@ def extract_request(
             body=body,
             source_kind="review_comment",
             source_id=str(_dig(payload, "comment", "id", default="") or ""),
+            source_node_id=str(_dig(payload, "comment", "node_id", default="") or ""),
             source_url=str(_dig(payload, "comment", "html_url", default="") or ""),
             review_id=str(_dig(payload, "comment", "pull_request_review_id", default="") or ""),
             path=str(_dig(payload, "comment", "path", default="") or ""),
@@ -297,6 +301,7 @@ def extract_request(
             body=body,
             source_kind="review",
             source_id=str(_dig(payload, "review", "id", default="") or ""),
+            source_node_id=str(_dig(payload, "review", "node_id", default="") or ""),
             source_url=str(_dig(payload, "review", "html_url", default="") or ""),
             review_id=str(_dig(payload, "review", "id", default="") or ""),
             review_state=str(_dig(payload, "review", "state", default="") or ""),
@@ -853,9 +858,10 @@ def resolve_pr_amend_existing_discord_route(artifact: dict[str, Any]) -> dict[st
             continue
         thread_id = str(worker.get("thread_id") or worker.get("discord_thread_id") or "").strip()
         message_id = str(
-            worker.get("source_message_id")
+            worker.get("discord_top_level_message_id")
+            or worker.get("summary_message_id")
+            or worker.get("source_message_id")
             or worker.get("request_id")
-            or worker.get("discord_top_level_message_id")
             or ""
         ).strip()
         board_slug = str(board or worker.get("discord_board") or "").strip()

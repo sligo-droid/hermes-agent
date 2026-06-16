@@ -565,6 +565,7 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
     )
     pr_policy = _pr_policy_prompt_note(role)
     autoreview = _dev_autoreview_prompt(role)
+    forced_skills = _forced_worker_skill_prompt(conn, task_id, role)
     return (
         f"You are the Discord Kanban {role} worker.\n"
         "Use the repository, shell, files, and worker helper commands available in this worker environment to complete the task.\n"
@@ -575,10 +576,109 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
         f"{frontend_smoke}"
         f"{browser_preflight}"
         f"{autoreview}"
+        f"{forced_skills}"
         f"{schema}\n\n"
         f"Git context:\n{git}\n\n"
         f"Kanban context:\n{context}"
     )
+
+
+def _forced_worker_skill_prompt(conn: Any, task_id: str, role: str) -> str:
+    """Render task/board force-loaded skills into role-worker context.
+
+    Discord worker-board role workers run through Codex/OpenCode, not the
+    legacy Hermes ``hermes chat --skills ...`` worker path. The normal Kanban
+    ``Task.skills`` field is still useful metadata, but it is not sufficient by
+    itself here: the coding-worker prompt must contain the resolved skill text
+    for the role worker to actually receive it. Keep this scoped to dev workers
+    so planner/reviewer prompts do not get implementation style manuals.
+    """
+
+    if role != ROLE_DEV:
+        return ""
+    try:
+        task = kanban_db.get_task(conn, task_id)
+    except Exception:
+        return ""
+    if not task:
+        return ""
+    names = _merge_skill_names(
+        getattr(task, "skills", None),
+        _board_worker_skill_hints(getattr(task, "tenant", None)),
+    )
+    if not names:
+        return ""
+
+    rendered: list[str] = ["Force-loaded implementation skills for this dev worker:"]
+    for name in names:
+        message = _render_worker_skill(name, task_id=task_id)
+        if message:
+            rendered.append(message)
+        else:
+            rendered.append(
+                f"[Skill load warning: requested skill `{name}` did not resolve in this worker environment. "
+                "Continue only with the task context and record the missing skill in handoff.notes.]"
+            )
+    return "\n\n".join(rendered).rstrip() + "\n\n"
+
+
+def _render_worker_skill(name: str, *, task_id: str) -> str:
+    try:
+        from agent.skill_commands import _build_skill_message, _load_skill_payload
+
+        loaded = _load_skill_payload(name, task_id=task_id)
+        if not loaded:
+            return ""
+        payload, skill_dir, display_name = loaded
+        return _build_skill_message(
+            payload,
+            skill_dir,
+            activation_note=(
+                f"Skill `{display_name}` is loaded for this Kanban dev worker. "
+                "Follow it for implementation style, pitfalls, and verification."
+            ),
+            runtime_note="Loaded by hermes_cli.kanban_codex_worker from task/board worker_skill_hints.",
+            session_id=task_id,
+        )
+    except Exception:
+        return ""
+
+
+def _merge_skill_names(*groups: Any) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        if isinstance(group, str):
+            values = [group]
+        elif isinstance(group, (list, tuple, set)):
+            values = list(group)
+        else:
+            values = []
+        for item in values:
+            name = str(item or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            merged.append(name)
+    return merged
+
+
+def _board_worker_skill_hints(board: Optional[str]) -> list[str]:
+    if not board:
+        return []
+    try:
+        metadata = kanban_db.read_board_metadata(board)
+    except Exception:
+        return []
+    from hermes_cli.discord_worker_boards import DISCORD_WORKER_META_KEY
+
+    worker = metadata.get(DISCORD_WORKER_META_KEY)
+    if not isinstance(worker, dict):
+        return []
+    context = worker.get("project_context")
+    if not isinstance(context, dict):
+        return []
+    return _merge_skill_names(context.get("worker_skill_hints"))
 
 
 def _worker_plan_artifact_lines(worker: dict[str, Any]) -> list[str]:

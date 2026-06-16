@@ -79,6 +79,7 @@ ISSUE_COMMENT_PAYLOAD = {
     },
     "comment": {
         "id": 4700001,
+        "node_id": "IC_kwDOReviewIssueComment",
         "html_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#issuecomment-4700001",
         "body": "@sligo-droid please update the tests for this change.",
     },
@@ -92,6 +93,7 @@ REVIEW_COMMENT_PAYLOAD = {
     "pull_request": {"number": 182},
     "comment": {
         "id": 4800001,
+        "node_id": "PRRC_kwDOReviewComment",
         "html_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#discussion_r4800001",
         "body": "@sligo-droid use the existing helper here.",
         "path": "src/example.ts",
@@ -109,6 +111,7 @@ REVIEW_PAYLOAD = {
     "pull_request": {"number": 182, "user": {"login": "sligo-droid"}},
     "review": {
         "id": 4900001,
+        "node_id": "PRR_kwDOReviewSummary",
         "url": "https://api.github.com/repos/reserve-protocol/reserve-index-dtf/pulls/182/reviews/4900001",
         "html_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#pullrequestreview-4900001",
         "state": "changes_requested",
@@ -393,7 +396,8 @@ class TestGitHubPrAmendPolicy:
             lambda board: {
                 "discord_worker": {
                     "thread_id": "thread-123",
-                    "source_message_id": "msg-123",
+                    "source_message_id": "user-request-msg",
+                    "summary_message_id": "bot-summary-msg",
                     "parent_channel_id": "channel-123",
                     "guild_id": "guild-123",
                     "public_url": "https://workers.test/thread-123",
@@ -409,7 +413,7 @@ class TestGitHubPrAmendPolicy:
 
         assert route == {
             "discord_channel_id": "channel-123",
-            "discord_top_level_message_id": "msg-123",
+            "discord_top_level_message_id": "bot-summary-msg",
             "discord_thread_id": "thread-123",
             "discord_thread_url": "",
             "discord_board": "discord-thread-123",
@@ -477,11 +481,6 @@ class TestGitHubPrAmendWebhookRoute:
                 REVIEW_COMMENT_PAYLOAD,
                 "repos/reserve-protocol/reserve-index-dtf/pulls/comments/4800001/reactions",
             ),
-            (
-                "pull_request_review",
-                REVIEW_PAYLOAD,
-                "repos/reserve-protocol/reserve-index-dtf/pulls/182/reviews/4900001/reactions",
-            ),
         ],
     )
     async def test_github_pr_amend_reaction_endpoint_mapping(
@@ -501,10 +500,49 @@ class TestGitHubPrAmendWebhookRoute:
         assert "X-GitHub-Api-Version: 2022-11-28" in argv
 
     @pytest.mark.asyncio
-    async def test_github_pr_amend_reaction_transition_deletes_prior_bot_status(self):
+    async def test_github_pr_amend_review_reaction_uses_graphql_review_node(self):
         adapter = _make_adapter({"github-pr-amend": ROUTE})
         request = extract_request("pull_request_review", REVIEW_PAYLOAD)
-        endpoint = "repos/reserve-protocol/reserve-index-dtf/pulls/182/reviews/4900001/reactions"
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            joined = "\n".join(argv)
+            if "reactionGroups" in joined:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "data": {
+                                "node": {
+                                    "reactionGroups": [
+                                        {"content": "EYES", "viewerHasReacted": False},
+                                        {"content": "ROCKET", "viewerHasReacted": False},
+                                    ]
+                                }
+                            }
+                        }
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"data": {}}), stderr="")
+
+        with patch("gateway.platforms.webhook.subprocess.run", side_effect=fake_run):
+            assert await adapter._add_github_pr_amend_reaction(request, "eyes") is True
+
+        assert all("pulls/182/reviews/4900001/reactions" not in "\n".join(call) for call in calls)
+        assert calls[0][:3] == ["gh", "api", "graphql"]
+        assert f"id={REVIEW_PAYLOAD['review']['node_id']}" in calls[0]
+        assert calls[1][:3] == ["gh", "api", "graphql"]
+        assert f"subjectId={REVIEW_PAYLOAD['review']['node_id']}" in calls[1]
+        assert "content=EYES" in calls[1]
+
+    @pytest.mark.asyncio
+    async def test_github_pr_amend_reaction_transition_deletes_prior_bot_status(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD)
+        endpoint = "repos/reserve-protocol/reserve-index-dtf/issues/comments/4700001/reactions"
         calls = []
 
         def fake_run(argv, **kwargs):
@@ -540,6 +578,47 @@ class TestGitHubPrAmendWebhookRoute:
         assert calls[2][0:4] == ["gh", "api", "-X", "POST"]
         assert f"{endpoint}/2" not in calls[1]
         assert all(f"{endpoint}/3" not in call for call in calls)
+
+    @pytest.mark.asyncio
+    async def test_github_pr_amend_review_reaction_transition_uses_graphql_viewer_reactions(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        request = extract_request("pull_request_review", REVIEW_PAYLOAD)
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            joined = "\n".join(argv)
+            if "reactionGroups" in joined:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "data": {
+                                "node": {
+                                    "reactionGroups": [
+                                        {"content": "EYES", "viewerHasReacted": True},
+                                        {"content": "ROCKET", "viewerHasReacted": False},
+                                        {"content": "THUMBS_DOWN", "viewerHasReacted": False},
+                                    ]
+                                }
+                            }
+                        }
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"data": {}}), stderr="")
+
+        with patch("gateway.platforms.webhook.subprocess.run", side_effect=fake_run):
+            assert await adapter._add_github_pr_amend_reaction(request, "rocket") is True
+
+        assert len(calls) == 3
+        assert "reactionGroups" in "\n".join(calls[0])
+        assert "removeReaction" in "\n".join(calls[1])
+        assert f"subjectId={REVIEW_PAYLOAD['review']['node_id']}" in calls[1]
+        assert "content=EYES" in calls[1]
+        assert "addReaction" in "\n".join(calls[2])
+        assert "content=ROCKET" in calls[2]
 
     @pytest.mark.asyncio
     async def test_github_pr_amend_reaction_list_failure_still_posts(self):

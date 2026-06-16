@@ -971,10 +971,6 @@ class WebhookAdapter(BasePlatformAdapter):
             return f"repos/{repo}/issues/comments/{source_id}/reactions"
         if source_kind == "review_comment" and source_id:
             return f"repos/{repo}/pulls/comments/{source_id}/reactions"
-        if source_kind == "review":
-            review_id = getattr(request, "review_id", "") or source_id
-            if review_id:
-                return f"repos/{repo}/pulls/{getattr(request, 'pr_number', '')}/reviews/{review_id}/reactions"
         return ""
 
     async def _safe_github_pr_amend_reaction(self, request: Any, content: str) -> None:
@@ -993,6 +989,9 @@ class WebhookAdapter(BasePlatformAdapter):
 
     async def _add_github_pr_amend_reaction(self, request: Any, content: str) -> bool:
         """Add a GitHub reaction to the triggering object via ``gh api``."""
+        if getattr(request, "source_kind", "") == "review":
+            return await self._add_github_pr_amend_graphql_reaction(request, content)
+
         endpoint = self._github_pr_amend_reaction_endpoint(request)
         if not endpoint:
             logger.warning(
@@ -1061,6 +1060,199 @@ class WebhookAdapter(BasePlatformAdapter):
             getattr(request, "source_id", ""),
             content,
         )
+        return True
+
+    def _github_pr_amend_graphql_reaction_content(self, content: str) -> str:
+        return {
+            "+1": "THUMBS_UP",
+            "-1": "THUMBS_DOWN",
+            "laugh": "LAUGH",
+            "confused": "CONFUSED",
+            "heart": "HEART",
+            "hooray": "HOORAY",
+            "rocket": "ROCKET",
+            "eyes": "EYES",
+        }.get(str(content or ""), "")
+
+    async def _add_github_pr_amend_graphql_reaction(self, request: Any, content: str) -> bool:
+        """Add a reaction to a PR review summary via GraphQL Reactable nodes."""
+
+        node_id = str(getattr(request, "source_node_id", "") or "").strip()
+        reaction_content = self._github_pr_amend_graphql_reaction_content(content)
+        if not node_id or not reaction_content:
+            logger.warning(
+                "[github-pr-amend] no GraphQL reaction target repo=%s pr=%s kind=%s id=%s node=%s content=%s",
+                getattr(request, "repo", ""),
+                getattr(request, "pr_number", ""),
+                getattr(request, "source_kind", ""),
+                getattr(request, "source_id", ""),
+                node_id,
+                content,
+            )
+            return False
+
+        existing = await self._github_pr_amend_graphql_viewer_reactions(node_id)
+        status_reactions = {"EYES", "ROCKET", "THUMBS_DOWN"}
+        if existing is not None:
+            for prior in sorted(status_reactions - {reaction_content}):
+                if prior in existing:
+                    await self._remove_github_pr_amend_graphql_reaction(node_id, prior)
+            if reaction_content in existing:
+                return True
+
+        query = """
+mutation($subjectId: ID!, $content: ReactionContent!) {
+  addReaction(input: {subjectId: $subjectId, content: $content}) {
+    reaction { content }
+    subject { id }
+  }
+}
+""".strip()
+        return await self._run_github_pr_amend_graphql(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"query={query}",
+                "-F",
+                f"subjectId={node_id}",
+                "-F",
+                f"content={reaction_content}",
+            ],
+            action="add",
+            node_id=node_id,
+            content=reaction_content,
+        )
+
+    async def _github_pr_amend_graphql_viewer_reactions(self, node_id: str) -> set[str] | None:
+        query = """
+query($id: ID!) {
+  node(id: $id) {
+    ... on Reactable {
+      reactionGroups { content viewerHasReacted }
+    }
+  }
+}
+""".strip()
+        argv = ["gh", "api", "graphql", "-f", f"query={query}", "-F", f"id={node_id}"]
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("[github-pr-amend] GraphQL reaction query failed node=%s error=%s", node_id, exc)
+            return None
+        if result.returncode != 0:
+            logger.warning(
+                "[github-pr-amend] gh GraphQL reaction query failed node=%s exit=%s stderr=%s",
+                node_id,
+                result.returncode,
+                (result.stderr or "").strip()[:500],
+            )
+            return None
+        try:
+            data = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            logger.warning("[github-pr-amend] gh GraphQL reaction query returned invalid JSON node=%s", node_id)
+            return None
+        if data.get("errors"):
+            logger.warning("[github-pr-amend] gh GraphQL reaction query returned errors node=%s errors=%s", node_id, data.get("errors"))
+            return None
+        node = data.get("data", {}).get("node") if isinstance(data.get("data"), dict) else None
+        groups = node.get("reactionGroups") if isinstance(node, dict) else None
+        if not isinstance(groups, list):
+            return None
+        return {
+            str(group.get("content") or "")
+            for group in groups
+            if isinstance(group, dict) and group.get("viewerHasReacted")
+        }
+
+    async def _remove_github_pr_amend_graphql_reaction(self, node_id: str, reaction_content: str) -> bool:
+        query = """
+mutation($subjectId: ID!, $content: ReactionContent!) {
+  removeReaction(input: {subjectId: $subjectId, content: $content}) {
+    subject { id }
+  }
+}
+""".strip()
+        return await self._run_github_pr_amend_graphql(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"query={query}",
+                "-F",
+                f"subjectId={node_id}",
+                "-F",
+                f"content={reaction_content}",
+            ],
+            action="remove",
+            node_id=node_id,
+            content=reaction_content,
+        )
+
+    async def _run_github_pr_amend_graphql(
+        self,
+        argv: list[str],
+        *,
+        action: str,
+        node_id: str,
+        content: str,
+    ) -> bool:
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning(
+                "[github-pr-amend] GraphQL reaction %s failed node=%s content=%s error=%s",
+                action,
+                node_id,
+                content,
+                exc,
+            )
+            return False
+        if result.returncode != 0:
+            logger.warning(
+                "[github-pr-amend] gh GraphQL reaction %s failed node=%s content=%s exit=%s stderr=%s",
+                action,
+                node_id,
+                content,
+                result.returncode,
+                (result.stderr or "").strip()[:500],
+            )
+            return False
+        try:
+            data = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            logger.warning(
+                "[github-pr-amend] gh GraphQL reaction %s returned invalid JSON node=%s content=%s",
+                action,
+                node_id,
+                content,
+            )
+            return False
+        if data.get("errors"):
+            logger.warning(
+                "[github-pr-amend] gh GraphQL reaction %s returned errors node=%s content=%s errors=%s",
+                action,
+                node_id,
+                content,
+                data.get("errors"),
+            )
+            return False
+        logger.info("[github-pr-amend] GraphQL reaction %s node=%s content=%s", action, node_id, content)
         return True
 
     async def _delete_prior_github_pr_amend_reactions(
