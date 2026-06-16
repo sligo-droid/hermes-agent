@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-16 16:45 UTC
+Last updated: 2026-06-16 17:06 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -33,6 +33,7 @@ This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork
 | Kanban board health diagnostics | implemented | `hermes kanban diagnostics --board-health` now performs a read-only filesystem health scan across discovered boards, reporting DB existence/size, zero-byte stubs, SQLite header classification, read-only integrity status, WAL/SHM sidecars, and corrupt backup counts/latest mtime without initializing missing DBs or repairing files. |
 | Self-improvement proposal terminal reconciliation | implemented | Command Center proposal reads now reconcile approved self-improvement proposal cards against active and archived Kanban worker boards, persist terminal completion evidence for done tasks/boards, and keep completed proposals out of active duplicate suppression while preserving historical cards. |
 | Finite no-agent cron auto-pause | implemented | Opted-in no-agent cron jobs that emit terminal-success output now pause after successful completion, preserve the terminal output path/reason for cron list/status/tool surfaces, and keep non-opted-in recurring jobs active. |
+| GitHub PR-amend worker-board routing | implemented | Accepted PR-amend webhooks now carry fetched PR/review/comment context, explicit fork target repo/base-branch metadata for worker boards, an active head-branch lock until the worker board reaches terminal state, and no premature done reaction at queue time. |
 
 Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `merged`, `deployed`, `verified`, `superseded`.
 
@@ -69,6 +70,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Added read-only Kanban board health diagnostics so operators can inspect corrupt DBs, zero-byte stubs, WAL/SHM sidecars, and corrupt backups from the existing diagnostics CLI surface without triggering board initialization or remediation.
 - [x] Added deterministic terminal-state reconciliation for self-improvement proposal cards backed by Kanban worker board/task evidence so completed execution no longer appears as active approved Command Center work.
 - [x] Added an explicit finite no-agent cron terminal-success contract so completed executor crons can auto-pause without broad heuristics that would affect watchdogs or recurring maintenance.
+- [x] Hardened GitHub PR-amend worker-board intake so accepted webhooks carry PR/review context, target the existing fork PR branch through explicit worker-board metadata/finalizer repo overrides, keep active branch locks until terminal boards, and stop sending queue-time done reactions.
 
 ## In Progress
 

@@ -16,6 +16,7 @@ from gateway.github_pr_amend import (
     build_pr_amend_intake_artifact,
     evaluate_request,
     extract_request,
+    fetch_pr_related_context,
     policy_from_route,
     preflight_request,
     write_pr_amend_intake_artifact,
@@ -107,6 +108,12 @@ REVIEW_PAYLOAD = {
         "state": "changes_requested",
         "body": "@sligo-droid please address the requested changes.",
     },
+}
+
+PR_RELATED_CONTEXT = {
+    "reviews": [{"id": 4900001, "state": "CHANGES_REQUESTED", "body": "Use the existing helper."}],
+    "review_comments": [{"id": 4800001, "path": "src/example.ts", "body": "Inline fix."}],
+    "issue_comments": [{"id": 4700001, "body": "@sligo-droid please update the tests."}],
 }
 
 
@@ -254,6 +261,7 @@ class TestGitHubPrAmendPolicy:
             policy,
             PR_INFO,
             ISSUE_COMMENT_PAYLOAD,
+            PR_RELATED_CONTEXT,
         )
         path = write_pr_amend_intake_artifact(artifact)
         saved = json.loads(path.read_text(encoding="utf-8"))
@@ -268,6 +276,9 @@ class TestGitHubPrAmendPolicy:
         assert saved["pull_request"]["base"]["repo"] == "reserve-protocol/reserve-index-dtf"
         assert saved["source"]["body"] == ISSUE_COMMENT_PAYLOAD["comment"]["body"]
         assert saved["fetched_context"]["pull_request"]["title"] == PR_INFO["title"]
+        assert saved["fetched_context"]["reviews"] == PR_RELATED_CONTEXT["reviews"]
+        assert saved["fetched_context"]["review_comments"] == PR_RELATED_CONTEXT["review_comments"]
+        assert saved["fetched_context"]["issue_comments"] == PR_RELATED_CONTEXT["issue_comments"]
         assert saved["policy_decision"]["accepted"] is True
         instructions = saved["operational_instructions"].lower()
         assert "do not post github text comments" in instructions
@@ -275,6 +286,53 @@ class TestGitHubPrAmendPolicy:
         assert "worker-board embed/thread" in instructions
         assert "open and merge a pr in the `sligo-droid` fork" in instructions
         assert "final public github output is pushed commits/prs plus reactions only" in instructions
+
+    def test_fetch_pr_related_context_fetches_paginated_lists(self, monkeypatch):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if "reviews" in cmd[-1]:
+                stdout = '[[{"id": 1}], [{"id": 2}]]'
+            elif "pulls/182/comments" in cmd[-1]:
+                stdout = '[[{"id": 3}]]'
+            else:
+                stdout = '[[{"id": 4}]]'
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr("gateway.github_pr_amend.subprocess.run", fake_run)
+
+        context = fetch_pr_related_context("reserve-protocol/reserve-index-dtf", 182)
+
+        assert context == {
+            "reviews": [{"id": 1}, {"id": 2}],
+            "review_comments": [{"id": 3}],
+            "issue_comments": [{"id": 4}],
+        }
+        assert all("--paginate" in cmd and "--slurp" in cmd for cmd in calls)
+        assert calls == [
+            [
+                "gh",
+                "api",
+                "--paginate",
+                "--slurp",
+                "repos/reserve-protocol/reserve-index-dtf/pulls/182/reviews?per_page=100",
+            ],
+            [
+                "gh",
+                "api",
+                "--paginate",
+                "--slurp",
+                "repos/reserve-protocol/reserve-index-dtf/pulls/182/comments?per_page=100",
+            ],
+            [
+                "gh",
+                "api",
+                "--paginate",
+                "--slurp",
+                "repos/reserve-protocol/reserve-index-dtf/issues/182/comments?per_page=100",
+            ],
+        ]
 
 
 class TestGitHubPrAmendWebhookRoute:
@@ -339,6 +397,8 @@ class TestGitHubPrAmendWebhookRoute:
         }
 
         with patch("gateway.github_pr_amend.fetch_pr_info", return_value=PR_INFO), patch(
+            "gateway.github_pr_amend.fetch_pr_related_context", return_value=PR_RELATED_CONTEXT
+        ), patch(
             "gateway.github_pr_amend.publish_and_activate_pr_amend_intake",
             return_value=board_metadata,
         ) as publish:
@@ -363,12 +423,18 @@ class TestGitHubPrAmendWebhookRoute:
         assert Path(data["artifact_path"]).is_file()
         artifact = json.loads(Path(data["artifact_path"]).read_text(encoding="utf-8"))
         assert artifact["delivery_id"] == "delivery-accepted"
+        assert artifact["fetched_context"]["reviews"] == PR_RELATED_CONTEXT["reviews"]
         assert "sligo-droid" in artifact["operational_instructions"]
         publish.assert_called_once()
         assert publish.call_args.kwargs["channel_id"] == "channel-123"
         card = publish.call_args.args[0]
         assert card["kind"] == "github_pr_amend"
         assert "Open and merge a PR" in card["body"]
+        assert card["github_pr_amend"]["head_ref"] == "feat/irrevocable-fee-recipients"
+        assert card["github_pr_amend"]["base_repo"] == "reserve-protocol/reserve-index-dtf"
+        assert card["project_context"]["github_pr_target_repo"] == "sligo-droid/reserve-index-dtf"
+        assert card["project_context"]["base_branch"] == "feat/irrevocable-fee-recipients"
+        assert card["project_context"]["github_pr_amend"]["head_sha"] == "19a1d0b"
         assert any(
             "Discord worker-board embed/thread" in criterion
             for criterion in card["acceptance_criteria"]
@@ -376,8 +442,9 @@ class TestGitHubPrAmendWebhookRoute:
         assert [call.args[1] for call in adapter._add_github_pr_amend_reaction.await_args_list] == [
             "eyes",
             "rocket",
-            "+1",
         ]
+        assert data["lock_key"] in adapter._github_pr_amend_locks
+        assert adapter._github_pr_amend_lock_boards[data["lock_key"]] == "discord-thread-123"
 
     @pytest.mark.asyncio
     async def test_non_tbrent_mention_is_ignored(self):
@@ -410,6 +477,8 @@ class TestGitHubPrAmendWebhookRoute:
         adapter._add_github_pr_amend_reaction = AsyncMock(side_effect=RuntimeError("gh down"))
 
         with patch("gateway.github_pr_amend.fetch_pr_info", return_value=PR_INFO), patch(
+            "gateway.github_pr_amend.fetch_pr_related_context", return_value=PR_RELATED_CONTEXT
+        ), patch(
             "gateway.github_pr_amend.resolve_pr_amend_discord_channel", return_value="channel-123"
         ), patch(
             "gateway.github_pr_amend.publish_and_activate_pr_amend_intake",
@@ -436,6 +505,8 @@ class TestGitHubPrAmendWebhookRoute:
         adapter._add_github_pr_amend_reaction = AsyncMock(return_value=True)
 
         with patch("gateway.github_pr_amend.fetch_pr_info", return_value=PR_INFO), patch(
+            "gateway.github_pr_amend.fetch_pr_related_context", return_value=PR_RELATED_CONTEXT
+        ), patch(
             "gateway.github_pr_amend.resolve_pr_amend_discord_channel", return_value=""
         ):
             async with TestClient(TestServer(_create_app(adapter))) as cli:
@@ -482,6 +553,8 @@ class TestGitHubPrAmendWebhookRoute:
         adapter = _make_adapter({"github-pr-amend": ROUTE})
 
         with patch("gateway.github_pr_amend.fetch_pr_info", return_value=PR_INFO), patch(
+            "gateway.github_pr_amend.fetch_pr_related_context", return_value=PR_RELATED_CONTEXT
+        ), patch(
             "gateway.github_pr_amend.resolve_pr_amend_discord_channel", return_value="channel-123"
         ), patch(
             "gateway.github_pr_amend.publish_and_activate_pr_amend_intake",
@@ -508,6 +581,8 @@ class TestGitHubPrAmendWebhookRoute:
         with patch(
             "gateway.github_pr_amend.fetch_pr_info",
             side_effect=[RuntimeError("api down"), PR_INFO],
+        ), patch(
+            "gateway.github_pr_amend.fetch_pr_related_context", return_value=PR_RELATED_CONTEXT
         ), patch(
             "gateway.github_pr_amend.resolve_pr_amend_discord_channel", return_value="channel-123"
         ), patch(

@@ -411,6 +411,75 @@ def fetch_pr_info(repo: str, pr_number: int, *, gh_command: str = "gh") -> dict[
     return data
 
 
+def _fetch_pr_api_json(
+    repo: str,
+    path: str,
+    *,
+    gh_command: str = "gh",
+    list_response: bool = False,
+) -> Any:
+    endpoint = f"repos/{repo}/{path.lstrip('/')}"
+    cmd = [gh_command, "api", endpoint]
+    if list_response:
+        separator = "&" if "?" in endpoint else "?"
+        cmd = [
+            gh_command,
+            "api",
+            "--paginate",
+            "--slurp",
+            f"{endpoint}{separator}per_page=100",
+        ]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"gh api failed with {result.returncode}")
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("gh api returned invalid JSON") from exc
+    if list_response and isinstance(data, list) and all(isinstance(page, list) for page in data):
+        return [item for page in data for item in page]
+    return data
+
+
+def fetch_pr_related_context(
+    repo: str,
+    pr_number: int,
+    *,
+    gh_command: str = "gh",
+) -> dict[str, Any]:
+    """Fetch review/comment context needed by worker-board PR amendment."""
+
+    context = {
+        "reviews": _fetch_pr_api_json(
+            repo,
+            f"pulls/{pr_number}/reviews",
+            gh_command=gh_command,
+            list_response=True,
+        ),
+        "review_comments": _fetch_pr_api_json(
+            repo,
+            f"pulls/{pr_number}/comments",
+            gh_command=gh_command,
+            list_response=True,
+        ),
+        "issue_comments": _fetch_pr_api_json(
+            repo,
+            f"issues/{pr_number}/comments",
+            gh_command=gh_command,
+            list_response=True,
+        ),
+    }
+    for key, value in context.items():
+        if not isinstance(value, list):
+            raise RuntimeError(f"gh api returned non-list {key}")
+    return context
+
+
 def safe_slug(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value).strip("-._")
     return slug[:120] or "github-pr"
@@ -490,8 +559,10 @@ def build_pr_amend_intake_artifact(
     policy: GitHubPrAmendPolicy,
     pr_info: dict[str, Any],
     payload: dict[str, Any],
+    fetched_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     now = _utc_now_iso()
+    fetched_context = fetched_context or {}
     return {
         "artifact_version": 1,
         "created_at": now,
@@ -525,9 +596,9 @@ def build_pr_amend_intake_artifact(
         "source": _source_info(payload, request),
         "fetched_context": {
             "pull_request": pr_info,
-            "reviews": [],
-            "review_comments": [],
-            "issue_comments": [],
+            "reviews": fetched_context.get("reviews") or [],
+            "review_comments": fetched_context.get("review_comments") or [],
+            "issue_comments": fetched_context.get("issue_comments") or [],
         },
         "normalized_payload": _safe_payload_subset(payload),
         "policy_decision": {
@@ -596,6 +667,11 @@ def build_pr_amend_discord_card(
     sender = str(_dig(artifact, "sender", "login", default=""))
     body = str(_dig(artifact, "source", "body", default=""))
     instructions = str(artifact.get("operational_instructions") or "")
+    head_repo = str(_dig(artifact, "pull_request", "head", "repo", default=""))
+    head_ref = str(_dig(artifact, "pull_request", "head", "ref", default=""))
+    head_sha = str(_dig(artifact, "pull_request", "head", "sha", default=""))
+    base_repo = str(_dig(artifact, "pull_request", "base", "repo", default=""))
+    base_ref = str(_dig(artifact, "pull_request", "base", "ref", default=""))
     title = f"GitHub PR amend: {repo}#{pr_number}"
     summary = f"{sender} requested an amendment on `{repo}` PR #{pr_number}: {pr_title}"
     request_body = "\n\n".join(
@@ -633,6 +709,29 @@ def build_pr_amend_discord_card(
             "repo": repo,
             "pr_number": pr_number,
             "source_url": source_url,
+            "base_repo": base_repo,
+            "base_ref": base_ref,
+            "head_repo": head_repo,
+            "head_ref": head_ref,
+            "head_sha": head_sha,
+            "lock_key": str(_dig(artifact, "policy_decision", "lock_key", default="")),
+        },
+        "project_context": {
+            "github_pr_target_repo": head_repo,
+            "github_pr_target_url": f"https://github.com/{head_repo}.git" if head_repo else "",
+            "base_branch": head_ref,
+            "github_pr_amend": {
+                "artifact_path": str(artifact_path),
+                "delivery_id": artifact.get("delivery_id"),
+                "upstream_repo": base_repo,
+                "upstream_pr_number": pr_number,
+                "upstream_pr_url": str(_dig(artifact, "pull_request", "html_url", default="")),
+                "upstream_base_ref": base_ref,
+                "head_repo": head_repo,
+                "head_ref": head_ref,
+                "head_sha": head_sha,
+                "source_url": source_url,
+            },
         },
         "created_by": "github-pr-amend",
         "dispatch_dirty_reason": "github-pr-amend-accepted",

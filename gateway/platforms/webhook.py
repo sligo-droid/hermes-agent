@@ -142,6 +142,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # events cannot race against the same ref while this gateway instance
         # is alive.
         self._github_pr_amend_locks: set[str] = set()
+        self._github_pr_amend_lock_boards: dict[str, str] = {}
 
         # Body size limit (auth-before-body pattern)
         self._max_body_bytes: int = int(
@@ -694,6 +695,41 @@ class WebhookAdapter(BasePlatformAdapter):
         mode = str(route_config.get("mode") or route_config.get("type") or "").strip().lower()
         return mode == "github_pr_amend" or bool(route_config.get("github_pr_amend"))
 
+    def _github_pr_amend_lock_is_active(self, lock_key: str) -> bool:
+        board = self._github_pr_amend_lock_boards.get(lock_key, "")
+        if not board:
+            return True
+        try:
+            from hermes_cli import kanban_db
+            from hermes_cli.discord_worker_roles import (
+                DISCORD_WORKER_META_KEY,
+                TERMINAL_GOAL_STATUSES,
+            )
+
+            metadata = kanban_db.read_board_metadata(board)
+            worker = metadata.get(DISCORD_WORKER_META_KEY)
+            worker = worker if isinstance(worker, dict) else {}
+            goal_status = str(worker.get("goal_status") or "").strip().lower()
+            phase = str(worker.get("phase") or "").strip().lower()
+            terminal = bool(
+                worker.get("cancelled")
+                or goal_status in TERMINAL_GOAL_STATUSES
+                or phase == "complete"
+            )
+        except Exception:
+            logger.debug(
+                "[github-pr-amend] treating unreadable lock board as active lock=%s board=%s",
+                lock_key,
+                board,
+                exc_info=True,
+            )
+            return True
+        if terminal:
+            self._github_pr_amend_locks.discard(lock_key)
+            self._github_pr_amend_lock_boards.pop(lock_key, None)
+            return False
+        return True
+
     async def _handle_github_pr_amend(
         self,
         *,
@@ -712,6 +748,7 @@ class WebhookAdapter(BasePlatformAdapter):
             evaluate_request,
             extract_request,
             fetch_pr_info,
+            fetch_pr_related_context,
             policy_from_route,
             preflight_request,
             publish_and_activate_pr_amend_intake,
@@ -805,7 +842,10 @@ class WebhookAdapter(BasePlatformAdapter):
                 status=200,
             )
 
-        if decision.lock_key in self._github_pr_amend_locks:
+        if (
+            decision.lock_key in self._github_pr_amend_locks
+            and self._github_pr_amend_lock_is_active(decision.lock_key)
+        ):
             logger.info(
                 "[github-pr-amend] branch already locked route=%s lock=%s delivery=%s",
                 route_name,
@@ -824,12 +864,18 @@ class WebhookAdapter(BasePlatformAdapter):
 
         self._github_pr_amend_locks.add(decision.lock_key)
         try:
+            fetched_context = await asyncio.to_thread(
+                fetch_pr_related_context,
+                request.repo,
+                request.pr_number,
+            )
             artifact = build_pr_amend_intake_artifact(
                 request,
                 decision,
                 policy,
                 pr_info,
                 payload,
+                fetched_context,
             )
             artifact_path = write_pr_amend_intake_artifact(artifact)
             channel_id = resolve_pr_amend_discord_channel(route_config, request)
@@ -843,8 +889,11 @@ class WebhookAdapter(BasePlatformAdapter):
                 card,
                 channel_id=channel_id,
             )
+            if not str(discord_metadata.get("discord_board") or "").strip():
+                raise RuntimeError("Discord activation did not return a worker board")
         except Exception:
             self._github_pr_amend_locks.discard(decision.lock_key)
+            self._github_pr_amend_lock_boards.pop(decision.lock_key, None)
             self._seen_deliveries.pop(delivery_id, None)
             logger.exception(
                 "[github-pr-amend] failed to queue worker-board intake route=%s delivery=%s",
@@ -871,8 +920,9 @@ class WebhookAdapter(BasePlatformAdapter):
             delivery_id,
             discord_metadata.get("discord_board"),
         )
-        self._github_pr_amend_locks.discard(decision.lock_key)
-        await self._safe_github_pr_amend_reaction(request, "+1")
+        self._github_pr_amend_lock_boards[decision.lock_key] = str(
+            discord_metadata.get("discord_board") or ""
+        )
         return web.json_response(
             {
                 "status": "queued",

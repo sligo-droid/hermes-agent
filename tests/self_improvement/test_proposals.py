@@ -120,6 +120,35 @@ def test_self_improvement_project_context_falls_back_to_channel_cwd(monkeypatch,
     }
 
 
+def test_project_context_preserves_explicit_card_context(monkeypatch, tmp_path):
+    project = tmp_path / "reserve-index-dtf"
+    project.mkdir()
+
+    monkeypatch.setattr(
+        discord_publish,
+        "load_config_readonly",
+        lambda: {"discord": {"channel_cwds": {"12345": str(project)}}},
+    )
+    monkeypatch.setattr(discord_publish, "_project_mapping_for_key", lambda _project: {})
+
+    context = discord_publish._project_context(
+        {
+            "project": "reserve-index-dtf",
+            "project_context": {
+                "github_pr_target_repo": "sligo-droid/reserve-index-dtf",
+                "base_branch": "feat/irrevocable-fee-recipients",
+                "github_pr_amend": {"head_sha": "19a1d0b"},
+            },
+        },
+        "12345",
+    )
+
+    assert context["project_path"] == str(project.resolve())
+    assert context["github_pr_target_repo"] == "sligo-droid/reserve-index-dtf"
+    assert context["base_branch"] == "feat/irrevocable-fee-recipients"
+    assert context["github_pr_amend"] == {"head_sha": "19a1d0b"}
+
+
 def test_self_improvement_project_context_uses_channel_cwd_when_mapping_has_no_path(monkeypatch, tmp_path):
     project = tmp_path / "hermes"
     project.mkdir()
