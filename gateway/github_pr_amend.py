@@ -45,6 +45,7 @@ class GitHubPrAmendRequest:
     source_url: str = ""
     review_state: str = ""
     review_id: str = ""
+    pr_author: str = ""
     path: str = ""
     line: int | None = None
     diff_hunk: str = ""
@@ -299,6 +300,7 @@ def extract_request(
             source_url=str(_dig(payload, "review", "html_url", default="") or ""),
             review_id=str(_dig(payload, "review", "id", default="") or ""),
             review_state=str(_dig(payload, "review", "state", default="") or ""),
+            pr_author=str(_dig(payload, "pull_request", "user", "login", default="") or ""),
             delivery_id=delivery_id,
         )
 
@@ -323,9 +325,6 @@ def preflight_request(
     if request.sender not in policy.allowed_senders:
         return f"sender '{request.sender}' is not allowlisted"
 
-    if policy.mention.lower() not in request.body.lower():
-        return f"missing mention {policy.mention}"
-
     if not _matches_repo_allowlist(request.repo, policy.allowed_base_repos):
         return f"base repo '{request.repo}' is not allowlisted"
 
@@ -334,7 +333,15 @@ def preflight_request(
         if request.pr_number not in allowed_numbers:
             return f"PR #{request.pr_number} is outside canary allowlist"
 
+    if policy.mention.lower() not in request.body.lower():
+        expected_pr_author = policy.mention.lstrip("@").lower()
+        if request.event_type != "pull_request_review":
+            return f"missing mention {policy.mention}"
+        if request.pr_author and request.pr_author.lower() != expected_pr_author:
+            return f"missing mention {policy.mention}; PR author '{request.pr_author}' is not {expected_pr_author}"
+
     return None
+
 
 
 def _repo_full_name_from_pr(pr_info: dict[str, Any], side: str) -> str:
@@ -362,6 +369,17 @@ def evaluate_request(
 
     if state and state != "open":
         return GitHubPrAmendDecision(False, f"PR is not open (state={state})")
+
+    if policy.mention.lower() not in request.body.lower():
+        expected_pr_author = policy.mention.lstrip("@").lower()
+        pr_author = str(_dig(pr_info, "user", "login", default="") or request.pr_author or "")
+        if request.event_type != "pull_request_review" or pr_author.lower() != expected_pr_author:
+            if request.event_type == "pull_request_review" and pr_author:
+                return GitHubPrAmendDecision(
+                    False,
+                    f"missing mention {policy.mention}; PR author '{pr_author}' is not {expected_pr_author}",
+                )
+            return GitHubPrAmendDecision(False, f"missing mention {policy.mention}")
 
     if not _matches_repo_allowlist(base_repo, policy.allowed_base_repos):
         return GitHubPrAmendDecision(False, f"base repo '{base_repo}' is not allowlisted")

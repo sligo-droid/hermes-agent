@@ -50,6 +50,7 @@ PR_INFO = {
     "html_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182",
     "title": "Add irrevocable fee recipients",
     "body": "PR body",
+    "user": {"login": "sligo-droid"},
     "head": {
         "ref": "feat/irrevocable-fee-recipients",
         "sha": "19a1d0b",
@@ -101,7 +102,7 @@ REVIEW_PAYLOAD = {
     "action": "submitted",
     "repository": {"full_name": "reserve-protocol/reserve-index-dtf"},
     "sender": {"login": "tbrent"},
-    "pull_request": {"number": 182},
+    "pull_request": {"number": 182, "user": {"login": "sligo-droid"}},
     "review": {
         "id": 4900001,
         "html_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#pullrequestreview-4900001",
@@ -234,6 +235,45 @@ class TestGitHubPrAmendPolicy:
         decision = evaluate_request(request, PR_INFO, GitHubPrAmendPolicy())
         assert decision.accepted is False
         assert "missing mention" in decision.reason
+
+    def test_accepts_missing_mention_review_on_sligo_droid_authored_pr(self):
+        payload = json.loads(json.dumps(REVIEW_PAYLOAD))
+        payload["review"]["body"] = "please address the requested changes."
+        request = extract_request("pull_request_review", payload)
+        decision = evaluate_request(request, PR_INFO, GitHubPrAmendPolicy())
+        assert decision.accepted is True
+
+    def test_defers_missing_mention_review_without_payload_author_to_pr_metadata(self):
+        payload = json.loads(json.dumps(REVIEW_PAYLOAD))
+        payload["pull_request"].pop("user")
+        payload["review"]["body"] = "please address the requested changes."
+        request = extract_request("pull_request_review", payload)
+        assert preflight_request(request, GitHubPrAmendPolicy()) is None
+        decision = evaluate_request(request, PR_INFO, GitHubPrAmendPolicy())
+        assert decision.accepted is True
+
+    def test_rejects_missing_mention_review_when_pr_metadata_author_is_not_sligo_droid(self):
+        payload = json.loads(json.dumps(REVIEW_PAYLOAD))
+        payload["pull_request"].pop("user")
+        payload["review"]["body"] = "please address the requested changes."
+        pr_info = json.loads(json.dumps(PR_INFO))
+        pr_info["user"]["login"] = "someone-else"
+        request = extract_request("pull_request_review", payload)
+        assert preflight_request(request, GitHubPrAmendPolicy()) is None
+        decision = evaluate_request(request, pr_info, GitHubPrAmendPolicy())
+        assert decision.accepted is False
+        assert decision.reason == (
+            "missing mention @sligo-droid; PR author 'someone-else' is not sligo-droid"
+        )
+
+    def test_rejects_missing_mention_review_on_non_sligo_droid_authored_pr(self):
+        payload = json.loads(json.dumps(REVIEW_PAYLOAD))
+        payload["pull_request"]["user"]["login"] = "someone-else"
+        payload["review"]["body"] = "please address the requested changes."
+        request = extract_request("pull_request_review", payload)
+        assert preflight_request(request, GitHubPrAmendPolicy()) == (
+            "missing mention @sligo-droid; PR author 'someone-else' is not sligo-droid"
+        )
 
     def test_rejects_unallowlisted_head_repo(self):
         pr_info = json.loads(json.dumps(PR_INFO))
@@ -472,6 +512,31 @@ class TestGitHubPrAmendWebhookRoute:
         adapter._add_github_pr_amend_reaction.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_issue_comment_missing_mention_is_ignored_before_pr_lookup(self):
+        payload = json.loads(json.dumps(ISSUE_COMMENT_PAYLOAD))
+        payload["comment"]["body"] = "please update the tests"
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        adapter._add_github_pr_amend_reaction = AsyncMock()
+
+        with patch("gateway.github_pr_amend.fetch_pr_info") as fetch_pr_info:
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                resp = await cli.post(
+                    "/webhooks/github-pr-amend",
+                    json=payload,
+                    headers={
+                        "X-GitHub-Event": "issue_comment",
+                        "X-GitHub-Delivery": "delivery-missing-mention",
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["status"] == "ignored"
+        assert "missing mention" in data["reason"]
+        fetch_pr_info.assert_not_called()
+        adapter._add_github_pr_amend_reaction.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_seen_reaction_failure_does_not_prevent_job_start(self, tmp_path):
         adapter = _make_adapter({"github-pr-amend": ROUTE})
         adapter._add_github_pr_amend_reaction = AsyncMock(side_effect=RuntimeError("gh down"))
@@ -573,6 +638,61 @@ class TestGitHubPrAmendWebhookRoute:
 
         assert resp.status == 202
         assert data["status"] == "queued"
+
+    @pytest.mark.asyncio
+    async def test_review_submitted_missing_mention_on_sligo_droid_authored_pr_is_accepted(self, tmp_path):
+        payload = json.loads(json.dumps(REVIEW_PAYLOAD))
+        payload["pull_request"].pop("user")
+        payload["review"]["body"] = "please address the requested changes."
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+
+        with patch("gateway.github_pr_amend.fetch_pr_info", return_value=PR_INFO), patch(
+            "gateway.github_pr_amend.fetch_pr_related_context", return_value=PR_RELATED_CONTEXT
+        ), patch(
+            "gateway.github_pr_amend.resolve_pr_amend_discord_channel", return_value="channel-123"
+        ), patch(
+            "gateway.github_pr_amend.publish_and_activate_pr_amend_intake",
+            return_value={"discord_board": "board", "discord_thread_id": "thread"},
+        ):
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                resp = await cli.post(
+                    "/webhooks/github-pr-amend",
+                    json=payload,
+                    headers={
+                        "X-GitHub-Event": "pull_request_review",
+                        "X-GitHub-Delivery": "delivery-review-implicit",
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 202
+        assert data["status"] == "queued"
+
+    @pytest.mark.asyncio
+    async def test_review_submitted_missing_mention_on_non_sligo_droid_authored_pr_is_ignored(self):
+        payload = json.loads(json.dumps(REVIEW_PAYLOAD))
+        payload["pull_request"]["user"]["login"] = "someone-else"
+        payload["review"]["body"] = "please address the requested changes."
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        adapter._add_github_pr_amend_reaction = AsyncMock()
+
+        with patch("gateway.github_pr_amend.fetch_pr_info") as fetch_pr_info:
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                resp = await cli.post(
+                    "/webhooks/github-pr-amend",
+                    json=payload,
+                    headers={
+                        "X-GitHub-Event": "pull_request_review",
+                        "X-GitHub-Delivery": "delivery-review-other-author",
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["status"] == "ignored"
+        assert "PR author 'someone-else' is not sligo-droid" in data["reason"]
+        fetch_pr_info.assert_not_called()
+        adapter._add_github_pr_amend_reaction.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_pr_fetch_failure_allows_github_retry_same_delivery(self, tmp_path):
