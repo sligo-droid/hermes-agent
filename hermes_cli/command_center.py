@@ -18,7 +18,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from hermes_constants import get_hermes_home
 from hermes_cli import kanban_db
@@ -33,6 +33,7 @@ COMMAND_CENTER_REPAIR_ASSIGNEE = "foreman"
 COMMAND_CENTER_REPAIR_ACTIVE_STATUSES = {"triage", "todo", "ready", "running", "review", "blocked", "scheduled"}
 
 _TERMINAL_TASK_STATUSES = {"done", "archived"}
+_TERMINAL_SUCCESS_STATUSES = {"done", "shipped", "complete", "completed"}
 _WAITING_TASK_STATUSES = {"triage", "todo", "scheduled", "ready"}
 _RUNNING_TASK_STATUSES = {"running"}
 _REVIEW_TASK_STATUSES = {"review"}
@@ -526,6 +527,8 @@ def _canonical_status_from_board(
 
 def _canonical_status_from_proposal(card: dict[str, Any], task: dict[str, Any] | None) -> tuple[str, str]:
     status = str(card.get("status") or "").lower()
+    if status == "completed":
+        return "shipped", status
     if status == "archived" or (card.get("archived_at") and status != "rejected"):
         return "archived", status or "archived"
     if status == "rejected":
@@ -566,6 +569,122 @@ def _latest_self_improvement_board(proposal_id: str) -> str:
     metadata = _latest_self_improvement_metadata(proposal_id)
     board = metadata.get("board") or metadata.get("discord_board")
     return str(board or kanban_db.DEFAULT_BOARD)
+
+
+def _board_from_worker_url(worker_url: Any) -> str | None:
+    text = str(worker_url or "").strip()
+    if not text:
+        return None
+    path = urlsplit(text).path.rstrip("/")
+    parts = [part for part in path.split("/") if part]
+    if len(parts) >= 2 and parts[0] == "workers":
+        return unquote(parts[1])
+    return None
+
+
+def _task_from_worker_url(worker_url: Any) -> str | None:
+    text = str(worker_url or "").strip()
+    if not text:
+        return None
+    parsed = urlsplit(text)
+    path = parsed.path.rstrip("/")
+    parts = [part for part in path.split("/") if part]
+    if len(parts) >= 4 and parts[0] == "workers" and parts[2] == "tickets":
+        return unquote(parts[3])
+    query_task = parse_qs(parsed.query).get("task") or []
+    return str(query_task[0]).strip() if query_task else None
+
+
+def _proposal_board_candidates(card: dict[str, Any], metadata: dict[str, Any], *, include_default: bool = True) -> list[str]:
+    candidates: list[str] = []
+    for value in (
+        metadata.get("board"),
+        metadata.get("discord_board"),
+        _board_from_worker_url(metadata.get("discord_board_public_url")),
+        _board_from_worker_url(metadata.get("board_public_url")),
+        _board_from_worker_url(metadata.get("worker_url")),
+        _board_from_worker_url(card.get("worker_url")),
+    ):
+        text = str(value or "").strip()
+        if text and text not in candidates:
+            candidates.append(text)
+    if include_default and kanban_db.DEFAULT_BOARD not in candidates:
+        candidates.append(kanban_db.DEFAULT_BOARD)
+    return candidates
+
+
+def _proposal_task_id(card: dict[str, Any]) -> str:
+    return str(card.get("kanban_task_id") or "").strip() or str(
+        _task_from_worker_url(card.get("worker_url")) or ""
+    ).strip()
+
+
+def _task_from_board_db(task_id: str, *, board: str, db_path: Path) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    conn = kanban_db.connect(db_path=db_path)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        task_dict = _task_to_dict(task) if task else None
+        if task_dict:
+            task_dict["latest_summary"] = kanban_db.latest_summary(conn, task_id)
+        return task_dict, _task_runs(conn, task_id, board=board)
+    finally:
+        conn.close()
+
+
+def _proposal_terminal_metadata(
+    card: dict[str, Any],
+    *,
+    task: dict[str, Any] | None,
+    board: str | None,
+    board_meta: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    task_id = _proposal_task_id(card)
+    if task_id and task and str(task.get("status") or "").lower() == "done":
+        return {
+            "proposal_id": card.get("proposal_id"),
+            "kanban_task_id": task_id,
+            "board": board or kanban_db.DEFAULT_BOARD,
+            "board_db_path": (board_meta or {}).get("db_path"),
+            "archive_path": (board_meta or {}).get("archive_path") or (board_meta or {}).get("archived_path"),
+            "observed_terminal_status": "done",
+            "evidence_kind": "kanban_task",
+        }
+    worker = _board_worker_meta(board_meta or {})
+    goal_status = str(worker.get("goal_status") or "").lower()
+    phase = str(worker.get("phase") or "").lower()
+    observed = goal_status if goal_status in _TERMINAL_SUCCESS_STATUSES else phase if phase in _TERMINAL_SUCCESS_STATUSES else ""
+    if board and observed:
+        return {
+            "proposal_id": card.get("proposal_id"),
+            "kanban_task_id": task_id or None,
+            "board": board,
+            "board_db_path": (board_meta or {}).get("db_path"),
+            "archive_path": (board_meta or {}).get("archive_path") or (board_meta or {}).get("archived_path"),
+            "observed_terminal_status": observed,
+            "evidence_kind": "worker_board",
+        }
+    return None
+
+
+def _reconcile_terminal_proposal(
+    card: dict[str, Any],
+    *,
+    task: dict[str, Any] | None,
+    board: str | None,
+    board_meta: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if str(card.get("status") or "").lower() != "approved":
+        return card
+    metadata = _proposal_terminal_metadata(card, task=task, board=board, board_meta=board_meta)
+    if not metadata:
+        return card
+    return proposal_storage.record_completion(
+        str(card.get("proposal_id") or ""),
+        actor="command-center-reconciliation",
+        reason="mapped Kanban worker reached terminal success",
+        kanban_task_id=_proposal_task_id(card) or None,
+        metadata=metadata,
+    )
 
 
 def _task_to_dict(task: kanban_db.Task) -> dict[str, Any]:
@@ -1002,26 +1121,48 @@ def _all_proposal_cards(*, include_archived: bool) -> list[dict[str, Any]]:
 def _load_task_for_proposal(
     card: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str | None, dict[str, Any] | None]:
-    task_id = str(card.get("kanban_task_id") or "").strip()
-    if not task_id:
+    task_id = _proposal_task_id(card)
+    proposal_id = str(card.get("proposal_id") or "")
+    metadata = _latest_self_improvement_metadata(proposal_id)
+    board_candidates = _proposal_board_candidates(card, metadata, include_default=bool(task_id))
+    if not task_id and not board_candidates:
         return None, [], None, None
-    board = _latest_self_improvement_board(str(card.get("proposal_id") or ""))
-    if board != kanban_db.DEFAULT_BOARD and not kanban_db.board_exists(board):
-        return None, [], board, kanban_db.read_board_metadata(board)
-    try:
-        kanban_db.init_db(board=board)
-        conn = kanban_db.connect(board=board)
-    except Exception:
-        return None, [], board, None
-    try:
-        task = kanban_db.get_task(conn, task_id)
-        task_dict = _task_to_dict(task) if task else None
-        if task_dict:
-            task_dict["latest_summary"] = kanban_db.latest_summary(conn, task_id)
-        runs = _task_runs(conn, task_id, board=board)
-        return task_dict, runs, board, kanban_db.read_board_metadata(board)
-    finally:
-        conn.close()
+    board_metas = kanban_db.list_boards(include_archived=True)
+    by_slug: dict[str, list[dict[str, Any]]] = {}
+    for board_meta in [*board_metas, *[meta for entries in _archived_boards_by_slug().values() for meta in entries]]:
+        slug = str(board_meta.get("slug") or "").strip()
+        if slug:
+            by_slug.setdefault(slug, []).append(board_meta)
+    fallback: tuple[dict[str, Any] | None, list[dict[str, Any]], str | None, dict[str, Any] | None] | None = None
+    for board in board_candidates:
+        metas = by_slug.get(board)
+        if not metas:
+            if board != kanban_db.DEFAULT_BOARD and not kanban_db.board_exists(board):
+                fallback = fallback or (None, [], board, kanban_db.read_board_metadata(board))
+                continue
+            metas = [kanban_db.read_board_metadata(board)]
+        for board_meta in metas:
+            if not task_id:
+                return None, [], board, board_meta
+            db_path_value = board_meta.get("db_path")
+            try:
+                if board_meta.get("archived") or board_meta.get("archive_path") or board_meta.get("archived_path"):
+                    if not db_path_value:
+                        continue
+                    db_path = Path(str(db_path_value))
+                    if not db_path.exists():
+                        continue
+                    task, runs = _task_from_board_db(task_id, board=board, db_path=db_path)
+                else:
+                    kanban_db.init_db(board=board)
+                    task, runs = _task_from_board_db(task_id, board=board, db_path=kanban_db.kanban_db_path(board))
+            except Exception:
+                fallback = fallback or (None, [], board, None)
+                continue
+            if task:
+                return task, runs, board, board_meta
+            fallback = fallback or (None, runs, board, board_meta)
+    return fallback or (None, [], board_candidates[0] if board_candidates else None, None)
 
 
 def _source_from_proposal_run(run: dict[str, Any]) -> dict[str, Any]:
@@ -1033,10 +1174,7 @@ def _source_from_proposal_run(run: dict[str, Any]) -> dict[str, Any]:
         "label": "Self-improvement cron run",
         "title": f"{run.get('project') or 'unknown'} / {run.get('prong') or 'unknown'}",
         "status": status,
-        # Proposal-run parse failures are source diagnostics, not actionable Work
-        # Items. Keep them visible in the source/runs diagnostics without adding
-        # noise to the decision inbox.
-        "bucket": "sources",
+        "bucket": "inbox" if status == "parse_failed" else "sources",
         "created_at": run.get("created_at") or run.get("generated_at") or run.get("ingested_at"),
         "updated_at": run.get("updated_at"),
         "ref": {
@@ -1122,6 +1260,7 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
 
     for card in _all_proposal_cards(include_archived=include_archived):
         task, task_runs, board, board_meta = _load_task_for_proposal(card)
+        card = _reconcile_terminal_proposal(card, task=task, board=board, board_meta=board_meta)
         metadata = _latest_self_improvement_metadata(str(card.get("proposal_id") or ""))
         item = _proposal_work_item(
             card,

@@ -396,6 +396,38 @@ def test_reingesting_approved_card_preserves_review_state(tmp_path, monkeypatch)
     assert summary["projects"][0]["prongs"][0]["accepted"][0]["kanban_task_id"] == "t_approved"
 
 
+def test_completed_cards_are_hidden_from_active_grouping_and_feedback_suppression(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    payload = _valid_payload()
+    template = payload["cards"][0]
+    payload["cards"] = []
+    for idx in range(2):
+        card = dict(template)
+        card["idempotency_key"] = f"completed-feedback-card-{idx}"
+        card["title"] = f"Feedback card {idx}"
+        payload["cards"].append(card)
+    proposal_storage.ingest_proposal_output(json.dumps(payload))
+    completed_card, active_card = proposal_storage.list_cards()["cards"]
+    proposal_storage.record_approval(completed_card["proposal_id"], kanban_task_id="t_done", worker_url="/workers/done")
+    proposal_storage.record_approval(active_card["proposal_id"], kanban_task_id="t_active", worker_url="/workers/active")
+
+    completed = proposal_storage.record_completion(
+        completed_card["proposal_id"],
+        actor="test",
+        reason="done task",
+        metadata={"board": "discord-done", "observed_terminal_status": "done"},
+    )
+    again = proposal_storage.record_completion(completed_card["proposal_id"], actor="test")
+
+    assert completed["status"] == "completed"
+    assert again["updated_at"] == completed["updated_at"]
+    grouped_cards = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"]
+    assert [card["proposal_id"] for card in grouped_cards] == [active_card["proposal_id"]]
+    summary = proposal_storage.summarize_feedback_history(project="pid", prong="airflow_scraper_doctor")
+    assert [item["kanban_task_id"] for item in summary["projects"][0]["prongs"][0]["accepted"]] == ["t_active"]
+    assert [event["action"] for event in proposal_storage.list_audit_events(completed_card["proposal_id"])] == ["approved", "completed"]
+
+
 def test_reingesting_rejected_card_preserves_review_state_and_hidden_grouping(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     source = _fenced("proposal_run_pid_valid.json")

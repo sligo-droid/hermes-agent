@@ -1207,6 +1207,11 @@ def _self_improvement_card_with_downstream(card: dict[str, Any] | None) -> dict[
 
 
 def _self_improvement_grouped_with_downstream() -> dict[str, Any]:
+    from hermes_cli import command_center
+
+    # Keep proposal endpoint reads in sync with the Command Center lifecycle
+    # projection so terminal worker evidence is reflected outside snapshots too.
+    command_center.build_command_center_snapshot()
     grouped = proposal_storage.grouped_cards()
     for project in grouped.get("projects", []):
         for prong in project.get("prongs", []):

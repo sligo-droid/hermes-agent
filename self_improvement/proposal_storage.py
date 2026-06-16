@@ -594,6 +594,7 @@ def list_cards(
             where.append("c.status != 'rejected'")
         if not include_archived:
             where.append("c.archived_at IS NULL")
+            where.append("c.status != 'completed'")
         where_sql = f"WHERE {' AND '.join(where)}" if where else ""
         rows = conn.execute(
             f"""
@@ -738,6 +739,58 @@ def record_archive(
                 VALUES (?, 'archived', ?, ?, ?)
                 """,
                 (proposal_id, actor, _json_dumps(metadata or {}), now),
+            )
+        card = get_card(proposal_id, db_path=db_path)
+        assert card is not None
+        return card
+    finally:
+        conn.close()
+
+
+def record_completion(
+    proposal_id: str,
+    *,
+    actor: str | None = None,
+    reason: str | None = None,
+    kanban_task_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    """Mark an approved proposal as terminally completed.
+
+    The operation is intentionally idempotent so Command Center reads and
+    maintenance backfills can share the same reconciliation path without
+    duplicating audit events or churning ``updated_at`` after completion.
+    """
+
+    init_db(db_path)
+    now = utc_now()
+    conn = connect(db_path)
+    try:
+        with conn:
+            row = conn.execute("SELECT * FROM proposal_cards WHERE proposal_id = ?", (proposal_id,)).fetchone()
+            if not row:
+                raise KeyError(proposal_id)
+            status = str(row["status"] or "").lower()
+            if status == "completed":
+                return _row_to_card(row)
+            if status != "approved":
+                return _row_to_card(row)
+            effective_task_id = kanban_task_id or row["kanban_task_id"] or None
+            conn.execute(
+                """
+                UPDATE proposal_cards
+                SET status = 'completed', rejected_reason = NULL, updated_at = ?
+                WHERE proposal_id = ?
+                """,
+                (now, proposal_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO proposal_audit_events(proposal_id, action, actor, kanban_task_id, reason, metadata_json, created_at)
+                VALUES (?, 'completed', ?, ?, ?, ?, ?)
+                """,
+                (proposal_id, actor, effective_task_id, reason, _json_dumps(metadata or {}), now),
             )
         card = get_card(proposal_id, db_path=db_path)
         assert card is not None
