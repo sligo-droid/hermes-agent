@@ -25,6 +25,7 @@ import os
 import signal
 import sys
 import tempfile
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import pytest
@@ -313,6 +314,32 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 })
 
 
+_HERMES_LOG_FILENAMES = {"agent.log", "errors.log", "gateway.log"}
+
+
+def _remove_stale_hermes_log_handlers(active_hermes_home: Path) -> None:
+    """Close Hermes file handlers that target any non-current HERMES_HOME."""
+    active_log_dir = (active_hermes_home / "logs").resolve()
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        if not isinstance(handler, RotatingFileHandler):
+            continue
+        try:
+            handler_path = Path(handler.baseFilename).resolve()
+        except (TypeError, ValueError):
+            continue
+        if handler_path.name not in _HERMES_LOG_FILENAMES:
+            continue
+        if handler_path.parent == active_log_dir:
+            continue
+        root.removeHandler(handler)
+        handler.close()
+
+    hermes_logging_mod = sys.modules.get("hermes_logging")
+    if hermes_logging_mod is not None:
+        setattr(hermes_logging_mod, "_logging_initialized", False)
+
+
 @pytest.fixture(autouse=True)
 def _hermetic_environment(tmp_path, monkeypatch):
     """Blank out all credential/behavioral env vars so local and CI match.
@@ -347,6 +374,7 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+    _remove_stale_hermes_log_handlers(fake_hermes_home)
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.

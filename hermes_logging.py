@@ -471,11 +471,24 @@ def _add_rotating_handler(
 
 
 def _remove_managed_rotating_handlers(logger: logging.Logger) -> None:
-    """Remove Hermes-managed file handlers before forced reconfiguration."""
+    """Remove Hermes log file handlers before forced reconfiguration.
+
+    Older tests and startup paths can leave a plain stdlib RotatingFileHandler
+    pointed at a previous Hermes home.  A forced reconfiguration must close
+    those too, otherwise warnings continue writing to the stale path.
+    """
     for handler in list(logger.handlers):
-        if isinstance(handler, _ManagedRotatingFileHandler):
+        if isinstance(handler, RotatingFileHandler) and _is_hermes_log_handler(handler):
             logger.removeHandler(handler)
             handler.close()
+
+
+def _is_hermes_log_handler(handler: RotatingFileHandler) -> bool:
+    """Return True for handlers targeting Hermes-managed log files."""
+    try:
+        return Path(handler.baseFilename).name in {"agent.log", "errors.log", "gateway.log"}
+    except (TypeError, ValueError):
+        return isinstance(handler, _ManagedRotatingFileHandler)
 
 
 def _read_logging_config():

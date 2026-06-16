@@ -4,6 +4,7 @@ import logging
 import os
 import stat
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from unittest.mock import patch
@@ -11,6 +12,7 @@ from unittest.mock import patch
 import pytest
 
 import hermes_logging
+from tests import conftest as test_conftest
 
 
 @pytest.fixture(autouse=True)
@@ -139,6 +141,44 @@ class TestSetupLogging:
         assert all(
             Path(h.baseFilename).resolve().is_relative_to((new_home / "logs").resolve())
             for h in root_handlers
+        )
+
+    def test_pytest_isolation_closes_plain_stale_live_profile_errors_handler(self, hermes_home):
+        live_errors = Path("/home/droid/.hermes/logs/errors.log")
+        marker = "gateway kanban pytest-isolation stale-handler regression marker"
+        if not live_errors.exists():
+            pytest.skip(f"live default-profile errors.log does not exist: {live_errors}")
+
+        isolated_home = hermes_home
+        hermes_logging.setup_logging(hermes_home=isolated_home, mode="gateway", force=True)
+        before_count = live_errors.read_text(errors="ignore").count(marker)
+        before = (live_errors.stat().st_mtime_ns, live_errors.stat().st_size)
+        time.sleep(0.001)
+
+        plain_live_handler = RotatingFileHandler(
+            live_errors,
+            maxBytes=2 * 1024 * 1024,
+            backupCount=2,
+            encoding="utf-8",
+        )
+        plain_live_handler.setLevel(logging.WARNING)
+        logging.getLogger().addHandler(plain_live_handler)
+
+        test_conftest._remove_stale_hermes_log_handlers(isolated_home)
+        logging.getLogger("gateway.kanban.notifier").warning(marker)
+
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+
+        temp_errors = isolated_home / "logs" / "errors.log"
+        assert marker in temp_errors.read_text()
+        assert live_errors.read_text(errors="ignore").count(marker) == before_count
+        assert (live_errors.stat().st_mtime_ns, live_errors.stat().st_size) == before
+        assert all(
+            Path(h.baseFilename).resolve().parent == (isolated_home / "logs").resolve()
+            for h in logging.getLogger().handlers
+            if isinstance(h, RotatingFileHandler)
+            and Path(h.baseFilename).name in {"agent.log", "errors.log", "gateway.log"}
         )
 
     def test_custom_log_level(self, hermes_home):
