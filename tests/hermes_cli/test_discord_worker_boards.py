@@ -284,6 +284,76 @@ def test_ensure_code_island_for_board_runs_deferred_setup(monkeypatch, tmp_path)
     assert worker["code_island_pending"] is False
 
 
+def test_ensure_code_island_logs_ready_transition_at_info(monkeypatch, tmp_path, caplog):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    board = dwb.ensure_discord_thread_board(
+        thread_id="12347b",
+        initial_request="/goal Ship it",
+        project_context={"project_path": str(project)},
+    )
+
+    def fake_ensure(worker):
+        worker["code_island_ready"] = True
+        worker["code_island_pending"] = False
+
+    monkeypatch.setattr(dwb, "_ensure_code_island", fake_ensure)
+
+    with caplog.at_level("INFO", logger="hermes_cli.discord_worker_boards"):
+        assert dwb.ensure_code_island_for_board(board.slug) is True
+
+    assert f"discord_worker_code_island board={board.slug}" in caplog.text
+    assert "ready=True" in caplog.text
+
+
+def test_ensure_code_island_keeps_unchanged_healthy_check_below_info(monkeypatch, tmp_path, caplog):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    board = dwb.set_goal(
+        thread_id="12347c",
+        goal="Ship it",
+        project_context={"project_path": str(project)},
+    )
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "code_island_ready": True,
+            "code_island_pending": False,
+            "worktree_path": str(tmp_path / "worktree"),
+        },
+    )
+
+    def fake_ensure(worker):
+        worker["code_island_ready"] = True
+        worker["code_island_pending"] = False
+
+    monkeypatch.setattr(dwb, "_ensure_code_island", fake_ensure)
+
+    with caplog.at_level("INFO", logger="hermes_cli.discord_worker_boards"):
+        assert dwb.ensure_code_island_for_board(board.slug) is True
+
+    assert f"discord_worker_code_island board={board.slug}" not in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("DEBUG", logger="hermes_cli.discord_worker_boards"):
+        assert dwb.ensure_code_island_for_board(board.slug) is True
+
+    debug_records = [
+        record
+        for record in caplog.records
+        if record.levelname == "DEBUG"
+        and record.message.startswith(f"discord_worker_code_island board={board.slug}")
+    ]
+    assert len(debug_records) == 1
+    assert "ready=True" in debug_records[0].message
+
+
 def test_ensure_code_island_blocks_active_board_without_project_mapping(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -390,8 +460,44 @@ def test_ensure_code_island_suppresses_terminal_stale_error_health(monkeypatch, 
     assert worker["phase"] == "complete"
     assert worker["code_island_error"] == "stale historical checkout failure"
     assert "blocked_reason" not in worker
-    assert f"discord_worker_code_island board={board.slug}" in caplog.text
-    assert "error=False" in caplog.text
+    assert f"discord_worker_code_island board={board.slug}" not in caplog.text
+
+
+def test_ensure_code_island_many_healthy_boards_emit_bounded_info(monkeypatch, tmp_path, caplog):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    boards = []
+    for index in range(12):
+        board = dwb.set_goal(
+            thread_id=f"12360{index}",
+            goal="Ship it",
+            project_context={"project_path": str(project)},
+        )
+        dwb._update_worker_meta(
+            board.slug,
+            {
+                "code_island_ready": True,
+                "code_island_pending": False,
+                "worktree_path": str(tmp_path / f"worktree-{index}"),
+            },
+        )
+        boards.append(board.slug)
+
+    def fake_ensure(worker):
+        worker["code_island_ready"] = True
+        worker["code_island_pending"] = False
+
+    monkeypatch.setattr(dwb, "_ensure_code_island", fake_ensure)
+
+    with caplog.at_level("INFO", logger="hermes_cli.discord_worker_boards"):
+        results = [dwb.ensure_code_island_for_board(board) for board in boards]
+
+    info_records = [record for record in caplog.records if record.message.startswith("discord_worker_code_island")]
+    assert results == [True] * len(boards)
+    assert len(info_records) == 0
 
 
 def test_prepare_existing_code_island_quarantines_plans_before_recreate(monkeypatch, tmp_path):
