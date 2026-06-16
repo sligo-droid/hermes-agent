@@ -340,6 +340,19 @@ def test_ensure_code_island_keeps_unchanged_healthy_check_below_info(monkeypatch
 
     assert f"discord_worker_code_island board={board.slug}" not in caplog.text
 
+    caplog.clear()
+    with caplog.at_level("DEBUG", logger="hermes_cli.discord_worker_boards"):
+        assert dwb.ensure_code_island_for_board(board.slug) is True
+
+    debug_records = [
+        record
+        for record in caplog.records
+        if record.levelname == "DEBUG"
+        and record.message.startswith(f"discord_worker_code_island board={board.slug}")
+    ]
+    assert len(debug_records) == 1
+    assert "ready=True" in debug_records[0].message
+
 
 def test_ensure_code_island_blocks_active_board_without_project_mapping(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
