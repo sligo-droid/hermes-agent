@@ -58,7 +58,7 @@ Every use case in their blog post — backlog triage, docs drift, deploy verific
 | **Skill chaining** | ❌ | ✅ Load multiple skills per automation |
 | **Daily limit** | 5-25 runs/day | **Unlimited** |
 | **Model choice** | Claude only | **Any model** — Claude, GPT, Gemini, DeepSeek, Qwen, local |
-| **Delivery targets** | GitHub comments | Telegram, Discord, Slack, SMS, email, GitHub comments, webhooks, local files |
+| **Delivery targets** | GitHub comments | Telegram, Discord, Slack, SMS, email, logs, webhooks, local files |
 | **Infrastructure** | Anthropic's servers | **Your infrastructure** — VPS, home server, laptop |
 | **Data residency** | Anthropic's cloud | **Your machines** |
 | **Cost** | Pro/Max/Team/Enterprise subscription | Your API key, your rates |
@@ -146,7 +146,8 @@ hermes webhook subscribe pr-review \
   --events "pull_request" \
   --prompt "Review PR #{pull_request.number}: {pull_request.title}" \
   --skills "github-code-review" \
-  --deliver github_comment
+  --deliver telegram \
+  --deliver-chat-id "-100123456789"
 ```
 
 Full automation templates gallery: [hermes-agent.nousresearch.com/docs/guides/automation-templates](https://hermes-agent.nousresearch.com/docs/guides/automation-templates)

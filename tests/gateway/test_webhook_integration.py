@@ -4,7 +4,7 @@ These tests exercise end-to-end flows through the webhook adapter:
 1. GitHub PR webhook → agent MessageEvent created
 2. Skills config injects skill content into the prompt
 3. Cross-platform delivery routes to a mock Telegram adapter
-4. GitHub comment delivery invokes ``gh`` CLI (mocked subprocess)
+4. GitHub comment delivery fails closed without invoking ``gh``
 """
 
 import asyncio
@@ -264,15 +264,14 @@ class TestCrossPlatformDelivery:
 
 
 # ===================================================================
-# Test 4: GitHub comment delivery via gh CLI
+# Test 4: Disabled GitHub comment delivery
 # ===================================================================
 
 class TestGitHubCommentDelivery:
 
     @pytest.mark.asyncio
     async def test_github_comment_delivery(self):
-        """When deliver='github_comment', the adapter invokes
-        ``gh pr comment`` via subprocess.run (mocked)."""
+        """deliver='github_comment' fails closed without running gh."""
         routes = {
             "pr-bot": {
                 "secret": _INSECURE_NO_AUTH,
@@ -308,31 +307,14 @@ class TestGitHubCommentDelivery:
         assert delivery["deliver_extra"]["repo"] == "org/repo"
         assert delivery["deliver_extra"]["pr_number"] == "42"
 
-        # Mock subprocess.run and call send()
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = "Comment posted"
-        mock_result.stderr = ""
-
-        with patch(
-            "gateway.platforms.webhook.subprocess.run",
-            return_value=mock_result,
-        ) as mock_run:
+        with patch("gateway.platforms.webhook.subprocess.run") as mock_run:
             result = await adapter.send(
                 chat_id, "LGTM! The code looks great."
             )
 
-        assert result.success is True
-        mock_run.assert_called_once_with(
-            [
-                "gh", "pr", "comment", "42",
-                "--repo", "org/repo",
-                "--body", "LGTM! The code looks great.",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        assert result.success is False
+        assert "github_comment delivery is disabled" in result.error
+        mock_run.assert_not_called()
         # Delivery info is retained after send() so interim status messages
         # don't strand the final response (TTL-based cleanup happens on POST).
         assert chat_id in adapter._delivery_info

@@ -11406,7 +11406,7 @@ class GatewayRunner:
             )
         
         # One-time prompt if no home channel is set for this platform
-        # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
+        # Skip for webhooks - they deliver directly to configured targets.
         if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)

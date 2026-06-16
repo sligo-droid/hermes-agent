@@ -82,8 +82,8 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `secret` | **Yes** | HMAC secret for signature validation. Falls back to the global `secret` if not set on the route. Set to `"INSECURE_NO_AUTH"` for testing only (skips validation). |
 | `prompt` | No | Template string with dot-notation payload access (e.g. `{pull_request.title}`). If omitted, the full JSON payload is dumped into the prompt. |
 | `skills` | No | List of skill names to load for the agent run. |
-| `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
-| `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
+| `deliver` | No | Where to send the response: `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
+| `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
 | `deliver_only` | No | If `true`, skip the agent entirely — the rendered `prompt` template becomes the literal message that gets delivered. Zero LLM cost, sub-second delivery. See [Direct Delivery Mode](#direct-delivery-mode) for use cases. Requires `deliver` to be a real target (not `log`). |
 
 ### Full example
@@ -108,10 +108,7 @@ platforms:
             Diff URL: {pull_request.diff_url}
             Action: {action}
           skills: ["github-code-review"]
-          deliver: "github_comment"
-          deliver_extra:
-            repo: "{repository.full_name}"
-            pr_number: "{number}"
+          deliver: "log"
         deploy-notify:
           events: ["push"]
           secret: "deploy-secret"
@@ -176,17 +173,9 @@ This walkthrough sets up automatic code review on every pull request.
 
 Add the `github-pr` route to your `~/.hermes/config.yaml` as shown in the example above.
 
-### 3. Ensure `gh` CLI is authenticated
+### 3. Test it
 
-The `github_comment` delivery type uses the GitHub CLI to post comments:
-
-```bash
-gh auth login
-```
-
-### 4. Test it
-
-Open a pull request on the repository. The webhook fires, Hermes processes the event, and posts a review comment on the PR.
+Open a pull request on the repository. The webhook fires, Hermes processes the event, and writes the response to the gateway log.
 
 ---
 
@@ -232,7 +221,6 @@ The `deliver` field controls where the agent's response goes after processing th
 | Deliver Type | Description |
 |-------------|-------------|
 | `log` | Logs the response to the gateway log output. This is the default and is useful for testing. |
-| `github_comment` | Posts the response as a PR/issue comment via the `gh` CLI. Requires `deliver_extra.repo` and `deliver_extra.pr_number`. The `gh` CLI must be installed and authenticated on the gateway host (`gh auth login`). |
 | `telegram` | Routes the response to Telegram. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
 | `discord` | Routes the response to Discord. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
 | `slack` | Routes the response to Slack. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
@@ -467,11 +455,9 @@ Webhook payloads contain attacker-controlled data — PR titles, commit messages
 - The idempotency cache should prevent this — check that the webhook source is sending a delivery ID header (`X-GitHub-Delivery` or `X-Request-ID`)
 - Delivery IDs are cached for 1 hour
 
-### `gh` CLI errors (GitHub comment delivery)
+### GitHub text-comment delivery
 
-- Run `gh auth login` on the gateway host
-- Ensure the authenticated GitHub user has write access to the repository
-- Check that `gh` is installed and on the PATH
+`deliver: github_comment` is disabled and fails closed. Hermes webhook routes should use `deliver: log` for local review output or a chat delivery target such as Telegram, Discord, or Slack.
 
 ---
 

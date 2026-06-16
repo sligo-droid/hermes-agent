@@ -636,8 +636,8 @@ class GatewayStreamConsumer:
                 # creates a fresh message below any tool-progress messages.
                 #
                 # Exception: when _message_id is "__no_edit__" the platform
-                # never returned a real message ID (e.g. Signal, webhook with
-                # github_comment delivery).  Resetting to None would re-enter
+                # never returned a real message ID (e.g. Signal or webhook
+                # delivery).  Resetting to None would re-enter
                 # the "first send" path on every tool boundary and post one
                 # platform message per tool call — that is what caused 155
                 # comments under a single PR.  Instead, preserve the sentinel
