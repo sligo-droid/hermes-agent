@@ -3829,6 +3829,39 @@ def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeyp
     assert meta["canonical_synced_at"]
 
 
+def test_ensure_pr_create_uses_concise_title_and_body(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+
+    giant_goal = (
+        "Goal: implement concise PR copy.\n"
+        "Acceptance criteria:\n- preserve this long list in Kanban only\n"
+        "Rollback plan:\n- keep this section out of GitHub copy\n"
+        + "full task body details " * 80
+    )
+    title, body = worker._build_worker_pr_copy(
+        {
+            "public_url": "https://dashboard.example.test/boards/concise-pr",
+            "root_goal": giant_goal,
+            "summary": "Implemented short PR copy from worker metadata.",
+            "changed_files": ["agent/prompt_builder.py", "hermes_cli/kanban_codex_worker.py"],
+            "tests": [{"command": "scripts/run_tests.sh tests/tools/test_kanban_tools.py", "result": "passed"}],
+        },
+        board="discord-concise-pr",
+    )
+    assert "\n" not in title
+    assert len(title) <= 80
+    assert title == "Discord worker: implement concise PR copy."
+    assert "Acceptance criteria" not in title
+    assert "Rollback" not in title
+    assert body.startswith("Board: https://dashboard.example.test/boards/concise-pr\n\n")
+    assert "## Summary\n" in body
+    assert "## Verification\n" in body
+    assert "scripts/run_tests.sh tests/tools/test_kanban_tools.py passed" in body
+    assert "Acceptance criteria" not in body
+    assert "Risk/rollback" not in body
+    assert "full task body details" not in body
+
+
 def test_ensure_pr_syncs_already_merged_pr(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

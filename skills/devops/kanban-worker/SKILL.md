@@ -70,6 +70,27 @@ kanban_block(
 
 Use `kanban_complete` only when the task is genuinely terminal — e.g. a one-line typo fix, a docs change with no functional consequences, or a research task where the artifact IS the writeup itself.
 
+## GitHub PR copy
+
+Full task specs, acceptance criteria, and handoff evidence belong in Kanban task bodies, comments, and metadata. If your workflow opens a GitHub PR, keep the PR title/body short by default:
+
+- Title: one short human-readable line; do not copy the task body or include newline/truncation artifacts.
+- Body: start with `Board: <worker board URL if known>`, then `## Summary` with 2-4 bullets, then `## Verification` with actual commands/results.
+- Do not paste acceptance criteria, raw ticket text, risk/rollback sections, or large evidence paragraphs into the PR body.
+
+Example:
+
+```markdown
+Board: https://example.test/worker-board/demo
+
+## Summary
+- Added concise PR copy guidance for Kanban workers.
+- Kept full task detail in Kanban handoff metadata.
+
+## Verification
+- `scripts/run_tests.sh tests/tools/test_kanban_tools.py` passed.
+```
+
 **Research task:**
 ```python
 kanban_complete(
