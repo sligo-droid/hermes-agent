@@ -24,6 +24,20 @@ def _first_card() -> dict:
     return cards[0]
 
 
+def _ingest_cards(monkeypatch, tmp_path, count: int) -> list[dict]:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    payload = _fixture_payload()
+    template = payload["cards"][0]
+    payload["cards"] = []
+    for idx in range(count):
+        card = dict(template)
+        card["idempotency_key"] = f"command-center-terminal-card-{idx}"
+        card["title"] = f"Terminal reconciliation card {idx}"
+        payload["cards"].append(card)
+    proposal_storage.ingest_proposal_output(json.dumps(payload))
+    return proposal_storage.list_cards()["cards"]
+
+
 def test_snapshot_cache_reuses_snapshot_until_ttl_or_force_refresh(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     command_center.invalidate_snapshot_cache()
@@ -91,6 +105,116 @@ def test_snapshot_hides_rejected_cards_by_default_and_exposes_source_ids(tmp_pat
     assert item["status"] == "rejected"
     assert item["source"]["id"] == f"source:self-improvement-proposal:{card['proposal_id']}"
     assert item["source"]["kind"] == "self_improvement"
+
+
+def test_snapshot_reconciles_approved_proposal_done_task_to_completed(tmp_path, monkeypatch):
+    _ingest_valid(monkeypatch, tmp_path)
+    card = _first_card()
+    board = "discord-terminal-proposal"
+    kanban_db.write_board_metadata(board, name="Terminal Proposal")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Completed proposal task", board=board)
+        with conn:
+            conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200, task_id))
+    finally:
+        conn.close()
+    proposal_storage.record_approval(
+        card["proposal_id"],
+        kanban_task_id=task_id,
+        worker_url=f"/workers/{board}/tickets/{task_id}",
+        actor="operator",
+        metadata={"board": board},
+    )
+
+    snapshot = command_center.build_command_center_snapshot()
+    completed = proposal_storage.get_card(card["proposal_id"])
+    events = proposal_storage.list_audit_events(card["proposal_id"])
+
+    assert completed["status"] == "completed"
+    assert [event["action"] for event in events] == ["approved", "completed"]
+    assert events[-1]["metadata"]["board"] == board
+    assert events[-1]["metadata"]["kanban_task_id"] == task_id
+    assert events[-1]["metadata"]["observed_terminal_status"] == "done"
+    assert events[-1]["metadata"]["board_db_path"].endswith(f"{board}/kanban.db")
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+    assert item["status"] == "shipped"
+    assert not any(item["id"] == f"self-improvement:{card['proposal_id']}" for item in snapshot["work_items"])
+
+    command_center.build_command_center_snapshot()
+    assert [event["action"] for event in proposal_storage.list_audit_events(card["proposal_id"])] == ["approved", "completed"]
+
+
+def test_snapshot_reconciles_approved_proposal_done_task_from_archived_board(tmp_path, monkeypatch):
+    _ingest_valid(monkeypatch, tmp_path)
+    card = _first_card()
+    board = "discord-archived-terminal-proposal"
+    kanban_db.write_board_metadata(board, name="Archived Terminal Proposal")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Archived completed task", board=board)
+        with conn:
+            conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200, task_id))
+    finally:
+        conn.close()
+    proposal_storage.record_approval(
+        card["proposal_id"],
+        kanban_task_id=task_id,
+        worker_url=f"/workers/{board}/tickets/{task_id}",
+        actor="operator",
+        metadata={"board": board},
+    )
+    archived_result = kanban_db.remove_board(board)
+
+    command_center.build_command_center_snapshot(include_archived=True)
+    completed = proposal_storage.get_card(card["proposal_id"])
+    events = proposal_storage.list_audit_events(card["proposal_id"])
+
+    assert completed["status"] == "completed"
+    assert events[-1]["action"] == "completed"
+    assert events[-1]["metadata"]["archive_path"] == archived_result["new_path"]
+    assert events[-1]["metadata"]["board_db_path"].endswith("kanban.db")
+
+
+def test_snapshot_does_not_reconcile_missing_or_nonterminal_proposal_tasks(tmp_path, monkeypatch):
+    cards = _ingest_cards(monkeypatch, tmp_path, 4)
+    missing_board, missing_task, running_board, blocked_board = cards
+    proposal_storage.record_approval(
+        missing_board["proposal_id"],
+        kanban_task_id="t_missing_board",
+        worker_url="/workers/discord-missing-board/tickets/t_missing_board",
+        metadata={"board": "discord-missing-board"},
+    )
+    existing_board = "discord-existing-missing-task"
+    kanban_db.write_board_metadata(existing_board, name="Existing Missing Task")
+    proposal_storage.record_approval(
+        missing_task["proposal_id"],
+        kanban_task_id="t_missing_task",
+        worker_url=f"/workers/{existing_board}/tickets/t_missing_task",
+        metadata={"board": existing_board},
+    )
+    running = "discord-running-proposal"
+    kanban_db.write_board_metadata(running, name="Running Proposal")
+    conn = kanban_db.connect(board=running)
+    try:
+        running_task = kanban_db.create_task(conn, title="Running proposal task", board=running)
+    finally:
+        conn.close()
+    proposal_storage.record_approval(running_board["proposal_id"], kanban_task_id=running_task, worker_url=f"/workers/{running}", metadata={"board": running})
+    blocked = "discord-blocked-proposal"
+    kanban_db.write_board_metadata(blocked, name="Blocked Proposal")
+    conn = kanban_db.connect(board=blocked)
+    try:
+        blocked_task = kanban_db.create_task(conn, title="Blocked proposal task", board=blocked, initial_status="blocked")
+    finally:
+        conn.close()
+    proposal_storage.record_approval(blocked_board["proposal_id"], kanban_task_id=blocked_task, worker_url=f"/workers/{blocked}", metadata={"board": blocked})
+
+    command_center.build_command_center_snapshot()
+
+    for card in cards:
+        assert proposal_storage.get_card(card["proposal_id"])["status"] == "approved"
+        assert [event["action"] for event in proposal_storage.list_audit_events(card["proposal_id"])] == ["approved"]
 
 
 def test_snapshot_enriches_work_items_with_operator_annotations(tmp_path, monkeypatch):
