@@ -13,12 +13,12 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.github_pr_amend import (
     GitHubPrAmendPolicy,
-    build_hermes_command,
-    build_worker_prompt,
+    build_pr_amend_intake_artifact,
     evaluate_request,
     extract_request,
     policy_from_route,
     preflight_request,
+    write_pr_amend_intake_artifact,
 )
 from gateway.config import PlatformConfig
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
@@ -242,24 +242,39 @@ class TestGitHubPrAmendPolicy:
         request = extract_request("issue_comment", payload)
         assert preflight_request(request, GitHubPrAmendPolicy()) == "sender 'stranger' is not allowlisted"
 
-    def test_worker_command_is_noninteractive_and_bounded(self):
+    def test_intake_artifact_contains_required_operational_contract(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD, delivery_id="delivery-artifact")
         policy = policy_from_route(ROUTE)
-        argv = build_hermes_command("do the work", policy)
-        assert argv[:4] == ["hermes", "chat", "--yolo", "--quiet"]
-        assert "--max-turns" in argv
-        assert argv[argv.index("--max-turns") + 1] == "120"
-        assert argv[argv.index("--toolsets") + 1] == "terminal,file,web,session_search"
-        assert argv[-2:] == ["--query", "do the work"]
+        decision = evaluate_request(request, PR_INFO, policy)
 
+        artifact = build_pr_amend_intake_artifact(
+            request,
+            decision,
+            policy,
+            PR_INFO,
+            ISSUE_COMMENT_PAYLOAD,
+        )
+        path = write_pr_amend_intake_artifact(artifact)
+        saved = json.loads(path.read_text(encoding="utf-8"))
 
-    def test_worker_command_respects_string_false_for_booleans(self):
-        route = json.loads(json.dumps(ROUTE))
-        route["github_pr_amend"]["job"]["quiet"] = "false"
-        route["github_pr_amend"]["job"]["yolo"] = "false"
-        policy = policy_from_route(route)
-        argv = build_hermes_command("do the work", policy)
-        assert "--quiet" not in argv
-        assert "--yolo" not in argv
+        assert saved["artifact_version"] == 1
+        assert saved["delivery_id"] == "delivery-artifact"
+        assert saved["event"] == {"type": "issue_comment", "action": "created"}
+        assert saved["sender"]["login"] == "tbrent"
+        assert saved["repository"]["full_name"] == "reserve-protocol/reserve-index-dtf"
+        assert saved["pull_request"]["number"] == 182
+        assert saved["pull_request"]["head"]["repo"] == "sligo-droid/reserve-index-dtf"
+        assert saved["pull_request"]["base"]["repo"] == "reserve-protocol/reserve-index-dtf"
+        assert saved["source"]["body"] == ISSUE_COMMENT_PAYLOAD["comment"]["body"]
+        assert saved["fetched_context"]["pull_request"]["title"] == PR_INFO["title"]
+        assert saved["policy_decision"]["accepted"] is True
+        instructions = saved["operational_instructions"].lower()
+        assert "do not post github text comments" in instructions
+        assert "command center/discord worker-board path" in instructions
+        assert "worker-board embed/thread" in instructions
+        assert "open and merge a pr in the `sligo-droid` fork" in instructions
+        assert "final public github output is pushed commits/prs plus reactions only" in instructions
 
 
 class TestGitHubPrAmendWebhookRoute:
@@ -301,20 +316,32 @@ class TestGitHubPrAmendWebhookRoute:
         assert "X-GitHub-Api-Version: 2022-11-28" in argv
 
     @pytest.mark.asyncio
-    async def test_signed_issue_comment_starts_amend_job(self, tmp_path):
+    async def test_signed_issue_comment_routes_to_discord_worker_board(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
         secret = "route-secret"
         route = json.loads(json.dumps(ROUTE))
         route["secret"] = secret
+        route["github_pr_amend"]["discord_channel_id"] = "channel-123"
         adapter = _make_adapter({"github-pr-amend": route})
-        adapter._run_github_pr_amend_job = AsyncMock()
         adapter._add_github_pr_amend_reaction = AsyncMock(return_value=True)
 
         body = json.dumps(ISSUE_COMMENT_PAYLOAD).encode()
         sig = _github_signature(body, secret)
 
+        board_metadata = {
+            "discord_channel_id": "channel-123",
+            "discord_top_level_message_id": "msg-123",
+            "discord_thread_id": "thread-123",
+            "discord_thread_url": "https://discord.test/thread-123",
+            "discord_board": "discord-thread-123",
+            "discord_board_public_url": "https://workers.test/thread-123",
+            "discord_guild_id": "guild-123",
+        }
+
         with patch("gateway.github_pr_amend.fetch_pr_info", return_value=PR_INFO), patch(
-            "gateway.github_pr_amend.write_job_brief", return_value=Path(tmp_path / "brief.json")
-        ):
+            "gateway.github_pr_amend.publish_and_activate_pr_amend_intake",
+            return_value=board_metadata,
+        ) as publish:
             async with TestClient(TestServer(_create_app(adapter))) as cli:
                 resp = await cli.post(
                     "/webhooks/github-pr-amend",
@@ -329,18 +356,34 @@ class TestGitHubPrAmendWebhookRoute:
                 data = await resp.json()
 
         assert resp.status == 202
-        assert data["status"] == "accepted"
+        assert data["status"] == "queued"
         assert data["lock_key"] == "sligo-droid/reserve-index-dtf:feat/irrevocable-fee-recipients"
-        assert adapter._run_github_pr_amend_job.await_count == 1
-        adapter._add_github_pr_amend_reaction.assert_awaited_once()
-        assert adapter._add_github_pr_amend_reaction.await_args.args[1] == "eyes"
+        assert data["artifact_path"].endswith("delivery-accepted.json")
+        assert data["discord_board"] == "discord-thread-123"
+        assert Path(data["artifact_path"]).is_file()
+        artifact = json.loads(Path(data["artifact_path"]).read_text(encoding="utf-8"))
+        assert artifact["delivery_id"] == "delivery-accepted"
+        assert "sligo-droid" in artifact["operational_instructions"]
+        publish.assert_called_once()
+        assert publish.call_args.kwargs["channel_id"] == "channel-123"
+        card = publish.call_args.args[0]
+        assert card["kind"] == "github_pr_amend"
+        assert "Open and merge a PR" in card["body"]
+        assert any(
+            "Discord worker-board embed/thread" in criterion
+            for criterion in card["acceptance_criteria"]
+        )
+        assert [call.args[1] for call in adapter._add_github_pr_amend_reaction.await_args_list] == [
+            "eyes",
+            "rocket",
+            "+1",
+        ]
 
     @pytest.mark.asyncio
     async def test_non_tbrent_mention_is_ignored(self):
         payload = json.loads(json.dumps(ISSUE_COMMENT_PAYLOAD))
         payload["sender"]["login"] = "stranger"
         adapter = _make_adapter({"github-pr-amend": ROUTE})
-        adapter._run_github_pr_amend_job = AsyncMock()
         adapter._add_github_pr_amend_reaction = AsyncMock()
 
         with patch("gateway.github_pr_amend.fetch_pr_info") as fetch_pr_info:
@@ -359,17 +402,18 @@ class TestGitHubPrAmendWebhookRoute:
         assert data["status"] == "ignored"
         assert "not allowlisted" in data["reason"]
         fetch_pr_info.assert_not_called()
-        adapter._run_github_pr_amend_job.assert_not_called()
         adapter._add_github_pr_amend_reaction.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_seen_reaction_failure_does_not_prevent_job_start(self, tmp_path):
         adapter = _make_adapter({"github-pr-amend": ROUTE})
-        adapter._run_github_pr_amend_job = AsyncMock()
         adapter._add_github_pr_amend_reaction = AsyncMock(side_effect=RuntimeError("gh down"))
 
         with patch("gateway.github_pr_amend.fetch_pr_info", return_value=PR_INFO), patch(
-            "gateway.github_pr_amend.write_job_brief", return_value=Path(tmp_path / "brief.json")
+            "gateway.github_pr_amend.resolve_pr_amend_discord_channel", return_value="channel-123"
+        ), patch(
+            "gateway.github_pr_amend.publish_and_activate_pr_amend_intake",
+            return_value={"discord_board": "board", "discord_thread_id": "thread"},
         ):
             async with TestClient(TestServer(_create_app(adapter))) as cli:
                 resp = await cli.post(
@@ -383,8 +427,33 @@ class TestGitHubPrAmendWebhookRoute:
                 data = await resp.json()
 
         assert resp.status == 202
-        assert data["status"] == "accepted"
-        assert adapter._run_github_pr_amend_job.await_count == 1
+        assert data["status"] == "queued"
+
+    @pytest.mark.asyncio
+    async def test_unresolved_discord_channel_fails_clearly_before_worker_board_publish(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        adapter._add_github_pr_amend_reaction = AsyncMock(return_value=True)
+
+        with patch("gateway.github_pr_amend.fetch_pr_info", return_value=PR_INFO), patch(
+            "gateway.github_pr_amend.resolve_pr_amend_discord_channel", return_value=""
+        ):
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                resp = await cli.post(
+                    "/webhooks/github-pr-amend",
+                    json=ISSUE_COMMENT_PAYLOAD,
+                    headers={
+                        "X-GitHub-Event": "issue_comment",
+                        "X-GitHub-Delivery": "delivery-no-channel",
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 500
+        assert data["status"] == "error"
+        assert data["error"] == "Failed to queue PR amendment worker board"
+        assert Path(data["artifact_path"]).is_file()
+        assert adapter._add_github_pr_amend_reaction.await_args.args[1] == "-1"
 
     @pytest.mark.asyncio
     async def test_branch_lock_rejects_concurrent_job(self, tmp_path):
@@ -411,10 +480,12 @@ class TestGitHubPrAmendWebhookRoute:
     @pytest.mark.asyncio
     async def test_review_submitted_changes_requested_is_accepted(self, tmp_path):
         adapter = _make_adapter({"github-pr-amend": ROUTE})
-        adapter._run_github_pr_amend_job = AsyncMock()
 
         with patch("gateway.github_pr_amend.fetch_pr_info", return_value=PR_INFO), patch(
-            "gateway.github_pr_amend.write_job_brief", return_value=Path(tmp_path / "brief.json")
+            "gateway.github_pr_amend.resolve_pr_amend_discord_channel", return_value="channel-123"
+        ), patch(
+            "gateway.github_pr_amend.publish_and_activate_pr_amend_intake",
+            return_value={"discord_board": "board", "discord_thread_id": "thread"},
         ):
             async with TestClient(TestServer(_create_app(adapter))) as cli:
                 resp = await cli.post(
@@ -428,19 +499,20 @@ class TestGitHubPrAmendWebhookRoute:
                 data = await resp.json()
 
         assert resp.status == 202
-        assert data["status"] == "accepted"
-        assert adapter._run_github_pr_amend_job.await_count == 1
+        assert data["status"] == "queued"
 
     @pytest.mark.asyncio
     async def test_pr_fetch_failure_allows_github_retry_same_delivery(self, tmp_path):
         adapter = _make_adapter({"github-pr-amend": ROUTE})
-        adapter._run_github_pr_amend_job = AsyncMock()
 
         with patch(
             "gateway.github_pr_amend.fetch_pr_info",
             side_effect=[RuntimeError("api down"), PR_INFO],
         ), patch(
-            "gateway.github_pr_amend.write_job_brief", return_value=Path(tmp_path / "brief.json")
+            "gateway.github_pr_amend.resolve_pr_amend_discord_channel", return_value="channel-123"
+        ), patch(
+            "gateway.github_pr_amend.publish_and_activate_pr_amend_intake",
+            return_value={"discord_board": "board", "discord_thread_id": "thread"},
         ):
             async with TestClient(TestServer(_create_app(adapter))) as cli:
                 first = await cli.post(
@@ -465,103 +537,4 @@ class TestGitHubPrAmendWebhookRoute:
         assert first.status == 502
         assert first_data["status"] == "error"
         assert second.status == 202
-        assert second_data["status"] == "accepted"
-        assert adapter._run_github_pr_amend_job.await_count == 1
-
-    @pytest.mark.asyncio
-    async def test_worker_failure_does_not_post_comment(self):
-        adapter = _make_adapter({"github-pr-amend": ROUTE})
-        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD, delivery_id="delivery-failed")
-        policy = policy_from_route(ROUTE)
-        decision = evaluate_request(request, PR_INFO, policy)
-        adapter._run_github_pr_amend_subprocess = AsyncMock(
-            return_value=subprocess.CompletedProcess(
-                ["hermes"],
-                7,
-                stdout="SECRET_STDOUT",
-                stderr="SECRET_STDERR with ``` fence",
-            )
-        )
-        adapter._deliver_github_comment = AsyncMock()
-        adapter._add_github_pr_amend_reaction = AsyncMock()
-
-        await adapter._run_github_pr_amend_job(
-            route_name="github-pr-amend",
-            request=request,
-            decision=decision,
-            policy=policy,
-            prompt="prompt",
-        )
-
-        adapter._deliver_github_comment.assert_not_awaited()
-        assert [call.args[1] for call in adapter._add_github_pr_amend_reaction.await_args_list] == [
-            "rocket",
-            "+1",
-        ]
-
-    @pytest.mark.asyncio
-    async def test_worker_crash_does_not_post_comment(self):
-        adapter = _make_adapter({"github-pr-amend": ROUTE})
-        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD, delivery_id="delivery-crashed")
-        policy = policy_from_route(ROUTE)
-        decision = evaluate_request(request, PR_INFO, policy)
-        adapter._run_github_pr_amend_subprocess = AsyncMock(side_effect=RuntimeError("boom"))
-        adapter._deliver_github_comment = AsyncMock()
-        adapter._add_github_pr_amend_reaction = AsyncMock()
-
-        await adapter._run_github_pr_amend_job(
-            route_name="github-pr-amend",
-            request=request,
-            decision=decision,
-            policy=policy,
-            prompt="prompt",
-        )
-
-        adapter._deliver_github_comment.assert_not_awaited()
-        assert [call.args[1] for call in adapter._add_github_pr_amend_reaction.await_args_list] == [
-            "rocket",
-            "+1",
-        ]
-
-    @pytest.mark.asyncio
-    async def test_worker_success_reactions_mark_working_then_done(self):
-        adapter = _make_adapter({"github-pr-amend": ROUTE})
-        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD, delivery_id="delivery-done")
-        policy = policy_from_route(ROUTE)
-        decision = evaluate_request(request, PR_INFO, policy)
-        adapter._run_github_pr_amend_subprocess = AsyncMock(
-            return_value=subprocess.CompletedProcess(["hermes"], 0, stdout="", stderr="")
-        )
-        adapter._add_github_pr_amend_reaction = AsyncMock(side_effect=[False, True])
-
-        await adapter._run_github_pr_amend_job(
-            route_name="github-pr-amend",
-            request=request,
-            decision=decision,
-            policy=policy,
-            prompt="prompt",
-        )
-
-        assert [call.args[1] for call in adapter._add_github_pr_amend_reaction.await_args_list] == [
-            "rocket",
-            "+1",
-        ]
-
-    def test_worker_prompt_forbids_github_text_replies(self, tmp_path):
-        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD, delivery_id="delivery-prompt")
-        policy = policy_from_route(ROUTE)
-        decision = evaluate_request(request, PR_INFO, policy)
-
-        prompt = build_worker_prompt(
-            request,
-            decision,
-            policy,
-            PR_INFO,
-            brief_path=Path(tmp_path / "brief.json"),
-        )
-        lowered = prompt.lower()
-
-        assert "must not create github comments, replies, review comments" in lowered
-        assert "return your final answer to the hermes subprocess only" in lowered
-        assert "comment the result back" not in lowered
-        assert "final github comment" not in lowered
+        assert second_data["status"] == "queued"

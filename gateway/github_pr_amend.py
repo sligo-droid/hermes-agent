@@ -2,8 +2,8 @@
 
 This module is deliberately policy-heavy and side-effect-light.  The webhook
 adapter owns HTTP/HMAC/rate-limit/idempotency; this module extracts GitHub
-comment/review events, verifies that they are allowed to trigger a coding job,
-and builds the bounded worker prompt used by the job runner.
+comment/review events, verifies that they are allowed to route to worker-board
+intake, and builds the Discord/Kanban worker-board artifact.
 """
 
 from __future__ import annotations
@@ -13,11 +13,13 @@ import logging
 import re
 import subprocess
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Sequence
 
 from hermes_constants import get_hermes_home
+from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +68,7 @@ class GitHubPrAmendDecision:
 
 @dataclass(frozen=True)
 class GitHubPrAmendJobConfig:
-    """Runtime settings for the coding job spawned after policy acceptance."""
+    """Legacy route settings still parsed from existing PR-amend config."""
 
     hermes_command: str = "hermes"
     toolsets: str = "terminal,file,web,session_search"
@@ -414,157 +416,244 @@ def safe_slug(value: str) -> str:
     return slug[:120] or "github-pr"
 
 
-def job_workspace(policy: GitHubPrAmendPolicy, decision: GitHubPrAmendDecision, request: GitHubPrAmendRequest) -> Path:
-    repo_slug = safe_slug(request.repo.replace("/", "-"))
-    return Path(policy.job.workspace_root).expanduser() / f"{repo_slug}-pr-{request.pr_number}"
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def write_job_brief(
+def _safe_payload_subset(payload: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "action",
+        "repository",
+        "sender",
+        "issue",
+        "pull_request",
+        "comment",
+        "review",
+    )
+    return {key: payload[key] for key in keys if key in payload}
+
+
+def _repo_info(payload: dict[str, Any], request: GitHubPrAmendRequest) -> dict[str, Any]:
+    repo = payload.get("repository") if isinstance(payload.get("repository"), dict) else {}
+    owner = repo.get("owner") if isinstance(repo.get("owner"), dict) else {}
+    return {
+        "full_name": str(repo.get("full_name") or request.repo),
+        "name": str(repo.get("name") or request.repo.rsplit("/", 1)[-1]),
+        "owner": str(owner.get("login") or request.repo.split("/", 1)[0]),
+        "html_url": str(repo.get("html_url") or f"https://github.com/{request.repo}"),
+    }
+
+
+def _source_info(payload: dict[str, Any], request: GitHubPrAmendRequest) -> dict[str, Any]:
+    raw = {}
+    if request.source_kind == "issue_comment":
+        raw = payload.get("comment") if isinstance(payload.get("comment"), dict) else {}
+    elif request.source_kind == "review_comment":
+        raw = payload.get("comment") if isinstance(payload.get("comment"), dict) else {}
+    elif request.source_kind == "review":
+        raw = payload.get("review") if isinstance(payload.get("review"), dict) else {}
+    return {
+        "kind": request.source_kind,
+        "id": request.source_id,
+        "node_id": str(raw.get("node_id") or ""),
+        "url": str(raw.get("url") or ""),
+        "html_url": request.source_url or str(raw.get("html_url") or ""),
+        "body": request.body,
+        "path": request.path or str(raw.get("path") or ""),
+        "line": request.line,
+        "original_line": raw.get("original_line"),
+        "diff_hunk": request.diff_hunk,
+        "review_id": request.review_id,
+        "review_state": request.review_state,
+    }
+
+
+def build_pr_amend_operational_instructions(
+    request: GitHubPrAmendRequest,
+    decision: GitHubPrAmendDecision,
+) -> str:
+    return f"""GitHub PR-amend operational instructions:
+- Do not post GitHub text comments, replies, review comments, or reviews.
+- Use GitHub reactions for seen/in-progress/done/error status when available.
+- Accepted intake must be handled through the Command Center/Discord worker-board path and produce the corresponding worker-board embed/thread, like an approved Command Center job.
+- Implement the requested amendment in a worker worktree using the Discord/Kanban worker-board flow.
+- Open and merge a PR in the `sligo-droid` fork/version of `{decision.base_repo or request.repo}`.
+- That PR must merge the worker worktree branch into the `sligo-droid` branch `{decision.head_ref}` that already has a PR open against the upstream `{decision.base_repo or request.repo}` repo.
+- Final public GitHub output is pushed commits/PRs plus reactions only.
+- Preserve unrelated user changes and report blockers in the worker-board thread, not on GitHub.
+""".strip()
+
+
+def build_pr_amend_intake_artifact(
     request: GitHubPrAmendRequest,
     decision: GitHubPrAmendDecision,
     policy: GitHubPrAmendPolicy,
     pr_info: dict[str, Any],
-) -> Path:
-    """Persist a structured job brief under HERMES_HOME for auditability."""
-
-    root = get_hermes_home() / "github-pr-amend" / safe_slug(request.repo) / str(request.pr_number)
-    root.mkdir(parents=True, exist_ok=True)
-    path = root / f"{safe_slug(request.delivery_id or request.source_id or 'event')}.json"
-    data = {
-        "request": request.__dict__,
-        "decision": decision.__dict__,
-        "policy": {
-            "mention": policy.mention,
-            "allowed_senders": policy.allowed_senders,
-            "allowed_base_repos": policy.allowed_base_repos,
-            "allowed_head_repos": policy.allowed_head_repos,
-            "canary_prs": policy.canary_prs,
-            "allowed_actions": policy.allowed_actions,
-            "job": policy.job.__dict__,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    return {
+        "artifact_version": 1,
+        "created_at": now,
+        "updated_at": now,
+        "delivery_id": request.delivery_id,
+        "event": {"type": request.event_type, "action": request.action},
+        "sender": {
+            "login": request.sender,
+            "id": _dig(payload, "sender", "id", default=None),
         },
-        "pr": {
-            "url": decision.pr_url,
-            "base_repo": decision.base_repo,
-            "base_ref": decision.base_ref,
-            "head_repo": decision.head_repo,
-            "head_ref": decision.head_ref,
-            "head_sha": decision.head_sha,
-            "title": pr_info.get("title"),
-            "body": pr_info.get("body"),
+        "repository": _repo_info(payload, request),
+        "pull_request": {
+            "number": request.pr_number,
+            "title": str(pr_info.get("title") or ""),
+            "url": str(pr_info.get("url") or ""),
+            "html_url": decision.pr_url,
+            "state": str(pr_info.get("state") or ""),
+            "body": str(pr_info.get("body") or ""),
+            "head": {
+                "repo": decision.head_repo,
+                "ref": decision.head_ref,
+                "sha": decision.head_sha,
+                "owner": decision.head_repo.split("/", 1)[0] if decision.head_repo else "",
+            },
+            "base": {
+                "repo": decision.base_repo,
+                "ref": decision.base_ref,
+                "owner": decision.base_repo.split("/", 1)[0] if decision.base_repo else "",
+            },
         },
+        "source": _source_info(payload, request),
+        "fetched_context": {
+            "pull_request": pr_info,
+            "reviews": [],
+            "review_comments": [],
+            "issue_comments": [],
+        },
+        "normalized_payload": _safe_payload_subset(payload),
+        "policy_decision": {
+            "accepted": decision.accepted,
+            "reason": decision.reason,
+            "lock_key": decision.lock_key,
+            "matched_gates": {
+                "mention": policy.mention,
+                "allowed_sender": request.sender in policy.allowed_senders,
+                "allowed_base_repos": policy.allowed_base_repos,
+                "allowed_head_repos": policy.allowed_head_repos,
+                "allowed_actions": policy.allowed_actions,
+                "canary_prs": policy.canary_prs,
+            },
+        },
+        "operational_instructions": build_pr_amend_operational_instructions(request, decision),
     }
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+
+
+def write_pr_amend_intake_artifact(artifact: dict[str, Any]) -> Path:
+    repo = str(_dig(artifact, "repository", "full_name", default="github-pr-amend"))
+    pr_number = str(_dig(artifact, "pull_request", "number", default="unknown"))
+    delivery_id = str(artifact.get("delivery_id") or _dig(artifact, "source", "id", default="event"))
+    root = get_hermes_home() / "gateway" / "github_pr_amend" / "intakes" / safe_slug(repo) / safe_slug(pr_number)
+    path = root / f"{safe_slug(delivery_id)}.json"
+    atomic_json_write(path, artifact, indent=2, mode=0o600)
     return path
 
 
-def build_worker_prompt(
-    request: GitHubPrAmendRequest,
-    decision: GitHubPrAmendDecision,
-    policy: GitHubPrAmendPolicy,
-    pr_info: dict[str, Any],
-    *,
-    brief_path: Path,
-) -> str:
-    """Build the one-shot Hermes coding-worker prompt."""
-
-    workspace = job_workspace(policy, decision, request)
-    source_context = {
-        "event_type": request.event_type,
-        "action": request.action,
-        "source_kind": request.source_kind,
-        "source_id": request.source_id,
-        "source_url": request.source_url,
-        "review_state": request.review_state,
-        "review_id": request.review_id,
-        "path": request.path,
-        "line": request.line,
-        "diff_hunk": request.diff_hunk,
-        "request_body": request.body,
-    }
-    return f"""You are the `sligo-droid` GitHub bot identity handling a trusted PR amendment request from `tbrent`.
-
-Goal: amend the PR branch in response to the tagged GitHub request, verify the change, push a commit to the PR head branch, and return the result privately to the Hermes subprocess.
-
-Hard policy:
-- You MAY clone/fetch/checkout, edit files, run tests/builds, commit, and push to the exact PR head branch.
-- You MUST NOT create GitHub comments, replies, review comments, text reviews, status text, or any other public text response on GitHub for this flow.
-- You MUST NOT merge, approve reviews, request reviews, deploy, publish releases, change repo settings, send/draft/reply/forward email, or push to any ref other than the exact PR head branch below.
-- Preserve unrelated user changes if the workspace already exists. Start by inspecting git status.
-- If the requested change is ambiguous, do not guess, do not push a commit, and report the ambiguity only in your private final answer to Hermes.
-- If a blocker prevents a safe commit, do not push a partial/broken commit; report the blocker only in your private final answer to Hermes.
-
-PR:
-- URL: {decision.pr_url}
-- Base: {decision.base_repo}:{decision.base_ref}
-- Head: {decision.head_repo}:{decision.head_ref}
-- Expected starting head SHA: {decision.head_sha}
-- Workspace: {workspace}
-- Audit brief: {brief_path}
-
-Triggering GitHub context (trusted because only `tbrent` may trigger this route):
-```json
-{json.dumps(source_context, indent=2, ensure_ascii=False)}
-```
-
-Before editing, fetch complete current context, including Changes Requested / review feedback:
-- `gh api repos/{decision.base_repo}/pulls/{request.pr_number}`
-- `gh api repos/{decision.base_repo}/pulls/{request.pr_number}/reviews`
-- `gh api repos/{decision.base_repo}/pulls/{request.pr_number}/comments`
-- `gh api repos/{decision.base_repo}/issues/{request.pr_number}/comments`
-- `gh pr diff {request.pr_number} --repo {decision.base_repo}`
-
-Checkout/push constraints:
-1. Use or create the workspace shown above under `/home/droid/workspaces/`.
-2. Fetch the PR head repo `{decision.head_repo}` and branch `{decision.head_ref}`.
-3. Reset to the expected starting head SHA `{decision.head_sha}` if it is still current; if the remote branch moved, inspect and continue only if safe.
-4. Add/fetch upstream `{decision.base_repo}` for base context if needed.
-5. Push only to `{decision.head_repo}` branch `{decision.head_ref}`.
-
-Final private reporting requirements:
-- Return your final answer to the Hermes subprocess only; do not post it to GitHub.
-- Include summary, commit SHA if pushed, commands/tests run, and caveats/blockers.
-- If no commit was pushed, say that explicitly in the private final answer.
-
-PR title: {pr_info.get('title') or ''}
-PR body:
-{pr_info.get('body') or ''}
-"""
-
-
-def build_hermes_command(prompt: str, policy: GitHubPrAmendPolicy) -> list[str]:
-    """Return argv for a one-shot Hermes worker run."""
-
-    argv = [
-        policy.job.hermes_command,
-        "chat",
-        "--source",
-        policy.job.source,
-        "--toolsets",
-        policy.job.toolsets,
-        "--max-turns",
-        str(policy.job.max_turns),
-        "--query",
-        prompt,
+def resolve_pr_amend_discord_channel(route_config: dict[str, Any], request: GitHubPrAmendRequest) -> str:
+    raw = dict(route_config)
+    nested = route_config.get("github_pr_amend")
+    if isinstance(nested, dict):
+        raw.update(nested)
+    for key in ("discord_channel_id", "channel_id"):
+        value = str(raw.get(key) or "").strip()
+        if value:
+            return value
+    project_candidates = [
+        raw.get("project"),
+        raw.get("project_key"),
+        request.repo,
+        request.repo.rsplit("/", 1)[-1] if request.repo else "",
     ]
-    if policy.job.quiet:
-        argv.insert(2, "--quiet")
-    if policy.job.yolo:
-        argv.insert(2, "--yolo")
-    return argv
+    try:
+        from self_improvement.discord_publish import configured_project_channel_id
+    except Exception as exc:
+        logger.debug("[github-pr-amend] Discord channel resolver unavailable: %s", exc)
+        return ""
+    for candidate in project_candidates:
+        channel_id = configured_project_channel_id(candidate)
+        if channel_id:
+            return channel_id
+    return ""
 
 
-def run_worker_command(prompt: str, policy: GitHubPrAmendPolicy) -> subprocess.CompletedProcess[str]:
-    """Run the one-shot Hermes worker command."""
-
-    argv = build_hermes_command(prompt, policy)
-    logger.info("[github-pr-amend] starting worker command: %s", argv[:6] + ["..."])
-    return subprocess.run(
-        argv,
-        capture_output=True,
-        text=True,
-        timeout=policy.job.timeout_seconds,
+def build_pr_amend_discord_card(
+    artifact: dict[str, Any],
+    *,
+    artifact_path: Path,
+) -> dict[str, Any]:
+    repo = str(_dig(artifact, "repository", "full_name", default=""))
+    pr_number = str(_dig(artifact, "pull_request", "number", default=""))
+    pr_title = str(_dig(artifact, "pull_request", "title", default=""))
+    source_url = str(_dig(artifact, "source", "html_url", default=""))
+    sender = str(_dig(artifact, "sender", "login", default=""))
+    body = str(_dig(artifact, "source", "body", default=""))
+    instructions = str(artifact.get("operational_instructions") or "")
+    title = f"GitHub PR amend: {repo}#{pr_number}"
+    summary = f"{sender} requested an amendment on `{repo}` PR #{pr_number}: {pr_title}"
+    request_body = "\n\n".join(
+        part
+        for part in (
+            f"Source: {source_url}" if source_url else "",
+            f"Artifact: {artifact_path}",
+            "Requested change:",
+            body,
+            instructions,
+        )
+        if part
     )
+    return {
+        "kind": "github_pr_amend",
+        "title": title,
+        "summary": summary,
+        "body": request_body,
+        "project": repo.rsplit("/", 1)[-1] or repo or "github-pr-amend",
+        "prong": "github-pr-amend",
+        "priority": "high",
+        "proposal_id": str(artifact.get("delivery_id") or ""),
+        "rationale": "Accepted signed GitHub PR-amend webhook routed through the Command Center/Discord worker-board path.",
+        "acceptance_criteria": [
+            "Do not post GitHub text comments or reviews.",
+            "Accepted intake must produce and use the corresponding Discord worker-board embed/thread, like an approved Command Center job.",
+            "Open and merge a PR in the sligo-droid fork/version of the repo.",
+            "Merge the worker worktree branch into the sligo-droid branch that already has the upstream PR open.",
+            "Final public GitHub output is pushed commits/PRs plus reactions only.",
+            f"Preserve and follow intake artifact: {artifact_path}",
+        ],
+        "github_pr_amend": {
+            "artifact_path": str(artifact_path),
+            "delivery_id": artifact.get("delivery_id"),
+            "repo": repo,
+            "pr_number": pr_number,
+            "source_url": source_url,
+        },
+        "created_by": "github-pr-amend",
+        "dispatch_dirty_reason": "github-pr-amend-accepted",
+    }
+
+
+def publish_and_activate_pr_amend_intake(
+    card: dict[str, Any],
+    *,
+    channel_id: str,
+) -> dict[str, Any]:
+    from self_improvement.discord_publish import activate_approved_proposal, publish_approved_proposal
+
+    route = publish_approved_proposal(card, channel_id=channel_id)
+    if route is None:
+        raise RuntimeError("Discord publish returned no route")
+    if route.error:
+        raise RuntimeError(route.error)
+    route = activate_approved_proposal(card, route)
+    if route is None:
+        raise RuntimeError("Discord activation returned no route")
+    if route.error:
+        raise RuntimeError(route.error)
+    return route.metadata()
