@@ -293,6 +293,123 @@ def test_autoreview_helper_preserves_existing_repo_helper(tmp_path):
     assert skill.read_text(encoding="utf-8") == "custom skill"
 
 
+def test_worker_pr_body_adds_project_state_justification_for_operational_changes():
+    from hermes_cli import kanban_codex_worker as worker
+    from scripts.check_pr_body_format import check_project_state_requirement
+
+    body = worker._worker_pr_body(
+        {"public_url": "https://discord/thread", "root_goal": "Fix worker PR hygiene"},
+        board="discord-board",
+        changed_files=["hermes_cli/kanban_codex_worker.py"],
+    )
+
+    assert "Board: https://discord/thread" in body
+    assert "## Summary\n" in body
+    assert "## Verification\n" in body
+    assert "Goal:\nFix worker PR hygiene" not in body
+    assert worker._WORKER_PROJECT_STATE_JUSTIFICATION in body
+    ok, _message = check_project_state_requirement(body, ["hermes_cli/kanban_codex_worker.py"])
+    assert ok is True
+
+
+def test_worker_pr_body_skips_project_state_justification_when_state_changed():
+    from hermes_cli import kanban_codex_worker as worker
+
+    body = worker._worker_pr_body(
+        {"root_goal": "Update project ledger"},
+        board="discord-board",
+        changed_files=["hermes_cli/kanban_codex_worker.py", "docs/project-state.md"],
+    )
+
+    assert worker._WORKER_PROJECT_STATE_JUSTIFICATION not in body
+
+
+def test_changed_files_for_pr_body_includes_branch_and_worktree_changes(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "diff", "--name-only", "origin/main...HEAD"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="gateway/run.py\n", stderr="")
+        if cmd == ["git", "diff", "--name-only", "--cached"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd == ["git", "diff", "--name-only"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="docs/project-state.md\ngateway/run.py\n", stderr="")
+        if cmd == ["git", "ls-files", "--others", "--exclude-standard"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="hermes_cli/kanban.py\n", stderr="")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._changed_files_for_pr_body(tmp_path, base="main") == [
+        "gateway/run.py",
+        "docs/project-state.md",
+        "hermes_cli/kanban.py",
+    ]
+    assert calls == [
+        ["git", "diff", "--name-only", "origin/main...HEAD"],
+        ["git", "diff", "--name-only", "--cached"],
+        ["git", "diff", "--name-only"],
+        ["git", "ls-files", "--others", "--exclude-standard"],
+    ]
+
+
+def test_ensure_existing_worker_pr_body_appends_project_state_justification(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+
+    calls = []
+    worker_meta = {"pr_url": "https://github.com/sligo-labs/hermes-agent/pull/123", "root_goal": "Fix worker PR hygiene"}
+
+    def fake_run_gh(args, *, root, timeout):
+        calls.append(args)
+        if args[:2] == ["pr", "view"]:
+            return subprocess.CompletedProcess(args, 0, stdout="Board: board\n\nGoal:\nFix worker PR hygiene\n", stderr="")
+        if args[:2] == ["pr", "edit"]:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(worker, "_run_gh", fake_run_gh)
+
+    worker._ensure_worker_pr_body_hygiene(
+        worker_meta,
+        root=tmp_path,
+        repo="sligo-labs/hermes-agent",
+        board="discord-board",
+        changed_files=["hermes_cli/kanban_codex_worker.py"],
+    )
+
+    assert calls[0][:4] == ["pr", "view", worker_meta["pr_url"], "--repo"]
+    assert calls[1][:4] == ["pr", "edit", worker_meta["pr_url"], "--repo"]
+    assert calls[1][-1].endswith(worker._WORKER_PROJECT_STATE_JUSTIFICATION)
+    assert "pr_body_update_error" not in worker_meta
+
+
+def test_ensure_existing_worker_pr_body_does_not_edit_when_requirement_satisfied(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+
+    calls = []
+    body = f"Board: board\n\nGoal:\nFix worker PR hygiene\n\n{worker._WORKER_PROJECT_STATE_JUSTIFICATION}"
+
+    def fake_run_gh(args, *, root, timeout):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout=body, stderr="")
+
+    monkeypatch.setattr(worker, "_run_gh", fake_run_gh)
+
+    worker._ensure_worker_pr_body_hygiene(
+        {"pr_url": "https://github.com/sligo-labs/hermes-agent/pull/123"},
+        root=tmp_path,
+        repo="sligo-labs/hermes-agent",
+        board="discord-board",
+        changed_files=["hermes_cli/kanban_codex_worker.py"],
+    )
+
+    assert len(calls) == 1
+    assert calls[0][:2] == ["pr", "view"]
+
+
 def test_role_workers_materialize_autoreview_before_backend(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli.discord_worker_boards import ROLE_DEV, ROLE_PLANNER, ROLE_REVIEWER
@@ -3081,6 +3198,63 @@ def test_planner_schema_uses_parents_not_depends_on():
     assert "deduplicated canonical board-level list" in schema
 
 
+def test_planner_prompt_defaults_simple_jobs_to_one_dev_ticket():
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_PLANNER
+
+    frame = worker._role_outcome_frame(ROLE_PLANNER)
+    schema = worker._schema_instructions(ROLE_PLANNER)
+
+    assert "Simple or single-surface Hermes/Discord jobs default to exactly one dev ticket" in frame
+    assert "For simple or single-surface Hermes/Discord jobs, default to exactly one dev ticket" in schema
+    assert "Fold docs, runbook notes, migration verification" in schema
+    assert "active-path evidence" in schema
+    assert "owning implementation ticket" in schema
+
+
+def test_planner_prompt_limits_standalone_tickets():
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_PLANNER
+
+    schema = worker._schema_instructions(ROLE_PLANNER)
+
+    assert "Create standalone dev tickets only for truly independent implementation slices" in schema
+    assert "user-requested separate deliverables" in schema
+    assert "shared blockers/prerequisites affecting multiple tickets" in schema
+    assert "Do not create extra assertion, telemetry, debug, hardening, or PR-check tickets" in schema
+    assert "concrete unmet acceptance criterion" in schema
+
+
+def test_reviewer_prompt_approves_when_only_optional_followups_remain():
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+
+    frame = worker._role_outcome_frame(ROLE_REVIEWER)
+    schema = worker._schema_instructions(ROLE_REVIEWER)
+
+    assert "If requirements are satisfied and only optional improvements remain" in frame
+    assert "approve with empty new_tasks" in frame
+    assert "Do not emit new_tasks for optional hardening, extra tests" in schema
+    assert "PR lifecycle, docs polish, telemetry" in schema
+    assert "routine active-path/code-island checks" in schema
+    assert "nice-to-have cleanup when requirements are satisfied" in schema
+    assert "set status to approved, keep new_tasks empty" in schema
+
+
+def test_reviewer_prompt_preserves_real_gap_followups():
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+
+    schema = worker._schema_instructions(ROLE_REVIEWER)
+
+    assert "Request a new round only for concrete acceptance gaps" in schema
+    assert "evidenced regressions" in schema
+    assert "real defects" in schema
+    assert "requested behavior that is unmet" in schema
+    assert "part of the requested behavior or acceptance criteria" in schema
+    assert "follow-up dev task must explicitly ask dev to verify" in schema
+
+
 def test_worker_role_frames_are_outcome_first():
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli.discord_worker_boards import ROLE_DEV, ROLE_PLANNER, ROLE_REVIEWER
@@ -4069,6 +4243,63 @@ def test_ensure_pr_waits_for_checks_before_merging(monkeypatch, tmp_path):
     assert meta["pr_checks_status"] == "pending"
     assert meta["pr_blocker"] == "checks pending"
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
+
+
+def test_ensure_pr_polls_passed_unstable_before_merging(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_PR_MERGE_WAIT_SECONDS", "1")
+    monkeypatch.setenv("HERMES_KANBAN_PR_MERGE_POLL_SECONDS", "0")
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="unstable-pr",
+        goal="Ship unstable PR",
+        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
+    )
+    workspace = tmp_path / "repo"
+    project_path = tmp_path / "canonical"
+    workspace.mkdir()
+    project_path.mkdir()
+    dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
+    calls = []
+    view_states = iter(
+        [
+            _pr_view_json(number=127, state="OPEN", merge_state="UNSTABLE"),
+            _pr_view_json(number=127, state="OPEN", merge_state="CLEAN"),
+            _pr_view_json(number=127, state="MERGED", merge_state="CLEAN"),
+        ]
+    )
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/127\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(returncode=0, stdout=next(view_states), stderr="")
+        if cmd[:3] == ["gh", "pr", "merge"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        sync_result = _canonical_sync_result(cmd)
+        if sync_result is not None:
+            return sync_result
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr(board.slug, str(workspace)) is True
+
+    merge_index = next(index for index, cmd in enumerate(calls) if cmd[:3] == ["gh", "pr", "merge"])
+    view_indices = [index for index, cmd in enumerate(calls) if cmd[:3] == ["gh", "pr", "view"]]
+    clean_view_index = view_indices[1]
+    assert clean_view_index < merge_index
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert meta["pr_state"] == "MERGED"
+    assert meta["pr_merge_state"] == "CLEAN"
+    assert meta["pr_checks_status"] == "passed"
+    assert meta["pr_blocker"] == ""
 
 
 def test_ensure_pr_falls_back_to_origin_remote_for_repo(monkeypatch, tmp_path):
