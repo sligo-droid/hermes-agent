@@ -18,7 +18,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from hermes_constants import get_hermes_home
 from hermes_cli import kanban_db
@@ -578,8 +578,21 @@ def _board_from_worker_url(worker_url: Any) -> str | None:
     path = urlsplit(text).path.rstrip("/")
     parts = [part for part in path.split("/") if part]
     if len(parts) >= 2 and parts[0] == "workers":
-        return parts[1]
+        return unquote(parts[1])
     return None
+
+
+def _task_from_worker_url(worker_url: Any) -> str | None:
+    text = str(worker_url or "").strip()
+    if not text:
+        return None
+    parsed = urlsplit(text)
+    path = parsed.path.rstrip("/")
+    parts = [part for part in path.split("/") if part]
+    if len(parts) >= 4 and parts[0] == "workers" and parts[2] == "tickets":
+        return unquote(parts[3])
+    query_task = parse_qs(parsed.query).get("task") or []
+    return str(query_task[0]).strip() or None
 
 
 def _proposal_board_candidates(card: dict[str, Any], metadata: dict[str, Any]) -> list[str]:
@@ -598,6 +611,12 @@ def _proposal_board_candidates(card: dict[str, Any], metadata: dict[str, Any]) -
     if kanban_db.DEFAULT_BOARD not in candidates:
         candidates.append(kanban_db.DEFAULT_BOARD)
     return candidates
+
+
+def _proposal_task_id(card: dict[str, Any]) -> str:
+    return str(card.get("kanban_task_id") or "").strip() or str(
+        _task_from_worker_url(card.get("worker_url")) or ""
+    ).strip()
 
 
 def _task_from_board_db(task_id: str, *, board: str, db_path: Path) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
@@ -619,7 +638,7 @@ def _proposal_terminal_metadata(
     board: str | None,
     board_meta: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    task_id = str(card.get("kanban_task_id") or "").strip()
+    task_id = _proposal_task_id(card)
     if task_id and task and str(task.get("status") or "").lower() == "done":
         return {
             "proposal_id": card.get("proposal_id"),
@@ -663,7 +682,7 @@ def _reconcile_terminal_proposal(
         str(card.get("proposal_id") or ""),
         actor="command-center-reconciliation",
         reason="mapped Kanban worker reached terminal success",
-        kanban_task_id=str(card.get("kanban_task_id") or "") or None,
+        kanban_task_id=_proposal_task_id(card) or None,
         metadata=metadata,
     )
 
@@ -1102,7 +1121,7 @@ def _all_proposal_cards(*, include_archived: bool) -> list[dict[str, Any]]:
 def _load_task_for_proposal(
     card: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str | None, dict[str, Any] | None]:
-    task_id = str(card.get("kanban_task_id") or "").strip()
+    task_id = _proposal_task_id(card)
     if not task_id:
         return None, [], None, None
     proposal_id = str(card.get("proposal_id") or "")
