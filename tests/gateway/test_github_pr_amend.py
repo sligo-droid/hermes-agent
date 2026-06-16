@@ -14,6 +14,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.github_pr_amend import (
     GitHubPrAmendPolicy,
     build_hermes_command,
+    build_worker_prompt,
     evaluate_request,
     extract_request,
     policy_from_route,
@@ -468,7 +469,7 @@ class TestGitHubPrAmendWebhookRoute:
         assert adapter._run_github_pr_amend_job.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_worker_failure_comment_does_not_leak_output(self):
+    async def test_worker_failure_does_not_post_comment(self):
         adapter = _make_adapter({"github-pr-amend": ROUTE})
         request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD, delivery_id="delivery-failed")
         policy = policy_from_route(ROUTE)
@@ -492,12 +493,31 @@ class TestGitHubPrAmendWebhookRoute:
             prompt="prompt",
         )
 
-        assert adapter._deliver_github_comment.await_count == 1
-        comment = adapter._deliver_github_comment.await_args_list[0].args[0]
-        assert "SECRET_STDOUT" not in comment
-        assert "SECRET_STDERR" not in comment
-        assert "Tail output" not in comment
-        assert "Delivery ID: `delivery-failed`" in comment
+        adapter._deliver_github_comment.assert_not_awaited()
+        assert [call.args[1] for call in adapter._add_github_pr_amend_reaction.await_args_list] == [
+            "rocket",
+            "+1",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_worker_crash_does_not_post_comment(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD, delivery_id="delivery-crashed")
+        policy = policy_from_route(ROUTE)
+        decision = evaluate_request(request, PR_INFO, policy)
+        adapter._run_github_pr_amend_subprocess = AsyncMock(side_effect=RuntimeError("boom"))
+        adapter._deliver_github_comment = AsyncMock()
+        adapter._add_github_pr_amend_reaction = AsyncMock()
+
+        await adapter._run_github_pr_amend_job(
+            route_name="github-pr-amend",
+            request=request,
+            decision=decision,
+            policy=policy,
+            prompt="prompt",
+        )
+
+        adapter._deliver_github_comment.assert_not_awaited()
         assert [call.args[1] for call in adapter._add_github_pr_amend_reaction.await_args_list] == [
             "rocket",
             "+1",
@@ -526,3 +546,22 @@ class TestGitHubPrAmendWebhookRoute:
             "rocket",
             "+1",
         ]
+
+    def test_worker_prompt_forbids_github_text_replies(self, tmp_path):
+        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD, delivery_id="delivery-prompt")
+        policy = policy_from_route(ROUTE)
+        decision = evaluate_request(request, PR_INFO, policy)
+
+        prompt = build_worker_prompt(
+            request,
+            decision,
+            policy,
+            PR_INFO,
+            brief_path=Path(tmp_path / "brief.json"),
+        )
+        lowered = prompt.lower()
+
+        assert "must not create github comments, replies, review comments" in lowered
+        assert "return your final answer to the hermes subprocess only" in lowered
+        assert "comment the result back" not in lowered
+        assert "final github comment" not in lowered

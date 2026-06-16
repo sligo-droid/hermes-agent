@@ -910,23 +910,6 @@ class WebhookAdapter(BasePlatformAdapter):
                 result.returncode,
                 stderr,
             )
-            await self._deliver_github_comment(
-                (
-                    "I tried to handle the tagged PR amendment request, but the "
-                    "worker failed before completing. No successful completion was "
-                    "reported, and no commit was confirmed pushed.\n\n"
-                    f"Exit code: `{result.returncode}`\n"
-                    f"Delivery ID: `{request.delivery_id or 'unknown'}`\n\n"
-                    "Details were kept in the private gateway logs/job brief rather "
-                    "than posted publicly."
-                ),
-                {
-                    "deliver_extra": {
-                        "repo": decision.base_repo or request.repo,
-                        "pr_number": str(request.pr_number),
-                    }
-                },
-            )
             await self._safe_github_pr_amend_reaction(request, "+1")
         except asyncio.CancelledError:
             logger.warning(
@@ -943,25 +926,6 @@ class WebhookAdapter(BasePlatformAdapter):
                 getattr(request, "repo", ""),
                 getattr(request, "pr_number", ""),
             )
-            try:
-                await self._deliver_github_comment(
-                    (
-                        "I tried to handle the tagged PR amendment request, but "
-                        "the worker crashed before completing. No commit was "
-                        "confirmed pushed.\n\n"
-                        f"Delivery ID: `{getattr(request, 'delivery_id', '') or 'unknown'}`\n\n"
-                        "Details were kept in the private gateway logs/job brief rather "
-                        "than posted publicly."
-                    ),
-                    {
-                        "deliver_extra": {
-                            "repo": getattr(decision, "base_repo", "") or getattr(request, "repo", ""),
-                            "pr_number": str(getattr(request, "pr_number", "")),
-                        }
-                    },
-                )
-            except Exception:
-                logger.exception("[github-pr-amend] failed to post crash comment")
             await self._safe_github_pr_amend_reaction(request, "+1")
         finally:
             self._github_pr_amend_locks.discard(decision.lock_key)

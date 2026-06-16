@@ -18,7 +18,7 @@ Let the trusted GitHub user `tbrent` tag the bot identity `@sligo-droid` in a pu
 6. implement the requested code change;
 7. run focused verification;
 8. commit and push to the PR head branch;
-9. reply in GitHub with the result, commit SHA, tests run, and any caveats.
+9. signal publicly only through GitHub reactions and code changes/PRs; keep text results in private logs/subprocess output.
 
 This is not a generic public GitHub chat surface. It is a trusted-author PR amendment channel for the `sligo-droid` bot identity.
 
@@ -27,7 +27,7 @@ This is not a generic public GitHub chat surface. It is a trusted-author PR amen
 - Do not create or require a GitHub App for v1.
 - Do not poll GitHub.
 - Do not allow arbitrary GitHub users to trigger coding work by tagging the bot.
-- Do not merge PRs, approve reviews, request reviews, deploy, publish releases, change repo settings, or send/draft/reply/forward email from this workflow.
+- Do not merge PRs, approve reviews, request reviews, deploy, publish releases, change repo settings, create GitHub text replies/comments/reviews, or send/draft/reply/forward email from this workflow.
 - Do not use the existing generic webhook prompt route as the final implementation for code changes; it is intentionally safe and does not expose the editing capability this workflow needs.
 
 ## Trust and safety model
@@ -53,7 +53,7 @@ Hard gates still apply before any coding work starts:
 - PR head repo matches the allowlist / is pushable by `sligo-droid`;
 - no active branch lock exists for the PR head branch.
 
-The coding worker may perform only the explicit PR amendment side effects: clone/fetch/checkout, edit files, run tests/builds, commit, push to the exact PR head branch, and comment the result.
+The coding worker may perform only the explicit PR amendment side effects: clone/fetch/checkout, edit files, run tests/builds, commit, and push to the exact PR head branch. It must not create GitHub text comments, replies, or reviews for this flow.
 
 ## Org-scoped policy
 
@@ -86,7 +86,7 @@ github_pr_amend:
     - run_tests
     - commit
     - push_to_pr_branch
-    - comment_result
+    - react_to_trigger
   forbidden_side_effects:
     - merge
     - approve_review
@@ -173,9 +173,9 @@ Webhook handling must return quickly. It should enqueue or start a bounded backg
 Preferred behavior:
 
 - acknowledge accepted webhook quickly;
-- optionally post a short GitHub acknowledgement comment, e.g. “Queued, I’ll amend this branch if verification passes.”;
+- add best-effort GitHub reactions to the trigger for accepted/working/done states;
 - run the amendment job out of band;
-- post final result comment.
+- keep text results in private logs/subprocess output.
 
 ### Branch lock
 
@@ -191,7 +191,7 @@ For PR #182:
 sligo-droid/reserve-index-dtf:feat/irrevocable-fee-recipients
 ```
 
-If the lock is held, either queue the new request or reply that another amendment is already in progress. Do not run two concurrent coding workers against the same branch.
+If the lock is held, either queue the new request or ignore it with private logging. Do not run two concurrent coding workers against the same branch.
 
 ### Workspace
 
@@ -235,33 +235,11 @@ The worker must return:
 - commit SHA if pushed;
 - blocker details if no commit was pushed.
 
-### Final GitHub comment
+### Public signaling
 
-On success:
+PR-amend must not create GitHub text comments, replies, review comments, or text reviews. Public signaling is limited to best-effort reactions on the trigger plus pushed commits or opened PRs when relevant. Success, failure, crash, and blocker details stay in private gateway logs, the audit brief, and the worker subprocess output.
 
-```text
-Implemented in <sha>: <short summary>
-
-Verification:
-- <command>: <result>
-
-Notes:
-- <caveats if any>
-```
-
-On failure:
-
-```text
-I tried to apply this but hit a blocker. No commit was pushed.
-
-Blocker:
-- <specific issue>
-
-Verification attempted:
-- <commands/results>
-```
-
-On policy rejection for unauthorized users, prefer no public reply at first; log the skip locally.
+On policy rejection for unauthorized users, do not reply publicly; log the skip locally.
 
 ## GitHub credentials
 
@@ -270,7 +248,7 @@ Use the `sligo-droid` GitHub identity for:
 - reading PR metadata/comments/reviews;
 - cloning/fetching;
 - pushing to `sligo-droid` branches;
-- commenting back on PRs.
+- reacting to PR-amend triggers.
 
 A narrower fine-grained token is preferable later, but v1 can use the existing authenticated `sligo-droid` CLI/runtime credentials if that is the current operational path.
 
@@ -285,8 +263,8 @@ Implemented pieces in this branch:
 - in-process branch lock keyed as `{head_repo}:{head_ref}`;
 - auditable job brief written under `$HERMES_HOME/github-pr-amend/...`;
 - bounded one-shot Hermes worker command with explicit toolsets, max turns, quiet mode, and yolo approval bypass for headless execution;
-- worker prompt contract that fetches current PR reviews/comments/diff, edits only the exact PR head branch, verifies, pushes, and comments back;
-- failure/crash GitHub comments if the worker exits non-zero after accepting a request.
+- worker prompt contract that fetches current PR reviews/comments/diff, edits only the exact PR head branch, verifies, pushes, and reports privately;
+- failure/crash details kept in private logs/audit/subprocess output while terminal reactions still mark completion.
 
 Verification run on 2026-06-15:
 
@@ -380,7 +358,7 @@ Unit tests:
 - accepts `pull_request_review.submitted` with mention and `changes_requested`;
 - rejects events outside allowed base/head repo patterns;
 - lock prevents concurrent jobs for same head branch;
-- final comment formatting includes commit/test/blocker fields.
+- worker prompt forbids GitHub text replies and requires private final reporting.
 
 Focused integration/smoke tests:
 
@@ -404,13 +382,13 @@ Runtime verification before enabling upstream webhook:
 3. Give operator exact webhook URL and event list.
 4. Operator adds webhook in GitHub settings.
 5. Test with a harmless tag on a reserve-protocol PR.
-6. Confirm branch amendment + final comment.
+6. Confirm branch amendment + terminal reaction.
 7. Expand sender/head repo allowlists only if there is a concrete need.
 
 ## Open questions / implementation choices
 
 - Whether to represent accepted webhook jobs as Command Center/Kanban work items in v1 or start with a simpler background job record and add Command Center integration after the core path works.
-- Whether to post an immediate “queued” acknowledgement comment or stay silent until final result.
+- Whether to expand non-text public signaling beyond reactions, without adding GitHub text replies.
 - Whether to allow non-PR allowlisted branches after the org-scoped PR path is proven.
 
-Recommendation: start with a simple background job plus branch lock and final comment, then add Command Center/Kanban surfacing once the core end-to-end path is proven.
+Recommendation: start with a simple background job plus branch lock and reaction-only public signaling, then add Command Center/Kanban surfacing once the core end-to-end path is proven.

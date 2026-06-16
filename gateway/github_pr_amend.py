@@ -487,14 +487,15 @@ def build_worker_prompt(
     }
     return f"""You are the `sligo-droid` GitHub bot identity handling a trusted PR amendment request from `tbrent`.
 
-Goal: amend the PR branch in response to the tagged GitHub request, verify the change, push a commit to the PR head branch, and comment the result back on the PR.
+Goal: amend the PR branch in response to the tagged GitHub request, verify the change, push a commit to the PR head branch, and return the result privately to the Hermes subprocess.
 
 Hard policy:
-- You MAY clone/fetch/checkout, edit files, run tests/builds, commit, push to the exact PR head branch, and comment the result.
+- You MAY clone/fetch/checkout, edit files, run tests/builds, commit, and push to the exact PR head branch.
+- You MUST NOT create GitHub comments, replies, review comments, text reviews, status text, or any other public text response on GitHub for this flow.
 - You MUST NOT merge, approve reviews, request reviews, deploy, publish releases, change repo settings, send/draft/reply/forward email, or push to any ref other than the exact PR head branch below.
 - Preserve unrelated user changes if the workspace already exists. Start by inspecting git status.
-- If the requested change is ambiguous, comment a concise clarification instead of guessing and do not push a commit.
-- If a blocker prevents a safe commit, comment the blocker and do not push a partial/broken commit.
+- If the requested change is ambiguous, do not guess, do not push a commit, and report the ambiguity only in your private final answer to Hermes.
+- If a blocker prevents a safe commit, do not push a partial/broken commit; report the blocker only in your private final answer to Hermes.
 
 PR:
 - URL: {decision.pr_url}
@@ -523,10 +524,10 @@ Checkout/push constraints:
 4. Add/fetch upstream `{decision.base_repo}` for base context if needed.
 5. Push only to `{decision.head_repo}` branch `{decision.head_ref}`.
 
-Final GitHub comment requirements:
-- Reply/comment on PR #{request.pr_number} in `{decision.base_repo}`.
+Final private reporting requirements:
+- Return your final answer to the Hermes subprocess only; do not post it to GitHub.
 - Include summary, commit SHA if pushed, commands/tests run, and caveats/blockers.
-- If no commit was pushed, say that explicitly.
+- If no commit was pushed, say that explicitly in the private final answer.
 
 PR title: {pr_info.get('title') or ''}
 PR body:
