@@ -592,10 +592,10 @@ def _task_from_worker_url(worker_url: Any) -> str | None:
     if len(parts) >= 4 and parts[0] == "workers" and parts[2] == "tickets":
         return unquote(parts[3])
     query_task = parse_qs(parsed.query).get("task") or []
-    return str(query_task[0]).strip() or None
+    return str(query_task[0]).strip() if query_task else None
 
 
-def _proposal_board_candidates(card: dict[str, Any], metadata: dict[str, Any]) -> list[str]:
+def _proposal_board_candidates(card: dict[str, Any], metadata: dict[str, Any], *, include_default: bool = True) -> list[str]:
     candidates: list[str] = []
     for value in (
         metadata.get("board"),
@@ -608,7 +608,7 @@ def _proposal_board_candidates(card: dict[str, Any], metadata: dict[str, Any]) -
         text = str(value or "").strip()
         if text and text not in candidates:
             candidates.append(text)
-    if kanban_db.DEFAULT_BOARD not in candidates:
+    if include_default and kanban_db.DEFAULT_BOARD not in candidates:
         candidates.append(kanban_db.DEFAULT_BOARD)
     return candidates
 
@@ -1122,11 +1122,11 @@ def _load_task_for_proposal(
     card: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str | None, dict[str, Any] | None]:
     task_id = _proposal_task_id(card)
-    if not task_id:
-        return None, [], None, None
     proposal_id = str(card.get("proposal_id") or "")
     metadata = _latest_self_improvement_metadata(proposal_id)
-    board_candidates = _proposal_board_candidates(card, metadata)
+    board_candidates = _proposal_board_candidates(card, metadata, include_default=bool(task_id))
+    if not task_id and not board_candidates:
+        return None, [], None, None
     board_metas = kanban_db.list_boards(include_archived=True)
     by_slug: dict[str, list[dict[str, Any]]] = {}
     for board_meta in [*board_metas, *[meta for entries in _archived_boards_by_slug().values() for meta in entries]]:
@@ -1142,6 +1142,8 @@ def _load_task_for_proposal(
                 continue
             metas = [kanban_db.read_board_metadata(board)]
         for board_meta in metas:
+            if not task_id:
+                return None, [], board, board_meta
             db_path_value = board_meta.get("db_path")
             try:
                 if board_meta.get("archived") or board_meta.get("archive_path") or board_meta.get("archived_path"):

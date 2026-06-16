@@ -776,7 +776,7 @@ def record_completion(
                 return _row_to_card(row)
             if status != "approved":
                 return _row_to_card(row)
-            effective_task_id = kanban_task_id or row["kanban_task_id"]
+            effective_task_id = kanban_task_id or row["kanban_task_id"] or None
             conn.execute(
                 """
                 UPDATE proposal_cards
