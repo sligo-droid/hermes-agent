@@ -6080,10 +6080,26 @@ def _completed_approved_reviewer_task(conn: Any, tasks: list[Any]) -> Optional[A
     return None
 
 
+def _pr_finalizer_failed_check_names(worker: dict[str, Any]) -> list[str]:
+    return [str(item).strip() for item in (worker.get("pr_checks_failed") or []) if str(item).strip()]
+
+
 def _pr_finalizer_failure_is_failed_checks(worker: dict[str, Any]) -> bool:
     checks_status = str(worker.get("pr_checks_status") or "").strip().lower()
     blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "").strip().lower()
     return checks_status == "failed" or "checks failed" in blocker
+
+
+def _pr_finalizer_failure_is_pr_body_check_only(worker: dict[str, Any]) -> bool:
+    failed = [item.lower() for item in _pr_finalizer_failed_check_names(worker)]
+    if failed:
+        return all("pr body format" in item for item in failed)
+    blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "").strip().lower()
+    if "checks failed" not in blocker or "pr body format" not in blocker:
+        return False
+    failed_text = blocker.split("checks failed", 1)[1].lstrip(": -\t") or blocker
+    failed_from_blocker = [part.strip() for part in failed_text.split(",") if part.strip()]
+    return bool(failed_from_blocker) and all("pr body format" in item for item in failed_from_blocker)
 
 
 def _pr_finalizer_failure_is_merge_conflict(worker: dict[str, Any]) -> bool:
@@ -6160,7 +6176,6 @@ def _create_pr_finalizer_recovery_task(
 
 
 def _create_pr_checks_recovery_task(board: str, worker: dict[str, Any], conn: Any) -> str:
-    failed_checks = [str(item) for item in (worker.get("pr_checks_failed") or []) if str(item).strip()]
     return _create_pr_finalizer_recovery_task(
         board,
         worker,
@@ -6170,53 +6185,21 @@ def _create_pr_checks_recovery_task(board: str, worker: dict[str, Any], conn: An
         instructions=[
             "The implementation review was already approved; do not restart the architecture review.",
             "Inspect the failing PR checks, fix the failures, and push the fixes to the worker branch.",
-            "After checks pass, let the reviewer/finalizer loop continue so the PR can be finalized.",
+            "Do not do PR lifecycle chores; after checks pass, let the reviewer/finalizer loop continue.",
         ],
-        extra_payload={"failed_checks": failed_checks},
+        extra_payload={"failed_checks": _pr_finalizer_failed_check_names(worker)},
     )
 
 
-def _create_pr_merge_conflict_recovery_task(board: str, worker: dict[str, Any], conn: Any) -> str:
-    return _create_pr_finalizer_recovery_task(
-        board,
-        worker,
-        conn,
-        recovery_kind="merge-conflict",
-        title="Resolve PR merge conflicts",
-        instructions=[
-            "The implementation review was already approved; do not restart the architecture review.",
-            "Update the worker branch against the current base branch, resolve the PR merge conflicts, and push the branch.",
-            "Rerun focused checks after resolving conflicts, then let the reviewer/finalizer loop continue so the PR can be finalized.",
-        ],
-        extra_payload={
-            "merge_state": str(worker.get("pr_merge_state") or worker.get("merge_state") or "").strip(),
-            "mergeable": str(worker.get("pr_mergeable") or worker.get("mergeable") or "").strip(),
-        },
-    )
-
-
-def _create_pr_finalizer_manual_recovery_task(board: str, worker: dict[str, Any], conn: Any) -> str:
-    return _create_pr_finalizer_recovery_task(
-        board,
-        worker,
-        conn,
-        recovery_kind="manual",
-        title="Recover PR finalization",
-        instructions=[
-            "The implementation review was already approved and no role work is active; do not restart the architecture review.",
-            "Inspect the recorded PR/finalizer blocker, restore any missing GitHub/auth/runtime prerequisite, then rerun the PR finalizer path.",
-            "If the PR is already clean and merged, transition the board to done and let the Discord terminal follow-up/reaction sync complete.",
-        ],
-    )
-
-
-def _reactivate_after_pr_finalizer_recovery(board: str, worker: dict[str, Any], blocker: str) -> None:
+def _reactivate_after_pr_checks_recovery(board: str, worker: dict[str, Any], blocker: str) -> None:
     worker.update(
         {
             "phase": "dev",
             "goal_status": "active",
             "blocked_reason": "",
             "pr_blocker": blocker,
+            "pr_finalizer_recovery_state": "dev_checks_recovery",
+            "pr_finalizer_recovery_blocker": blocker,
             "terminal_reaction_sync_pending": True,
             "terminal_summary_sync_pending": True,
         }
@@ -6225,6 +6208,25 @@ def _reactivate_after_pr_finalizer_recovery(board: str, worker: dict[str, Any], 
         worker["pr_error"] = blocker
     _clear_board_run_summary(board, worker)
     _update_worker_meta(board, worker)
+
+
+def _block_after_pr_finalizer_failure(board: str, worker: dict[str, Any], blocker: str) -> None:
+    worker.update(
+        {
+            "phase": "blocked",
+            "goal_status": "blocked",
+            "blocked_reason": "approved reviewer PR finalization failed",
+            "pr_blocker": blocker,
+            "pr_finalizer_recovery_state": "operator_blocked",
+            "pr_finalizer_recovery_blocker": blocker,
+            "terminal_reaction_sync_pending": True,
+            "terminal_summary_sync_pending": True,
+        }
+    )
+    if not str(worker.get("pr_error") or "").strip():
+        worker["pr_error"] = blocker
+    _update_worker_meta(board, worker)
+    persist_board_run_summary(board)
 
 
 def _recover_approved_reviewer_finalizer(board: str, worker: dict[str, Any], conn: Any, tasks: list[Any]) -> Optional[str]:
@@ -6245,28 +6247,17 @@ def _recover_approved_reviewer_finalizer(board: str, worker: dict[str, Any], con
     refreshed = dict(metadata.get(DISCORD_WORKER_META_KEY) or {})
     blocker = str(refreshed.get("pr_blocker") or refreshed.get("pr_error") or "approved reviewer PR finalization failed").strip()
     if _pr_finalizer_failure_is_failed_checks(refreshed):
+        if _pr_finalizer_failure_is_pr_body_check_only(refreshed):
+            _block_after_pr_finalizer_failure(board, refreshed, blocker)
+            return "approved_reviewer_finalizer_pr_body_check_blocked"
         _create_pr_checks_recovery_task(board, refreshed, conn)
-        _reactivate_after_pr_finalizer_recovery(board, refreshed, blocker)
+        _reactivate_after_pr_checks_recovery(board, refreshed, blocker)
         return "approved_reviewer_finalizer_checks_recovery_created"
     if _pr_finalizer_failure_is_merge_conflict(refreshed):
-        _create_pr_merge_conflict_recovery_task(board, refreshed, conn)
-        _reactivate_after_pr_finalizer_recovery(board, refreshed, blocker)
-        return "approved_reviewer_finalizer_merge_conflict_recovery_created"
+        _block_after_pr_finalizer_failure(board, refreshed, blocker)
+        return "approved_reviewer_finalizer_merge_conflict_blocked"
 
-    refreshed.update(
-        {
-            "phase": "blocked",
-            "goal_status": "blocked",
-            "blocked_reason": "approved reviewer PR finalization failed",
-            "pr_blocker": blocker,
-            "terminal_reaction_sync_pending": True,
-            "terminal_summary_sync_pending": True,
-        }
-    )
-    if not str(refreshed.get("pr_error") or "").strip():
-        refreshed["pr_error"] = blocker
-    _update_worker_meta(board, refreshed)
-    persist_board_run_summary(board)
+    _block_after_pr_finalizer_failure(board, refreshed, blocker)
     return "approved_reviewer_finalizer_blocked"
 
 
@@ -6292,6 +6283,11 @@ def _recover_blocked_approved_reviewer_finalizer(
         return None
     if _completed_approved_reviewer_task(conn, tasks) is None:
         return None
+    if (
+        str(worker.get("pr_finalizer_recovery_state") or "") == "operator_blocked"
+        and str(worker.get("pr_finalizer_recovery_blocker") or "") == finalizer_blocker
+    ):
+        return None
 
     # A blocked board may have been recovered by a previously-created dev task.
     # Do not trust the stored PR blocker blindly: it can still say DIRTY even
@@ -6310,17 +6306,18 @@ def _recover_blocked_approved_reviewer_finalizer(
 
     blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "approved reviewer PR finalization failed").strip()
     if _pr_finalizer_failure_is_failed_checks(worker):
+        if _pr_finalizer_failure_is_pr_body_check_only(worker):
+            _block_after_pr_finalizer_failure(board, worker, blocker)
+            return "approved_reviewer_finalizer_pr_body_check_blocked"
         _create_pr_checks_recovery_task(board, worker, conn)
-        _reactivate_after_pr_finalizer_recovery(board, worker, blocker)
+        _reactivate_after_pr_checks_recovery(board, worker, blocker)
         return "approved_reviewer_finalizer_checks_recovery_created"
     if _pr_finalizer_failure_is_merge_conflict(worker):
-        _create_pr_merge_conflict_recovery_task(board, worker, conn)
-        _reactivate_after_pr_finalizer_recovery(board, worker, blocker)
-        return "approved_reviewer_finalizer_merge_conflict_recovery_created"
+        _block_after_pr_finalizer_failure(board, worker, blocker)
+        return "approved_reviewer_finalizer_merge_conflict_blocked"
     if finalizer_blocker:
-        _create_pr_finalizer_manual_recovery_task(board, worker, conn)
-        _reactivate_after_pr_finalizer_recovery(board, worker, blocker)
-        return "approved_reviewer_finalizer_manual_recovery_created"
+        _block_after_pr_finalizer_failure(board, worker, blocker)
+        return "approved_reviewer_finalizer_manual_blocked"
     return None
 
 
@@ -6331,6 +6328,18 @@ def _active_pr_finalizer_recovery_task(tasks: list[Any]) -> Optional[Any]:
         if str(getattr(task, "status", "") or "") in {"triage", "todo", "ready", "running", "blocked"}:
             return task
     return None
+
+
+def _archive_active_pr_finalizer_recovery_tasks(conn: Any, tasks: list[Any]) -> int:
+    archived = 0
+    for task in tasks:
+        if str(getattr(task, "created_by", "") or "") != "discord-pr-finalizer-recovery":
+            continue
+        if str(getattr(task, "status", "") or "") not in {"triage", "todo", "ready", "running", "blocked"}:
+            continue
+        if kanban_db.archive_task(conn, str(getattr(task, "id", "") or "")):
+            archived += 1
+    return archived
 
 
 def _pre_review_safe_text(value: Any, *, max_chars: int = _PRE_REVIEW_MAX_TEXT_CHARS) -> Optional[str]:
@@ -6475,10 +6484,33 @@ def reconcile_board(board: str) -> Optional[str]:
             for t in tasks
             if t.status in {"triage", "todo", "ready", "running", "blocked"}
         }
-        if goal_status == "blocked" and _active_pr_finalizer_recovery_task(tasks) is not None:
+        active_recovery = _active_pr_finalizer_recovery_task(tasks)
+        if goal_status == "blocked" and active_recovery is not None:
+            # Legacy finalizer recovery tasks for merge conflicts/manual blockers
+            # were implementation-round shaped even though role workers cannot
+            # perform PR lifecycle work. Archive those without reactivating the
+            # board. Preserve real failing-checks recovery tasks because those
+            # can still represent code/test work; PR-body hygiene failures are
+            # deterministic finalizer work and should not keep a dev round alive.
+            if _pr_finalizer_failure_is_failed_checks(worker) and not _pr_finalizer_failure_is_pr_body_check_only(worker):
+                return None
+            _archive_active_pr_finalizer_recovery_tasks(conn, tasks)
+            tasks = kanban_db.list_tasks(conn, include_archived=False)
+            active_roles = {
+                str(t.assignee or "").lower()
+                for t in tasks
+                if t.status in {"triage", "todo", "ready", "running", "blocked"}
+            }
             blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "approved reviewer PR finalization failed").strip()
-            _reactivate_after_pr_finalizer_recovery(board, worker, blocker)
-            return "approved_reviewer_finalizer_recovery_active"
+            if _pr_finalizer_failure_is_failed_checks(worker):
+                _block_after_pr_finalizer_failure(board, worker, blocker)
+                return "approved_reviewer_finalizer_pr_body_check_blocked"
+            if _pr_finalizer_failure_is_merge_conflict(worker):
+                _block_after_pr_finalizer_failure(board, worker, blocker)
+                return "approved_reviewer_finalizer_merge_conflict_blocked"
+            if blocker:
+                _block_after_pr_finalizer_failure(board, worker, blocker)
+                return "approved_reviewer_finalizer_manual_blocked"
         if ROLE_PLANNER in active_roles or ROLE_DEV in active_roles or ROLE_REVIEWER in active_roles:
             return None
         if goal_status == "blocked":
