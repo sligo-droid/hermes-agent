@@ -337,10 +337,13 @@ def activate_approved_proposal(
             project_context=_project_context(card, route.channel_id),
             request_id=route.top_level_message_id,
             board_slug=route.board,
-            created_by="self-improvement",
+            created_by=str(card.get("created_by") or "self-improvement"),
             acceptance_criteria=criteria,
         )
-        mark_dispatch_dirty(board=board.slug, reason="self-improvement-approved")
+        mark_dispatch_dirty(
+            board=board.slug,
+            reason=str(card.get("dispatch_dirty_reason") or "self-improvement-approved"),
+        )
         _update_feature_embed(route.channel_id, route.top_level_message_id, card, board.public_url)
         return replace(route, board=board.slug, board_public_url=board.public_url)
     except Exception as exc:

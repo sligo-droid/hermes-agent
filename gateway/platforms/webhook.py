@@ -35,7 +35,6 @@ import json
 import logging
 import os
 import re
-import signal
 import subprocess
 import time
 from typing import Any, Dict, List, Optional
@@ -138,11 +137,10 @@ class WebhookAdapter(BasePlatformAdapter):
         self._rate_counts: Dict[str, List[float]] = {}
         self._rate_limit: int = int(config.extra.get("rate_limit", 30))  # per minute
 
-        # GitHub PR amendment routes spawn bounded coding workers that push to
-        # PR head branches.  Keep an in-process branch lock so duplicate/tagged
+        # GitHub PR amendment routes enqueue accepted requests onto Discord/Kanban
+        # worker boards. Keep an in-process branch lock so duplicate/tagged
         # events cannot race against the same ref while this gateway instance
-        # is alive.  Durable job/lock storage can be added once the core route
-        # has proven itself.
+        # is alive.
         self._github_pr_amend_locks: set[str] = set()
 
         # Body size limit (auth-before-body pattern)
@@ -705,17 +703,20 @@ class WebhookAdapter(BasePlatformAdapter):
         event_type: str,
         delivery_id: str,
     ) -> Any:
-        """Gate a GitHub mention event and start a PR amendment worker."""
+        """Gate a GitHub mention event and enqueue a Discord/Kanban worker board."""
         assert web is not None
         from gateway.github_pr_amend import (
             GitHubPrAmendError,
-            build_worker_prompt,
+            build_pr_amend_discord_card,
+            build_pr_amend_intake_artifact,
             evaluate_request,
             extract_request,
             fetch_pr_info,
             policy_from_route,
             preflight_request,
-            write_job_brief,
+            publish_and_activate_pr_amend_intake,
+            resolve_pr_amend_discord_channel,
+            write_pr_amend_intake_artifact,
         )
 
         try:
@@ -823,112 +824,68 @@ class WebhookAdapter(BasePlatformAdapter):
 
         self._github_pr_amend_locks.add(decision.lock_key)
         try:
-            brief_path = write_job_brief(request, decision, policy, pr_info)
-            prompt = build_worker_prompt(
+            artifact = build_pr_amend_intake_artifact(
                 request,
                 decision,
                 policy,
                 pr_info,
-                brief_path=brief_path,
+                payload,
+            )
+            artifact_path = write_pr_amend_intake_artifact(artifact)
+            channel_id = resolve_pr_amend_discord_channel(route_config, request)
+            if not channel_id:
+                raise RuntimeError("No Discord channel resolved for GitHub PR-amend intake")
+            card = build_pr_amend_discord_card(artifact, artifact_path=artifact_path)
+            await self._safe_github_pr_amend_reaction(request, "eyes")
+            await self._safe_github_pr_amend_reaction(request, "rocket")
+            discord_metadata = await asyncio.to_thread(
+                publish_and_activate_pr_amend_intake,
+                card,
+                channel_id=channel_id,
             )
         except Exception:
             self._github_pr_amend_locks.discard(decision.lock_key)
             self._seen_deliveries.pop(delivery_id, None)
             logger.exception(
-                "[github-pr-amend] failed to prepare job route=%s delivery=%s",
+                "[github-pr-amend] failed to queue worker-board intake route=%s delivery=%s",
                 route_name,
                 delivery_id,
             )
+            await self._safe_github_pr_amend_reaction(request, "-1")
             return web.json_response(
-                {"status": "error", "error": "Failed to prepare PR amendment job"},
+                {
+                    "status": "error",
+                    "error": "Failed to queue PR amendment worker board",
+                    "delivery_id": delivery_id,
+                    **({"artifact_path": str(locals().get("artifact_path"))} if locals().get("artifact_path") else {}),
+                },
                 status=500,
             )
 
-        task = asyncio.create_task(
-            self._run_github_pr_amend_job(
-                route_name=route_name,
-                request=request,
-                decision=decision,
-                policy=policy,
-                prompt=prompt,
-            )
-        )
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-
         logger.info(
-            "[github-pr-amend] accepted route=%s repo=%s pr=%s lock=%s delivery=%s",
+            "[github-pr-amend] queued route=%s repo=%s pr=%s lock=%s delivery=%s board=%s",
             route_name,
             request.repo,
             request.pr_number,
             decision.lock_key,
             delivery_id,
+            discord_metadata.get("discord_board"),
         )
-        await self._safe_github_pr_amend_reaction(request, "eyes")
+        self._github_pr_amend_locks.discard(decision.lock_key)
+        await self._safe_github_pr_amend_reaction(request, "+1")
         return web.json_response(
             {
-                "status": "accepted",
+                "status": "queued",
                 "route": route_name,
                 "event": event_type,
                 "delivery_id": delivery_id,
                 "lock_key": decision.lock_key,
                 "pr": request.pr_number,
+                "artifact_path": str(artifact_path),
+                **discord_metadata,
             },
             status=202,
         )
-
-    async def _run_github_pr_amend_job(
-        self,
-        *,
-        route_name: str,
-        request: Any,
-        decision: Any,
-        policy: Any,
-        prompt: str,
-    ) -> None:
-        """Run the one-shot Hermes worker and release the branch lock."""
-        try:
-            await self._safe_github_pr_amend_reaction(request, "rocket")
-            result = await self._run_github_pr_amend_subprocess(prompt, policy)
-            if result.returncode == 0:
-                logger.info(
-                    "[github-pr-amend] worker completed route=%s repo=%s pr=%s lock=%s",
-                    route_name,
-                    request.repo,
-                    request.pr_number,
-                    decision.lock_key,
-                )
-                await self._safe_github_pr_amend_reaction(request, "+1")
-                return
-
-            stderr = (result.stderr or result.stdout or "").strip()[-1200:]
-            logger.error(
-                "[github-pr-amend] worker failed route=%s repo=%s pr=%s exit=%s stderr=%s",
-                route_name,
-                request.repo,
-                request.pr_number,
-                result.returncode,
-                stderr,
-            )
-            await self._safe_github_pr_amend_reaction(request, "+1")
-        except asyncio.CancelledError:
-            logger.warning(
-                "[github-pr-amend] worker task cancelled route=%s repo=%s pr=%s",
-                route_name,
-                getattr(request, "repo", ""),
-                getattr(request, "pr_number", ""),
-            )
-            raise
-        except Exception as exc:
-            logger.exception(
-                "[github-pr-amend] worker crashed route=%s repo=%s pr=%s",
-                route_name,
-                getattr(request, "repo", ""),
-                getattr(request, "pr_number", ""),
-            )
-            await self._safe_github_pr_amend_reaction(request, "+1")
-        finally:
-            self._github_pr_amend_locks.discard(decision.lock_key)
 
     def _github_pr_amend_reaction_endpoint(self, request: Any) -> str:
         """Return the GitHub reactions endpoint for a PR-amend trigger."""
@@ -1028,79 +985,6 @@ class WebhookAdapter(BasePlatformAdapter):
             content,
         )
         return True
-
-    async def _run_github_pr_amend_subprocess(
-        self,
-        prompt: str,
-        policy: Any,
-    ) -> subprocess.CompletedProcess[str]:
-        """Run a PR-amend worker as a cancellable subprocess."""
-        from gateway.github_pr_amend import build_hermes_command
-
-        argv = build_hermes_command(prompt, policy)
-        logger.info("[github-pr-amend] starting worker command: %s", argv[:6] + ["..."])
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=policy.job.timeout_seconds,
-            )
-        except asyncio.TimeoutError:
-            await self._terminate_github_pr_amend_process(proc)
-            return subprocess.CompletedProcess(
-                argv,
-                124,
-                stdout="",
-                stderr=f"Timed out after {policy.job.timeout_seconds} seconds",
-            )
-        except asyncio.CancelledError:
-            await self._terminate_github_pr_amend_process(proc)
-            raise
-
-        return subprocess.CompletedProcess(
-            argv,
-            proc.returncode if proc.returncode is not None else 1,
-            stdout=stdout_b.decode("utf-8", errors="replace"),
-            stderr=stderr_b.decode("utf-8", errors="replace"),
-        )
-
-    async def _terminate_github_pr_amend_process(
-        self,
-        proc: asyncio.subprocess.Process,
-    ) -> None:
-        """Terminate a PR-amend worker process group, escalating if needed."""
-        if proc.returncode is not None:
-            return
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        except Exception:
-            proc.terminate()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-            return
-        except asyncio.TimeoutError:
-            pass
-        except ProcessLookupError:
-            return
-
-        if proc.returncode is None:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                return
-            except Exception:
-                proc.kill()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except Exception:
-                logger.warning("[github-pr-amend] worker process did not exit after kill")
 
     # ------------------------------------------------------------------
     # Signature validation
