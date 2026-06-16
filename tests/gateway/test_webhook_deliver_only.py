@@ -454,12 +454,9 @@ class TestDirectDeliverUnit:
         )
 
     @pytest.mark.asyncio
-    async def test_dispatches_to_github_comment(self):
+    async def test_github_comment_fails_closed(self):
         adapter = _make_adapter({})
-        with patch.object(
-            adapter, "_deliver_github_comment",
-            new=AsyncMock(return_value=SendResult(success=True)),
-        ) as mock_gh:
+        with patch("gateway.platforms.webhook.subprocess.run") as mock_run:
             result = await adapter._direct_deliver(
                 "review body",
                 {
@@ -467,5 +464,6 @@ class TestDirectDeliverUnit:
                     "deliver_extra": {"repo": "org/r", "pr_number": "1"},
                 },
             )
-            assert result.success is True
-            mock_gh.assert_awaited_once()
+            assert result.success is False
+            assert "github_comment delivery is disabled" in result.error
+            mock_run.assert_not_called()

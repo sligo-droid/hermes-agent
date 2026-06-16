@@ -11,8 +11,8 @@ Each route defines:
   - secret or secret_env: HMAC secret for signature validation (REQUIRED)
   - prompt: template string formatted with the webhook payload
   - skills: optional list of skills to load for the agent
-  - deliver: where to send the response (github_comment, telegram, etc.)
-  - deliver_extra: additional delivery config (repo, pr_number, chat_id)
+  - deliver: where to send the response (telegram, discord, log, etc.)
+  - deliver_extra: additional delivery config (chat_id, etc.)
   - deliver_only: if true, skip the agent — the rendered prompt IS the
     message that gets delivered.  Use for external push notifications
     (Supabase, monitoring alerts, inter-agent pings) where zero LLM cost
@@ -189,7 +189,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     raise ValueError(
                         f"[webhook] Route '{name}' has deliver_only=true but "
                         f"deliver is '{deliver}'. Direct delivery requires a "
-                        f"real target (telegram, discord, slack, github_comment, etc.)."
+                        f"real target (telegram, discord, slack, etc.)."
                     )
 
         app = web.Application()
@@ -1280,8 +1280,7 @@ class WebhookAdapter(BasePlatformAdapter):
         Used by ``deliver_only`` routes: the rendered template becomes the
         literal message body, and we dispatch to the same delivery helpers
         that the agent-mode ``send()`` flow uses.  All target types that
-        work in agent mode work here — Telegram, Discord, Slack, GitHub
-        PR comments, etc.
+        work in agent mode work here — Telegram, Discord, Slack, etc.
         """
         deliver_type = delivery.get("deliver", "log")
 
@@ -1303,56 +1302,13 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _deliver_github_comment(
         self, content: str, delivery: dict
     ) -> SendResult:
-        """Post agent response as a GitHub PR/issue comment via ``gh`` CLI."""
-        extra = delivery.get("deliver_extra", {})
-        repo = extra.get("repo", "")
-        pr_number = extra.get("pr_number", "")
-
-        if not repo or not pr_number:
-            logger.error(
-                "[webhook] github_comment delivery missing repo or pr_number"
-            )
-            return SendResult(
-                success=False, error="Missing repo or pr_number"
-            )
-
-        try:
-            result = subprocess.run(
-                [
-                    "gh",
-                    "pr",
-                    "comment",
-                    str(pr_number),
-                    "--repo",
-                    repo,
-                    "--body",
-                    content,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if result.returncode == 0:
-                logger.info(
-                    "[webhook] Posted comment on %s#%s", repo, pr_number
-                )
-                return SendResult(success=True)
-            else:
-                logger.error(
-                    "[webhook] gh pr comment failed: %s", result.stderr
-                )
-                return SendResult(success=False, error=result.stderr)
-        except FileNotFoundError:
-            logger.error(
-                "[webhook] 'gh' CLI not found — install GitHub CLI for "
-                "github_comment delivery"
-            )
-            return SendResult(
-                success=False, error="gh CLI not installed"
-            )
-        except Exception as e:
-            logger.error("[webhook] github_comment delivery error: %s", e)
-            return SendResult(success=False, error=str(e))
+        """Fail closed: GitHub text-comment delivery is disabled."""
+        error = (
+            "github_comment delivery is disabled; configure another "
+            "delivery target"
+        )
+        logger.error("[webhook] %s", error)
+        return SendResult(success=False, error=error)
 
     async def _deliver_cross_platform(
         self, platform_name: str, content: str, delivery: dict

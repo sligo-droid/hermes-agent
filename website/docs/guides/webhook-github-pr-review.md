@@ -68,12 +68,9 @@ platforms:
             Otherwise:
             1. Run: gh pr diff {number} --repo {repository.full_name}
             2. Review the code changes for correctness, security issues, and clarity.
-            3. Write a concise, actionable review comment and post it.
+            3. Write a concise, actionable review summary for the gateway log.
 
-          deliver: github_comment
-          deliver_extra:
-            repo: "{repository.full_name}"
-            pr_number: "{number}"
+          deliver: log
 ```
 
 **Key fields:**
@@ -83,9 +80,7 @@ platforms:
 | `secret` (route-level) | HMAC secret for this route. Falls back to `extra.secret` global if omitted. |
 | `events` | List of `X-GitHub-Event` header values to accept. Empty list = accept all. |
 | `prompt` | Template; `{field}` and `{nested.field}` resolve from the GitHub payload. |
-| `deliver` | `github_comment` posts via `gh pr comment`. `log` just writes to the gateway log. |
-| `deliver_extra.repo` | Resolves to e.g. `org/repo` from the payload. |
-| `deliver_extra.pr_number` | Resolves to the PR number from the payload. |
+| `deliver` | `log` writes to the gateway log. Use a chat target such as `telegram`, `discord`, or `slack` to send the response elsewhere. `github_comment` is disabled. |
 
 :::note The payload does not contain code
 The GitHub webhook payload includes PR metadata (title, description, branch names, URLs) but **not the diff**. The prompt above instructs the agent to run `gh pr diff` to fetch the actual changes. The `terminal` tool is included in the default `hermes-webhook` toolset, so no extra configuration is needed.
@@ -130,7 +125,7 @@ GitHub will immediately send a `ping` event to confirm the connection. It is saf
 
 ## Step 4 — Open a test PR
 
-Create a branch, push a change, and open a PR. Within 30–90 seconds (depending on PR size and model), Hermes should post a review comment.
+Create a branch, push a change, and open a PR. Within 30–90 seconds (depending on PR size and model), Hermes should write a review summary to the configured delivery target.
 
 To follow the agent's progress in real time:
 
@@ -152,8 +147,8 @@ Copy the `https://...ngrok-free.app` URL and use it as your GitHub Payload URL. 
 
 You can smoke-test a static route directly with `curl` — no GitHub account or real PR needed.
 
-:::tip Use `deliver: log` when testing locally
-Change `deliver: github_comment` to `deliver: log` in your config while testing. Otherwise the agent will attempt to post a comment to the fake `org/repo#99` repo in the test payload, which will fail. Switch back to `deliver: github_comment` once you're satisfied with the prompt output.
+:::tip Keep GitHub webhook tests on `deliver: log`
+GitHub text-comment delivery is disabled. Use `deliver: log` while testing locally, or choose a chat target such as `telegram`, `discord`, or `slack` for active delivery.
 :::
 
 ```bash
@@ -217,13 +212,10 @@ platforms:
             Otherwise:
             1. Run: gh pr diff {number} --repo {repository.full_name}
             2. Review the diff using your review guidelines.
-            3. Write a concise, actionable review comment and post it.
+            3. Write a concise, actionable review summary for the gateway log.
           skills:
             - review
-          deliver: github_comment
-          deliver_extra:
-            repo: "{repository.full_name}"
-            pr_number: "{number}"
+          deliver: log
 ```
 
 > **Note:** Only the first skill in the list that is found is loaded. Hermes does not stack multiple skills — subsequent entries are ignored.
@@ -250,7 +242,7 @@ deliver_extra:
 
 The target platform must also be enabled and connected in the gateway. If `chat_id` is omitted, the response is sent to that platform's configured home channel.
 
-Valid `deliver` values: `log` · `github_comment` · `telegram` · `discord` · `slack` · `signal` · `sms`
+Valid `deliver` values: `log` · `telegram` · `discord` · `slack` · `signal` · `sms`
 
 ---
 
@@ -315,8 +307,8 @@ platforms:
           events: []            # [] = accept all; otherwise list X-GitHub-Event values
           prompt: ""            # {field} / {nested.field} resolved from payload
           skills: []            # first matching skill is loaded (only one)
-          deliver: "log"        # log | github_comment | telegram | discord | slack | signal | sms
-          deliver_extra: {}     # repo + pr_number for github_comment; chat_id for others
+          deliver: "log"        # log | telegram | discord | slack | signal | sms
+          deliver_extra: {}     # chat_id for messaging targets
 ```
 
 ---

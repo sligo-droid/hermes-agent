@@ -701,8 +701,8 @@ class TestSegmentBreakOnToolBoundary:
 
     @pytest.mark.asyncio
     async def test_no_message_id_segment_breaks_do_not_resend(self):
-        """On a platform that never returns a message_id (e.g. webhook with
-        github_comment delivery), tool-call segment breaks must NOT trigger
+        """On a platform that never returns a message_id (e.g. webhook
+        delivery), tool-call segment breaks must NOT trigger
         a new adapter.send() per boundary.  The fix: _message_id == '__no_edit__'
         suppresses the reset so all text accumulates and is sent once."""
         adapter = MagicMock()

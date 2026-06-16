@@ -609,7 +609,7 @@ hermes webhook subscribe <name> [options]
 | `--events` | Comma-separated event types to accept (e.g. `issues,pull_request`). Empty = all. |
 | `--description` | Human-readable description. |
 | `--skills` | Comma-separated skill names to load for the agent run. |
-| `--deliver` | Delivery target: `log` (default), `telegram`, `discord`, `slack`, `github_comment`. |
+| `--deliver` | Delivery target: `log` (default), `telegram`, `discord`, `slack`, and other enabled messaging platforms. |
 | `--deliver-chat-id` | Target chat/channel ID for cross-platform delivery. |
 | `--secret` | Custom HMAC secret. Auto-generated if omitted. |
 | `--deliver-only` | Skip the agent — deliver the rendered `--prompt` as the literal message. Zero LLM cost, sub-second delivery. Requires `--deliver` to be a real target (not `log`). |

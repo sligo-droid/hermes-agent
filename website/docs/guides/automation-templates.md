@@ -17,7 +17,7 @@ Every template works with **any model** — not locked to a single provider.
 | **GitHub Event** | Fires on PR opens, pushes, issues, CI results | Webhook platform (`hermes webhook subscribe`) |
 | **API Call** | External service POSTs JSON to your endpoint | Webhook platform (config.yaml routes or `hermes webhook subscribe`) |
 
-All three support delivery to Telegram, Discord, Slack, SMS, email, GitHub comments, or local files.
+All three support delivery to Telegram, Discord, Slack, SMS, email, logs, or local files.
 :::
 
 ---
@@ -49,7 +49,7 @@ Format as a clean digest. If no new issues, respond with [SILENT]." \
 
 ### Automatic PR Code Review
 
-Review every pull request automatically when it's opened. Posts a review comment directly on the PR.
+Review every pull request automatically when it's opened. Writes the review to the gateway log or a chat delivery target.
 
 **Trigger:** GitHub webhook
 
@@ -73,9 +73,10 @@ Review for:
 - Code quality (naming, duplication, error handling)
 - Missing tests for new behavior
 
-Post a concise review. If the PR is a trivial docs/typo change, say so briefly." \
+Write a concise review summary. If the PR is a trivial docs/typo change, say so briefly." \
   --skill github-code-review \
-  --deliver github_comment
+  --deliver telegram \
+  --deliver-chat-id "-100123456789"
 ```
 
 **Option B — Static route (config.yaml):**
@@ -98,10 +99,7 @@ platforms:
             Diff URL: {pull_request.diff_url}
             Review for security, performance, and code quality.
           skills: ["github-code-review"]
-          deliver: "github_comment"
-          deliver_extra:
-            repo: "{repository.full_name}"
-            pr_number: "{pull_request.number}"
+          deliver: "log"
 ```
 
 Then in GitHub: **Settings → Webhooks → Add webhook** → Payload URL: `http://your-server:8644/webhooks/github-pr-review`, Content type: `application/json`, Secret: `github-webhook-secret`, Events: **Pull requests**.
@@ -365,15 +363,16 @@ If this is a new issue (action=opened):
 1. Read the issue title and body carefully
 2. Suggest appropriate labels (bug, feature, docs, security, question)
 3. If it's a bug report, check if you can identify the affected component from the description
-4. Post a helpful initial response acknowledging the issue
+4. Write a helpful triage note for the configured delivery target
 
 If this is a label or assignment change, respond with [SILENT]." \
-  --deliver github_comment
+  --deliver telegram \
+  --deliver-chat-id "-100123456789"
 ```
 
 ### CI Failure Analysis
 
-Analyze CI failures and post diagnostics on the PR.
+Analyze CI failures and send diagnostics to the configured delivery target.
 
 **Trigger:** GitHub webhook
 
@@ -400,10 +399,7 @@ platforms:
             2. Identify the likely cause of failure
             3. Suggest a fix
             If conclusion is "success", respond with [SILENT].
-          deliver: "github_comment"
-          deliver_extra:
-            repo: "{repository.full_name}"
-            pr_number: "{check_run.pull_requests.0.number}"
+          deliver: "log"
 ```
 
 ### Auto-Port Changes Across Repos
