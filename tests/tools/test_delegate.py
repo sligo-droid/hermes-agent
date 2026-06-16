@@ -513,6 +513,133 @@ class TestToolNamePreservation(unittest.TestCase):
 class TestDelegateObservability(unittest.TestCase):
     """Tests for enriched metadata returned by _run_single_child."""
 
+    def _run_mocked_child(self, child_result, *, session_db=None):
+        parent = _make_mock_parent(depth=0)
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.session_id = "child-session-1"
+            mock_child._session_db = session_db
+            mock_child.run_conversation.return_value = child_result
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test child", parent_agent=parent))
+
+        return result["results"][0], mock_child
+
+    def test_provider_retry_summary_with_failed_metadata_is_failed(self):
+        entry, mock_child = self._run_mocked_child(
+            {
+                "final_response": "API call failed after 3 retries: upstream unavailable",
+                "completed": False,
+                "failed": True,
+                "error": "upstream unavailable",
+                "api_calls": 3,
+                "messages": [],
+            }
+        )
+
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["exit_reason"], "provider_failure")
+        self.assertIn("upstream unavailable", entry["error"])
+        mock_child.close.assert_called_once()
+
+    def test_model_authored_failed_tests_summary_can_complete(self):
+        entry, _mock_child = self._run_mocked_child(
+            {
+                "final_response": "Tests failed because the assertion expects old behavior.",
+                "completed": True,
+                "failed": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+        )
+
+        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(entry["exit_reason"], "completed")
+
+    def test_no_final_after_tool_output_fails_with_bounded_output_tail(self):
+        long_output = "x" * 1000
+        entry, _mock_child = self._run_mocked_child(
+            {
+                "final_response": "",
+                "completed": False,
+                "failed": False,
+                "api_calls": 1,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "tc_1",
+                                "function": {"name": "terminal", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "tc_1", "content": long_output},
+                ],
+            }
+        )
+
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["exit_reason"], "failed_no_final")
+        self.assertEqual(len(entry["output_tail"]), 1)
+        self.assertEqual(entry["output_tail"][0]["tool"], "terminal")
+        self.assertEqual(len(entry["output_tail"][0]["preview"]), 600)
+
+    def test_failed_child_session_is_ended_before_close(self):
+        session_db = MagicMock()
+        entry, mock_child = self._run_mocked_child(
+            {
+                "final_response": "API call failed after 3 retries: rate limited",
+                "completed": False,
+                "failed": True,
+                "error": "rate limited",
+                "api_calls": 3,
+                "messages": [],
+            },
+            session_db=session_db,
+        )
+
+        self.assertEqual(entry["status"], "failed")
+        session_db.end_session.assert_called_once_with("child-session-1", "provider_failure")
+        mock_child.close.assert_called_once()
+
+    @patch("tools.delegate_tool._run_single_child")
+    def test_batch_preserves_failed_child_status(self, mock_run):
+        mock_run.side_effect = [
+            {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "ok",
+                "api_calls": 1,
+                "duration_seconds": 0.1,
+            },
+            {
+                "task_index": 1,
+                "status": "failed",
+                "summary": "API call failed after 3 retries: nope",
+                "error": "nope",
+                "exit_reason": "provider_failure",
+                "api_calls": 3,
+                "duration_seconds": 0.2,
+            },
+        ]
+        parent = _make_mock_parent()
+
+        result = json.loads(
+            delegate_task(
+                tasks=[{"goal": "success"}, {"goal": "provider fails"}],
+                parent_agent=parent,
+            )
+        )
+
+        self.assertEqual(result["results"][0]["status"], "completed")
+        self.assertEqual(result["results"][1]["status"], "failed")
+        self.assertEqual(result["results"][1]["exit_reason"], "provider_failure")
+
     def test_observability_fields_present(self):
         """Completed child should return tool_trace, tokens, model, exit_reason."""
         parent = _make_mock_parent(depth=0)
@@ -687,7 +814,7 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertEqual(result["results"][0]["exit_reason"], "interrupted")
 
     def test_exit_reason_max_iterations(self):
-        """Child that didn't complete and wasn't interrupted hit max_iterations."""
+        """Child that didn't complete and produced no final is a failed no-final."""
         parent = _make_mock_parent(depth=0)
 
         with patch("run_agent.AIAgent") as MockAgent:
@@ -705,7 +832,8 @@ class TestDelegateObservability(unittest.TestCase):
             MockAgent.return_value = mock_child
 
             result = json.loads(delegate_task(goal="Test max iter", parent_agent=parent))
-            self.assertEqual(result["results"][0]["exit_reason"], "max_iterations")
+            self.assertEqual(result["results"][0]["status"], "failed")
+            self.assertEqual(result["results"][0]["exit_reason"], "failed_no_final")
 
 
 class TestSubagentCostRollup(unittest.TestCase):
