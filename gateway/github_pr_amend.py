@@ -42,6 +42,7 @@ class GitHubPrAmendRequest:
     body: str
     source_kind: str
     source_id: str
+    source_node_id: str = ""
     source_url: str = ""
     review_state: str = ""
     review_id: str = ""
@@ -242,6 +243,7 @@ def extract_request(
         pr_number = _require_int(_dig(payload, "issue", "number"), "issue.number")
         body = str(_dig(payload, "comment", "body", default="") or "")
         source_id = str(_dig(payload, "comment", "id", default="") or "")
+        source_node_id = str(_dig(payload, "comment", "node_id", default="") or "")
         source_url = str(_dig(payload, "comment", "html_url", default="") or "")
         return GitHubPrAmendRequest(
             event_type=event_type,
@@ -252,6 +254,7 @@ def extract_request(
             body=body,
             source_kind="issue_comment",
             source_id=source_id,
+            source_node_id=source_node_id,
             source_url=source_url,
             delivery_id=delivery_id,
         )
@@ -275,6 +278,7 @@ def extract_request(
             body=body,
             source_kind="review_comment",
             source_id=str(_dig(payload, "comment", "id", default="") or ""),
+            source_node_id=str(_dig(payload, "comment", "node_id", default="") or ""),
             source_url=str(_dig(payload, "comment", "html_url", default="") or ""),
             review_id=str(_dig(payload, "comment", "pull_request_review_id", default="") or ""),
             path=str(_dig(payload, "comment", "path", default="") or ""),
@@ -297,6 +301,7 @@ def extract_request(
             body=body,
             source_kind="review",
             source_id=str(_dig(payload, "review", "id", default="") or ""),
+            source_node_id=str(_dig(payload, "review", "node_id", default="") or ""),
             source_url=str(_dig(payload, "review", "html_url", default="") or ""),
             review_id=str(_dig(payload, "review", "id", default="") or ""),
             review_state=str(_dig(payload, "review", "state", default="") or ""),
@@ -760,6 +765,7 @@ def build_pr_amend_discord_card(
             "github_pr_target_repo": head_repo,
             "github_pr_target_url": f"https://github.com/{head_repo}.git" if head_repo else "",
             "base_branch": head_ref,
+            **_reserve_solidity_skill_hint(base_repo, head_repo),
             "github_pr_amend": {
                 "artifact_path": str(artifact_path),
                 "delivery_id": artifact.get("delivery_id"),
@@ -778,14 +784,110 @@ def build_pr_amend_discord_card(
     }
 
 
+def _reserve_solidity_skill_hint(base_repo: str, head_repo: str) -> dict[str, Any]:
+    repos = {str(base_repo or "").lower(), str(head_repo or "").lower()}
+    if not any(repo.startswith("reserve-protocol/") for repo in repos):
+        return {}
+    if not any(
+        token in repo
+        for repo in repos
+        for token in ("solidity", "protocol", "contracts", "dtf")
+    ):
+        return {}
+    return {
+        "worker_skill_hints": ["reserve-solidity-style"],
+        "worker_context_hints": [
+            "For reserve-protocol Solidity work, load and follow the reserve-solidity-style skill before implementation."
+        ],
+    }
+
+
+def resolve_pr_amend_existing_discord_route(artifact: dict[str, Any]) -> dict[str, Any]:
+    """Find the Discord worker route that originally produced this PR, if any."""
+
+    pr_url = str(_dig(artifact, "pull_request", "html_url", default="") or "").strip()
+    head_repo = str(_dig(artifact, "pull_request", "head", "repo", default="") or "").strip()
+    head_ref = str(_dig(artifact, "pull_request", "head", "ref", default="") or "").strip()
+    if not pr_url and not (head_repo and head_ref):
+        return {}
+    try:
+        from hermes_cli import kanban_db
+        from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
+    except Exception as exc:
+        logger.debug("[github-pr-amend] Discord worker-board resolver unavailable: %s", exc)
+        return {}
+
+    try:
+        boards = kanban_db.list_boards(include_archived=True)
+    except Exception as exc:
+        logger.debug("[github-pr-amend] Discord worker-board list failed: %s", exc)
+        return {}
+
+    for board_meta in boards:
+        if not isinstance(board_meta, dict):
+            continue
+        board = str(board_meta.get("slug") or board_meta.get("id") or board_meta.get("name") or "").strip()
+        metadata = board_meta
+        if board:
+            try:
+                metadata = kanban_db.read_board_metadata(board)
+            except Exception:
+                metadata = board_meta
+        worker = metadata.get(DISCORD_WORKER_META_KEY) if isinstance(metadata, dict) else None
+        if not isinstance(worker, dict):
+            continue
+        context = worker.get("project_context") if isinstance(worker.get("project_context"), dict) else {}
+        github_context = context.get("github_pr_amend") if isinstance(context.get("github_pr_amend"), dict) else {}
+        candidates = {
+            str(worker.get("pr_url") or "").strip(),
+            str(worker.get("github_pr_url") or "").strip(),
+            str(context.get("pr_url") or "").strip(),
+            str(github_context.get("upstream_pr_url") or "").strip(),
+        }
+        repo_matches = head_repo and head_repo in {
+            str(worker.get("github_pr_target_repo") or "").strip(),
+            str(context.get("github_pr_target_repo") or "").strip(),
+            str(github_context.get("head_repo") or "").strip(),
+        }
+        ref_matches = head_ref and head_ref in {
+            str(worker.get("base_branch") or "").strip(),
+            str(context.get("base_branch") or "").strip(),
+            str(github_context.get("head_ref") or "").strip(),
+        }
+        if pr_url not in candidates and not (repo_matches and ref_matches):
+            continue
+        thread_id = str(worker.get("thread_id") or worker.get("discord_thread_id") or "").strip()
+        message_id = str(
+            worker.get("discord_top_level_message_id")
+            or worker.get("summary_message_id")
+            or worker.get("source_message_id")
+            or worker.get("request_id")
+            or ""
+        ).strip()
+        board_slug = str(board or worker.get("discord_board") or "").strip()
+        channel_id = str(worker.get("parent_channel_id") or worker.get("chat_id") or "").strip()
+        if thread_id and message_id and board_slug and channel_id:
+            return {
+                "discord_channel_id": channel_id,
+                "discord_top_level_message_id": message_id,
+                "discord_thread_id": thread_id,
+                "discord_thread_url": str(worker.get("thread_url") or worker.get("discord_thread_url") or ""),
+                "discord_board": board_slug,
+                "discord_board_public_url": str(worker.get("public_url") or worker.get("discord_board_public_url") or ""),
+                "discord_guild_id": str(worker.get("guild_id") or worker.get("discord_guild_id") or ""),
+            }
+    return {}
+
+
 def publish_and_activate_pr_amend_intake(
     card: dict[str, Any],
     *,
     channel_id: str,
+    existing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from self_improvement.discord_publish import activate_approved_proposal, publish_approved_proposal
 
-    route = publish_approved_proposal(card, channel_id=channel_id)
+    route = publish_approved_proposal(card, channel_id=channel_id, existing=existing)
     if route is None:
         raise RuntimeError("Discord publish returned no route")
     if route.error:

@@ -752,6 +752,7 @@ class WebhookAdapter(BasePlatformAdapter):
             policy_from_route,
             preflight_request,
             publish_and_activate_pr_amend_intake,
+            resolve_pr_amend_existing_discord_route,
             resolve_pr_amend_discord_channel,
             write_pr_amend_intake_artifact,
         )
@@ -879,8 +880,31 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             artifact_path = write_pr_amend_intake_artifact(artifact)
             channel_id = resolve_pr_amend_discord_channel(route_config, request)
+            existing_route = resolve_pr_amend_existing_discord_route(artifact)
+            if existing_route:
+                channel_id = str(existing_route.get("discord_channel_id") or channel_id or "").strip()
+            degraded_reason = ""
             if not channel_id:
-                raise RuntimeError("No Discord channel resolved for GitHub PR-amend intake")
+                degraded_reason = "missing_discord_route"
+            elif request.source_kind in {"review", "review_comment"} and not existing_route:
+                degraded_reason = "missing_original_discord_thread"
+            if degraded_reason:
+                self._github_pr_amend_locks.discard(decision.lock_key)
+                self._github_pr_amend_lock_boards.pop(decision.lock_key, None)
+                await self._safe_github_pr_amend_reaction(request, "-1")
+                return web.json_response(
+                    {
+                        "status": "degraded",
+                        "route": route_name,
+                        "reason": degraded_reason,
+                        "discord_dispatch": "skipped",
+                        "delivery_id": delivery_id,
+                        "lock_key": decision.lock_key,
+                        "pr": request.pr_number,
+                        "artifact_path": str(artifact_path),
+                    },
+                    status=202,
+                )
             card = build_pr_amend_discord_card(artifact, artifact_path=artifact_path)
             await self._safe_github_pr_amend_reaction(request, "eyes")
             await self._safe_github_pr_amend_reaction(request, "rocket")
@@ -888,6 +912,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 publish_and_activate_pr_amend_intake,
                 card,
                 channel_id=channel_id,
+                existing=existing_route or None,
             )
             if not str(discord_metadata.get("discord_board") or "").strip():
                 raise RuntimeError("Discord activation did not return a worker board")
@@ -946,10 +971,6 @@ class WebhookAdapter(BasePlatformAdapter):
             return f"repos/{repo}/issues/comments/{source_id}/reactions"
         if source_kind == "review_comment" and source_id:
             return f"repos/{repo}/pulls/comments/{source_id}/reactions"
-        if source_kind == "review":
-            # GitHub does not expose a stable reaction endpoint for PR review
-            # summary objects; react on the PR's issue timeline instead.
-            return f"repos/{repo}/issues/{getattr(request, 'pr_number', '')}/reactions"
         return ""
 
     async def _safe_github_pr_amend_reaction(self, request: Any, content: str) -> None:
@@ -968,6 +989,9 @@ class WebhookAdapter(BasePlatformAdapter):
 
     async def _add_github_pr_amend_reaction(self, request: Any, content: str) -> bool:
         """Add a GitHub reaction to the triggering object via ``gh api``."""
+        if getattr(request, "source_kind", "") == "review":
+            return await self._add_github_pr_amend_graphql_reaction(request, content)
+
         endpoint = self._github_pr_amend_reaction_endpoint(request)
         if not endpoint:
             logger.warning(
@@ -980,6 +1004,8 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return False
 
+        if await self._delete_prior_github_pr_amend_reactions(request, endpoint, content):
+            return True
         argv = [
             "gh",
             "api",
@@ -1035,6 +1061,296 @@ class WebhookAdapter(BasePlatformAdapter):
             content,
         )
         return True
+
+    def _github_pr_amend_graphql_reaction_content(self, content: str) -> str:
+        return {
+            "+1": "THUMBS_UP",
+            "-1": "THUMBS_DOWN",
+            "laugh": "LAUGH",
+            "confused": "CONFUSED",
+            "heart": "HEART",
+            "hooray": "HOORAY",
+            "rocket": "ROCKET",
+            "eyes": "EYES",
+        }.get(str(content or ""), "")
+
+    async def _add_github_pr_amend_graphql_reaction(self, request: Any, content: str) -> bool:
+        """Add a reaction to a PR review summary via GraphQL Reactable nodes."""
+
+        node_id = str(getattr(request, "source_node_id", "") or "").strip()
+        reaction_content = self._github_pr_amend_graphql_reaction_content(content)
+        if not node_id or not reaction_content:
+            logger.warning(
+                "[github-pr-amend] no GraphQL reaction target repo=%s pr=%s kind=%s id=%s node=%s content=%s",
+                getattr(request, "repo", ""),
+                getattr(request, "pr_number", ""),
+                getattr(request, "source_kind", ""),
+                getattr(request, "source_id", ""),
+                node_id,
+                content,
+            )
+            return False
+
+        existing = await self._github_pr_amend_graphql_viewer_reactions(node_id)
+        status_reactions = {"EYES", "ROCKET", "THUMBS_DOWN"}
+        if existing is not None:
+            for prior in sorted(status_reactions - {reaction_content}):
+                if prior in existing:
+                    await self._remove_github_pr_amend_graphql_reaction(node_id, prior)
+            if reaction_content in existing:
+                return True
+
+        query = """
+mutation($subjectId: ID!, $content: ReactionContent!) {
+  addReaction(input: {subjectId: $subjectId, content: $content}) {
+    reaction { content }
+    subject { id }
+  }
+}
+""".strip()
+        return await self._run_github_pr_amend_graphql(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"query={query}",
+                "-F",
+                f"subjectId={node_id}",
+                "-F",
+                f"content={reaction_content}",
+            ],
+            action="add",
+            node_id=node_id,
+            content=reaction_content,
+        )
+
+    async def _github_pr_amend_graphql_viewer_reactions(self, node_id: str) -> set[str] | None:
+        query = """
+query($id: ID!) {
+  node(id: $id) {
+    ... on Reactable {
+      reactionGroups { content viewerHasReacted }
+    }
+  }
+}
+""".strip()
+        argv = ["gh", "api", "graphql", "-f", f"query={query}", "-F", f"id={node_id}"]
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("[github-pr-amend] GraphQL reaction query failed node=%s error=%s", node_id, exc)
+            return None
+        if result.returncode != 0:
+            logger.warning(
+                "[github-pr-amend] gh GraphQL reaction query failed node=%s exit=%s stderr=%s",
+                node_id,
+                result.returncode,
+                (result.stderr or "").strip()[:500],
+            )
+            return None
+        try:
+            data = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            logger.warning("[github-pr-amend] gh GraphQL reaction query returned invalid JSON node=%s", node_id)
+            return None
+        if data.get("errors"):
+            logger.warning("[github-pr-amend] gh GraphQL reaction query returned errors node=%s errors=%s", node_id, data.get("errors"))
+            return None
+        node = data.get("data", {}).get("node") if isinstance(data.get("data"), dict) else None
+        groups = node.get("reactionGroups") if isinstance(node, dict) else None
+        if not isinstance(groups, list):
+            return None
+        return {
+            str(group.get("content") or "")
+            for group in groups
+            if isinstance(group, dict) and group.get("viewerHasReacted")
+        }
+
+    async def _remove_github_pr_amend_graphql_reaction(self, node_id: str, reaction_content: str) -> bool:
+        query = """
+mutation($subjectId: ID!, $content: ReactionContent!) {
+  removeReaction(input: {subjectId: $subjectId, content: $content}) {
+    subject { id }
+  }
+}
+""".strip()
+        return await self._run_github_pr_amend_graphql(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"query={query}",
+                "-F",
+                f"subjectId={node_id}",
+                "-F",
+                f"content={reaction_content}",
+            ],
+            action="remove",
+            node_id=node_id,
+            content=reaction_content,
+        )
+
+    async def _run_github_pr_amend_graphql(
+        self,
+        argv: list[str],
+        *,
+        action: str,
+        node_id: str,
+        content: str,
+    ) -> bool:
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning(
+                "[github-pr-amend] GraphQL reaction %s failed node=%s content=%s error=%s",
+                action,
+                node_id,
+                content,
+                exc,
+            )
+            return False
+        if result.returncode != 0:
+            logger.warning(
+                "[github-pr-amend] gh GraphQL reaction %s failed node=%s content=%s exit=%s stderr=%s",
+                action,
+                node_id,
+                content,
+                result.returncode,
+                (result.stderr or "").strip()[:500],
+            )
+            return False
+        try:
+            data = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            logger.warning(
+                "[github-pr-amend] gh GraphQL reaction %s returned invalid JSON node=%s content=%s",
+                action,
+                node_id,
+                content,
+            )
+            return False
+        if data.get("errors"):
+            logger.warning(
+                "[github-pr-amend] gh GraphQL reaction %s returned errors node=%s content=%s errors=%s",
+                action,
+                node_id,
+                content,
+                data.get("errors"),
+            )
+            return False
+        logger.info("[github-pr-amend] GraphQL reaction %s node=%s content=%s", action, node_id, content)
+        return True
+
+    async def _delete_prior_github_pr_amend_reactions(
+        self,
+        request: Any,
+        endpoint: str,
+        content: str,
+    ) -> bool:
+        status_reactions = {"eyes", "rocket", "-1"}
+        if content not in status_reactions:
+            return False
+        list_argv = [
+            "gh",
+            "api",
+            endpoint,
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "X-GitHub-Api-Version: 2022-11-28",
+        ]
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                list_argv,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("[github-pr-amend] reaction list failed endpoint=%s error=%s", endpoint, exc)
+            return False
+        if result.returncode != 0:
+            logger.warning(
+                "[github-pr-amend] gh reaction list failed endpoint=%s exit=%s stderr=%s",
+                endpoint,
+                result.returncode,
+                (result.stderr or "").strip()[:500],
+            )
+            return False
+        try:
+            reactions = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError:
+            logger.warning("[github-pr-amend] gh reaction list returned invalid JSON endpoint=%s", endpoint)
+            return False
+        if not isinstance(reactions, list):
+            return False
+        already_present = False
+        for reaction in reactions:
+            if not isinstance(reaction, dict):
+                continue
+            prior = str(reaction.get("content") or "")
+            if prior not in status_reactions:
+                continue
+            user = reaction.get("user") if isinstance(reaction.get("user"), dict) else {}
+            if str(user.get("type") or "").lower() != "bot":
+                continue
+            if prior == content:
+                already_present = True
+                continue
+            reaction_id = str(reaction.get("id") or "").strip()
+            if not reaction_id:
+                continue
+            delete_argv = [
+                "gh",
+                "api",
+                "-X",
+                "DELETE",
+                f"{endpoint}/{reaction_id}",
+                "-H",
+                "Accept: application/vnd.github+json",
+                "-H",
+                "X-GitHub-Api-Version: 2022-11-28",
+            ]
+            try:
+                deleted = await asyncio.to_thread(
+                    subprocess.run,
+                    delete_argv,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                logger.warning(
+                    "[github-pr-amend] reaction delete failed endpoint=%s reaction=%s error=%s",
+                    endpoint,
+                    reaction_id,
+                    exc,
+                )
+                continue
+            if deleted.returncode != 0:
+                logger.warning(
+                    "[github-pr-amend] gh reaction delete failed endpoint=%s reaction=%s exit=%s stderr=%s",
+                    endpoint,
+                    reaction_id,
+                    deleted.returncode,
+                    (deleted.stderr or "").strip()[:500],
+                )
+        return already_present
 
     # ------------------------------------------------------------------
     # Signature validation

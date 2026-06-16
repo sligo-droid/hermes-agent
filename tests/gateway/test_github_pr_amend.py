@@ -11,14 +11,18 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from hermes_cli import kanban_db
+from hermes_cli.discord_worker_boards import _planner_instructions
 from gateway.github_pr_amend import (
     GitHubPrAmendPolicy,
     build_pr_amend_intake_artifact,
+    build_pr_amend_discord_card,
     evaluate_request,
     extract_request,
     fetch_pr_related_context,
     policy_from_route,
     preflight_request,
+    resolve_pr_amend_existing_discord_route,
     write_pr_amend_intake_artifact,
 )
 from gateway.config import PlatformConfig
@@ -75,6 +79,7 @@ ISSUE_COMMENT_PAYLOAD = {
     },
     "comment": {
         "id": 4700001,
+        "node_id": "IC_kwDOReviewIssueComment",
         "html_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#issuecomment-4700001",
         "body": "@sligo-droid please update the tests for this change.",
     },
@@ -88,6 +93,7 @@ REVIEW_COMMENT_PAYLOAD = {
     "pull_request": {"number": 182},
     "comment": {
         "id": 4800001,
+        "node_id": "PRRC_kwDOReviewComment",
         "html_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#discussion_r4800001",
         "body": "@sligo-droid use the existing helper here.",
         "path": "src/example.ts",
@@ -105,6 +111,8 @@ REVIEW_PAYLOAD = {
     "pull_request": {"number": 182, "user": {"login": "sligo-droid"}},
     "review": {
         "id": 4900001,
+        "node_id": "PRR_kwDOReviewSummary",
+        "url": "https://api.github.com/repos/reserve-protocol/reserve-index-dtf/pulls/182/reviews/4900001",
         "html_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#pullrequestreview-4900001",
         "state": "changes_requested",
         "body": "@sligo-droid please address the requested changes.",
@@ -154,6 +162,20 @@ class TestGitHubPrAmendPolicy:
         assert request.source_kind == "review"
         assert request.review_state == "changes_requested"
         assert request.review_id == "4900001"
+
+    def test_preflight_rejects_non_tbrent_review_before_pr_lookup(self):
+        payload = json.loads(json.dumps(REVIEW_PAYLOAD))
+        payload["sender"]["login"] = "stranger"
+        request = extract_request("pull_request_review", payload)
+        assert preflight_request(request, GitHubPrAmendPolicy()) == "sender 'stranger' is not allowlisted"
+
+    def test_preflight_rejects_non_tbrent_missing_mention_review_before_pr_lookup(self):
+        payload = json.loads(json.dumps(REVIEW_PAYLOAD))
+        payload["sender"]["login"] = "stranger"
+        payload["pull_request"].pop("user")
+        payload["review"]["body"] = "please address the requested changes."
+        request = extract_request("pull_request_review", payload)
+        assert preflight_request(request, GitHubPrAmendPolicy()) == "sender 'stranger' is not allowlisted"
 
     def test_accepts_tbrent_mention_on_canary_pr(self):
         policy = policy_from_route(ROUTE)
@@ -327,6 +349,78 @@ class TestGitHubPrAmendPolicy:
         assert "open and merge a pr in the `sligo-droid` fork" in instructions
         assert "final public github output is pushed commits/prs plus reactions only" in instructions
 
+    def test_reserve_protocol_pr_amend_card_includes_solidity_skill_hint(self, tmp_path):
+        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD, delivery_id="delivery-card")
+        policy = policy_from_route(ROUTE)
+        decision = evaluate_request(request, PR_INFO, policy)
+        artifact = build_pr_amend_intake_artifact(request, decision, policy, PR_INFO, ISSUE_COMMENT_PAYLOAD)
+
+        card = build_pr_amend_discord_card(artifact, artifact_path=tmp_path / "intake.json")
+
+        assert card["project_context"]["worker_skill_hints"] == ["reserve-solidity-style"]
+        assert "reserve-solidity-style" in card["project_context"]["worker_context_hints"][0]
+        worker = {"project_context": card["project_context"]}
+        assert any("reserve-solidity-style" in item for item in _planner_instructions(worker))
+
+    def test_non_reserve_pr_amend_card_omits_solidity_skill_hint(self, tmp_path):
+        payload = json.loads(json.dumps(ISSUE_COMMENT_PAYLOAD))
+        payload["repository"]["full_name"] = "acme/webapp"
+        pr_info = json.loads(json.dumps(PR_INFO))
+        pr_info["base"]["repo"]["full_name"] = "acme/webapp"
+        pr_info["head"]["repo"]["full_name"] = "sligo-droid/webapp"
+        policy = GitHubPrAmendPolicy(allowed_base_repos=("acme/*",), canary_prs={})
+        request = extract_request("issue_comment", payload, delivery_id="delivery-card")
+        decision = evaluate_request(request, pr_info, policy)
+        artifact = build_pr_amend_intake_artifact(request, decision, policy, pr_info, payload)
+
+        card = build_pr_amend_discord_card(artifact, artifact_path=tmp_path / "intake.json")
+
+        assert "worker_skill_hints" not in card["project_context"]
+        worker = {"project_context": card["project_context"]}
+        assert not any("reserve-solidity-style" in item for item in _planner_instructions(worker))
+
+    def test_resolves_existing_discord_route_from_worker_board_metadata(self, monkeypatch):
+        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD, delivery_id="delivery-route")
+        policy = policy_from_route(ROUTE)
+        decision = evaluate_request(request, PR_INFO, policy)
+        artifact = build_pr_amend_intake_artifact(request, decision, policy, PR_INFO, ISSUE_COMMENT_PAYLOAD)
+
+        monkeypatch.setattr(
+            kanban_db,
+            "list_boards",
+            lambda include_archived=False: [{"slug": "discord-thread-123"}],
+        )
+        monkeypatch.setattr(
+            kanban_db,
+            "read_board_metadata",
+            lambda board: {
+                "discord_worker": {
+                    "thread_id": "thread-123",
+                    "source_message_id": "user-request-msg",
+                    "summary_message_id": "bot-summary-msg",
+                    "parent_channel_id": "channel-123",
+                    "guild_id": "guild-123",
+                    "public_url": "https://workers.test/thread-123",
+                    "project_context": {
+                        "github_pr_target_repo": "sligo-droid/reserve-index-dtf",
+                        "base_branch": "feat/irrevocable-fee-recipients",
+                    },
+                }
+            },
+        )
+
+        route = resolve_pr_amend_existing_discord_route(artifact)
+
+        assert route == {
+            "discord_channel_id": "channel-123",
+            "discord_top_level_message_id": "bot-summary-msg",
+            "discord_thread_id": "thread-123",
+            "discord_thread_url": "",
+            "discord_board": "discord-thread-123",
+            "discord_board_public_url": "https://workers.test/thread-123",
+            "discord_guild_id": "guild-123",
+        }
+
     def test_fetch_pr_related_context_fetches_paginated_lists(self, monkeypatch):
         calls = []
 
@@ -387,11 +481,6 @@ class TestGitHubPrAmendWebhookRoute:
                 REVIEW_COMMENT_PAYLOAD,
                 "repos/reserve-protocol/reserve-index-dtf/pulls/comments/4800001/reactions",
             ),
-            (
-                "pull_request_review",
-                REVIEW_PAYLOAD,
-                "repos/reserve-protocol/reserve-index-dtf/issues/182/reactions",
-            ),
         ],
     )
     async def test_github_pr_amend_reaction_endpoint_mapping(
@@ -404,11 +493,150 @@ class TestGitHubPrAmendWebhookRoute:
         with patch("gateway.platforms.webhook.subprocess.run", return_value=completed) as run:
             assert await adapter._add_github_pr_amend_reaction(request, "eyes") is True
 
-        argv = run.call_args.args[0]
+        argv = run.call_args_list[-1].args[0]
         assert endpoint in argv
         assert "content=eyes" in argv
         assert "Accept: application/vnd.github+json" in argv
         assert "X-GitHub-Api-Version: 2022-11-28" in argv
+
+    @pytest.mark.asyncio
+    async def test_github_pr_amend_review_reaction_uses_graphql_review_node(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        request = extract_request("pull_request_review", REVIEW_PAYLOAD)
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            joined = "\n".join(argv)
+            if "reactionGroups" in joined:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "data": {
+                                "node": {
+                                    "reactionGroups": [
+                                        {"content": "EYES", "viewerHasReacted": False},
+                                        {"content": "ROCKET", "viewerHasReacted": False},
+                                    ]
+                                }
+                            }
+                        }
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"data": {}}), stderr="")
+
+        with patch("gateway.platforms.webhook.subprocess.run", side_effect=fake_run):
+            assert await adapter._add_github_pr_amend_reaction(request, "eyes") is True
+
+        assert all("pulls/182/reviews/4900001/reactions" not in "\n".join(call) for call in calls)
+        assert calls[0][:3] == ["gh", "api", "graphql"]
+        assert f"id={REVIEW_PAYLOAD['review']['node_id']}" in calls[0]
+        assert calls[1][:3] == ["gh", "api", "graphql"]
+        assert f"subjectId={REVIEW_PAYLOAD['review']['node_id']}" in calls[1]
+        assert "content=EYES" in calls[1]
+
+    @pytest.mark.asyncio
+    async def test_github_pr_amend_reaction_transition_deletes_prior_bot_status(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD)
+        endpoint = "repos/reserve-protocol/reserve-index-dtf/issues/comments/4700001/reactions"
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            if argv[:2] == ["gh", "api"] and "-X" not in argv:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=json.dumps(
+                        [
+                            {"id": 1, "content": "eyes", "user": {"type": "Bot"}},
+                            {"id": 2, "content": "eyes", "user": {"type": "User"}},
+                            {"id": 3, "content": "heart", "user": {"type": "Bot"}},
+                        ]
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+        with patch("gateway.platforms.webhook.subprocess.run", side_effect=fake_run):
+            assert await adapter._add_github_pr_amend_reaction(request, "rocket") is True
+
+        assert calls[0] == [
+            "gh",
+            "api",
+            endpoint,
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "X-GitHub-Api-Version: 2022-11-28",
+        ]
+        assert calls[1][:5] == ["gh", "api", "-X", "DELETE", f"{endpoint}/1"]
+        assert calls[2][0:4] == ["gh", "api", "-X", "POST"]
+        assert f"{endpoint}/2" not in calls[1]
+        assert all(f"{endpoint}/3" not in call for call in calls)
+
+    @pytest.mark.asyncio
+    async def test_github_pr_amend_review_reaction_transition_uses_graphql_viewer_reactions(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        request = extract_request("pull_request_review", REVIEW_PAYLOAD)
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            joined = "\n".join(argv)
+            if "reactionGroups" in joined:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "data": {
+                                "node": {
+                                    "reactionGroups": [
+                                        {"content": "EYES", "viewerHasReacted": True},
+                                        {"content": "ROCKET", "viewerHasReacted": False},
+                                        {"content": "THUMBS_DOWN", "viewerHasReacted": False},
+                                    ]
+                                }
+                            }
+                        }
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"data": {}}), stderr="")
+
+        with patch("gateway.platforms.webhook.subprocess.run", side_effect=fake_run):
+            assert await adapter._add_github_pr_amend_reaction(request, "rocket") is True
+
+        assert len(calls) == 3
+        assert "reactionGroups" in "\n".join(calls[0])
+        assert "removeReaction" in "\n".join(calls[1])
+        assert f"subjectId={REVIEW_PAYLOAD['review']['node_id']}" in calls[1]
+        assert "content=EYES" in calls[1]
+        assert "addReaction" in "\n".join(calls[2])
+        assert "content=ROCKET" in calls[2]
+
+    @pytest.mark.asyncio
+    async def test_github_pr_amend_reaction_list_failure_still_posts(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD)
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            if argv[:2] == ["gh", "api"] and "-X" not in argv:
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="nope")
+            return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+        with patch("gateway.platforms.webhook.subprocess.run", side_effect=fake_run):
+            assert await adapter._add_github_pr_amend_reaction(request, "rocket") is True
+
+        assert len(calls) == 2
+        assert calls[-1][0:4] == ["gh", "api", "-X", "POST"]
 
     @pytest.mark.asyncio
     async def test_signed_issue_comment_routes_to_discord_worker_board(self, tmp_path, monkeypatch):
@@ -464,6 +692,7 @@ class TestGitHubPrAmendWebhookRoute:
         assert "sligo-droid" in artifact["operational_instructions"]
         publish.assert_called_once()
         assert publish.call_args.kwargs["channel_id"] == "channel-123"
+        assert publish.call_args.kwargs["existing"] is None
         card = publish.call_args.args[0]
         assert card["kind"] == "github_pr_amend"
         assert "Open and merge a PR" in card["body"]
@@ -505,6 +734,33 @@ class TestGitHubPrAmendWebhookRoute:
         assert resp.status == 200
         assert data["status"] == "ignored"
         assert "not allowlisted" in data["reason"]
+        fetch_pr_info.assert_not_called()
+        adapter._add_github_pr_amend_reaction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_tbrent_review_missing_mention_is_ignored_before_pr_lookup(self):
+        payload = json.loads(json.dumps(REVIEW_PAYLOAD))
+        payload["sender"]["login"] = "stranger"
+        payload["pull_request"].pop("user")
+        payload["review"]["body"] = "please address the requested changes."
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        adapter._add_github_pr_amend_reaction = AsyncMock()
+
+        with patch("gateway.github_pr_amend.fetch_pr_info") as fetch_pr_info:
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                resp = await cli.post(
+                    "/webhooks/github-pr-amend",
+                    json=payload,
+                    headers={
+                        "X-GitHub-Event": "pull_request_review",
+                        "X-GitHub-Delivery": "delivery-review-stranger-implicit",
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["status"] == "ignored"
+        assert data["reason"] == "sender 'stranger' is not allowlisted"
         fetch_pr_info.assert_not_called()
         adapter._add_github_pr_amend_reaction.assert_not_called()
 
@@ -561,7 +817,7 @@ class TestGitHubPrAmendWebhookRoute:
         assert data["status"] == "queued"
 
     @pytest.mark.asyncio
-    async def test_unresolved_discord_channel_fails_clearly_before_worker_board_publish(self, tmp_path, monkeypatch):
+    async def test_unresolved_discord_channel_degrades_before_worker_board_publish(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
         adapter = _make_adapter({"github-pr-amend": ROUTE})
         adapter._add_github_pr_amend_reaction = AsyncMock(return_value=True)
@@ -570,7 +826,7 @@ class TestGitHubPrAmendWebhookRoute:
             "gateway.github_pr_amend.fetch_pr_related_context", return_value=PR_RELATED_CONTEXT
         ), patch(
             "gateway.github_pr_amend.resolve_pr_amend_discord_channel", return_value=""
-        ):
+        ), patch("gateway.github_pr_amend.publish_and_activate_pr_amend_intake") as publish:
             async with TestClient(TestServer(_create_app(adapter))) as cli:
                 resp = await cli.post(
                     "/webhooks/github-pr-amend",
@@ -582,11 +838,14 @@ class TestGitHubPrAmendWebhookRoute:
                 )
                 data = await resp.json()
 
-        assert resp.status == 500
-        assert data["status"] == "error"
-        assert data["error"] == "Failed to queue PR amendment worker board"
+        assert resp.status == 202
+        assert data["status"] == "degraded"
+        assert data["reason"] == "missing_discord_route"
+        assert data["discord_dispatch"] == "skipped"
         assert Path(data["artifact_path"]).is_file()
         assert adapter._add_github_pr_amend_reaction.await_args.args[1] == "-1"
+        assert data["lock_key"] not in adapter._github_pr_amend_locks
+        publish.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_branch_lock_rejects_concurrent_job(self, tmp_path):
@@ -613,15 +872,23 @@ class TestGitHubPrAmendWebhookRoute:
     @pytest.mark.asyncio
     async def test_review_submitted_changes_requested_is_accepted(self, tmp_path):
         adapter = _make_adapter({"github-pr-amend": ROUTE})
+        existing = {
+            "discord_channel_id": "channel-123",
+            "discord_top_level_message_id": "msg-123",
+            "discord_thread_id": "thread-123",
+            "discord_board": "board",
+        }
 
         with patch("gateway.github_pr_amend.fetch_pr_info", return_value=PR_INFO), patch(
             "gateway.github_pr_amend.fetch_pr_related_context", return_value=PR_RELATED_CONTEXT
         ), patch(
             "gateway.github_pr_amend.resolve_pr_amend_discord_channel", return_value="channel-123"
         ), patch(
+            "gateway.github_pr_amend.resolve_pr_amend_existing_discord_route", return_value=existing
+        ), patch(
             "gateway.github_pr_amend.publish_and_activate_pr_amend_intake",
             return_value={"discord_board": "board", "discord_thread_id": "thread"},
-        ):
+        ) as publish:
             async with TestClient(TestServer(_create_app(adapter))) as cli:
                 resp = await cli.post(
                     "/webhooks/github-pr-amend",
@@ -635,6 +902,41 @@ class TestGitHubPrAmendWebhookRoute:
 
         assert resp.status == 202
         assert data["status"] == "queued"
+        assert publish.call_args.kwargs["existing"] == existing
+
+    @pytest.mark.asyncio
+    async def test_review_without_original_discord_thread_degrades(self, tmp_path):
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+        try:
+            adapter = _make_adapter({"github-pr-amend": ROUTE})
+            adapter._add_github_pr_amend_reaction = AsyncMock(return_value=True)
+
+            with patch("gateway.github_pr_amend.fetch_pr_info", return_value=PR_INFO), patch(
+                "gateway.github_pr_amend.fetch_pr_related_context", return_value=PR_RELATED_CONTEXT
+            ), patch(
+                "gateway.github_pr_amend.resolve_pr_amend_discord_channel", return_value="channel-123"
+            ), patch(
+                "gateway.github_pr_amend.resolve_pr_amend_existing_discord_route", return_value={}
+            ), patch("gateway.github_pr_amend.publish_and_activate_pr_amend_intake") as publish:
+                async with TestClient(TestServer(_create_app(adapter))) as cli:
+                    resp = await cli.post(
+                        "/webhooks/github-pr-amend",
+                        json=REVIEW_PAYLOAD,
+                        headers={
+                            "X-GitHub-Event": "pull_request_review",
+                            "X-GitHub-Delivery": "delivery-review-no-thread",
+                        },
+                    )
+                    data = await resp.json()
+
+            assert resp.status == 202
+            assert data["status"] == "degraded"
+            assert data["reason"] == "missing_original_discord_thread"
+            assert Path(data["artifact_path"]).is_file()
+            publish.assert_not_called()
+        finally:
+            monkeypatch.undo()
 
     @pytest.mark.asyncio
     async def test_review_submitted_missing_mention_on_sligo_droid_authored_pr_is_accepted(self, tmp_path):
@@ -643,10 +945,19 @@ class TestGitHubPrAmendWebhookRoute:
         payload["review"]["body"] = "please address the requested changes."
         adapter = _make_adapter({"github-pr-amend": ROUTE})
 
+        existing = {
+            "discord_channel_id": "channel-123",
+            "discord_top_level_message_id": "msg-123",
+            "discord_thread_id": "thread-123",
+            "discord_board": "board",
+        }
+
         with patch("gateway.github_pr_amend.fetch_pr_info", return_value=PR_INFO), patch(
             "gateway.github_pr_amend.fetch_pr_related_context", return_value=PR_RELATED_CONTEXT
         ), patch(
             "gateway.github_pr_amend.resolve_pr_amend_discord_channel", return_value="channel-123"
+        ), patch(
+            "gateway.github_pr_amend.resolve_pr_amend_existing_discord_route", return_value=existing
         ), patch(
             "gateway.github_pr_amend.publish_and_activate_pr_amend_intake",
             return_value={"discord_board": "board", "discord_thread_id": "thread"},
