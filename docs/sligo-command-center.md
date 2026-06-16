@@ -21,7 +21,7 @@ This code change only adds project/read-model support. Live Hermes recommendatio
 Canonical Sligo-host routes:
 
 - `/sligo` — overview
-- `/sligo/inbox` — proposals, parse failures, and blocked items needing operator attention
+- `/sligo/inbox` — proposed/decision Work Items and blocked items needing operator attention; source-only cron run diagnostics stay in `/sligo/sources` and metrics unless promoted to a Work Item
 - `/sligo/work` — accepted/queued/running/review/blocked work items
 - `/sligo/completed` — completed/shipped work items
 - `/sligo/archive` — archived/historical work items and board rollups
