@@ -1848,7 +1848,23 @@ def _github_repo_from_url(url: str) -> Optional[str]:
     return None
 
 
+def _github_repo_from_value(value: object) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if re.match(r"^[^/\s]+/[^/\s]+$", raw):
+        return raw.removesuffix(".git")
+    return _github_repo_from_url(raw)
+
+
 def _resolve_github_repo(worker: dict[str, Any], root: Path) -> Optional[str]:
+    context = worker.get("project_context") if isinstance(worker.get("project_context"), dict) else {}
+    for source in (context, worker):
+        for key in ("github_pr_target_repo", "pr_target_repo"):
+            repo = _github_repo_from_value(source.get(key))
+            if repo:
+                return repo
+
     try:
         remote = subprocess.run(
             ["git", "remote", "get-url", "origin"],
@@ -1864,7 +1880,6 @@ def _resolve_github_repo(worker: dict[str, Any], root: Path) -> Optional[str]:
         if repo:
             return repo
 
-    context = worker.get("project_context") if isinstance(worker.get("project_context"), dict) else {}
     for source in (context, worker):
         for key in ("github_url", "project_github_url", "repo_url", "repository_url"):
             repo = _github_repo_from_url(str(source.get(key) or ""))

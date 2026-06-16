@@ -381,6 +381,7 @@ def _project_context(card: dict[str, Any], channel_id: str) -> dict[str, Any]:
         channel_mapping = _project_mapping_for_channel(channel_id)
         if channel_mapping:
             mapping = {**mapping, **channel_mapping}
+    explicit_context = card.get("project_context") if isinstance(card.get("project_context"), dict) else {}
     context = {
         "project_name": str(mapping.get("project_name") or project),
         "project_path": mapping.get("project_path"),
@@ -390,6 +391,7 @@ def _project_context(card: dict[str, Any], channel_id: str) -> dict[str, Any]:
         "project_mapping_resolved": bool(mapping),
         "self_improvement_project": project,
         "self_improvement_prong": str(card.get("prong") or ""),
+        **explicit_context,
     }
     return {key: value for key, value in context.items() if value is not None}
 

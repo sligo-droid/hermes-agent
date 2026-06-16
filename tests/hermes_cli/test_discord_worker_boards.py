@@ -47,6 +47,29 @@ def test_ensure_discord_thread_board_creates_public_metadata(monkeypatch, tmp_pa
     assert worker["code_island_pending"] is False
 
 
+def test_worktree_base_start_ref_uses_remote_slash_branch(monkeypatch, tmp_path):
+    from hermes_cli import discord_worker_boards as dwb
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[-1] == "origin/feat/irrevocable-fee-recipients":
+            return type("Result", (), {"returncode": 0})()
+        return type("Result", (), {"returncode": 1})()
+
+    monkeypatch.setattr(dwb.subprocess, "run", fake_run)
+
+    assert (
+        dwb._worktree_base_start_ref(str(tmp_path), "feat/irrevocable-fee-recipients")
+        == "origin/feat/irrevocable-fee-recipients"
+    )
+    assert calls == [
+        ["git", "rev-parse", "--verify", "--quiet", "feat/irrevocable-fee-recipients"],
+        ["git", "rev-parse", "--verify", "--quiet", "origin/feat/irrevocable-fee-recipients"],
+    ]
+
+
 def test_old_discord_worker_boards_are_not_status_targets(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
