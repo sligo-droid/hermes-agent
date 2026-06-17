@@ -1953,6 +1953,11 @@ DEFAULT_CONFIG = {
             "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
             "docker_bin": "docker",
             "codex_home_root": "",
+            # Absolute workspace paths that Discord role workers must not reuse.
+            # Intended for explicit local quarantines, not broad worktree hygiene.
+            "excluded_workspaces": [
+                "/home/droid/workspaces/hermes-self-improvement-live-test",
+            ],
             "service_tier": "auto",  # auto | normal | fast; explicit role/env values win
             # Overall live role-worker cap per board. Planner/reviewer lanes
             # remain singleton; dev parallelism is controlled separately below.
