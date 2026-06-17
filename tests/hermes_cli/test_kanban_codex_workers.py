@@ -1050,6 +1050,21 @@ def test_codex_role_worker_pythonpath_prefers_runtime_venv_owner(monkeypatch, tm
     assert captured["cwd"] == str(project_worktree.resolve())
 
 
+def test_codex_role_worker_rejects_excluded_workspace(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    workspace = tmp_path / "workspaces" / "quarantined"
+    monkeypatch.setattr(
+        workers,
+        "_worker_config",
+        lambda: {"excluded_workspaces": [str(workspace)]},
+    )
+
+    with pytest.raises(RuntimeError, match="workspace is quarantined"):
+        workers.spawn_codex_worker(task, str(workspace), board=board.slug)
+
+
 def test_codex_role_worker_uses_systemd_worker_handle_when_enabled(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_workers as workers
     from hermes_cli import kanban_db

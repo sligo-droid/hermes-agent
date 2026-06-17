@@ -85,6 +85,28 @@ def _runner_kind(cfg: dict[str, Any]) -> str:
     return runner if runner in {"host", "docker"} else "host"
 
 
+def _excluded_worker_workspaces(cfg: dict[str, Any]) -> set[Path]:
+    raw = cfg.get("excluded_workspaces")
+    if isinstance(raw, str):
+        values = raw.split(os.pathsep)
+    elif isinstance(raw, (list, tuple, set)):
+        values = raw
+    else:
+        values = []
+    excluded: set[Path] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        excluded.add(Path(text).expanduser().resolve())
+    return excluded
+
+
+def _ensure_workspace_not_excluded(workspace_path: Path, cfg: dict[str, Any]) -> None:
+    if workspace_path in _excluded_worker_workspaces(cfg):
+        raise RuntimeError(f"Discord worker workspace is quarantined and not selectable: {workspace_path}")
+
+
 def _coding_backend(cfg: dict[str, Any]) -> str:
     try:
         from agent.opencode_worker import load_coding_worker_backend
@@ -380,6 +402,7 @@ def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None
     if role not in ROLE_ASSIGNEES:
         return None
     cfg = _worker_config()
+    _ensure_workspace_not_excluded(Path(workspace).expanduser().resolve(), cfg)
     configured_backend = _coding_backend(cfg)
     backend = _role_backend(role, configured_backend, task)
     settings = _role_runtime_settings(role, cfg, task)
