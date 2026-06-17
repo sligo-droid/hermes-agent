@@ -386,6 +386,44 @@ def _text_preview(*parts: Any, limit: int = 260) -> str:
     return text[: max(0, limit - 1)].rstrip() + "…"
 
 
+def _plain_text_section(title: str, value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return f"{title}\n{text}"
+
+
+def _full_description_from_sections(*sections: tuple[str, Any]) -> str | None:
+    rendered = [section for title, value in sections if (section := _plain_text_section(title, value))]
+    if not rendered:
+        return None
+    return "\n\n".join(rendered)
+
+
+def _source_excerpt_text(source_excerpts: Any) -> str:
+    if not isinstance(source_excerpts, list):
+        return ""
+    parts: list[str] = []
+    for excerpt in source_excerpts[:3]:
+        label = ""
+        if isinstance(excerpt, dict):
+            label = str(excerpt.get("label") or excerpt.get("url") or "").strip()
+            nested_excerpt = excerpt.get("excerpt")
+            nested: dict[str, Any] = nested_excerpt if isinstance(nested_excerpt, dict) else {}
+            text = str(
+                excerpt.get("text")
+                or excerpt.get("content")
+                or nested.get("text")
+                or nested.get("content")
+                or ""
+            ).strip()
+        else:
+            text = str(excerpt or "").strip()
+        if text:
+            parts.append(f"{label}\n{text}" if label else text)
+    return "\n\n".join(parts)
+
+
 def _worker_board_url(board: str | None, public_url: str | None = None) -> str | None:
     if public_url:
         candidate = str(public_url).rstrip("/")
@@ -930,11 +968,20 @@ def _proposal_work_item(
             execution["task_url"] = _worker_ticket_url(task_id, board=effective_board, public_url=str(public_url))
         elif worker_url_fallback:
             execution["task_url"] = str(worker_url_fallback)
+    source_excerpts = card.get("source_excerpts") or []
+    full_description = _full_description_from_sections(
+        ("Title", card.get("title")),
+        ("Summary", card.get("summary")),
+        ("Body", card.get("body")),
+        ("Rationale", card.get("rationale")),
+        ("Source excerpts", _source_excerpt_text(source_excerpts)),
+    )
     return {
         "id": f"self-improvement:{card['proposal_id']}",
         "title": card.get("title") or card.get("proposal_id"),
         "summary": card.get("summary") or _text_preview(card.get("body")),
         "body_preview": _text_preview(card.get("body"), card.get("rationale")),
+        "full_description": full_description,
         "project": _normalize_project_key(card.get("project")) or card.get("project"),
         "priority": card.get("priority") or "medium",
         "priority_rank": _priority_rank(card.get("priority")),
@@ -956,7 +1003,7 @@ def _proposal_work_item(
         "execution": execution,
         "runs": runs,
         "artifacts": _artifacts_from_metadata(metadata, fallback_worker_url=card.get("worker_url")),
-        "source_excerpts": card.get("source_excerpts") or [],
+        "source_excerpts": source_excerpts,
         "raw": {"proposal": card, "task": task, "approval_metadata": metadata},
     }
 
@@ -1017,6 +1064,27 @@ def _board_summary(board_meta: dict[str, Any], tasks: list[dict[str, Any]], prop
     return "Worker board with no active task detail recorded."
 
 
+def _board_full_description(board_meta: dict[str, Any], proposal_action_context: dict[str, Any] | None = None) -> str | None:
+    worker = _board_worker_meta(board_meta)
+    thread_context = worker.get("latest_goal_thread_context")
+    if proposal_action_context:
+        return _full_description_from_sections(
+            ("Title", proposal_action_context.get("title")),
+            ("Summary", proposal_action_context.get("summary")),
+            ("Body", proposal_action_context.get("body")),
+            ("Rationale", proposal_action_context.get("rationale")),
+            ("Worker request", worker.get("root_goal") or worker.get("initial_request")),
+            ("Thread context", thread_context),
+        )
+    return _full_description_from_sections(
+        ("Root goal", worker.get("root_goal")),
+        ("Planner request", worker.get("latest_planner_request")),
+        ("Initial request", worker.get("initial_request")),
+        ("Thread context", thread_context),
+        ("Board description", board_meta.get("description")),
+    )
+
+
 def _task_status_counts(tasks: list[dict[str, Any]]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for task in tasks:
@@ -1070,6 +1138,7 @@ def _board_work_item(
         "title": _board_title(board, board_meta, proposal_action_context),
         "summary": _board_summary(board_meta, tasks, proposal_action_context),
         "body_preview": proposal_action_context.get("body_preview") if proposal_action_context else None,
+        "full_description": _board_full_description(board_meta, proposal_action_context),
         "project": project,
         "priority": proposal_action_context.get("priority") if proposal_action_context else None,
         "priority_rank": proposal_action_context.get("priority_rank") if proposal_action_context else 0,
@@ -1295,6 +1364,8 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
                         "proposal_id": proposal_id,
                         "title": card.get("title"),
                         "summary": card.get("summary"),
+                        "body": card.get("body"),
+                        "rationale": card.get("rationale"),
                         "body_preview": item.get("body_preview"),
                         "project": item.get("project"),
                         "priority": item.get("priority"),

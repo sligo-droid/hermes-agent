@@ -578,6 +578,111 @@ def test_command_center_annotation_validates_and_persists_proposed_without_appro
     assert item["title"] == card["title"]
 
 
+def test_command_center_proposal_full_description_keeps_complete_body(client):
+    long_body = "complete proposal context " * 30
+    proposal_storage.init_db()
+    conn = proposal_storage.connect()
+    try:
+        now = "2026-06-17T00:00:00Z"
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO proposal_runs(
+                    source_key, contract_version, project, prong, run_id,
+                    status, card_count, payload_json, human_markdown,
+                    source_markdown, source_ref_json, ingested_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "rich-description-test",
+                    "self_improvement.proposal_run.v1",
+                    "hermes",
+                    "command_center",
+                    "rich-description-test",
+                    "valid",
+                    1,
+                    "{}",
+                    "Long description regression.",
+                    "",
+                    "{}",
+                    now,
+                    now,
+                ),
+            )
+            run_id = conn.execute("SELECT id FROM proposal_runs WHERE source_key = ?", ("rich-description-test",)).fetchone()["id"]
+            conn.execute(
+                """
+                INSERT INTO proposal_cards(
+                    proposal_id, run_db_id, project, prong, title, summary, body,
+                    rationale, priority, severity, status, created_at,
+                    source_excerpts_json, kanban_task_json, payload_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "long-proposal-description",
+                    run_id,
+                    "hermes",
+                    "command_center",
+                    "Long proposal description",
+                    "Compact summary",
+                    long_body,
+                    "Full rationale that should be visible on expansion.",
+                    "medium",
+                    "minor",
+                    "proposed",
+                    now,
+                    "[]",
+                    "{}",
+                    "{}",
+                    now,
+                ),
+            )
+    finally:
+        conn.close()
+
+    snapshot = client.get("/api/plugins/kanban/command-center/snapshot")
+
+    assert snapshot.status_code == 200, snapshot.text
+    item = next(item for item in snapshot.json()["work_items"] if item["id"] == "self-improvement:long-proposal-description")
+    assert item["summary"] == "Compact summary"
+    assert item["body_preview"].endswith("…")
+    assert item["full_description"] != item["body_preview"]
+    assert long_body.strip() in item["full_description"]
+    assert "Full rationale" in item["full_description"]
+
+
+def test_command_center_board_full_description_uses_worker_request(client):
+    from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
+
+    board = "rich-description-worker-board"
+    long_request = "worker planner ticket request " * 30
+    meta = kb.write_board_metadata(board, name="Rich Description Board")
+    meta.pop("db_path", None)
+    meta[DISCORD_WORKER_META_KEY] = {
+        "kind": "discord_worker_board",
+        "root_goal": long_request,
+        "latest_planner_request": "latest planner request context",
+        "initial_request": "initial worker request context",
+        "latest_goal_thread_context": "complete Discord thread context handed to planner",
+    }
+    kb.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    conn = kb.connect(board=board)
+    try:
+        kb.create_task(conn, title="Worker ticket", initial_status="running")
+    finally:
+        conn.close()
+
+    snapshot = client.get("/api/plugins/kanban/command-center/snapshot")
+
+    assert snapshot.status_code == 200, snapshot.text
+    item = next(item for item in snapshot.json()["work_items"] if item["id"] == f"kanban-board:{board}")
+    assert item["summary"].endswith("…")
+    assert item["full_description"] != item["summary"]
+    assert long_request.strip() in item["full_description"]
+    assert "latest planner request context" in item["full_description"]
+    assert "complete Discord thread context handed to planner" in item["full_description"]
+
+
 def test_command_center_annotation_context_is_included_on_later_approval(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]

@@ -1014,6 +1014,7 @@ export interface CommandCenterWorkItem {
   title: string;
   summary?: string | null;
   body_preview?: string | null;
+  full_description?: string | null;
   project?: string | null;
   priority?: string | number | null;
   priority_rank?: number;
