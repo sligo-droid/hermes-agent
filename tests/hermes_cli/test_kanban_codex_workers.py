@@ -139,6 +139,50 @@ def test_worker_retry_operation_names_are_backend_neutral():
     assert 'operation_name="codex_worker.' not in source
 
 
+def test_backend_child_env_bridges_profile_cli_paths(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+
+    hermes_home = tmp_path / "hermes-home"
+    profile_home = hermes_home / "home"
+    profile_local_bin = profile_home / ".local" / "bin"
+    profile_foundry_bin = profile_home / ".foundry" / "bin"
+    profile_cargo_bin = profile_home / ".cargo" / "bin"
+    profile_local_bin.mkdir(parents=True)
+    profile_foundry_bin.mkdir(parents=True)
+    profile_cargo_bin.mkdir(parents=True)
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HOME", "/home/operator")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-control-state")
+
+    env = worker._backend_child_env({"HERMES_KANBAN_WORKSPACE": "/workspace"})
+
+    assert env["HOME"] == str(profile_home)
+    assert env["HERMES_HOME"] == str(hermes_home)
+    assert "HERMES_KANBAN_TASK" not in env
+    assert env["HERMES_KANBAN_WORKSPACE"] == "/workspace"
+    assert env["PATH"].split(os.pathsep)[:3] == [
+        str(profile_local_bin),
+        str(profile_foundry_bin),
+        str(profile_cargo_bin),
+    ]
+
+
+def test_backend_child_env_respects_explicit_path(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+
+    hermes_home = tmp_path / "hermes-home"
+    (hermes_home / "home" / ".foundry" / "bin").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    env = worker._backend_child_env({"PATH": "/explicit/bin"})
+
+    assert env["HOME"] == str(hermes_home / "home")
+    assert env["PATH"] == "/explicit/bin"
+
+
 def test_run_gh_bridges_real_gh_config_dir_when_home_is_isolated(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_worker as worker
 
