@@ -997,6 +997,74 @@ def test_snapshot_completed_discord_worker_board_is_shipped_not_active(tmp_path,
     assert snapshot["metrics"]["shipped"] == 1
 
 
+def test_snapshot_blocked_thread_state_overrides_stale_done_worker_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "discord-1516821213685485690"
+    meta = kanban_db.write_board_metadata(board, name="Blocked Root Embed Worker Board")
+    meta[command_center.DISCORD_WORKER_META_KEY] = {
+        "kind": "discord_worker_board",
+        "thread_id": "1516821213685485690",
+        "guild_id": "111",
+        "source_message_id": "1516821213685485690",
+        "goal_status": "done",
+        "phase": "complete",
+        "thread_state": "blocked",
+        "public_url": "https://hermes.sligolabs.com/workers/1516821213685485690",
+        "board_summary": {"thread_state": "blocked", "task_counts": {"done": 1}},
+    }
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Stale completed worker task", board=board, initial_status="running")
+        with conn:
+            conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200, task_id))
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+
+    assert item["status"] == "blocked"
+    assert item["status_detail"] == "blocked"
+    assert item["source"]["ref"]["discord_thread_url"] == "https://discord.com/channels/111/1516821213685485690"
+    assert item["execution"]["worker_url"] == "https://hermes.sligolabs.com/workers/1516821213685485690"
+    assert snapshot["metrics"]["blocked"] == 1
+    assert snapshot["metrics"]["active_work"] == 0
+    assert snapshot["metrics"]["shipped"] == 0
+
+
+def test_snapshot_running_task_overrides_blocked_thread_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "discord-running-thread-state-blocked"
+    meta = kanban_db.write_board_metadata(board, name="Running Thread State Blocked")
+    meta[command_center.DISCORD_WORKER_META_KEY] = {
+        "kind": "discord_worker_board",
+        "thread_id": "1516821213685485690",
+        "goal_status": "done",
+        "phase": "complete",
+        "thread_state": "blocked",
+    }
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Active worker", board=board, initial_status="running")
+        with conn:
+            conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                (task_id, "running", 100, None, None),
+            )
+            run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute("UPDATE tasks SET status = 'running', current_run_id = ? WHERE id = ?", (run_id, task_id))
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+
+    assert item["status"] == "running"
+    assert snapshot["metrics"]["active_work"] == 1
+
+
 def test_snapshot_phase_complete_discord_worker_board_is_shipped_not_active(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     board = "discord-phase-complete"
