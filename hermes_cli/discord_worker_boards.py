@@ -3169,36 +3169,52 @@ def _final_reviewer_verdict(tasks: list[Any], runs_by_task: dict[str, list[Any]]
 
 def _verification_commands(tasks: list[Any], runs_by_task: dict[str, list[Any]]) -> list[dict[str, Any]]:
     commands: list[dict[str, Any]] = []
+    seen_commands: set[str] = set()
     task_by_id = {str(getattr(task, "id", "") or ""): task for task in tasks}
+    candidates: list[tuple[int, int, int, int, str, Any, Any, dict[str, Any]]] = []
+
     for task_id, runs in runs_by_task.items():
         task = task_by_id.get(task_id)
         assignee = str(getattr(task, "assignee", "") or "").strip().lower() if task else ""
-        if assignee != ROLE_DEV:
+        if assignee not in {ROLE_DEV, ROLE_REVIEWER}:
             continue
-        for run in sorted(runs, key=_run_sort_timestamp, reverse=True):
+        for run in runs:
             metadata = getattr(run, "metadata", None) if isinstance(getattr(run, "metadata", None), dict) else {}
             tests = metadata.get("tests")
             if not isinstance(tests, list):
                 raw = metadata.get("raw") if isinstance(metadata.get("raw"), dict) else {}
-                tests = raw.get("tests") if isinstance(raw.get("tests"), list) else []
-            for item in tests:
+                raw_tests = raw.get("tests") if isinstance(raw, dict) else []
+                tests = raw_tests if isinstance(raw_tests, list) else []
+            if not isinstance(tests, list):
+                tests = []
+            for index, item in enumerate(tests):
                 if not isinstance(item, dict):
                     continue
                 command = str(item.get("command") or "").strip()
                 if not command:
                     continue
-                commands.append(
-                    {
-                        "task_id": task_id,
-                        "task_title": str(getattr(task, "title", "") or "") if task else "",
-                        "run_id": getattr(run, "id", None),
-                        "command": command,
-                        "result": str(item.get("result") or "unknown").strip() or "unknown",
-                        "output": _cap_state_value(str(item.get("output") or ""), max_text=4000),
-                    }
-                )
-                if len(commands) >= 20:
-                    return commands
+                run_id = int(getattr(run, "id", None) or 0)
+                role_priority = 1 if assignee == ROLE_REVIEWER else 0
+                candidates.append((_run_sort_timestamp(run), run_id, role_priority, -index, task_id, task, run, item))
+
+    for _timestamp, _run_id, _role_priority, _order, task_id, task, run, item in sorted(candidates, reverse=True):
+        command = str(item.get("command") or "").strip()
+        command_key = command.casefold()
+        if command_key in seen_commands:
+            continue
+        seen_commands.add(command_key)
+        commands.append(
+            {
+                "task_id": task_id,
+                "task_title": str(getattr(task, "title", "") or "") if task else "",
+                "run_id": getattr(run, "id", None),
+                "command": command,
+                "result": str(item.get("result") or "unknown").strip() or "unknown",
+                "output": _cap_state_value(str(item.get("output") or ""), max_text=4000),
+            }
+        )
+        if len(commands) >= 20:
+            break
     return commands
 
 
