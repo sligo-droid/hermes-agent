@@ -6196,6 +6196,42 @@ def _create_pr_checks_recovery_task(board: str, worker: dict[str, Any], conn: An
     )
 
 
+def _pr_finalizer_conflict_files(worker: dict[str, Any]) -> list[str]:
+    for key in ("pr_conflict_files", "conflict_files", "pr_merge_conflict_files"):
+        value = worker.get(key)
+        if isinstance(value, list):
+            files = [str(item).strip() for item in value if str(item).strip()]
+            if files:
+                return files
+    blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "")
+    files: list[str] = []
+    for token in blocker.replace(",", " ").split():
+        clean = token.strip("`'\".()[]{}")
+        if "/" in clean and clean not in files:
+            files.append(clean)
+    return files
+
+
+def _create_pr_merge_conflict_recovery_task(board: str, worker: dict[str, Any], conn: Any) -> str:
+    conflict_files = _pr_finalizer_conflict_files(worker)
+    instructions = [
+        "The implementation review was already approved; do not restart planner or reviewer work.",
+        "Merge or rebase the current main branch into the worker branch, resolve the concrete PR merge conflicts, rerun focused verification, and push the worker branch.",
+        "Do not do PR lifecycle chores; after the branch is mergeable, let the reviewer/finalizer loop continue.",
+    ]
+    if conflict_files:
+        instructions.insert(2, "Known conflict files: " + ", ".join(conflict_files))
+    return _create_pr_finalizer_recovery_task(
+        board,
+        worker,
+        conn,
+        recovery_kind="merge-conflict",
+        title="Resolve PR merge conflicts",
+        instructions=instructions,
+        extra_payload={"conflict_files": conflict_files},
+    )
+
+
 def _reactivate_after_pr_checks_recovery(board: str, worker: dict[str, Any], blocker: str) -> None:
     worker.update(
         {
@@ -6212,6 +6248,29 @@ def _reactivate_after_pr_checks_recovery(board: str, worker: dict[str, Any], blo
     if not str(worker.get("pr_error") or "").strip():
         worker["pr_error"] = blocker
     _clear_board_run_summary(board, worker)
+    worker["terminal_reaction_sync_pending"] = True
+    worker["terminal_summary_sync_pending"] = True
+    _update_worker_meta(board, worker)
+
+
+def _reactivate_after_pr_merge_conflict_recovery(board: str, worker: dict[str, Any], blocker: str) -> None:
+    worker.update(
+        {
+            "phase": "dev",
+            "goal_status": "active",
+            "blocked_reason": "",
+            "pr_blocker": blocker,
+            "pr_finalizer_recovery_state": "dev_merge_conflict_recovery",
+            "pr_finalizer_recovery_blocker": blocker,
+            "terminal_reaction_sync_pending": True,
+            "terminal_summary_sync_pending": True,
+        }
+    )
+    if not str(worker.get("pr_error") or "").strip():
+        worker["pr_error"] = blocker
+    _clear_board_run_summary(board, worker)
+    worker["terminal_reaction_sync_pending"] = True
+    worker["terminal_summary_sync_pending"] = True
     _update_worker_meta(board, worker)
 
 
@@ -6259,8 +6318,9 @@ def _recover_approved_reviewer_finalizer(board: str, worker: dict[str, Any], con
         _reactivate_after_pr_checks_recovery(board, refreshed, blocker)
         return "approved_reviewer_finalizer_checks_recovery_created"
     if _pr_finalizer_failure_is_merge_conflict(refreshed):
-        _block_after_pr_finalizer_failure(board, refreshed, blocker)
-        return "approved_reviewer_finalizer_merge_conflict_blocked"
+        _create_pr_merge_conflict_recovery_task(board, refreshed, conn)
+        _reactivate_after_pr_merge_conflict_recovery(board, refreshed, blocker)
+        return "approved_reviewer_finalizer_merge_conflict_recovery_created"
 
     _block_after_pr_finalizer_failure(board, refreshed, blocker)
     return "approved_reviewer_finalizer_blocked"
@@ -6291,6 +6351,7 @@ def _recover_blocked_approved_reviewer_finalizer(
     if (
         str(worker.get("pr_finalizer_recovery_state") or "") == "operator_blocked"
         and str(worker.get("pr_finalizer_recovery_blocker") or "") == finalizer_blocker
+        and not _pr_finalizer_failure_is_merge_conflict(worker)
     ):
         return None
 
@@ -6318,8 +6379,9 @@ def _recover_blocked_approved_reviewer_finalizer(
         _reactivate_after_pr_checks_recovery(board, worker, blocker)
         return "approved_reviewer_finalizer_checks_recovery_created"
     if _pr_finalizer_failure_is_merge_conflict(worker):
-        _block_after_pr_finalizer_failure(board, worker, blocker)
-        return "approved_reviewer_finalizer_merge_conflict_blocked"
+        _create_pr_merge_conflict_recovery_task(board, worker, conn)
+        _reactivate_after_pr_merge_conflict_recovery(board, worker, blocker)
+        return "approved_reviewer_finalizer_merge_conflict_recovery_created"
     if finalizer_blocker:
         _block_after_pr_finalizer_failure(board, worker, blocker)
         return "approved_reviewer_finalizer_manual_blocked"
@@ -6499,6 +6561,13 @@ def reconcile_board(board: str) -> Optional[str]:
             # deterministic finalizer work and should not keep a dev round alive.
             if _pr_finalizer_failure_is_failed_checks(worker) and not _pr_finalizer_failure_is_pr_body_check_only(worker):
                 return None
+            if _pr_finalizer_failure_is_merge_conflict(worker):
+                _reactivate_after_pr_merge_conflict_recovery(
+                    board,
+                    worker,
+                    str(worker.get("pr_blocker") or worker.get("pr_error") or "approved reviewer PR finalization failed").strip(),
+                )
+                return "approved_reviewer_finalizer_merge_conflict_recovery_created"
             _archive_active_pr_finalizer_recovery_tasks(conn, tasks)
             tasks = kanban_db.list_tasks(conn, include_archived=False)
             active_roles = {
@@ -6511,8 +6580,9 @@ def reconcile_board(board: str) -> Optional[str]:
                 _block_after_pr_finalizer_failure(board, worker, blocker)
                 return "approved_reviewer_finalizer_pr_body_check_blocked"
             if _pr_finalizer_failure_is_merge_conflict(worker):
-                _block_after_pr_finalizer_failure(board, worker, blocker)
-                return "approved_reviewer_finalizer_merge_conflict_blocked"
+                _create_pr_merge_conflict_recovery_task(board, worker, conn)
+                _reactivate_after_pr_merge_conflict_recovery(board, worker, blocker)
+                return "approved_reviewer_finalizer_merge_conflict_recovery_created"
             if blocker:
                 _block_after_pr_finalizer_failure(board, worker, blocker)
                 return "approved_reviewer_finalizer_manual_blocked"
