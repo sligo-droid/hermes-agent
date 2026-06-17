@@ -544,9 +544,17 @@ def _canonical_status_from_board(
     if board_meta.get("archived"):
         return "archived", "archived"
     phase = str(worker.get("phase") or "").lower()
+    counts = _task_status_counts(tasks)
+    board_summary = worker.get("board_summary") if isinstance(worker.get("board_summary"), dict) else {}
+    thread_state = str(worker.get("thread_state") or board_summary.get("thread_state") or "").lower()
+    if thread_state in {"blocked", "paused"}:
+        if counts.get("running", 0) or any(_is_active_run(run) for run in runs or []):
+            return "running", "running"
+        if thread_state == "paused":
+            return "paused", thread_state
+        return "blocked", thread_state
     if goal_status in {"done", "shipped", "complete", "completed"} or phase == "complete":
         return "shipped", goal_status or phase or "done"
-    counts = _task_status_counts(tasks)
     if counts.get("running", 0) or any(_is_active_run(run) for run in runs or []):
         return "running", "running"
     if board_meta.get("command_center_paused") or worker.get("paused") or goal_status == "paused" or phase == "paused":
