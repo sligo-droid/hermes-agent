@@ -14,6 +14,11 @@ from hermes_cli.discord_time import discord_message_exceeds_age_limit
 from gateway.session import Platform, SessionSource
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
+from agent.verification_evidence import (
+    claim_constraints_for_text,
+    downgrade_verified_metadata,
+    evidence_from_runtime_breakdown,
+)
 
 
 INCOMPLETE_STATUSES = frozenset(
@@ -197,6 +202,20 @@ def classify_delivery_completion(item: dict[str, Any], final_response: str | Non
         "repo_backed": repo_backed,
     }
     if not repo_backed:
+        return gate
+
+    evidence = evidence_from_runtime_breakdown(item.get("runtime_breakdown"))
+    constraints = claim_constraints_for_text(final_text, evidence)
+    if not constraints.get("allowed"):
+        gate.update(
+            {
+                "allowed_to_complete": False,
+                "summary_status": "Blocked",
+                "terminal_status": "blocked",
+                "reason": "latest_verification_evidence_negative",
+                "verification_constraints": constraints,
+            }
+        )
         return gate
 
     matched = [reason for reason, pattern in _INCOMPLETE_FINAL_PATTERNS if re.search(pattern, final_text, flags=re.IGNORECASE)]
@@ -489,6 +508,16 @@ class GatewayWorkLedger:
         item["completion_gate"] = gate
         if not gate.get("allowed_to_complete"):
             item["summary_status"] = str(gate.get("summary_status") or "Blocked")
+            blocked_surfaces = (
+                gate.get("verification_constraints", {}).get("blocked_surfaces")
+                if isinstance(gate.get("verification_constraints"), dict)
+                else None
+            )
+            if isinstance(blocked_surfaces, list) and blocked_surfaces:
+                if isinstance(item.get("feature_summary"), dict):
+                    item["feature_summary"] = downgrade_verified_metadata(item["feature_summary"], blocked_surfaces)
+                if isinstance(item.get("project_summary"), dict):
+                    item["project_summary"] = downgrade_verified_metadata(item["project_summary"], blocked_surfaces)
         _record_discord_board_final_response(item)
         self._write(data)
         return True

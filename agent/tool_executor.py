@@ -31,6 +31,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
+from agent.verification_evidence import classify_tool_verification_evidence
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -217,6 +218,31 @@ def _record_turn_tool_runtime(
             item["blocked"] = int(item.get("blocked") or 0) + 1
     except Exception:
         logger.debug("turn tool runtime accounting failed", exc_info=True)
+
+
+def _record_turn_verification_evidence(
+    agent: Any,
+    function_name: str,
+    function_args: dict[str, Any] | None,
+    result: Any,
+    is_error: bool,
+) -> None:
+    stats = getattr(agent, "_turn_runtime_stats", None)
+    if not isinstance(stats, dict):
+        return
+    try:
+        order = int(stats.get("tool_calls") or 0)
+        evidence = classify_tool_verification_evidence(
+            function_name,
+            function_args,
+            result,
+            is_error,
+            order=order,
+        )
+        if evidence:
+            stats.setdefault("verification_evidence", []).extend(evidence)
+    except Exception:
+        logger.debug("turn verification evidence accounting failed", exc_info=True)
 
 
 def apply_tool_result_hooks(
@@ -703,6 +729,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             is_error,
             blocked=blocked,
         )
+        if not blocked:
+            _record_turn_verification_evidence(agent, name, storage_args, function_result, is_error)
 
         # Print cute message per tool
         if agent._should_emit_quiet_tool_messages():
@@ -1205,6 +1233,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _is_error_result,
             blocked=_execution_blocked,
         )
+        if not _execution_blocked:
+            _record_turn_verification_evidence(
+                agent, function_name, storage_args, function_result, _is_error_result,
+            )
 
         # Track file-mutation outcome for the turn-end verifier.  See
         # the concurrent path for the rationale; both paths must feed
