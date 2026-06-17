@@ -758,8 +758,10 @@ def _terminal_worker_reaction_state(worker: dict[str, Any]) -> str:
 
 
 def _terminal_worker_has_non_green_finalization(worker: dict[str, Any]) -> bool:
-    if any(str(worker.get(key) or "").strip() for key in ("pr_blocker", "pr_error", "pr_status_error")):
-        return True
+    pr_success = _worker_has_successful_pr_terminal_evidence(worker)
+    if not pr_success:
+        if any(str(worker.get(key) or "").strip() for key in ("pr_blocker", "pr_error", "pr_status_error")):
+            return True
     if [item for item in worker.get("pr_checks_failed") or [] if str(item).strip()]:
         return True
     raw_checks_status = worker.get("pr_checks_status")
@@ -3308,6 +3310,18 @@ def _pr_merge_evidence_present(*, state: str, merged_at: str, merge_commit: str)
     return state.upper() == "MERGED" or bool(merged_at or merge_commit)
 
 
+def _worker_has_successful_pr_terminal_evidence(worker: dict[str, Any]) -> bool:
+    state = str(worker.get("pr_state") or "").strip()
+    merged_at = str(worker.get("pr_merged_at") or "").strip()
+    merge_commit = str(worker.get("pr_merge_commit") or "").strip()
+    if not _pr_merge_evidence_present(state=state, merged_at=merged_at, merge_commit=merge_commit):
+        return False
+    checks_status = str(worker.get("pr_checks_status") or "").strip().lower()
+    if checks_status not in {"passed", "success"}:
+        return False
+    return not [item for item in worker.get("pr_checks_failed") or [] if str(item).strip()]
+
+
 def _normalized_pr_summary_merge_state(
     *,
     state: str,
@@ -3357,11 +3371,12 @@ def _pr_summary(worker: dict[str, Any]) -> dict[str, Any]:
         merge_commit=merge_commit,
         merge_state=merge_state,
     )
+    pr_success = _worker_has_successful_pr_terminal_evidence(worker)
     return {
         "url": str(worker.get("pr_url") or "").strip(),
         "number": str(worker.get("pr_number") or "").strip(),
-        "error": str(worker.get("pr_error") or "").strip(),
-        "status_error": str(worker.get("pr_status_error") or "").strip(),
+        "error": "" if pr_success else str(worker.get("pr_error") or "").strip(),
+        "status_error": "" if pr_success else str(worker.get("pr_status_error") or "").strip(),
         "state": state,
         "merged_at": merged_at,
         "merge_commit": merge_commit,
@@ -3372,7 +3387,7 @@ def _pr_summary(worker: dict[str, Any]) -> dict[str, Any]:
         "checks_status": checks_status,
         "checks_total": int(worker.get("pr_checks_total") or 0),
         "checks_failed": list(worker.get("pr_checks_failed") or []),
-        "blocker": str(worker.get("pr_blocker") or "").strip(),
+        "blocker": "" if pr_success else str(worker.get("pr_blocker") or "").strip(),
     }
 
 
