@@ -109,6 +109,9 @@ def build_turn_runtime_breakdown(
             "reasoning": _count(stats.get("reasoning_tokens")),
         },
         "top_tools": tool_rows[:5],
+        "verification_evidence": list(stats.get("verification_evidence") or [])[:20]
+        if isinstance(stats.get("verification_evidence"), list)
+        else [],
         "active_exceeds_wall": bool(wall and active > wall + 0.25),
     }
 

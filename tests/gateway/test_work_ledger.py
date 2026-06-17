@@ -292,6 +292,212 @@ def test_default_repo_project_pr_opened_but_unmerged_is_blocked(tmp_path):
     assert stored["summary_status"] == "Blocked"
 
 
+def test_latest_production_browser_timeout_blocks_shipped_verified_completion(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Ship the production modal")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="Shipped and verified in production; browser modal is visible.",
+        summary_status="Complete",
+        runtime_breakdown={
+            "verification_evidence": [
+                {
+                    "surface": "production_browser",
+                    "check_name": "python -m hermes_cli.worker_frontend_smoke --url https://app.example --route /modal --browser chromium",
+                    "status": "timeout",
+                    "order": 1,
+                    "detail": "Command timed out after 30 seconds",
+                }
+            ]
+        },
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["summary_status"] == "Blocked"
+    assert stored["completion_gate"]["allowed_to_complete"] is False
+    assert stored["completion_gate"]["reason"] == "latest_verification_evidence_negative"
+    blocked = stored["completion_gate"]["verification_constraints"]["blocked_surfaces"]
+    assert blocked[0]["surface"] == "production_browser"
+    assert "worker_frontend_smoke" in blocked[0]["check_name"]
+
+
+def test_downgraded_final_response_still_blocks_intact_success_claim(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Ship the production modal")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response=(
+            "Shipped and verified in production; browser modal is visible.\n\n"
+            "Verification downgrade: production browser verification is not verified: "
+            "latest check `browser modal smoke` timeout."
+        ),
+        summary_status="Complete",
+        runtime_breakdown={
+            "verification_evidence": [
+                {
+                    "surface": "production_browser",
+                    "check_name": "browser modal smoke",
+                    "status": "timeout",
+                    "order": 1,
+                }
+            ]
+        },
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["completion_gate"]["allowed_to_complete"] is False
+    assert stored["summary_status"] == "Blocked"
+
+
+def test_rewritten_downgraded_final_response_allows_operator_summary_with_blocked_surface(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Ship the production modal")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response=(
+            "CI passed via scripts/run_tests.sh.\n\n"
+            "Verification downgrade: production browser verification is not verified: "
+            "latest check `browser modal smoke` timeout."
+        ),
+        summary_status="Complete",
+        runtime_breakdown={
+            "verification_evidence": [
+                {
+                    "surface": "production_browser",
+                    "check_name": "browser modal smoke",
+                    "status": "timeout",
+                    "order": 1,
+                }
+            ]
+        },
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert stored["summary_status"] == "Complete"
+
+
+def test_later_successful_production_browser_check_allows_verified_claim(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Ship the production modal")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="Production browser modal verified visible after npm run browser:smoke -- --prod --modal.",
+        summary_status="Complete",
+        runtime_breakdown={
+            "verification_evidence": [
+                {
+                    "surface": "production_browser",
+                    "check_name": "npm run browser:smoke -- --prod --modal",
+                    "status": "failure",
+                    "order": 1,
+                    "detail": "modal missing",
+                },
+                {
+                    "surface": "production_browser",
+                    "check_name": "npm run browser:smoke -- --prod --modal",
+                    "status": "success",
+                    "order": 2,
+                    "detail": "modal visible",
+                },
+            ]
+        },
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["summary_status"] == "Complete"
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+
+
+def test_verification_gate_keeps_independent_ci_claim_separate(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Ship the production modal")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="CI passed via scripts/run_tests.sh. Production browser modal is not verified: browser modal smoke failed.",
+        summary_status="Complete",
+        runtime_breakdown={
+            "verification_evidence": [
+                {"surface": "browser", "check_name": "browser modal smoke", "status": "failure", "order": 1},
+                {"surface": "ci", "check_name": "scripts/run_tests.sh tests/unit", "status": "success", "order": 2},
+            ]
+        },
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert stored["summary_status"] == "Complete"
+
+
+def test_verified_project_summary_metadata_downgraded_on_latest_failed_evidence(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Ship the production modal")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="Production browser modal verified visible.",
+        summary_status="Complete",
+        project_summary={"channel_id": "channel-1", "production_ui": {"status": "verified"}},
+        runtime_breakdown={
+            "verification_evidence": [
+                {
+                    "surface": "production_browser",
+                    "check_name": "browser modal smoke",
+                    "status": "failure",
+                    "order": 1,
+                    "detail": "modal missing",
+                }
+            ]
+        },
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["summary_status"] == "Blocked"
+    assert stored["project_summary"]["production_ui"]["status"] == "not_verified"
+    assert stored["project_summary"]["verification_guard"]["status"] == "not_verified"
+
+
 def test_generic_discord_incomplete_wording_preserves_old_completion_behavior(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _discord_event(text="answer this question")

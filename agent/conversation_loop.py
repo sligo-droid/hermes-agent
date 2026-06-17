@@ -61,6 +61,7 @@ from agent.runtime_breakdown import build_turn_runtime_breakdown
 from agent.retry_utils import jittered_backoff
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.verification_evidence import downgrade_final_response_for_evidence
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
@@ -195,6 +196,15 @@ def _attach_runtime_breakdown(result: dict[str, Any], agent: Any, total_elapsed_
         if breakdown:
             result["runtime_breakdown"] = breakdown
     return result
+
+
+def _downgrade_final_response_for_turn_evidence(agent: Any, final_response: str | None) -> tuple[str | None, bool, dict[str, Any]]:
+    if not final_response:
+        return final_response, False, {}
+    stats = getattr(agent, "_turn_runtime_stats", None)
+    evidence = stats.get("verification_evidence") if isinstance(stats, dict) else None
+    downgraded, constraints = downgrade_final_response_for_evidence(final_response, evidence)
+    return downgraded, downgraded != final_response, constraints
 
 
 def _estimate_request_tokens_for_progress(
@@ -5029,6 +5039,26 @@ def run_conversation(
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
 
+    # Final-response verification guard.
+    # Runtime verification evidence is collected from terminal/browser/status
+    # checks during this turn and remains the source of truth for delivery. Run
+    # after deterministic/plugin transforms but before post_llm_call, memory
+    # sync, gateway return, Discord ledger updates, and operator summaries so
+    # all downstream consumers see the downgraded final text.
+    _verification_constraints = {}
+    if final_response and not interrupted:
+        try:
+            final_response, _verification_downgraded, _verification_constraints = _downgrade_final_response_for_turn_evidence(
+                agent,
+                final_response,
+            )
+            if _verification_downgraded:
+                _response_transformed = True
+                if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "assistant":
+                    messages[-1]["content"] = final_response
+        except Exception as exc:
+            logger.debug("verification evidence final-response downgrade failed: %s", exc)
+
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
@@ -5095,6 +5125,8 @@ def run_conversation(
         "cost_source": agent.session_cost_source,
         "session_id": agent.session_id,
     }
+    if _verification_constraints:
+        result["verification_constraints"] = _verification_constraints
     _attach_runtime_breakdown(
         result,
         agent,
