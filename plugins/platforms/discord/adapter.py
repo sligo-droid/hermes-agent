@@ -1959,6 +1959,47 @@ class DiscordAdapter(BasePlatformAdapter):
             "foreman": "🔨",
         }.get(str(state or ""))
 
+    def _feature_kanban_reaction_state_from_emoji(self, emoji: object) -> Optional[str]:
+        text = str(getattr(emoji, "name", emoji) or "").strip()
+        return {
+            "✅": "done",
+            "👀": "active",
+            "⏳": "running",
+            "❓": "blocked",
+            "❌": "errored",
+            "🔨": "foreman",
+        }.get(text)
+
+    def _message_status_reaction_state(self, message: Any) -> Optional[str]:
+        for reaction in getattr(message, "reactions", None) or []:
+            if not bool(getattr(reaction, "me", False)):
+                continue
+            state = self._feature_kanban_reaction_state_from_emoji(getattr(reaction, "emoji", reaction))
+            if state:
+                return state
+        return None
+
+    async def _latest_thread_feature_summary_reaction_state(self, thread: Any) -> Optional[tuple[str, str]]:
+        history = getattr(thread, "history", None)
+        if not callable(history):
+            return None
+        try:
+            async for message in history(limit=50):
+                if not getattr(message, "embeds", None):
+                    continue
+                author = getattr(message, "author", None)
+                if author is not None and bool(getattr(author, "bot", False)) is False:
+                    continue
+                state = self._message_status_reaction_state(message)
+                if not state:
+                    continue
+                message_id = str(getattr(message, "id", "") or "").strip()
+                if message_id:
+                    return message_id, state
+        except Exception as exc:
+            logger.debug("[%s] Failed to inspect latest Discord feature-summary reaction: %s", self.name, exc)
+        return None
+
     def _feature_kanban_completion_state(
         self,
         handle: Optional[Dict[str, Any]],
@@ -2005,6 +2046,16 @@ class DiscordAdapter(BasePlatformAdapter):
             return "done"
         return fallback
 
+    @staticmethod
+    def _kanban_thread_target_order(target: Dict[str, Any]) -> Optional[tuple[int, int]]:
+        for priority, field in enumerate(("message_id", "source_message_id", "updated_at")):
+            value = str(target.get(field) or "").strip()
+            if not value:
+                continue
+            if value.isdigit():
+                return (3 - priority, int(value))
+        return None
+
     def _kanban_thread_origin_reaction_state(
         self,
         target: Dict[str, Any],
@@ -2017,10 +2068,17 @@ class DiscordAdapter(BasePlatformAdapter):
             from hermes_cli.discord_worker_boards import thread_status_targets
 
             states: List[Optional[str]] = []
+            ordered: List[tuple[tuple[int, int], Optional[str]]] = []
             for candidate in thread_status_targets():
                 if str(candidate.get("thread_id") or "").strip() != thread_id:
                     continue
-                states.append(self._kanban_target_reaction_state(candidate))
+                candidate_state = self._kanban_target_reaction_state(candidate)
+                order = self._kanban_thread_target_order(candidate)
+                if order is not None:
+                    ordered.append((order, candidate_state))
+                states.append(candidate_state)
+            if ordered:
+                return max(ordered, key=lambda item: item[0])[1] or self._kanban_target_reaction_state(target) or fallback
             return self._aggregate_thread_reaction_state(states, fallback)
         except Exception as exc:
             logger.debug("[%s] Failed to aggregate Discord thread reaction state: %s", self.name, exc)
@@ -3931,7 +3989,17 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         origin_message = await self._thread_origin_message(thread)
         origin_identity = self._message_identity(origin_message) if origin_message is not None else None
-        origin_state = self._kanban_thread_origin_reaction_state(target, state)
+        latest_summary_state = await self._latest_thread_feature_summary_reaction_state(thread)
+        target_message_ids = {
+            str(target.get("message_id") or "").strip(),
+            str(target.get("source_message_id") or "").strip(),
+        }
+        if latest_summary_state is not None and latest_summary_state[0] not in target_message_ids:
+            origin_state = latest_summary_state[1]
+        elif latest_summary_state is not None and latest_summary_state[0] in target_message_ids:
+            origin_state = state
+        else:
+            origin_state = self._kanban_thread_origin_reaction_state(target, state)
         origin_emoji = self._feature_kanban_reaction_emoji(origin_state) or emoji
         for message in messages:
             try:

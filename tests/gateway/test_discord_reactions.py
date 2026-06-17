@@ -796,6 +796,180 @@ async def test_kanban_thread_reaction_keeps_origin_active_when_other_thread_work
 
 
 @pytest.mark.asyncio
+async def test_kanban_thread_reaction_origin_uses_latest_feature_summary(adapter, monkeypatch):
+    op_message = SimpleNamespace(
+        id=333,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="❓", me=True)],
+    )
+    old_source_message = SimpleNamespace(
+        id=444,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="✅", me=True)],
+    )
+    old_summary_message = SimpleNamespace(
+        id=555,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="✅", me=True)],
+    )
+
+    async def fetch_message(message_id):
+        messages = {
+            op_message.id: op_message,
+            old_source_message.id: old_source_message,
+            old_summary_message.id: old_summary_message,
+        }
+        return messages[int(message_id)]
+
+    thread = SimpleNamespace(
+        id=op_message.id,
+        starter_message=op_message,
+        fetch_message=AsyncMock(side_effect=fetch_message),
+        parent=SimpleNamespace(fetch_message=AsyncMock(side_effect=fetch_message)),
+    )
+    adapter._resolve_summary_channel = AsyncMock(return_value=thread)
+    monkeypatch.setattr(
+        "hermes_cli.discord_worker_boards.thread_status_targets",
+        lambda: [
+            {
+                "thread_id": str(thread.id),
+                "state": "blocked",
+                "reaction_state": "blocked",
+                "message_id": str(old_summary_message.id),
+                "source_message_id": str(old_source_message.id),
+            },
+            {
+                "thread_id": str(thread.id),
+                "state": "done",
+                "reaction_state": "done",
+                "message_id": "777",
+                "source_message_id": "666",
+            },
+        ],
+    )
+
+    synced = await adapter.sync_kanban_thread_reaction(
+        {
+            "board": "discord-333-old",
+            "thread_id": str(thread.id),
+            "state": "blocked",
+            "reaction_state": "blocked",
+            "message_id": str(old_summary_message.id),
+            "source_message_id": str(old_source_message.id),
+        }
+    )
+
+    assert synced == "blocked"
+    for message in (old_source_message, old_summary_message):
+        assert [call.args for call in message.remove_reaction.await_args_list] == _status_remove_calls(
+            adapter,
+            except_emoji="❓",
+        )
+        message.add_reaction.assert_awaited_once_with("❓")
+    assert [call.args for call in op_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="✅",
+    )
+    op_message.add_reaction.assert_awaited_once_with("✅")
+
+
+@pytest.mark.asyncio
+async def test_kanban_thread_reaction_origin_uses_latest_thread_embed_when_status_targets_are_stale(
+    adapter,
+    monkeypatch,
+):
+    op_message = SimpleNamespace(
+        id=333,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="❓", me=True)],
+    )
+    old_source_message = SimpleNamespace(
+        id=444,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[SimpleNamespace(emoji="❓", me=True)],
+    )
+    old_summary_message = SimpleNamespace(
+        id=555,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        embeds=[SimpleNamespace(title="old blocked board")],
+        reactions=[SimpleNamespace(emoji="❓", me=True)],
+        author=SimpleNamespace(bot=True),
+    )
+    latest_summary_message = SimpleNamespace(
+        id=777,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        embeds=[SimpleNamespace(title="newer completed feature")],
+        reactions=[SimpleNamespace(emoji="✅", me=True)],
+        author=SimpleNamespace(bot=True),
+    )
+
+    async def fetch_message(message_id):
+        messages = {
+            op_message.id: op_message,
+            old_source_message.id: old_source_message,
+            old_summary_message.id: old_summary_message,
+            latest_summary_message.id: latest_summary_message,
+        }
+        return messages[int(message_id)]
+
+    async def history(**_kwargs):
+        for message in (latest_summary_message, old_summary_message):
+            yield message
+
+    thread = SimpleNamespace(
+        id=op_message.id,
+        starter_message=op_message,
+        fetch_message=AsyncMock(side_effect=fetch_message),
+        history=history,
+        parent=SimpleNamespace(fetch_message=AsyncMock(side_effect=fetch_message)),
+    )
+    adapter._resolve_summary_channel = AsyncMock(return_value=thread)
+    monkeypatch.setattr(
+        "hermes_cli.discord_worker_boards.thread_status_targets",
+        lambda: [
+            {
+                "thread_id": str(thread.id),
+                "state": "blocked",
+                "reaction_state": "blocked",
+                "message_id": str(old_summary_message.id),
+                "source_message_id": str(old_source_message.id),
+            },
+        ],
+    )
+
+    synced = await adapter.sync_kanban_thread_reaction(
+        {
+            "board": "discord-333-old",
+            "thread_id": str(thread.id),
+            "state": "blocked",
+            "reaction_state": "blocked",
+            "message_id": str(old_summary_message.id),
+            "source_message_id": str(old_source_message.id),
+        }
+    )
+
+    assert synced == "blocked"
+    for message in (old_source_message, old_summary_message):
+        assert [call.args for call in message.remove_reaction.await_args_list] == _status_remove_calls(
+            adapter,
+            except_emoji="❓",
+        )
+        message.add_reaction.assert_not_awaited()
+    assert [call.args for call in op_message.remove_reaction.await_args_list] == _status_remove_calls(
+        adapter,
+        except_emoji="✅",
+    )
+    op_message.add_reaction.assert_awaited_once_with("✅")
+
+
+@pytest.mark.asyncio
 async def test_kanban_thread_reaction_uses_source_task_state_over_done_target(adapter, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import kanban_db
@@ -880,7 +1054,7 @@ async def test_kanban_thread_reaction_uses_terminal_done_over_stale_source_task(
         conn.close()
 
     source_message = SimpleNamespace(
-        id=1512532369897160735,
+        id=555,
         add_reaction=AsyncMock(),
         remove_reaction=AsyncMock(),
         reactions=[SimpleNamespace(emoji="⏳", me=True)],
