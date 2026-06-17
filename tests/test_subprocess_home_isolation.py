@@ -259,6 +259,10 @@ class TestMakeRunEnvHomeInjection:
         real_home = tmp_path / "real-home"
         hermes_home = tmp_path / "hermes"
         real_bin = real_home / ".local" / "bin"
+        profile_home = hermes_home / "home"
+        profile_local_bin = profile_home / ".local" / "bin"
+        profile_foundry_bin = profile_home / ".foundry" / "bin"
+        profile_cargo_bin = profile_home / ".cargo" / "bin"
         gh_dir = real_home / ".config" / "gh"
         gcloud_dir = real_home / ".config" / "gcloud"
         docker_dir = real_home / ".docker"
@@ -266,6 +270,9 @@ class TestMakeRunEnvHomeInjection:
         gitconfig = real_home / ".gitconfig"
         npmrc = real_home / ".npmrc"
         real_bin.mkdir(parents=True)
+        profile_local_bin.mkdir(parents=True)
+        profile_foundry_bin.mkdir(parents=True)
+        profile_cargo_bin.mkdir(parents=True)
         gh_dir.mkdir(parents=True)
         gcloud_dir.mkdir(parents=True)
         docker_dir.mkdir(parents=True)
@@ -274,8 +281,7 @@ class TestMakeRunEnvHomeInjection:
         (docker_dir / "config.json").write_text("{}\n", encoding="utf-8")
         npmrc.write_text("registry=https://registry.npmjs.org/\n", encoding="utf-8")
         (gh_dir / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
-        hermes_home.mkdir()
-        (hermes_home / "home").mkdir()
+        profile_home.mkdir(exist_ok=True)
         monkeypatch.setattr(Path, "home", lambda: real_home)
         monkeypatch.setenv("HOME", str(real_home))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -290,9 +296,15 @@ class TestMakeRunEnvHomeInjection:
         from tools.environments.local import _make_run_env
         result = _make_run_env({})
 
-        assert result["HOME"] == str(hermes_home / "home")
+        assert result["HOME"] == str(profile_home)
         assert result["HERMES_HOME"] == str(hermes_home)
-        assert str(real_bin) in result["PATH"].split(os.pathsep)
+        path_entries = result["PATH"].split(os.pathsep)
+        assert path_entries[:3] == [
+            str(profile_local_bin),
+            str(profile_foundry_bin),
+            str(profile_cargo_bin),
+        ]
+        assert str(real_bin) in path_entries
         assert result["GH_CONFIG_DIR"] == str(gh_dir)
         assert result["GIT_CONFIG_GLOBAL"] == str(gitconfig)
         assert result["DOCKER_CONFIG"] == str(docker_dir)
@@ -491,6 +503,10 @@ class TestSanitizeSubprocessEnvHomeInjection:
         real_home = tmp_path / "real-home"
         hermes_home = tmp_path / "hermes"
         real_bin = real_home / ".local" / "bin"
+        profile_home = hermes_home / "home"
+        profile_local_bin = profile_home / ".local" / "bin"
+        profile_foundry_bin = profile_home / ".foundry" / "bin"
+        profile_cargo_bin = profile_home / ".cargo" / "bin"
         gh_dir = real_home / ".config" / "gh"
         gcloud_dir = real_home / ".config" / "gcloud"
         docker_dir = real_home / ".docker"
@@ -498,6 +514,9 @@ class TestSanitizeSubprocessEnvHomeInjection:
         gitconfig = real_home / ".gitconfig"
         npmrc = real_home / ".npmrc"
         real_bin.mkdir(parents=True)
+        profile_local_bin.mkdir(parents=True)
+        profile_foundry_bin.mkdir(parents=True)
+        profile_cargo_bin.mkdir(parents=True)
         gh_dir.mkdir(parents=True)
         gcloud_dir.mkdir(parents=True)
         docker_dir.mkdir(parents=True)
@@ -506,8 +525,7 @@ class TestSanitizeSubprocessEnvHomeInjection:
         (docker_dir / "config.json").write_text("{}\n", encoding="utf-8")
         npmrc.write_text("registry=https://registry.npmjs.org/\n", encoding="utf-8")
         (gh_dir / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
-        hermes_home.mkdir()
-        (hermes_home / "home").mkdir()
+        profile_home.mkdir(exist_ok=True)
         monkeypatch.setattr(Path, "home", lambda: real_home)
         monkeypatch.setenv("HOME", str(real_home))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -522,9 +540,15 @@ class TestSanitizeSubprocessEnvHomeInjection:
         from tools.environments.local import _sanitize_subprocess_env
         result = _sanitize_subprocess_env(base_env)
 
-        assert result["HOME"] == str(hermes_home / "home")
+        assert result["HOME"] == str(profile_home)
         assert result["HERMES_HOME"] == str(hermes_home)
-        assert str(real_bin) in result["PATH"].split(os.pathsep)
+        path_entries = result["PATH"].split(os.pathsep)
+        assert path_entries[:3] == [
+            str(profile_local_bin),
+            str(profile_foundry_bin),
+            str(profile_cargo_bin),
+        ]
+        assert str(real_bin) in path_entries
         assert result["GH_CONFIG_DIR"] == str(gh_dir)
         assert result["GIT_CONFIG_GLOBAL"] == str(gitconfig)
         assert result["DOCKER_CONFIG"] == str(docker_dir)

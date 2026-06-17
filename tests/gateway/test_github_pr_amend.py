@@ -413,12 +413,13 @@ class TestGitHubPrAmendPolicy:
 
         assert route == {
             "discord_channel_id": "channel-123",
-            "discord_top_level_message_id": "bot-summary-msg",
+            "discord_top_level_message_id": "user-request-msg",
             "discord_thread_id": "thread-123",
             "discord_thread_url": "",
             "discord_board": "discord-thread-123",
             "discord_board_public_url": "https://workers.test/thread-123",
             "discord_guild_id": "guild-123",
+            "discord_summary_message_id": "bot-summary-msg",
         }
 
     def test_fetch_pr_related_context_fetches_paginated_lists(self, monkeypatch):

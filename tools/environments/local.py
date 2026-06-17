@@ -273,6 +273,13 @@ def _append_path_entry(path_value: str, entry: Path) -> str:
     return separator.join([*parts, entry_str]) if parts else entry_str
 
 
+def _prepend_path_entry(path_value: str, entry: Path) -> str:
+    entry_str = str(entry)
+    separator = os.pathsep
+    parts = [part for part in path_value.split(separator) if part and part != entry_str]
+    return separator.join([entry_str, *parts]) if parts else entry_str
+
+
 def _bootstrap_profile_subprocess_env(
     env: dict[str, str], explicit_keys: set[str] | None = None
 ) -> None:
@@ -292,9 +299,19 @@ def _bootstrap_profile_subprocess_env(
     except Exception:
         return
 
-    real_user_bin = Path.home() / ".local" / "bin"
-    if "PATH" not in explicit_keys and real_user_bin.is_dir():
-        env["PATH"] = _append_path_entry(env.get("PATH", ""), real_user_bin)
+    if "PATH" not in explicit_keys:
+        profile_bins = (
+            Path(profile_home) / ".local" / "bin",
+            Path(profile_home) / ".foundry" / "bin",
+            Path(profile_home) / ".cargo" / "bin",
+        )
+        for profile_bin in reversed(profile_bins):
+            if profile_bin.is_dir():
+                env["PATH"] = _prepend_path_entry(env.get("PATH", ""), profile_bin)
+
+        real_user_bin = Path.home() / ".local" / "bin"
+        if real_user_bin.is_dir():
+            env["PATH"] = _append_path_entry(env.get("PATH", ""), real_user_bin)
 
     _inject_real_home_profile_config_paths(env, explicit_keys)
     _inject_github_cli_config_dir(env)

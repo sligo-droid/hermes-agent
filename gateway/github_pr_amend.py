@@ -857,24 +857,25 @@ def resolve_pr_amend_existing_discord_route(artifact: dict[str, Any]) -> dict[st
         if pr_url not in candidates and not (repo_matches and ref_matches):
             continue
         thread_id = str(worker.get("thread_id") or worker.get("discord_thread_id") or "").strip()
-        message_id = str(
+        top_level_message_id = str(
             worker.get("discord_top_level_message_id")
-            or worker.get("summary_message_id")
             or worker.get("source_message_id")
             or worker.get("request_id")
             or ""
         ).strip()
+        summary_message_id = str(worker.get("summary_message_id") or "").strip()
         board_slug = str(board or worker.get("discord_board") or "").strip()
         channel_id = str(worker.get("parent_channel_id") or worker.get("chat_id") or "").strip()
-        if thread_id and message_id and board_slug and channel_id:
+        if thread_id and top_level_message_id and board_slug and channel_id:
             return {
                 "discord_channel_id": channel_id,
-                "discord_top_level_message_id": message_id,
+                "discord_top_level_message_id": top_level_message_id,
                 "discord_thread_id": thread_id,
                 "discord_thread_url": str(worker.get("thread_url") or worker.get("discord_thread_url") or ""),
                 "discord_board": board_slug,
                 "discord_board_public_url": str(worker.get("public_url") or worker.get("discord_board_public_url") or ""),
                 "discord_guild_id": str(worker.get("guild_id") or worker.get("discord_guild_id") or ""),
+                "discord_summary_message_id": summary_message_id,
             }
     return {}
 
