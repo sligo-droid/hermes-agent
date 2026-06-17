@@ -7,6 +7,7 @@ import {
   Archive,
   Check,
   CheckCircle2,
+  ChevronDown,
   Circle,
   CircleDashed,
   CircleDot,
@@ -652,21 +653,24 @@ function WorkItemCard({
         <AnnotationSummary item={item} />
         <p className="text-sm leading-6 text-slate-300">{compactDescription}</p>
         {canShowFullDescription ? (
-          <div className="mt-3" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
+          <div className="mt-2" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
             <button
               aria-controls={descriptionId}
               aria-expanded={fullDescriptionOpen}
-              className="inline-flex h-8 items-center rounded-full border border-white/10 px-3 text-xs font-semibold text-cyan-100 transition hover:border-cyan-100/35 hover:bg-cyan-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/30"
+              aria-label={fullDescriptionOpen ? `Collapse full context for ${item.title}` : `Expand full context for ${item.title}`}
+              className="command-center-description-disclosure inline-flex items-center gap-1.5 rounded-md text-[0.72rem] font-semibold uppercase tracking-[0.16em] text-slate-500 transition hover:text-cyan-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/30"
               onClick={(event) => {
                 event.stopPropagation();
                 setFullDescriptionOpen((open) => !open);
               }}
               type="button"
             >
-              {fullDescriptionOpen ? "Hide full description" : "Show full description"}
+              <ChevronDown aria-hidden="true" className={cn("h-3.5 w-3.5 transition-transform", fullDescriptionOpen && "rotate-180")} />
+              <span>Full context</span>
+              <span className="sr-only">{fullDescriptionOpen ? "expanded" : "collapsed"}</span>
             </button>
             {fullDescriptionOpen ? (
-              <div id={descriptionId} className="mt-3 whitespace-pre-wrap rounded-xl border border-white/[0.08] bg-white/[0.035] p-3 text-sm leading-6 text-slate-200">
+              <div id={descriptionId} className="mt-2 whitespace-pre-wrap rounded-xl border border-white/[0.08] bg-white/[0.035] p-3 text-sm leading-6 text-slate-200">
                 {fullDescription}
               </div>
             ) : null}
