@@ -1124,6 +1124,20 @@ def ensure_discord_thread_board(
     project_path = incoming_project_path or existing_project_path
     if project_path:
         merged_project_context["project_path"] = project_path
+    existing_pr_amend_context = (
+        existing_context.get("github_pr_amend") if isinstance(existing_context, dict) else None
+    )
+    incoming_pr_amend_context = incoming_project_context.get("github_pr_amend")
+    existing_pr_amend_source_key = ""
+    incoming_pr_amend_source_key = ""
+    if isinstance(existing_pr_amend_context, dict):
+        existing_pr_amend_source_key = str(existing_pr_amend_context.get("source_key") or "").strip()
+    if isinstance(incoming_pr_amend_context, dict):
+        incoming_pr_amend_source_key = str(incoming_pr_amend_context.get("source_key") or "").strip()
+    reset_review_loop_budget = bool(
+        incoming_pr_amend_source_key
+        and incoming_pr_amend_source_key != existing_pr_amend_source_key
+    )
     token = worker.get("share_token") or secrets.token_urlsafe(PUBLIC_TOKEN_BYTES)
     request_suffix = slug.removeprefix("discord-")
     branch = f"discord/{request_suffix or thread_id}"
@@ -1161,8 +1175,12 @@ def ensure_discord_thread_board(
             "phase": worker.get("phase") or "intake",
             "goal_status": worker.get("goal_status") or "unset",
             "criteria": worker.get("criteria") or [],
-            "review_loop_count": int(worker.get("review_loop_count") or 0),
-            "review_loop_limit": int(worker.get("review_loop_limit") or _review_loop_limit_for_request(request_text)),
+            "review_loop_count": 0 if reset_review_loop_budget else int(worker.get("review_loop_count") or 0),
+            "review_loop_limit": (
+                _review_loop_limit_for_request(request_text)
+                if reset_review_loop_budget
+                else int(worker.get("review_loop_limit") or _review_loop_limit_for_request(request_text))
+            ),
             "pr_open_policy": pr_policy["pr_open_policy"],
             "merge_policy": pr_policy["merge_policy"],
             "share_token": token,

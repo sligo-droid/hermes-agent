@@ -596,6 +596,54 @@ def test_foreman_goal_uses_three_review_loops_but_regular_keeps_default(monkeypa
     assert foreman_worker["review_loop_limit"] == 3
 
 
+def test_pr_amend_new_source_resets_review_loop_budget(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.ensure_discord_thread_board(
+        thread_id="7770",
+        initial_request="GitHub PR amend round 1",
+        project_context={"github_pr_amend": {"source_key": "github-pr-amend:review:1"}},
+    )
+    dwb._update_worker_meta(board.slug, {"review_loop_count": 5, "review_loop_limit": 5})
+
+    updated = dwb.ensure_discord_thread_board(
+        thread_id="7770",
+        initial_request="GitHub PR amend round 2",
+        project_context={"github_pr_amend": {"source_key": "github-pr-amend:review_comment:2"}},
+    )
+
+    worker = kanban_db.read_board_metadata(updated.slug)["discord_worker"]
+    assert worker["review_loop_count"] == 0
+    assert worker["review_loop_limit"] == 5
+    assert worker["project_context"]["github_pr_amend"]["source_key"] == "github-pr-amend:review_comment:2"
+
+
+def test_pr_amend_duplicate_source_preserves_review_loop_budget(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    project_context = {"github_pr_amend": {"source_key": "github-pr-amend:review:1"}}
+    board = dwb.ensure_discord_thread_board(
+        thread_id="7774",
+        initial_request="GitHub PR amend round 1",
+        project_context=project_context,
+    )
+    dwb._update_worker_meta(board.slug, {"review_loop_count": 5, "review_loop_limit": 5})
+
+    updated = dwb.ensure_discord_thread_board(
+        thread_id="7774",
+        initial_request="GitHub PR amend duplicate delivery",
+        project_context=project_context,
+    )
+
+    worker = kanban_db.read_board_metadata(updated.slug)["discord_worker"]
+    assert worker["review_loop_count"] == 5
+    assert worker["review_loop_limit"] == 5
+
+
 def test_foreman_board_blocks_at_three_review_rounds(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
