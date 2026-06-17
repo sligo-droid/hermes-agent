@@ -4130,7 +4130,10 @@ class DiscordAdapter(BasePlatformAdapter):
         raw_summary = target.get("board_summary")
         board_summary: Dict[str, Any] = raw_summary if isinstance(raw_summary, dict) else {}
         final_response = self._kanban_completion_final_response(board_summary)
-        if final_response:
+        if final_response and not self._kanban_completion_final_response_is_stale_success_blocker(
+            final_response,
+            board_summary,
+        ):
             lines = [final_response]
             lines.extend(self._kanban_completion_notice_link_lines(target, board_summary, existing_text=final_response))
             return "\n".join(lines)
@@ -4320,6 +4323,45 @@ class DiscordAdapter(BasePlatformAdapter):
         if not isinstance(final, dict):
             return ""
         return str(final.get("text") or "").strip()
+
+    @staticmethod
+    def _kanban_completion_final_response_is_stale_success_blocker(
+        final_response: str,
+        board_summary: Dict[str, Any],
+    ) -> bool:
+        if not isinstance(board_summary, dict):
+            return False
+        phase = str(board_summary.get("phase") or "").strip().lower()
+        goal_status = str(board_summary.get("goal_status") or "").strip().lower()
+        if phase != "complete" or goal_status != "done":
+            return False
+
+        pr = board_summary.get("pr") if isinstance(board_summary.get("pr"), dict) else {}
+        merge_state = str(pr.get("merge_state") or "").strip().lower()
+        merge_commit = str(pr.get("merge_commit") or "").strip()
+        checks_status = str(pr.get("checks_status") or "").strip().lower()
+        deployment_status = str(board_summary.get("deployment_status") or "").strip().lower()
+        if merge_state != "merged" or not merge_commit:
+            return False
+        if checks_status not in {"passed", "success"}:
+            return False
+        if deployment_status and deployment_status not in {
+            "done",
+            "deployed",
+            "success",
+            "passed",
+            "not checked",
+            "unknown",
+            "unchecked",
+        }:
+            return False
+
+        text = str(final_response or "").lower()
+        return "blocker:" in text and (
+            "dirty" in text
+            or "conflicting" in text
+            or "unblock path" in text
+        )
 
     @staticmethod
     def _kanban_completion_notice_link_lines(
