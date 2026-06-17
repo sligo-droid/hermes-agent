@@ -269,6 +269,26 @@ def test_command_center_annotations_render_as_safe_plain_text():
     assert "markdown" not in summary_source.lower()
 
 
+def test_command_center_work_item_full_description_toggle_is_accessible_plain_text():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    api_source = (ROOT / "web/src/lib/api.ts").read_text(encoding="utf-8")
+    card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
+
+    assert "full_description?: string | null;" in api_source
+    assert "const compactDescription = item.summary || item.body_preview || \"No summary yet.\";" in card_source
+    assert "const fullDescription = item.full_description?.trim();" in card_source
+    assert "canShowFullDescription" in card_source
+    assert "Show full description" in card_source
+    assert "Hide full description" in card_source
+    assert "aria-expanded={fullDescriptionOpen}" in card_source
+    assert "aria-controls={descriptionId}" in card_source
+    assert "whitespace-pre-wrap" in card_source
+    assert "{fullDescription}" in card_source
+    assert "event.stopPropagation();" in card_source
+    assert "item.raw" not in card_source
+    assert "dangerouslySetInnerHTML" not in card_source
+
+
 def test_command_center_annotation_submit_surfaces_partial_failures_and_refreshes():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
     submit_source = source.split("const submitAnnotation = useCallback", 1)[1].split("const runActionForItem = useCallback", 1)[0]

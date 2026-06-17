@@ -80,6 +80,7 @@ Important invariants:
 3. Active worker runs are always included in `runs`, even when they are older than the recent-run limit.
 4. Approval artifacts such as Discord thread URLs and worker-board URLs survive later halt/undo audit events.
 5. Stored legacy `proposal_cards.worker_url` values remain visible as execution/artifact fallbacks.
+6. Work Item descriptions are split by intent: `summary` and `body_preview` stay compact for default row rendering, while optional `full_description` is backend-provided plain text for an operator-controlled expanded view.
 
 ## Operator Annotations
 
@@ -148,7 +149,8 @@ Current UX intention is tracked in `docs/project-state.md`; update that file whe
 3. **Rows are Work Items or board-level rollups.** Proposed recommendations, intake/decision items, and named worker boards can render as rows. Individual Kanban tasks/tickets and accepted downstream proposal cards should stay inside board/detail surfaces unless they are promoted to canonical Work Items.
 4. **Worker links are execution artifacts.** Show a Worker link only after execution starts; point it directly to the board URL; never use bare `/workers` as a per-item destination.
 5. **Archive is historical, not a live-board filter.** Archived board rows can be listed from `boards/_archived/`, but they should not expose live-board actions or look like active execution.
-6. **UI chrome stays quiet.** Use one shell header/refresh area, one Work State lane, a left work list, and a right detail/audit pane. Avoid duplicate refresh rows, KPI cards, status bars, and stale `Operator Surface` copy.
+6. **Compact first, rich on demand.** Work Item rows render compact `summary`/`body_preview` text by default. When `full_description` is present, the UI may expose a per-row plain-text toggle that preserves line breaks and does not navigate away from the row.
+7. **UI chrome stays quiet.** Use one shell header/refresh area, one Work State lane, a left work list, and a right detail/audit pane. Avoid duplicate refresh rows, KPI cards, status bars, and stale `Operator Surface` copy.
 
 ## Feature Requests Without Worker Boards
 
