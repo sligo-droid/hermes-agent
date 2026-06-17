@@ -20,6 +20,17 @@ def _fixture(name: str) -> dict:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
+def _github_pr_amend_card() -> dict:
+    return {
+        "proposal_id": "github-pr-amend-123",
+        "project": "reserve-index-dtf",
+        "prong": "github-pr-amend",
+        "title": "GitHub PR amend: reserve-protocol/reserve-index-dtf#182",
+        "summary": "Route the accepted review request through the worker board.",
+        "priority": "high",
+    }
+
+
 def test_default_config_contains_pid_self_improvement_prongs():
     cfg = load_config()
     section = cfg["self_improvement"]
@@ -217,6 +228,121 @@ def test_self_improvement_discord_approval_embed_links_worker_board():
     assert embed["url"].rstrip("/") != "https://sligo.sligolabs.com/workers"
     fields = {field["name"]: field["value"] for field in embed["fields"]}
     assert fields["Worker board"] == "https://sligo.sligolabs.com/workers/1512960023947378698"
+
+
+def test_self_improvement_discord_publish_posts_thread_summary_embed(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "hermes-home" / "kanban"))
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://example.test")
+    monkeypatch.setattr(discord_publish, "_project_mapping_for_key", lambda _project: {})
+    monkeypatch.setattr(discord_publish, "load_config_readonly", lambda: {})
+
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
+    from tools import discord_tool
+
+    calls = []
+
+    def fake_request(method, path, token, **kwargs):
+        calls.append({"method": method, "path": path, "token": token, "kwargs": kwargs})
+        if method == "POST" and path == "/channels/123/messages":
+            return {"id": "555", "guild_id": "999"}
+        if method == "POST" and path == "/channels/123/messages/555/threads":
+            return {"id": "777", "guild_id": "999"}
+        if method == "POST" and path == "/channels/777/messages":
+            return {"id": "888"}
+        return {}
+
+    monkeypatch.setattr(discord_tool, "_get_bot_token", lambda: "tok")
+    monkeypatch.setattr(discord_tool, "_discord_request", fake_request)
+
+    card = _github_pr_amend_card()
+
+    route = discord_publish.publish_approved_proposal(card, channel_id="123")
+
+    assert route is not None
+    assert route.thread_id == "777"
+    assert route.top_level_message_id == "555"
+    assert route.summary_message_id == "888"
+    assert route.metadata()["discord_summary_message_id"] == "888"
+
+    assert any(
+        call["method"] == "POST" and call["path"] == "/channels/777/messages"
+        for call in calls
+    )
+    assert any(
+        call["method"] == "PUT"
+        and call["path"] == "/channels/777/messages/888/reactions/%F0%9F%91%80/@me"
+        for call in calls
+    )
+
+    worker = kanban_db.read_board_metadata(route.board)[DISCORD_WORKER_META_KEY]
+    assert worker["summary_message_id"] == "888"
+    assert worker["source_message_id"] == "555"
+
+    state_path = tmp_path / "hermes-home" / "gateway" / "discord_project_summaries.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    handle = state["_feature_summaries"]["999:777:555"]
+    assert handle["message_id"] == "888"
+    assert handle["source_message_id"] == "555"
+    assert handle["summary_channel_id"] == "777"
+    assert handle["kanban_board"] == {"slug": route.board, "public_url": route.board_public_url}
+
+
+def test_self_improvement_discord_thread_summary_recovers_stale_message(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "hermes-home" / "kanban"))
+    monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://example.test")
+    monkeypatch.setattr(discord_publish, "_project_mapping_for_key", lambda _project: {})
+    monkeypatch.setattr(discord_publish, "load_config_readonly", lambda: {})
+
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
+    from tools import discord_tool
+
+    calls = []
+
+    def fake_request(method, path, token, **kwargs):
+        calls.append({"method": method, "path": path, "token": token, "kwargs": kwargs})
+        if method == "PATCH" and path == "/channels/777/messages/stale-summary":
+            raise RuntimeError("Discord API error 404: Unknown Message")
+        if method == "POST" and path == "/channels/777/messages":
+            return {"id": "fresh-summary"}
+        return {}
+
+    monkeypatch.setattr(discord_tool, "_get_bot_token", lambda: "tok")
+    monkeypatch.setattr(discord_tool, "_discord_request", fake_request)
+
+    card = _github_pr_amend_card()
+    route = discord_publish.DiscordApprovalRoute(
+        channel_id="123",
+        top_level_message_id="555",
+        thread_id="777",
+        thread_url="https://discord.test/thread/777",
+        board="discord-777",
+        board_public_url="https://example.test/workers/discord-777",
+        guild_id="999",
+        summary_message_id="stale-summary",
+    )
+    route = discord_publish.ensure_approval_route_board(card, route)
+    route = discord_publish.ensure_thread_feature_summary(card, route)
+
+    assert route is not None
+    assert route.error == ""
+    assert route.summary_message_id == "fresh-summary"
+    assert [call["method"] for call in calls[:2]] == ["PATCH", "POST"]
+    assert any(
+        call["method"] == "PUT"
+        and call["path"] == "/channels/777/messages/fresh-summary/reactions/%F0%9F%91%80/@me"
+        for call in calls
+    )
+
+    worker = kanban_db.read_board_metadata(route.board)[DISCORD_WORKER_META_KEY]
+    assert worker["summary_message_id"] == "fresh-summary"
+    assert worker["source_message_id"] == "555"
 
 
 def test_self_improvement_activation_uses_planner_flow_with_board_criteria(monkeypatch, tmp_path):

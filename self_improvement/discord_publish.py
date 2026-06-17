@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from hermes_cli.config import cfg_get, load_config_readonly
+from utils import atomic_json_write
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +25,7 @@ class DiscordApprovalRoute:
     board: str
     board_public_url: str
     guild_id: str = ""
+    summary_message_id: str = ""
     error: str = ""
 
     def metadata(self) -> dict[str, Any]:
@@ -33,6 +37,7 @@ class DiscordApprovalRoute:
             "discord_board": self.board,
             "discord_board_public_url": self.board_public_url,
             "discord_guild_id": self.guild_id,
+            "discord_summary_message_id": self.summary_message_id,
             **({"discord_publish_error": self.error} if self.error else {}),
         }
 
@@ -225,10 +230,12 @@ def publish_approved_proposal(
             board=existing_board,
             board_public_url=str(existing.get("discord_board_public_url") or ""),
             guild_id=str(existing.get("discord_guild_id") or ""),
+            summary_message_id=str(existing.get("discord_summary_message_id") or ""),
         )
         route = ensure_approval_route_board(card, route)
         if route and route.board_public_url:
             _update_feature_embed(channel_id, existing_message, card, route.board_public_url)
+        route = ensure_thread_feature_summary(card, route)
         return route
 
     try:
@@ -271,6 +278,7 @@ def publish_approved_proposal(
         route = ensure_approval_route_board(card, route)
         if route and route.board_public_url:
             _update_feature_embed(channel_id, message_id, card, route.board_public_url)
+        route = ensure_thread_feature_summary(card, route)
         return route
     except Exception as exc:
         log.warning("self-improvement Discord approval publish failed: %s", exc)
@@ -314,6 +322,164 @@ def ensure_approval_route_board(
         if route.error:
             error = f"{route.error}; board: {error}"
         return replace(route, error=error)
+
+
+def ensure_thread_feature_summary(
+    card: dict[str, Any],
+    route: DiscordApprovalRoute | None,
+) -> DiscordApprovalRoute | None:
+    """Ensure the worker thread has an immediately visible summary embed.
+
+    The parent approval embed is useful as an inbox row, but operators expect
+    the created worker thread itself to contain the live feature/worker embed
+    immediately. Persisting that message id into board metadata lets the normal
+    Kanban status sync update the inner embed and keep the parent/source emoji
+    aligned with it.
+    """
+
+    if route is None or not route.thread_id or not route.board:
+        return route
+    board_public_url = str(route.board_public_url or "").strip()
+    if not board_public_url:
+        return route
+    try:
+        from tools.discord_tool import _discord_request, _get_bot_token
+
+        token = _get_bot_token()
+        if not token:
+            return route
+
+        summary_message_id = str(route.summary_message_id or _board_summary_message_id(route.board) or "").strip()
+        body = {"embeds": [_feature_embed(card, board_public_url)]}
+        if summary_message_id:
+            try:
+                _discord_request(
+                    "PATCH",
+                    f"/channels/{route.thread_id}/messages/{summary_message_id}",
+                    token,
+                    body=body,
+                )
+            except Exception as exc:
+                if not _is_missing_discord_message_error(exc):
+                    raise
+                log.info(
+                    "self-improvement Discord thread summary handle was stale; recreating message for board %s",
+                    route.board,
+                )
+                summary_message_id = ""
+        if not summary_message_id:
+            message = _discord_request(
+                "POST",
+                f"/channels/{route.thread_id}/messages",
+                token,
+                body=body,
+            ) or {}
+            summary_message_id = str(message.get("id") or "").strip()
+            if summary_message_id:
+                _add_reaction(token, route.thread_id, summary_message_id, "👀")
+
+        if not summary_message_id:
+            return route
+        _attach_thread_summary_handle(card, route, summary_message_id)
+        return replace(route, summary_message_id=summary_message_id)
+    except Exception as exc:
+        log.warning("self-improvement Discord thread summary publish failed: %s", exc)
+        error = str(exc)
+        if route.error:
+            error = f"{route.error}; thread summary: {error}"
+        return replace(route, error=error)
+
+
+def _is_missing_discord_message_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return (
+        "404" in text
+        or "unknown message" in text
+        or "not found" in text
+        or "missing access" in text
+    )
+
+
+def _board_summary_message_id(board: str) -> str:
+    if not board:
+        return ""
+    try:
+        from hermes_cli import kanban_db
+        from hermes_cli.discord_worker_roles import DISCORD_WORKER_META_KEY
+
+        metadata = kanban_db.read_board_metadata(board)
+        worker = metadata.get(DISCORD_WORKER_META_KEY) if isinstance(metadata, dict) else {}
+        return str(worker.get("summary_message_id") or "").strip() if isinstance(worker, dict) else ""
+    except Exception:
+        return ""
+
+
+def _attach_thread_summary_handle(
+    card: dict[str, Any],
+    route: DiscordApprovalRoute,
+    summary_message_id: str,
+) -> None:
+    summary_message_id = str(summary_message_id or "").strip()
+    if not summary_message_id:
+        return
+    try:
+        from hermes_cli.discord_worker_boards import set_feature_summary_handle
+
+        set_feature_summary_handle(
+            route.board,
+            message_id=summary_message_id,
+            source_message_id=route.top_level_message_id,
+        )
+    except Exception:
+        log.debug("failed to attach Discord thread summary ids to board", exc_info=True)
+    try:
+        _persist_thread_feature_summary_handle(card, route, summary_message_id)
+    except Exception:
+        log.debug("failed to persist Discord thread summary handle", exc_info=True)
+
+
+def _persist_thread_feature_summary_handle(
+    card: dict[str, Any],
+    route: DiscordApprovalRoute,
+    summary_message_id: str,
+) -> None:
+    from hermes_constants import get_hermes_home
+
+    path = get_hermes_home() / "gateway" / "discord_project_summaries.json"
+    try:
+        state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception:
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    bucket = state.get("_feature_summaries")
+    if not isinstance(bucket, dict):
+        bucket = {}
+    source_message_id = str(route.top_level_message_id or "").strip()
+    key = f"{route.guild_id or 'dm'}:{route.thread_id}"
+    if source_message_id:
+        key = f"{key}:{source_message_id}"
+    bucket[key] = {
+        "thread_id": str(route.thread_id or ""),
+        "message_id": str(summary_message_id or ""),
+        "source_message_id": source_message_id or None,
+        "summary_channel_id": str(route.thread_id or ""),
+        "guild_id": str(route.guild_id or ""),
+        "parent_channel_id": str(route.channel_id or ""),
+        "initial_request": _initial_request(card),
+        "project_context": _project_context(card, route.channel_id),
+        "kanban_board": {"slug": route.board, "public_url": route.board_public_url},
+        "source_board": "",
+        "source_task_id": "",
+        "source_task_url": "",
+        "source_kanban_url": "",
+        "source_discord_thread_url": "",
+        "pr_url": "",
+        "hide_source_links": False,
+        "updated_at": time.time(),
+    }
+    state["_feature_summaries"] = bucket
+    atomic_json_write(path, state, indent=0, separators=(",", ":"))
 
 
 def activate_approved_proposal(
