@@ -207,10 +207,30 @@ def setup_logging(
     max_bytes = (max_size_mb or cfg_max_size or 5) * 1024 * 1024
     backups = backup_count or cfg_backup or 3
 
+    root = logging.getLogger()
+
+    if _logging_initialized and not force:
+        if mode == "gateway":
+            # Gateway startup can follow earlier CLI logging setup in the same
+            # process; attach the component log without rebuilding handlers.
+            from agent.redact import RedactingFormatter
+
+            _add_rotating_handler(
+                root,
+                log_dir / "gateway.log",
+                level=logging.INFO,
+                max_bytes=5 * 1024 * 1024,
+                backup_count=3,
+                formatter=RedactingFormatter(_LOG_FORMAT),
+                log_filter=_ComponentFilter(COMPONENT_PREFIXES["gateway"]),
+            )
+        return log_dir
+
+    if force:
+        _remove_managed_rotating_handlers(root)
+
     # Lazy import to avoid circular dependency at module load time.
     from agent.redact import RedactingFormatter
-
-    root = logging.getLogger()
 
     # --- agent.log (INFO+) — the main activity log -------------------------
     _add_rotating_handler(
@@ -243,9 +263,6 @@ def setup_logging(
             formatter=RedactingFormatter(_LOG_FORMAT),
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gateway"]),
         )
-
-    if _logging_initialized and not force:
-        return log_dir
 
     # Ensure root logger level is low enough for the handlers to fire.
     if root.level == logging.NOTSET or root.level > level:
@@ -451,6 +468,27 @@ def _add_rotating_handler(
     if log_filter is not None:
         handler.addFilter(log_filter)
     logger.addHandler(handler)
+
+
+def _remove_managed_rotating_handlers(logger: logging.Logger) -> None:
+    """Remove Hermes log file handlers before forced reconfiguration.
+
+    Older tests and startup paths can leave a plain stdlib RotatingFileHandler
+    pointed at a previous Hermes home.  A forced reconfiguration must close
+    those too, otherwise warnings continue writing to the stale path.
+    """
+    for handler in list(logger.handlers):
+        if isinstance(handler, RotatingFileHandler) and _is_hermes_log_handler(handler):
+            logger.removeHandler(handler)
+            handler.close()
+
+
+def _is_hermes_log_handler(handler: RotatingFileHandler) -> bool:
+    """Return True for handlers targeting Hermes-managed log files."""
+    try:
+        return Path(handler.baseFilename).name in {"agent.log", "errors.log", "gateway.log"}
+    except (TypeError, ValueError):
+        return isinstance(handler, _ManagedRotatingFileHandler)
 
 
 def _read_logging_config():
