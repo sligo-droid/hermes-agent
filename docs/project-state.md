@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-16 17:06 UTC
+Last updated: 2026-06-17 00:00 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -34,6 +34,7 @@ This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork
 | Self-improvement proposal terminal reconciliation | implemented | Command Center proposal reads now reconcile approved self-improvement proposal cards against active and archived Kanban worker boards, persist terminal completion evidence for done tasks/boards, and keep completed proposals out of active duplicate suppression while preserving historical cards. |
 | Finite no-agent cron auto-pause | implemented | Opted-in no-agent cron jobs that emit terminal-success output now pause after successful completion, preserve the terminal output path/reason for cron list/status/tool surfaces, and keep non-opted-in recurring jobs active. |
 | GitHub PR-amend worker-board routing | implemented | Accepted PR-amend webhooks now carry fetched PR/review/comment context, explicit fork target repo/base-branch metadata for worker boards, an active head-branch lock until the worker board reaches terminal state, and no premature done reaction at queue time. |
+| Dirty secondary main worktree quarantine | in_progress | `/home/droid/workspaces/hermes-self-improvement-live-test` is explicitly excluded from Discord role-worker selection via `kanban.discord_worker.excluded_workspaces`; `docs/runbooks/worktree-quarantine-2026-06-17.md` records the 247-file dirty inventory, reference checks, and human-approval cleanup plan. |
 
 Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `merged`, `deployed`, `verified`, `superseded`.
 
@@ -77,6 +78,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - **Skill-to-repo transition:** remove current-state and target-setting prose from installed Hermes skills over time. Leave short pointers from `hermes-agent`, `hermes-operations`, and related references to this file and `docs/context.md`.
 - **Command Center as operator ledger:** keep Hermes (`#dev`) and PID as project tabs over one Work Item / Source / Worker Run model. Do not reintroduce competing self-improvement/worker-board ledgers.
 - **Autonomous operations loop goalplan:** use `docs/plans/2026-06-08-autonomous-operations-loop-goalplan.md` as the durable completeness target for policy-gated Observe -> Diagnose -> Decide -> Execute -> Verify -> Learn autonomy.
+- **Dirty secondary main worktree quarantine:** keep `/home/droid/workspaces/hermes-self-improvement-live-test` excluded from worker selection until an operator preserves and reconciles the dirty diff per `docs/runbooks/worktree-quarantine-2026-06-17.md`.
 
 ## Current Command Center UX Intent
 
@@ -99,6 +101,7 @@ These are known ideas or cleanup candidates, not the active target unless the us
 - Browser/typed-input secret redaction hardening: useful core safety work, not this transition.
 - Orphan-DAG tests and PID-specific Operations checks: belong in PID repo state, not Hermes state, unless the Hermes orchestration layer changes.
 - Broad stale-worktree cleanup: useful hygiene, but should not distract from the repo-state boundary unless it blocks current work.
+- Broad automatic worktree janitor/preflight: intentionally out of scope for the current dirty-main quarantine; use the runbook inventory for human-approved cleanup instead.
 
 ## Blocked
 
