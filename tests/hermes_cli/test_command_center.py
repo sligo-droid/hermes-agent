@@ -1357,6 +1357,72 @@ def test_snapshot_terminal_archived_board_stays_historical(tmp_path, monkeypatch
     assert "repair_required" not in item["execution"]
 
 
+def test_snapshot_terminal_archive_suppresses_recreated_empty_active_stub(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "discord-terminal-archive-empty-stub"
+    meta = kanban_db.write_board_metadata(board, name="Terminal Archive Empty Stub")
+    meta[command_center.DISCORD_WORKER_META_KEY] = {"kind": "discord_worker_board", "goal_status": "done", "phase": "complete"}
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Finished worker", board=board)
+        with conn:
+            conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200, task_id))
+    finally:
+        conn.close()
+    kanban_db.remove_board(board)
+
+    stub_conn = kanban_db.connect(board=board)
+    stub_conn.close()
+
+    default_snapshot = command_center.build_command_center_snapshot()
+    archived_snapshot = command_center.build_command_center_snapshot(include_archived=True)
+
+    assert not any(item["id"] == f"kanban-board:{board}" for item in default_snapshot["work_items"])
+    assert not any(item["id"] == f"kanban-board:{board}" for item in archived_snapshot["work_items"])
+    archived_items = [item for item in archived_snapshot["work_items"] if item.get("execution", {}).get("board") == board]
+    assert archived_items
+    assert all(item["status"] == "archived" for item in archived_items)
+
+
+def test_snapshot_terminal_archive_suppresses_stale_blocked_done_active_board(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "discord-terminal-archive-stale-blocked"
+    meta = kanban_db.write_board_metadata(board, name="Terminal Archive Stale Blocked")
+    meta[command_center.DISCORD_WORKER_META_KEY] = {"kind": "discord_worker_board", "goal_status": "cancelled", "phase": "cancelled", "cancelled": True}
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    kanban_db.connect(board=board).close()
+    kanban_db.remove_board(board)
+
+    active_meta = kanban_db.write_board_metadata(board, name="Terminal Archive Stale Blocked")
+    active_meta[command_center.DISCORD_WORKER_META_KEY] = {
+        "kind": "discord_worker_board",
+        "goal_status": "blocked",
+        "phase": "blocked",
+        "thread_state": "blocked",
+        "board_summary": {"thread_state": "blocked", "task_counts": {"done": 2}},
+    }
+    kanban_db.board_metadata_path(board).write_text(json.dumps(active_meta), encoding="utf-8")
+    conn = kanban_db.connect(board=board)
+    try:
+        for idx in range(2):
+            task_id = kanban_db.create_task(conn, title=f"Stale completed worker task {idx}", board=board)
+            with conn:
+                conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200 + idx, task_id))
+    finally:
+        conn.close()
+
+    default_snapshot = command_center.build_command_center_snapshot()
+    archived_snapshot = command_center.build_command_center_snapshot(include_archived=True)
+
+    assert not any(item["id"] == f"kanban-board:{board}" for item in default_snapshot["work_items"])
+    assert not any(item["id"] == f"kanban-board:{board}" for item in archived_snapshot["work_items"])
+    assert any(
+        item.get("execution", {}).get("board") == board and item["status"] == "archived"
+        for item in archived_snapshot["work_items"]
+    )
+
+
 def test_archived_board_metadata_cache_reuses_until_archive_root_mtime_changes(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     archive_root = kanban_db.boards_root() / "_archived"
