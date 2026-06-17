@@ -1035,6 +1035,16 @@ def _discord_worker_board_is_terminal(worker: dict[str, Any]) -> bool:
     return _discord_worker_board_status(worker) in {"done", "blocked", "cancelled"}
 
 
+def _discord_worker_board_is_cancelled(worker: dict[str, Any]) -> bool:
+    # Done boards still owe their green terminal reaction/completion notice before
+    # archive; a stale cancellation flag must not bypass those delivery guards.
+    status = str(worker.get("goal_status") or "").strip().lower()
+    phase = str(worker.get("phase") or "").strip().lower()
+    if status == "done" or phase == "complete":
+        return False
+    return _discord_worker_board_status(worker) == "cancelled" or bool(worker.get("cancelled"))
+
+
 def _pause_generic_task(conn: sqlite3.Connection, task_id: str, *, reason: str) -> bool:
     task = kanban_db.get_task(conn, task_id)
     if task is None or task.status in {"done", "archived"}:
@@ -3352,7 +3362,12 @@ def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete
                 from hermes_cli import discord_worker_boards as dwb
 
                 terminal_before_archive = _discord_worker_board_is_terminal(worker)
-                if terminal_before_archive and dwb.board_has_unsynced_terminal_reaction(normed):
+                cancelled_before_archive = terminal_before_archive and _discord_worker_board_is_cancelled(worker)
+                if (
+                    terminal_before_archive
+                    and not cancelled_before_archive
+                    and dwb.board_has_unsynced_terminal_reaction(normed)
+                ):
                     dwb.mark_dispatch_dirty(board=normed, reason="archive-waiting-for-terminal-reaction-sync")
                     raise HTTPException(
                         status_code=409,
