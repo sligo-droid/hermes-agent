@@ -34,6 +34,7 @@ COMMAND_CENTER_REPAIR_ACTIVE_STATUSES = {"triage", "todo", "ready", "running", "
 
 _TERMINAL_TASK_STATUSES = {"done", "archived"}
 _TERMINAL_SUCCESS_STATUSES = {"done", "shipped", "complete", "completed"}
+_SUCCESS_CHECK_STATUSES = {"passed", "success", "successful", "green", "ok"}
 _WAITING_TASK_STATUSES = {"triage", "todo", "scheduled", "ready"}
 _RUNNING_TASK_STATUSES = {"running"}
 _REVIEW_TASK_STATUSES = {"review"}
@@ -533,6 +534,61 @@ def _canonical_status_from_task(task: dict[str, Any] | None) -> tuple[str, str]:
     return "accepted", status or "unknown"
 
 
+def _has_nonterminal_task_counts(counts: dict[str, int]) -> bool:
+    return bool(
+        counts.get("running", 0)
+        or counts.get("review", 0)
+        or counts.get("blocked", 0)
+        or sum(counts.get(status, 0) for status in _WAITING_TASK_STATUSES)
+    )
+
+
+def _board_has_strong_terminal_success_evidence(
+    worker: dict[str, Any],
+    board_summary: dict[str, Any],
+    counts: dict[str, int],
+) -> bool:
+    """Return whether terminal worker metadata is corroborated enough to beat stale blocked thread state."""
+
+    goal_status = str(worker.get("goal_status") or board_summary.get("goal_status") or "").lower()
+    phase = str(worker.get("phase") or board_summary.get("phase") or "").lower()
+    if not (goal_status in _TERMINAL_SUCCESS_STATUSES or phase in _TERMINAL_SUCCESS_STATUSES):
+        return False
+    if _has_nonterminal_task_counts(counts):
+        return False
+
+    thread_state = str(worker.get("thread_state") or board_summary.get("thread_state") or "").lower()
+    if thread_state in _TERMINAL_SUCCESS_STATUSES:
+        return True
+    synced_state = str(worker.get("terminal_reaction_synced_state") or board_summary.get("terminal_reaction_synced_state") or "").lower()
+    if synced_state in _TERMINAL_SUCCESS_STATUSES:
+        return True
+
+    review_value = board_summary.get("review")
+    review: dict[str, Any] = review_value if isinstance(review_value, dict) else {}
+    final_verdict_value = review.get("final_verdict")
+    final_verdict: dict[str, Any] = final_verdict_value if isinstance(final_verdict_value, dict) else {}
+    if str(final_verdict.get("status") or "").lower() == "approved":
+        return True
+
+    pr_summary_value = board_summary.get("pr")
+    pr_summary: dict[str, Any] = pr_summary_value if isinstance(pr_summary_value, dict) else {}
+    pr_state = str(worker.get("pr_state") or pr_summary.get("state") or "").upper()
+    checks_status = str(worker.get("pr_checks_status") or pr_summary.get("checks_status") or "").lower()
+    if pr_state == "MERGED" and (
+        checks_status in _SUCCESS_CHECK_STATUSES
+        or worker.get("pr_merged_at")
+        or pr_summary.get("merged_at")
+    ):
+        return True
+
+    canonical_sync_state = str(worker.get("canonical_sync_state") or board_summary.get("canonical_sync_state") or "").lower()
+    return bool(
+        canonical_sync_state == "synced"
+        and (worker.get("canonical_sync_head") or worker.get("canonical_sync_merge_commit"))
+    )
+
+
 def _canonical_status_from_board(
     tasks: list[dict[str, Any]],
     *,
@@ -545,15 +601,18 @@ def _canonical_status_from_board(
         return "archived", "archived"
     phase = str(worker.get("phase") or "").lower()
     counts = _task_status_counts(tasks)
-    board_summary = worker.get("board_summary") if isinstance(worker.get("board_summary"), dict) else {}
+    board_summary_value = worker.get("board_summary")
+    board_summary: dict[str, Any] = board_summary_value if isinstance(board_summary_value, dict) else {}
     thread_state = str(worker.get("thread_state") or board_summary.get("thread_state") or "").lower()
     if thread_state in {"blocked", "paused"}:
         if counts.get("running", 0) or any(_is_active_run(run) for run in runs or []):
             return "running", "running"
+        if _board_has_strong_terminal_success_evidence(worker, board_summary, counts):
+            return "shipped", goal_status or phase or "done"
         if thread_state == "paused":
             return "paused", thread_state
         return "blocked", thread_state
-    if goal_status in {"done", "shipped", "complete", "completed"} or phase == "complete":
+    if goal_status in _TERMINAL_SUCCESS_STATUSES or phase in _TERMINAL_SUCCESS_STATUSES:
         return "shipped", goal_status or phase or "done"
     if counts.get("running", 0) or any(_is_active_run(run) for run in runs or []):
         return "running", "running"

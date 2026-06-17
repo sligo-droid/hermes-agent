@@ -278,10 +278,16 @@ def test_command_center_work_item_full_description_toggle_is_accessible_plain_te
     assert "const compactDescription = item.summary || item.body_preview || \"No summary yet.\";" in card_source
     assert "const fullDescription = item.full_description?.trim();" in card_source
     assert "canShowFullDescription" in card_source
-    assert "Show full description" in card_source
-    assert "Hide full description" in card_source
+    assert "ChevronDown" in source
+    assert "command-center-description-disclosure" in card_source
+    assert "Full context" in card_source
+    assert "Expand full context for" in card_source
+    assert "Collapse full context for" in card_source
+    assert "Show full description" not in card_source
+    assert "Hide full description" not in card_source
     assert "aria-expanded={fullDescriptionOpen}" in card_source
     assert "aria-controls={descriptionId}" in card_source
+    assert "rotate-180" in card_source
     assert "whitespace-pre-wrap" in card_source
     assert "{fullDescription}" in card_source
     assert "event.stopPropagation();" in card_source

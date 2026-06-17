@@ -1033,6 +1033,54 @@ def test_snapshot_blocked_thread_state_overrides_stale_done_worker_metadata(tmp_
     assert snapshot["metrics"]["shipped"] == 0
 
 
+def test_snapshot_terminal_board_evidence_overrides_stale_blocked_thread_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    board = "discord-1516821213685485690"
+    meta = kanban_db.write_board_metadata(board, name="Merged Worker Board With Stale Blocked Embed")
+    meta[command_center.DISCORD_WORKER_META_KEY] = {
+        "kind": "discord_worker_board",
+        "thread_id": "1516821213685485690",
+        "guild_id": "111",
+        "source_message_id": "1516821213685485690",
+        "goal_status": "done",
+        "phase": "complete",
+        "thread_state": "blocked",
+        "public_url": "https://hermes.sligolabs.com/workers/1516821213685485690",
+        "pr_state": "MERGED",
+        "pr_checks_status": "passed",
+        "pr_merged_at": "2026-06-17T15:26:40Z",
+        "canonical_sync_state": "synced",
+        "canonical_sync_head": "c4c33e0b8d6b9b1c93c6351013b5fd31a340ee98",
+        "board_summary": {
+            "thread_state": "blocked",
+            "goal_status": "done",
+            "phase": "complete",
+            "task_counts": {"done": 7, "total": 7},
+            "review": {"final_verdict": {"status": "approved"}},
+            "pr": {"state": "MERGED", "checks_status": "passed", "merged_at": "2026-06-17T15:26:40Z"},
+        },
+    }
+    kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+    conn = kanban_db.connect(board=board)
+    try:
+        for idx in range(7):
+            task_id = kanban_db.create_task(conn, title=f"Completed worker task {idx}", board=board, initial_status="running")
+            with conn:
+                conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200 + idx, task_id))
+    finally:
+        conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+
+    assert item["status"] == "shipped"
+    assert item["status_detail"] == "done"
+    assert item["execution"]["worker_url"] == "https://hermes.sligolabs.com/workers/1516821213685485690"
+    assert snapshot["metrics"]["blocked"] == 0
+    assert snapshot["metrics"]["active_work"] == 0
+    assert snapshot["metrics"]["shipped"] == 1
+
+
 def test_snapshot_running_task_overrides_blocked_thread_state(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     board = "discord-running-thread-state-blocked"
