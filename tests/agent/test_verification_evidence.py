@@ -4,7 +4,11 @@ import json
 from types import SimpleNamespace
 
 from agent import conversation_loop, tool_executor
-from agent.verification_evidence import claim_constraints_for_text, latest_evidence_by_surface
+from agent.verification_evidence import (
+    claim_constraints_for_text,
+    downgrade_final_response_for_evidence,
+    latest_evidence_by_surface,
+)
 
 
 def test_terminal_production_browser_timeout_blocks_matching_shipped_claim():
@@ -84,3 +88,86 @@ def test_failed_browser_check_does_not_block_independent_ci_claim():
 
     assert claim_constraints_for_text("CI passed via scripts/run_tests.sh.", evidence)["allowed"] is True
     assert claim_constraints_for_text("CI passed and browser modal verified visible.", evidence)["allowed"] is False
+
+
+def test_final_response_downgrade_names_latest_failed_check():
+    text = "Shipped and verified in production; browser modal is visible. CI passed via scripts/run_tests.sh."
+    evidence = [
+        {
+            "surface": "production_browser",
+            "check_name": "python -m hermes_cli.worker_frontend_smoke --url https://app.example --route /modal --browser chromium",
+            "status": "timeout",
+            "order": 1,
+            "detail": "Timeout 30000ms exceeded",
+        },
+        {
+            "surface": "ci",
+            "check_name": "scripts/run_tests.sh tests/unit",
+            "status": "success",
+            "order": 2,
+            "detail": "passed",
+        },
+    ]
+
+    downgraded, constraints = downgrade_final_response_for_evidence(text, evidence)
+
+    assert constraints["allowed"] is False
+    assert "Verification downgrade:" in downgraded
+    assert "production browser verification is not verified" in downgraded
+    assert "worker_frontend_smoke" in downgraded
+    assert "timeout" in downgraded
+    assert "CI passed via scripts/run_tests.sh" in downgraded
+
+
+def test_conversation_loop_final_response_guard_uses_turn_runtime_evidence():
+    agent = SimpleNamespace(
+        _turn_runtime_stats={
+            "verification_evidence": [
+                {
+                    "surface": "production_browser",
+                    "check_name": "browser modal smoke",
+                    "status": "timeout",
+                    "order": 1,
+                }
+            ]
+        }
+    )
+
+    downgraded, transformed, constraints = conversation_loop._downgrade_final_response_for_turn_evidence(
+        agent,
+        "Shipped and verified in production; browser modal is visible.",
+    )
+
+    assert transformed is True
+    assert constraints["allowed"] is False
+    assert "Verification downgrade:" in downgraded
+    assert "browser modal smoke" in downgraded
+
+
+def test_final_response_downgrade_skips_later_success():
+    text = "Production browser modal verified visible after npm run browser:smoke -- --prod --modal."
+    evidence = [
+        {"surface": "production_browser", "check_name": "npm run browser:smoke -- --prod --modal", "status": "failure", "order": 1},
+        {"surface": "production_browser", "check_name": "npm run browser:smoke -- --prod --modal", "status": "success", "order": 2},
+    ]
+
+    downgraded, constraints = downgrade_final_response_for_evidence(text, evidence)
+
+    assert constraints["allowed"] is True
+    assert downgraded == text
+
+
+def test_final_response_downgrade_keeps_independent_deployed_claim_separate():
+    text = "Deployment completed and CI passed. Production browser modal verified visible."
+    evidence = [
+        {"surface": "production_browser", "check_name": "browser modal smoke", "status": "failure", "order": 3},
+        {"surface": "deployment", "check_name": "deployment status", "status": "success", "order": 2},
+        {"surface": "ci", "check_name": "gh pr checks", "status": "success", "order": 1},
+    ]
+
+    downgraded, constraints = downgrade_final_response_for_evidence(text, evidence)
+
+    assert constraints["allowed"] is False
+    assert "Deployment completed and CI passed" in downgraded
+    assert "production browser verification is not verified" in downgraded
+    assert "browser modal smoke" in downgraded

@@ -328,6 +328,41 @@ def test_latest_production_browser_timeout_blocks_shipped_verified_completion(tm
     assert "worker_frontend_smoke" in blocked[0]["check_name"]
 
 
+def test_downgraded_final_response_allows_operator_summary_with_blocked_surface(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Ship the production modal")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response=(
+            "Shipped and verified in production; browser modal is visible.\n\n"
+            "Verification downgrade: production browser verification is not verified: "
+            "latest check `browser modal smoke` timeout."
+        ),
+        summary_status="Complete",
+        runtime_breakdown={
+            "verification_evidence": [
+                {
+                    "surface": "production_browser",
+                    "check_name": "browser modal smoke",
+                    "status": "timeout",
+                    "order": 1,
+                }
+            ]
+        },
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert stored["summary_status"] == "Complete"
+
+
 def test_later_successful_production_browser_check_allows_verified_claim(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(text="Ship the production modal")

@@ -24,6 +24,16 @@ _CLAIM_WORD_RE = re.compile(r"\b(shipped|verified|visible|checked|confirmed|pass
 _NEGATED_CLAIM_RE = re.compile(r"\b(?:not|isn['’]?t|failed|failure|blocked|unverified|not_verified)\b", re.IGNORECASE)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
+_SURFACE_LABELS = {
+    "browser": "browser verification",
+    "production": "production verification",
+    "production_browser": "production browser verification",
+    "ci": "CI verification",
+    "deployment": "deployment verification",
+    "pr": "PR/merge verification",
+    "verification": "verification",
+}
+
 
 def _json_object(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
@@ -179,12 +189,30 @@ def _surface_terms_present(text: str, surface: str) -> bool:
     return True
 
 
+def _surface_downgraded(text: str, surface: str, item: dict[str, Any]) -> bool:
+    label = _SURFACE_LABELS.get(surface, surface.replace("_", " "))
+    check = str(item.get("check_name") or "").strip()
+    downgrade_lines = [line for line in str(text or "").splitlines() if "verification downgrade" in line.lower()]
+    for line in downgrade_lines:
+        lowered = line.lower()
+        if label.lower() not in lowered and not _surface_terms_present(line, surface):
+            continue
+        if not _NEGATED_CLAIM_RE.search(line):
+            continue
+        if check and check[:80].lower() not in lowered:
+            continue
+        return True
+    return False
+
+
 def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]:
     latest = latest_evidence_by_surface(evidence)
     blocked = []
     for surface, item in sorted(latest.items()):
         status = str(item.get("status") or "").lower()
         if status not in {"failure", "timeout"}:
+            continue
+        if _surface_downgraded(final_text, surface, item):
             continue
         if _surface_claimed(final_text, surface):
             blocked.append(
@@ -200,6 +228,45 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
         "blocked_surfaces": blocked,
         "latest_by_surface": latest,
     }
+
+
+def _blocked_surface_clause(item: dict[str, Any]) -> str:
+    surface = str(item.get("surface") or "verification")
+    label = _SURFACE_LABELS.get(surface, surface.replace("_", " ") + " verification")
+    status = str(item.get("status") or "failed").lower()
+    check = str(item.get("check_name") or "verification")
+    if len(check) > 180:
+        check = check[:177].rstrip() + "..."
+    return f"{label} is not verified: latest check `{check}` {status}."
+
+
+def downgrade_final_response_for_evidence(final_text: str, evidence: Any) -> tuple[str, dict[str, Any]]:
+    """Downgrade final-answer success claims contradicted by latest evidence.
+
+    This runs after model synthesis and before host delivery. The evidence ledger
+    remains the source of truth; this helper only adds user-visible qualifiers so
+    a streamed/returned final answer cannot overclaim a failed or timed-out check.
+    """
+    text = str(final_text or "")
+    constraints = claim_constraints_for_text(text, evidence)
+    blocked = constraints.get("blocked_surfaces")
+    if not text.strip() or not isinstance(blocked, list) or not blocked:
+        return text, constraints
+
+    clauses = [_blocked_surface_clause(item) for item in blocked if isinstance(item, dict)]
+    seen: set[str] = set()
+    unique_clauses = []
+    for clause in clauses:
+        if clause not in seen:
+            seen.add(clause)
+            unique_clauses.append(clause)
+    if not unique_clauses:
+        return text, constraints
+
+    downgrade = "Verification downgrade: " + " ".join(unique_clauses)
+    if downgrade.lower() in text.lower():
+        return text, constraints
+    return text.rstrip() + "\n\n" + downgrade, constraints
 
 
 def metadata_has_verified_claim(value: Any) -> bool:
