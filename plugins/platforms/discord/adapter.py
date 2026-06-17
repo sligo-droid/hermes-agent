@@ -4010,6 +4010,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     continue
                 raise
         if state in {"done", "blocked", "errored"} and targets_final:
+            await self._sync_github_pr_amend_terminal_reaction(target, state)
             try:
                 from hermes_cli.discord_worker_boards import mark_thread_status_synced
 
@@ -4021,6 +4022,19 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception:
                 logger.debug("[%s] Failed to clear Discord terminal reaction sync flag", self.name, exc_info=True)
         return state if targets_final else None
+
+    async def _sync_github_pr_amend_terminal_reaction(self, target: Dict[str, Any], state: str) -> None:
+        metadata = target.get("github_pr_amend") if isinstance(target.get("github_pr_amend"), dict) else {}
+        if not metadata:
+            return
+        try:
+            from gateway.config import PlatformConfig
+            from gateway.platforms.webhook import WebhookAdapter
+
+            adapter = WebhookAdapter(PlatformConfig(enabled=True, extra={}))
+            await adapter.sync_github_pr_amend_terminal_reaction(metadata, state)
+        except Exception:
+            logger.debug("[%s] Failed to sync GitHub PR-amend terminal reaction", self.name, exc_info=True)
 
     async def send_kanban_completion_notice(self, target: Dict[str, Any]) -> Optional[str]:
         """Post one visible completion notice for a finished Kanban goal."""

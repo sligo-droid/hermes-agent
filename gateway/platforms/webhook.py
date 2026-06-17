@@ -37,6 +37,7 @@ import os
 import re
 import subprocess
 import time
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 try:
@@ -63,6 +64,9 @@ _BUILTIN_DELIVER_PLATFORMS = {
     "feishu", "wecom", "wecom_callback", "weixin", "bluebubbles",
     "qqbot", "yuanbao",
 }
+
+_GITHUB_PR_AMEND_REST_STATUS_REACTIONS = {"eyes", "rocket", "-1", "+1"}
+_GITHUB_PR_AMEND_GRAPHQL_STATUS_REACTIONS = {"EYES", "ROCKET", "THUMBS_DOWN", "THUMBS_UP"}
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8644
@@ -987,6 +991,18 @@ class WebhookAdapter(BasePlatformAdapter):
                 content,
             )
 
+    async def sync_github_pr_amend_terminal_reaction(self, metadata: dict[str, Any], state: str) -> bool:
+        """Best-effort terminal reaction sync for a PR-amend trigger."""
+        content = "+1" if str(state or "").strip() == "done" else "-1"
+        request = SimpleNamespace(
+            repo=str(metadata.get("repo") or metadata.get("upstream_repo") or ""),
+            pr_number=str(metadata.get("pr_number") or metadata.get("upstream_pr_number") or ""),
+            source_kind=str(metadata.get("source_kind") or ""),
+            source_id=str(metadata.get("source_id") or ""),
+            source_node_id=str(metadata.get("source_node_id") or ""),
+        )
+        return await self._add_github_pr_amend_reaction(request, content)
+
     async def _add_github_pr_amend_reaction(self, request: Any, content: str) -> bool:
         """Add a GitHub reaction to the triggering object via ``gh api``."""
         if getattr(request, "source_kind", "") == "review":
@@ -1092,7 +1108,7 @@ class WebhookAdapter(BasePlatformAdapter):
             return False
 
         existing = await self._github_pr_amend_graphql_viewer_reactions(node_id)
-        status_reactions = {"EYES", "ROCKET", "THUMBS_DOWN"}
+        status_reactions = _GITHUB_PR_AMEND_GRAPHQL_STATUS_REACTIONS
         if existing is not None:
             for prior in sorted(status_reactions - {reaction_content}):
                 if prior in existing:
@@ -1261,7 +1277,7 @@ mutation($subjectId: ID!, $content: ReactionContent!) {
         endpoint: str,
         content: str,
     ) -> bool:
-        status_reactions = {"eyes", "rocket", "-1"}
+        status_reactions = _GITHUB_PR_AMEND_REST_STATUS_REACTIONS
         if content not in status_reactions:
             return False
         list_argv = [

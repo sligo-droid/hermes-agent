@@ -128,6 +128,38 @@ def test_done_metadata_transition_arms_completion_notice(monkeypatch, tmp_path):
     assert target["board_summary"]["goal_status"] == "done"
 
 
+def test_thread_status_targets_include_github_pr_amend_metadata(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    thread_id = _discord_snowflake_at(time.time())
+    github_pr_amend = {
+        "repo": "reserve-protocol/reserve-index-dtf",
+        "pr_number": "182",
+        "source_kind": "review",
+        "source_id": "4518030260",
+        "source_node_id": "PRR_kwDOReviewSummary",
+        "source_key": "github-pr-amend:review:4518030260",
+    }
+    board = dwb.start_direct_goal(
+        thread_id=thread_id,
+        goal="Ship PR amend",
+        project_context={"github_pr_amend": github_pr_amend},
+    )
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_reaction_sync_pending": True,
+        },
+    )
+
+    target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
+
+    assert target["github_pr_amend"] == github_pr_amend
+
+
 def test_paused_terminal_worker_with_pending_sync_remains_status_target(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

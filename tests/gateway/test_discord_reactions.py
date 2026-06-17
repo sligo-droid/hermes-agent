@@ -1169,6 +1169,119 @@ async def test_kanban_thread_reaction_clears_flag_after_syncing_reachable_target
 
 
 @pytest.mark.asyncio
+async def test_kanban_thread_reaction_syncs_github_pr_amend_done_reaction(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.start_direct_goal(thread_id="336", goal="Ship PR amend")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "terminal_reaction_sync_pending": True,
+        },
+    )
+    summary_message = SimpleNamespace(
+        id=222,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[],
+    )
+    parent = SimpleNamespace(fetch_message=AsyncMock(return_value=summary_message))
+    thread = SimpleNamespace(
+        id=336,
+        parent=parent,
+        fetch_message=AsyncMock(side_effect=RuntimeError("404 not found: unknown message")),
+    )
+    adapter._resolve_summary_channel = AsyncMock(return_value=thread)
+    github_sync = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "gateway.platforms.webhook.WebhookAdapter.sync_github_pr_amend_terminal_reaction",
+        github_sync,
+    )
+    github_pr_amend = {
+        "repo": "reserve-protocol/reserve-index-dtf",
+        "pr_number": "182",
+        "source_kind": "issue_comment",
+        "source_id": "4700001",
+    }
+
+    synced = await adapter.sync_kanban_thread_reaction(
+        {
+            "board": board.slug,
+            "thread_id": "336",
+            "state": "done",
+            "message_id": str(summary_message.id),
+            "source_message_id": "111",
+            "terminal_reaction_sync_pending": True,
+            "github_pr_amend": github_pr_amend,
+        }
+    )
+
+    assert synced == "done"
+    github_sync.assert_awaited_once()
+    assert github_sync.await_args.args[0] == github_pr_amend
+    assert github_sync.await_args.args[1] == "done"
+
+
+@pytest.mark.asyncio
+async def test_kanban_thread_reaction_swallows_github_pr_amend_sync_failure(adapter, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.start_direct_goal(thread_id="337", goal="Ship PR amend")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "blocked",
+            "phase": "blocked",
+            "terminal_reaction_sync_pending": True,
+        },
+    )
+    summary_message = SimpleNamespace(
+        id=222,
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+        reactions=[],
+    )
+    parent = SimpleNamespace(fetch_message=AsyncMock(return_value=summary_message))
+    thread = SimpleNamespace(
+        id=337,
+        parent=parent,
+        fetch_message=AsyncMock(side_effect=RuntimeError("404 not found: unknown message")),
+    )
+    adapter._resolve_summary_channel = AsyncMock(return_value=thread)
+    github_sync = AsyncMock(side_effect=RuntimeError("gh unavailable"))
+    monkeypatch.setattr(
+        "gateway.platforms.webhook.WebhookAdapter.sync_github_pr_amend_terminal_reaction",
+        github_sync,
+    )
+
+    synced = await adapter.sync_kanban_thread_reaction(
+        {
+            "board": board.slug,
+            "thread_id": "337",
+            "state": "blocked",
+            "message_id": str(summary_message.id),
+            "source_message_id": "111",
+            "terminal_reaction_sync_pending": True,
+            "github_pr_amend": {
+                "repo": "reserve-protocol/reserve-index-dtf",
+                "pr_number": "182",
+                "source_kind": "review_comment",
+                "source_id": "4800001",
+            },
+        }
+    )
+
+    assert synced == "blocked"
+    summary_message.add_reaction.assert_awaited_once_with("❓")
+    github_sync.assert_awaited_once()
+    assert github_sync.await_args.args[1] == "blocked"
+
+
+@pytest.mark.asyncio
 async def test_kanban_thread_reaction_uses_origin_fallback_when_source_fetch_is_transient(
     adapter,
     monkeypatch,

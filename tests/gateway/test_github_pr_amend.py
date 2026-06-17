@@ -405,6 +405,12 @@ class TestGitHubPrAmendPolicy:
         assert "comment 3430163992" in body
         assert "discussion_r3430163992" in body
         assert "remove since `_validateFeeRecipients()` will catch if the total is above the max" in body
+        assert card["github_pr_amend"]["source_kind"] == "review"
+        assert card["github_pr_amend"]["source_id"] == "4518030260"
+        assert card["github_pr_amend"]["source_node_id"] == payload["review"]["node_id"]
+        assert card["project_context"]["github_pr_amend"]["source_kind"] == "review"
+        assert card["project_context"]["github_pr_amend"]["source_id"] == "4518030260"
+        assert card["project_context"]["github_pr_amend"]["source_node_id"] == payload["review"]["node_id"]
         assert card["project_context"]["github_pr_amend"]["source_key"] == "github-pr-amend:review:4518030260"
         assert artifact["fetched_context"]["review_comments"] == context["review_comments"]
 
@@ -663,6 +669,70 @@ class TestGitHubPrAmendWebhookRoute:
         assert all(f"{endpoint}/3" not in call for call in calls)
 
     @pytest.mark.asyncio
+    async def test_github_pr_amend_terminal_success_deletes_active_status_and_adds_thumbs_up(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD)
+        endpoint = "repos/reserve-protocol/reserve-index-dtf/issues/comments/4700001/reactions"
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            if argv[:2] == ["gh", "api"] and "-X" not in argv:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=json.dumps(
+                        [
+                            {"id": 1, "content": "eyes", "user": {"type": "Bot"}},
+                            {"id": 2, "content": "rocket", "user": {"type": "Bot"}},
+                            {"id": 3, "content": "-1", "user": {"type": "Bot"}},
+                        ]
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+        with patch("gateway.platforms.webhook.subprocess.run", side_effect=fake_run):
+            assert await adapter._add_github_pr_amend_reaction(request, "+1") is True
+
+        assert calls[1][:5] == ["gh", "api", "-X", "DELETE", f"{endpoint}/1"]
+        assert calls[2][:5] == ["gh", "api", "-X", "DELETE", f"{endpoint}/2"]
+        assert calls[3][:5] == ["gh", "api", "-X", "DELETE", f"{endpoint}/3"]
+        assert calls[4][0:4] == ["gh", "api", "-X", "POST"]
+        assert "content=+1" in calls[4]
+
+    @pytest.mark.asyncio
+    async def test_github_pr_amend_terminal_failure_deletes_done_status_and_adds_thumbs_down(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        request = extract_request("pull_request_review_comment", REVIEW_COMMENT_PAYLOAD)
+        endpoint = "repos/reserve-protocol/reserve-index-dtf/pulls/comments/4800001/reactions"
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            if argv[:2] == ["gh", "api"] and "-X" not in argv:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=json.dumps(
+                        [
+                            {"id": 7, "content": "+1", "user": {"type": "Bot"}},
+                            {"id": 8, "content": "rocket", "user": {"type": "Bot"}},
+                        ]
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+        with patch("gateway.platforms.webhook.subprocess.run", side_effect=fake_run):
+            assert await adapter._add_github_pr_amend_reaction(request, "-1") is True
+
+        assert calls[1][:5] == ["gh", "api", "-X", "DELETE", f"{endpoint}/7"]
+        assert calls[2][:5] == ["gh", "api", "-X", "DELETE", f"{endpoint}/8"]
+        assert calls[3][0:4] == ["gh", "api", "-X", "POST"]
+        assert "content=-1" in calls[3]
+
+    @pytest.mark.asyncio
     async def test_github_pr_amend_review_reaction_transition_uses_graphql_viewer_reactions(self):
         adapter = _make_adapter({"github-pr-amend": ROUTE})
         request = extract_request("pull_request_review", REVIEW_PAYLOAD)
@@ -702,6 +772,49 @@ class TestGitHubPrAmendWebhookRoute:
         assert "content=EYES" in calls[1]
         assert "addReaction" in "\n".join(calls[2])
         assert "content=ROCKET" in calls[2]
+
+    @pytest.mark.asyncio
+    async def test_github_pr_amend_review_terminal_reaction_uses_graphql_node(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        request = extract_request("pull_request_review", REVIEW_PAYLOAD)
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            joined = "\n".join(argv)
+            if "reactionGroups" in joined:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "data": {
+                                "node": {
+                                    "reactionGroups": [
+                                        {"content": "ROCKET", "viewerHasReacted": True},
+                                        {"content": "THUMBS_DOWN", "viewerHasReacted": True},
+                                        {"content": "THUMBS_UP", "viewerHasReacted": False},
+                                    ]
+                                }
+                            }
+                        }
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"data": {}}), stderr="")
+
+        with patch("gateway.platforms.webhook.subprocess.run", side_effect=fake_run):
+            assert await adapter._add_github_pr_amend_reaction(request, "+1") is True
+
+        assert len(calls) == 4
+        assert "reactionGroups" in "\n".join(calls[0])
+        assert "removeReaction" in "\n".join(calls[1])
+        assert "content=ROCKET" in calls[1]
+        assert "removeReaction" in "\n".join(calls[2])
+        assert "content=THUMBS_DOWN" in calls[2]
+        assert "addReaction" in "\n".join(calls[3])
+        assert f"subjectId={REVIEW_PAYLOAD['review']['node_id']}" in calls[3]
+        assert "content=THUMBS_UP" in calls[3]
 
     @pytest.mark.asyncio
     async def test_github_pr_amend_reaction_list_failure_still_posts(self):

@@ -3917,6 +3917,10 @@ def thread_status_targets() -> list[dict[str, Any]]:
             "archived": bool(board_meta.get("archived")),
             "metadata_path": str(board_meta.get("metadata_path") or ""),
         }
+        project_context = worker.get("project_context") if isinstance(worker.get("project_context"), dict) else {}
+        github_pr_amend = project_context.get("github_pr_amend") if isinstance(project_context.get("github_pr_amend"), dict) else {}
+        if github_pr_amend:
+            target["github_pr_amend"] = dict(github_pr_amend)
         if source_context:
             target.update(source_context)
         if source_state:

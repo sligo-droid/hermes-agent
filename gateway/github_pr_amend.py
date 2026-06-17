@@ -827,6 +827,9 @@ def build_pr_amend_discord_card(
     pr_number = str(_dig(artifact, "pull_request", "number", default=""))
     pr_title = str(_dig(artifact, "pull_request", "title", default=""))
     source_url = str(_dig(artifact, "source", "html_url", default=""))
+    source_kind = str(_dig(artifact, "source", "kind", default=""))
+    source_id = str(_dig(artifact, "source", "id", default=""))
+    source_node_id = str(_dig(artifact, "source", "node_id", default=""))
     sender = str(_dig(artifact, "sender", "login", default=""))
     body = str(_dig(artifact, "source", "body", default=""))
     review_context = _github_review_context_block(artifact)
@@ -873,6 +876,9 @@ def build_pr_amend_discord_card(
             "delivery_id": artifact.get("delivery_id"),
             "repo": repo,
             "pr_number": pr_number,
+            "source_kind": source_kind,
+            "source_id": source_id,
+            "source_node_id": source_node_id,
             "source_url": source_url,
             "base_repo": base_repo,
             "base_ref": base_ref,
@@ -896,6 +902,9 @@ def build_pr_amend_discord_card(
                 "head_repo": head_repo,
                 "head_ref": head_ref,
                 "head_sha": head_sha,
+                "source_kind": source_kind,
+                "source_id": source_id,
+                "source_node_id": source_node_id,
                 "source_url": source_url,
                 "source_key": _pr_amend_source_key(artifact),
             },
