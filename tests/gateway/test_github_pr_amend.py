@@ -362,6 +362,88 @@ class TestGitHubPrAmendPolicy:
         worker = {"project_context": card["project_context"]}
         assert any("reserve-solidity-style" in item for item in _planner_instructions(worker))
 
+    def test_review_card_includes_inline_review_comments(self, tmp_path):
+        payload = json.loads(json.dumps(REVIEW_PAYLOAD))
+        payload["review"]["id"] = 4518030260
+        payload["review"]["html_url"] = (
+            "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#pullrequestreview-4518030260"
+        )
+        payload["review"]["body"] = "@sligo-droid please address the inline comments."
+        request = extract_request("pull_request_review", payload, delivery_id="delivery-review")
+        policy = policy_from_route(ROUTE)
+        decision = evaluate_request(request, PR_INFO, policy)
+        context = {
+            **PR_RELATED_CONTEXT,
+            "reviews": [
+                {
+                    "id": 4518030260,
+                    "state": "CHANGES_REQUESTED",
+                    "body": "@sligo-droid please address the inline comments.",
+                }
+            ],
+            "review_comments": [
+                {
+                    "id": 3430163992,
+                    "pull_request_review_id": 4518030260,
+                    "html_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#discussion_r3430163992",
+                    "path": "contracts/utils/FolioLib.sol",
+                    "line": 59,
+                    "body": "remove since `_validateFeeRecipients()` will catch if the total is above the max",
+                    "diff_hunk": "@@ line 59 @@",
+                }
+            ],
+        }
+        artifact = build_pr_amend_intake_artifact(request, decision, policy, PR_INFO, payload, context)
+
+        card = build_pr_amend_discord_card(artifact, artifact_path=tmp_path / "intake.json")
+
+        body = card["body"]
+        assert "GitHub review context:" in body
+        assert "review_id=4518030260" in body
+        assert "contracts/utils/FolioLib.sol" in body
+        assert "line 59" in body
+        assert "comment 3430163992" in body
+        assert "discussion_r3430163992" in body
+        assert "remove since `_validateFeeRecipients()` will catch if the total is above the max" in body
+        assert card["project_context"]["github_pr_amend"]["source_key"] == "github-pr-amend:review:4518030260"
+        assert artifact["fetched_context"]["review_comments"] == context["review_comments"]
+
+    def test_review_card_includes_all_matching_inline_review_comments(self, tmp_path):
+        payload = json.loads(json.dumps(REVIEW_PAYLOAD))
+        payload["review"]["id"] = 4518030260
+        payload["review"]["body"] = "@sligo-droid please address every inline comment."
+        request = extract_request("pull_request_review", payload, delivery_id="delivery-review-many")
+        policy = policy_from_route(ROUTE)
+        decision = evaluate_request(request, PR_INFO, policy)
+        comments = [
+            {
+                "id": 3430163900 + index,
+                "pull_request_review_id": 4518030260,
+                "path": f"contracts/File{index}.sol",
+                "line": index,
+                "body": f"inline detail {index}",
+            }
+            for index in range(1, 31)
+        ]
+        artifact = build_pr_amend_intake_artifact(
+            request,
+            decision,
+            policy,
+            PR_INFO,
+            payload,
+            {**PR_RELATED_CONTEXT, "review_comments": comments},
+        )
+
+        card = build_pr_amend_discord_card(artifact, artifact_path=tmp_path / "intake.json")
+
+        body = card["body"]
+        assert "Inline review comments (30):" in body
+        assert "contracts/File1.sol" in body
+        assert "inline detail 1" in body
+        assert "contracts/File30.sol" in body
+        assert "inline detail 30" in body
+        assert "additional inline review comments omitted" not in body
+
     def test_non_reserve_pr_amend_card_omits_solidity_skill_hint(self, tmp_path):
         payload = json.loads(json.dumps(ISSUE_COMMENT_PAYLOAD))
         payload["repository"]["full_name"] = "acme/webapp"

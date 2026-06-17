@@ -663,6 +663,124 @@ def build_pr_amend_intake_artifact(
     }
 
 
+def _pr_amend_source_key(artifact: dict[str, Any]) -> str:
+    kind = str(_dig(artifact, "source", "kind", default="") or "").strip()
+    source_id = str(_dig(artifact, "source", "id", default="") or "").strip()
+    if kind and source_id:
+        return f"github-pr-amend:{kind}:{source_id}"
+    delivery_id = str(artifact.get("delivery_id") or "").strip()
+    if delivery_id:
+        return f"github-pr-amend:delivery:{delivery_id}"
+    return ""
+
+
+def _compact_pr_amend_text(value: Any, *, limit: int | None = None) -> str:
+    text = str(value or "").strip()
+    if limit is None:
+        return text
+    if len(text) <= limit:
+        return text
+    return text[: limit - 15].rstrip() + " ... [truncated]"
+
+
+def _line_value(comment: dict[str, Any]) -> str:
+    line = comment.get("line") or comment.get("original_line") or comment.get("position")
+    return str(line or "").strip()
+
+
+def _comment_review_id(comment: dict[str, Any]) -> str:
+    return str(comment.get("pull_request_review_id") or comment.get("review_id") or "").strip()
+
+
+def _format_review_comment(comment: dict[str, Any], index: int) -> list[str]:
+    comment_id = str(comment.get("id") or "").strip()
+    review_id = _comment_review_id(comment)
+    path = str(comment.get("path") or "").strip()
+    line = _line_value(comment)
+    url = str(comment.get("html_url") or comment.get("url") or "").strip()
+    header_parts = [f"{index}."]
+    if path:
+        header_parts.append(path)
+    if line:
+        header_parts.append(f"line {line}")
+    if comment_id:
+        header_parts.append(f"comment {comment_id}")
+    if review_id:
+        header_parts.append(f"review {review_id}")
+    lines = [" ".join(header_parts).strip()]
+    if url:
+        lines.append(f"   URL: {url}")
+    body = _compact_pr_amend_text(comment.get("body"))
+    if body:
+        lines.append(f"   Body: {body}")
+    diff_hunk = _compact_pr_amend_text(comment.get("diff_hunk"), limit=800)
+    if diff_hunk:
+        lines.append(f"   Diff hunk: {diff_hunk}")
+    return lines
+
+
+def _github_review_context_block(artifact: dict[str, Any]) -> str:
+    source = artifact.get("source") if isinstance(artifact.get("source"), dict) else {}
+    fetched = artifact.get("fetched_context") if isinstance(artifact.get("fetched_context"), dict) else {}
+    reviews = [item for item in fetched.get("reviews") or [] if isinstance(item, dict)]
+    comments = [item for item in fetched.get("review_comments") or [] if isinstance(item, dict)]
+    source_kind = str(source.get("kind") or "").strip()
+    source_id = str(source.get("id") or "").strip()
+    source_review_id = str(source.get("review_id") or "").strip()
+    source_url = str(source.get("html_url") or "").strip()
+
+    lines = ["GitHub review context:"]
+    trigger = " ".join(
+        part
+        for part in (
+            f"kind={source_kind}" if source_kind else "",
+            f"id={source_id}" if source_id else "",
+            f"review_id={source_review_id}" if source_review_id else "",
+        )
+        if part
+    )
+    if trigger:
+        lines.append(f"Trigger: {trigger}")
+    if source_url:
+        lines.append(f"Trigger URL: {source_url}")
+    if source.get("path"):
+        line = str(source.get("line") or source.get("original_line") or "").strip()
+        lines.append(f"Trigger location: {source.get('path')}{f' line {line}' if line else ''}")
+
+    matching_review = None
+    review_match_id = source_review_id if source_kind == "review_comment" else source_id or source_review_id
+    if review_match_id:
+        matching_review = next((review for review in reviews if str(review.get("id") or "") == review_match_id), None)
+    if matching_review:
+        state = str(matching_review.get("state") or "").strip()
+        body = _compact_pr_amend_text(matching_review.get("body"))
+        lines.append(f"Review {review_match_id}{f' ({state})' if state else ''}:")
+        if body:
+            lines.append(f"Review body: {body}")
+
+    selected_comments = comments
+    if source_kind == "review":
+        selected_comments = [comment for comment in comments if _comment_review_id(comment) == source_id]
+    elif source_kind == "review_comment":
+        selected_comments = [comment for comment in comments if str(comment.get("id") or "") == source_id]
+        if source_review_id:
+            siblings = [comment for comment in comments if _comment_review_id(comment) == source_review_id]
+            selected_comments = selected_comments + [
+                comment for comment in siblings if str(comment.get("id") or "") != source_id
+            ]
+    if not selected_comments and comments:
+        selected_comments = comments
+
+    if selected_comments:
+        lines.append(f"Inline review comments ({len(selected_comments)}):")
+        for index, comment in enumerate(selected_comments, start=1):
+            lines.extend(_format_review_comment(comment, index))
+    elif source_kind in {"review", "review_comment"}:
+        lines.append("Inline review comments: none found in fetched context; see artifact for raw payload.")
+
+    return "\n".join(line for line in lines if line).strip()
+
+
 def write_pr_amend_intake_artifact(artifact: dict[str, Any]) -> Path:
     repo = str(_dig(artifact, "repository", "full_name", default="github-pr-amend"))
     pr_number = str(_dig(artifact, "pull_request", "number", default="unknown"))
@@ -711,6 +829,7 @@ def build_pr_amend_discord_card(
     source_url = str(_dig(artifact, "source", "html_url", default=""))
     sender = str(_dig(artifact, "sender", "login", default=""))
     body = str(_dig(artifact, "source", "body", default=""))
+    review_context = _github_review_context_block(artifact)
     instructions = str(artifact.get("operational_instructions") or "")
     head_repo = str(_dig(artifact, "pull_request", "head", "repo", default=""))
     head_ref = str(_dig(artifact, "pull_request", "head", "ref", default=""))
@@ -726,6 +845,7 @@ def build_pr_amend_discord_card(
             f"Artifact: {artifact_path}",
             "Requested change:",
             body,
+            review_context,
             instructions,
         )
         if part
@@ -777,6 +897,7 @@ def build_pr_amend_discord_card(
                 "head_ref": head_ref,
                 "head_sha": head_sha,
                 "source_url": source_url,
+                "source_key": _pr_amend_source_key(artifact),
             },
         },
         "created_by": "github-pr-amend",
