@@ -1878,7 +1878,21 @@ def test_persisted_board_run_summary_drives_terminal_surfaces(monkeypatch, tmp_p
             conn,
             review_id,
             summary="Approved terminal summary.",
-            metadata={"raw": {"status": "approved"}},
+            metadata={
+                "raw": {"status": "approved"},
+                "tests": [
+                    {
+                        "command": "scripts/run_tests.sh tests/hermes_cli/test_discord_worker_boards.py::review -q",
+                        "result": "passed",
+                        "output": "review ok",
+                    },
+                    {
+                        "command": "git diff --check",
+                        "result": "passed",
+                        "output": "clean",
+                    },
+                ],
+            },
             expected_run_id=claimed_review.current_run_id,
         )
     finally:
@@ -1906,7 +1920,11 @@ def test_persisted_board_run_summary_drives_terminal_surfaces(monkeypatch, tmp_p
     assert summary["run_counts"]["by_outcome"]["completed"] == 2
     assert summary["review"]["final_verdict"]["status"] == "approved"
     assert summary["pr"]["checks_status"] == "passed"
-    assert summary["verification_commands"][0]["command"].startswith("scripts/run_tests.sh")
+    assert summary["verification_commands"][0]["command"] == (
+        "scripts/run_tests.sh tests/hermes_cli/test_discord_worker_boards.py::review -q"
+    )
+    assert summary["verification_commands"][0]["task_id"] == review_id
+    assert summary["verification_commands"][1]["command"] == "git diff --check"
     assert summary["runtime_breakdown"]["scope"] == "discord_worker_board"
     assert {phase["name"] for phase in summary["runtime_breakdown"]["phases"]} >= {"Build", "Review"}
     assert dwb.board_run_summary_path(board.slug).exists()
