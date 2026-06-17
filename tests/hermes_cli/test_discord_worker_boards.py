@@ -1122,6 +1122,62 @@ def test_terminal_non_green_finalization_keeps_summary_and_reaction_blocked(monk
     assert "reaction_state" not in target
 
 
+def test_merged_pr_with_stale_status_error_resyncs_terminal_state_done(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.set_goal(thread_id="78012", goal="Recover stale PR finalizer metadata")
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        task = kanban_db.list_tasks(conn, include_archived=False)[0]
+        claimed = kanban_db.claim_task(conn, task.id)
+        assert claimed is not None
+        kanban_db.complete_task(conn, task.id, summary="done", expected_run_id=claimed.current_run_id)
+    finally:
+        conn.close()
+
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "summary_message_id": "333",
+            "source_message_id": "111",
+            "pr_url": "https://github.example.test/acme/repo/pull/42",
+            "pr_state": "MERGED",
+            "pr_merged_at": "2026-06-17T15:26:40Z",
+            "pr_merge_commit": "c4c33e0b8d6b9b1c93c6351013b5fd31a340ee98",
+            "pr_checks_status": "passed",
+            "pr_checks_failed": [],
+            "pr_status_error": "GraphQL: Merge already in progress (mergePullRequest)",
+            "pr_merge_state": "UNKNOWN",
+            "pr_mergeable": "UNKNOWN",
+        },
+    )
+    metadata = kanban_db.read_board_metadata(board.slug)
+    worker = metadata["discord_worker"]
+    worker.pop("terminal_reaction_sync_pending", None)
+    worker.pop("terminal_summary_sync_pending", None)
+    worker.pop("terminal_completion_message_pending", None)
+    worker["terminal_reaction_synced_state"] = "blocked"
+    dwb._write_metadata(board.slug, metadata)
+
+    target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
+    summary = dwb.build_board_run_summary(board.slug)
+
+    assert dwb.board_thread_state(board.slug) == "done"
+    assert dwb.board_thread_reaction_state(board.slug) == "done"
+    assert dwb.board_has_unsynced_terminal_reaction(board.slug) is True
+    assert target["state"] == "done"
+    assert "reaction_state" not in target
+    assert target["terminal_reaction_sync_needed"] is True
+    assert summary["thread_state"] == "done"
+    assert summary["pr"]["merge_state"] == "merged"
+    assert summary["pr"]["status_error"] == ""
+    assert summary["deployment_status"] == "done"
+
+
 def test_start_direct_goal_activates_board_without_planner(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
