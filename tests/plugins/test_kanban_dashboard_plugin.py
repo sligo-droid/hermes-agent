@@ -944,6 +944,44 @@ def test_archive_completed_discord_worker_waits_for_terminal_reaction_sync(clien
     assert marker_reasons == [(board, "archive-waiting-for-terminal-reaction-sync")]
 
 
+def test_archive_stale_blocked_discord_worker_with_done_tasks_bypasses_terminal_sync(client, monkeypatch):
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = "discord-archive-stale-blocked-done"
+    _write_discord_worker_metadata(
+        board,
+        {"goal_status": "blocked", "phase": "blocked", "terminal_reaction_sync_pending": True},
+    )
+    conn = kb.connect(board=board)
+    try:
+        task_id = kb.create_task(conn, title="Already completed", board=board)
+        with conn:
+            conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200, task_id))
+    finally:
+        conn.close()
+    monkeypatch.setattr(
+        dwb,
+        "mark_dispatch_dirty",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("stale blocked done board should not wait for sync")),
+    )
+    monkeypatch.setattr(
+        dwb,
+        "stop_board_execution",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("done board should not be stopped")),
+    )
+
+    archived = client.delete(f"/api/plugins/kanban/boards/{board}")
+
+    assert archived.status_code == 200, archived.text
+    assert archived.json()["result"]["action"] == "archived"
+    assert not kb.board_dir(board).exists()
+    archived_path = Path(archived.json()["result"]["new_path"])
+    worker = json.loads((archived_path / "board.json").read_text(encoding="utf-8"))[dwb.DISCORD_WORKER_META_KEY]
+    assert worker["goal_status"] == "blocked"
+    assert worker["phase"] == "blocked"
+    assert worker["terminal_reaction_sync_pending"] is True
+
+
 def test_archive_completed_discord_worker_stale_cancel_flag_still_waits_for_sync(client, monkeypatch):
     from hermes_cli import discord_worker_boards as dwb
 

@@ -3357,15 +3357,19 @@ def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete
         normed = kanban_db._normalize_board_slug(slug)
         if not delete and normed and kanban_db.board_exists(normed):
             _raise_if_corrupt_quarantined(normed)
+            board_meta = kanban_db.read_board_metadata(normed)
             worker = _discord_worker_meta(normed)
             if worker:
                 from hermes_cli import discord_worker_boards as dwb
 
                 terminal_before_archive = _discord_worker_board_is_terminal(worker)
                 cancelled_before_archive = terminal_before_archive and _discord_worker_board_is_cancelled(worker)
+                completed_before_archive = _board_is_completed(normed, board_meta)
+                stale_blocked_completion = _discord_worker_board_status(worker) == "blocked" and completed_before_archive
                 if (
                     terminal_before_archive
                     and not cancelled_before_archive
+                    and not stale_blocked_completion
                     and dwb.board_has_unsynced_terminal_reaction(normed)
                 ):
                     dwb.mark_dispatch_dirty(board=normed, reason="archive-waiting-for-terminal-reaction-sync")

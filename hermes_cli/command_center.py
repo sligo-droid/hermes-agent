@@ -285,6 +285,84 @@ def _matching_nonterminal_archive(board: str, archived_by_slug: dict[str, list[d
     return None
 
 
+def _archived_board_has_terminal_evidence(board_meta: dict[str, Any]) -> bool:
+    worker = _board_worker_meta(board_meta)
+    goal_status = str(worker.get("goal_status") or "").lower()
+    phase = str(worker.get("phase") or "").lower()
+    if goal_status in {"done", "shipped", "complete", "completed", "cancelled", "canceled"}:
+        return True
+    if phase in {"complete", "completed", "cancelled", "canceled"}:
+        return True
+
+    db_path = board_meta.get("db_path")
+    if not db_path or not Path(str(db_path)).exists():
+        return False
+    try:
+        conn = kanban_db.connect(db_path=Path(str(db_path)))
+    except Exception:
+        return False
+    try:
+        tasks = [_task_to_dict(task) for task in kanban_db.list_tasks(conn, include_archived=True, order_by="updated")]
+        runs = _recent_board_runs(conn, board=str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD), limit=20)
+    except Exception:
+        return False
+    finally:
+        conn.close()
+    if not tasks or any(_is_active_run(run) for run in runs):
+        return False
+    statuses = {str(task.get("status") or "").lower() for task in tasks}
+    return bool(statuses) and statuses <= _TERMINAL_TASK_STATUSES
+
+
+def _matching_terminal_archive(board: str, archived_by_slug: dict[str, list[dict[str, Any]]]) -> dict[str, Any] | None:
+    for archived_meta in archived_by_slug.get(board, []):
+        if _archived_board_has_terminal_evidence(archived_meta):
+            return archived_meta
+    return None
+
+
+def _active_board_has_open_work_evidence(
+    board: str,
+    board_meta: dict[str, Any],
+    *,
+    tasks: list[dict[str, Any]] | None = None,
+    runs: list[dict[str, Any]] | None = None,
+) -> bool:
+    if board == kanban_db.DEFAULT_BOARD or board_meta.get("archived"):
+        return False
+    if tasks is None or runs is None:
+        db_path = board_meta.get("db_path") or kanban_db.kanban_db_path(board)
+        try:
+            conn = kanban_db.connect(db_path=Path(str(db_path)))
+        except Exception:
+            return True
+        try:
+            tasks = [_task_to_dict(task) for task in kanban_db.list_tasks(conn, include_archived=True, order_by="updated")]
+            runs = _recent_board_runs(conn, board=board, limit=20)
+        except Exception:
+            return True
+        finally:
+            conn.close()
+    if any(_is_active_run(run) for run in runs):
+        return True
+    return any(str(task.get("status") or "").lower() not in _TERMINAL_TASK_STATUSES for task in tasks)
+
+
+def _active_board_shadowed_by_terminal_archive(
+    board: str,
+    board_meta: dict[str, Any],
+    *,
+    archived_by_slug: dict[str, list[dict[str, Any]]],
+    tasks: list[dict[str, Any]] | None = None,
+    runs: list[dict[str, Any]] | None = None,
+) -> bool:
+    if board == kanban_db.DEFAULT_BOARD or board_meta.get("archived"):
+        return False
+    if not _matching_terminal_archive(board, archived_by_slug):
+        return False
+    return not _active_board_has_open_work_evidence(board, board_meta, tasks=tasks, runs=runs)
+
+
 def _metadata_file_is_readable(board: str) -> bool:
     path = kanban_db.board_metadata_path(board)
     if not path.exists():
@@ -1445,6 +1523,8 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
         boards.extend(meta for entries in archived_by_slug.values() for meta in entries)
     for board_meta in boards:
         board = str(board_meta.get("slug") or kanban_db.DEFAULT_BOARD)
+        if _active_board_shadowed_by_terminal_archive(board, board_meta, archived_by_slug=archived_by_slug):
+            continue
         if _is_discord_board(board, board_meta):
             sources.append(_source_from_discord_board(board, board_meta))
         corrupt_state = None
