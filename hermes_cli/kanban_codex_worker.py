@@ -1096,6 +1096,15 @@ def _backend_child_env(extra: Optional[dict[str, str]] = None) -> dict[str, str]
     }
     if extra:
         env.update(extra)
+
+    explicit_keys = set((extra or {}).keys())
+    try:
+        from tools.environments.local import _bootstrap_profile_subprocess_env
+
+        _bootstrap_profile_subprocess_env(env, explicit_keys)
+    except Exception:
+        pass
+
     return env
 
 
