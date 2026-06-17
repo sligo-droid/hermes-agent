@@ -18,6 +18,7 @@ This report quarantines the secondary Hermes `main` worktree at `/home/droid/wor
 - File summary: `git -C /home/droid/workspaces/hermes-self-improvement-live-test diff --cached --name-status` produced the dirty file list. Representative entries include `.github/PULL_REQUEST_TEMPLATE.md`, `AGENTS.md`, `agent/conversation_loop.py`, deleted `docs/project-state.md`, deleted `hermes_cli/command_center.py`, and modified `web/src/App.tsx`.
 - Worktree inventory source: `git worktree list --porcelain` from `/home/droid/hermes`.
 - Reference checks: `rg -n "hermes-self-improvement-live-test" /home/droid/hermes /home/droid/.hermes /home/droid/workspaces --glob '!**/.git/**' --glob '!**/node_modules/**' --glob '!**/.venv/**'`; `systemctl --user list-units --all --no-pager`; `crontab -l`.
+- Complete raw evidence bundle: `/home/droid/.local/share/opencode/tool-output/tool_ed5e97969001DOCKUW5tneZpTX`. It contains the canonical checkout status, the complete 247-entry dirty status, the cached diff stat, the complete 247-entry `diff --cached --name-status`, the full `git worktree list --porcelain` output, and a 355-row inventory table for registered Hermes worktrees under `/home/droid/workspaces/` and `/home/droid/.hermes/worktrees/`.
 
 ## Reference Check Results
 
@@ -31,11 +32,14 @@ This report quarantines the secondary Hermes `main` worktree at `/home/droid/wor
 | Path | Branch | HEAD | Tracking | Dirty count | Status | Proposed disposition |
 | --- | --- | --- | --- | ---: | --- | --- |
 | `/home/droid/workspaces/hermes-self-improvement-live-test` | `main` | `30818b22616805e61233e5097d0ebc7821cfbbd6` | `origin/main` | 247 | dirty secondary main; quarantined | Preserve patch/file summary, then human chooses branch/archive/reset. |
-| `/home/droid/.hermes/worktrees/hermes-silent-compaction` | not present in current `git worktree list --porcelain` output | unknown | previously reported gone | unknown | stale/gone example from context, not found in current registered worktrees | Operator should inspect filesystem path before deleting; preserve diff first if it exists. |
-| `/home/droid/workspaces/.hermes-discord-1507071138612642073` | not present in current `git worktree list --porcelain` output | unknown | previously reported `origin/discord/1507071138612642073: gone` | unknown | stale/dirty gone example from context, not found in current registered worktrees | Operator should inspect filesystem path before cleanup; preserve diff first if it exists. |
-| `/home/droid/workspaces/codex-worker-hermes-routing` | not present in current `git worktree list --porcelain` output | unknown | previously reported `[ahead 8833, behind 8831]` | unknown | divergent example from context, not found in current registered worktrees | Operator should locate path/branch before cleanup; do not force reset without approval. |
+| `/home/droid/.hermes/worktrees/hermes-silent-compaction` | `fix/silent-compression-start-status` | `522e2efe359b872d97eed27109efbd6a2bdab644` | `origin/fix/silent-compression-start-status [gone]` | 0 | stale/gone registered worktree | Operator may remove only after confirming no out-of-band artifacts are needed. |
+| `/home/droid/workspaces/.hermes-discord-1507071138612642073` | `discord/1507071138612642073` | `f6cb0f96f07dff9aad834662232f868f3cbf4af7` | `origin/discord/1507071138612642073 [gone]` | 1 | dirty gone registered worktree | Preserve dirty diff before any cleanup. |
+| `/home/droid/workspaces/codex-worker-hermes-routing` | `codex-worker-hermes-routing` | `e78851827eaf353d446f9ece2d701601dbdebd0c` | `origin/codex-worker-hermes-routing [ahead 8833, behind 8831]` | 0 | divergent registered worktree | Do not force-reset; operator should decide whether to archive, rebase, or remove. |
+| `/home/droid/workspaces/hermes-codex-proxy-pool` | `fix-codex-proxy-pool` | `96111882cd8d1b56b05273b2fc7849a9de41566f` | `origin/main [ahead 1, behind 10748]` | 0 | highly stale/divergent example | Preserve or retire only after human review. |
+| `/home/droid/workspaces/hermes-discord-worker-concurrency` | `discord-worker-cross-board-concurrency` | `5b838c25e44ea71ccac270fd0aff70b8083e7b8c` | `origin/discord-worker-cross-board-concurrency [gone]` | 7 | dirty gone example | Preserve dirty diff before any cleanup. |
+| `/home/droid/workspaces/merge-open-prs` | `merge-open-prs` | `05dbaf88cc3b1e954c666ade9bcacefeed876b37` | `origin/main [ahead 197, behind 11054]` | 0 | highly divergent example | Do not force-reset; operator should classify before cleanup. |
 
-The current porcelain worktree list is large and remains the authoritative live registry. This ticket did not delete or prune stale records.
+The current porcelain worktree list is large and remains the authoritative live registry. The complete review inventory is in the raw evidence bundle above and covers 355 registered Hermes worktrees under `/home/droid/workspaces/` and `/home/droid/.hermes/worktrees/`. This ticket did not delete, reset, prune, commit, rebase, or force-push any dirty or stale worktree.
 
 ## Cleanup Plan Requiring Human Approval
 
