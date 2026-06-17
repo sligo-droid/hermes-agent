@@ -573,6 +573,8 @@ function WorkItemCard({
   selectionActive: boolean;
   showActions?: boolean;
 }) {
+  const descriptionId = useId();
+  const [fullDescriptionOpen, setFullDescriptionOpen] = useState(false);
   const rowBusy = Boolean(activeAction?.ids.includes(item.id));
   const actionBusy = (kind: ActionKind) => rowBusy && activeAction?.kind === kind;
   const singleActions = availableActionKinds(item);
@@ -590,6 +592,9 @@ function WorkItemCard({
   };
   const discordUrl = discordSourceUrl(item.source);
   const workerUrl = item.execution?.worker_url || null;
+  const compactDescription = item.summary || item.body_preview || "No summary yet.";
+  const fullDescription = item.full_description?.trim();
+  const canShowFullDescription = Boolean(fullDescription && fullDescription !== compactDescription.trim());
   const openWorker = () => {
     if (!workerUrl) return;
     window.open(workerUrl, "_blank", "noopener,noreferrer");
@@ -645,7 +650,28 @@ function WorkItemCard({
       </div>
       <div className="mt-3 block w-full text-left">
         <AnnotationSummary item={item} />
-        <p className="text-sm leading-6 text-slate-300">{item.summary || item.body_preview || "No summary yet."}</p>
+        <p className="text-sm leading-6 text-slate-300">{compactDescription}</p>
+        {canShowFullDescription ? (
+          <div className="mt-3" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
+            <button
+              aria-controls={descriptionId}
+              aria-expanded={fullDescriptionOpen}
+              className="inline-flex h-8 items-center rounded-full border border-white/10 px-3 text-xs font-semibold text-cyan-100 transition hover:border-cyan-100/35 hover:bg-cyan-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/30"
+              onClick={(event) => {
+                event.stopPropagation();
+                setFullDescriptionOpen((open) => !open);
+              }}
+              type="button"
+            >
+              {fullDescriptionOpen ? "Hide full description" : "Show full description"}
+            </button>
+            {fullDescriptionOpen ? (
+              <div id={descriptionId} className="mt-3 whitespace-pre-wrap rounded-xl border border-white/[0.08] bg-white/[0.035] p-3 text-sm leading-6 text-slate-200">
+                {fullDescription}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
       </div>
       {repairBlocked ? (
         <div className="command-center-mega-blocked-banner mt-3 rounded-xl border px-3 py-2 text-left" role="status">
