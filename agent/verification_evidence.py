@@ -23,6 +23,7 @@ _TIMEOUT_RE = re.compile(r"\b(timed?\s*out|timeout|deadline|expired)\b", re.IGNO
 _CLAIM_WORD_RE = re.compile(r"\b(shipped|verified|visible|checked|confirmed|passed|deployed|merged)\b", re.IGNORECASE)
 _NEGATED_CLAIM_RE = re.compile(r"\b(?:not|isn['’]?t|failed|failure|blocked|unverified|not_verified)\b", re.IGNORECASE)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_CLAUSE_SPLIT_RE = re.compile(r"\s*(?:;|\b(?:and|but)\b)\s*", re.IGNORECASE)
 
 _SURFACE_LABELS = {
     "browser": "browser verification",
@@ -189,6 +190,13 @@ def _surface_terms_present(text: str, surface: str) -> bool:
     return True
 
 
+def _clause_mentions_blocked_surface(text: str, surface: str) -> bool:
+    lowered = text.lower()
+    if surface == "production_browser":
+        return bool(_PRODUCTION_RE.search(text) or _BROWSER_RE.search(text) or "modal" in lowered or "visible" in lowered)
+    return _surface_terms_present(text, surface)
+
+
 def _surface_downgraded(text: str, surface: str, item: dict[str, Any]) -> bool:
     label = _SURFACE_LABELS.get(surface, surface.replace("_", " "))
     check = str(item.get("check_name") or "").strip()
@@ -211,8 +219,6 @@ def claim_constraints_for_text(final_text: str, evidence: Any) -> dict[str, Any]
     for surface, item in sorted(latest.items()):
         status = str(item.get("status") or "").lower()
         if status not in {"failure", "timeout"}:
-            continue
-        if _surface_downgraded(final_text, surface, item):
             continue
         if _surface_claimed(final_text, surface):
             blocked.append(
@@ -238,6 +244,41 @@ def _blocked_surface_clause(item: dict[str, Any]) -> str:
     if len(check) > 180:
         check = check[:177].rstrip() + "..."
     return f"{label} is not verified: latest check `{check}` {status}."
+
+
+def _rewrite_blocked_surface_claims(final_text: str, blocked: list[dict[str, Any]], downgrade: str) -> str:
+    sentences = [part for part in _SENTENCE_SPLIT_RE.split(str(final_text or "")) if part.strip()]
+    if not sentences:
+        return downgrade
+
+    rewritten: list[str] = []
+    inserted = False
+    for sentence in sentences:
+        sentence = sentence.strip()
+        blocked_surfaces = [
+            str(item.get("surface") or "")
+            for item in blocked
+            if isinstance(item, dict) and _surface_claimed(sentence, str(item.get("surface") or ""))
+        ]
+        if not blocked_surfaces:
+            rewritten.append(sentence)
+            continue
+
+        clauses = [part.strip() for part in _CLAUSE_SPLIT_RE.split(sentence) if part.strip()]
+        kept = []
+        for clause in clauses:
+            if any(_clause_mentions_blocked_surface(clause, surface) for surface in blocked_surfaces):
+                continue
+            kept.append(clause.rstrip(".!?"))
+        if kept:
+            rewritten.append(". ".join(kept) + ".")
+        if not inserted:
+            rewritten.append(downgrade)
+            inserted = True
+
+    if not inserted:
+        rewritten.append(downgrade)
+    return "\n\n".join(part for part in rewritten if part.strip())
 
 
 def downgrade_final_response_for_evidence(final_text: str, evidence: Any) -> tuple[str, dict[str, Any]]:
@@ -266,7 +307,7 @@ def downgrade_final_response_for_evidence(final_text: str, evidence: Any) -> tup
     downgrade = "Verification downgrade: " + " ".join(unique_clauses)
     if downgrade.lower() in text.lower():
         return text, constraints
-    return text.rstrip() + "\n\n" + downgrade, constraints
+    return _rewrite_blocked_surface_claims(text, blocked, downgrade), constraints
 
 
 def metadata_has_verified_claim(value: Any) -> bool:

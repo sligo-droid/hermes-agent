@@ -117,6 +117,8 @@ def test_final_response_downgrade_names_latest_failed_check():
     assert "worker_frontend_smoke" in downgraded
     assert "timeout" in downgraded
     assert "CI passed via scripts/run_tests.sh" in downgraded
+    assert "Shipped and verified in production" not in downgraded
+    assert "browser modal is visible" not in downgraded
 
 
 def test_conversation_loop_final_response_guard_uses_turn_runtime_evidence():
@@ -142,6 +144,8 @@ def test_conversation_loop_final_response_guard_uses_turn_runtime_evidence():
     assert constraints["allowed"] is False
     assert "Verification downgrade:" in downgraded
     assert "browser modal smoke" in downgraded
+    assert "Shipped and verified in production" not in downgraded
+    assert "browser modal is visible" not in downgraded
 
 
 def test_final_response_downgrade_skips_later_success():
@@ -171,3 +175,4 @@ def test_final_response_downgrade_keeps_independent_deployed_claim_separate():
     assert "Deployment completed and CI passed" in downgraded
     assert "production browser verification is not verified" in downgraded
     assert "browser modal smoke" in downgraded
+    assert "Production browser modal verified visible" not in downgraded
