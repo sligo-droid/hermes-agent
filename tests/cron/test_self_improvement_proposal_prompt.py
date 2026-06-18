@@ -187,6 +187,7 @@ def _run_tick_with_response(tmp_path, monkeypatch, job, final_response):
          patch("cron.scheduler.advance_next_run"), \
          patch("cron.scheduler.mark_job_run"), \
          patch("cron.scheduler.save_job_output", side_effect=lambda _job_id, output: output_file), \
+         patch("cron.scheduler.update_job_output"), \
          patch("cron.scheduler.run_job", return_value=(True, output_doc, final_response, None)):
         assert tick(verbose=False) == 1
     return output_file
