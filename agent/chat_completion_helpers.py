@@ -39,6 +39,11 @@ from utils import base_url_host_matches, base_url_hostname
 logger = logging.getLogger(__name__)
 
 
+_CODING_WORKER_PRE_TOOL_ALLOWED_TOOLS = frozenset({
+    "delegate_coding_task",
+})
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 
@@ -62,6 +67,24 @@ def _redact_browser_type_arguments(tool_name: str, arguments: Any) -> Any:
         return arguments
     parsed = {**parsed, "text": "[REDACTED_BROWSER_INPUT]"}
     return json.dumps(parsed, ensure_ascii=False)
+
+
+def _coding_worker_tools_for_api(agent: Any, tools: Any) -> Any:
+    """Narrow Hermes-codebase coding turns to the worker before edits."""
+    if not isinstance(tools, list):
+        return tools
+    if not getattr(agent, "_coding_worker_required_this_turn", False):
+        return tools
+    if getattr(agent, "_coding_worker_used_this_turn", False):
+        return tools
+    if str(getattr(agent, "api_mode", "") or "").strip().lower() == "codex_app_server":
+        return tools
+    return [
+        tool
+        for tool in tools
+        if isinstance(tool, dict)
+        and (tool.get("function") or {}).get("name") in _CODING_WORKER_PRE_TOOL_ALLOWED_TOOLS
+    ]
 
 
 def estimate_request_context_tokens(api_payload: Any) -> int:
@@ -536,7 +559,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
-    tools_for_api = agent.tools
+    tools_for_api = _coding_worker_tools_for_api(agent, agent.tools)
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()

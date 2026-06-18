@@ -108,6 +108,78 @@ class TestBuildApiKwargsOpenRouter:
         tool_names = [t["function"]["name"] for t in kwargs["tools"]]
         assert "web_search" in tool_names
 
+    def test_hermes_coding_turn_routes_to_worker_before_mutation_tools(self, monkeypatch):
+        monkeypatch.setattr(
+            "run_agent.get_tool_definitions",
+            lambda **kw: _tool_defs("delegate_coding_task", "terminal", "write_file", "web_search"),
+        )
+        monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
+        monkeypatch.setattr("run_agent.OpenAI", _FakeOpenAI)
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            provider="openrouter",
+            api_mode="chat_completions",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent._coding_worker_required_this_turn = True
+        agent._coding_worker_used_this_turn = False
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "fix Hermes"}])
+
+        assert [t["function"]["name"] for t in kwargs["tools"]] == ["delegate_coding_task"]
+        assert {"delegate_coding_task", "terminal", "write_file", "web_search"} <= agent.valid_tool_names
+
+    def test_non_hermes_turn_keeps_mutation_tools_available(self, monkeypatch):
+        monkeypatch.setattr(
+            "run_agent.get_tool_definitions",
+            lambda **kw: _tool_defs("delegate_coding_task", "terminal", "write_file", "web_search"),
+        )
+        monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
+        monkeypatch.setattr("run_agent.OpenAI", _FakeOpenAI)
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            provider="openrouter",
+            api_mode="chat_completions",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent._coding_worker_required_this_turn = False
+        agent._coding_worker_used_this_turn = False
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "fix app"}])
+
+        tool_names = {t["function"]["name"] for t in kwargs["tools"]}
+        assert {"delegate_coding_task", "terminal", "write_file", "web_search"} <= tool_names
+
+    def test_hermes_coding_turn_restores_tools_after_worker_attempt(self, monkeypatch):
+        monkeypatch.setattr(
+            "run_agent.get_tool_definitions",
+            lambda **kw: _tool_defs("delegate_coding_task", "terminal", "write_file", "web_search"),
+        )
+        monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
+        monkeypatch.setattr("run_agent.OpenAI", _FakeOpenAI)
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            provider="openrouter",
+            api_mode="chat_completions",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent._coding_worker_required_this_turn = True
+        agent._coding_worker_used_this_turn = True
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "continue"}])
+
+        tool_names = {t["function"]["name"] for t in kwargs["tools"]}
+        assert {"delegate_coding_task", "terminal", "write_file", "web_search"} <= tool_names
+
     def test_no_responses_api_fields(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openrouter")
         messages = [{"role": "user", "content": "hi"}]

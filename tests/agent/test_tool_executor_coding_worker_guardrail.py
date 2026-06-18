@@ -27,6 +27,25 @@ def test_coding_worker_guardrail_blocks_mutating_terminal_before_delegate():
     assert "delegate_coding_task" in message
 
 
+def test_coding_worker_guardrail_still_blocks_mutation_if_exposed_before_delegate():
+    message = _coding_worker_mutation_block(
+        _agent(),
+        "write_file",
+        {"path": "/tmp/hermes.py", "content": "edited"},
+    )
+
+    assert message is not None
+    assert "delegate_coding_task" in message
+
+
+def test_coding_worker_guardrail_does_not_block_non_hermes_turn_mutation():
+    assert _coding_worker_mutation_block(
+        _agent(_coding_worker_required_this_turn=False),
+        "write_file",
+        {"path": "/tmp/app.py", "content": "edited"},
+    ) is None
+
+
 def test_coding_worker_guardrail_allows_read_only_terminal_before_delegate():
     assert _coding_worker_mutation_block(
         _agent(),
