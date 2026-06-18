@@ -67,6 +67,31 @@ def _log_corrupt_board_incident(board: str, incident: Optional[dict], exc: Excep
     )
 
 
+def _schema_ready(board: str, conn, operation: str) -> bool:
+    ready, incident = kanban_db.board_schema_ready(
+        conn,
+        board=board,
+        operation=operation,
+        required_tables=("tasks",),
+    )
+    if ready:
+        return True
+    _log_corrupt_board_incident(
+        board,
+        incident,
+        RuntimeError((incident or {}).get("reason") or "kanban board schema not ready"),
+    )
+    return False
+
+
+def _board_schema_ready_for_dispatch(board: str) -> bool:
+    conn = kanban_db.connect(board=board)
+    try:
+        return _schema_ready(board, conn, "discord_dispatcher")
+    finally:
+        conn.close()
+
+
 def _coerce_positive_int(value: object, default: int) -> int:
     try:
         parsed = int(value)
@@ -79,6 +104,8 @@ def running_role_count(board: str) -> int:
     """Return the number of running Discord role-lane tasks on one board."""
     conn = kanban_db.connect(board=board)
     try:
+        if not _schema_ready(board, conn, "discord_dispatcher"):
+            return 0
         placeholders = ",".join("?" for _ in dwb.ROLE_ASSIGNEES)
         row = conn.execute(
             "SELECT COUNT(*) FROM tasks "
@@ -94,6 +121,8 @@ def running_role_counts(board: str) -> dict[str, int]:
     """Return running Discord role-lane counts keyed by role."""
     conn = kanban_db.connect(board=board)
     try:
+        if not _schema_ready(board, conn, "discord_dispatcher"):
+            return {role: 0 for role in dwb.ROLE_ASSIGNEES}
         placeholders = ",".join("?" for _ in dwb.ROLE_ASSIGNEES)
         rows = conn.execute(
             "SELECT lower(assignee) AS role, COUNT(*) AS count FROM tasks "
@@ -112,6 +141,8 @@ def running_role_counts(board: str) -> dict[str, int]:
 def _ready_role_counts(board: str) -> dict[str, int]:
     conn = kanban_db.connect(board=board)
     try:
+        if not _schema_ready(board, conn, "discord_dispatcher"):
+            return {role: 0 for role in dwb.ROLE_ASSIGNEES}
         rows = conn.execute(
             "SELECT status, lower(assignee) AS role, COUNT(*) AS count FROM tasks "
             "WHERE status IN ('ready', 'review') AND claim_lock IS NULL "
@@ -134,6 +165,8 @@ def _dev_shared_workspace_limited(board: str) -> bool:
     """True when queued/running dev tasks share one checkout path."""
     conn = kanban_db.connect(board=board)
     try:
+        if not _schema_ready(board, conn, "discord_dispatcher"):
+            return False
         rows = conn.execute(
             "SELECT workspace_path FROM tasks "
             "WHERE status IN ('ready', 'running') AND lower(assignee) = ?",
@@ -187,6 +220,8 @@ def _dispatch_board(
 ) -> kanban_db.DispatchResult:
     conn = kanban_db.connect(board=board)
     try:
+        if not _schema_ready(board, conn, "discord_dispatcher"):
+            return kanban_db.DispatchResult()
         return kanban_db.dispatch_once(
             conn,
             board=board,
@@ -251,6 +286,9 @@ def dispatch_discord_worker_boards(
                 out.append((board, None))
                 continue
             if dwb.is_paused_or_cancelled(board):
+                out.append((board, None))
+                continue
+            if not _board_schema_ready_for_dispatch(board):
                 out.append((board, None))
                 continue
             running = running_role_count(board)

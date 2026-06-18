@@ -1612,6 +1612,56 @@ def is_corrupt_board_db_error(exc: Exception) -> bool:
     )
 
 
+def board_schema_ready(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str],
+    operation: str,
+    required_tables: Iterable[str],
+) -> tuple[bool, Optional[dict[str, Any]]]:
+    """Return whether a routed board DB has the tables needed by a tick path.
+
+    Gateway notifier/dispatcher loops can encounter stale handles or partially
+    initialized board DBs before operation-specific SQL runs. Treat missing
+    required tables as a board repair condition and reuse the existing bounded
+    corruption pause metadata so the gateway does not log the same OperationalError
+    every tick.
+    """
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    tables = tuple(str(table).strip() for table in required_tables if str(table).strip())
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+        present = {str(row[0]) for row in rows}
+    except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
+        reason = f"schema readiness probe failed for {operation}: {exc}"
+    else:
+        missing = [table for table in tables if table not in present]
+        if not missing:
+            return True, None
+        reason = (
+            f"schema readiness failed for {operation}: missing required table(s): "
+            + ", ".join(missing)
+        )
+    db_path = kanban_db_path(slug)
+    try:
+        resolved = db_path.resolve()
+    except OSError:
+        resolved = db_path
+    try:
+        fingerprint = _db_content_fingerprint(resolved)
+    except Exception:
+        fingerprint = None
+    incident = record_corrupt_board_incident(
+        slug,
+        resolved,
+        reason,
+        fingerprint=fingerprint,
+    )
+    return False, incident
+
+
 def corrupt_board_quarantine_state(
     board: Optional[str] = None,
     *,
