@@ -1575,6 +1575,64 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # UI-work routing for coding workers. This keeps frontend/dashboard/TUI
+    # implementation on a configurable specialist model without changing the
+    # default backend for non-UI work.
+    "ui_work": {
+        "enabled": True,
+        "provider": "openrouter",
+        "model": "z-ai/glm-5.2",
+        "codex": {
+            "provider_config_key": "model_provider",
+            "model_config_key": "model",
+            "extra_args": [],
+        },
+        "detection": {
+            "title_body_keywords": [
+                "frontend",
+                "front-end",
+                "ui",
+                "ux",
+                "dashboard",
+                "command center",
+                "tui",
+                "react",
+                "svelte",
+                "vue",
+                "css",
+                "layout",
+                "responsive",
+                "visual",
+                "chart",
+                "modal",
+                "drawer",
+                "button",
+                "form",
+                "screen",
+                "page",
+            ],
+            "negative_keywords": [
+                "backend-only",
+                "backend only",
+                "api-only",
+                "api only",
+                "server-only",
+                "server only",
+                "no frontend",
+                "not frontend",
+                "no ui",
+                "not ui",
+                "non-ui",
+                "without ui",
+                "without frontend",
+            ],
+        },
+        "fallback": {
+            "allow_default_worker": False,
+        },
+        "route_delegate_task": False,
+    },
+
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
     # injected at the start of every API call for few-shot priming.
     # Never saved to sessions, logs, or trajectories.

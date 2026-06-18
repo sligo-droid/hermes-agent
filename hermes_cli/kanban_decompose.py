@@ -89,6 +89,9 @@ Rules:
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+  - If a child task is user-interface work, keep explicit UI/frontend/
+    dashboard/TUI wording in its title or body so deterministic worker routing
+    can select the UI-specialist model.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:

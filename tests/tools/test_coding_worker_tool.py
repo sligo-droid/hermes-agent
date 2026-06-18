@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import time
@@ -10,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.transports.codex_app_server_session import TurnResult
+from hermes_cli.config import DEFAULT_CONFIG
 from tools import coding_worker_tool as cwt
 
 
@@ -157,6 +159,69 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     assert prompt.index("Open PRs and merge them yourself") < prompt.index("Worker boundary")
     assert result["agents"] == ["build"]
     assert result["plan_used"] is False
+    assert result["ui_work_route"]["matched"] is False
+
+
+def test_ui_work_uses_codex_model_overlay(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["backend"] = "codex"
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Implement the frontend dashboard layout polish",
+            context="Keep the Command Center responsive.",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert result["ui_work_route"] == {
+        "matched": True,
+        "enabled": True,
+        "reason": "ui keyword: frontend",
+        "provider": "openrouter",
+        "model": "z-ai/glm-5.2",
+        "backend": "codex",
+        "fallback_allowed": False,
+        "error": "",
+    }
+    assert FakeSession.instances[0].kwargs["extra_args"] == [
+        "-c",
+        'model_provider="openrouter"',
+        "-c",
+        'model="z-ai/glm-5.2"',
+        "-c",
+        'model_reasoning_effort="medium"',
+    ]
+
+
+def test_ui_work_missing_model_fails_before_worker(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["ui_work"]["model"] = ""
+    cfg["ui_work"]["fallback"]["allow_default_worker"] = False
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Fix frontend chart labels",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert "ui_work.provider and ui_work.model" in result["error"]
+    assert FakeSession.instances == []
 
 
 def test_delegate_prefers_hermes_md_context_over_agents(monkeypatch, tmp_path):
