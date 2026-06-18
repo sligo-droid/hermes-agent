@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -402,3 +403,132 @@ def test_compression_churn_result_is_structured_failure(tmp_path):
     assert result["compression_exhausted"] is True
     assert result["compression_loop"] == details
     assert persisted["messages"] == messages
+
+
+def test_largest_message_candidate_names_skill_view_tool_result():
+    from agent.conversation_compression import _largest_message_candidate
+
+    content = json.dumps({
+        "success": True,
+        "name": "oversized-skill",
+        "content": "x" * 70_605,
+    })
+    messages = [
+        {"role": "user", "content": "load skill"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_skill",
+                "type": "function",
+                "function": {"name": "skill_view", "arguments": '{"name":"oversized-skill"}'},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_skill", "content": content},
+    ]
+
+    candidate = _largest_message_candidate(messages)
+
+    assert candidate["role"] == "tool"
+    assert candidate["tool_name"] == "skill_view"
+    assert candidate["result_class"] == "oversized-skill"
+    assert candidate["chars"] >= 70_605
+
+
+def test_oversized_skill_view_emergency_shrink_avoids_churn_breaker():
+    from agent.conversation_compression import compress_context
+    from agent.context_compressor import ContextCompressor
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = SessionDB(db_path=Path(tmpdir) / "state.db")
+        db.create_session("root", "cli")
+        db.update_token_counts("root", input_tokens=190_000, absolute=True)
+        db.end_session("root", "compression")
+        db.create_session("child1", "cli", parent_session_id="root")
+        db.update_token_counts("child1", input_tokens=186_000, absolute=True)
+        db.end_session("child1", "compression")
+        db.create_session("child2", "cli", parent_session_id="child1")
+        db.update_token_counts("child2", input_tokens=170_000, absolute=True)
+
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                session_db=db,
+                session_id="child2",
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        agent._build_system_prompt = lambda _system_message: "system"
+        agent.commit_memory_session = lambda _messages: None
+        agent.context_compressor.threshold_tokens = 190_400
+        agent.context_compressor.compress = lambda messages, **_kwargs: ContextCompressor.emergency_shrink(
+            agent.context_compressor,
+            messages,
+            target_tokens=agent.context_compressor.threshold_tokens,
+        )[0]
+
+        skill_content = """---
+version: 9.8.7
+---
+# Oversized Skill
+## When to Use
+When reproducing compression churn.
+## Procedure
+Keep this heading.
+## Verification
+Keep this too.
+""" + ("body line\n" * 8000)
+        skill_result = json.dumps({
+            "success": True,
+            "name": "oversized-skill",
+            "content": skill_content,
+            "path": "qa/oversized-skill/SKILL.md",
+            "skill_dir": "/tmp/hermes/skills/qa/oversized-skill",
+            "linked_files": {"references": ["references/details.md"]},
+            "usage_hint": "To view linked files, call skill_view(name, file_path)",
+        })
+        messages = [
+            {"role": "user", "content": "load skill"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_skill",
+                    "type": "function",
+                    "function": {"name": "skill_view", "arguments": '{"name":"oversized-skill"}'},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_skill", "content": skill_result},
+            {"role": "assistant", "content": "loaded"},
+            {"role": "user", "content": "continue"},
+        ]
+
+        captured = {}
+
+        def estimate(messages_arg, **_kwargs):
+            captured["messages"] = messages_arg
+            return 20_000
+
+        with patch("agent.conversation_compression.estimate_request_tokens_rough", side_effect=estimate):
+            compressed, new_system_prompt = compress_context(
+                agent,
+                messages,
+                "system",
+                approx_tokens=195_000,
+            )
+
+    serialized = json.dumps(captured["messages"])
+    assert compressed == captured["messages"]
+    assert new_system_prompt == "system"
+    assert agent.session_id != "child2"
+    assert len(serialized) < 10_000
+    assert "Skill: oversized-skill" in serialized
+    assert "Version: 9.8.7" in serialized
+    assert "## Procedure" in serialized
+    assert "references/details.md" in serialized
+    assert "skill_view(name, file_path)" in serialized

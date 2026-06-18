@@ -234,6 +234,128 @@ class TestCompress:
         assert len(result[1]["content"]) < len(summary)
         assert result[-1] == msgs[-1]
 
+    def test_prune_compacts_oversized_historical_skill_view_in_tail(self, compressor):
+        import json
+
+        skill_content = """---
+version: 2.3.4
+---
+# Demo Skill
+## When to Use
+Use it for testing.
+## Procedure
+Follow the steps.
+## Verification
+Run the checks.
+""" + ("large body\n" * 8000)
+        skill_result = json.dumps({
+            "success": True,
+            "name": "demo-skill",
+            "content": skill_content,
+            "path": "testing/demo-skill/SKILL.md",
+            "skill_dir": "/tmp/hermes/skills/testing/demo-skill",
+            "linked_files": {
+                "references": ["references/api.md"],
+                "scripts": ["scripts/check.py"],
+            },
+            "usage_hint": "To view linked files, call skill_view(name, file_path)",
+        })
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "load the skill"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_skill",
+                    "type": "function",
+                    "function": {"name": "skill_view", "arguments": '{"name":"demo-skill"}'},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_skill", "content": skill_result},
+            {"role": "assistant", "content": "I loaded it."},
+            {"role": "user", "content": "latest ask must stay"},
+        ]
+
+        result, stats = compressor.emergency_shrink(msgs, target_tokens=10_000)
+
+        compacted = result[3]["content"]
+        assert stats["tool_results"] >= 1
+        assert len(compacted) < 3000
+        assert "Skill: demo-skill" in compacted
+        assert "Version: 2.3.4" in compacted
+        assert "## Procedure" in compacted
+        assert "references/api.md" in compacted
+        assert "scripts/check.py" in compacted
+        assert "skill_view(name, file_path)" in compacted
+        assert result[-1] == msgs[-1]
+
+    def test_skill_view_summary_cap_preserves_recovery_fields(self, compressor):
+        import json
+
+        long_path = "references/" + ("deep-directory-name/" * 20) + "representative-recovery.md"
+        linked_files = [
+            long_path,
+            "references/second-recovery.md",
+            *[f"references/generated-{i:02d}-" + ("x" * 120) + ".md" for i in range(40)],
+        ]
+        skill_content = """---
+version: 9.8.7
+---
+# Recovery Heavy Skill
+## When to Use
+Use it for capped skill summaries.
+## Procedure
+Follow the recovery trail.
+## Verification
+Check the summary.
+""" + "\n".join(
+            f"### Procedure Heading {i:02d} " + ("with long detail " * 20)
+            for i in range(40)
+        )
+        skill_result = json.dumps({
+            "success": True,
+            "name": "recovery-heavy",
+            "content": skill_content + ("\nlarge body" * 8000),
+            "path": "testing/recovery-heavy/SKILL.md",
+            "skill_dir": "/tmp/hermes/skills/testing/recovery-heavy",
+            "linked_files": {"references": linked_files},
+            "usage_hint": "To view linked files, call skill_view(name, file_path)",
+        })
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "load the skill"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_skill",
+                    "type": "function",
+                    "function": {"name": "skill_view", "arguments": '{"name":"recovery-heavy"}'},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_skill", "content": skill_result},
+            {"role": "assistant", "content": "I loaded it."},
+            {"role": "user", "content": "latest ask must stay"},
+        ]
+
+        result, stats = compressor.emergency_shrink(msgs, target_tokens=10_000)
+
+        compacted = result[3]["content"]
+        assert stats["tool_results"] >= 1
+        assert len(compacted) <= 2500
+        assert "Skill: recovery-heavy" in compacted
+        assert "Version: 9.8.7" in compacted
+        assert "## Procedure" in compacted
+        assert "## Verification" in compacted
+        assert "representative-recovery.md" in compacted
+        assert "references/second-recovery.md" in compacted
+        assert "additional linked files omitted" in compacted
+        assert "skill_view(name, file_path)" in compacted
+        assert "Fetch full skill content again: skill_view(\"recovery-heavy\")" in compacted
+        assert result[-1] == msgs[-1]
+
+
 
 class TestGenerateSummaryNoneContent:
     """Regression: content=None (from tool-call-only assistant messages) must not crash."""

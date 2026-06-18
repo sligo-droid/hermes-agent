@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import json
 import tempfile
 import uuid
 from datetime import datetime
@@ -302,22 +303,48 @@ def _content_text_length(content: Any) -> int:
 
 def _largest_message_candidate(messages: list) -> dict[str, Any]:
     candidate: dict[str, Any] = {}
+    call_id_to_tool: dict[str, str] = {}
+    for msg in messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for tool_call in msg.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            call_id = str(tool_call.get("id") or "")
+            tool_name = str(tool_call.get("function", {}).get("name") or "")
+            if call_id and tool_name:
+                call_id_to_tool[call_id] = tool_name
     for idx, msg in enumerate(messages or []):
         if not isinstance(msg, dict):
             continue
         size = _content_text_length(msg.get("content"))
+        tool_name = msg.get("tool_name")
         for tool_call in msg.get("tool_calls") or []:
             if isinstance(tool_call, dict):
                 size += _content_text_length(tool_call.get("function", {}).get("arguments"))
+                if not tool_name:
+                    tool_name = tool_call.get("function", {}).get("name")
         if size > int(candidate.get("chars") or 0):
             preview = msg.get("content")
             if not isinstance(preview, str):
                 preview = str(preview) if preview is not None else ""
+            if not tool_name and msg.get("role") == "tool":
+                tool_name = call_id_to_tool.get(str(msg.get("tool_call_id") or ""))
+            result_class = None
+            if msg.get("role") == "tool" and tool_name == "skill_view":
+                result_class = "skill_view_result"
+                try:
+                    parsed = json.loads(preview or "{}")
+                    if isinstance(parsed, dict):
+                        result_class = str(parsed.get("name") or result_class)
+                except Exception:
+                    pass
             candidate = {
                 "index": idx,
                 "role": msg.get("role"),
                 "chars": size,
-                "tool_name": msg.get("tool_name"),
+                "tool_name": tool_name,
+                "result_class": result_class,
                 "preview": preview[:240],
             }
     return candidate
