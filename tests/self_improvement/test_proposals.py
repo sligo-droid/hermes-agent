@@ -147,8 +147,19 @@ def test_project_context_preserves_explicit_card_context(monkeypatch, tmp_path):
             "project": "reserve-index-dtf",
             "project_context": {
                 "github_pr_target_repo": "sligo-droid/reserve-index-dtf",
+                "github_pr_target_url": "https://github.com/sligo-droid/reserve-index-dtf.git",
                 "base_branch": "feat/irrevocable-fee-recipients",
-                "github_pr_amend": {"head_sha": "19a1d0b"},
+                "github_pr_amend": {
+                    "upstream_repo": "reserve-protocol/reserve-index-dtf",
+                    "upstream_pr_number": "182",
+                    "upstream_pr_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182",
+                    "head_repo": "sligo-droid/reserve-index-dtf",
+                    "head_ref": "feat/irrevocable-fee-recipients",
+                    "head_sha": "19a1d0b",
+                    "source_kind": "review",
+                    "source_id": "4518030260",
+                    "requires_head_sha_advance": True,
+                },
             },
         },
         "12345",
@@ -156,8 +167,19 @@ def test_project_context_preserves_explicit_card_context(monkeypatch, tmp_path):
 
     assert context["project_path"] == str(project.resolve())
     assert context["github_pr_target_repo"] == "sligo-droid/reserve-index-dtf"
+    assert context["github_pr_target_url"] == "https://github.com/sligo-droid/reserve-index-dtf.git"
     assert context["base_branch"] == "feat/irrevocable-fee-recipients"
-    assert context["github_pr_amend"] == {"head_sha": "19a1d0b"}
+    assert context["github_pr_amend"] == {
+        "upstream_repo": "reserve-protocol/reserve-index-dtf",
+        "upstream_pr_number": "182",
+        "upstream_pr_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182",
+        "head_repo": "sligo-droid/reserve-index-dtf",
+        "head_ref": "feat/irrevocable-fee-recipients",
+        "head_sha": "19a1d0b",
+        "source_kind": "review",
+        "source_id": "4518030260",
+        "requires_head_sha_advance": True,
+    }
 
 
 def test_self_improvement_project_context_uses_channel_cwd_when_mapping_has_no_path(monkeypatch, tmp_path):

@@ -2362,6 +2362,81 @@ def _pr_open_policy(worker: dict[str, Any]) -> str:
     return policy if policy in {PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL, PR_OPEN_POLICY_NEVER} else PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL
 
 
+def _github_pr_amend_context(worker: dict[str, Any]) -> dict[str, Any]:
+    context = worker.get("project_context") if isinstance(worker.get("project_context"), dict) else {}
+    amend = context.get("github_pr_amend") if isinstance(context.get("github_pr_amend"), dict) else {}
+    return dict(amend)
+
+
+def _pr_amend_requires_head_sha_advance(worker: dict[str, Any]) -> bool:
+    amend = _github_pr_amend_context(worker)
+    if amend.get("requires_head_sha_advance") is True:
+        return True
+    source_kind = str(amend.get("source_kind") or "").strip()
+    review_state = str(amend.get("review_state") or amend.get("source_state") or "").strip().upper()
+    if source_kind == "review_comment":
+        return True
+    return source_kind == "review" and review_state == "CHANGES_REQUESTED"
+
+
+def _validate_pr_amend_target(worker: dict[str, Any], *, repo: str, base: str) -> str:
+    amend = _github_pr_amend_context(worker)
+    if not amend:
+        return ""
+    head_repo = str(amend.get("head_repo") or "").strip()
+    head_ref = str(amend.get("head_ref") or "").strip()
+    if head_repo and repo != head_repo:
+        return f"PR-amend target mismatch: finalizer repo {repo} is not PR head repo {head_repo}"
+    if head_ref and base != head_ref:
+        return f"PR-amend target mismatch: finalizer base {base} is not PR head ref {head_ref}"
+    upstream_repo = str(amend.get("upstream_repo") or "").strip()
+    if upstream_repo and upstream_repo != head_repo and repo == upstream_repo:
+        return f"PR-amend target mismatch: refusing to use upstream repo {upstream_repo} for amendment PR lifecycle"
+    return ""
+
+
+def _verify_pr_amend_head_advanced(worker: dict[str, Any], *, root: Path) -> bool:
+    if not _pr_amend_requires_head_sha_advance(worker):
+        return True
+    amend = _github_pr_amend_context(worker)
+    upstream_repo = str(amend.get("upstream_repo") or "").strip()
+    upstream_pr_number = str(amend.get("upstream_pr_number") or "").strip()
+    trigger_sha = str(amend.get("head_sha") or "").strip()
+    if not upstream_repo or not upstream_pr_number or not trigger_sha:
+        worker["pr_amend_head_advanced"] = False
+        worker["pr_blocker"] = "PR-amend completion blocked: missing upstream PR head SHA verification context."
+        return False
+
+    viewed = _run_gh(
+        [
+            "pr",
+            "view",
+            upstream_pr_number,
+            "--repo",
+            upstream_repo,
+            "--json",
+            "headRefOid",
+            "--jq",
+            ".headRefOid",
+        ],
+        root=root,
+        timeout=30,
+    )
+    if viewed.returncode != 0:
+        worker["pr_amend_head_advanced"] = False
+        worker["pr_status_error"] = (viewed.stderr or viewed.stdout or "gh pr view failed").strip()
+        worker["pr_blocker"] = worker["pr_status_error"]
+        return False
+    current_sha = (viewed.stdout or "").strip().strip('"')
+    worker["pr_amend_upstream_head_sha"] = current_sha
+    worker["pr_amend_trigger_head_sha"] = trigger_sha
+    advanced = bool(current_sha and current_sha != trigger_sha)
+    worker["pr_amend_head_advanced"] = advanced
+    if not advanced:
+        worker["pr_blocker"] = "PR-amend completion blocked: upstream PR head SHA did not advance from triggering review commit."
+    return advanced
+
+
 def _pr_blocker(worker: dict[str, Any]) -> str:
     if worker.get("pr_error"):
         return str(worker.get("pr_error") or "")
@@ -2800,6 +2875,13 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
                 worker["pr_blocker"] = worker["pr_error"]
                 raise RuntimeError(worker["pr_error"])
             assert repo is not None
+            target_error = _validate_pr_amend_target(worker, repo=repo, base=base)
+            if target_error:
+                worker["pr_error"] = target_error
+                worker["pr_checks_status"] = "not checked"
+                worker["pr_merge_state"] = "unknown"
+                worker["pr_blocker"] = target_error
+                raise RuntimeError(target_error)
             has_commits = _branch_has_commits(root, base=base, branch=branch)
             if _is_foreman_generated_worker(worker) and has_commits is False:
                 worker["pr_skipped_no_changes"] = True
@@ -2830,6 +2912,9 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
                     worker.setdefault("pr_checks_status", "not checked")
                     worker.setdefault("pr_merge_state", "unknown")
                     worker["pr_blocker"] = _pr_open_blocker(worker)
+        if not worker.get("pr_blocker") and not _verify_pr_amend_head_advanced(worker, root=root):
+            worker.setdefault("pr_checks_status", "not checked")
+            worker.setdefault("pr_merge_state", "unknown")
     except Exception as exc:
         worker.setdefault("pr_error", str(exc))
         worker.setdefault("pr_checks_status", "not checked")
@@ -2867,10 +2952,15 @@ def _ensure_pr(board: Optional[str], workspace: str) -> bool:
                 "canonical_sync_head",
                 "canonical_sync_merge_commit",
                 "canonical_synced_at",
+                "pr_amend_head_advanced",
+                "pr_amend_upstream_head_sha",
+                "pr_amend_trigger_head_sha",
             )
             if key in worker
         },
     )
+    if worker.get("pr_blocker"):
+        return False
     if worker.get("pr_skipped_no_changes"):
         return not bool(worker.get("pr_error"))
     if policy == MERGE_POLICY_AUTO:
