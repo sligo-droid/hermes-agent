@@ -139,6 +139,59 @@ def test_corrupt_board_quarantine_state_skips_until_retry_window(kanban_home, mo
     assert state["next_retry"] == incident["next_retry"]
 
 
+def test_connect_skips_unchanged_paused_corrupt_board_before_sqlite_open(kanban_home, monkeypatch):
+    board = "connect-quarantine-skip"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"not sqlite")
+    fingerprint = kb._db_content_fingerprint(db_path)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "sqlite refused to open file: file is not a database",
+        fingerprint=fingerprint,
+    )
+
+    def fail_sqlite_connect(*_args, **_kwargs):
+        raise AssertionError("known corrupt board should not reopen sqlite")
+
+    monkeypatch.setattr(kb.sqlite3, "connect", fail_sqlite_connect)
+
+    with pytest.raises(kb.KanbanDbCorruptError) as exc_info:
+        kb.connect(board=board)
+
+    assert exc_info.value.db_path == db_path.resolve()
+    assert "file is not a database" in exc_info.value.reason
+
+
+def test_explicit_db_path_bypasses_corrupt_board_preflight_for_diagnostics(kanban_home, monkeypatch):
+    board = "connect-quarantine-diagnostic"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"not sqlite")
+    fingerprint = kb._db_content_fingerprint(db_path)
+    kb.record_corrupt_board_incident(
+        board,
+        db_path,
+        "sqlite refused to open file: file is not a database",
+        fingerprint=fingerprint,
+    )
+
+    calls = {"guard": 0}
+
+    def fake_raise(path, reason, *, board=None, sidecar_bytes=None):
+        calls["guard"] += 1
+        raise kb.KanbanDbCorruptError(Path(path), None, "diagnostic open attempted")
+
+    monkeypatch.setattr(kb, "_raise_corrupt_existing_db", fake_raise)
+
+    with pytest.raises(kb.KanbanDbCorruptError) as exc_info:
+        kb.connect(db_path=db_path)
+
+    assert calls == {"guard": 1}
+    assert exc_info.value.reason == "diagnostic open attempted"
+
+
 def test_corrupt_board_quarantine_state_derives_legacy_retry_before_due(kanban_home):
     board = "legacy-quarantine-window"
     db_path = kb.kanban_db_path(board)

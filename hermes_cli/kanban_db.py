@@ -1680,6 +1680,29 @@ def corrupt_board_quarantine_state(
     return state
 
 
+def raise_if_corrupt_board_quarantined(board: Optional[str] = None) -> None:
+    """Fail normal readers before reopening an unchanged corrupt board DB."""
+    state = corrupt_board_quarantine_state(board)
+    incident = state.get("incident") if isinstance(state.get("incident"), dict) else {}
+    if not state.get("skipped"):
+        return
+    reason = str(state.get("reason") or incident.get("reason") or "kanban DB corruption incident")
+    if reason.startswith("post-init task-row read corruption"):
+        return
+    if "wrong # of entries in index" in reason:
+        return
+    backup_path = (
+        Path(str(incident["quarantine_path"]))
+        if incident.get("quarantine_path") else None
+    )
+    raise KanbanDbCorruptError(
+        Path(str(state.get("db_path") or incident.get("db_path") or kanban_db_path(board))),
+        backup_path,
+        reason,
+        incident=incident,
+    )
+
+
 def is_board_paused_for_corruption(board: Optional[str] = None) -> Optional[dict[str, Any]]:
     meta = read_board_metadata(board)
     incident = meta.get("corruption_incident")
@@ -2344,6 +2367,8 @@ def connect(
         path = kanban_db_path(board=board)
         resolved_board = board
     path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path is None:
+        raise_if_corrupt_board_quarantined(resolved_board)
     with _cross_process_init_lock(path):
         # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
         # and other invalid-header cases without opening a sqlite connection.
