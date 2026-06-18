@@ -735,7 +735,18 @@ def delegate_coding_task(
         return tool_error(f"could not import Codex app-server session: {exc}")
     try:
         from hermes_cli.ui_work_routing import codex_ui_work_extra_args
-    except Exception:
+    except Exception as exc:
+        if (
+            ui_route is not None
+            and ui_route.matched
+            and ui_route.enabled
+            and ui_route.backend == "codex"
+            and not ui_route.fallback_allowed
+        ):
+            return tool_error(
+                "ui_work routing matched but Codex route args could not be built: "
+                f"{exc}"
+            )
         codex_ui_work_extra_args = None
 
     try:
@@ -782,6 +793,18 @@ def delegate_coding_task(
         if codex_ui_work_extra_args is not None and ui_route is not None
         else []
     )
+    if (
+        ui_route is not None
+        and ui_route.matched
+        and ui_route.enabled
+        and ui_route.backend == "codex"
+        and not ui_route.fallback_allowed
+        and not ui_codex_args
+    ):
+        return tool_error(
+            "ui_work routing matched but Codex route args were empty; "
+            "refusing to fall back to the default coding worker."
+        )
 
     try:
         pass_cfg = load_coding_worker_pass_config()

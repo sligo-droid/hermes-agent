@@ -11,6 +11,11 @@ from typing import Any
 
 
 _WORD_RE = re.compile(r"[a-z0-9][a-z0-9_.+-]*")
+_OPENROUTER_PROVIDER_CONFIG_ARGS = {
+    "model_providers.openrouter.name": "openrouter",
+    "model_providers.openrouter.base_url": "https://openrouter.ai/api/v1",
+    "model_providers.openrouter.env_key": "OPENROUTER_API_KEY",
+}
 
 
 @dataclass(frozen=True)
@@ -173,8 +178,6 @@ def resolve_ui_work_route(
         )
     if not provider or not model:
         error = "ui_work routing matched but ui_work.provider and ui_work.model must both be configured"
-        if fallback_allowed:
-            error = ""
         return UIWorkRouteDecision(
             matched=True,
             enabled=True,
@@ -192,8 +195,6 @@ def resolve_ui_work_route(
         model_key = str(backend_cfg.get("model_config_key") or "model").strip()
         if not provider_key or not model_key:
             error = "ui_work routing matched but ui_work.codex provider/model config keys are incomplete"
-            if fallback_allowed:
-                error = ""
             return UIWorkRouteDecision(
                 matched=True,
                 enabled=True,
@@ -211,7 +212,7 @@ def resolve_ui_work_route(
         }
     else:
         route_backend_config = _as_dict(backend_cfg)
-        if not route_backend_config and not fallback_allowed:
+        if not route_backend_config:
             return UIWorkRouteDecision(
                 matched=True,
                 enabled=True,
@@ -250,6 +251,9 @@ def codex_ui_work_extra_args(decision: UIWorkRouteDecision) -> list[str]:
         (model_key, decision.model),
     ):
         if key and value:
+            args.extend(["-c", f"{key}={json.dumps(value)}"])
+    if decision.provider.strip().lower() == "openrouter":
+        for key, value in _OPENROUTER_PROVIDER_CONFIG_ARGS.items():
             args.extend(["-c", f"{key}={json.dumps(value)}"])
     args.extend(str(item) for item in cfg.get("extra_args") or [])
     return args

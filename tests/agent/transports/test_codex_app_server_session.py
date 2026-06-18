@@ -376,6 +376,78 @@ class TestRunTurn:
         assert r.should_retire is True
         assert r.final_text == ""
 
+    def test_openrouter_missing_provider_startup_failure_adds_operator_guidance(self):
+        client = FakeClient()
+        client.set_stderr_tail([
+            "Model provider `openrouter` not found",
+            "OPENROUTER_API_KEY=sk-or-v1-secretmustnotleak",
+        ])
+        from agent.transports.codex_app_server import CodexAppServerError
+
+        def boom(method, params):
+            if method == "thread/start":
+                raise CodexAppServerError(code=-32603, message="Internal error")
+            return {}
+
+        client._request_handler = boom
+        s = make_session(client)
+        r = s.run_turn("hi", turn_timeout=2.0)
+        assert r.error is not None
+        assert "OpenRouter model provider" in r.error
+        assert "[model_providers.openrouter]" in r.error
+        assert "OPENROUTER_API_KEY" in r.error
+        assert "secretmustnotleak" not in r.error
+        assert r.should_retire is True
+
+    def test_openrouter_auth_failure_prefers_env_key_guidance_over_codex_login(self):
+        from agent.transports.codex_app_server import CodexAppServerError
+
+        client = FakeClient()
+        client.set_stderr_tail([
+            "OpenRouter 401 Unauthorized: invalid API key",
+            "Authorization: Bearer sk-or-v1-secretmustnotleak",
+        ])
+
+        def boom(method, params):
+            if method == "turn/start":
+                raise CodexAppServerError(
+                    code=-32603,
+                    message="OpenRouter authentication failed",
+                )
+            return {"thread": {"id": "t"}, "activePermissionProfile": {"id": "x"}}
+
+        client._request_handler = boom
+        s = make_session(client)
+        r = s.run_turn("hi", turn_timeout=1.0)
+        assert r.error is not None
+        assert "OpenRouter authentication failed for Codex" in r.error
+        assert "OPENROUTER_API_KEY" in r.error
+        assert "codex login" not in r.error
+        assert "secretmustnotleak" not in r.error
+        assert r.auth_failed is True
+        assert r.should_retire is True
+
+    def test_openrouter_billing_failure_from_turn_completed_is_clear(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={
+                "id": "tu1",
+                "status": "failed",
+                "error": {
+                    "message": "OpenRouter 402 Payment Required: insufficient credits"
+                },
+            },
+        )
+        s = make_session(client)
+        r = s.run_turn("x", turn_timeout=1.0)
+        assert r.error is not None
+        assert "payment, credit, quota, or billing" in r.error
+        assert "account balance" in r.error
+        assert r.auth_failed is False
+        assert r.should_retire is True
+
     def test_interrupt_during_turn_issues_turn_interrupt(self):
         client = FakeClient()
         # Don't queue turn/completed — the loop has to interrupt out
