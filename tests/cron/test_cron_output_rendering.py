@@ -1,5 +1,5 @@
-from cron.jobs import save_job_output
-from cron.scheduler import _render_job_output
+from cron.jobs import save_job_output, update_job_output
+from cron.scheduler import _ingest_self_improvement_proposal_output, _render_job_output, _render_job_status_stub
 
 
 def _large_prompt(sentinel: str) -> str:
@@ -120,7 +120,6 @@ def test_failure_output_artifact_adds_codex_auth_incident_summary():
 
 
 def test_saved_temp_output_artifact_keeps_final_first_rendering(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     output = _render_job_output(
         {
             "id": "manual-inspection-job",
@@ -148,3 +147,76 @@ def test_saved_temp_output_artifact_keeps_final_first_rendering(tmp_path, monkey
         saved, "## Response"
     )
     assert saved.rfind("MANUAL_INSPECTION_FINAL_RESPONSE") > saved.find("## Response")
+
+
+def test_reserved_output_artifact_is_non_empty_then_keeps_success_final_first(tmp_path, monkeypatch):
+    job = {"id": "reserved-success-job", "name": "Reserved success", "schedule_display": "manual"}
+    reserved = _render_job_status_stub(job, status="running", run_time="2026-06-13 12:20:00")
+
+    output_path = save_job_output(job["id"], reserved)
+    assert output_path.read_text(encoding="utf-8").strip()
+    assert "artifact_schema: cron-output-status-v1" in output_path.read_text(encoding="utf-8")
+    assert 'status: "running"' in output_path.read_text(encoding="utf-8")
+
+    final = _render_job_output(
+        job,
+        _large_prompt("RESERVED_SUCCESS_PROMPT_SENTINEL"),
+        status="success",
+        final_response="RESERVED_SUCCESS_FINAL_RESPONSE",
+        run_time="2026-06-13 12:21:00",
+    )
+    update_job_output(output_path, final)
+    saved = output_path.read_text(encoding="utf-8")
+
+    assert "artifact_schema: cron-output-v2" in saved
+    assert "artifact_schema: cron-output-status-v1" not in saved
+    assert _line_number(saved, "RESERVED_SUCCESS_FINAL_RESPONSE") <= 50
+    assert _line_number(saved, "RESERVED_SUCCESS_FINAL_RESPONSE") < _line_number(
+        saved, "## Prompt/context transcript"
+    )
+
+
+def test_status_stub_records_timeout_error_class_and_is_non_empty():
+    output = _render_job_status_stub(
+        {"id": "timeout-job", "name": "Timeout job", "schedule_display": "manual"},
+        status="timed_out",
+        run_time="2026-06-13 12:22:00",
+        session_id="cron_timeout-job_20260613_122200",
+        error_class="TimeoutError",
+        message="Cron job timed out during inactivity closeout.",
+    )
+
+    assert output.strip()
+    assert "artifact_schema: cron-output-status-v1" in output
+    assert 'status: "timed_out"' in output
+    assert 'session_id: "cron_timeout-job_20260613_122200"' in output
+    assert 'error_class: "TimeoutError"' in output
+
+
+def test_self_improvement_ingestion_skips_silent_and_status_stub(monkeypatch, tmp_path):
+    job = {
+        "id": "proposal-silent-job",
+        "name": "Proposal silent",
+        "self_improvement_proposal": {"project": "pid", "prong": "p"},
+    }
+    monkeypatch.setattr("cron.scheduler._self_improvement_proposal_config", lambda _job: ("pid", "p"))
+
+    def fail_ingest(*_args, **_kwargs):
+        raise AssertionError("silent/status output should not be ingested")
+
+    import self_improvement.proposal_storage as proposal_storage
+
+    monkeypatch.setattr(proposal_storage, "ingest_proposal_output", fail_ingest)
+
+    assert _ingest_self_improvement_proposal_output(
+        job,
+        "# Cron Job\n\nartifact_schema: cron-output-status-v1\n",
+        tmp_path / "out.md",
+        "",
+    ) is None
+    assert _ingest_self_improvement_proposal_output(
+        job,
+        "# Cron Job\n\nintentional silence",
+        tmp_path / "out.md",
+        "[SILENT]",
+    ) is None

@@ -255,6 +255,7 @@ from cron.jobs import (
     mark_manual_run_finished,
     mark_manual_run_started,
     save_job_output,
+    update_job_output,
 )
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -1307,6 +1308,14 @@ def _ingest_self_improvement_proposal_output(
     proposal = _self_improvement_proposal_config(job)
     if proposal is None:
         return None
+    response_text = str(final_response or "").strip()
+    output_text = str(output or "").strip()
+    if SILENT_MARKER in response_text.upper() or "artifact_schema: cron-output-status-v1" in output_text:
+        logger.info(
+            "Job '%s': skipping self-improvement proposal ingestion for silent/status output",
+            job.get("id"),
+        )
+        return None
 
     from self_improvement import proposal_storage
 
@@ -1325,7 +1334,7 @@ def _ingest_self_improvement_proposal_output(
             break
 
     result = proposal_storage.ingest_proposal_output(
-        final_response if final_response.strip() else output,
+        response_text if response_text else output,
         source=source,
     )
     logger.info(
@@ -1555,6 +1564,46 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 def _cron_output_metadata_value(value: object) -> str:
     text = str(value if value is not None else "").replace("\r\n", "\n").replace("\r", "\n")
     return json.dumps(text, ensure_ascii=False)
+
+
+def _render_job_status_stub(
+    job: dict,
+    *,
+    status: str,
+    run_time: str | None = None,
+    session_id: str | None = None,
+    error_class: str | None = None,
+    message: str = "",
+) -> str:
+    """Render a concise non-empty artifact for reserved/non-final cron states."""
+    job_id = job["id"]
+    job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    schedule = job.get("schedule_display", "N/A")
+    run_time = run_time or _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+    metadata_lines = [
+        "---",
+        "artifact_schema: cron-output-status-v1",
+        f"status: {_cron_output_metadata_value(status)}",
+        f"job_id: {_cron_output_metadata_value(job_id)}",
+        f"job_name: {_cron_output_metadata_value(job_name)}",
+        f"run_time: {_cron_output_metadata_value(run_time)}",
+        f"schedule: {_cron_output_metadata_value(schedule)}",
+    ]
+    if session_id:
+        metadata_lines.append(f"session_id: {_cron_output_metadata_value(session_id)}")
+    if error_class:
+        metadata_lines.append(f"error_class: {_cron_output_metadata_value(error_class)}")
+    metadata_lines.append("---")
+    body = message.strip() or f"Cron output artifact reserved with status `{status}`."
+    metadata = "\n".join(metadata_lines)
+    return (
+        f"# Cron Job: {job_name}\n\n"
+        f"{metadata}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {run_time}\n"
+        f"**Status:** {status}\n\n"
+        f"{body}\n"
+    )
 
 
 def _render_job_output(
@@ -2227,10 +2276,11 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         error_msg = redact_auth_incident_text(f"{type(e).__name__}: {str(e)}")
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         
+        status = "timed_out" if isinstance(e, TimeoutError) else "failed"
         output = _render_job_output(
             job,
             prompt,
-            status="failed",
+            status=status,
             error_text=error_msg,
         )
         return False, output, "", error_msg
@@ -2356,12 +2406,33 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             """Run one due job end-to-end: execute, save, deliver, mark."""
             manual_run = job.get("manual_run") if isinstance(job.get("manual_run"), dict) else None
             manual_run_id = manual_run.get("run_id") if manual_run and manual_run.get("state") == "queued" else None
+            run_time = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+            running_stub = _render_job_status_stub(
+                job,
+                status="running",
+                run_time=run_time,
+                message="Cron job is running; this artifact will be atomically replaced at closeout.",
+            )
+            output_file = save_job_output(job["id"], running_stub)
             if manual_run_id:
                 mark_manual_run_started(job["id"], manual_run_id, os.getpid())
             try:
                 success, output, final_response, error = run_job(job)
 
-                output_file = save_job_output(job["id"], output)
+                if not str(output or "").strip():
+                    status = "silent" if success and SILENT_MARKER in str(final_response or "").upper() else "empty"
+                    output = _render_job_status_stub(
+                        job,
+                        status=status,
+                        run_time=run_time,
+                        message=(
+                            "Cron job intentionally produced no deliverable output."
+                            if status == "silent"
+                            else "Cron job returned an empty output artifact."
+                        ),
+                    )
+                if output_file:
+                    update_job_output(output_file, output)
                 if manual_run_id:
                     mark_manual_run_finished(
                         job["id"],
@@ -2420,6 +2491,18 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
             except Exception as e:
                 logger.error("Error processing job %s: %s", job['id'], e)
+                failed_stub = _render_job_status_stub(
+                    job,
+                    status="failed",
+                    run_time=run_time,
+                    error_class=type(e).__name__,
+                    message=f"Cron job failed before final output closeout: {e}",
+                )
+                try:
+                    if output_file:
+                        update_job_output(output_file, failed_stub)
+                except Exception as write_exc:
+                    logger.error("Error writing failure output for job %s: %s", job["id"], write_exc)
                 if manual_run_id:
                     mark_manual_run_finished(
                         job["id"],

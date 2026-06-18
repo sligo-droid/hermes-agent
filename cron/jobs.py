@@ -1444,16 +1444,12 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     return due
 
 
-def save_job_output(job_id: str, output: str):
-    """Save job output to file."""
-    ensure_dirs()
-    job_output_dir = _job_output_dir(job_id)
+def _write_job_output_file(output_file: Path, output: str) -> Path:
+    """Atomically replace a reserved cron output artifact."""
+    job_output_dir = output_file.parent
     job_output_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(job_output_dir)
-    
-    timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_file = job_output_dir / f"{timestamp}.md"
-    
+
     fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1468,8 +1464,31 @@ def save_job_output(job_id: str, output: str):
         except OSError:
             pass
         raise
-    
     return output_file
+
+
+def reserve_job_output(job_id: str, output: str = "") -> Path:
+    """Reserve and optionally seed a cron output artifact path for one run."""
+    ensure_dirs()
+    job_output_dir = _job_output_dir(job_id)
+    job_output_dir.mkdir(parents=True, exist_ok=True)
+    _secure_dir(job_output_dir)
+
+    timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
+    output_file = job_output_dir / f"{timestamp}.md"
+
+    return _write_job_output_file(output_file, output)
+
+
+def update_job_output(output_file: Union[str, Path], output: str) -> Path:
+    """Atomically write final cron output to a reserved artifact path."""
+    output_path = Path(output_file)
+    return _write_job_output_file(output_path, output)
+
+
+def save_job_output(job_id: str, output: str):
+    """Save job output to file."""
+    return reserve_job_output(job_id, output)
 
 
 # =============================================================================

@@ -226,6 +226,8 @@ def test_run_job_no_agent_empty_output_is_silent(hermes_env):
     assert success is True
     assert error is None
     assert final_response == SILENT_MARKER
+    assert doc.strip()
+    assert "**Status:** silent (empty output)" in doc
 
 
 def test_run_job_no_agent_wake_gate_is_silent(hermes_env):
@@ -242,6 +244,8 @@ def test_run_job_no_agent_wake_gate_is_silent(hermes_env):
     success, doc, final_response, error = run_job(job)
     assert success is True
     assert final_response == SILENT_MARKER
+    assert doc.strip()
+    assert "**Status:** silent (wakeAgent=false)" in doc
 
 
 def test_run_job_no_agent_script_failure_delivers_error(hermes_env):
