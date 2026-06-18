@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -810,6 +811,126 @@ def test_discord_kanban_typing_watcher_continues_status_sync_after_typing_collec
             "reaction_state": "active",
         }
     ]
+
+
+def test_discord_kanban_typing_watcher_continues_typing_after_status_collection_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    monkeypatch.setattr(
+        dwb,
+        "running_discord_thread_typing_targets",
+        lambda: [
+            {
+                "thread_id": "99032",
+                "chat_id": "parent-99032",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        dwb,
+        "thread_status_targets",
+        lambda: (_ for _ in ()).throw(RuntimeError("bad status board")),
+    )
+
+    adapter = TypingAdapter()
+    runner = _make_discord_runner(adapter)
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert adapter.typing == [
+        {
+            "chat_id": "parent-99032",
+            "metadata": {"thread_id": "99032"},
+        }
+    ]
+
+
+def test_discord_kanban_typing_watcher_rate_limits_repeated_collection_errors(monkeypatch, caplog):
+    from hermes_cli import discord_worker_boards as dwb
+
+    monkeypatch.setattr(
+        dwb,
+        "running_discord_thread_typing_targets",
+        lambda: (_ for _ in ()).throw(RuntimeError("same bad board")),
+    )
+    monkeypatch.setattr(dwb, "thread_status_targets", lambda: [])
+    monkeypatch.setattr(time, "monotonic", Mock(return_value=100.0))
+
+    adapter = TypingAdapter()
+    runner = _make_discord_runner(adapter)
+    real_sleep = asyncio.sleep
+    sleeps = 0
+
+    async def patched_sleep(delay):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps >= 3:
+            runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", patched_sleep)
+
+    with caplog.at_level(logging.ERROR, logger="gateway.run"):
+        asyncio.run(runner._discord_kanban_typing_watcher(interval=1))
+
+    exception_records = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR and "target collection failed" in record.getMessage()
+    ]
+    assert len(exception_records) == 1
+
+
+def test_discord_kanban_typing_watcher_logs_again_after_collection_recovery(monkeypatch, caplog):
+    from hermes_cli import discord_worker_boards as dwb
+
+    calls = 0
+
+    def typing_targets():
+        nonlocal calls
+        calls += 1
+        if calls in {1, 3}:
+            raise RuntimeError("flaky board")
+        return [
+            {
+                "thread_id": "99033",
+                "chat_id": "parent-99033",
+            }
+        ]
+
+    monkeypatch.setattr(dwb, "running_discord_thread_typing_targets", typing_targets)
+    monkeypatch.setattr(dwb, "thread_status_targets", lambda: [])
+    monkeypatch.setattr(time, "monotonic", Mock(return_value=100.0))
+
+    real_sleep = asyncio.sleep
+    sleeps = 0
+
+    async def patched_sleep(delay):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps >= 3:
+            runner._running = False
+        await real_sleep(0)
+
+    adapter = TypingAdapter()
+    runner = _make_discord_runner(adapter)
+    monkeypatch.setattr(asyncio, "sleep", patched_sleep)
+
+    with caplog.at_level(logging.ERROR, logger="gateway.run"):
+        asyncio.run(runner._discord_kanban_typing_watcher(interval=1))
+
+    exception_records = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR and "target collection failed" in record.getMessage()
+    ]
+    assert len(exception_records) == 2
+    assert adapter.typing
+    assert adapter.typing[-1] == {
+        "chat_id": "parent-99033",
+        "metadata": {"thread_id": "99033"},
+    }
 
 
 def test_discord_kanban_typing_watcher_syncs_feature_summary(tmp_path, monkeypatch):
