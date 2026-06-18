@@ -240,6 +240,36 @@ def test_discord_worker_dirty_marker_polls_below_old_one_second_ceiling(tmp_path
     asyncio.run(run())
 
 
+def test_kanban_notifier_skips_board_missing_notify_subs_without_log_storm(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(kb.time, "time", lambda: 8000)
+    board = "notifier-missing-subs"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.unlink(missing_ok=True)
+    conn = kb._sqlite_connect(db_path)
+    try:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY)")
+        conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT)")
+        conn.commit()
+    finally:
+        conn.close()
+    kb._write_board_metadata_raw(board, {"slug": board, "name": "Missing Subs"})
+    kb._INITIALIZED_PATHS.add(str(db_path.resolve()))
+
+    runner = _make_runner(RecordingAdapter())
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    messages = [record.getMessage() for record in caplog.records]
+    schema_events = [msg for msg in messages if "schema readiness failed for notifier" in msg]
+    assert len(schema_events) == 1
+    assert "missing required table(s): kanban_notify_subs" in schema_events[0]
+    assert kb.corrupt_board_quarantine_state(board, now=8001)["skipped"] is True
+
+
 def test_discord_worker_spawned_task_records_worker_thread_state(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://hermes.example.test")

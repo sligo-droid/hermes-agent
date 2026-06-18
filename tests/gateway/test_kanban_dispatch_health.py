@@ -73,3 +73,94 @@ def test_corrupt_board_quarantine_state_skips_health_open(tmp_path, monkeypatch)
     assert state["skipped"] is True
     assert state["open_allowed"] is False
     assert state["next_retry"] == 5000 + kb.CORRUPT_BOARD_RETRY_SECONDS
+
+
+def test_board_schema_ready_records_missing_tasks_once_per_window(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(kb.time, "time", lambda: 7000)
+    board = "gateway-schema-missing-tasks"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.unlink(missing_ok=True)
+    conn = kb._sqlite_connect(db_path)
+    try:
+        conn.execute("CREATE TABLE kanban_notify_subs (task_id TEXT)")
+        conn.commit()
+        ready, incident = kb.board_schema_ready(
+            conn,
+            board=board,
+            operation="dispatcher",
+            required_tables=("tasks",),
+        )
+    finally:
+        conn.close()
+
+    assert ready is False
+    assert incident is not None
+    assert "missing required table(s): tasks" in incident["reason"]
+    state = kb.corrupt_board_quarantine_state(board, now=7001)
+    assert state["skipped"] is True
+    assert state["open_allowed"] is False
+
+
+def test_board_schema_ready_keeps_healthy_board_available(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    board = "gateway-schema-ready"
+    conn = kb.connect(board=board)
+    try:
+        ready, incident = kb.board_schema_ready(
+            conn,
+            board=board,
+            operation="dispatcher",
+            required_tables=("tasks",),
+        )
+    finally:
+        conn.close()
+
+    assert ready is True
+    assert incident is None
+
+
+def test_discord_worker_dispatch_skips_board_missing_tasks(tmp_path, monkeypatch, caplog):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(kb.time, "time", lambda: 9000)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import discord_worker_dispatch as dwd
+
+    board = "discord-missing-tasks"
+    db_path = kb.kanban_db_path(board)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.unlink(missing_ok=True)
+    conn = kb._sqlite_connect(db_path)
+    try:
+        conn.execute("CREATE TABLE kanban_notify_subs (task_id TEXT)")
+        conn.commit()
+    finally:
+        conn.close()
+    kb._write_board_metadata_raw(board, {"slug": board, "name": "Missing Tasks"})
+    kb._INITIALIZED_PATHS.add(str(db_path.resolve()))
+    monkeypatch.setattr(dwb, "is_discord_worker_board", lambda slug: slug == board)
+    monkeypatch.setattr(dwb, "reconcile_board", lambda slug: None)
+    monkeypatch.setattr(dwb, "ensure_code_island_for_board", lambda slug: True)
+    monkeypatch.setattr(dwb, "is_executable_worker_board", lambda slug: True)
+    monkeypatch.setattr(dwb, "is_paused_or_cancelled", lambda slug: False)
+
+    with caplog.at_level("ERROR"):
+        result = dwd.dispatch_discord_worker_boards([board], spawn_fn=lambda *args: None)
+        result += dwd.dispatch_discord_worker_boards([board], spawn_fn=lambda *args: None)
+
+    assert result == [(board, None), (board, None)]
+    messages = [record.getMessage() for record in caplog.records]
+    schema_events = [msg for msg in messages if "schema readiness failed for discord_dispatcher" in msg]
+    assert len(schema_events) == 1
+    assert "missing required table(s): tasks" in schema_events[0]
+    assert kb.corrupt_board_quarantine_state(board, now=9001)["skipped"] is True

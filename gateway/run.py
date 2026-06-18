@@ -5747,6 +5747,17 @@ class GatewayRunner:
                             # a legacy DB. `_add_column_if_missing` now
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
+                            ready, incident = _kb.board_schema_ready(
+                                conn,
+                                board=slug,
+                                operation="notifier",
+                                required_tables=("kanban_notify_subs", "task_events", "tasks"),
+                            )
+                            if not ready:
+                                _log_corrupt_board_incident(slug, incident, RuntimeError(
+                                    (incident or {}).get("reason") or "kanban board schema not ready"
+                                ))
+                                continue
                             subs = _kb.list_notify_subs(conn)
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
@@ -6525,6 +6536,17 @@ class GatewayRunner:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
+                ready, incident = _kb.board_schema_ready(
+                    conn,
+                    board=slug,
+                    operation="dispatcher",
+                    required_tables=("tasks",),
+                )
+                if not ready:
+                    _log_corrupt_board_incident(slug, incident, RuntimeError(
+                        (incident or {}).get("reason") or "kanban board schema not ready"
+                    ))
+                    return None
                 # Legacy Discord default-board intake rows were created as
                 # blocked+unassigned; if an operator unblocks one, route only
                 # that intake tenant instead of generic unassigned work.
