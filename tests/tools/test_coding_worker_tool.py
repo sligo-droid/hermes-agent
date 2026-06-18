@@ -198,8 +198,49 @@ def test_ui_work_uses_codex_model_overlay(monkeypatch, tmp_path):
         "-c",
         'model="z-ai/glm-5.2"',
         "-c",
+        'model_providers.openrouter.name="openrouter"',
+        "-c",
+        'model_providers.openrouter.base_url="https://openrouter.ai/api/v1"',
+        "-c",
+        'model_providers.openrouter.env_key="OPENROUTER_API_KEY"',
+        "-c",
         'model_reasoning_effort="medium"',
     ]
+
+
+def test_ui_work_matched_route_fails_closed_when_codex_overlay_unavailable(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["backend"] = "codex"
+    cfg["ui_work"]["fallback"]["allow_default_worker"] = False
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+    monkeypatch.setattr(cwt, "codex_ui_work_extra_args", None, raising=False)
+
+    import builtins
+
+    real_import = builtins.__import__
+
+    def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "hermes_cli.ui_work_routing" and "codex_ui_work_extra_args" in fromlist:
+            raise ImportError("overlay helper unavailable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Implement frontend dashboard polish",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["error"]
+    assert "Codex route args could not be built" in result["error"]
+    assert FakeSession.instances == []
 
 
 def test_ui_work_missing_model_fails_before_worker(monkeypatch, tmp_path):

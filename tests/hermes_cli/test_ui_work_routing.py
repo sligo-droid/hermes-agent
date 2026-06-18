@@ -27,6 +27,12 @@ def test_matches_frontend_dashboard_work():
         'model_provider="openrouter"',
         "-c",
         'model="z-ai/glm-5.2"',
+        "-c",
+        'model_providers.openrouter.name="openrouter"',
+        "-c",
+        'model_providers.openrouter.base_url="https://openrouter.ai/api/v1"',
+        "-c",
+        'model_providers.openrouter.env_key="OPENROUTER_API_KEY"',
     ]
 
 
@@ -95,7 +101,7 @@ def test_missing_model_errors_when_fallback_disabled():
     assert "provider and ui_work.model" in decision.error
 
 
-def test_missing_model_can_fallback_when_allowed():
+def test_missing_model_fails_closed_even_when_fallback_allowed():
     cfg = _cfg()
     cfg["ui_work"]["model"] = ""
     cfg["ui_work"]["fallback"]["allow_default_worker"] = True
@@ -104,5 +110,5 @@ def test_missing_model_can_fallback_when_allowed():
 
     assert decision.matched is True
     assert decision.fallback_allowed is True
-    assert decision.error == ""
+    assert "ui_work.provider and ui_work.model" in decision.error
     assert decision.backend_config == {}

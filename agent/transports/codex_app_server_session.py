@@ -155,6 +155,39 @@ _OAUTH_REFRESH_FAILURE_HINTS = (
 )
 
 
+_CODEX_OPENROUTER_AUTH_HINTS = (
+    "openrouter_api_key",
+    "openrouter api key",
+    "missing api key",
+    "api key is required",
+    "api key required",
+    "invalid api key",
+    "invalid_api_key",
+    "incorrect api key",
+    "authentication failed",
+    "auth failed",
+    "authorization failed",
+    "401",
+    "403",
+    "unauthorized",
+    "forbidden",
+)
+_CODEX_OPENROUTER_BILLING_HINTS = (
+    "402",
+    "payment required",
+    "insufficient credit",
+    "insufficient credits",
+    "insufficient funds",
+    "no usable credits",
+    "balance_depleted",
+    "billing",
+    "credit balance",
+    "can only afford",
+    "top up",
+    "quota exceeded",
+)
+
+
 def _classify_oauth_failure(*parts: str) -> Optional[str]:
     """Return a user-friendly re-auth hint if any of the provided strings
     look like a codex OAuth/token-refresh failure; otherwise None.
@@ -175,6 +208,38 @@ def _classify_oauth_failure(*parts: str) -> Optional[str]:
                 "then retry. (Fall back to default runtime with "
                 "`/codex-runtime auto` if the issue persists.)"
             )
+    return None
+
+
+def _classify_codex_provider_failure(*parts: str) -> Optional[str]:
+    """Return secret-safe operator guidance for Codex provider failures."""
+    haystack = " ".join(p for p in parts if p).lower()
+    if not haystack:
+        return None
+    mentions_openrouter = "openrouter" in haystack or "openrouter_api_key" in haystack
+    if (
+        "model provider" in haystack
+        and "openrouter" in haystack
+        and any(needle in haystack for needle in ("not found", "not configured", "missing"))
+    ):
+        return (
+            "Operator guidance: Codex does not have the OpenRouter model provider "
+            "configured. The specialist route must pass model_provider=\"openrouter\", "
+            "model=\"...\", and a [model_providers.openrouter] table with "
+            "base_url=https://openrouter.ai/api/v1 and env_key=OPENROUTER_API_KEY."
+        )
+    if mentions_openrouter and any(needle in haystack for needle in _CODEX_OPENROUTER_BILLING_HINTS):
+        return (
+            "Operator guidance: OpenRouter rejected the Codex request for payment, "
+            "credit, quota, or billing reasons. Check the OpenRouter account balance, "
+            "billing status, and model availability, then retry the specialist worker."
+        )
+    if mentions_openrouter and any(needle in haystack for needle in _CODEX_OPENROUTER_AUTH_HINTS):
+        return (
+            "Operator guidance: OpenRouter authentication failed for Codex. Ensure "
+            "OPENROUTER_API_KEY is set in the worker environment and accepted by "
+            "OpenRouter. Secret values are intentionally omitted."
+        )
     return None
 
 
@@ -364,18 +429,22 @@ class CodexAppServerSession:
         """
         exc_str = str(exc) if exc != "" and exc is not None else ""
         base = f"{prefix}: {exc_str}" if exc_str else prefix
+        base_guidance = _classify_codex_provider_failure(base)
         if self._client is None:
-            return base
+            return f"{base}\n{base_guidance}" if base_guidance else base
         try:
             tail = self._client.stderr_tail(tail_lines)
         except Exception:  # pragma: no cover - diagnostic best-effort
-            return base
+            return f"{base}\n{base_guidance}" if base_guidance else base
         if not tail:
-            return base
+            return f"{base}\n{base_guidance}" if base_guidance else base
         joined = "\n".join(line.rstrip() for line in tail if line)
         if not joined.strip():
-            return base
+            return f"{base}\n{base_guidance}" if base_guidance else base
         redacted = redact_sensitive_text(joined, force=True)
+        guidance = _classify_codex_provider_failure(base, redacted) or base_guidance
+        if guidance:
+            return f"{base}\n{guidance}\ncodex stderr (last {len(tail)} lines):\n{redacted}"
         return f"{base}\ncodex stderr (last {len(tail)} lines):\n{redacted}"
 
     # ---------- per-turn ----------
@@ -437,10 +506,12 @@ class CodexAppServerSession:
             # Classify auth/refresh failures so the user gets a clear
             # `codex login` pointer instead of a raw RPC error string.
             stderr_blob = "\n".join(self._client.stderr_tail(40))
-            hint = _classify_oauth_failure(exc.message, stderr_blob)
+            hint = _classify_codex_provider_failure(exc.message, stderr_blob)
+            if hint is None:
+                hint = _classify_oauth_failure(exc.message, stderr_blob)
             if hint is not None:
                 result.error = hint
-                result.auth_failed = True
+                result.auth_failed = "auth" in hint.lower() or "login" in hint.lower()
                 # Subprocess is fine on a JSON-RPC level here, but the
                 # token store is broken — retire so the next turn does a
                 # clean handshake (and the user has a chance to re-auth
@@ -454,11 +525,13 @@ class CodexAppServerSession:
         except TimeoutError as exc:
             # turn/start hanging is a strong signal the subprocess is wedged.
             stderr_blob = "\n".join(self._client.stderr_tail(40))
-            hint = _classify_oauth_failure(stderr_blob)
+            hint = _classify_codex_provider_failure(stderr_blob)
+            if hint is None:
+                hint = _classify_oauth_failure(stderr_blob)
             result.error = hint or self._format_error_with_stderr(
                 "turn/start timed out", exc
             )
-            if hint is not None:
+            if hint is not None and ("auth" in hint.lower() or "login" in hint.lower()):
                 result.auth_failed = True
             result.should_retire = True
             return result
@@ -614,10 +687,14 @@ class CodexAppServerSession:
                         stderr_blob = "\n".join(
                             self._client.stderr_tail(40)
                         )
-                        hint = _classify_oauth_failure(err_msg, stderr_blob)
+                        hint = _classify_codex_provider_failure(err_msg, stderr_blob)
+                        if hint is None:
+                            hint = _classify_oauth_failure(err_msg, stderr_blob)
                         if hint is not None:
                             result.error = hint
-                            result.auth_failed = True
+                            result.auth_failed = (
+                                "auth" in hint.lower() or "login" in hint.lower()
+                            )
                             result.should_retire = True
                         else:
                             result.error = self._format_error_with_stderr(
