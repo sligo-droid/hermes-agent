@@ -157,6 +157,54 @@ def _dedupe_append(items: list[str], value: str, *, limit: int) -> None:
         items.append(value)
 
 
+def _ellipsize_middle(value: str, *, max_chars: int) -> str:
+    value = str(value).strip()
+    if len(value) <= max_chars:
+        return value
+    if max_chars <= 6:
+        return value[:max_chars]
+    keep_left = max_chars // 2 - 2
+    keep_right = max_chars - keep_left - 3
+    return f"{value[:keep_left]}...{value[-keep_right:]}"
+
+
+def _bounded_section(
+    title: str,
+    items: list[str],
+    *,
+    max_chars: int,
+    item_max_chars: int,
+    omitted_note: str,
+) -> list[str]:
+    """Return a section that fits its budget and keeps an omitted-count note."""
+    if not items or max_chars <= len(title) + 8:
+        return []
+
+    lines = [title]
+    used = len(title)
+    omitted = 0
+    for index, item in enumerate(items):
+        rendered = f"- {_ellipsize_middle(item, max_chars=item_max_chars)}"
+        remaining_count = len(items) - index - 1
+        note = omitted_note.format(count=remaining_count) if remaining_count else ""
+        reserve = len(note) + 1 if note else 0
+        if used + 1 + len(rendered) + reserve > max_chars:
+            omitted = len(items) - index
+            break
+        lines.append(rendered)
+        used += 1 + len(rendered)
+
+    if omitted:
+        note = omitted_note.format(count=omitted)
+        if used + 1 + len(note) <= max_chars:
+            lines.append(note)
+        elif len(lines) > 1:
+            lines[-1] = note
+        else:
+            lines.append(note[: max_chars - used - 1])
+    return lines
+
+
 def _extract_tool_call_name_and_args(tool_call: Any) -> tuple[str, str]:
     """Return a best-effort ``(name, arguments)`` pair for dict/object tool calls."""
     if isinstance(tool_call, dict):
@@ -243,43 +291,83 @@ def _summarize_skill_view_result(tool_args: str, tool_content: str) -> str | Non
     linked_files = _flatten_skill_linked_files(result.get("linked_files"))
     path = str(result.get("path") or "")
     skill_dir = str(result.get("skill_dir") or "")
+    usage_hint = result.get("usage_hint")
+    if usage_hint:
+        linked_fetch = f"Fetch linked content: {usage_hint}"
+    else:
+        linked_fetch = (
+            "Fetch linked content: call skill_view(name, file_path), for "
+            f"example skill_view(\"{name}\", \"references/example.md\")."
+        )
 
-    lines = [
+    required_lines = [
         "[skill_view result compacted to prevent context-compression churn]",
         f"Skill: {name}",
     ]
     if version:
-        lines.append(f"Version: {version}")
+        required_lines.append(f"Version: {version}")
     if file_path:
-        lines.append(f"Viewed file: {file_path}")
+        required_lines.append(f"Viewed file: {file_path}")
     if path:
-        lines.append(f"Path: {path}")
+        required_lines.append(f"Path: {_ellipsize_middle(path, max_chars=220)}")
     if skill_dir:
-        lines.append(f"Skill directory: {skill_dir}")
-    if headings:
-        lines.append("Top-level procedure headings:")
-        lines.extend(f"- {heading}" for heading in headings)
-    else:
-        preview = re.sub(r"\s+", " ", content).strip()[:500]
-        if preview:
-            lines.append(f"Content preview: {preview}")
-    if linked_files:
-        lines.append("Linked files:")
-        lines.extend(f"- {path}" for path in linked_files)
-    usage_hint = result.get("usage_hint")
-    if usage_hint:
-        lines.append(f"Fetch linked content: {usage_hint}")
-    else:
-        lines.append(
-            "Fetch linked content: call skill_view(name, file_path), for "
-            f"example skill_view(\"{name}\", \"references/example.md\")."
-        )
-    if not file_path:
-        lines.append(f"Fetch full skill content again: skill_view(\"{name}\").")
+        required_lines.append(f"Skill directory: {_ellipsize_middle(skill_dir, max_chars=220)}")
 
+    recovery_lines = [linked_fetch]
+    if not file_path:
+        recovery_lines.append(f"Fetch full skill content again: skill_view(\"{name}\").")
+
+    required_text = "\n".join(required_lines + recovery_lines)
+    remaining = _SKILL_VIEW_SUMMARY_MAX_CHARS - len(required_text) - 4
+
+    optional_lines: list[str] = []
+    if remaining > 120:
+        headings_budget = min(max(remaining // 2, 250), 900)
+        optional_lines.extend(
+            _bounded_section(
+                "Top-level procedure headings:",
+                headings,
+                max_chars=headings_budget,
+                item_max_chars=180,
+                omitted_note="- ... {count} additional headings omitted; fetch full skill source for all headings.",
+            )
+        )
+        remaining -= len("\n".join(optional_lines)) + (1 if optional_lines else 0)
+
+    if remaining > 120 and linked_files:
+        optional_lines.extend(
+            _bounded_section(
+                "Linked files:",
+                linked_files,
+                max_chars=max(remaining, 120),
+                item_max_chars=220,
+                omitted_note="- ... {count} additional linked files omitted; fetch full skill source or linked_files metadata.",
+            )
+        )
+    elif remaining > 120 and not headings:
+        preview = re.sub(r"\s+", " ", content).strip()
+        if preview:
+            max_preview = min(remaining - 40, 500)
+            optional_lines.append(f"Content preview: {_ellipsize_middle(preview, max_chars=max_preview)}")
+
+    lines = required_lines + optional_lines + recovery_lines
     summary = "\n".join(lines)
     if len(summary) > _SKILL_VIEW_SUMMARY_MAX_CHARS:
-        summary = summary[: _SKILL_VIEW_SUMMARY_MAX_CHARS - 80].rstrip() + "\n...[skill_view summary capped]"
+        marker = "\n...[skill_view optional preview capped; use fetch guidance above to recover source]"
+        budget = _SKILL_VIEW_SUMMARY_MAX_CHARS - len(marker)
+        trimmed_required = "\n".join(required_lines)
+        trimmed_recovery = "\n".join(recovery_lines)
+        optional_budget = max(0, budget - len(trimmed_required) - len(trimmed_recovery) - 2)
+        optional = "\n".join(optional_lines)
+        summary = "\n".join(
+            part
+            for part in (
+                trimmed_required,
+                optional[:optional_budget].rstrip(),
+                trimmed_recovery,
+            )
+            if part
+        ) + marker
     return summary
 
 
@@ -1062,6 +1150,8 @@ class ContextCompressor(ContextEngine):
             if len(content) > 200:
                 call_id = msg.get("tool_call_id", "")
                 tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
+                if tool_name == "skill_view":
+                    continue
                 summary = _summarize_tool_result(tool_name, tool_args, content)
                 result[i] = {**msg, "content": summary}
                 pruned += 1
@@ -1176,6 +1266,12 @@ class ContextCompressor(ContextEngine):
                 continue
             call_id = msg.get("tool_call_id", "")
             tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
+            if tool_name == "skill_view":
+                summary = _summarize_skill_view_result(tool_args, content)
+                if summary:
+                    result[i] = {**msg, "content": summary}
+                    stats["tool_results"] += 1
+                continue
             result[i] = {**msg, "content": _summarize_tool_result(tool_name, tool_args, content)}
             stats["tool_results"] += 1
 
