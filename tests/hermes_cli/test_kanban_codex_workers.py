@@ -1558,14 +1558,13 @@ def test_planner_worker_env_carries_effective_opencode_backend(monkeypatch, tmp_
     assert "scheduled OpenCode role worker: role=planner reasoning=xhigh mode=normal" in log
 
 
-def test_command_center_repair_foreman_schedules_opencode_with_codex_config(monkeypatch, tmp_path):
+def test_command_center_repair_foreman_uses_codex_with_codex_config(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_workers as workers
     from hermes_cli import kanban_db
-    from agent import opencode_worker as ow
 
     _home(monkeypatch, tmp_path)
-    board = "repair-opencode-board"
-    kanban_db.create_board(board, name="Repair OpenCode Board")
+    board = "repair-codex-board"
+    kanban_db.create_board(board, name="Repair Codex Board")
     conn = kanban_db.connect(board=board)
     try:
         task_id = kanban_db.create_task(
@@ -1592,17 +1591,22 @@ def test_command_center_repair_foreman_schedules_opencode_with_codex_config(monk
         captured.update({"env": env})
         return Proc()
 
-    monkeypatch.setattr(workers, "_worker_config", lambda: {"backend": "codex"})
-    monkeypatch.setattr(ow, "check_opencode_binary", lambda: (True, "/bin/opencode"))
+    monkeypatch.setattr(
+        workers,
+        "_worker_config",
+        lambda: {"backend": "codex", "codex_home_root": str(tmp_path / "homes")},
+    )
+    monkeypatch.setattr(workers, "_write_minimal_codex_home", lambda path: None)
     monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
 
     workers.spawn_codex_worker(task, str(tmp_path), board=board)
 
-    assert captured["env"]["HERMES_CODING_WORKER_BACKEND"] == "opencode"
+    assert captured["env"]["HERMES_CODING_WORKER_BACKEND"] == "codex"
+    assert captured["env"]["CODEX_HOME"].endswith(f"/homes/{task.id}")
     log = kanban_db.read_worker_log(task.id, board=board)
     assert log is not None
-    assert "scheduled OpenCode role worker: role=foreman reasoning=xhigh mode=normal" in log
+    assert "scheduled Codex role worker: role=foreman reasoning=xhigh mode=normal" in log
 
 
 def test_role_extra_args_use_scheduled_runtime_env(monkeypatch):
@@ -2355,7 +2359,7 @@ def test_reviewer_role_uses_configured_opencode_backend(monkeypatch, tmp_path):
     assert calls
 
 
-def test_command_center_repair_foreman_runtime_uses_opencode_without_global_backend(monkeypatch, tmp_path):
+def test_command_center_repair_foreman_runtime_uses_codex_with_codex_backend(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli.discord_worker_boards import ROLE_FOREMAN
     from agent import opencode_worker as ow
@@ -2364,7 +2368,7 @@ def test_command_center_repair_foreman_runtime_uses_opencode_without_global_back
     monkeypatch.setattr(worker, "record_codex_worker_result", lambda *args, **kwargs: None)
     calls = []
 
-    def fake_run(prompt, workspace, **kwargs):
+    def fake_codex(prompt, workspace, *args, **kwargs):
         calls.append((prompt, workspace, kwargs))
         return SimpleNamespace(
             final_text=(
@@ -2378,13 +2382,18 @@ def test_command_center_repair_foreman_runtime_uses_opencode_without_global_back
             tool_iterations=1,
             thread_id="ses-repair",
             turn_id="ses-repair",
-            backend="opencode",
+            backend="codex",
             agents=["build"],
             plan_text="",
             exit_code=0,
         )
 
-    monkeypatch.setattr(ow, "run_opencode_task", fake_run)
+    monkeypatch.setattr(
+        ow,
+        "run_opencode_task",
+        lambda *args, **kwargs: pytest.fail("repair foreman should use Codex when configured"),
+    )
+    monkeypatch.setattr(worker, "_run_codex", fake_codex)
 
     result = worker._run_role_backend(
         "prompt",
@@ -2401,9 +2410,8 @@ def test_command_center_repair_foreman_runtime_uses_opencode_without_global_back
         board=None,
     )
 
-    assert result.backend == "opencode"
+    assert result.backend == "codex"
     assert calls
-    assert calls[0][2]["force_plan"] is False
 
 
 def test_opencode_planner_output_creates_dev_ticket(monkeypatch, tmp_path):

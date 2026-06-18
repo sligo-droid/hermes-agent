@@ -42,7 +42,6 @@ from hermes_cli.pr_body_format import check_project_state_requirement
 from hermes_cli.worker_autoreview import materialize_autoreview_helper
 
 _OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER}
-_COMMAND_CENTER_REPAIR_CREATED_BY = "command-center-repair"
 _CODEX_AUTH_RETRY_LIMIT = 2
 _PR_GUARDED_ROLES = {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER}
 _GH_PR_MUTATING_SUBCOMMANDS = {
@@ -989,11 +988,12 @@ def _backend_label(role: str, task: Any = None) -> str:
 
 
 def _task_forces_opencode(task: Any = None) -> bool:
-    if task is None:
-        return False
-    role = str(getattr(task, "assignee", "") or "").strip().lower()
-    created_by = str(getattr(task, "created_by", "") or "").strip().lower()
-    return role == ROLE_FOREMAN and created_by == _COMMAND_CENTER_REPAIR_CREATED_BY
+    """Return whether a role task must bypass the configured Codex backend.
+
+    No current task type forces OpenCode. Command Center repair work follows the
+    same configured coding-worker backend as every other role lane.
+    """
+    return False
 
 
 def _role_uses_opencode(role: str, task: Any = None) -> bool:

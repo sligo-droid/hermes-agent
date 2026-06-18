@@ -117,11 +117,12 @@ def _coding_backend(cfg: dict[str, Any]) -> str:
 
 
 def _task_forces_opencode(task: Any = None) -> bool:
-    if task is None:
-        return False
-    role = str(getattr(task, "assignee", "") or "").strip().lower()
-    created_by = str(getattr(task, "created_by", "") or "").strip().lower()
-    return role == ROLE_FOREMAN and created_by == "command-center-repair"
+    """Return whether a task must bypass the configured Codex backend.
+
+    No current task type forces OpenCode. Command Center repair work follows the
+    same configured coding-worker backend as every other role lane.
+    """
+    return False
 
 
 def _role_backend(role: str, configured_backend: str, task: Any = None) -> str:
