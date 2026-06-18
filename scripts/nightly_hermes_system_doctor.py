@@ -40,7 +40,6 @@ REPO = Path(os.environ.get("HERMES_REPO", "/home/droid/hermes"))
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/home/droid/.hermes"))
 HERMES = REPO / ".venv" / "bin" / "hermes"
 PYTHON = Path(os.environ.get("HERMES_PYTHON", str(REPO / ".venv" / "bin" / "python")))
-OPENCODE = Path(os.environ.get("OPENCODE_BIN", "/home/droid/.local/bin/opencode"))
 STATE = HERMES_HOME / "state" / "nightly-hermes-system-doctor.json"
 LIVE_SCRIPT = HERMES_HOME / "scripts" / "nightly_hermes_system_doctor.py"
 REPO_SCRIPT = REPO / "scripts" / "nightly_hermes_system_doctor.py"
@@ -58,10 +57,10 @@ HONCHO_INFERENCE_DISABLED_RE = re.compile(
 )
 
 
-def opencode_worker_model() -> str:
-    code = "from agent.opencode_worker import load_opencode_config; print(load_opencode_config().get('model') or '')"
-    r = run([str(REPO / ".venv" / "bin" / "python"), "-c", code], timeout=60, cwd=REPO)
-    return (r["output"] or "").strip() if r["exit"] == 0 else "openai/gpt-5.5"
+def coding_worker_backend() -> str:
+    code = "from agent.opencode_worker import load_coding_worker_backend; print(load_coding_worker_backend())"
+    r = run([str(PYTHON if PYTHON.exists() else sys.executable), "-c", code], timeout=60, cwd=REPO)
+    return (r["output"] or "").strip() if r["exit"] == 0 else "unknown"
 
 
 def clean(text: str, limit: int = 4000) -> str:
@@ -585,76 +584,54 @@ def check_honcho_watchdog_status(
     record_honcho_watchdog_result(watchdog_status, issues, facts)
 
 
-def check_opencode(issues: list[dict[str, str]], facts: dict[str, Any]) -> None:
-    if not OPENCODE.exists():
-        add_issue(issues, "critical", "opencode binary missing", str(OPENCODE))
-        return
-    auth = run([str(OPENCODE), "auth", "list"], timeout=120, cwd=Path("/tmp"))
-    facts["opencode_auth_exit"] = auth["exit"]
-    facts["opencode_auth_output"] = auth["output"]
-    if auth["exit"] != 0 or "hermes-codex" not in auth["output"]:
-        add_issue(issues, "critical", "opencode auth missing hermes-codex", auth["output"])
-
-    worker_model = opencode_worker_model()
-    model_provider = worker_model.split("/", 1)[0] if "/" in worker_model else "openai"
-    facts["opencode_worker_model"] = worker_model
-    models = run([str(OPENCODE), "models", model_provider], timeout=120, cwd=Path("/tmp"))
-    facts["opencode_models_exit"] = models["exit"]
-    facts["opencode_models_output"] = models["output"]
-    if models["exit"] != 0 or worker_model not in models["output"]:
-        add_issue(issues, "critical", "opencode worker model unavailable", models["output"])
+def check_codex_worker(issues: list[dict[str, str]], facts: dict[str, Any]) -> None:
+    backend = coding_worker_backend()
+    facts["coding_worker_backend"] = backend
+    if backend != "codex":
+        add_issue(issues, "critical", "coding worker backend is not Codex", backend)
 
     code = r'''
 import json
 import sys
-import time
-from agent.opencode_worker import run_opencode_task
+from agent.codex_worker_auth import create_codex_worker_home
+from agent.transports.codex_app_server import check_codex_binary
+from agent.transports.codex_app_server_session import CodexAppServerSession
 
-marker = 'OPENCODE_CODING_WORKER_OK'
-success = False
-last = None
-for attempt in range(1, 3):
-    r = run_opencode_task(
-        'Smoke test only. Return exactly OPENCODE_CODING_WORKER_OK and nothing else.',
-        '/tmp',
-        timeout=240,
-    )
-    last = r
-    final_text = (r.final_text or '').strip()
-    events_tail = []
-    for event in (getattr(r, 'events', None) or [])[-5:]:
-        if isinstance(event, dict):
-            events_tail.append({
-                'type': event.get('type'),
-                'sessionID': event.get('sessionID') or event.get('session_id'),
-                'keys': sorted(str(key) for key in event.keys())[:12],
-            })
-    print(json.dumps({
-        'attempt': attempt,
-        'error': r.error,
-        'exit_code': getattr(r, 'exit_code', None),
-        'final_text': final_text,
-        'thread_id': getattr(r, 'thread_id', None),
-        'tool_iterations': getattr(r, 'tool_iterations', None),
-        'stdout_tail': (getattr(r, 'stdout', '') or '')[-1000:],
-        'stderr_tail': (getattr(r, 'stderr', '') or '')[-1000:],
-        'events_tail': events_tail,
-    }, sort_keys=True))
-    if r.error is None and marker in final_text:
-        success = True
-        break
-    # Empty-final successful exits have been transient in practice. Retry once
-    # before alerting, but preserve both attempts in the state file.
-    if attempt == 1:
-        time.sleep(2)
-if not success:
+ok, detail = check_codex_binary()
+print(json.dumps({'phase': 'binary', 'ok': ok, 'detail': detail}, sort_keys=True))
+if not ok:
+    sys.exit(1)
+
+marker = 'CODEX_CODING_WORKER_OK'
+with create_codex_worker_home(prefix='doctor-codex-worker-') as lease:
+    with CodexAppServerSession(
+        cwd='/tmp',
+        codex_home=str(lease.path),
+        extra_args=['-c', 'model_reasoning_effort="medium"'],
+        scope_kind='coding-worker-smoke',
+        scope_purpose='Nightly Hermes Codex coding-worker smoke',
+    ) as session:
+        result = session.run_turn(
+            user_input=f'Smoke test only. Return exactly {marker} and nothing else.',
+            turn_timeout=240,
+        )
+print(json.dumps({
+    'phase': 'turn',
+    'error': result.error,
+    'final_text': (result.final_text or '').strip(),
+    'interrupted': result.interrupted,
+    'thread_id': result.thread_id,
+    'tool_iterations': result.tool_iterations,
+    'turn_id': result.turn_id,
+}, sort_keys=True))
+if result.error or result.interrupted or marker not in (result.final_text or ''):
     sys.exit(1)
 '''
     smoke = python_smoke(code, timeout=540)
-    facts["opencode_worker_smoke_exit"] = smoke["exit"]
-    facts["opencode_worker_smoke_output"] = smoke["output"]
-    if smoke["exit"] != 0 or "OPENCODE_CODING_WORKER_OK" not in smoke["output"]:
-        add_issue(issues, "critical", "opencode coding-worker inference smoke failed", smoke["output"])
+    facts["codex_worker_smoke_exit"] = smoke["exit"]
+    facts["codex_worker_smoke_output"] = smoke["output"]
+    if smoke["exit"] != 0 or "CODEX_CODING_WORKER_OK" not in smoke["output"]:
+        add_issue(issues, "critical", "Codex coding-worker inference smoke failed", smoke["output"])
 
 
 def _compact_issue_detail(detail: str, *, max_lines: int = 8, max_chars: int = 1200) -> str:
@@ -666,7 +643,7 @@ def _compact_issue_detail(detail: str, *, max_lines: int = 8, max_chars: int = 1
         line = raw.strip()
         if not line:
             continue
-        # OpenCode sometimes emits full JSON event envelopes; keep the useful
+        # Worker CLIs can emit full JSON event envelopes; keep the useful
         # human line/ref and drop the bulky envelope from Discord alerts.
         if line.startswith("{") and line.endswith("}"):
             continue
@@ -710,7 +687,13 @@ def _print_issue_report(issues: list[dict[str, str]]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--status", action="store_true", help="print OK output even when healthy")
-    parser.add_argument("--skip-opencode-smoke", action="store_true", help="skip expensive OpenCode worker smoke")
+    parser.add_argument(
+        "--skip-coding-worker-smoke",
+        "--skip-opencode-smoke",
+        dest="skip_coding_worker_smoke",
+        action="store_true",
+        help="skip expensive Codex coding-worker smoke",
+    )
     parser.add_argument("--install-live", action="store_true", help="install this repo-managed script to $HERMES_HOME/scripts")
     parser.add_argument("--dry-run", action="store_true", help="show install-live actions without changing files")
     args = parser.parse_args()
@@ -732,8 +715,8 @@ def main() -> int:
     check_main_inference(issues, facts)
     check_compression_inference(issues, facts)
     check_honcho(issues, facts)
-    if not args.skip_opencode_smoke:
-        check_opencode(issues, facts)
+    if not args.skip_coding_worker_smoke:
+        check_codex_worker(issues, facts)
 
     STATE.parent.mkdir(parents=True, exist_ok=True)
     STATE.write_text(json.dumps({"issues": issues, "facts": facts}, indent=2, sort_keys=True) + "\n")
@@ -747,8 +730,8 @@ def main() -> int:
 
     if args.status:
         checked = "hermes doctor/auth/main inference/compression/honcho"
-        if not args.skip_opencode_smoke:
-            checked += "/opencode"
+        if not args.skip_coding_worker_smoke:
+            checked += "/codex-worker"
         print(
             f"OK Nightly Hermes system doctor: {checked} checks passed; "
             f"checked_at={facts['checked_at']}; "

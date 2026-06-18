@@ -244,7 +244,7 @@ def test_repo_script_is_full_cron_entrypoint_for_live_cron_job():
 
     assert callable(doctor.main)
     assert callable(doctor.check_hermes_doctor)
-    assert callable(doctor.check_opencode)
+    assert callable(doctor.check_codex_worker)
     assert callable(doctor.install_live)
 
 
@@ -416,9 +416,9 @@ def test_main_status_persists_provenance_and_normal_healthy_run_is_silent(tmp_pa
     monkeypatch.setattr(doctor, "check_main_inference", ok_check)
     monkeypatch.setattr(doctor, "check_compression_inference", ok_check)
     monkeypatch.setattr(doctor, "check_honcho", ok_check)
-    monkeypatch.setattr(doctor, "check_opencode", ok_check)
+    monkeypatch.setattr(doctor, "check_codex_worker", ok_check)
 
-    monkeypatch.setattr("sys.argv", ["nightly_hermes_system_doctor.py", "--skip-opencode-smoke"])
+    monkeypatch.setattr("sys.argv", ["nightly_hermes_system_doctor.py", "--skip-coding-worker-smoke"])
     assert doctor.main() == 0
     assert capsys.readouterr().out == ""
     facts = json.loads(state.read_text())["facts"]

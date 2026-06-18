@@ -423,7 +423,7 @@ def test_command_center_repair_creates_idempotent_foreman_task(client):
 
     from hermes_cli import kanban_codex_workers as workers
 
-    assert workers._role_backend("foreman", "codex", SimpleNamespace(**repair_task)) == "opencode"
+    assert workers._role_backend("foreman", "codex", SimpleNamespace(**repair_task)) == "codex"
 
     board_rollup = client.post(f"/api/plugins/kanban/boards/{board}/repair", json={"title": "Board rollup"})
     assert board_rollup.status_code == 200, board_rollup.text
