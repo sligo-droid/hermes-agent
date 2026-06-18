@@ -2,7 +2,7 @@ import React, { type PropsWithChildren, useContext, useInsertionEffect } from 'r
 import { c as _c } from 'react/compiler-runtime'
 
 import instances from '../instances.js'
-import { SYNC_OUTPUT_SUPPORTED } from '../terminal.js'
+import { isRuntimeSynchronizedOutputSupported } from '../terminal.js'
 import { CURSOR_HOME, ERASE_SCREEN, ERASE_SCROLLBACK, RESET_SCROLL_REGION } from '../termio/csi.js'
 import {
   BSU,
@@ -84,7 +84,8 @@ export function AlternateScreen(t0: Props) {
         CURSOR_HOME +
         DISABLE_MOUSE_TRACKING +
         enableMouse
-      writeRaw(SYNC_OUTPUT_SUPPORTED ? BSU + enter + ESU : enter)
+
+      writeRaw(isRuntimeSynchronizedOutputSupported() ? BSU + enter + ESU : enter)
       ink?.setAltScreenActive(true, mouseTracking)
       // setAltScreenActive(true, mouseTracking) above stores the mode for
       // SIGCONT/resize/stdin-gap re-assertion. We don't also call
@@ -103,7 +104,7 @@ export function AlternateScreen(t0: Props) {
         // on every teardown means a crash mid-mount can't leak DEC modes
         // back to the host shell.
         const exit = DISABLE_MOUSE_TRACKING + RESET_SCROLL_REGION + EXIT_ALT_SCREEN
-        writeRaw(SYNC_OUTPUT_SUPPORTED ? BSU + exit + ESU : exit)
+        writeRaw(isRuntimeSynchronizedOutputSupported() ? BSU + exit + ESU : exit)
       }
     }
 

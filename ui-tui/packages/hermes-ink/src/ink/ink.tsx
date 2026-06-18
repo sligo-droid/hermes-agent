@@ -76,9 +76,9 @@ import {
   updateSelection
 } from './selection.js'
 import {
+  isRuntimeSynchronizedOutputSupported,
   needsAltScreenResizeScrollbackClear,
   supportsExtendedKeys,
-  SYNC_OUTPUT_SUPPORTED,
   type Terminal,
   writeDiffToTerminal
 } from './terminal.js'
@@ -910,6 +910,8 @@ export default class Ink {
 
     const tDiff = performance.now()
 
+    const syncOutputSupported = isRuntimeSynchronizedOutputSupported()
+
     const diff = this.log.render(
       prevFrame,
       frame,
@@ -917,8 +919,8 @@ export default class Ink {
       // DECSTBM needs BSU/ESU atomicity — without it the outer terminal
       // renders the scrolled-but-not-yet-repainted intermediate state.
       // tmux is the main case (re-emits DECSTBM with its own timing and
-      // doesn't implement DEC 2026, so SYNC_OUTPUT_SUPPORTED is false).
-      SYNC_OUTPUT_SUPPORTED
+      // doesn't implement DEC 2026, so syncOutputSupported is false).
+      syncOutputSupported
     )
 
     const diffMs = performance.now() - tDiff
@@ -1104,7 +1106,7 @@ export default class Ink {
     const { bytes: writeBytes, backpressure } = writeDiffToTerminal(
       this.terminal,
       optimized,
-      this.altScreenActive && !SYNC_OUTPUT_SUPPORTED,
+      this.altScreenActive && !syncOutputSupported,
       trackDrain
         ? () => {
             // Callback fires once Node has flushed the chunk to the OS.
