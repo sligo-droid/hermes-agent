@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 import re
-import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -170,28 +169,14 @@ _TERMINAL_THREAD_STATES = frozenset({"blocked", "errored", "done", "archived", "
 
 def _paused_corrupt_incident(board: str) -> Optional[dict[str, Any]]:
     try:
-        incident = kanban_db.is_board_paused_for_corruption(board)
+        state = kanban_db.corrupt_board_quarantine_state(board)
     except Exception:
         return None
-    if not incident:
-        return None
-    db_path = Path(str(incident.get("db_path") or kanban_db.kanban_db_path(board)))
-    try:
-        fingerprint = kanban_db._db_content_fingerprint(db_path)
-    except Exception:
-        fingerprint = None
-    if incident.get("fingerprint") == fingerprint:
-        return incident
-    return None
+    return state.get("incident") if state.get("skipped") else None
 
 
 def _is_corrupt_board_db_error(exc: Exception) -> bool:
-    if isinstance(exc, kanban_db.KanbanDbCorruptError):
-        return True
-    if not isinstance(exc, sqlite3.DatabaseError):
-        return False
-    msg = str(exc).lower()
-    return "file is not a database" in msg or "database disk image is malformed" in msg
+    return kanban_db.is_corrupt_board_db_error(exc)
 
 
 def _record_corrupt_board(board: str, exc: Exception) -> Optional[dict[str, Any]]:

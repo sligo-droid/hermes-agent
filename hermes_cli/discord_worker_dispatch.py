@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import logging
-import sqlite3
-from pathlib import Path
 from typing import Callable, Optional
 
 from hermes_cli import discord_worker_boards as dwb
@@ -16,32 +14,19 @@ logger = logging.getLogger(__name__)
 
 def _paused_corrupt_incident(board: str) -> Optional[dict]:
     try:
-        incident = kanban_db.is_board_paused_for_corruption(board)
+        state = kanban_db.corrupt_board_quarantine_state(board)
     except Exception:
         return None
-    if not incident:
-        return None
-    db_path = Path(str(incident.get("db_path") or kanban_db.kanban_db_path(board)))
-    try:
-        fingerprint = kanban_db._db_content_fingerprint(db_path)
-    except Exception:
-        fingerprint = None
-    if incident.get("fingerprint") == fingerprint:
-        return incident
-    logger.info(
-        "kanban dispatcher: Discord worker board %s database changed since corruption incident; retrying",
-        board,
-    )
-    return None
+    if state.get("changed_fingerprint"):
+        logger.info(
+            "kanban dispatcher: Discord worker board %s database changed since corruption incident; retrying",
+            board,
+        )
+    return state.get("incident") if state.get("skipped") else None
 
 
 def _is_corrupt_board_db_error(exc: Exception) -> bool:
-    if isinstance(exc, kanban_db.KanbanDbCorruptError):
-        return True
-    if not isinstance(exc, sqlite3.DatabaseError):
-        return False
-    msg = str(exc).lower()
-    return "file is not a database" in msg or "database disk image is malformed" in msg
+    return kanban_db.is_corrupt_board_db_error(exc)
 
 
 def _record_corrupt_board(board: str, exc: Exception) -> Optional[dict]:
