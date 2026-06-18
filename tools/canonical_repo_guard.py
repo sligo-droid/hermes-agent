@@ -182,16 +182,22 @@ def canonical_main_write_violation(path: str | Path, *, require_tracked: bool = 
 
 def canonical_main_worker_violation(workdir: str | Path) -> str | None:
     """Return a block message when a coding worker is pointed at canonical main."""
+    return canonical_main_routing_hint(workdir, action="delegate_coding_task")
+
+
+def canonical_main_routing_hint(workdir: str | Path, *, action: str) -> str | None:
+    """Return routing guidance when *action* targets protected canonical main."""
     if _guard_disabled():
         return None
     info = _repo_info_for_path(workdir)
     if info is None:
         return None
+    action_text = str(action or "requested action").strip() or "requested action"
     return (
-        "BLOCKED: delegate_coding_task was pointed at a protected canonical "
-        f"checkout on {info.branch}: {info.repo_root}. Coding workers must not "
-        "edit canonical main. Create or use a git worktree under "
-        "/home/droid/workspaces/ and call delegate_coding_task with cwd set to "
+        f"BLOCKED: {action_text} was pointed at a protected canonical "
+        f"checkout on {info.branch}: {info.repo_root}. Canonical checkouts are "
+        "inspection-only for agents and must not be mutated. Create or use a "
+        "git worktree under /home/droid/workspaces/ and retry with cwd set to "
         "that worktree."
     )
 
