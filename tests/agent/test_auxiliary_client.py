@@ -3825,8 +3825,8 @@ class TestAuxUnhealthyCache:
         monkeypatch.setattr(aux, "_select_pool_entry", lambda provider: (False, None))
         monkeypatch.setattr(aux, "_read_nous_auth", lambda: None)
         monkeypatch.setattr(aux, "_resolve_nous_runtime_api", lambda force_refresh=False: None)
-        monkeypatch.setattr(aux, "_try_custom_endpoint", lambda: (None, None))
-        monkeypatch.setattr(aux, "_resolve_api_key_provider", lambda: (None, None))
+        monkeypatch.setattr(aux, "_try_custom_endpoint", lambda **kwargs: (None, None))
+        monkeypatch.setattr(aux, "_resolve_api_key_provider", lambda **kwargs: (None, None))
 
         with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
             for _ in range(3):
@@ -3838,9 +3838,15 @@ class TestAuxUnhealthyCache:
 
         messages = [rec.message for rec in caplog.records]
         assert sum("marking openrouter unhealthy" in msg for msg in messages) == 2
-        assert sum("Auxiliary auto-detect: no provider available" in msg for msg in messages) == 2
-        assert sum("Auxiliary Nous client unavailable" in msg for msg in messages) == 2
+        degraded = [msg for msg in messages if "Auxiliary compression health degraded" in msg]
+        assert len(degraded) == 2
+        assert sum("Auxiliary auto-detect: no provider available" in msg for msg in messages) == 0
+        assert sum(msg.startswith("Auxiliary Nous client unavailable") for msg in messages) == 0
         assert any("task=compression" in msg for msg in messages)
+        assert any("route_chain=openrouter" in msg for msg in degraded)
+        assert any("openrouter:unavailable" in msg for msg in degraded)
+        assert any("nous:unavailable" in msg for msg in degraded)
+        assert any("final_state=degraded" in msg for msg in degraded)
         summaries = [msg for msg in messages if "Auxiliary health summary" in msg]
         assert any(
             "provider=auto" in msg

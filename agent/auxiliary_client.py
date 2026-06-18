@@ -1401,7 +1401,7 @@ def _read_codex_access_token() -> Optional[str]:
         return None
 
 
-def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
+def _resolve_api_key_provider(*, task: Optional[str] = None) -> Tuple[Optional[OpenAI], Optional[str]]:
     """Try each API-key provider in PROVIDER_REGISTRY order.
 
     Returns (client, model) for the first provider with usable runtime
@@ -1883,7 +1883,7 @@ def _validate_base_url(base_url: str) -> None:
         ) from exc
 
 
-def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
+def _try_custom_endpoint(*, task: Optional[str] = None) -> Tuple[Optional[Any], Optional[str]]:
     runtime = _resolve_custom_runtime()
     if len(runtime) == 2:
         custom_base, custom_key = runtime
@@ -2239,6 +2239,7 @@ _aux_unhealthy_until: Dict[str, float] = {}
 _aux_unhealthy_logged_at: Dict[str, float] = {}
 _aux_warning_buckets: Dict[Tuple[str, str, str], Dict[str, float]] = {}
 _aux_warning_lock = threading.RLock()
+_aux_route_probe = threading.local()
 
 
 def _aux_time() -> float:
@@ -2247,6 +2248,34 @@ def _aux_time() -> float:
 
 def _format_aux_warning_ts(ts: float) -> str:
     return time.strftime("%H:%M:%S", time.localtime(ts))
+
+
+def _record_aux_route_probe_failure(
+    provider: str,
+    failure_class: str,
+    message: str,
+    *args: Any,
+) -> bool:
+    probe = getattr(_aux_route_probe, "current", None)
+    if probe is None:
+        return False
+    try:
+        rendered = message % args if args else message
+    except Exception:
+        rendered = message
+    provider_label = _normalize_chain_label(provider or "auto") or "auto"
+    key = (provider_label, failure_class)
+    if key not in probe["seen"]:
+        probe["seen"].add(key)
+        probe["failures"].append(
+            {
+                "provider": provider_label,
+                "failure_class": failure_class,
+                "reason": rendered,
+            }
+        )
+    logger.debug(rendered)
+    return True
 
 
 def _emit_aux_warning_summary(provider: str, failure_class: str, task: str, bucket: Dict[str, float]) -> None:
@@ -2314,6 +2343,9 @@ def log_auxiliary_health_warning(
     task: Optional[str] = None,
     window: float = _AUX_WARNING_WINDOW_SECONDS,
 ) -> None:
+    if task == "compression" and provider != "auto":
+        if _record_aux_route_probe_failure(provider, failure_class, message, *args):
+            return
     if _should_emit_aux_health_warning(provider, failure_class, task=task, window=window):
         logger.warning(message, *args)
 
@@ -3184,6 +3216,16 @@ def _resolve_auto(
     """
     global auxiliary_is_nous, _stale_base_url_warned
     auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
+    previous_route_probe = getattr(_aux_route_probe, "current", None)
+    route_probe = None
+    if task == "compression":
+        route_probe = {"failures": [], "seen": set()}
+        _aux_route_probe.current = route_probe
+
+    def _restore_route_probe() -> None:
+        if task == "compression":
+            _aux_route_probe.current = previous_route_probe
+
     runtime = _normalize_main_runtime(main_runtime)
     runtime_provider = runtime.get("provider", "")
     runtime_model = str(runtime.get("model") or "")
@@ -3259,7 +3301,7 @@ def _resolve_auto(
         # falling to Step-2.
         main_chain_label = _normalize_chain_label(resolved_provider)
         if main_chain_label and _is_provider_unhealthy(main_chain_label):
-            _log_skip_unhealthy(main_chain_label)
+            _log_skip_unhealthy(main_chain_label, task)
         else:
             client, resolved = resolve_provider_client(
                 resolved_provider,
@@ -3271,38 +3313,65 @@ def _resolve_auto(
             if client is not None:
                 logger.info("Auxiliary auto-detect: using main provider %s (%s)",
                             main_provider, resolved or resolved_model)
+                _restore_route_probe()
                 return client, resolved or resolved_model
 
     # ── Step 2: aggregator / fallback chain ──────────────────────────────
     tried = []
     for label, try_fn in _get_provider_chain():
         if _is_provider_unhealthy(label):
-            _log_skip_unhealthy(label)
+            _log_skip_unhealthy(label, task)
             tried.append(f"{label} (unhealthy)")
             continue
-        client, model = try_fn()
+        try:
+            client, model = try_fn(task=task)
+        except TypeError:
+            client, model = try_fn()
         if client is not None:
             if tried:
                 logger.info("Auxiliary auto-detect: using %s (%s) — skipped: %s",
                             label, model or "default", ", ".join(tried))
             else:
                 logger.info("Auxiliary auto-detect: using %s (%s)", label, model or "default")
+            _restore_route_probe()
             return client, model
         tried.append(label)
 
-    log_auxiliary_health_warning(
-        "auto",
-        "no_provider",
-        "Auxiliary auto-detect: no provider available (tried: %s). "
-        "Compression, summarization, and memory flush will not work. "
-        "task=%s; route_chain=%s; final_state=degraded. "
-        "Set OPENROUTER_API_KEY or configure a local model in config.yaml.",
-        ", ".join(tried),
-        task or "global",
-        ", ".join(tried),
-        task=task,
-    )
-    return None, None
+    try:
+        route_chain = ", ".join(tried)
+        if task == "compression" and route_probe is not None:
+            first_failures = "; ".join(
+                f"{item['provider']}:{item['failure_class']}:{item['reason']}"
+                for item in route_probe["failures"]
+            ) or "none"
+            log_auxiliary_health_warning(
+                "auto",
+                "no_provider",
+                "Auxiliary compression health degraded: no auxiliary route available. "
+                "task=compression; route_chain=%s; first_failures=%s; "
+                "failure_class=no_provider; final_state=degraded. "
+                "Compression summaries will be unavailable; messages are unchanged "
+                "or local fallback behavior is preserved.",
+                route_chain,
+                first_failures,
+                task=task,
+            )
+        else:
+            log_auxiliary_health_warning(
+                "auto",
+                "no_provider",
+                "Auxiliary auto-detect: no provider available (tried: %s). "
+                "Compression, summarization, and memory flush will not work. "
+                "task=%s; route_chain=%s; final_state=degraded. "
+                "Set OPENROUTER_API_KEY or configure a local model in config.yaml.",
+                route_chain,
+                task or "global",
+                route_chain,
+                task=task,
+            )
+        return None, None
+    finally:
+        _restore_route_probe()
 
 
 # ── Centralized Provider Router ─────────────────────────────────────────────
