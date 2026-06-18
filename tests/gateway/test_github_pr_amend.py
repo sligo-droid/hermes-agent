@@ -346,7 +346,10 @@ class TestGitHubPrAmendPolicy:
         assert "do not post github text comments" in instructions
         assert "command center/discord worker-board path" in instructions
         assert "worker-board embed/thread" in instructions
-        assert "open and merge a pr in the `sligo-droid` fork" in instructions
+        assert "target checkout/repo" in instructions
+        assert "`sligo-droid/reserve-index-dtf`" in instructions
+        assert "base `feat/irrevocable-fee-recipients`" in instructions
+        assert "review context only" in instructions
         assert "final public github output is pushed commits/prs plus reactions only" in instructions
 
     def test_reserve_protocol_pr_amend_card_includes_solidity_skill_hint(self, tmp_path):
@@ -383,6 +386,15 @@ class TestGitHubPrAmendPolicy:
             ],
             "review_comments": [
                 {
+                    "id": 3430163991,
+                    "pull_request_review_id": 4518030260,
+                    "html_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#discussion_r3430163991",
+                    "path": "contracts/interfaces/IFolio.sol",
+                    "line": 235,
+                    "body": "remove",
+                    "diff_hunk": "@@ line 235 @@",
+                },
+                {
                     "id": 3430163992,
                     "pull_request_review_id": 4518030260,
                     "html_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#discussion_r3430163992",
@@ -400,6 +412,9 @@ class TestGitHubPrAmendPolicy:
         body = card["body"]
         assert "GitHub review context:" in body
         assert "review_id=4518030260" in body
+        assert "contracts/interfaces/IFolio.sol" in body
+        assert "line 235" in body
+        assert "Body: remove" in body
         assert "contracts/utils/FolioLib.sol" in body
         assert "line 59" in body
         assert "comment 3430163992" in body
@@ -412,7 +427,37 @@ class TestGitHubPrAmendPolicy:
         assert card["project_context"]["github_pr_amend"]["source_id"] == "4518030260"
         assert card["project_context"]["github_pr_amend"]["source_node_id"] == payload["review"]["node_id"]
         assert card["project_context"]["github_pr_amend"]["source_key"] == "github-pr-amend:review:4518030260"
+        assert card["project_context"]["github_pr_amend"]["requires_head_sha_advance"] is True
         assert artifact["fetched_context"]["review_comments"] == context["review_comments"]
+
+    def test_pr_amend_card_targets_head_repo_and_marks_upstream_context_only(self, tmp_path):
+        request = extract_request("pull_request_review", REVIEW_PAYLOAD, delivery_id="delivery-target")
+        policy = policy_from_route(ROUTE)
+        decision = evaluate_request(request, PR_INFO, policy)
+        artifact = build_pr_amend_intake_artifact(request, decision, policy, PR_INFO, REVIEW_PAYLOAD, PR_RELATED_CONTEXT)
+
+        card = build_pr_amend_discord_card(artifact, artifact_path=tmp_path / "intake.json")
+
+        body = card["body"]
+        criteria = "\n".join(card["acceptance_criteria"])
+        assert "Target checkout/repo" in body
+        assert "`sligo-droid/reserve-index-dtf`" in body
+        assert "Target base branch" in body
+        assert "`feat/irrevocable-fee-recipients`" in body
+        assert "review context only" in body
+        assert "do not open, close, review, or merge that upstream PR" in body
+        assert "Target repo for checkout/PR lifecycle is `sligo-droid/reserve-index-dtf`" in criteria
+        assert "upstream `reserve-protocol/reserve-index-dtf` is review context only" in criteria
+        assert "base `feat/irrevocable-fee-recipients`" in criteria
+        assert card["project_context"]["github_pr_target_repo"] == "sligo-droid/reserve-index-dtf"
+        assert card["project_context"]["github_pr_target_url"] == "https://github.com/sligo-droid/reserve-index-dtf.git"
+        assert card["project_context"]["base_branch"] == "feat/irrevocable-fee-recipients"
+        amend = card["project_context"]["github_pr_amend"]
+        assert amend["upstream_repo"] == "reserve-protocol/reserve-index-dtf"
+        assert amend["upstream_pr_number"] == "182"
+        assert amend["head_repo"] == "sligo-droid/reserve-index-dtf"
+        assert amend["head_ref"] == "feat/irrevocable-fee-recipients"
+        assert amend["requires_head_sha_advance"] is True
 
     def test_review_card_includes_all_matching_inline_review_comments(self, tmp_path):
         payload = json.loads(json.dumps(REVIEW_PAYLOAD))

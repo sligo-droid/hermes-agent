@@ -75,7 +75,7 @@ export function isSynchronizedOutputSupported(env: NodeJS.ProcessEnv = process.e
   // tmux parses and proxies every byte but doesn't implement DEC 2026.
   // BSU/ESU pass through to the outer terminal but tmux has already
   // broken atomicity by chunking. Skip to save 16 bytes/frame + parser work.
-  if (env.TMUX) {
+  if (isTmuxSession(env)) {
     return false
   }
 
@@ -145,6 +145,10 @@ export function isSynchronizedOutputSupported(env: NodeJS.ProcessEnv = process.e
   return false
 }
 
+export function isTmuxSession(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(env.TMUX || env.TERM_PROGRAM === 'tmux')
+}
+
 // -- XTVERSION-detected terminal name (populated async at startup) --
 //
 // TERM_PROGRAM is not forwarded over SSH by default, so env-based detection
@@ -208,9 +212,26 @@ export function hasCursorUpViewportYankBug(): boolean {
   return process.platform === 'win32' || !!process.env.WT_SESSION
 }
 
-// Computed once at module load — terminal capabilities don't change mid-session.
-// Exported so callers can pass a sync-skip hint gated to specific modes.
+// Initial env-based capability. Remote SSH sessions can strip terminal
+// identity (TERM_PROGRAM/CMUX_*) down to TERM=xterm-256color, so the live
+// render path reads the mutable runtime value below after terminal probing.
 export const SYNC_OUTPUT_SUPPORTED = isSynchronizedOutputSupported()
+
+let runtimeSyncOutputSupported = SYNC_OUTPUT_SUPPORTED
+
+export function isRuntimeSynchronizedOutputSupported(): boolean {
+  return runtimeSyncOutputSupported
+}
+
+export function enableSynchronizedOutputFromTerminalQuery(env: NodeJS.ProcessEnv = process.env): void {
+  if (!isTmuxSession(env)) {
+    runtimeSyncOutputSupported = true
+  }
+}
+
+export function resetSynchronizedOutputSupportForTest(supported = SYNC_OUTPUT_SUPPORTED): void {
+  runtimeSyncOutputSupported = supported
+}
 
 export type Terminal = {
   stdout: Writable

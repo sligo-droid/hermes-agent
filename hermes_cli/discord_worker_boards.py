@@ -3345,6 +3345,10 @@ def _pr_merge_evidence_present(*, state: str, merged_at: str, merge_commit: str)
 
 
 def _worker_has_successful_pr_terminal_evidence(worker: dict[str, Any]) -> bool:
+    context = worker.get("project_context") if isinstance(worker.get("project_context"), dict) else {}
+    amend = context.get("github_pr_amend") if isinstance(context.get("github_pr_amend"), dict) else {}
+    if amend.get("requires_head_sha_advance") is True and worker.get("pr_amend_head_advanced") is not True:
+        return False
     state = str(worker.get("pr_state") or "").strip()
     merged_at = str(worker.get("pr_merged_at") or "").strip()
     merge_commit = str(worker.get("pr_merge_commit") or "").strip()

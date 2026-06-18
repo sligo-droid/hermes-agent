@@ -586,13 +586,18 @@ def build_pr_amend_operational_instructions(
     request: GitHubPrAmendRequest,
     decision: GitHubPrAmendDecision,
 ) -> str:
+    target_repo = decision.head_repo or "the PR head repo"
+    target_ref = decision.head_ref or "the PR head branch"
+    upstream_repo = decision.base_repo or request.repo
     return f"""GitHub PR-amend operational instructions:
 - Do not post GitHub text comments, replies, review comments, or reviews.
 - Use GitHub reactions for seen/in-progress/done/error status when available.
 - Accepted intake must be handled through the Command Center/Discord worker-board path and produce the corresponding worker-board embed/thread, like an approved Command Center job.
 - Implement the requested amendment in a worker worktree using the Discord/Kanban worker-board flow.
-- Open and merge a PR in the `sligo-droid` fork/version of `{decision.base_repo or request.repo}`.
-- That PR must merge the worker worktree branch into the `sligo-droid` branch `{decision.head_ref}` that already has a PR open against the upstream `{decision.base_repo or request.repo}` repo.
+- Target checkout/repo for implementation and PR lifecycle: `{target_repo}`.
+- Target base branch for the worker PR: `{target_ref}`.
+- The upstream `{upstream_repo}` PR #{request.pr_number} is review context only; do not open, close, review, or merge that upstream PR as part of amendment work.
+- Open and merge a PR in `{target_repo}` with base `{target_ref}` so the existing upstream PR head branch advances.
 - Final public GitHub output is pushed commits/PRs plus reactions only.
 - Preserve unrelated user changes and report blockers in the worker-board thread, not on GitHub.
 """.strip()
@@ -672,6 +677,17 @@ def _pr_amend_source_key(artifact: dict[str, Any]) -> str:
     if delivery_id:
         return f"github-pr-amend:delivery:{delivery_id}"
     return ""
+
+
+def _pr_amend_requires_head_sha_advance(artifact: dict[str, Any]) -> bool:
+    source = artifact.get("source") if isinstance(artifact.get("source"), dict) else {}
+    source_kind = str(source.get("kind") or "").strip()
+    review_state = str(source.get("review_state") or "").strip().upper()
+    if source_kind == "review_comment":
+        return True
+    if source_kind == "review" and review_state == "CHANGES_REQUESTED":
+        return True
+    return False
 
 
 def _compact_pr_amend_text(value: Any, *, limit: int | None = None) -> str:
@@ -830,6 +846,7 @@ def build_pr_amend_discord_card(
     source_kind = str(_dig(artifact, "source", "kind", default=""))
     source_id = str(_dig(artifact, "source", "id", default=""))
     source_node_id = str(_dig(artifact, "source", "node_id", default=""))
+    source_review_state = str(_dig(artifact, "source", "review_state", default=""))
     sender = str(_dig(artifact, "sender", "login", default=""))
     body = str(_dig(artifact, "source", "body", default=""))
     review_context = _github_review_context_block(artifact)
@@ -841,6 +858,7 @@ def build_pr_amend_discord_card(
     base_ref = str(_dig(artifact, "pull_request", "base", "ref", default=""))
     title = f"GitHub PR amend: {repo}#{pr_number}"
     summary = f"{sender} requested an amendment on `{repo}` PR #{pr_number}: {pr_title}"
+    requires_head_sha_advance = _pr_amend_requires_head_sha_advance(artifact)
     request_body = "\n\n".join(
         part
         for part in (
@@ -866,8 +884,10 @@ def build_pr_amend_discord_card(
         "acceptance_criteria": [
             "Do not post GitHub text comments or reviews.",
             "Accepted intake must produce and use the corresponding Discord worker-board embed/thread, like an approved Command Center job.",
-            "Open and merge a PR in the sligo-droid fork/version of the repo.",
-            "Merge the worker worktree branch into the sligo-droid branch that already has the upstream PR open.",
+            f"Target repo for checkout/PR lifecycle is `{head_repo}`; upstream `{base_repo}` is review context only.",
+            f"Open and merge a PR in `{head_repo}` with base `{head_ref}`.",
+            f"Do not merge the upstream `{base_repo}` PR #{pr_number} as part of amendment work.",
+            "When code changes are requested, completion requires evidence that the upstream PR head SHA advanced beyond the triggering source commit.",
             "Final public GitHub output is pushed commits/PRs plus reactions only.",
             f"Preserve and follow intake artifact: {artifact_path}",
         ],
@@ -905,8 +925,10 @@ def build_pr_amend_discord_card(
                 "source_kind": source_kind,
                 "source_id": source_id,
                 "source_node_id": source_node_id,
+                "review_state": source_review_state,
                 "source_url": source_url,
                 "source_key": _pr_amend_source_key(artifact),
+                "requires_head_sha_advance": requires_head_sha_advance,
             },
         },
         "created_by": "github-pr-amend",
