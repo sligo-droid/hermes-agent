@@ -3799,6 +3799,57 @@ class TestAuxUnhealthyCache:
         assert "nous no provider" in messages
         assert "openrouter exhausted" in messages
 
+    def test_distinct_task_warnings_remain_visible(self, monkeypatch, caplog):
+        import agent.auxiliary_client as aux
+
+        monkeypatch.setattr(aux, "_aux_time", lambda: 2500.0)
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            aux.log_auxiliary_health_warning(
+                "openrouter", "no_provider", "openrouter compression unavailable", task="compression"
+            )
+            aux.log_auxiliary_health_warning(
+                "openrouter", "no_provider", "openrouter web unavailable", task="web_extract"
+            )
+
+        messages = [rec.message for rec in caplog.records]
+        assert "openrouter compression unavailable" in messages
+        assert "openrouter web unavailable" in messages
+
+    def test_repeated_compression_auto_detect_warnings_are_coalesced(self, monkeypatch, caplog):
+        import agent.auxiliary_client as aux
+
+        now = 4000.0
+        monkeypatch.setattr(aux, "_aux_time", lambda: now)
+        monkeypatch.setattr(aux, "_read_main_provider", lambda: "")
+        monkeypatch.setattr(aux, "_read_main_model", lambda: "")
+        monkeypatch.setattr(aux, "_select_pool_entry", lambda provider: (False, None))
+        monkeypatch.setattr(aux, "_read_nous_auth", lambda: None)
+        monkeypatch.setattr(aux, "_resolve_nous_runtime_api", lambda force_refresh=False: None)
+        monkeypatch.setattr(aux, "_try_custom_endpoint", lambda: (None, None))
+        monkeypatch.setattr(aux, "_resolve_api_key_provider", lambda: (None, None))
+
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            for _ in range(3):
+                assert aux._resolve_auto(task="compression") == (None, None)
+
+            now = 4061.0
+            monkeypatch.setattr(aux, "_aux_time", lambda: now)
+            assert aux._resolve_auto(task="compression") == (None, None)
+
+        messages = [rec.message for rec in caplog.records]
+        assert sum("marking openrouter unhealthy" in msg for msg in messages) == 2
+        assert sum("Auxiliary auto-detect: no provider available" in msg for msg in messages) == 2
+        assert sum("Auxiliary Nous client unavailable" in msg for msg in messages) == 2
+        assert any("task=compression" in msg for msg in messages)
+        summaries = [msg for msg in messages if "Auxiliary health summary" in msg]
+        assert any(
+            "provider=auto" in msg
+            and "failure_class=no_provider" in msg
+            and "task=compression" in msg
+            and "suppressed=2" in msg
+            for msg in summaries
+        )
+
     def test_provider_recovery_flushes_summary_and_resets_bucket(self, monkeypatch, caplog):
         import agent.auxiliary_client as aux
 

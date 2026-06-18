@@ -1513,12 +1513,23 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
 
 
 
-def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Optional[OpenAI], Optional[str]]:
+def _try_openrouter(
+    explicit_api_key: str = None,
+    model: str = None,
+    *,
+    task: Optional[str] = None,
+) -> Tuple[Optional[OpenAI], Optional[str]]:
     pool_present, entry = _select_pool_entry("openrouter")
     if pool_present:
         or_key = explicit_api_key or _pool_runtime_api_key(entry)
         if not or_key:
-            _mark_provider_unhealthy("openrouter", ttl=60)
+            _mark_provider_unhealthy(
+                "openrouter",
+                ttl=60,
+                failure_class="unavailable",
+                reason="OpenRouter credential pool has no usable entries (credentials may be exhausted)",
+                task=task,
+            )
             return None, None
         base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
         logger.debug("Auxiliary client: OpenRouter via pool")
@@ -1527,7 +1538,13 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
 
     or_key = explicit_api_key or os.getenv("OPENROUTER_API_KEY")
     if not or_key:
-        _mark_provider_unhealthy("openrouter", ttl=60)
+        _mark_provider_unhealthy(
+            "openrouter",
+            ttl=60,
+            failure_class="unavailable",
+            reason="OPENROUTER_API_KEY not set",
+            task=task,
+        )
         return None, None
     logger.debug("Auxiliary client: OpenRouter")
     return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
@@ -1547,7 +1564,11 @@ def _describe_openrouter_unavailable() -> str:
     return "no usable OpenRouter credentials found"
 
 
-def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
+def _try_nous(
+    vision: bool = False,
+    *,
+    task: Optional[str] = None,
+) -> Tuple[Optional[OpenAI], Optional[str]]:
     # Check cross-session rate limit guard before attempting Nous —
     # if another session already recorded a 429, skip Nous entirely
     # to avoid piling more requests onto the tapped RPH bucket.
@@ -1559,7 +1580,13 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
                 "Auxiliary: skipping Nous Portal (rate-limited, resets in %.0fs)",
                 _remaining,
             )
-            _mark_provider_unhealthy("nous", ttl=_remaining)
+            _mark_provider_unhealthy(
+                "nous",
+                ttl=_remaining,
+                failure_class="rate_limited",
+                reason="rate-limited",
+                task=task,
+            )
             return None, None
     except Exception:
         pass
@@ -1567,11 +1594,21 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
     nous = _read_nous_auth()
     runtime = _resolve_nous_runtime_api(force_refresh=False)
     if runtime is None and not nous:
-        logger.warning(
+        log_auxiliary_health_warning(
+            "nous",
+            "unavailable",
             "Auxiliary Nous client unavailable: no Nous authentication found "
-            "(run: hermes auth)."
+            "(run: hermes auth). task=%s; final_state=degraded.",
+            task or "global",
+            task=task,
         )
-        _mark_provider_unhealthy("nous", ttl=60)
+        _mark_provider_unhealthy(
+            "nous",
+            ttl=60,
+            failure_class="unavailable",
+            reason="no Nous authentication found",
+            task=task,
+        )
         return None, None
     if runtime is None and nous:
         logger.debug(
@@ -1615,11 +1652,21 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
     else:
         api_key = _nous_api_key(nous or {})
         if not api_key:
-            logger.warning(
+            log_auxiliary_health_warning(
+                "nous",
+                "unavailable",
                 "Auxiliary Nous client unavailable: no usable inference JWT found "
-                "(run: hermes auth add nous)."
+                "(run: hermes auth add nous). task=%s; final_state=degraded.",
+                task or "global",
+                task=task,
             )
-            _mark_provider_unhealthy("nous", ttl=60)
+            _mark_provider_unhealthy(
+                "nous",
+                ttl=60,
+                failure_class="unavailable",
+                reason="no usable inference JWT found",
+                task=task,
+            )
             return None, None
         base_url = str((nous or {}).get("inference_base_url") or _nous_base_url()).rstrip("/")
     return (
@@ -2190,7 +2237,7 @@ _AUX_UNHEALTHY_TTL_SECONDS = 600  # 10 minutes
 _AUX_WARNING_WINDOW_SECONDS = 60
 _aux_unhealthy_until: Dict[str, float] = {}
 _aux_unhealthy_logged_at: Dict[str, float] = {}
-_aux_warning_buckets: Dict[Tuple[str, str], Dict[str, float]] = {}
+_aux_warning_buckets: Dict[Tuple[str, str, str], Dict[str, float]] = {}
 _aux_warning_lock = threading.RLock()
 
 
@@ -2202,14 +2249,15 @@ def _format_aux_warning_ts(ts: float) -> str:
     return time.strftime("%H:%M:%S", time.localtime(ts))
 
 
-def _emit_aux_warning_summary(provider: str, failure_class: str, bucket: Dict[str, float]) -> None:
+def _emit_aux_warning_summary(provider: str, failure_class: str, task: str, bucket: Dict[str, float]) -> None:
     suppressed = int(bucket.get("suppressed", 0))
     if suppressed <= 0:
         return
     logger.warning(
-        "Auxiliary health summary: provider=%s failure_class=%s suppressed=%d first=%s last=%s",
+        "Auxiliary health summary: provider=%s failure_class=%s task=%s suppressed=%d first=%s last=%s",
         provider,
         failure_class,
+        task or "global",
         suppressed,
         _format_aux_warning_ts(bucket.get("first", 0.0)),
         _format_aux_warning_ts(bucket.get("last", 0.0)),
@@ -2220,15 +2268,17 @@ def _should_emit_aux_health_warning(
     provider: str,
     failure_class: str,
     *,
+    task: Optional[str] = None,
     window: float = _AUX_WARNING_WINDOW_SECONDS,
 ) -> bool:
     """Return True for the first visible warning in a bounded window.
 
-    Repeats for the same normalized provider/failure class are counted and
-    summarized when the window rolls over or the provider recovers.
+    Repeats for the same normalized provider/failure class/task route are
+    counted and summarized when the window rolls over or the provider recovers.
     """
     normalized_provider = _normalize_chain_label(provider or "auto") or "auto"
-    key = (normalized_provider, failure_class)
+    route_task = str(task or "global").strip() or "global"
+    key = (normalized_provider, failure_class, route_task)
     now = _aux_time()
     with _aux_warning_lock:
         bucket = _aux_warning_buckets.get(key)
@@ -2236,7 +2286,7 @@ def _should_emit_aux_health_warning(
             _aux_warning_buckets[key] = {"first": now, "last": now, "suppressed": 0.0}
             return True
         if now - bucket.get("first", now) >= window:
-            _emit_aux_warning_summary(normalized_provider, failure_class, bucket)
+            _emit_aux_warning_summary(normalized_provider, failure_class, route_task, bucket)
             _aux_warning_buckets[key] = {"first": now, "last": now, "suppressed": 0.0}
             return True
         bucket["last"] = now
@@ -2253,7 +2303,7 @@ def _flush_aux_health_warning_summary(provider: str, failure_class: Optional[str
         ]
         for key in keys:
             bucket = _aux_warning_buckets.pop(key)
-            _emit_aux_warning_summary(key[0], key[1], bucket)
+            _emit_aux_warning_summary(key[0], key[1], key[2], bucket)
 
 
 def log_auxiliary_health_warning(
@@ -2261,9 +2311,10 @@ def log_auxiliary_health_warning(
     failure_class: str,
     message: str,
     *args: Any,
+    task: Optional[str] = None,
     window: float = _AUX_WARNING_WINDOW_SECONDS,
 ) -> None:
-    if _should_emit_aux_health_warning(provider, failure_class, window=window):
+    if _should_emit_aux_health_warning(provider, failure_class, task=task, window=window):
         logger.warning(message, *args)
 
 # Map provider names that show up in resolved_provider / explicit-config
@@ -2291,7 +2342,14 @@ def _normalize_chain_label(provider: str) -> str:
     return _AUX_UNHEALTHY_LABEL_ALIASES.get(p, p)
 
 
-def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None:
+def _mark_provider_unhealthy(
+    provider: str,
+    ttl: Optional[float] = None,
+    *,
+    failure_class: str = "payment_error",
+    reason: str = "payment / credit error",
+    task: Optional[str] = None,
+) -> None:
     """Mark ``provider`` as recently-402'd, hidden from chain iteration
     until the TTL expires. Called from the payment-fallback branches in
     ``call_llm`` and ``acall_llm`` after a confirmed payment error.
@@ -2304,12 +2362,15 @@ def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None
         _aux_unhealthy_until[label] = expires_at
     log_auxiliary_health_warning(
         label,
-        "payment_error",
-        "Auxiliary: marking %s unhealthy for %ds (payment / credit error). "
-        "Subsequent auxiliary calls will skip it until %s.",
+        failure_class,
+        "Auxiliary: marking %s unhealthy for %ds (%s). "
+        "task=%s; final_state=degraded; subsequent auxiliary calls will skip it until %s.",
         label,
         int(ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS),
+        reason,
+        task or "global",
         _format_aux_warning_ts(expires_at),
+        task=task,
     )
 
 
@@ -2337,7 +2398,7 @@ def _log_skip_unhealthy(label: str, task: Optional[str] = None) -> None:
     giving the user a trail.
     """
     now = _aux_time()
-    emit = _should_emit_aux_health_warning(label, "unhealthy_skip")
+    emit = _should_emit_aux_health_warning(label, "unhealthy_skip", task=task)
     last = _aux_unhealthy_logged_at.get(label, 0.0)
     if emit and now - last >= 60:
         with _aux_warning_lock:
@@ -2933,7 +2994,10 @@ def _try_payment_fallback(
             _log_skip_unhealthy(label, task)
             tried.append(f"{label} (unhealthy)")
             continue
-        client, model = try_fn()
+        try:
+            client, model = try_fn(task=task)
+        except TypeError:
+            client, model = try_fn()
         if client is not None:
             logger.info(
                 "Auxiliary %s: %s on %s — falling back to %s (%s)",
@@ -3231,8 +3295,12 @@ def _resolve_auto(
         "no_provider",
         "Auxiliary auto-detect: no provider available (tried: %s). "
         "Compression, summarization, and memory flush will not work. "
+        "task=%s; route_chain=%s; final_state=degraded. "
         "Set OPENROUTER_API_KEY or configure a local model in config.yaml.",
         ", ".join(tried),
+        task or "global",
+        ", ".join(tried),
+        task=task,
     )
     return None, None
 
@@ -3471,11 +3539,14 @@ def resolve_provider_client(
 
     # ── OpenRouter ───────────────────────────────────────────
     if provider == "openrouter":
-        client, default = _try_openrouter(explicit_api_key=explicit_api_key)
+        client, default = _try_openrouter(explicit_api_key=explicit_api_key, task=task)
         if client is None:
-            logger.warning(
+            log_auxiliary_health_warning(
+                "openrouter",
+                "unavailable",
                 "resolve_provider_client: openrouter requested but %s",
                 _describe_openrouter_unavailable(),
+                task=task,
             )
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
@@ -3490,10 +3561,16 @@ def resolve_provider_client(
             model in _PROVIDER_VISION_MODELS.values()
             or (model or "").strip().lower() == "mimo-v2-omni"
         )
-        client, default = _try_nous(vision=_is_vision)
+        client, default = _try_nous(vision=_is_vision, task=task)
         if client is None:
-            logger.warning("resolve_provider_client: nous requested "
-                           "but Nous Portal not configured (run: hermes auth)")
+            log_auxiliary_health_warning(
+                "nous",
+                "unavailable",
+                "resolve_provider_client: nous requested but Nous Portal not "
+                "configured (run: hermes auth). task=%s; final_state=degraded.",
+                task or "global",
+                task=task,
+            )
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
@@ -4080,9 +4157,9 @@ def _resolve_strict_vision_backend(
     if provider == "copilot":
         return resolve_provider_client("copilot", model, is_vision=True)
     if provider == "openrouter":
-        return _try_openrouter(model=model)
+        return _try_openrouter(model=model, task="vision")
     if provider == "nous":
-        return _try_nous(vision=True)
+        return _try_nous(vision=True, task="vision")
     if provider == "openai-codex":
         # Route through resolve_provider_client so the caller's explicit
         # model is used.  There is no safe default Codex model (shifting
