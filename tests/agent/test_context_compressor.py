@@ -234,6 +234,62 @@ class TestCompress:
         assert len(result[1]["content"]) < len(summary)
         assert result[-1] == msgs[-1]
 
+    def test_prune_compacts_oversized_historical_skill_view_in_tail(self, compressor):
+        import json
+
+        skill_content = """---
+version: 2.3.4
+---
+# Demo Skill
+## When to Use
+Use it for testing.
+## Procedure
+Follow the steps.
+## Verification
+Run the checks.
+""" + ("large body\n" * 8000)
+        skill_result = json.dumps({
+            "success": True,
+            "name": "demo-skill",
+            "content": skill_content,
+            "path": "testing/demo-skill/SKILL.md",
+            "skill_dir": "/tmp/hermes/skills/testing/demo-skill",
+            "linked_files": {
+                "references": ["references/api.md"],
+                "scripts": ["scripts/check.py"],
+            },
+            "usage_hint": "To view linked files, call skill_view(name, file_path)",
+        })
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "load the skill"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_skill",
+                    "type": "function",
+                    "function": {"name": "skill_view", "arguments": '{"name":"demo-skill"}'},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_skill", "content": skill_result},
+            {"role": "assistant", "content": "I loaded it."},
+            {"role": "user", "content": "latest ask must stay"},
+        ]
+
+        result, stats = compressor.emergency_shrink(msgs, target_tokens=10_000)
+
+        compacted = result[3]["content"]
+        assert stats["tool_results"] >= 1
+        assert len(compacted) < 3000
+        assert "Skill: demo-skill" in compacted
+        assert "Version: 2.3.4" in compacted
+        assert "## Procedure" in compacted
+        assert "references/api.md" in compacted
+        assert "scripts/check.py" in compacted
+        assert "skill_view(name, file_path)" in compacted
+        assert result[-1] == msgs[-1]
+
 
 class TestGenerateSummaryNoneContent:
     """Regression: content=None (from tool-call-only assistant messages) must not crash."""
