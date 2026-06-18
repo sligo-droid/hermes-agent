@@ -201,6 +201,23 @@ def test_status_stub_records_timeout_error_class_and_is_non_empty():
     assert 'error_class: "TimeoutError"' in output
 
 
+def test_status_stub_records_interrupted_error_class_and_is_non_empty():
+    output = _render_job_status_stub(
+        {"id": "interrupted-job", "name": "Interrupted job", "schedule_display": "manual"},
+        status="interrupted",
+        run_time="2026-06-13 12:22:30",
+        session_id="cron_interrupted-job_20260613_122230",
+        error_class="InterruptedError",
+        message="Cron job was interrupted before final output closeout.",
+    )
+
+    assert output.strip()
+    assert "artifact_schema: cron-output-status-v1" in output
+    assert 'status: "interrupted"' in output
+    assert 'session_id: "cron_interrupted-job_20260613_122230"' in output
+    assert 'error_class: "InterruptedError"' in output
+
+
 def test_status_stub_records_manual_run_id():
     output = _render_job_status_stub(
         {"id": "manual-job", "name": "Manual job", "schedule_display": "manual"},
@@ -278,6 +295,49 @@ def test_reconcile_zero_byte_output_artifacts_annotates_eligible_manual_run(monk
     assert 'job_id: "known-job"' in saved
     assert 'run_id: "run-123"' in saved
     assert 'session_id: "cron_known-job_20260618_090000"' in saved
+
+
+def test_reconcile_zero_byte_output_artifacts_preserves_interrupted_manual_run_status(monkeypatch, tmp_path):
+    import cron.scheduler as scheduler
+
+    now = datetime(2026, 6, 18, 10, 0, tzinfo=timezone.utc)
+    output_root = tmp_path / "output"
+    artifact = output_root / "interrupted-job" / "2026-06-18_09-00-00.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.touch()
+    old_mtime = (now - timedelta(minutes=45)).timestamp()
+    os.utime(artifact, (old_mtime, old_mtime))
+    job = {
+        "id": "interrupted-job",
+        "name": "Interrupted job",
+        "schedule_display": "manual",
+        "manual_run": {
+            "run_id": "run-interrupted",
+            "state": "interrupted",
+            "output_path": str(artifact),
+            "error": "Manual cron run was interrupted before completion or lost during restart.",
+        },
+    }
+
+    monkeypatch.setattr(scheduler, "load_jobs", lambda: [job])
+    monkeypatch.setattr(
+        scheduler,
+        "_session_evidence_for_output_artifact",
+        lambda job_id, artifact_time: {
+            "available": True,
+            "session_id": f"cron_{job_id}_20260618_090000",
+            "ended_at": None,
+        },
+    )
+
+    assert reconcile_zero_byte_output_artifacts(now=now, output_root=output_root, stale_after_seconds=1800) == 1
+    saved = artifact.read_text(encoding="utf-8")
+    assert saved.strip()
+    assert "artifact_schema: cron-output-status-v1" in saved
+    assert 'status: "interrupted"' in saved
+    assert 'error_class: "InterruptedError"' in saved
+    assert 'run_id: "run-interrupted"' in saved
+    assert 'session_id: "cron_interrupted-job_20260618_090000"' in saved
 
 
 def test_reconcile_zero_byte_output_artifacts_leaves_ineligible_files_unchanged(monkeypatch, tmp_path):

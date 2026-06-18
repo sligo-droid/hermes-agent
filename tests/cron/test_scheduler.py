@@ -2070,6 +2070,40 @@ class TestSilentDelivery:
         assert "pre-final boom" in failed_doc
         mark_mock.assert_called_once_with("monitor-job", False, "pre-final boom")
 
+    def test_run_job_interrupted_result_renders_interrupted_output_status(self):
+        job = self._make_job()
+        result = {
+            "failed": True,
+            "completed": False,
+            "interrupted": True,
+            "error": "agent interrupted by shutdown",
+            "final_response": "",
+            "messages": [],
+        }
+
+        with patch("run_agent.AIAgent") as mock_agent_cls, \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("hermes_state.SessionDB"):
+            mock_agent = mock_agent_cls.return_value
+            mock_agent.run_conversation.return_value = result
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert "InterruptedError: agent interrupted by shutdown" == error
+        assert "artifact_schema: cron-output-v2" in output
+        assert 'status: "interrupted"' in output
+        assert "InterruptedError: agent interrupted by shutdown" in output
+
 
 class TestBuildJobPromptSilentHint:
     """Verify _build_job_prompt always injects [SILENT] guidance."""

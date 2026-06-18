@@ -1739,7 +1739,12 @@ def reconcile_zero_byte_output_artifacts(
             status = "running"
             error_class = None
             if manual.get("state") in {"completed", "error", "interrupted"} and linked_manual:
-                status = "failed" if manual.get("state") in {"error", "interrupted"} else "empty"
+                if manual.get("state") == "interrupted":
+                    status = "interrupted"
+                elif manual.get("state") == "error":
+                    status = "failed"
+                else:
+                    status = "empty"
                 error_class = "InterruptedError" if manual.get("state") == "interrupted" else None
             elif linked_session and session.get("ended_at") is not None:
                 status = "empty"
@@ -2410,6 +2415,8 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 or (result.get("final_response") or "").strip()
                 or "agent reported failure"
             )
+            if result.get("interrupted") is True:
+                raise InterruptedError(_err_text)
             raise RuntimeError(_err_text)
 
         final_response = result.get("final_response", "") or ""
@@ -2434,7 +2441,12 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         error_msg = redact_auth_incident_text(f"{type(e).__name__}: {str(e)}")
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         
-        status = "timed_out" if isinstance(e, TimeoutError) else "failed"
+        if isinstance(e, TimeoutError):
+            status = "timed_out"
+        elif isinstance(e, InterruptedError):
+            status = "interrupted"
+        else:
+            status = "failed"
         output = _render_job_output(
             job,
             prompt,
