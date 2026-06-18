@@ -4662,6 +4662,179 @@ def test_ensure_pr_explicit_target_repo_overrides_checkout_remote(monkeypatch, t
     assert pr_create[pr_create.index("--head") + 1] == "discord/pr-amend-target"
 
 
+def test_ensure_pr_amend_uses_head_repo_and_never_upstream_for_pr_commands(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+
+    board = dwb.start_direct_goal(
+        thread_id="pr-amend-finalizer-target",
+        goal="Amend upstream PR through fork branch",
+        project_context={
+            "github_pr_target_repo": "sligo-droid/reserve-index-dtf",
+            "base_branch": "feat/irrevocable-fee-recipients",
+            "project_github_url": "https://github.com/reserve-protocol/reserve-index-dtf",
+            "github_pr_amend": {
+                "upstream_repo": "reserve-protocol/reserve-index-dtf",
+                "upstream_pr_number": "182",
+                "head_repo": "sligo-droid/reserve-index-dtf",
+                "head_ref": "feat/irrevocable-fee-recipients",
+                "head_sha": "oldsha",
+                "source_kind": "issue_comment",
+            },
+        },
+    )
+    workspace = tmp_path / "repo"
+    project_path = tmp_path / "canonical"
+    workspace.mkdir()
+    project_path.mkdir()
+    dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "remote", "get-url", "origin"]:
+            return SimpleNamespace(returncode=0, stdout="git@github.com:reserve-protocol/reserve-index-dtf.git\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-droid/reserve-index-dtf/pull/7\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=7), stderr="")
+        sync_result = _canonical_sync_result(cmd)
+        if sync_result is not None:
+            return sync_result
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr(board.slug, str(workspace)) is True
+
+    gh_pr_calls = [cmd for cmd in calls if cmd[:2] == ["gh", "pr"]]
+    assert gh_pr_calls
+    assert all(cmd[cmd.index("--repo") + 1] == "sligo-droid/reserve-index-dtf" for cmd in gh_pr_calls if "--repo" in cmd)
+    assert all("reserve-protocol/reserve-index-dtf" not in cmd for cmd in gh_pr_calls)
+    pr_create = next(cmd for cmd in gh_pr_calls if cmd[:3] == ["gh", "pr", "create"])
+    assert pr_create[pr_create.index("--base") + 1] == "feat/irrevocable-fee-recipients"
+
+
+def test_ensure_pr_amend_blocks_when_upstream_head_sha_does_not_advance(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="pr-amend-unchanged-head",
+        goal="Amend upstream PR through fork branch",
+        project_context={
+            "github_pr_target_repo": "sligo-droid/reserve-index-dtf",
+            "base_branch": "feat/irrevocable-fee-recipients",
+            "github_pr_amend": {
+                "upstream_repo": "reserve-protocol/reserve-index-dtf",
+                "upstream_pr_number": "182",
+                "head_repo": "sligo-droid/reserve-index-dtf",
+                "head_ref": "feat/irrevocable-fee-recipients",
+                "head_sha": "oldsha",
+                "source_kind": "review",
+                "review_state": "CHANGES_REQUESTED",
+                "requires_head_sha_advance": True,
+            },
+        },
+    )
+    workspace = tmp_path / "repo"
+    project_path = tmp_path / "canonical"
+    workspace.mkdir()
+    project_path.mkdir()
+    dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
+    view_states = ["OPEN", "MERGED"]
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-droid/reserve-index-dtf/pull/7\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"] and "headRefOid" in cmd:
+            return SimpleNamespace(returncode=0, stdout="oldsha\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=7, state=view_states.pop(0)), stderr="")
+        if cmd[:3] == ["gh", "pr", "merge"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        sync_result = _canonical_sync_result(cmd)
+        if sync_result is not None:
+            return sync_result
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr(board.slug, str(workspace)) is False
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert meta["pr_state"] == "MERGED"
+    assert meta["pr_amend_head_advanced"] is False
+    assert meta["pr_amend_upstream_head_sha"] == "oldsha"
+    assert meta["pr_amend_trigger_head_sha"] == "oldsha"
+    assert meta["pr_blocker"] == "PR-amend completion blocked: upstream PR head SHA did not advance from triggering review commit."
+
+
+def test_ensure_pr_amend_succeeds_when_upstream_head_sha_advances(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="pr-amend-advanced-head",
+        goal="Amend upstream PR through fork branch",
+        project_context={
+            "github_pr_target_repo": "sligo-droid/reserve-index-dtf",
+            "base_branch": "feat/irrevocable-fee-recipients",
+            "github_pr_amend": {
+                "upstream_repo": "reserve-protocol/reserve-index-dtf",
+                "upstream_pr_number": "182",
+                "head_repo": "sligo-droid/reserve-index-dtf",
+                "head_ref": "feat/irrevocable-fee-recipients",
+                "head_sha": "oldsha",
+                "source_kind": "review",
+                "review_state": "CHANGES_REQUESTED",
+                "requires_head_sha_advance": True,
+            },
+        },
+    )
+    workspace = tmp_path / "repo"
+    project_path = tmp_path / "canonical"
+    workspace.mkdir()
+    project_path.mkdir()
+    dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
+    view_states = ["OPEN", "MERGED"]
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-droid/reserve-index-dtf/pull/7\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"] and "headRefOid" in cmd:
+            return SimpleNamespace(returncode=0, stdout="newsha\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=7, state=view_states.pop(0)), stderr="")
+        if cmd[:3] == ["gh", "pr", "merge"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        sync_result = _canonical_sync_result(cmd)
+        if sync_result is not None:
+            return sync_result
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr(board.slug, str(workspace)) is True
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert meta["pr_state"] == "MERGED"
+    assert meta["pr_amend_head_advanced"] is True
+    assert meta["pr_amend_upstream_head_sha"] == "newsha"
+    assert meta["pr_blocker"] == ""
+
+
 def test_ensure_pr_skips_foreman_no_change_branch(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
