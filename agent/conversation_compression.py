@@ -41,6 +41,26 @@ from agent.model_metadata import estimate_request_tokens_rough
 
 logger = logging.getLogger(__name__)
 
+
+def _log_compression_degraded_once(
+    provider: str,
+    failure_class: str,
+    message: str,
+    *args: Any,
+) -> None:
+    try:
+        from agent.auxiliary_client import log_auxiliary_health_warning
+
+        log_auxiliary_health_warning(
+            provider,
+            failure_class,
+            message,
+            *args,
+            task="compression",
+        )
+    except Exception:
+        logger.warning(message, *args)
+
 _CHURN_WINDOW_SECONDS = 10 * 60
 _CHURN_RECENT_COMPRESSION_LIMIT = 3
 _CHURN_ZERO_MESSAGE_LIMIT = 2
@@ -133,9 +153,13 @@ def check_compression_model_feasibility(agent: Any) -> None:
                 )
             agent._compression_warning = msg
             agent._emit_status(msg)
-            logger.warning(
-                "No auxiliary LLM provider for compression — "
-                "summaries will be unavailable."
+            _log_compression_degraded_once(
+                _aux_cfg_provider or "auto",
+                "no_provider",
+                "No auxiliary LLM provider for compression — summaries will be "
+                "unavailable. task=compression; provider=%s; route_chain=auto; "
+                "failure_class=no_provider; final_state=degraded; messages are unchanged.",
+                _aux_cfg_provider or "auto",
             )
             return
 
