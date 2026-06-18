@@ -74,6 +74,12 @@ def _patch_list_profiles(names: list[str]):
     ]
 
 
+def test_decomposer_prompt_preserves_ui_routing_terms():
+    assert "UI/frontend/" in decomp._SYSTEM_PROMPT
+    assert "dashboard/TUI" in decomp._SYSTEM_PROMPT
+    assert "UI-specialist model" in decomp._SYSTEM_PROMPT
+
+
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="ship a feature", triage=True)

@@ -559,6 +559,13 @@ def delegate_coding_task(
     except Exception as exc:
         autoreview_note = f"Autoreview helper materialization failed before worker start: {exc}"
 
+    try:
+        from hermes_cli.config import load_config
+
+        loaded_config = load_config() or {}
+    except Exception:
+        loaded_config = {}
+
     timeout = (
         float(turn_timeout_seconds)
         if turn_timeout_seconds is not None
@@ -569,9 +576,41 @@ def delegate_coding_task(
     try:
         from agent.opencode_worker import BACKEND_OPENCODE, load_coding_worker_backend
 
-        backend = load_coding_worker_backend()
+        try:
+            backend = load_coding_worker_backend(config=loaded_config)
+        except TypeError:
+            backend = load_coding_worker_backend()
     except Exception:
         backend = "codex"
+
+    try:
+        from hermes_cli.ui_work_routing import resolve_ui_work_route
+
+        ui_route = resolve_ui_work_route(
+            loaded_config,
+            task=task_text,
+            context=str(context or ""),
+            cwd=workdir,
+            backend=backend,
+        )
+    except Exception:
+        ui_route = None
+    if ui_route is not None and ui_route.error:
+        return tool_error(ui_route.error)
+    ui_route_metadata = (
+        ui_route.metadata()
+        if ui_route is not None
+        else {
+            "matched": False,
+            "enabled": False,
+            "reason": "ui routing unavailable",
+            "provider": "",
+            "model": "",
+            "backend": backend,
+            "fallback_allowed": False,
+            "error": "",
+        }
+    )
 
     worker_label = "OpenCode" if backend == BACKEND_OPENCODE else "Codex"
     worker_prompt_parts = [
@@ -676,6 +715,7 @@ def delegate_coding_task(
                 "thread_id": result.thread_id,
                 "turn_id": result.turn_id,
                 "tool_iterations": result.tool_iterations,
+                "ui_work_route": ui_route_metadata,
         }
         no_final_metadata = getattr(result, "no_final_metadata", None)
         if no_final_metadata:
@@ -693,6 +733,10 @@ def delegate_coding_task(
         from agent.transports.codex_app_server_session import CodexAppServerSession
     except Exception as exc:
         return tool_error(f"could not import Codex app-server session: {exc}")
+    try:
+        from hermes_cli.ui_work_routing import codex_ui_work_extra_args
+    except Exception:
+        codex_ui_work_extra_args = None
 
     try:
         from tools.terminal_tool import _get_approval_callback
@@ -733,6 +777,11 @@ def delegate_coding_task(
     agents: list[str] = []
     plan_text = ""
     turns = []
+    ui_codex_args = (
+        codex_ui_work_extra_args(ui_route)
+        if codex_ui_work_extra_args is not None and ui_route is not None
+        else []
+    )
 
     try:
         pass_cfg = load_coding_worker_pass_config()
@@ -742,7 +791,7 @@ def delegate_coding_task(
             with CodexAppServerSession(
                 cwd=workdir,
                 codex_home=str(codex_home) if codex_home is not None else None,
-                extra_args=_codex_reasoning_args(
+                extra_args=ui_codex_args + _codex_reasoning_args(
                     pass_cfg["complex_plan_reasoning_level"]
                 ),
                 approval_callback=approval_callback,
@@ -774,6 +823,7 @@ def delegate_coding_task(
                         "turn_id": plan_turn.turn_id,
                         "tool_iterations": plan_turn.tool_iterations,
                         "projected_message_count": len(plan_turn.projected_messages),
+                        "ui_work_route": ui_route_metadata,
                     },
                     ensure_ascii=False,
                 )
@@ -795,7 +845,7 @@ def delegate_coding_task(
         with CodexAppServerSession(
             cwd=workdir,
             codex_home=str(codex_home) if codex_home is not None else None,
-            extra_args=_codex_reasoning_args(reasoning_level),
+            extra_args=ui_codex_args + _codex_reasoning_args(reasoning_level),
             approval_callback=approval_callback,
             on_event=_touch_codex_activity,
             env={"HERMES_SESSION_KEY": getattr(parent_agent, "session_key", "")},
@@ -840,6 +890,7 @@ def delegate_coding_task(
             "turn_id": turn.turn_id,
             "tool_iterations": tool_iterations,
             "projected_message_count": projected_message_count,
+            "ui_work_route": ui_route_metadata,
         },
         ensure_ascii=False,
     )
