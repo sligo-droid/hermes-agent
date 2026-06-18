@@ -1307,6 +1307,52 @@ def test_pr_amend_unchanged_head_sha_keeps_terminal_state_blocked(monkeypatch, t
     assert summary["pr"]["blocker"] == "PR-amend completion blocked: upstream PR head SHA did not advance from triggering review commit."
 
 
+def test_pr_amend_head_advance_claim_requires_post_push_head_sha(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(
+        thread_id="78014",
+        goal="Amend upstream PR through fork branch",
+        project_context={
+            "github_pr_amend": {
+                "requires_head_sha_advance": True,
+                "upstream_repo": "reserve-protocol/reserve-index-dtf",
+                "upstream_pr_number": "182",
+                "head_repo": "sligo-droid/reserve-index-dtf",
+                "head_ref": "feat/irrevocable-fee-recipients",
+                "head_sha": "oldsha",
+            }
+        },
+    )
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "done",
+            "phase": "complete",
+            "summary_message_id": "333",
+            "source_message_id": "111",
+            "pr_url": "https://github.com/sligo-droid/reserve-index-dtf/pull/7",
+            "pr_state": "MERGED",
+            "pr_merged_at": "2026-06-17T15:26:40Z",
+            "pr_merge_commit": "c4c33e0b8d6b9b1c93c6351013b5fd31a340ee98",
+            "pr_checks_status": "passed",
+            "pr_checks_failed": [],
+            "pr_amend_head_advanced": True,
+            "concise_outcome": "Worker summary claims the review request was implemented.",
+            "terminal_completion_message_pending": True,
+        },
+    )
+
+    target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
+    summary = dwb.build_board_run_summary(board.slug)
+
+    assert target["state"] == "blocked"
+    assert summary["thread_state"] == "blocked"
+    assert summary["pr"]["blocker"] != ""
+    assert summary["deployment_status"] != "done"
+
+
 def test_start_direct_goal_activates_board_without_planner(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

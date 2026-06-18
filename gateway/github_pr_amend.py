@@ -859,6 +859,12 @@ def build_pr_amend_discord_card(
     title = f"GitHub PR amend: {repo}#{pr_number}"
     summary = f"{sender} requested an amendment on `{repo}` PR #{pr_number}: {pr_title}"
     requires_head_sha_advance = _pr_amend_requires_head_sha_advance(artifact)
+    source_body = _compact_pr_amend_text(body, limit=1000)
+    source_criterion = (
+        f"Address the triggering {source_kind or 'GitHub'} request verbatim: {source_body}"
+        if source_body
+        else "Address the triggering GitHub PR-amend request."
+    )
     request_body = "\n\n".join(
         part
         for part in (
@@ -882,6 +888,7 @@ def build_pr_amend_discord_card(
         "proposal_id": str(artifact.get("delivery_id") or ""),
         "rationale": "Accepted signed GitHub PR-amend webhook routed through the Command Center/Discord worker-board path.",
         "acceptance_criteria": [
+            source_criterion,
             "Do not post GitHub text comments or reviews.",
             "Accepted intake must produce and use the corresponding Discord worker-board embed/thread, like an approved Command Center job.",
             f"Target repo for checkout/PR lifecycle is `{head_repo}`; upstream `{base_repo}` is review context only.",

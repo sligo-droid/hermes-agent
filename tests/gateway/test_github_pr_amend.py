@@ -428,6 +428,11 @@ class TestGitHubPrAmendPolicy:
         assert card["project_context"]["github_pr_amend"]["source_node_id"] == payload["review"]["node_id"]
         assert card["project_context"]["github_pr_amend"]["source_key"] == "github-pr-amend:review:4518030260"
         assert card["project_context"]["github_pr_amend"]["requires_head_sha_advance"] is True
+        assert any(
+            "Address the triggering review request verbatim: @sligo-droid please address the inline comments."
+            == criterion
+            for criterion in card["acceptance_criteria"]
+        )
         assert artifact["fetched_context"]["review_comments"] == context["review_comments"]
 
     def test_pr_amend_card_targets_head_repo_and_marks_upstream_context_only(self, tmp_path):

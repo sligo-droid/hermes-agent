@@ -3347,8 +3347,18 @@ def _pr_merge_evidence_present(*, state: str, merged_at: str, merge_commit: str)
 def _worker_has_successful_pr_terminal_evidence(worker: dict[str, Any]) -> bool:
     context = worker.get("project_context") if isinstance(worker.get("project_context"), dict) else {}
     amend = context.get("github_pr_amend") if isinstance(context.get("github_pr_amend"), dict) else {}
-    if amend.get("requires_head_sha_advance") is True and worker.get("pr_amend_head_advanced") is not True:
+    requires_head_sha_advance = amend.get("requires_head_sha_advance") is True
+    if requires_head_sha_advance and worker.get("pr_amend_head_advanced") is not True:
         return False
+    if requires_head_sha_advance:
+        upstream_head = str(worker.get("pr_amend_upstream_head_sha") or "").strip()
+        trigger_head = str(worker.get("pr_amend_trigger_head_sha") or amend.get("head_sha") or "").strip()
+        if not upstream_head or not trigger_head or upstream_head == trigger_head:
+            worker.setdefault(
+                "pr_blocker",
+                "PR-amend completion blocked: missing post-push upstream PR head SHA verification.",
+            )
+            return False
     state = str(worker.get("pr_state") or "").strip()
     merged_at = str(worker.get("pr_merged_at") or "").strip()
     merge_commit = str(worker.get("pr_merge_commit") or "").strip()
