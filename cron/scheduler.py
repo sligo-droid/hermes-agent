@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 from contextlib import contextmanager
+from datetime import datetime
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -250,6 +251,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 from cron.jobs import (
     advance_next_run,
     get_due_jobs,
+    load_jobs,
     mark_job_run,
     mark_job_terminal_success,
     mark_manual_run_finished,
@@ -1572,6 +1574,7 @@ def _render_job_status_stub(
     status: str,
     run_time: str | None = None,
     session_id: str | None = None,
+    run_id: str | None = None,
     error_class: str | None = None,
     message: str = "",
 ) -> str:
@@ -1591,6 +1594,8 @@ def _render_job_status_stub(
     ]
     if session_id:
         metadata_lines.append(f"session_id: {_cron_output_metadata_value(session_id)}")
+    if run_id:
+        metadata_lines.append(f"run_id: {_cron_output_metadata_value(run_id)}")
     if error_class:
         metadata_lines.append(f"error_class: {_cron_output_metadata_value(error_class)}")
     metadata_lines.append("---")
@@ -1604,6 +1609,159 @@ def _render_job_status_stub(
         f"**Status:** {status}\n\n"
         f"{body}\n"
     )
+
+
+def _cron_output_reconcile_age_seconds() -> int:
+    """Return the bounded still-running window before empty artifact repair."""
+    default = 30 * 60
+    raw = os.getenv("HERMES_CRON_OUTPUT_RECONCILE_AFTER_SECONDS", "").strip()
+    if raw:
+        try:
+            value = int(float(raw))
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid HERMES_CRON_OUTPUT_RECONCILE_AFTER_SECONDS=%r; using default %ds",
+                raw,
+                default,
+            )
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        value = int(float(cron_cfg.get("output_reconcile_after_seconds") or default))
+        return value if value > 0 else default
+    except Exception:
+        return default
+
+
+def _parse_cron_output_filename_time(path: Path) -> datetime | None:
+    try:
+        return datetime.strptime(path.stem, "%Y-%m-%d_%H-%M-%S").replace(tzinfo=_hermes_now().tzinfo)
+    except (TypeError, ValueError):
+        return None
+
+
+def _session_evidence_for_output_artifact(
+    job_id: str,
+    artifact_time: datetime | None,
+    *,
+    max_session_skew_seconds: int = 10 * 60,
+) -> dict:
+    evidence = {"session_id": None, "ended_at": None, "available": False}
+    db_path = _get_hermes_home() / "state.db"
+    if not db_path.exists():
+        return evidence
+
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, started_at, ended_at
+                FROM sessions
+                WHERE id LIKE ?
+                ORDER BY started_at DESC
+                LIMIT 5
+                """,
+                (f"cron_{job_id}_%",),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return evidence
+
+    evidence["available"] = True
+    if not rows:
+        return evidence
+
+    selected = rows[0]
+    if artifact_time is not None:
+        artifact_ts = artifact_time.timestamp()
+        selected = min(
+            rows,
+            key=lambda row: abs(float(row["started_at"] or 0.0) - artifact_ts),
+        )
+        if abs(float(selected["started_at"] or 0.0) - artifact_ts) > max_session_skew_seconds:
+            return evidence
+    evidence["session_id"] = selected["id"]
+    evidence["ended_at"] = selected["ended_at"]
+    return evidence
+
+
+def reconcile_zero_byte_output_artifacts(
+    *,
+    now: datetime | None = None,
+    output_root: Path | None = None,
+    stale_after_seconds: int | None = None,
+) -> int:
+    """Annotate eligible stale zero-byte cron output artifacts.
+
+    Eligibility is intentionally narrow: only files under a known job output
+    directory, either linked to the active manual run output path or to a recent
+    cron session for that job, and older than the bounded still-running window.
+    """
+    check_now = now or _hermes_now()
+    max_age = stale_after_seconds if stale_after_seconds is not None else _cron_output_reconcile_age_seconds()
+    root = output_root or (_get_hermes_home() / "cron" / "output")
+    jobs = {str(job.get("id")): job for job in load_jobs() if job.get("id")}
+    repaired = 0
+
+    for job_id, job in jobs.items():
+        job_dir = root / job_id
+        try:
+            candidates = [path for path in job_dir.glob("*.md") if path.is_file()]
+        except OSError:
+            continue
+        for artifact in candidates:
+            try:
+                stat = artifact.stat()
+            except OSError:
+                continue
+            if stat.st_size != 0:
+                continue
+            artifact_time = _parse_cron_output_filename_time(artifact)
+            artifact_age = check_now.timestamp() - stat.st_mtime
+            if artifact_age < max_age:
+                continue
+
+            manual = job.get("manual_run") if isinstance(job.get("manual_run"), dict) else {}
+            manual_output = str(manual.get("output_path") or "")
+            session = _session_evidence_for_output_artifact(job_id, artifact_time)
+            linked_manual = bool(manual_output and Path(manual_output) == artifact)
+            linked_session = bool(session.get("session_id"))
+            if not linked_manual and not linked_session:
+                continue
+
+            status = "running"
+            error_class = None
+            if manual.get("state") in {"completed", "error", "interrupted"} and linked_manual:
+                status = "failed" if manual.get("state") in {"error", "interrupted"} else "empty"
+                error_class = "InterruptedError" if manual.get("state") == "interrupted" else None
+            elif linked_session and session.get("ended_at") is not None:
+                status = "empty"
+
+            stub = _render_job_status_stub(
+                job,
+                status=status,
+                run_time=artifact_time.strftime("%Y-%m-%d %H:%M:%S") if artifact_time else None,
+                session_id=str(session.get("session_id") or "") or None,
+                run_id=str(manual.get("run_id") or "") or None,
+                error_class=error_class,
+                message=(
+                    "Cron output artifact was zero bytes after the bounded still-running window; "
+                    "annotated from cron job/manual-run metadata and session provenance."
+                ),
+            )
+            try:
+                update_job_output(artifact, stub)
+                repaired += 1
+            except OSError as exc:
+                logger.warning("Failed to reconcile cron output artifact %s: %s", artifact, exc)
+    return repaired
 
 
 def _render_job_output(
@@ -2361,6 +2519,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
     _set_tick_running(True)
     try:
+        reconcile_zero_byte_output_artifacts()
         due_jobs = get_due_jobs()
 
         if verbose and not due_jobs:
@@ -2415,7 +2574,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             )
             output_file = save_job_output(job["id"], running_stub)
             if manual_run_id:
-                mark_manual_run_started(job["id"], manual_run_id, os.getpid())
+                mark_manual_run_started(job["id"], manual_run_id, os.getpid(), output_path=str(output_file))
             try:
                 success, output, final_response, error = run_job(job)
 

@@ -1083,7 +1083,13 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
-def mark_manual_run_started(job_id: str, run_id: str, pid: int) -> None:
+def mark_manual_run_started(
+    job_id: str,
+    run_id: str,
+    pid: int,
+    *,
+    output_path: Optional[str] = None,
+) -> None:
     """Persist that a manually-triggered cron run is actively executing."""
     with _jobs_file_lock:
         jobs = load_jobs()
@@ -1098,6 +1104,7 @@ def mark_manual_run_started(job_id: str, run_id: str, pid: int) -> None:
                     "state": "running",
                     "started_at": manual.get("started_at") or _hermes_now().isoformat(),
                     "pid": pid,
+                    "output_path": str(output_path) if output_path else manual.get("output_path"),
                     "error": None,
                 }
             )

@@ -1,5 +1,13 @@
+import os
+from datetime import datetime, timedelta, timezone
+
 from cron.jobs import save_job_output, update_job_output
-from cron.scheduler import _ingest_self_improvement_proposal_output, _render_job_output, _render_job_status_stub
+from cron.scheduler import (
+    _ingest_self_improvement_proposal_output,
+    _render_job_output,
+    _render_job_status_stub,
+    reconcile_zero_byte_output_artifacts,
+)
 
 
 def _large_prompt(sentinel: str) -> str:
@@ -193,6 +201,17 @@ def test_status_stub_records_timeout_error_class_and_is_non_empty():
     assert 'error_class: "TimeoutError"' in output
 
 
+def test_status_stub_records_manual_run_id():
+    output = _render_job_status_stub(
+        {"id": "manual-job", "name": "Manual job", "schedule_display": "manual"},
+        status="running",
+        run_time="2026-06-13 12:23:00",
+        run_id="manual-run-123",
+    )
+
+    assert 'run_id: "manual-run-123"' in output
+
+
 def test_self_improvement_ingestion_skips_silent_and_status_stub(monkeypatch, tmp_path):
     job = {
         "id": "proposal-silent-job",
@@ -220,3 +239,107 @@ def test_self_improvement_ingestion_skips_silent_and_status_stub(monkeypatch, tm
         tmp_path / "out.md",
         "[SILENT]",
     ) is None
+
+
+def test_reconcile_zero_byte_output_artifacts_annotates_eligible_manual_run(monkeypatch, tmp_path):
+    import cron.scheduler as scheduler
+
+    now = datetime(2026, 6, 18, 10, 0, tzinfo=timezone.utc)
+    output_root = tmp_path / "output"
+    artifact = output_root / "known-job" / "2026-06-18_09-00-00.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.touch()
+    old_mtime = (now - timedelta(minutes=45)).timestamp()
+    artifact.touch()
+    os.utime(artifact, (old_mtime, old_mtime))
+    job = {
+        "id": "known-job",
+        "name": "Known job",
+        "schedule_display": "manual",
+        "manual_run": {"run_id": "run-123", "state": "running", "output_path": str(artifact)},
+    }
+
+    monkeypatch.setattr(scheduler, "load_jobs", lambda: [job])
+    monkeypatch.setattr(
+        scheduler,
+        "_session_evidence_for_output_artifact",
+        lambda job_id, artifact_time: {
+            "available": True,
+            "session_id": f"cron_{job_id}_20260618_090000",
+            "ended_at": None,
+        },
+    )
+
+    assert reconcile_zero_byte_output_artifacts(now=now, output_root=output_root, stale_after_seconds=1800) == 1
+    saved = artifact.read_text(encoding="utf-8")
+    assert saved.strip()
+    assert "artifact_schema: cron-output-status-v1" in saved
+    assert 'status: "running"' in saved
+    assert 'job_id: "known-job"' in saved
+    assert 'run_id: "run-123"' in saved
+    assert 'session_id: "cron_known-job_20260618_090000"' in saved
+
+
+def test_reconcile_zero_byte_output_artifacts_leaves_ineligible_files_unchanged(monkeypatch, tmp_path):
+    import cron.scheduler as scheduler
+
+    now = datetime(2026, 6, 18, 10, 0, tzinfo=timezone.utc)
+    output_root = tmp_path / "output"
+    fresh = output_root / "known-job" / "2026-06-18_09-50-00.md"
+    historical = output_root / "known-job" / "2026-06-18_08-00-00.md"
+    non_empty = output_root / "known-job" / "2026-06-18_07-00-00.md"
+    non_cron = output_root / "unknown-job" / "2026-06-18_08-30-00.md"
+    for path in (fresh, historical, non_empty, non_cron):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    non_empty.write_text("already has output", encoding="utf-8")
+    old_mtime = (now - timedelta(hours=2)).timestamp()
+    for path in (historical, non_empty, non_cron):
+        os.utime(path, (old_mtime, old_mtime))
+    fresh_mtime = (now - timedelta(minutes=5)).timestamp()
+    os.utime(fresh, (fresh_mtime, fresh_mtime))
+
+    monkeypatch.setattr(
+        scheduler,
+        "load_jobs",
+        lambda: [{"id": "known-job", "name": "Known job", "schedule_display": "manual"}],
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_session_evidence_for_output_artifact",
+        lambda *_args: {"available": True, "session_id": None, "ended_at": None},
+    )
+
+    assert reconcile_zero_byte_output_artifacts(now=now, output_root=output_root, stale_after_seconds=1800) == 0
+    assert fresh.stat().st_size == 0
+    assert historical.stat().st_size == 0
+    assert non_cron.stat().st_size == 0
+    assert non_empty.read_text(encoding="utf-8") == "already has output"
+
+
+def test_reconcile_zero_byte_output_artifacts_rejects_distant_session_evidence(tmp_path):
+    from hermes_state import SessionDB
+    import cron.scheduler as scheduler
+
+    now = datetime(2026, 6, 18, 10, 0, tzinfo=timezone.utc)
+    home = tmp_path / "home"
+    home.mkdir()
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("cron_known-job_20260618_060000", "cron")
+    db._conn.execute(
+        "UPDATE sessions SET started_at = ? WHERE id = ?",
+        ((now - timedelta(hours=4)).timestamp(), "cron_known-job_20260618_060000"),
+    )
+    db._conn.commit()
+
+    scheduler._hermes_home = home
+    try:
+        evidence = scheduler._session_evidence_for_output_artifact(
+            "known-job",
+            datetime(2026, 6, 18, 9, 0, tzinfo=timezone.utc),
+        )
+    finally:
+        scheduler._hermes_home = None
+
+    assert evidence["available"] is True
+    assert evidence["session_id"] is None
