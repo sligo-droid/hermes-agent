@@ -8014,6 +8014,30 @@ class GatewayRunner:
     async def _discord_kanban_typing_watcher(self, interval: float = 8.0) -> None:
         """Keep Discord thread typing visible while thread workers are running."""
         interval = max(float(interval or 8.0), 1.0)
+        error_backoff: dict[tuple[str, str, str], dict[str, float | int]] = {}
+        error_backoff_window = 60.0
+
+        def log_watcher_exception(scope: str, message: str, exc: Exception, *args: object) -> None:
+            key = (scope, type(exc).__name__, str(exc))
+            now = time.monotonic()
+            state = error_backoff.get(key)
+            if state is None or now - float(state.get("last_logged", 0.0)) >= error_backoff_window:
+                error_backoff[key] = {"last_logged": now, "suppressed": 0}
+                logger.exception(message, *args, exc_info=(type(exc), exc, exc.__traceback__))
+                return
+            state["suppressed"] = int(state.get("suppressed", 0)) + 1
+            logger.debug(
+                "%s: suppressed repeated %s after %d occurrences",
+                scope,
+                type(exc).__name__,
+                int(state["suppressed"]),
+            )
+
+        def reset_watcher_errors(scope: str) -> None:
+            for key in list(error_backoff):
+                if key[0] == scope:
+                    error_backoff.pop(key, None)
+
         while self._running:
             try:
                 adapter = self.adapters.get(Platform.DISCORD)
@@ -8027,6 +8051,8 @@ class GatewayRunner:
                     or callable(summary_sync)
                     or callable(completion_notice)
                 ):
+                    targets = []
+                    reaction_targets = []
                     try:
                         from hermes_cli.discord_worker_boards import (
                             running_discord_thread_typing_targets,
@@ -8037,30 +8063,27 @@ class GatewayRunner:
                             "discord kanban typing: worker board helper unavailable",
                             exc_info=True,
                         )
-                        targets = []
-                        reaction_targets = []
                     else:
-                        collected = await asyncio.gather(
-                            asyncio.to_thread(running_discord_thread_typing_targets),
-                            asyncio.to_thread(thread_status_targets),
-                            return_exceptions=True,
-                        )
-                        targets = []
-                        reaction_targets = []
-                        if isinstance(collected[0], Exception):
-                            logger.debug(
+                        try:
+                            targets = await asyncio.to_thread(running_discord_thread_typing_targets)
+                        except Exception as exc:
+                            log_watcher_exception(
+                                "discord kanban typing target collection",
                                 "discord kanban typing: target collection failed",
-                                exc_info=(type(collected[0]), collected[0], collected[0].__traceback__),
+                                exc,
                             )
                         else:
-                            targets = collected[0]
-                        if isinstance(collected[1], Exception):
-                            logger.debug(
+                            reset_watcher_errors("discord kanban typing target collection")
+                        try:
+                            reaction_targets = await asyncio.to_thread(thread_status_targets)
+                        except Exception as exc:
+                            log_watcher_exception(
+                                "discord kanban status target collection",
                                 "discord kanban status: target collection failed",
-                                exc_info=(type(collected[1]), collected[1], collected[1].__traceback__),
+                                exc,
                             )
                         else:
-                            reaction_targets = collected[1]
+                            reset_watcher_errors("discord kanban status target collection")
                     if callable(sender):
                         for target in targets:
                             thread_id = str(target.get("thread_id") or "").strip()
@@ -8192,8 +8215,12 @@ class GatewayRunner:
             except asyncio.CancelledError:
                 logger.debug("discord kanban typing: cancelled")
                 raise
-            except Exception:
-                logger.exception("discord kanban typing: unexpected watcher error")
+            except Exception as exc:
+                log_watcher_exception(
+                    "discord kanban typing watcher",
+                    "discord kanban typing: unexpected watcher error",
+                    exc,
+                )
                 await asyncio.sleep(interval)
 
     async def _platform_reconnect_watcher(self) -> None:
