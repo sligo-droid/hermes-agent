@@ -6,10 +6,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from tools.canonical_repo_guard import (
+    canonical_main_routing_hint,
     canonical_main_terminal_violation,
     canonical_main_worker_violation,
     canonical_main_write_violation,
 )
+from tools import coding_worker_tool as cwt
 from tools.coding_worker_tool import delegate_coding_task
 from tools.code_execution_tool import execute_code
 from tools.file_tools import patch_tool, write_file_tool
@@ -93,6 +95,23 @@ def test_terminal_guard_blocks_non_readonly_command_in_protected_main(tmp_path, 
     assert "non-read-only terminal command" in msg
 
 
+def test_routing_hint_describes_protected_main_worktree_route(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    repo = workspace / "PID"
+    _init_repo(repo)
+    _protect(monkeypatch, workspace)
+
+    msg = canonical_main_routing_hint(repo, action="delegate_coding_task")
+
+    assert msg is not None
+    assert "BLOCKED" in msg
+    assert "delegate_coding_task" in msg
+    assert str(repo) in msg
+    assert "main" in msg
+    assert "/home/droid/workspaces/" in msg
+    assert "inspection-only" in msg
+
+
 def test_terminal_guard_allows_readonly_git_and_worktree_creation(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     repo = workspace / "PID"
@@ -137,6 +156,15 @@ def test_coding_worker_refuses_protected_main_before_backend_launch(tmp_path, mo
     _init_repo(repo)
     _protect(monkeypatch, workspace)
 
+    def fail_materialize(_workdir):
+        raise AssertionError("autoreview helper should not materialize")
+
+    def fail_backend():
+        raise AssertionError("backend should not be loaded")
+
+    monkeypatch.setattr("hermes_cli.worker_autoreview.materialize_autoreview_helper", fail_materialize)
+    monkeypatch.setattr(cwt, "_load_coding_worker_timeout", fail_backend)
+
     result = json.loads(
         delegate_coding_task(
             task="change tracked.txt",
@@ -146,6 +174,7 @@ def test_coding_worker_refuses_protected_main_before_backend_launch(tmp_path, mo
     )
 
     assert "delegate_coding_task was pointed at a protected canonical checkout" in result["error"]
+    assert "/home/droid/workspaces/" in result["error"]
 
 
 def test_coding_worker_allows_nonprotected_worktree(tmp_path, monkeypatch):
