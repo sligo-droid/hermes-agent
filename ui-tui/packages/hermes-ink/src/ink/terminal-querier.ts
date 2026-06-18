@@ -20,7 +20,7 @@
  *   // sync and grapheme are DECRPM responses or undefined if unsupported
  */
 
-import type { TerminalResponse } from './parse-keypress.js'
+import { DECRPM_STATUS, type TerminalResponse } from './parse-keypress.js'
 import { csi } from './termio/csi.js'
 import { osc } from './termio/osc.js'
 
@@ -51,6 +51,10 @@ export function decrqm(mode: number): TerminalQuery<DecrpmResponse> {
     request: csi(`?${mode}$p`),
     match: (r): r is DecrpmResponse => r.type === 'decrpm' && r.mode === mode
   }
+}
+
+export function isDecrpmModeSettable(response: DecrpmResponse | undefined): boolean {
+  return response?.status === DECRPM_STATUS.SET || response?.status === DECRPM_STATUS.RESET
 }
 
 /** Primary Device Attributes query (CSI c). Every terminal answers this —
