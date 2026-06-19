@@ -59,6 +59,52 @@ def _codex_reasoning_args(reasoning_level: str) -> list[str]:
     return ["-c", f'model_reasoning_effort="{level}"']
 
 
+_UI_ROUTE_DEFAULT_FALLBACK_HINTS = (
+    "model provider",
+    "not found",
+    "not configured",
+    "missing api key",
+    "api key required",
+    "invalid api key",
+    "authentication failed",
+    "authorization failed",
+    "payment required",
+    "insufficient credit",
+    "insufficient credits",
+    "insufficient funds",
+    "no usable credits",
+    "balance_depleted",
+    "billing",
+    "credit balance",
+    "top up",
+    "quota exceeded",
+    "402",
+    "401",
+    "403",
+)
+
+
+def _should_fallback_ui_route_error(error: Any) -> bool:
+    """Return True for specialist provider failures safe to retry on default model."""
+    text = str(error or "").lower()
+    if not text:
+        return False
+    if "openrouter" in text and any(hint in text for hint in _UI_ROUTE_DEFAULT_FALLBACK_HINTS):
+        return True
+    if "model provider" in text and any(
+        hint in text for hint in ("not found", "not configured", "missing")
+    ):
+        return True
+    return False
+
+
+def _mark_ui_route_fallback(metadata: dict[str, Any], reason: str) -> dict[str, Any]:
+    updated = dict(metadata)
+    updated["fallback_used"] = True
+    updated["fallback_reason"] = str(reason or "specialist route unavailable")
+    return updated
+
+
 def _resolve_cwd(cwd: Optional[str], parent_agent: Any) -> str:
     raw = cwd or getattr(parent_agent, "session_cwd", None) or os.getcwd()
     path = Path(str(raw)).expanduser()
@@ -793,6 +839,7 @@ def delegate_coding_task(
         if codex_ui_work_extra_args is not None and ui_route is not None
         else []
     )
+    turn = None
     if (
         ui_route is not None
         and ui_route.matched
@@ -808,78 +855,128 @@ def delegate_coding_task(
 
     try:
         pass_cfg = load_coding_worker_pass_config()
+        route_attempts = [ui_codex_args]
+        if (
+            ui_codex_args
+            and ui_route is not None
+            and ui_route.matched
+            and ui_route.enabled
+            and ui_route.backend == "codex"
+            and ui_route.fallback_allowed
+        ):
+            route_attempts.append([])
+        if (
+            not ui_codex_args
+            and ui_route is not None
+            and ui_route.matched
+            and ui_route.enabled
+            and ui_route.backend == "codex"
+            and ui_route.fallback_allowed
+        ):
+            ui_route_metadata = _mark_ui_route_fallback(
+                ui_route_metadata,
+                ui_route.reason,
+            )
 
-        if needs_plan:
-            agents.append("plan")
+        for attempt_index, active_ui_codex_args in enumerate(route_attempts):
+            agents = []
+            turns = []
+            plan_text = ""
+
+            if needs_plan:
+                agents.append("plan")
+                with CodexAppServerSession(
+                    cwd=workdir,
+                    codex_home=str(codex_home) if codex_home is not None else None,
+                    extra_args=active_ui_codex_args + _codex_reasoning_args(
+                        pass_cfg["complex_plan_reasoning_level"]
+                    ),
+                    approval_callback=approval_callback,
+                    on_event=_touch_codex_activity,
+                    env={"HERMES_SESSION_KEY": getattr(parent_agent, "session_key", "")},
+                    scope_kind="coding-worker",
+                    scope_purpose="Codex coding worker plan pass",
+                ) as session:
+                    plan_turn = session.run_turn(
+                        user_input=_plan_prompt(worker_prompt),
+                        turn_timeout=timeout,
+                    )
+                turns.append(plan_turn)
+                if plan_turn.error or plan_turn.interrupted:
+                    if (
+                        attempt_index == 0
+                        and len(route_attempts) > 1
+                        and plan_turn.error
+                        and _should_fallback_ui_route_error(plan_turn.error)
+                    ):
+                        ui_route_metadata = _mark_ui_route_fallback(
+                            ui_route_metadata,
+                            plan_turn.error,
+                        )
+                        continue
+                    duration = round(time.monotonic() - started, 2)
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "status": "partial",
+                            "summary": plan_turn.final_text,
+                            "error": plan_turn.error,
+                            "interrupted": plan_turn.interrupted,
+                            "duration_seconds": duration,
+                            "cwd": workdir,
+                            "backend": "codex",
+                            "agents": agents,
+                            "plan_used": True,
+                            "thread_id": plan_turn.thread_id,
+                            "turn_id": plan_turn.turn_id,
+                            "tool_iterations": plan_turn.tool_iterations,
+                            "projected_message_count": len(plan_turn.projected_messages),
+                            "ui_work_route": ui_route_metadata,
+                        },
+                        ensure_ascii=False,
+                    )
+                plan_text = plan_turn.final_text.strip()
+
+            agents.append("build")
+            build_prompt = worker_prompt
+            if plan_text:
+                build_prompt = (
+                    f"{worker_prompt.rstrip()}\n\n"
+                    "Codex plan to follow:\n"
+                    f"{plan_text}\n"
+                )
+            reasoning_level = (
+                pass_cfg["complex_build_reasoning_level"]
+                if needs_plan
+                else pass_cfg["simple_build_reasoning_level"]
+            )
             with CodexAppServerSession(
                 cwd=workdir,
                 codex_home=str(codex_home) if codex_home is not None else None,
-                extra_args=ui_codex_args + _codex_reasoning_args(
-                    pass_cfg["complex_plan_reasoning_level"]
-                ),
+                extra_args=active_ui_codex_args + _codex_reasoning_args(reasoning_level),
                 approval_callback=approval_callback,
                 on_event=_touch_codex_activity,
                 env={"HERMES_SESSION_KEY": getattr(parent_agent, "session_key", "")},
                 scope_kind="coding-worker",
-                scope_purpose="Codex coding worker plan pass",
+                scope_purpose="Codex coding worker build pass",
             ) as session:
-                plan_turn = session.run_turn(
-                    user_input=_plan_prompt(worker_prompt),
+                turn = session.run_turn(
+                    user_input=build_prompt,
                     turn_timeout=timeout,
                 )
-            turns.append(plan_turn)
-            if plan_turn.error or plan_turn.interrupted:
-                duration = round(time.monotonic() - started, 2)
-                return json.dumps(
-                    {
-                        "success": False,
-                        "status": "partial",
-                        "summary": plan_turn.final_text,
-                        "error": plan_turn.error,
-                        "interrupted": plan_turn.interrupted,
-                        "duration_seconds": duration,
-                        "cwd": workdir,
-                        "backend": "codex",
-                        "agents": agents,
-                        "plan_used": True,
-                        "thread_id": plan_turn.thread_id,
-                        "turn_id": plan_turn.turn_id,
-                        "tool_iterations": plan_turn.tool_iterations,
-                        "projected_message_count": len(plan_turn.projected_messages),
-                        "ui_work_route": ui_route_metadata,
-                    },
-                    ensure_ascii=False,
+            turns.append(turn)
+            if (
+                attempt_index == 0
+                and len(route_attempts) > 1
+                and turn.error
+                and _should_fallback_ui_route_error(turn.error)
+            ):
+                ui_route_metadata = _mark_ui_route_fallback(
+                    ui_route_metadata,
+                    turn.error,
                 )
-            plan_text = plan_turn.final_text.strip()
-
-        agents.append("build")
-        build_prompt = worker_prompt
-        if plan_text:
-            build_prompt = (
-                f"{worker_prompt.rstrip()}\n\n"
-                "Codex plan to follow:\n"
-                f"{plan_text}\n"
-            )
-        reasoning_level = (
-            pass_cfg["complex_build_reasoning_level"]
-            if needs_plan
-            else pass_cfg["simple_build_reasoning_level"]
-        )
-        with CodexAppServerSession(
-            cwd=workdir,
-            codex_home=str(codex_home) if codex_home is not None else None,
-            extra_args=ui_codex_args + _codex_reasoning_args(reasoning_level),
-            approval_callback=approval_callback,
-            on_event=_touch_codex_activity,
-            env={"HERMES_SESSION_KEY": getattr(parent_agent, "session_key", "")},
-            scope_kind="coding-worker",
-            scope_purpose="Codex coding worker build pass",
-        ) as session:
-            turn = session.run_turn(
-                user_input=build_prompt,
-                turn_timeout=timeout,
-            )
-        turns.append(turn)
+                continue
+            break
     finally:
         if codex_home is not None and inherited_credential_id:
             try:
@@ -890,6 +987,9 @@ def delegate_coding_task(
                 pass
         if codex_home_lease is not None:
             codex_home_lease.cleanup()
+
+    if turn is None:
+        return tool_error("coding worker did not produce a build turn")
 
     duration = round(time.monotonic() - started, 2)
     success = bool(turn.final_text) and not turn.error and not turn.interrupted
