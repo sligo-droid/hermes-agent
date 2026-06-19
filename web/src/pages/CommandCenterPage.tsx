@@ -248,22 +248,22 @@ function WorkStatePanel({
     { key: "archive", label: "Archive", href: "/sligo/archive", value: laneCounts.archive },
   ];
   const tileClass = (selected: boolean) => cn(
-    "command-center-lane group rounded-2xl border px-3.5 py-3 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
-    selected ? "command-center-lane-selected border-cyan-100/55 bg-cyan-100/10 text-cyan-50" : "border-white/10 bg-white/[0.035] text-slate-300 hover:border-cyan-100/35 hover:bg-cyan-100/[0.055]",
+    "command-center-lane group rounded-xl border px-3 py-2.5 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
+    selected ? "command-center-lane-selected border-cyan-100/45 bg-cyan-100/[0.075] text-cyan-50" : "border-white/[0.08] bg-white/[0.025] text-slate-300 hover:border-cyan-100/30 hover:bg-cyan-100/[0.045]",
   );
   return (
-    <Card className="border-white/10 bg-white/[0.035]">
-      <CardHeader className="gap-1">
-        <CardTitle className="text-base text-white">Work State</CardTitle>
+    <Card className="command-center-work-state-panel border-white/[0.08] bg-white/[0.025]">
+      <CardHeader className="gap-1 pb-3">
+        <CardTitle className="text-sm font-semibold uppercase tracking-[0.16em] text-slate-300">Work State</CardTitle>
       </CardHeader>
-      <CardContent>
-        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-5" aria-label="Command Center lanes">
+      <CardContent className="pt-0">
+        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5" aria-label="Command Center lanes">
           {lanes.map((lane) => {
             const selected = activeView === lane.key;
             const content = (
               <>
-                <span className="command-center-lane-value block text-xl font-semibold tracking-tight text-white">{lane.value}</span>
-                <span className="mt-1 block text-[0.68rem] font-semibold uppercase tracking-[0.16em]">{lane.label}</span>
+                <span className="command-center-lane-value block text-lg font-semibold tracking-tight text-white">{lane.value}</span>
+                <span className="mt-1 block text-[0.66rem] font-semibold uppercase tracking-[0.16em]">{lane.label}</span>
               </>
             );
             return (
@@ -293,7 +293,7 @@ function ProjectTabs({
     return `?${params.toString()}`;
   };
   return (
-    <div className="command-center-project-tab-row flex flex-wrap items-center justify-between gap-2 border-b border-white/10">
+    <div className="command-center-project-tab-row flex flex-wrap items-center justify-between gap-2 border-b border-white/[0.08] pb-1">
       <nav aria-label="Command Center projects" className="command-center-project-tabs flex flex-wrap">
         {projects.map((project) => {
           const selected = currentProject === project.key;
@@ -301,10 +301,10 @@ function ProjectTabs({
             <Link
               aria-current={selected ? "page" : undefined}
               className={cn(
-                "command-center-project-tab relative -mb-px border-b-2 px-4 py-2 text-sm font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
+                "command-center-project-tab relative -mb-px border-b-2 px-3 py-2 text-sm font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
                 selected
-                  ? "command-center-project-tab-selected border-cyan-200 bg-cyan-100/[0.08] text-cyan-50"
-                  : "border-transparent text-slate-400 hover:border-cyan-100/35 hover:bg-white/[0.035] hover:text-slate-100",
+                  ? "command-center-project-tab-selected border-cyan-200 bg-cyan-100/[0.06] text-cyan-50"
+                  : "border-transparent text-slate-400 hover:border-cyan-100/30 hover:bg-white/[0.025] hover:text-slate-100",
               )}
               key={project.key}
               to={{ pathname, search: tabSearch(project.key) }}
@@ -314,7 +314,7 @@ function ProjectTabs({
           );
         })}
       </nav>
-      <a className="inline-flex items-center gap-1.5 rounded-full border border-white/10 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.14em] text-slate-300 transition hover:border-cyan-100/35 hover:bg-cyan-100/[0.055] hover:text-cyan-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40" href="/workers" rel="noopener noreferrer" target="_blank">
+      <a className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.08] px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.14em] text-slate-300 transition hover:border-cyan-100/30 hover:bg-cyan-100/[0.045] hover:text-cyan-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40" href="/workers" rel="noopener noreferrer" target="_blank">
         Kanban <ExternalLink className="h-3.5 w-3.5" /><span aria-hidden="true">↗</span><span className="sr-only">opens in a new tab</span>
       </a>
     </div>
@@ -605,7 +605,7 @@ function WorkItemCard({
       aria-label={workerUrl ? `Open worker board for ${item.title}` : undefined}
       aria-busy={rowBusy || undefined}
       className={cn(
-        "command-center-card relative overflow-hidden rounded-2xl border bg-[#08090a]/80 p-4 pl-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.025)] transition",
+        "command-center-card relative overflow-hidden rounded-xl border bg-[#08090a]/80 p-4 pl-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.025)] transition",
         selected && "command-center-card-selected border-cyan-100/45 bg-cyan-100/[0.055]",
         workerUrl ? "cursor-pointer border-white/10 hover:border-cyan-100/35 hover:bg-cyan-100/[0.045] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/35" : "border-white/10 hover:border-white/20 hover:bg-white/[0.03]",
         running && "command-center-card-running",
@@ -622,7 +622,7 @@ function WorkItemCard({
       tabIndex={workerUrl ? 0 : undefined}
     >
       <StatusRail status={visualStatus} />
-      <div className="flex items-start justify-between gap-3">
+      <div className="command-center-card-header flex items-start justify-between gap-3">
         <input
           aria-label={`Select ${item.title || item.id}`}
           checked={selected}
@@ -633,23 +633,23 @@ function WorkItemCard({
           type="checkbox"
         />
         <div className="min-w-0 flex-1 text-left">
-          <div className="mb-2 flex flex-wrap items-center gap-2">
+          <div className="command-center-card-meta mb-2 flex flex-wrap items-center gap-2">
             <SourceBadge source={item.source} />
             <StatusGlyph active={running} detail={runningDetail || item.status_detail} value={item.status} />
             {running && <RunningMeter />}
             {item.project && <span className="text-xs uppercase tracking-[0.16em] text-slate-500">{item.project}</span>}
           </div>
-          <h3 className="text-base font-semibold leading-snug text-white">{item.title}</h3>
+          <h3 className="command-center-card-title text-base font-semibold leading-snug text-white">{item.title}</h3>
         </div>
         {discordUrl ? (
-          <div className="flex shrink-0 items-center gap-2">
-            <a aria-label={`Open Discord source for ${item.title}`} className="inline-flex h-8 items-center gap-1.5 rounded-full border border-indigo-200/25 px-2.5 text-xs font-semibold text-indigo-100 transition hover:border-indigo-100/40 hover:bg-indigo-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-100/35" href={discordUrl} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank">
+          <div className="command-center-card-header-links flex shrink-0 items-center gap-2">
+            <a aria-label={`Open Discord source for ${item.title}`} className="command-center-quiet-link inline-flex h-8 items-center gap-1.5 rounded-full border border-indigo-200/25 px-2.5 text-xs font-semibold text-indigo-100 transition hover:border-indigo-100/40 hover:bg-indigo-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-100/35" href={discordUrl} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank">
               Discord <ExternalLink className="h-3 w-3" /><span className="sr-only">opens in a new tab</span>
             </a>
           </div>
         ) : null}
       </div>
-      <div className="mt-3 block w-full text-left">
+      <div className="command-center-card-body mt-3 block w-full text-left">
         <AnnotationSummary item={item} />
         <p className="text-sm leading-6 text-slate-300">{compactDescription}</p>
         {canShowFullDescription ? (
@@ -670,7 +670,7 @@ function WorkItemCard({
               <span className="sr-only">{fullDescriptionOpen ? "expanded" : "collapsed"}</span>
             </button>
             {fullDescriptionOpen ? (
-              <div id={descriptionId} className="mt-2 whitespace-pre-wrap rounded-xl border border-white/[0.08] bg-white/[0.035] p-3 text-sm leading-6 text-slate-200">
+              <div id={descriptionId} className="command-center-full-context mt-2 whitespace-pre-wrap rounded-xl border border-white/[0.08] bg-white/[0.035] p-3 text-sm leading-6 text-slate-200">
                 {fullDescription}
               </div>
             ) : null}
@@ -687,38 +687,42 @@ function WorkItemCard({
           </p>
         </div>
       ) : null}
-      <div aria-busy={rowBusy} className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3">
-        {workerUrl && (
-          <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-cyan-100/20 px-3 text-xs font-semibold text-cyan-100 transition hover:border-cyan-100/35 hover:bg-cyan-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/30" href={workerUrl} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank">
-            Worker board <ExternalLink className="h-3.5 w-3.5" /><span className="sr-only">opens in a new tab</span>
-          </a>
-        )}
-        {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && (
-          <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/[0.07] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" href={item.execution.task_url} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank">
-            Ticket <ExternalLink className="h-3.5 w-3.5" /><span className="sr-only">opens in a new tab</span>
-          </a>
-        )}
-        <AnnotationButton item={item} onOpen={onAnnotate} />
-        {rowBusy && activeAction && (
-          <span className="inline-flex h-9 items-center gap-2 rounded-full border border-cyan-100/25 bg-cyan-100/10 px-3 text-xs font-semibold text-cyan-50" aria-live="polite">
-            <Spinner /> {ACTION_PROGRESS_LABELS[activeAction.kind]}…
-          </span>
-        )}
-        {showActions && actions.map((kind) => {
-          const disabled = actionDisabled(kind);
-          return (
-            <ActionButton
-              busy={actionBusy(kind)}
-              disabled={disabled}
-              key={kind}
-              kind={kind}
-              onClick={() => onAction(kind, item)}
-              title={disabled ? disabledTitle(kind) : undefined}
-            />
-          );
-        })}
-        <div className="ml-auto min-w-fit pl-2 text-right text-[0.68rem] text-slate-500">
-          Created {formatTime(item.created_at)}
+      <div aria-busy={rowBusy} className="command-center-card-footer mt-4 border-t border-white/[0.08] pt-3">
+        <div className="command-center-card-link-group flex flex-wrap items-center gap-2">
+          {workerUrl && (
+            <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-cyan-100/20 px-3 text-xs font-semibold text-cyan-100 transition hover:border-cyan-100/35 hover:bg-cyan-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/30" href={workerUrl} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank">
+              Worker board <ExternalLink className="h-3.5 w-3.5" /><span className="sr-only">opens in a new tab</span>
+            </a>
+          )}
+          {item.execution?.task_url && item.execution.task_url !== item.execution.worker_url && (
+            <a className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/10 px-3 text-xs font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/[0.07] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" href={item.execution.task_url} onClick={(event) => event.stopPropagation()} rel="noopener noreferrer" target="_blank">
+              Ticket <ExternalLink className="h-3.5 w-3.5" /><span className="sr-only">opens in a new tab</span>
+            </a>
+          )}
+          <AnnotationButton item={item} onOpen={onAnnotate} />
+          {rowBusy && activeAction && (
+            <span className="inline-flex h-9 items-center gap-2 rounded-full border border-cyan-100/25 bg-cyan-100/10 px-3 text-xs font-semibold text-cyan-50" aria-live="polite">
+              <Spinner /> {ACTION_PROGRESS_LABELS[activeAction.kind]}…
+            </span>
+          )}
+        </div>
+        <div className="command-center-card-action-group flex flex-wrap items-center justify-end gap-2">
+          {showActions && actions.map((kind) => {
+            const disabled = actionDisabled(kind);
+            return (
+              <ActionButton
+                busy={actionBusy(kind)}
+                disabled={disabled}
+                key={kind}
+                kind={kind}
+                onClick={() => onAction(kind, item)}
+                title={disabled ? disabledTitle(kind) : undefined}
+              />
+            );
+          })}
+          <div className="command-center-card-timestamp min-w-fit text-right text-[0.68rem] text-slate-500">
+            Created {formatTime(item.created_at)}
+          </div>
         </div>
       </div>
     </article>
@@ -807,6 +811,81 @@ function PaginationControls({
         </button>
       </div>
     </div>
+  );
+}
+
+function AuditPane({
+  activeView,
+  item,
+  selectedCount,
+}: {
+  activeView: ViewKey;
+  item: CommandCenterWorkItem | null;
+  selectedCount: number;
+}) {
+  const latestRun = item?.runs?.[0];
+  const workerUrl = item?.execution?.worker_url || null;
+  return (
+    <aside aria-label="Command Center detail and audit" className="command-center-audit-pane">
+      <div className="command-center-audit-sticky rounded-xl border border-white/[0.08] bg-white/[0.025] p-4">
+        <div className="flex items-center justify-between gap-3 border-b border-white/[0.08] pb-3">
+          <div>
+            <h2 className="text-sm font-semibold uppercase tracking-[0.16em] text-slate-300">Detail / Audit</h2>
+            <p className="mt-1 text-xs text-slate-500">{selectedCount > 1 ? `${selectedCount} selected` : activeView}</p>
+          </div>
+          {item ? <StatusGlyph active={isRunningWorkItem(item)} detail={item.status_detail} value={item.status} /> : null}
+        </div>
+        {item ? (
+          <div className="mt-4 grid gap-4 text-sm">
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
+                <SourceBadge source={item.source} />
+                {item.project ? <span className="text-[0.68rem] font-semibold uppercase tracking-[0.16em] text-slate-500">{item.project}</span> : null}
+              </div>
+              <h3 className="mt-3 text-base font-semibold leading-snug text-white">{item.title}</h3>
+              <p className="mt-2 line-clamp-4 text-sm leading-6 text-slate-400">{item.summary || item.body_preview || "No summary yet."}</p>
+            </div>
+            <dl className="grid gap-2 border-t border-white/[0.08] pt-3 text-xs">
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-slate-500">Created</dt>
+                <dd className="text-right text-slate-300">{formatTime(item.created_at)}</dd>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <dt className="text-slate-500">Updated</dt>
+                <dd className="text-right text-slate-300">{formatTime(item.updated_at)}</dd>
+              </div>
+              {latestRun ? (
+                <div className="flex items-start justify-between gap-3">
+                  <dt className="text-slate-500">Latest run</dt>
+                  <dd className="text-right text-slate-300">{runIsActive(latestRun) ? runDescriptor(latestRun) : latestRun.outcome || latestRun.status || latestRun.id}</dd>
+                </div>
+              ) : null}
+              {item.operator_note_count ? (
+                <div className="flex items-start justify-between gap-3">
+                  <dt className="text-slate-500">Notes</dt>
+                  <dd className="text-right text-slate-300">{item.operator_note_count}</dd>
+                </div>
+              ) : null}
+            </dl>
+            {item.latest_correction ? (
+              <div className="rounded-lg border border-amber-200/20 bg-amber-300/[0.06] p-3">
+                <div className="text-[0.65rem] font-black uppercase tracking-[0.18em] text-amber-100">Correction</div>
+                <p className="mt-2 line-clamp-4 text-xs leading-5 text-amber-50/85">{item.latest_correction.text}</p>
+              </div>
+            ) : null}
+            {workerUrl ? (
+              <a className="inline-flex h-9 items-center justify-center gap-1.5 rounded-full border border-cyan-100/20 px-3 text-xs font-semibold text-cyan-100 transition hover:border-cyan-100/35 hover:bg-cyan-100/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/30" href={workerUrl} rel="noopener noreferrer" target="_blank">
+                Worker board <ExternalLink className="h-3.5 w-3.5" /><span className="sr-only">opens in a new tab</span>
+              </a>
+            ) : null}
+          </div>
+        ) : (
+          <div className="mt-4 rounded-lg border border-white/[0.08] bg-black/20 p-3 text-sm leading-6 text-slate-400">
+            Select a work item to keep its source, execution, and annotation context pinned here.
+          </div>
+        )}
+      </div>
+    </aside>
   );
 }
 
@@ -1119,6 +1198,16 @@ export default function CommandCenterPage() {
     }[activeView];
     return visibleItems.map((item) => item.id);
   }, [activeView, pagedArchivedItems, pagedCompletedItems, pagedInboxItems, pagedOverviewItems, pagedWorkItems, recommendations]);
+  const visibleWorkItemsForAudit = useMemo(() => ({
+    overview: pagedOverviewItems,
+    inbox: pagedInboxItems.filter((entry) => entry.type === "work").map((entry) => entry.item),
+    work: pagedWorkItems,
+    completed: pagedCompletedItems,
+    archive: pagedArchivedItems,
+    recommendations,
+    runs: [],
+    sources: [],
+  }[activeView]), [activeView, pagedArchivedItems, pagedCompletedItems, pagedInboxItems, pagedOverviewItems, pagedWorkItems, recommendations]);
   const sources = useMemo(() => snapshot?.sources ?? [], [snapshot]);
   const workItemsById = useMemo(() => new Map((snapshot?.work_items ?? []).map((item) => [item.id, item])), [snapshot]);
   const selectedItems = useMemo(() => [...selectedIds].map((id) => workItemsById.get(id)).filter((item): item is CommandCenterWorkItem => Boolean(item)), [selectedIds, workItemsById]);
@@ -1129,6 +1218,7 @@ export default function CommandCenterPage() {
   const selectAllCheckboxRef = useRef<HTMLInputElement | null>(null);
   const multiSelectActionUnion = useMemo(() => actionSet(selectedItems, "union"), [selectedItems]);
   const multiSelectActionCommon = useMemo(() => actionSet(selectedItems, "common"), [selectedItems]);
+  const auditItem = selectedItems[0] || visibleWorkItemsForAudit[0] || null;
   useEffect(() => {
     if (selectAllCheckboxRef.current) {
       selectAllCheckboxRef.current.indeterminate = someVisibleSelected;
@@ -1256,7 +1346,7 @@ export default function CommandCenterPage() {
   }, [activeAction, clearSelection, multiSelectActionCommon, refresh, runActionForItem, selectedIds, selectedItems, selectionActive]);
 
   return (
-    <div className="flex flex-col gap-5">
+    <div className="command-center-shell flex flex-col gap-5">
       <ProjectTabs
         currentProject={snapshot?.current_project || selectedProject}
         pathname={location.pathname}
@@ -1293,9 +1383,9 @@ export default function CommandCenterPage() {
           </CardContent>
         </Card>
       ) : (
-        <section className="min-w-0">
+        <section className="command-center-workspace min-w-0">
           {(visibleSelectableIds.length > 0 || selectedItems.length > 0) && (
-            <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-slate-300">
+            <div className="command-center-selection-bar mb-3 flex flex-wrap items-center gap-2 text-xs text-slate-300">
               {visibleSelectableIds.length > 0 && (
                 <label className="inline-flex cursor-pointer items-center gap-2 rounded-full border border-white/10 px-3 py-1 font-semibold text-slate-300 transition hover:border-white/20 hover:bg-white/[0.06] focus-within:ring-2 focus-within:ring-white/20">
                   <input
@@ -1313,51 +1403,56 @@ export default function CommandCenterPage() {
               {selectedItems.length > 0 && <button className="rounded-full border border-white/10 px-3 py-1 font-semibold text-slate-300 transition hover:border-white/20 hover:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20" onClick={clearSelection} type="button">Clear</button>}
             </div>
           )}
-          {activeView === "overview" && (
-            <>
-              <OverviewWorkList activeAction={activeAction} emptyMessage="No recent decisions, worker boards, or active work yet." items={pagedOverviewItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
-              <PaginationControls label="overview" onPageChange={(page) => setPage("overview", page)} page={pages.overview} totalItems={pageTotals.overview} />
-            </>
-          )}
-          {activeView === "inbox" && (
-            <>
-              <InboxList activeAction={activeAction} emptyMessage="Inbox is clear. Finished, blocked, and archiveable boards stay on Overview or Active." items={pagedInboxItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
-              <PaginationControls label="inbox" onPageChange={(page) => setPage("inbox", page)} page={pages.inbox} totalItems={pageTotals.inbox} />
-            </>
-          )}
-          {activeView === "work" && (
-            <>
-              <WorkList activeAction={activeAction} emptyMessage="No active or recently shipped work is visible." items={pagedWorkItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
-              <PaginationControls label="work" onPageChange={(page) => setPage("work", page)} page={pages.work} totalItems={pageTotals.work} />
-            </>
-          )}
-          {activeView === "completed" && (
-            <>
-              <WorkList activeAction={activeAction} emptyLabel="completed items" emptyMessage="Completed and shipped work items will appear here." items={pagedCompletedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
-              <PaginationControls label="completed" onPageChange={(page) => setPage("completed", page)} page={pages.completed} totalItems={pageTotals.completed} />
-            </>
-          )}
-          {activeView === "archive" && (
-            <>
-              <WorkList activeAction={activeAction} emptyLabel="archived items" emptyMessage="Archived worker boards and work items will appear here." items={pagedArchivedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} showActions={false} />
-              <PaginationControls label="archive" onPageChange={(page) => setPage("archive", page)} page={pages.archive} totalItems={pageTotals.archive} />
-            </>
-          )}
-          {activeView === "recommendations" && <WorkList activeAction={activeAction} emptyLabel="recommendations" emptyMessage="No self-improvement recommendations are waiting." items={recommendations} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />}
-          {activeView === "runs" && (
-            <div className="grid gap-3">
-              {snapshot?.runs.length ? snapshot.runs.map((run) => (
-                <RunCard key={`${run.board || "default"}:${run.id}`} run={run} />
-              )) : <EmptyState label="worker runs" />}
+          <div className="command-center-content-grid">
+            <div className="command-center-list-pane min-w-0">
+              {activeView === "overview" && (
+                <>
+                  <OverviewWorkList activeAction={activeAction} emptyMessage="No recent decisions, worker boards, or active work yet." items={pagedOverviewItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+                  <PaginationControls label="overview" onPageChange={(page) => setPage("overview", page)} page={pages.overview} totalItems={pageTotals.overview} />
+                </>
+              )}
+              {activeView === "inbox" && (
+                <>
+                  <InboxList activeAction={activeAction} emptyMessage="Inbox is clear. Finished, blocked, and archiveable boards stay on Overview or Active." items={pagedInboxItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+                  <PaginationControls label="inbox" onPageChange={(page) => setPage("inbox", page)} page={pages.inbox} totalItems={pageTotals.inbox} />
+                </>
+              )}
+              {activeView === "work" && (
+                <>
+                  <WorkList activeAction={activeAction} emptyMessage="No active or recently shipped work is visible." items={pagedWorkItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+                  <PaginationControls label="work" onPageChange={(page) => setPage("work", page)} page={pages.work} totalItems={pageTotals.work} />
+                </>
+              )}
+              {activeView === "completed" && (
+                <>
+                  <WorkList activeAction={activeAction} emptyLabel="completed items" emptyMessage="Completed and shipped work items will appear here." items={pagedCompletedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+                  <PaginationControls label="completed" onPageChange={(page) => setPage("completed", page)} page={pages.completed} totalItems={pageTotals.completed} />
+                </>
+              )}
+              {activeView === "archive" && (
+                <>
+                  <WorkList activeAction={activeAction} emptyLabel="archived items" emptyMessage="Archived worker boards and work items will appear here." items={pagedArchivedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} showActions={false} />
+                  <PaginationControls label="archive" onPageChange={(page) => setPage("archive", page)} page={pages.archive} totalItems={pageTotals.archive} />
+                </>
+              )}
+              {activeView === "recommendations" && <WorkList activeAction={activeAction} emptyLabel="recommendations" emptyMessage="No self-improvement recommendations are waiting." items={recommendations} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />}
+              {activeView === "runs" && (
+                <div className="grid gap-3">
+                  {snapshot?.runs.length ? snapshot.runs.map((run) => (
+                    <RunCard key={`${run.board || "default"}:${run.id}`} run={run} />
+                  )) : <EmptyState label="worker runs" />}
+                </div>
+              )}
+              {activeView === "sources" && (
+                <div className="grid gap-3">
+                  {sources.length ? sources.map((source) => (
+                    <SourceCard key={source.id} source={source} />
+                  )) : <EmptyState label="sources" />}
+                </div>
+              )}
             </div>
-          )}
-          {activeView === "sources" && (
-            <div className="grid gap-3">
-              {sources.length ? sources.map((source) => (
-                <SourceCard key={source.id} source={source} />
-              )) : <EmptyState label="sources" />}
-            </div>
-          )}
+            <AuditPane activeView={activeView} item={auditItem} selectedCount={selectedItems.length} />
+          </div>
         </section>
       )}
 

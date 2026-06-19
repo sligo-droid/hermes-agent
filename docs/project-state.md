@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-19 13:20 UTC
+Last updated: 2026-06-19 15:23 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -18,7 +18,7 @@ This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork
 | Main branch | verified | `/home/droid/hermes` is clean on `main` and tracking `origin/main` after the autonomous operations loop docs landed. |
 | Open PRs | verified | `gh pr list --state open --limit 10` returned no rows during the autonomous operations loop state refresh. |
 | Repo-state transition | merged | PR #320 added `docs/project-state.md`, `docs/context.md`, and `docs/decisions/0001-repo-backed-project-state.md`; `AGENTS.md` now routes workers here. |
-| Command Center model | merged | `docs/sligo-command-center.md` records the Work Item / Source / Worker Run model, Hermes/PID project scoping, and current UX contract. The primary lanes are Overview, Inbox, Active, Completed, and Archive. Live runtime must still be smoked separately when code changes. |
+| Command Center model | merged | `docs/sligo-command-center.md` records the Work Item / Source / Worker Run model, Hermes/PID project scoping, and current UX contract. The primary lanes are Overview, Inbox, Active, Completed, and Archive; the current visual target is quiet chrome, grouped row actions/artifacts, and a right Detail / Audit pane. Live runtime must still be smoked separately when code changes. |
 | Autonomous operations loop | planned | `docs/plans/2026-06-08-autonomous-operations-loop-goalplan.md` defines the complete Observe -> Diagnose -> Decide -> Execute -> Verify -> Learn loop, with Command Center as the canonical ledger and policy-gated autonomy boundaries. |
 | Skills boundary | in_progress | Installed default-profile pointers were patched for `hermes-agent`, `hermes-operations`, and `general-coding/references/operator-command-center-ui.md`; intention-setting material should keep moving into this repo state/doc set. |
 | Worker autoreview helper | implemented | Hermes worker bootstrap now materializes `.agents/skills/autoreview/scripts/autoreview` plus `SKILL.md` into worker workspaces for Hermes and PID-style projects before role/delegated worker closeout prompts ask workers to run autoreview. The helper is deterministic/advisory and does not claim model review. |
