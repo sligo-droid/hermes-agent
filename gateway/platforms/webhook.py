@@ -987,8 +987,6 @@ class WebhookAdapter(BasePlatformAdapter):
     ) -> str:
         if not channel_id:
             return "missing_discord_route"
-        if source_kind == "review" and not existing_route:
-            return "missing_original_discord_thread"
         return ""
 
     def _github_pr_amend_reaction_requests(

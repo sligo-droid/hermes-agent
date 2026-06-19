@@ -990,7 +990,7 @@ class TestGitHubPrAmendWebhookRoute:
         assert f"subjectId={REVIEW_PAYLOAD['review']['node_id']}" in calls[3]
         assert "content=THUMBS_UP" in calls[3]
 
-    def test_github_pr_amend_review_comment_without_existing_thread_can_route(self):
+    def test_github_pr_amend_missing_existing_thread_can_route_when_channel_resolves(self):
         adapter = _make_adapter({"github-pr-amend": ROUTE})
 
         assert (
@@ -1007,7 +1007,7 @@ class TestGitHubPrAmendWebhookRoute:
                 channel_id="channel-123",
                 existing_route={},
             )
-            == "missing_original_discord_thread"
+            == ""
         )
 
     @pytest.mark.asyncio
@@ -1322,38 +1322,49 @@ class TestGitHubPrAmendWebhookRoute:
         assert publish.call_args.kwargs["existing"] == existing
 
     @pytest.mark.asyncio
-    async def test_review_without_original_discord_thread_degrades(self, tmp_path):
-        monkeypatch = pytest.MonkeyPatch()
+    async def test_review_without_original_discord_thread_routes_to_project_channel(
+        self, tmp_path, monkeypatch
+    ):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
-        try:
-            adapter = _make_adapter({"github-pr-amend": ROUTE})
-            adapter._add_github_pr_amend_reaction = AsyncMock(return_value=True)
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        adapter._add_github_pr_amend_reaction = AsyncMock(return_value=True)
+        payload = json.loads(json.dumps(REVIEW_PAYLOAD))
+        payload["review"]["body"] = ""
 
-            with patch("gateway.github_pr_amend.fetch_pr_info", return_value=PR_INFO), patch(
-                "gateway.github_pr_amend.fetch_pr_related_context", return_value=PR_RELATED_CONTEXT
-            ), patch(
-                "gateway.github_pr_amend.resolve_pr_amend_discord_channel", return_value="channel-123"
-            ), patch(
-                "gateway.github_pr_amend.resolve_pr_amend_existing_discord_route", return_value={}
-            ), patch("gateway.github_pr_amend.publish_and_activate_pr_amend_intake") as publish:
-                async with TestClient(TestServer(_create_app(adapter))) as cli:
-                    resp = await cli.post(
-                        "/webhooks/github-pr-amend",
-                        json=REVIEW_PAYLOAD,
-                        headers={
-                            "X-GitHub-Event": "pull_request_review",
-                            "X-GitHub-Delivery": "delivery-review-no-thread",
-                        },
-                    )
-                    data = await resp.json()
+        async def immediate_to_thread(func, /, *args, **kwargs):
+            return func(*args, **kwargs)
 
-            assert resp.status == 202
-            assert data["status"] == "degraded"
-            assert data["reason"] == "missing_original_discord_thread"
-            assert Path(data["artifact_path"]).is_file()
-            publish.assert_not_called()
-        finally:
-            monkeypatch.undo()
+        monkeypatch.setattr("gateway.platforms.webhook.asyncio.to_thread", immediate_to_thread)
+
+        with patch("gateway.github_pr_amend.fetch_pr_info", return_value=PR_INFO), patch(
+            "gateway.github_pr_amend.fetch_pr_related_context", return_value=PR_RELATED_CONTEXT
+        ), patch(
+            "gateway.github_pr_amend.resolve_pr_amend_discord_channel", return_value="channel-123"
+        ), patch(
+            "gateway.github_pr_amend.resolve_pr_amend_existing_discord_route", return_value={}
+        ), patch(
+            "gateway.github_pr_amend.publish_and_activate_pr_amend_intake",
+            return_value={"discord_board": "board", "discord_thread_id": "thread"},
+        ) as publish:
+            resp = await adapter._handle_github_pr_amend(
+                route_name="github-pr-amend",
+                route_config=ROUTE,
+                payload=payload,
+                event_type="pull_request_review",
+                delivery_id="delivery-review-no-thread",
+            )
+            data = json.loads(resp.text)
+
+        assert resp.status == 202
+        assert data["status"] == "queued"
+        assert Path(data["artifact_path"]).is_file()
+        publish.assert_called_once()
+        assert publish.call_args.kwargs["channel_id"] == "channel-123"
+        assert publish.call_args.kwargs["existing"] is None
+        assert [call.args[1] for call in adapter._add_github_pr_amend_reaction.await_args_list] == [
+            "eyes",
+            "rocket",
+        ]
 
     @pytest.mark.asyncio
     async def test_review_submitted_missing_mention_on_sligo_droid_authored_pr_is_accepted(self, tmp_path):
