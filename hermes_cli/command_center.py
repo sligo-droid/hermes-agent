@@ -727,7 +727,11 @@ def _canonical_status_from_proposal(card: dict[str, Any], task: dict[str, Any] |
     return "proposed", status or "proposed"
 
 
-def _latest_self_improvement_metadata(proposal_id: str) -> dict[str, Any]:
+def _latest_self_improvement_metadata(
+    proposal_id: str,
+    *,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
     """Return durable proposal metadata without losing approval artifacts.
 
     Follow-up audit events such as halt/undo often carry small metadata payloads
@@ -738,7 +742,7 @@ def _latest_self_improvement_metadata(proposal_id: str) -> dict[str, Any]:
     """
 
     try:
-        events = proposal_storage.list_audit_events(proposal_id)
+        events = proposal_storage.list_audit_events(proposal_id, db_path=db_path)
     except Exception:
         return {}
     merged: dict[str, Any] = {}
@@ -1040,6 +1044,7 @@ def _reconcile_terminal_proposal(
     runs: list[dict[str, Any]],
     board: str | None,
     board_meta: dict[str, Any] | None,
+    proposal_db_path: Path | None = None,
 ) -> dict[str, Any]:
     status = str(card.get("status") or "").lower()
     if status not in {"approved", "recovery_needed"}:
@@ -1052,6 +1057,7 @@ def _reconcile_terminal_proposal(
             reason="mapped Kanban worker reached terminal success",
             kanban_task_id=_proposal_task_id(card) or None,
             metadata=metadata,
+            db_path=proposal_db_path,
         )
     if status == "approved":
         recovery_metadata = _proposal_recovery_metadata(card, task=task, board=board, board_meta=board_meta)
@@ -1062,6 +1068,7 @@ def _reconcile_terminal_proposal(
                 reason=str(recovery_metadata.get("recovery_reason") or "linked Kanban worker needs recovery"),
                 kanban_task_id=_proposal_task_id(card) or None,
                 metadata=recovery_metadata,
+                db_path=proposal_db_path,
             )
     return card
 
@@ -1571,22 +1578,73 @@ def _artifacts_from_task_and_board(task: dict[str, Any], board_meta: dict[str, A
     return artifacts
 
 
-def _all_proposal_cards(*, include_archived: bool) -> list[dict[str, Any]]:
+def _all_proposal_cards(
+    *,
+    include_archived: bool,
+    db_path: Path | None = None,
+) -> list[dict[str, Any]]:
     try:
         return proposal_storage.list_cards(
             include_rejected=include_archived,
             include_archived=include_archived,
+            db_path=db_path,
         ).get("cards", [])
     except AttributeError:
         return []
 
 
+def reconcile_self_improvement_proposals(
+    *,
+    include_archived: bool = False,
+    project: str | None = None,
+    prong: str | None = None,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    """Persist proposal lifecycle state from linked Kanban source-of-truth data.
+
+    This is the active reconciliation path used by Command Center reads. Cron
+    proposal feedback also invokes it before accepted history is summarized so
+    stale approved proposal cards cannot suppress new work merely because no
+    dashboard/API snapshot has been read yet.
+    """
+
+    project_filter = _normalize_project_key(project)
+    prong_filter = str(prong).strip() if prong else None
+    checked = 0
+    changed = 0
+    for card in _all_proposal_cards(include_archived=include_archived, db_path=db_path):
+        if project_filter and _normalize_project_key(card.get("project")) != project_filter:
+            continue
+        if prong_filter and str(card.get("prong") or "").strip() != prong_filter:
+            continue
+        status = str(card.get("status") or "").lower()
+        if status not in {"approved", "recovery_needed"}:
+            continue
+        checked += 1
+        task, task_runs, board, board_meta = _load_task_for_proposal(card, proposal_db_path=db_path)
+        reconciled = _reconcile_terminal_proposal(
+            card,
+            task=task,
+            runs=task_runs,
+            board=board,
+            board_meta=board_meta,
+            proposal_db_path=db_path,
+        )
+        if str(reconciled.get("status") or "").lower() != status:
+            changed += 1
+    if changed:
+        invalidate_snapshot_cache()
+    return {"checked": checked, "changed": changed}
+
+
 def _load_task_for_proposal(
     card: dict[str, Any],
+    *,
+    proposal_db_path: Path | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str | None, dict[str, Any] | None]:
     task_id = _proposal_task_id(card)
     proposal_id = str(card.get("proposal_id") or "")
-    metadata = _latest_self_improvement_metadata(proposal_id)
+    metadata = _latest_self_improvement_metadata(proposal_id, db_path=proposal_db_path)
     board_candidates = _proposal_board_candidates(card, metadata, include_default=bool(task_id))
     if not task_id and not board_candidates:
         return None, [], None, None

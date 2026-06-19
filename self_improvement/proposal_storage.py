@@ -480,6 +480,9 @@ def summarize_feedback_history(
     max_items = max(0, int(max_items_per_kind))
     text_limit = max(0, int(max_text_chars))
     init_db(db_path)
+    from hermes_cli.command_center import reconcile_self_improvement_proposals
+
+    reconcile_self_improvement_proposals(project=project, prong=prong, db_path=db_path)
     conn = connect(db_path)
     try:
         params: list[Any] = []
