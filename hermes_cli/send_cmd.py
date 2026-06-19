@@ -204,7 +204,8 @@ def _load_hermes_env() -> None:
     ``os.getenv(...)`` on each call. The gateway process does two things at
     startup that ``hermes send`` must replicate when invoked standalone:
 
-    1. ``load_dotenv(~/.hermes/.env)`` — brings bot tokens into the env.
+    1. ``load_hermes_dotenv()`` — safely parses ``~/.hermes/.env`` as dotenv
+       data and brings bot tokens into the env.
     2. Bridge top-level simple values from ``~/.hermes/config.yaml`` into
        ``os.environ`` (without overriding existing env vars). This is where
        ``TELEGRAM_HOME_CHANNEL`` and friends live when the user saved them
@@ -214,29 +215,20 @@ def _load_hermes_env() -> None:
     intentionally reimplement the minimum needed here so ``hermes send``
     doesn't pull in the full gateway module just to resolve a home channel.
     """
-    # Step 1: dotenv
-    try:
-        from dotenv import load_dotenv
-    except Exception:
-        load_dotenv = None  # type: ignore[assignment]
-
     try:
         from hermes_cli.config import get_hermes_home
+        from hermes_cli.env_loader import load_hermes_dotenv
+
         home = get_hermes_home()
     except Exception:
         return
 
-    env_path = home / ".env"
-    if load_dotenv and env_path.exists():
-        try:
-            load_dotenv(str(env_path), override=True, encoding="utf-8")
-        except UnicodeDecodeError:
-            try:
-                load_dotenv(str(env_path), override=True, encoding="latin-1")
-            except Exception:
-                pass
-        except Exception:
-            pass
+    # Step 1: dotenv. Use the central Hermes loader so `.env` is parsed as
+    # dotenv data, not shell syntax, and startup sanitization stays consistent.
+    try:
+        load_hermes_dotenv(hermes_home=home)
+    except Exception:
+        pass
 
     # Step 2: bridge top-level config.yaml values into the environment so
     # gateway.config.load_gateway_config() sees them. Scalars only; don't

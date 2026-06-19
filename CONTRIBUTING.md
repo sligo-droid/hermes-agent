@@ -655,13 +655,12 @@ that touches the OS, assume *any* platform can hit your code path.
        idx = int(input("Choice: ")) - 1
    ```
 
-4. **File encoding.** Windows may save `.env` files in `cp1252`. Always
-   handle encoding errors:
+4. **File encoding.** Windows may save `.env` files in `cp1252`. Use the
+   central Hermes loader instead of calling `python-dotenv` directly:
    ```python
-   try:
-       load_dotenv(env_path)
-   except UnicodeDecodeError:
-       load_dotenv(env_path, encoding="latin-1")
+   from hermes_cli.env_loader import load_hermes_dotenv
+
+   load_hermes_dotenv(hermes_home=hermes_home)
    ```
    Config files (`config.yaml`) may be saved with a UTF-8 BOM by Notepad and
    similar editors — use `encoding="utf-8-sig"` when reading files that

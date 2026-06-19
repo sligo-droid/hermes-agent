@@ -365,6 +365,32 @@ def test_load_hermes_env_bridges_config_yaml_scalars(tmp_path, monkeypatch):
     assert os.environ.get("TELEGRAM_HOME_CHANNEL") == "5550001111"
 
 
+def test_load_hermes_env_preserves_dotenv_metacharacters(tmp_path, monkeypatch):
+    """`hermes send` startup must parse .env as data, not shell syntax."""
+    import os
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    sentinel = tmp_path / "send_cmd_env_was_executed"
+    value = f"tok_$HOME; touch {sentinel} & quoted='yes' eq=tail space token"
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    (hermes_home / ".env").write_text(
+        f'DISCORD_BOT_TOKEN="{escaped}"\n', encoding="utf-8"
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+
+    from importlib import reload
+    import hermes_cli.config as _hc_config
+    reload(_hc_config)
+
+    send_cmd._load_hermes_env()
+
+    assert os.environ.get("DISCORD_BOT_TOKEN") == value
+    assert not sentinel.exists()
+
+
 def test_load_hermes_env_does_not_override_existing(tmp_path, monkeypatch):
     """Existing env vars must not be clobbered by config.yaml values."""
     import os

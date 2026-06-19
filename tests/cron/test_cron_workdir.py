@@ -303,11 +303,11 @@ class TestRunJobTerminalCwd:
         # Unlimited inactivity so the poll loop returns immediately.
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
 
-        # run_job calls load_dotenv(~/.hermes/.env, override=True), which will
-        # happily clobber TERMINAL_CWD out from under us if the real user .env
-        # has TERMINAL_CWD set (common on dev boxes).  Stub it out.
-        import dotenv
-        monkeypatch.setattr(dotenv, "load_dotenv", lambda *_a, **_kw: True)
+        # run_job reloads Hermes dotenv/config so provider/key changes take
+        # effect per run. Stub the central loader so a real user .env cannot
+        # clobber TERMINAL_CWD out from under this focused workdir test.
+        import hermes_cli.env_loader as env_loader
+        monkeypatch.setattr(env_loader, "load_hermes_dotenv", lambda *_a, **_kw: [])
 
     def test_workdir_sets_and_restores_terminal_cwd(
         self, tmp_path, monkeypatch

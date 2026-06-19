@@ -222,13 +222,15 @@ class TestRunJobProfileContext:
         monkeypatch.setattr(sched, "_hermes_home", None)
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
 
-        import dotenv
+        import hermes_cli.env_loader as env_loader
 
-        def fake_load_dotenv(path, *_a, **_kw):
-            observed.setdefault("dotenv_paths", []).append(str(path))
-            return True
+        def fake_load_hermes_dotenv(*, hermes_home=None, **_kw):
+            assert hermes_home is not None
+            env_path = hermes_home / ".env"
+            observed.setdefault("dotenv_paths", []).append(str(env_path))
+            return [env_path]
 
-        monkeypatch.setattr(dotenv, "load_dotenv", fake_load_dotenv)
+        monkeypatch.setattr(env_loader, "load_hermes_dotenv", fake_load_hermes_dotenv)
 
     def test_run_job_sets_and_restores_profile_home(
         self, isolated_cron_profile_home, monkeypatch
@@ -263,7 +265,7 @@ class TestRunJobProfileContext:
     def test_profile_dotenv_environment_is_restored(
         self, isolated_cron_profile_home, monkeypatch
     ):
-        import dotenv
+        import hermes_cli.env_loader as env_loader
         import cron.scheduler as sched
 
         root, profile_home = isolated_cron_profile_home
@@ -272,14 +274,16 @@ class TestRunJobProfileContext:
         monkeypatch.setenv("HERMES_PROFILE_TEST_SHARED", "outer")
         monkeypatch.delenv("HERMES_PROFILE_TEST_ONLY", raising=False)
 
-        def fake_load_dotenv(path, *_a, **_kw):
-            observed.setdefault("dotenv_paths", []).append(str(path))
+        def fake_load_hermes_dotenv(*, hermes_home=None, **_kw):
+            assert hermes_home is not None
+            env_path = hermes_home / ".env"
+            observed.setdefault("dotenv_paths", []).append(str(env_path))
             os.environ["HERMES_PROFILE_TEST_SHARED"] = "profile-value"
             os.environ["HERMES_PROFILE_TEST_ONLY"] = "profile-only"
             os.environ["HERMES_CRON_TIMEOUT"] = "123"
-            return True
+            return [env_path]
 
-        monkeypatch.setattr(dotenv, "load_dotenv", fake_load_dotenv)
+        monkeypatch.setattr(env_loader, "load_hermes_dotenv", fake_load_hermes_dotenv)
 
         job = {
             "id": "env-profile",
@@ -410,6 +414,7 @@ class TestTickProfilePartition:
         import threading
         import cron.scheduler as sched
 
+        root, _profile_home = isolated_cron_profile_home
         profile_job = {"id": "a", "name": "A", "profile": "default"}
         parallel_job = {"id": "b", "name": "B", "profile": None}
 
@@ -423,7 +428,7 @@ class TestTickProfilePartition:
             return True, "output", "response", None
 
         monkeypatch.setattr(sched, "run_job", fake_run_job)
-        monkeypatch.setattr(sched, "save_job_output", lambda _jid, _o: None)
+        monkeypatch.setattr(sched, "save_job_output", lambda jid, _o: str(root / f"{jid}.md"))
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
 

@@ -127,7 +127,7 @@ systemctl list-timers hermes-teams-pipeline-maintain.timer
 0 */12 * * * /usr/local/bin/hermes teams-pipeline maintain-subscriptions >> /var/log/hermes/teams-pipeline-maintain.log 2>&1
 ```
 
-Make sure the cron environment has the `MSGRAPH_*` credentials. Simplest fix: source `~/.hermes/.env` at the top of a wrapper script that crontab calls.
+The `hermes teams-pipeline maintain-subscriptions` command loads `~/.hermes/.env` itself through Hermes' dotenv loader, so wrapper scripts should not source that file as shell syntax.
 
 #### Verifying renewal is working
 

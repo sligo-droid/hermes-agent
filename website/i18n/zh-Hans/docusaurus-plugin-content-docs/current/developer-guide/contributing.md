@@ -124,13 +124,12 @@ except (ImportError, NotImplementedError):
 
 ### 2. 文件编码
 
-某些环境可能以非 UTF-8 编码保存 `.env` 文件：
+某些环境可能以非 UTF-8 编码保存 `.env` 文件。请使用 Hermes 的集中加载器，而不是直接调用 `python-dotenv`：
 
 ```python
-try:
-    load_dotenv(env_path)
-except UnicodeDecodeError:
-    load_dotenv(env_path, encoding="latin-1")
+from hermes_cli.env_loader import load_hermes_dotenv
+
+load_hermes_dotenv(hermes_home=hermes_home)
 ```
 
 ### 3. 进程管理

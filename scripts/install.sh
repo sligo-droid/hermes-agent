@@ -1834,6 +1834,18 @@ run_setup_wizard() {
     fi
 }
 
+read_hermes_env_value() {
+    local var="$1"
+    local py
+    if [ "$USE_VENV" = true ] && [ -x "$INSTALL_DIR/venv/bin/python" ]; then
+        py="$INSTALL_DIR/venv/bin/python"
+    else
+        py="python"
+    fi
+    HERMES_HOME="$HERMES_HOME" PYTHONPATH="$INSTALL_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        "$py" -m hermes_cli.env_loader "$var" --hermes-home "$HERMES_HOME" 2>/dev/null || true
+}
+
 maybe_start_gateway() {
     # Check if any messaging platform tokens were configured
     ENV_FILE="$HERMES_HOME/.env"
@@ -1843,7 +1855,7 @@ maybe_start_gateway() {
 
     HAS_MESSAGING=false
     for VAR in TELEGRAM_BOT_TOKEN DISCORD_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN WHATSAPP_ENABLED; do
-        VAL=$(grep "^${VAR}=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)
+        VAL="$(read_hermes_env_value "$VAR")"
         if [ -n "$VAL" ] && [ "$VAL" != "your-token-here" ]; then
             HAS_MESSAGING=true
             break
@@ -1859,7 +1871,7 @@ maybe_start_gateway() {
     log_info "The gateway needs to be running for Hermes to send/receive messages."
 
     # If WhatsApp is enabled and no session exists yet, run foreground first for QR scan
-    WHATSAPP_VAL=$(grep "^WHATSAPP_ENABLED=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2-)
+    WHATSAPP_VAL="$(read_hermes_env_value WHATSAPP_ENABLED)"
     WHATSAPP_SESSION="$HERMES_HOME/whatsapp/session/creds.json"
     if [ "$WHATSAPP_VAL" = "true" ] && [ ! -f "$WHATSAPP_SESSION" ]; then
         if [ "$IS_INTERACTIVE" = true ]; then
