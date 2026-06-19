@@ -3,19 +3,134 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 
-_WORD_RE = re.compile(r"[a-z0-9][a-z0-9_.+-]*")
 _OPENROUTER_PROVIDER_CONFIG_ARGS = {
     "model_providers.openrouter.name": "openrouter",
     "model_providers.openrouter.base_url": "https://openrouter.ai/api/v1",
     "model_providers.openrouter.env_key": "OPENROUTER_API_KEY",
 }
+
+_BROAD_SURFACE_KEYWORDS = {
+    "app interface",
+    "button",
+    "card",
+    "chart",
+    "command center",
+    "component",
+    "dashboard",
+    "drawer",
+    "footer",
+    "form",
+    "header",
+    "interface",
+    "layout",
+    "modal",
+    "page",
+    "product surface",
+    "screen",
+    "sidebar",
+    "table",
+    "toolbar",
+    "ui",
+    "user interface",
+    "web interface",
+    "web ui",
+}
+
+_DEFAULT_ACTION_KEYWORDS = [
+    "implement",
+    "implementing",
+    "build",
+    "building",
+    "create",
+    "creating",
+    "add",
+    "adding",
+    "develop",
+    "developing",
+    "development",
+    "design",
+    "designing",
+    "redesign",
+    "redesigning",
+    "style",
+    "styling",
+    "restyle",
+    "polish",
+    "polishing",
+    "visual design",
+    "make responsive",
+]
+
+_DEFAULT_NON_VISUAL_DOMAIN_KEYWORDS = [
+    "state",
+    "app-state",
+    "application state",
+    "routing",
+    "route",
+    "router",
+    "data",
+    "dataset",
+    "datasets",
+    "config",
+    "configuration",
+    "default",
+    "defaults",
+    "selection",
+    "selection model",
+    "normalization",
+    "normalize",
+    "normalized",
+    "plumbing",
+    "wiring",
+    "model",
+    "models",
+    "schema",
+    "store",
+    "storage",
+    "query",
+    "queries",
+    "api",
+    "backend",
+    "server",
+    "database",
+    "db",
+    "endpoint",
+    "endpoints",
+    "contract",
+    "serialization",
+    "parser",
+    "ingestion",
+    "pipeline",
+]
+
+_DEFAULT_VISUAL_INTENT_KEYWORDS = [
+    "style",
+    "styling",
+    "restyle",
+    "polish",
+    "polishing",
+    "visual design",
+    "visual polish",
+    "ui polish",
+    "interface polish",
+    "layout polish",
+    "visual",
+    "visuals",
+    "appearance",
+    "css",
+    "responsive",
+    "spacing",
+    "color",
+    "colors",
+    "typography",
+    "theme",
+    "design system",
+]
 
 
 @dataclass(frozen=True)
@@ -60,17 +175,6 @@ def _normalize_text(*parts: Any) -> str:
     return re.sub(r"\s+", " ", text.lower()).strip()
 
 
-def _path_hints(cwd: str | os.PathLike[str] | None) -> str:
-    if not cwd:
-        return ""
-    try:
-        path = Path(cwd).expanduser()
-    except TypeError:
-        return str(cwd)
-    parts = list(path.parts[-4:])
-    return " ".join(parts)
-
-
 def _contains_keyword(text: str, keyword: str) -> bool:
     raw = str(keyword or "").strip().lower()
     if not raw:
@@ -87,6 +191,14 @@ def _first_match(text: str, keywords: list[str]) -> str:
     return ""
 
 
+def _explicit_visual_keywords(keywords: list[str]) -> list[str]:
+    return [
+        keyword
+        for keyword in keywords
+        if _normalize_text(keyword) not in _BROAD_SURFACE_KEYWORDS
+    ]
+
+
 def _classify_ui_work(
     *,
     config: dict[str, Any],
@@ -97,32 +209,49 @@ def _classify_ui_work(
     project: str = "",
 ) -> tuple[bool, str]:
     detection = _as_dict(config.get("detection"))
-    positive_keywords = _as_list(detection.get("title_body_keywords"))
+    action_keywords = _as_list(detection.get("action_keywords"))
+    surface_keywords = _explicit_visual_keywords(
+        _as_list(detection.get("visual_surface_keywords"))
+    )
     negative_keywords = _as_list(detection.get("negative_keywords"))
+    non_visual_domain_keywords = _as_list(
+        detection.get("non_visual_domain_keywords")
+    )
+    visual_intent_keywords = _as_list(detection.get("visual_intent_keywords"))
+    if not action_keywords:
+        action_keywords = _DEFAULT_ACTION_KEYWORDS
+    if not surface_keywords:
+        surface_keywords = _explicit_visual_keywords(
+            _as_list(detection.get("title_body_keywords"))
+        )
+    if not non_visual_domain_keywords:
+        non_visual_domain_keywords = _DEFAULT_NON_VISUAL_DOMAIN_KEYWORDS
+    if not visual_intent_keywords:
+        visual_intent_keywords = _DEFAULT_VISUAL_INTENT_KEYWORDS
 
     body_text = _normalize_text(title, task, context)
-    hint_text = _normalize_text(project, _path_hints(cwd))
-    all_text = _normalize_text(body_text, hint_text)
 
     negative = _first_match(body_text, negative_keywords)
     if negative:
         return False, f"negative keyword: {negative}"
 
-    positive = _first_match(body_text, positive_keywords)
-    if positive:
-        return True, f"ui keyword: {positive}"
+    # CWD/project names are deliberately not positive evidence: repository names
+    # like PID or Command Center should not route backend, docs, test, or review
+    # work to the visual specialist model.
+    action = _first_match(body_text, action_keywords)
+    if not action:
+        return False, "no visual ui action"
 
-    # Project/cwd names are intentionally weak. They can corroborate explicit
-    # UI words, but a project named PID must not route all work to the UI model.
-    if "pid" in set(_WORD_RE.findall(hint_text)):
-        weak_ui = _first_match(body_text, ["dashboard", "frontend", "ui", "ux", "tui"])
-        if weak_ui:
-            return True, f"pid ui keyword: {weak_ui}"
+    non_visual_domain = _first_match(body_text, non_visual_domain_keywords)
+    visual_intent = _first_match(body_text, visual_intent_keywords)
+    if non_visual_domain and not visual_intent:
+        return False, f"non-visual domain keyword: {non_visual_domain}"
 
-    if _first_match(all_text, positive_keywords) and _first_match(body_text, ["dashboard", "frontend", "ui", "ux", "tui"]):
-        return True, "ui keyword with project hint"
+    surface = _first_match(body_text, surface_keywords) or visual_intent
+    if not surface:
+        return False, "no explicit visual ui intent"
 
-    return False, "no ui keyword"
+    return True, f"visual ui work: {action} + {surface}"
 
 
 def resolve_ui_work_route(
