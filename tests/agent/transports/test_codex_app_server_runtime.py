@@ -481,6 +481,65 @@ class TestSpawnEnvIsolation:
         assert "sandbox_workspace_write.network_access=true" in cmd
         assert not any("/live/kanban.db" in arg for arg in cmd)
 
+    def test_authorized_coding_worker_workspace_env_sets_writable_root(self, monkeypatch):
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                captured["env"] = kwargs.get("env", {}).copy()
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.invalid:8080")
+        monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-parent-secret")
+        monkeypatch.setenv("GH_TOKEN", "gho_parent_secret")
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_parent_secret")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-parent-secret")
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+        client = cas.CodexAppServerClient(
+            codex_bin="codex",
+            env={
+                "PATH": "/bin",
+                "HERMES_CODEX_WORKER_NETWORK_ACCESS": "1",
+                "HERMES_CODEX_WORKER_WORKSPACE": "/home/droid/workspaces/project-fix",
+            },
+            replace_env=False,
+        )
+        client._closed = True
+
+        cmd = captured["cmd"]
+        assert 'sandbox_mode="workspace-write"' in cmd
+        assert 'sandbox_workspace_write.writable_roots=["/home/droid/workspaces/project-fix"]' in cmd
+        assert "sandbox_workspace_write.network_access=true" in cmd
+        assert captured["env"]["HTTPS_PROXY"] == "http://proxy.example.invalid:8080"
+        assert captured["env"]["REQUESTS_CA_BUNDLE"] == "/etc/ssl/certs/ca-certificates.crt"
+        assert "OPENAI_API_KEY" not in captured["env"]
+        assert "GH_TOKEN" not in captured["env"]
+        assert "GITHUB_TOKEN" not in captured["env"]
+        assert "OPENROUTER_API_KEY" not in captured["env"]
+
     def test_spawn_wraps_codex_app_server_in_gateway_child_scope(self, monkeypatch, tmp_path):
         import subprocess
         from agent.transports import codex_app_server as cas
@@ -534,7 +593,13 @@ class TestSpawnEnvIsolation:
         client = cas.CodexAppServerClient(
             codex_bin="codex",
             cwd=str(tmp_path),
-            env={"HERMES_SESSION_KEY": "discord:123", "OPENAI_API_KEY": "secret"},
+            env={
+                "HERMES_SESSION_KEY": "discord:123",
+                "OPENAI_API_KEY": "secret",
+                "GH_TOKEN": "gho_secret",
+                "GITHUB_TOKEN": "ghp_secret",
+                "OPENROUTER_API_KEY": "sk-or-secret",
+            },
         )
         client._closed = True
 
@@ -549,5 +614,9 @@ class TestSpawnEnvIsolation:
         assert captured["popen_kwargs"]["stdin"] is subprocess.PIPE
         assert captured["popen_kwargs"]["stdout"] is subprocess.PIPE
         assert captured["popen_kwargs"]["stderr"] is subprocess.PIPE
-        assert captured["env"]["OPENAI_API_KEY"] == "secret"
+        assert captured["env"]["HERMES_SESSION_KEY"] == "discord:123"
+        assert "OPENAI_API_KEY" not in captured["env"]
+        assert "GH_TOKEN" not in captured["env"]
+        assert "GITHUB_TOKEN" not in captured["env"]
+        assert "OPENROUTER_API_KEY" not in captured["env"]
         assert client.child_scope_unit == "hermes-gateway-child-codex-app-server-session.scope"

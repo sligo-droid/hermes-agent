@@ -162,6 +162,74 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     assert result["ui_work_route"]["matched"] is False
 
 
+def test_authorized_git_pr_lifecycle_updates_prompt_and_codex_env(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    gh_config = tmp_path / "gh"
+    gh_config.mkdir()
+    git_config = tmp_path / ".gitconfig"
+    git_config.write_text("[user]\n\tname = Test\n\temail = test@example.invalid\n")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(gh_config))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(git_config))
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/ssh-agent.sock")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+    monkeypatch.setenv("GH_TOKEN", "gho_secret")
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix and open a PR",
+            parent_agent=_parent(tmp_path),
+            allow_git_pr_lifecycle=True,
+        )
+    )
+
+    assert result["success"] is True
+    kwargs = FakeSession.instances[0].kwargs
+    assert kwargs["replace_env"] is False
+    env = kwargs["env"]
+    assert env["HERMES_SESSION_KEY"] == "discord:123"
+    assert env["HERMES_CODEX_WORKER_NETWORK_ACCESS"] == "1"
+    assert env["HERMES_CODEX_WORKER_WORKSPACE"] == str(tmp_path)
+    assert env["GH_CONFIG_DIR"] == str(gh_config)
+    assert env["GIT_CONFIG_GLOBAL"] == str(git_config)
+    assert env["SSH_AUTH_SOCK"] == "/tmp/ssh-agent.sock"
+    assert "GITHUB_TOKEN" not in env
+    assert "GH_TOKEN" not in env
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "Git/PR lifecycle is explicitly authorized" in prompt
+    assert "open a non-draft PR" in prompt
+    assert "Do not create commits or pull requests." not in prompt
+    assert "Do not merge PRs" in prompt
+
+
+def test_default_coding_worker_keeps_restricted_codex_env(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.invalid:8080")
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix without PR lifecycle",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    kwargs = FakeSession.instances[0].kwargs
+    assert kwargs["replace_env"] is False
+    assert kwargs["env"] == {"HERMES_SESSION_KEY": "discord:123"}
+    assert "HTTPS_PROXY" not in kwargs["env"]
+    assert "HERMES_CODEX_WORKER_NETWORK_ACCESS" not in kwargs["env"]
+
+
 def test_ui_work_uses_codex_model_overlay(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []
