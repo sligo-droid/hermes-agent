@@ -799,6 +799,45 @@ def test_self_improvement_cards_include_downstream_task_status(client):
     assert enriched["downstream_task"]["id"] == approved.json()["task"]["id"]
 
 
+def test_self_improvement_resume_uses_recovery_metadata_task_id(kanban_home):
+    _load_plugin_router()
+    plugin_api = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="Metadata-only recovery task", initial_status="blocked")
+    finally:
+        conn.close()
+    proposal_storage.record_approval(
+        card["proposal_id"],
+        kanban_task_id="",
+        worker_url=f"/workers?task={task_id}",
+        actor="operator",
+    )
+    recovered = proposal_storage.record_recovery_needed(
+        card["proposal_id"],
+        actor="command-center",
+        kanban_task_id=task_id,
+        metadata={
+            "board": kb.DEFAULT_BOARD,
+            "kanban_task_id": task_id,
+            "observed_task_status": "blocked",
+            "recovery_required": True,
+        },
+    )
+    assert recovered["kanban_task_id"] == ""
+
+    body = plugin_api.self_improvement_proposal_resume_endpoint(card["proposal_id"])
+
+    assert body["task"]["id"] == task_id
+    assert body["task"]["status"] == "ready"
+    assert body["card"]["kanban_task_id"] == ""
+    audit = proposal_storage.list_audit_events(card["proposal_id"])
+    assert audit[-1]["action"] == "resumed"
+    assert audit[-1]["kanban_task_id"] == task_id
+
+
 def test_self_improvement_proposal_api_reconciles_archived_downstream_task(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
@@ -1343,6 +1382,100 @@ def test_discord_worker_board_resume_replays_blocked_tickets(client):
         assert kb.claim_task(conn, blocked_id) is not None
     finally:
         conn.close()
+
+
+def test_discord_worker_board_resume_rejects_recovery_needed_non_resumable_row(kanban_home):
+    from hermes_cli import command_center
+    from hermes_cli import discord_worker_boards as dwb
+    from fastapi import HTTPException
+
+    _load_plugin_router()
+    plugin_api = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    board = "discord-recovery-needed-resume"
+    _write_discord_worker_metadata(board, {"goal_status": "blocked", "phase": "blocked"})
+    conn = kb.connect(board=board)
+    try:
+        task_id = kb.create_task(conn, title="Recovery-needed worker", board=board, initial_status="blocked")
+    finally:
+        conn.close()
+    proposal_storage.record_approval(
+        card["proposal_id"],
+        kanban_task_id=task_id,
+        worker_url=f"/workers/{board}/tickets/{task_id}",
+        actor="operator",
+        metadata={"board": board},
+    )
+    proposal_storage.record_recovery_needed(
+        card["proposal_id"],
+        actor="command-center",
+        reason="manual recovery required",
+        kanban_task_id=task_id,
+        metadata={
+            "board": board,
+            "kanban_task_id": task_id,
+            "recovery_required": True,
+            "recovery_reason": "manual recovery required",
+            "observed_terminal_status": "blocked",
+            "observed_task_status": "blocked",
+            "evidence_kind": "worker_board",
+        },
+    )
+
+    snapshot = command_center.build_command_center_snapshot()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+    assert item["status_detail"] == "recovery_needed"
+    assert item["execution"]["recovery_required"] is True
+    assert item["execution"]["resumable"] is False
+
+    with pytest.raises(HTTPException) as excinfo:
+        plugin_api.resume_board(board)
+
+    assert excinfo.value.status_code == 409
+    assert "recovery" in excinfo.value.detail
+    conn = kb.connect(board=board)
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task.status == "blocked"
+    finally:
+        conn.close()
+    worker = kb.read_board_metadata(board)[dwb.DISCORD_WORKER_META_KEY]
+    assert worker["goal_status"] == "blocked"
+    assert worker["phase"] == "blocked"
+    assert worker.get("paused") is not False
+
+
+def test_discord_worker_board_resume_guard_permits_resumable_board(kanban_home):
+    from hermes_cli import discord_worker_boards as dwb
+
+    _load_plugin_router()
+    plugin_api = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    board = "discord-resumable-direct"
+    _write_discord_worker_metadata(
+        board,
+        {
+            "goal_status": "paused",
+            "phase": "paused",
+            "phase_before_pause": "dev",
+            "paused": True,
+            "paused_reason": "operator pause",
+        },
+    )
+    conn = kb.connect(board=board)
+    try:
+        task_id = kb.create_task(conn, title="Paused worker", board=board, initial_status="blocked")
+    finally:
+        conn.close()
+
+    body = plugin_api.resume_board(board)
+
+    assert body["result"]["resumed"] is True
+    assert body["result"]["replayed_task_ids"] == [task_id]
+    worker = kb.read_board_metadata(board)[dwb.DISCORD_WORKER_META_KEY]
+    assert worker["goal_status"] == "active"
+    assert worker["phase"] == "dev"
+    assert worker["paused"] is False
 
 
 def test_self_improvement_undo_followup_for_done_task_is_idempotent(client):

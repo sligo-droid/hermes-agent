@@ -980,6 +980,15 @@ def _latest_self_improvement_recovery_metadata(proposal_id: str) -> dict[str, An
     return {}
 
 
+def _self_improvement_resume_task_id(card: dict[str, Any]) -> str:
+    task_id = str(card.get("kanban_task_id") or "").strip()
+    if task_id:
+        return task_id
+    proposal_id = str(card.get("proposal_id") or "")
+    recovery_metadata = _latest_self_improvement_recovery_metadata(proposal_id)
+    return str(recovery_metadata.get("kanban_task_id") or "").strip()
+
+
 def _discord_worker_meta(board: str | None) -> dict[str, Any]:
     board = str(board or "").strip()
     if not board or board == "default":
@@ -1120,6 +1129,47 @@ def _resume_generic_board(board: str) -> dict[str, Any]:
     meta.pop("command_center_pause_reason", None)
     kanban_db.board_metadata_path(board).write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return {"board": board, "resumed": resumed}
+
+
+def _board_recovery_resume_blocker(board: str) -> str | None:
+    try:
+        cards = proposal_storage.list_cards(include_rejected=True, include_archived=True).get("cards", [])
+    except Exception:
+        return None
+    for card in cards:
+        if str(card.get("status") or "").lower() != "recovery_needed":
+            continue
+        proposal_id = str(card.get("proposal_id") or "")
+        if _latest_self_improvement_board(proposal_id) != board:
+            continue
+        metadata = _latest_self_improvement_recovery_metadata(proposal_id)
+        return str(metadata.get("recovery_reason") or "recovery is required").strip()
+    return None
+
+
+def _require_command_center_board_resumable(board: str, worker: dict[str, Any] | None = None) -> None:
+    if board == kanban_db.DEFAULT_BOARD:
+        raise HTTPException(status_code=409, detail="default board is not resumable through board replay")
+    meta = kanban_db.read_board_metadata(board)
+    if meta.get("archived"):
+        raise HTTPException(status_code=409, detail="archived board is not resumable")
+    recovery_reason = _board_recovery_resume_blocker(board)
+    if recovery_reason:
+        raise HTTPException(status_code=409, detail=f"board requires recovery and cannot be resumed directly: {recovery_reason}")
+    worker = worker or _discord_worker_meta(board)
+    paused = bool(
+        (worker or {}).get("paused")
+        or meta.get("command_center_paused")
+        or str((worker or {}).get("goal_status") or "").lower() == "paused"
+        or str((worker or {}).get("phase") or "").lower() == "paused"
+    )
+    conn = _conn(board=board)
+    try:
+        statuses = {str(task.status or "").lower() for task in kanban_db.list_tasks(conn, include_archived=False)}
+    finally:
+        conn.close()
+    if not paused and not (statuses & {"blocked", "scheduled"}):
+        raise HTTPException(status_code=409, detail="board is not resumable from current Command Center state")
 
 
 def _stop_generic_board_for_archive(board: str, *, reason: str) -> dict[str, Any]:
@@ -2356,7 +2406,7 @@ def self_improvement_proposal_resume_endpoint(proposal_id: str):
     card = proposal_storage.get_card(proposal_id)
     if card is None:
         raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")
-    task_id = card.get("kanban_task_id")
+    task_id = _self_improvement_resume_task_id(card)
     if not task_id:
         raise HTTPException(status_code=409, detail="proposal has no downstream task")
     board = _latest_self_improvement_board(proposal_id)
@@ -3242,6 +3292,7 @@ def resume_board(slug: str):
         raise HTTPException(status_code=404, detail=f"board {slug!r} does not exist")
     _raise_if_corrupt_quarantined(normed)
     worker = _discord_worker_meta(normed)
+    _require_command_center_board_resumable(normed, worker=worker)
     if worker:
         from hermes_cli import discord_worker_boards as dwb
 

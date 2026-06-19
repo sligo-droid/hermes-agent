@@ -186,6 +186,26 @@ def test_command_center_archive_action_renders_last_in_row_rail():
     assert "command-center-card-timestamp" in row_footer
 
 
+def test_command_center_recovery_rows_stay_out_of_active_and_use_correct_actions():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    inbox_source = source.split("function isInboxItem", 1)[1].split("function isWorkItem", 1)[0]
+    work_source = source.split("function isWorkItem", 1)[1].split("function isArchivedItem", 1)[0]
+    attention_source = source.split("function isOperatorAttentionOnlyItem", 1)[1].split("function workItemRecency", 1)[0]
+    action_source = source.split("function availableActionKinds", 1)[1].split("function actionSet", 1)[0]
+    resume_source = action_source.split("const canResume", 1)[1].split("const canUndo", 1)[0]
+
+    assert "isOperatorAttentionOnlyItem(item)" in inbox_source
+    assert "!isOperatorAttentionOnlyItem(item)" in work_source
+    assert "item.execution?.recovery_required && item.execution?.resumable !== true" in attention_source
+    assert "worker_url" not in attention_source
+    assert "item.execution?.resumable === true" in resume_source
+    assert "recovery_required" not in resume_source
+    assert "worker_url" not in resume_source
+    assert "item.status === \"paused\"" not in resume_source
+    assert "item.execution?.paused" not in resume_source
+    assert action_source.index('actions.push("replay")') < action_source.index('actions.push("archive")')
+
+
 def test_command_center_repair_action_wiring_and_footer_removed():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
     api_source = (ROOT / "web/src/lib/api.ts").read_text(encoding="utf-8")
