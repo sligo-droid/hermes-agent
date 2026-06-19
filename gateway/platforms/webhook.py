@@ -753,6 +753,7 @@ class WebhookAdapter(BasePlatformAdapter):
             extract_request,
             fetch_pr_info,
             fetch_pr_related_context,
+            github_pr_amend_reaction_targets,
             policy_from_route,
             preflight_request,
             publish_and_activate_pr_amend_intake,
@@ -868,6 +869,7 @@ class WebhookAdapter(BasePlatformAdapter):
             )
 
         self._github_pr_amend_locks.add(decision.lock_key)
+        reaction_metadata: dict[str, Any] = {}
         try:
             fetched_context = await asyncio.to_thread(
                 fetch_pr_related_context,
@@ -883,19 +885,27 @@ class WebhookAdapter(BasePlatformAdapter):
                 fetched_context,
             )
             artifact_path = write_pr_amend_intake_artifact(artifact)
+            reaction_metadata = {
+                "repo": request.repo,
+                "pr_number": str(request.pr_number),
+                "source_kind": request.source_kind,
+                "source_id": request.source_id,
+                "source_node_id": request.source_node_id,
+                "reaction_targets": github_pr_amend_reaction_targets(artifact),
+            }
             channel_id = resolve_pr_amend_discord_channel(route_config, request)
             existing_route = resolve_pr_amend_existing_discord_route(artifact)
             if existing_route:
                 channel_id = str(existing_route.get("discord_channel_id") or channel_id or "").strip()
-            degraded_reason = ""
-            if not channel_id:
-                degraded_reason = "missing_discord_route"
-            elif request.source_kind in {"review", "review_comment"} and not existing_route:
-                degraded_reason = "missing_original_discord_thread"
+            degraded_reason = self._github_pr_amend_degraded_reason(
+                source_kind=request.source_kind,
+                channel_id=channel_id,
+                existing_route=existing_route,
+            )
             if degraded_reason:
                 self._github_pr_amend_locks.discard(decision.lock_key)
                 self._github_pr_amend_lock_boards.pop(decision.lock_key, None)
-                await self._safe_github_pr_amend_reaction(request, "-1")
+                await self._safe_github_pr_amend_reactions(reaction_metadata, request, "-1")
                 return web.json_response(
                     {
                         "status": "degraded",
@@ -910,8 +920,10 @@ class WebhookAdapter(BasePlatformAdapter):
                     status=202,
                 )
             card = build_pr_amend_discord_card(artifact, artifact_path=artifact_path)
-            await self._safe_github_pr_amend_reaction(request, "eyes")
-            await self._safe_github_pr_amend_reaction(request, "rocket")
+            if isinstance(card.get("github_pr_amend"), dict):
+                reaction_metadata = card["github_pr_amend"]
+            await self._safe_github_pr_amend_reactions(reaction_metadata, request, "eyes")
+            await self._safe_github_pr_amend_reactions(reaction_metadata, request, "rocket")
             discord_metadata = await asyncio.to_thread(
                 publish_and_activate_pr_amend_intake,
                 card,
@@ -929,7 +941,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 route_name,
                 delivery_id,
             )
-            await self._safe_github_pr_amend_reaction(request, "-1")
+            await self._safe_github_pr_amend_reactions(reaction_metadata, request, "-1")
             return web.json_response(
                 {
                     "status": "error",
@@ -966,6 +978,71 @@ class WebhookAdapter(BasePlatformAdapter):
             status=202,
         )
 
+    @staticmethod
+    def _github_pr_amend_degraded_reason(
+        *,
+        source_kind: str,
+        channel_id: str,
+        existing_route: dict[str, Any],
+    ) -> str:
+        if not channel_id:
+            return "missing_discord_route"
+        return ""
+
+    def _github_pr_amend_reaction_requests(
+        self,
+        metadata: dict[str, Any],
+        fallback: Any | None = None,
+    ) -> list[Any]:
+        """Build reaction request objects from stored PR-amend metadata."""
+
+        base = metadata if isinstance(metadata, dict) else {}
+        raw_targets = base.get("reaction_targets")
+        targets = raw_targets if isinstance(raw_targets, list) else []
+        requests: list[Any] = []
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+            source_kind = str(target.get("source_kind") or "").strip()
+            source_id = str(target.get("source_id") or "").strip()
+            source_node_id = str(target.get("source_node_id") or "").strip()
+            if not source_kind or not (source_id or source_node_id):
+                continue
+            requests.append(
+                SimpleNamespace(
+                    repo=str(
+                        target.get("repo")
+                        or base.get("repo")
+                        or base.get("upstream_repo")
+                        or getattr(fallback, "repo", "")
+                        or ""
+                    ),
+                    pr_number=str(
+                        target.get("pr_number")
+                        or base.get("pr_number")
+                        or base.get("upstream_pr_number")
+                        or getattr(fallback, "pr_number", "")
+                        or ""
+                    ),
+                    source_kind=source_kind,
+                    source_id=source_id,
+                    source_node_id=source_node_id,
+                )
+            )
+        if requests:
+            return requests
+        if fallback is not None:
+            return [fallback]
+        return [
+            SimpleNamespace(
+                repo=str(base.get("repo") or base.get("upstream_repo") or ""),
+                pr_number=str(base.get("pr_number") or base.get("upstream_pr_number") or ""),
+                source_kind=str(base.get("source_kind") or ""),
+                source_id=str(base.get("source_id") or ""),
+                source_node_id=str(base.get("source_node_id") or ""),
+            )
+        ]
+
     def _github_pr_amend_reaction_endpoint(self, request: Any) -> str:
         """Return the GitHub reactions endpoint for a PR-amend trigger."""
         repo = getattr(request, "repo", "")
@@ -976,6 +1053,15 @@ class WebhookAdapter(BasePlatformAdapter):
         if source_kind == "review_comment" and source_id:
             return f"repos/{repo}/pulls/comments/{source_id}/reactions"
         return ""
+
+    async def _safe_github_pr_amend_reactions(
+        self,
+        metadata: dict[str, Any],
+        fallback: Any,
+        content: str,
+    ) -> None:
+        for request in self._github_pr_amend_reaction_requests(metadata, fallback):
+            await self._safe_github_pr_amend_reaction(request, content)
 
     async def _safe_github_pr_amend_reaction(self, request: Any, content: str) -> None:
         """Best-effort GitHub reaction; never block or fail the amend job."""
@@ -994,14 +1080,11 @@ class WebhookAdapter(BasePlatformAdapter):
     async def sync_github_pr_amend_terminal_reaction(self, metadata: dict[str, Any], state: str) -> bool:
         """Best-effort terminal reaction sync for a PR-amend trigger."""
         content = "+1" if str(state or "").strip() == "done" else "-1"
-        request = SimpleNamespace(
-            repo=str(metadata.get("repo") or metadata.get("upstream_repo") or ""),
-            pr_number=str(metadata.get("pr_number") or metadata.get("upstream_pr_number") or ""),
-            source_kind=str(metadata.get("source_kind") or ""),
-            source_id=str(metadata.get("source_id") or ""),
-            source_node_id=str(metadata.get("source_node_id") or ""),
-        )
-        return await self._add_github_pr_amend_reaction(request, content)
+        requests = self._github_pr_amend_reaction_requests(metadata)
+        if not requests:
+            return False
+        results = [await self._add_github_pr_amend_reaction(request, content) for request in requests]
+        return all(results)
 
     async def _add_github_pr_amend_reaction(self, request: Any, content: str) -> bool:
         """Add a GitHub reaction to the triggering object via ``gh api``."""
