@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createGatewayEventHandler } from '../app/createGatewayEventHandler.js'
 import { getOverlayState, patchOverlayState, resetOverlayState } from '../app/overlayStore.js'
@@ -56,11 +56,29 @@ const buildCtx = (appended: Msg[], overrides: any = {}) =>
 
 describe('createGatewayEventHandler', () => {
   beforeEach(() => {
+    vi.stubEnv('TMUX', '')
+    vi.stubEnv('STY', '')
+    vi.stubEnv('CMUX_WORKSPACE_ID', '')
+    vi.stubEnv('CMUX_SURFACE_ID', '')
+    vi.stubEnv('CMUX_TAB_ID', '')
+    vi.stubEnv('CMUX_PANEL_ID', '')
+    vi.stubEnv('CMUX_SOCKET_PATH', '')
+    vi.stubEnv('__CFBundleIdentifier', '')
+    vi.stubEnv('SSH_CONNECTION', '')
+    vi.stubEnv('SSH_TTY', '')
+    vi.stubEnv('GHOSTTY_RESOURCES_DIR', '')
+    vi.stubEnv('GHOSTTY_BIN_DIR', '')
+    vi.stubEnv('TERM_PROGRAM', '')
+    vi.stubEnv('TERM', 'xterm-256color')
     resetOverlayState()
     resetUiState()
     resetTurnState()
     turnController.fullReset()
     patchUiState({ showReasoning: true })
+  })
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
   })
 
   it('archives incomplete todos into transcript flow at end of turn so they scroll up', () => {
@@ -94,6 +112,7 @@ describe('createGatewayEventHandler', () => {
   it('writes terminal completion notification on completed assistant responses', () => {
     const appended: Msg[] = []
     const stdout = { isTTY: true, write: vi.fn() }
+
     const onEvent = createGatewayEventHandler(
       buildCtx(appended, { system: { stdout, terminalNotifyOnComplete: true } })
     )
@@ -101,6 +120,21 @@ describe('createGatewayEventHandler', () => {
     onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
 
     expect(stdout.write).toHaveBeenCalledWith(wrapForMultiplexer(osc777Notify()))
+  })
+
+  it('does not emit terminal completion notification inside tmux', () => {
+    vi.stubEnv('TMUX', '/tmp/tmux')
+
+    const appended: Msg[] = []
+    const stdout = { isTTY: true, write: vi.fn() }
+
+    const onEvent = createGatewayEventHandler(
+      buildCtx(appended, { system: { stdout, terminalNotifyOnComplete: true } })
+    )
+
+    onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
+
+    expect(stdout.write).not.toHaveBeenCalled()
   })
 
   it('requests a tail resnap after completed assistant responses enter history', () => {
@@ -128,6 +162,7 @@ describe('createGatewayEventHandler', () => {
   it('does not write terminal completion notification after interrupted turns', () => {
     const appended: Msg[] = []
     const stdout = { isTTY: true, write: vi.fn() }
+
     const onEvent = createGatewayEventHandler(
       buildCtx(appended, { system: { stdout, terminalNotifyOnComplete: true } })
     )

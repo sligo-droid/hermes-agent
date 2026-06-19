@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import {
+  isUnsafeCompletionNotificationSession,
   osc777Notify,
   sanitizeOscField,
   wrapForMultiplexer,
@@ -25,7 +26,24 @@ describe('terminalNotification', () => {
     expect(wrapped.endsWith('\x1b\\')).toBe(true)
   })
 
-  it('writes only when enabled and attached to a TTY', () => {
+  it('detects terminal sessions where completion notifications are unsafe', () => {
+    expect(isUnsafeCompletionNotificationSession({})).toBe(false)
+    expect(isUnsafeCompletionNotificationSession({ TMUX: '/tmp/tmux' })).toBe(true)
+    expect(isUnsafeCompletionNotificationSession({ STY: 'screen' })).toBe(true)
+    expect(isUnsafeCompletionNotificationSession({ CMUX_WORKSPACE_ID: 'workspace' })).toBe(true)
+    expect(isUnsafeCompletionNotificationSession({ CMUX_SURFACE_ID: 'surface' })).toBe(true)
+    expect(isUnsafeCompletionNotificationSession({ CMUX_TAB_ID: 'tab' })).toBe(true)
+    expect(isUnsafeCompletionNotificationSession({ CMUX_PANEL_ID: 'panel' })).toBe(true)
+    expect(isUnsafeCompletionNotificationSession({ CMUX_SOCKET_PATH: '/tmp/cmux.sock' })).toBe(true)
+    expect(isUnsafeCompletionNotificationSession({ __CFBundleIdentifier: 'com.cmuxterm.app' })).toBe(true)
+    expect(isUnsafeCompletionNotificationSession({ SSH_CONNECTION: 'client server' })).toBe(true)
+    expect(isUnsafeCompletionNotificationSession({ SSH_TTY: '/dev/pts/9' })).toBe(true)
+    expect(isUnsafeCompletionNotificationSession({ TERM_PROGRAM: 'ghostty' })).toBe(false)
+    expect(isUnsafeCompletionNotificationSession({ TERM: 'xterm-ghostty' })).toBe(false)
+    expect(isUnsafeCompletionNotificationSession({ TERM_PROGRAM: 'cmux' })).toBe(true)
+  })
+
+  it('writes only when enabled and attached to a TTY outside unsafe sessions', () => {
     const write = vi.fn()
     const stdout = { isTTY: true, write }
 
@@ -34,5 +52,23 @@ describe('terminalNotification', () => {
 
     expect(writeCompletionNotification(stdout, false, {})).toBe(false)
     expect(writeCompletionNotification({ isTTY: false, write }, true, {})).toBe(false)
+  })
+
+  it('suppresses TUI completion notifications in unsafe terminal sessions', () => {
+    const write = vi.fn()
+    const stdout = { isTTY: true, write }
+
+    expect(writeCompletionNotification(stdout, true, { TMUX: '/tmp/tmux' })).toBe(false)
+    expect(writeCompletionNotification(stdout, true, { STY: 'screen' })).toBe(false)
+    expect(writeCompletionNotification(stdout, true, { CMUX_WORKSPACE_ID: 'workspace' })).toBe(false)
+    expect(writeCompletionNotification(stdout, true, { CMUX_SURFACE_ID: 'surface' })).toBe(false)
+    expect(writeCompletionNotification(stdout, true, { CMUX_TAB_ID: 'tab' })).toBe(false)
+    expect(writeCompletionNotification(stdout, true, { __CFBundleIdentifier: 'com.cmuxterm.app' })).toBe(false)
+    expect(writeCompletionNotification(stdout, true, { SSH_CONNECTION: 'client server' })).toBe(false)
+    expect(writeCompletionNotification(stdout, true, { SSH_TTY: '/dev/pts/9' })).toBe(false)
+    expect(write).not.toHaveBeenCalled()
+
+    expect(writeCompletionNotification(stdout, true, { TERM_PROGRAM: 'ghostty' })).toBe(true)
+    expect(writeCompletionNotification(stdout, true, { TERM: 'xterm-ghostty' })).toBe(true)
   })
 })
