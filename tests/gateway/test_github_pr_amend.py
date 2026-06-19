@@ -91,7 +91,7 @@ REVIEW_COMMENT_PAYLOAD = {
     "action": "created",
     "repository": {"full_name": "reserve-protocol/reserve-index-dtf"},
     "sender": {"login": "tbrent"},
-    "pull_request": {"number": 182},
+    "pull_request": {"number": 182, "user": {"login": "sligo-droid"}},
     "comment": {
         "id": 4800001,
         "node_id": "PRRC_kwDOReviewComment",
@@ -157,6 +157,7 @@ class TestGitHubPrAmendPolicy:
         assert request.path == "src/example.ts"
         assert request.line == 42
         assert request.review_id == "123"
+        assert request.pr_author == "sligo-droid"
 
     def test_extracts_changes_requested_review_context(self):
         request = extract_request("pull_request_review", REVIEW_PAYLOAD)
@@ -265,6 +266,25 @@ class TestGitHubPrAmendPolicy:
         request = extract_request("pull_request_review", payload)
         decision = evaluate_request(request, PR_INFO, GitHubPrAmendPolicy())
         assert decision.accepted is True
+
+    def test_accepts_missing_mention_review_comment_on_sligo_droid_authored_pr(self):
+        payload = json.loads(json.dumps(REVIEW_COMMENT_PAYLOAD))
+        payload["comment"]["body"] = "use the existing helper here."
+        request = extract_request("pull_request_review_comment", payload)
+        assert preflight_request(request, GitHubPrAmendPolicy()) is None
+
+        decision = evaluate_request(request, PR_INFO, GitHubPrAmendPolicy())
+
+        assert decision.accepted is True
+
+    def test_rejects_missing_mention_review_comment_on_non_sligo_droid_authored_pr(self):
+        payload = json.loads(json.dumps(REVIEW_COMMENT_PAYLOAD))
+        payload["pull_request"]["user"]["login"] = "someone-else"
+        payload["comment"]["body"] = "use the existing helper here."
+        request = extract_request("pull_request_review_comment", payload)
+        assert preflight_request(request, GitHubPrAmendPolicy()) == (
+            "missing mention @sligo-droid; PR author 'someone-else' is not sligo-droid"
+        )
 
     def test_defers_missing_mention_review_without_payload_author_to_pr_metadata(self):
         payload = json.loads(json.dumps(REVIEW_PAYLOAD))
@@ -388,6 +408,7 @@ class TestGitHubPrAmendPolicy:
             "review_comments": [
                 {
                     "id": 3430163991,
+                    "node_id": "PRRC_kwDOInlineOne",
                     "pull_request_review_id": 4518030260,
                     "html_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#discussion_r3430163991",
                     "path": "contracts/interfaces/IFolio.sol",
@@ -397,6 +418,7 @@ class TestGitHubPrAmendPolicy:
                 },
                 {
                     "id": 3430163992,
+                    "node_id": "PRRC_kwDOInlineTwo",
                     "pull_request_review_id": 4518030260,
                     "html_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#discussion_r3430163992",
                     "path": "contracts/utils/FolioLib.sol",
@@ -428,6 +450,24 @@ class TestGitHubPrAmendPolicy:
         assert card["project_context"]["github_pr_amend"]["source_id"] == "4518030260"
         assert card["project_context"]["github_pr_amend"]["source_node_id"] == payload["review"]["node_id"]
         assert card["project_context"]["github_pr_amend"]["source_key"] == "github-pr-amend:review:4518030260"
+        assert card["project_context"]["github_pr_amend"]["reaction_targets"] == [
+            {
+                "repo": "reserve-protocol/reserve-index-dtf",
+                "pr_number": "182",
+                "source_kind": "review_comment",
+                "source_id": "3430163991",
+                "source_node_id": "PRRC_kwDOInlineOne",
+                "source_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#discussion_r3430163991",
+            },
+            {
+                "repo": "reserve-protocol/reserve-index-dtf",
+                "pr_number": "182",
+                "source_kind": "review_comment",
+                "source_id": "3430163992",
+                "source_node_id": "PRRC_kwDOInlineTwo",
+                "source_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#discussion_r3430163992",
+            },
+        ]
         assert card["project_context"]["github_pr_amend"]["requires_head_sha_advance"] is True
         assert any(
             "Address the triggering review request verbatim: @sligo-droid please address the inline comments."
@@ -500,6 +540,46 @@ class TestGitHubPrAmendPolicy:
         assert "contracts/File30.sol" in body
         assert "inline detail 30" in body
         assert "additional inline review comments omitted" not in body
+
+    def test_review_card_without_matching_inline_comments_omits_stale_pr_comments(self, tmp_path):
+        payload = json.loads(json.dumps(REVIEW_PAYLOAD))
+        payload["review"]["id"] = 4534458851
+        payload["review"]["html_url"] = (
+            "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#pullrequestreview-4534458851"
+        )
+        payload["review"]["body"] = "New direction: use an array of FeeRecipient."
+        request = extract_request("pull_request_review", payload, delivery_id="delivery-review-no-comments")
+        policy = policy_from_route(ROUTE)
+        decision = evaluate_request(request, PR_INFO, policy)
+        context = {
+            **PR_RELATED_CONTEXT,
+            "reviews": [
+                {
+                    "id": 4534458851,
+                    "state": "CHANGES_REQUESTED",
+                    "body": "New direction: use an array of FeeRecipient.",
+                }
+            ],
+            "review_comments": [
+                {
+                    "id": 3430163992,
+                    "pull_request_review_id": 4518030260,
+                    "html_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#discussion_r3430163992",
+                    "path": "contracts/utils/FolioLib.sol",
+                    "line": 59,
+                    "body": "stale older review comment",
+                }
+            ],
+        }
+        artifact = build_pr_amend_intake_artifact(request, decision, policy, PR_INFO, payload, context)
+
+        card = build_pr_amend_discord_card(artifact, artifact_path=tmp_path / "intake.json")
+
+        body = card["body"]
+        assert "Review 4534458851 (CHANGES_REQUESTED):" in body
+        assert "Inline review comments: none found in fetched context" in body
+        assert "stale older review comment" not in body
+        assert "discussion_r3430163992" not in body
 
     def test_non_reserve_pr_amend_card_omits_solidity_skill_hint(self, tmp_path):
         payload = json.loads(json.dumps(ISSUE_COMMENT_PAYLOAD))
@@ -909,6 +989,53 @@ class TestGitHubPrAmendWebhookRoute:
         assert "addReaction" in "\n".join(calls[3])
         assert f"subjectId={REVIEW_PAYLOAD['review']['node_id']}" in calls[3]
         assert "content=THUMBS_UP" in calls[3]
+
+    def test_github_pr_amend_review_comment_without_existing_thread_can_route(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+
+        assert (
+            adapter._github_pr_amend_degraded_reason(
+                source_kind="review_comment",
+                channel_id="channel-123",
+                existing_route={},
+            )
+            == ""
+        )
+        assert (
+            adapter._github_pr_amend_degraded_reason(
+                source_kind="review",
+                channel_id="channel-123",
+                existing_route={},
+            )
+            == "missing_original_discord_thread"
+        )
+
+    @pytest.mark.asyncio
+    async def test_github_pr_amend_terminal_reaction_uses_review_comment_targets(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        adapter._add_github_pr_amend_reaction = AsyncMock(return_value=True)
+        metadata = {
+            "repo": "reserve-protocol/reserve-index-dtf",
+            "pr_number": "181",
+            "source_kind": "review",
+            "source_id": "4534464625",
+            "source_node_id": "PRR_kwDOReviewSummary",
+            "reaction_targets": [
+                {
+                    "source_kind": "review_comment",
+                    "source_id": "3443862311",
+                    "source_node_id": "PRRC_kwDOInlineComment",
+                }
+            ],
+        }
+
+        assert await adapter.sync_github_pr_amend_terminal_reaction(metadata, "done") is True
+
+        adapter._add_github_pr_amend_reaction.assert_awaited_once()
+        request, content = adapter._add_github_pr_amend_reaction.await_args.args
+        assert content == "+1"
+        assert request.source_kind == "review_comment"
+        assert request.source_id == "3443862311"
 
     @pytest.mark.asyncio
     async def test_github_pr_amend_reaction_list_failure_still_posts(self):

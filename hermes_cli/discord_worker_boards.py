@@ -953,6 +953,38 @@ def _clear_generated_summary_title(worker: dict[str, Any]) -> None:
     worker["summary_title"] = _DELETE_META
 
 
+def _reset_pr_amend_worker_for_new_source(worker: dict[str, Any]) -> None:
+    """Clear terminal/finalizer state before reusing a board for a new review."""
+
+    worker["phase"] = "intake"
+    worker["goal_status"] = "unset"
+    worker["execution_mode"] = "pending"
+    worker["criteria"] = []
+    for key in (
+        "blocked_reason",
+        "concise_outcome",
+        "deployment_status",
+        "final_discord_response",
+        "final_discord_response_at",
+        "final_discord_session_id",
+        "final_discord_work_item_id",
+        "final_discord_message_id",
+        "pr_amend_trigger_head_sha",
+        "pr_amend_upstream_head_sha",
+        "pr_amend_head_advanced",
+        "github_pr_amend_head_sha",
+        "pr_finalizer_recovery_state",
+        "pr_finalizer_recovery_blocker",
+        "pr_skipped_no_changes",
+        "pr_merge_skipped",
+        "pr_merge_skipped_reason",
+    ):
+        worker[key] = _DELETE_META
+    _clear_terminal_summary_fields(worker)
+    _clear_pr_summary_fields(worker)
+    _clear_generated_summary_title(worker)
+
+
 def _public_base_url() -> str:
     value = str(os.getenv("HERMES_PUBLIC_KANBAN_BASE_URL") or "").strip()
     if value:
@@ -1188,23 +1220,34 @@ def ensure_discord_thread_board(
             "created_at": worker.get("created_at") or _now(),
         }
     )
+    if reset_review_loop_budget:
+        _reset_pr_amend_worker_for_new_source(worker)
     _mark_code_island_deferred(worker)
     setup_updates = {
         key: value
         for key, value in worker.items()
         if key
-        not in {
+        and (value is _DELETE_META or key not in {
             "terminal_reaction_sync_pending",
             "terminal_summary_sync_pending",
             "terminal_completion_message_pending",
             "terminal_completion_message_sent_at",
             "terminal_completion_message_id",
             "terminal_reaction_synced_state",
-        }
+        })
     }
+
+    def apply_setup_updates(current_metadata: dict[str, Any], current_worker: dict[str, Any]) -> bool:
+        for key, value in setup_updates.items():
+            if value is _DELETE_META:
+                current_worker.pop(key, None)
+            else:
+                current_worker[key] = value
+        return True
+
     metadata = _mutate_worker_metadata(
         slug,
-        lambda current_metadata, current_worker: (current_worker.update(setup_updates) or True),
+        apply_setup_updates,
         warning_action="ensure Discord worker board metadata",
     ) or metadata
     if previous_worktree_path != str(worker.get("worktree_path") or ""):

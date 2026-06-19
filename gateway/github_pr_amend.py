@@ -30,6 +30,8 @@ _ALLOWED_EVENTS_DEFAULT = {
     "pull_request_review": {"submitted"},
 }
 
+_IMPLICIT_PR_AUTHOR_EVENTS = {"pull_request_review", "pull_request_review_comment"}
+
 
 @dataclass(frozen=True)
 class GitHubPrAmendRequest:
@@ -282,6 +284,7 @@ def extract_request(
             source_node_id=str(_dig(payload, "comment", "node_id", default="") or ""),
             source_url=str(_dig(payload, "comment", "html_url", default="") or ""),
             review_id=str(_dig(payload, "comment", "pull_request_review_id", default="") or ""),
+            pr_author=str(_dig(payload, "pull_request", "user", "login", default="") or ""),
             path=str(_dig(payload, "comment", "path", default="") or ""),
             line=line,
             diff_hunk=str(_dig(payload, "comment", "diff_hunk", default="") or ""),
@@ -341,7 +344,7 @@ def preflight_request(
 
     if policy.mention.lower() not in request.body.lower():
         expected_pr_author = policy.mention.lstrip("@").lower()
-        if request.event_type != "pull_request_review":
+        if request.event_type not in _IMPLICIT_PR_AUTHOR_EVENTS:
             return f"missing mention {policy.mention}"
         if request.pr_author and request.pr_author.lower() != expected_pr_author:
             return f"missing mention {policy.mention}; PR author '{request.pr_author}' is not {expected_pr_author}"
@@ -379,8 +382,8 @@ def evaluate_request(
     if policy.mention.lower() not in request.body.lower():
         expected_pr_author = policy.mention.lstrip("@").lower()
         pr_author = str(_dig(pr_info, "user", "login", default="") or request.pr_author or "")
-        if request.event_type != "pull_request_review" or pr_author.lower() != expected_pr_author:
-            if request.event_type == "pull_request_review" and pr_author:
+        if request.event_type not in _IMPLICIT_PR_AUTHOR_EVENTS or pr_author.lower() != expected_pr_author:
+            if request.event_type in _IMPLICIT_PR_AUTHOR_EVENTS and pr_author:
                 return GitHubPrAmendDecision(
                     False,
                     f"missing mention {policy.mention}; PR author '{pr_author}' is not {expected_pr_author}",
@@ -738,6 +741,54 @@ def _format_review_comment(comment: dict[str, Any], index: int) -> list[str]:
     return lines
 
 
+def github_pr_amend_reaction_targets(artifact: dict[str, Any]) -> list[dict[str, str]]:
+    """Return GitHub objects that should carry PR-amend status reactions."""
+
+    source = artifact.get("source") if isinstance(artifact.get("source"), dict) else {}
+    fetched = artifact.get("fetched_context") if isinstance(artifact.get("fetched_context"), dict) else {}
+    comments = [item for item in fetched.get("review_comments") or [] if isinstance(item, dict)]
+    source_kind = str(source.get("kind") or "").strip()
+    source_id = str(source.get("id") or "").strip()
+    repo = str(_dig(artifact, "repository", "full_name", default="") or "")
+    pr_number = str(_dig(artifact, "pull_request", "number", default="") or "")
+
+    selected_comments: list[dict[str, Any]] = []
+    if source_kind == "review":
+        selected_comments = [comment for comment in comments if _comment_review_id(comment) == source_id]
+    elif source_kind == "review_comment":
+        selected_comments = [comment for comment in comments if str(comment.get("id") or "") == source_id]
+
+    targets: list[dict[str, str]] = []
+    for comment in selected_comments:
+        comment_id = str(comment.get("id") or "").strip()
+        if not comment_id:
+            continue
+        targets.append(
+            {
+                "repo": repo,
+                "pr_number": pr_number,
+                "source_kind": "review_comment",
+                "source_id": comment_id,
+                "source_node_id": str(comment.get("node_id") or "").strip(),
+                "source_url": str(comment.get("html_url") or comment.get("url") or "").strip(),
+            }
+        )
+
+    if targets:
+        return targets
+
+    return [
+        {
+            "repo": repo,
+            "pr_number": pr_number,
+            "source_kind": source_kind,
+            "source_id": source_id,
+            "source_node_id": str(source.get("node_id") or "").strip(),
+            "source_url": str(source.get("html_url") or source.get("url") or "").strip(),
+        }
+    ]
+
+
 def _github_review_context_block(artifact: dict[str, Any]) -> str:
     source = artifact.get("source") if isinstance(artifact.get("source"), dict) else {}
     fetched = artifact.get("fetched_context") if isinstance(artifact.get("fetched_context"), dict) else {}
@@ -787,7 +838,7 @@ def _github_review_context_block(artifact: dict[str, Any]) -> str:
             selected_comments = selected_comments + [
                 comment for comment in siblings if str(comment.get("id") or "") != source_id
             ]
-    if not selected_comments and comments:
+    if not selected_comments and comments and source_kind not in {"review", "review_comment"}:
         selected_comments = comments
 
     if selected_comments:
@@ -850,6 +901,7 @@ def build_pr_amend_discord_card(
     source_id = str(_dig(artifact, "source", "id", default=""))
     source_node_id = str(_dig(artifact, "source", "node_id", default=""))
     source_review_state = str(_dig(artifact, "source", "review_state", default=""))
+    reaction_targets = github_pr_amend_reaction_targets(artifact)
     sender = str(_dig(artifact, "sender", "login", default=""))
     body = str(_dig(artifact, "source", "body", default=""))
     review_context = _github_review_context_block(artifact)
@@ -910,6 +962,7 @@ def build_pr_amend_discord_card(
             "source_id": source_id,
             "source_node_id": source_node_id,
             "source_url": source_url,
+            "reaction_targets": reaction_targets,
             "base_repo": base_repo,
             "base_ref": base_ref,
             "head_repo": head_repo,
@@ -937,6 +990,7 @@ def build_pr_amend_discord_card(
                 "source_node_id": source_node_id,
                 "review_state": source_review_state,
                 "source_url": source_url,
+                "reaction_targets": reaction_targets,
                 "source_key": _pr_amend_source_key(artifact),
                 "requires_head_sha_advance": requires_head_sha_advance,
             },
