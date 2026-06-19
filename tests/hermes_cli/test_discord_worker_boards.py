@@ -638,7 +638,26 @@ def test_pr_amend_new_source_resets_review_loop_budget(monkeypatch, tmp_path):
         initial_request="GitHub PR amend round 1",
         project_context={"github_pr_amend": {"source_key": "github-pr-amend:review:1"}},
     )
-    dwb._update_worker_meta(board.slug, {"review_loop_count": 5, "review_loop_limit": 5})
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "review_loop_count": 5,
+            "review_loop_limit": 5,
+            "phase": "blocked",
+            "goal_status": "blocked",
+            "execution_mode": "kanban_pipeline",
+            "blocked_reason": "old PR-amend blocker",
+            "pr_blocker": "old PR blocker",
+            "pr_error": "old PR error",
+            "pr_amend_trigger_head_sha": "old-trigger",
+            "pr_amend_upstream_head_sha": "old-upstream",
+            "pr_amend_head_advanced": False,
+            "board_summary": {"outcome": "old summary"},
+            "terminal_reaction_synced_state": "blocked",
+            "summary_title": "old summary title",
+            "criteria": [{"text": "old stale criteria", "active": True}],
+        },
+    )
 
     updated = dwb.ensure_discord_thread_board(
         thread_id="7770",
@@ -649,7 +668,23 @@ def test_pr_amend_new_source_resets_review_loop_budget(monkeypatch, tmp_path):
     worker = kanban_db.read_board_metadata(updated.slug)["discord_worker"]
     assert worker["review_loop_count"] == 0
     assert worker["review_loop_limit"] == 5
+    assert worker["phase"] == "intake"
+    assert worker["goal_status"] == "unset"
+    assert worker["execution_mode"] == "pending"
+    assert worker["criteria"] == []
     assert worker["project_context"]["github_pr_amend"]["source_key"] == "github-pr-amend:review_comment:2"
+    for stale_key in (
+        "blocked_reason",
+        "pr_blocker",
+        "pr_error",
+        "pr_amend_trigger_head_sha",
+        "pr_amend_upstream_head_sha",
+        "pr_amend_head_advanced",
+        "board_summary",
+        "terminal_reaction_synced_state",
+        "summary_title",
+    ):
+        assert stale_key not in worker
 
 
 def test_pr_amend_duplicate_source_preserves_review_loop_budget(monkeypatch, tmp_path):
