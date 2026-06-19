@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from types import SimpleNamespace
 from typing import Any, FrozenSet
@@ -60,6 +61,8 @@ _SPEED_SERVICE_TIERS = {
 }
 _MODEL_COOLDOWNS_ENV = "HERMES_CODEX_PROXY_MODEL_COOLDOWNS"
 _MODEL_COOLDOWNS_STATE = "codex-proxy-model-cooldowns.json"
+_JSON_WORD_RE = re.compile(r"\bjson\b", re.IGNORECASE)
+_TEXT_PART_TYPES: FrozenSet[str] = frozenset({"text", "input_text", "output_text"})
 
 
 def _to_namespace(value: Any) -> Any:
@@ -75,6 +78,32 @@ def _chat_json_error(status: int, message: str, code: str = "proxy_error") -> we
         {"error": {"message": message, "type": code, "code": code}},
         status=status,
     )
+
+
+def _text_contains_json_word(text: str) -> bool:
+    return bool(_JSON_WORD_RE.search(text))
+
+
+def _message_content_text_parts(content: Any) -> list[str]:
+    if isinstance(content, str):
+        return [content]
+    if not isinstance(content, list):
+        return []
+
+    texts: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            texts.append(part)
+            continue
+        if not isinstance(part, dict):
+            continue
+        part_type = str(part.get("type") or "").strip().lower()
+        if part_type not in _TEXT_PART_TYPES:
+            continue
+        text = part.get("text")
+        if isinstance(text, str):
+            texts.append(text)
+    return texts
 
 
 def _parse_model_cooldown_rules(raw: str | None = None) -> dict[str, tuple[str, int]]:
@@ -299,22 +328,32 @@ class OpenAICodexAdapter(UpstreamAdapter):
             return _chat_json_error(400, "Request body must be a JSON object.", code="invalid_request")
         wants_stream = payload.get("stream") is True
 
+        model = str(payload.get("model") or "").strip()
+        if not model:
+            return _chat_json_error(400, "Missing required field: model.", code="invalid_request")
+        requested_model = model
+
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            return _chat_json_error(400, "Missing required field: messages.", code="invalid_request")
+
+        text_format = self._responses_text_format(payload.get("response_format"))
+        if text_format and not self._messages_include_json_word(messages):
+            return _chat_json_error(
+                400,
+                "response_format requests JSON output, but no message content contains "
+                "the standalone word 'json'. Add a system or user instruction such "
+                "as 'Respond with JSON.' before retrying.",
+                code="invalid_json_mode_request",
+            )
+
         try:
             cred = self.get_credential()
         except Exception as exc:
             logger.warning("proxy: Codex credential resolution failed: %s", exc)
             return _chat_json_error(401, str(exc), code="upstream_auth_failed")
 
-        model = str(payload.get("model") or "").strip()
-        if not model:
-            return _chat_json_error(400, "Missing required field: model.", code="invalid_request")
-        requested_model = model
         model = self._effective_model_for_cooldown(requested_model)
-
-        messages = payload.get("messages")
-        if not isinstance(messages, list):
-            return _chat_json_error(400, "Missing required field: messages.", code="invalid_request")
-
         instructions, payload_messages = self._split_instructions(messages)
         responses_payload: dict[str, Any] = {
             "model": model,
@@ -342,7 +381,6 @@ class OpenAICodexAdapter(UpstreamAdapter):
         if service_tier:
             responses_payload["service_tier"] = service_tier
 
-        text_format = self._responses_text_format(payload.get("response_format"))
         if text_format:
             responses_payload["text"] = {"format": text_format}
 
@@ -617,6 +655,16 @@ class OpenAICodexAdapter(UpstreamAdapter):
         return SimpleNamespace(**attrs)
 
     @staticmethod
+    def _messages_include_json_word(messages: list[Any]) -> bool:
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            for text in _message_content_text_parts(msg.get("content")):
+                if _text_contains_json_word(text):
+                    return True
+        return False
+
+    @staticmethod
     def _split_instructions(messages: list[Any]) -> tuple[str, list[dict[str, Any]]]:
         instructions: list[str] = []
         rest: list[dict[str, Any]] = []
@@ -624,9 +672,9 @@ class OpenAICodexAdapter(UpstreamAdapter):
             if not isinstance(msg, dict):
                 continue
             if msg.get("role") == "system":
-                content = msg.get("content")
-                if isinstance(content, str) and content.strip():
-                    instructions.append(content.strip())
+                for text in _message_content_text_parts(msg.get("content")):
+                    if text.strip():
+                        instructions.append(text.strip())
                 continue
             rest.append(msg)
         return "\n\n".join(instructions), rest

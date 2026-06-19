@@ -307,6 +307,16 @@ def resolve_ui_work_route(
         )
     if not provider or not model:
         error = "ui_work routing matched but ui_work.provider and ui_work.model must both be configured"
+        if fallback_allowed:
+            return UIWorkRouteDecision(
+                matched=True,
+                enabled=True,
+                reason="missing provider/model; falling back to default worker",
+                provider=provider,
+                model=model,
+                backend=normalized_backend,
+                fallback_allowed=True,
+            )
         return UIWorkRouteDecision(
             matched=True,
             enabled=True,
@@ -324,6 +334,16 @@ def resolve_ui_work_route(
         model_key = str(backend_cfg.get("model_config_key") or "model").strip()
         if not provider_key or not model_key:
             error = "ui_work routing matched but ui_work.codex provider/model config keys are incomplete"
+            if fallback_allowed:
+                return UIWorkRouteDecision(
+                    matched=True,
+                    enabled=True,
+                    reason="incomplete codex config; falling back to default worker",
+                    provider=provider,
+                    model=model,
+                    backend=normalized_backend,
+                    fallback_allowed=True,
+                )
             return UIWorkRouteDecision(
                 matched=True,
                 enabled=True,
@@ -342,6 +362,16 @@ def resolve_ui_work_route(
     else:
         route_backend_config = _as_dict(backend_cfg)
         if not route_backend_config:
+            if fallback_allowed:
+                return UIWorkRouteDecision(
+                    matched=True,
+                    enabled=True,
+                    reason=f"missing {normalized_backend} config; falling back to default worker",
+                    provider=provider,
+                    model=model,
+                    backend=normalized_backend,
+                    fallback_allowed=True,
+                )
             return UIWorkRouteDecision(
                 matched=True,
                 enabled=True,
