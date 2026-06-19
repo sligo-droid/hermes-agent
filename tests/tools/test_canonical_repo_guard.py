@@ -109,6 +109,8 @@ def test_routing_hint_describes_protected_main_worktree_route(tmp_path, monkeypa
     assert str(repo) in msg
     assert "main" in msg
     assert "/home/droid/workspaces/" in msg
+    assert "intentional safety guard" in msg
+    assert "absolute worktree path" in msg
     assert "inspection-only" in msg
 
 
@@ -175,6 +177,7 @@ def test_coding_worker_refuses_protected_main_before_backend_launch(tmp_path, mo
 
     assert "delegate_coding_task was pointed at a protected canonical checkout" in result["error"]
     assert "/home/droid/workspaces/" in result["error"]
+    assert "absolute worktree path" in result["error"]
 
 
 def test_coding_worker_allows_nonprotected_worktree(tmp_path, monkeypatch):

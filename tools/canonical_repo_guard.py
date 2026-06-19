@@ -196,9 +196,11 @@ def canonical_main_routing_hint(workdir: str | Path, *, action: str) -> str | No
     return (
         f"BLOCKED: {action_text} was pointed at a protected canonical "
         f"checkout on {info.branch}: {info.repo_root}. Canonical checkouts are "
-        "inspection-only for agents and must not be mutated. Create or use a "
-        "git worktree under /home/droid/workspaces/ and retry with cwd set to "
-        "that worktree."
+        "inspection-only for agents and must not be mutated. This is an "
+        "intentional safety guard; do not disable it for agent work. Create "
+        "or use a git worktree under /home/droid/workspaces/ and retry with "
+        "cwd set to an absolute worktree path such as "
+        "/home/droid/workspaces/<repo-task>."
     )
 
 

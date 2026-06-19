@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from hermes_constants import get_hermes_home
+from hermes_cli.github_remote import github_cli_env
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -422,6 +423,7 @@ def fetch_pr_info(repo: str, pr_number: int, *, gh_command: str = "gh") -> dict[
         capture_output=True,
         text=True,
         timeout=30,
+        env=github_cli_env(),
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"gh api failed with {result.returncode}")
@@ -475,6 +477,7 @@ def _fetch_pr_api_json(
         capture_output=True,
         text=True,
         timeout=30,
+        env=github_cli_env(),
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"gh api failed with {result.returncode}")

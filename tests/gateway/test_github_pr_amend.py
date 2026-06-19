@@ -19,6 +19,7 @@ from gateway.github_pr_amend import (
     build_pr_amend_discord_card,
     evaluate_request,
     extract_request,
+    fetch_pr_info,
     fetch_pr_related_context,
     policy_from_route,
     preflight_request,
@@ -603,6 +604,49 @@ class TestGitHubPrAmendPolicy:
                 "repos/reserve-protocol/reserve-index-dtf/issues/182/comments?per_page=100",
             ],
         ]
+
+    def test_fetch_pr_info_bridges_gh_config_without_token_env(self, monkeypatch, tmp_path):
+        from hermes_cli import github_remote
+
+        isolated_home = tmp_path / "hermes-home" / "home"
+        real_gh_config = tmp_path / "real-home" / ".config" / "gh"
+        real_gh_config.mkdir(parents=True)
+        captured = {}
+        monkeypatch.setenv("HOME", str(isolated_home))
+        monkeypatch.setenv("GH_TOKEN", "gho_secret")
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+        monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(
+            github_remote,
+            "get_github_cli_config_dir",
+            lambda env: str(real_gh_config)
+            if env.get("HOME") == str(isolated_home)
+            else "",
+        )
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs.get("env")
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps(PR_INFO),
+                stderr="",
+            )
+
+        monkeypatch.setattr("gateway.github_pr_amend.subprocess.run", fake_run)
+
+        assert fetch_pr_info("reserve-protocol/reserve-index-dtf", 182) == PR_INFO
+
+        assert captured["cmd"] == [
+            "gh",
+            "api",
+            "repos/reserve-protocol/reserve-index-dtf/pulls/182",
+        ]
+        env = captured["env"]
+        assert env["GH_CONFIG_DIR"] == str(real_gh_config)
+        assert "GH_TOKEN" not in env
+        assert "GITHUB_TOKEN" not in env
 
 
 class TestGitHubPrAmendWebhookRoute:

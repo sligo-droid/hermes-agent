@@ -184,6 +184,7 @@ def test_backend_child_env_respects_explicit_path(monkeypatch, tmp_path):
 
 
 def test_run_gh_bridges_real_gh_config_dir_when_home_is_isolated(monkeypatch, tmp_path):
+    from hermes_cli import github_remote
     from hermes_cli import kanban_codex_worker as worker
 
     isolated_home = tmp_path / "hermes-home" / "home"
@@ -192,9 +193,11 @@ def test_run_gh_bridges_real_gh_config_dir_when_home_is_isolated(monkeypatch, tm
     captured: dict[str, object] = {}
 
     monkeypatch.setenv("HOME", str(isolated_home))
+    monkeypatch.setenv("GH_TOKEN", "gho_secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
     monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
     monkeypatch.setattr(
-        worker,
+        github_remote,
         "get_github_cli_config_dir",
         lambda env: str(real_gh_config) if env.get("HOME") == str(isolated_home) else "",
     )
@@ -216,6 +219,8 @@ def test_run_gh_bridges_real_gh_config_dir_when_home_is_isolated(monkeypatch, tm
     assert isinstance(env, dict)
     assert env["HOME"] == str(isolated_home)
     assert env["GH_CONFIG_DIR"] == str(real_gh_config)
+    assert "GH_TOKEN" not in env
+    assert "GITHUB_TOKEN" not in env
 
 
 def _write_codex_auth(path: Path, *, access: str, refresh: str, id_token: str) -> None:
@@ -4086,6 +4091,67 @@ def test_ensure_pr_never_policy_opens_without_merging(monkeypatch, tmp_path):
     assert "canonical_sync_state" not in meta
 
 
+def test_ensure_pr_open_uses_sanitized_github_env_for_push_and_gh(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import github_remote
+    from hermes_cli import kanban_codex_worker as worker
+
+    isolated_home = tmp_path / "hermes-home" / "home"
+    real_gh_config = tmp_path / "real-home" / ".config" / "gh"
+    real_gh_config.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(isolated_home))
+    monkeypatch.setenv("GH_TOKEN", "gho_secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(
+        github_remote,
+        "get_github_cli_config_dir",
+        lambda env: str(real_gh_config) if env.get("HOME") == str(isolated_home) else "",
+    )
+    calls: list[tuple[list[str], dict | None]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs.get("env")))
+        if cmd == ["git", "remote", "-v"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:2] == ["git", "push"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="https://github.com/sligo-labs/PID/pull/321\n",
+                stderr="",
+            )
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=_pr_view_json(number=321, state="OPEN"),
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr_open(
+        {"summary": "Opened finalizer PR."},
+        root=tmp_path,
+        repo="sligo-labs/PID",
+        branch="feature/pr-env",
+        base="main",
+        board="discord-pr-env",
+    )
+
+    env_by_cmd = {tuple(cmd[:3]): env for cmd, env in calls if env}
+    for key in (("git", "push", "-u"), ("gh", "pr", "create")):
+        env = env_by_cmd[key]
+        assert env["GH_CONFIG_DIR"] == str(real_gh_config)
+        assert "GH_TOKEN" not in env
+        assert "GITHUB_TOKEN" not in env
+
+
 def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -4580,6 +4646,52 @@ def test_ensure_pr_falls_back_to_origin_remote_for_repo(monkeypatch, tmp_path):
     assert pr_create[pr_create.index("--repo") + 1] == "sligo-labs/PID"
     assert pr_create[pr_create.index("--base") + 1] == "main"
     assert pr_create[pr_create.index("--head") + 1] == "discord/remote-pr"
+
+
+def test_ensure_pr_blocks_local_only_remote_before_pr_creation(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="local-remote-pr",
+        goal="Ship remote preflight",
+        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
+    )
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "remote", "get-url", "origin"]:
+            return SimpleNamespace(returncode=0, stdout="/home/droid/hermes\n", stderr="")
+        if cmd[:3] == ["git", "rev-list", "--count"]:
+            return SimpleNamespace(returncode=0, stdout="1\n", stderr="")
+        if cmd == ["git", "remote", "-v"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "origin\t/home/droid/hermes (fetch)\n"
+                    "origin\t/home/droid/hermes (push)\n"
+                ),
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr(board.slug, str(workspace)) is False
+
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "only local/file remotes" in meta["pr_error"]
+    assert "/home/droid/hermes" in meta["pr_error"]
+    assert "not a GitHub token/auth problem" in meta["pr_error"]
+    assert "git remote set-url origin" in meta["pr_error"]
+    assert meta["pr_blocker"] == meta["pr_error"]
+    assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd in calls)
 
 
 def test_ensure_pr_prefers_checkout_remote_over_stale_project_context(monkeypatch, tmp_path):
