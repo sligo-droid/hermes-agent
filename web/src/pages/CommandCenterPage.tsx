@@ -43,6 +43,7 @@ type AnnotationDraft = { item: CommandCenterWorkItem; mode: CommandCenterAnnotat
 type InboxPageItem = { type: "work"; item: CommandCenterWorkItem } | { type: "source"; source: CommandCenterSource };
 type VisualStatus = "proposed" | "queued" | "running" | "review" | "blocked" | "mega_blocked" | "paused" | "shipped" | "rejected" | "archived" | "unknown";
 type CommandCenterPagination = { project: string; pages: Record<PaginatedViewKey, number> };
+type CommandCenterWorkItemDetailCache = Pick<CommandCenterWorkItem, "full_description" | "raw" | "source_excerpts">;
 
 const ACTION_SETTLE_MS = 600;
 const COMMAND_CENTER_PAGE_SIZE = 20;
@@ -202,6 +203,18 @@ function workItemViewSort(a: CommandCenterWorkItem, b: CommandCenterWorkItem): n
 
 function runIsActive(run: CommandCenterRun): boolean {
   return !run.ended_at && run.task_status === "running";
+}
+
+function cacheableWorkItemDetail(item: CommandCenterWorkItem): CommandCenterWorkItemDetailCache {
+  return {
+    full_description: item.full_description,
+    raw: item.raw,
+    source_excerpts: item.source_excerpts,
+  };
+}
+
+function mergeWorkItemDetail(item: CommandCenterWorkItem, detail?: CommandCenterWorkItemDetailCache): CommandCenterWorkItem {
+  return detail ? { ...item, ...detail } : item;
 }
 
 function availableActionKinds(item: CommandCenterWorkItem): ActionKind[] {
@@ -558,6 +571,7 @@ function WorkItemCard({
   multiSelectActionUnion,
   onAction,
   onAnnotate,
+  onLoadDetails,
   onToggleSelected,
   selected,
   selectionActive,
@@ -569,6 +583,7 @@ function WorkItemCard({
   multiSelectActionUnion: Set<ActionKind>;
   onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
   onAnnotate: (item: CommandCenterWorkItem, mode: CommandCenterAnnotationMode) => void;
+  onLoadDetails: (id: string) => Promise<CommandCenterWorkItem | null>;
   onToggleSelected: (id: string) => void;
   selected: boolean;
   selectionActive: boolean;
@@ -576,6 +591,8 @@ function WorkItemCard({
 }) {
   const descriptionId = useId();
   const [fullDescriptionOpen, setFullDescriptionOpen] = useState(false);
+  const [fullDescriptionLoading, setFullDescriptionLoading] = useState(false);
+  const [fullDescriptionError, setFullDescriptionError] = useState<string | null>(null);
   const rowBusy = Boolean(activeAction?.ids.includes(item.id));
   const actionBusy = (kind: ActionKind) => rowBusy && activeAction?.kind === kind;
   const singleActions = availableActionKinds(item);
@@ -595,7 +612,7 @@ function WorkItemCard({
   const workerUrl = item.execution?.worker_url || null;
   const compactDescription = item.summary || item.body_preview || "No summary yet.";
   const fullDescription = item.full_description?.trim();
-  const canShowFullDescription = Boolean(fullDescription && fullDescription !== compactDescription.trim());
+  const canShowFullDescription = Boolean((fullDescription && fullDescription !== compactDescription.trim()) || item.has_full_description);
   const openWorker = () => {
     if (!workerUrl) return;
     window.open(workerUrl, "_blank", "noopener,noreferrer");
@@ -661,18 +678,40 @@ function WorkItemCard({
               className="command-center-description-disclosure inline-flex items-center gap-1.5 rounded-md text-[0.72rem] font-semibold uppercase tracking-[0.16em] text-slate-500 transition hover:text-cyan-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/30"
               onClick={(event) => {
                 event.stopPropagation();
-                setFullDescriptionOpen((open) => !open);
+                if (fullDescriptionOpen) {
+                  setFullDescriptionOpen(false);
+                  return;
+                }
+                if (fullDescription) {
+                  setFullDescriptionOpen(true);
+                  return;
+                }
+                setFullDescriptionLoading(true);
+                setFullDescriptionError(null);
+                void onLoadDetails(item.id)
+                  .then((detail) => {
+                    const nextDescription = detail?.full_description?.trim();
+                    if (nextDescription) setFullDescriptionOpen(true);
+                    else setFullDescriptionError("Full context is no longer available.");
+                  })
+                  .catch((err: unknown) => {
+                    setFullDescriptionError(err instanceof Error ? err.message : String(err));
+                  })
+                  .finally(() => setFullDescriptionLoading(false));
               }}
               type="button"
             >
               <ChevronDown aria-hidden="true" className={cn("h-3.5 w-3.5 transition-transform", fullDescriptionOpen && "rotate-180")} />
-              <span>Full context</span>
+              <span>{fullDescriptionLoading ? "Loading context" : "Full context"}</span>
               <span className="sr-only">{fullDescriptionOpen ? "expanded" : "collapsed"}</span>
             </button>
             {fullDescriptionOpen ? (
               <div id={descriptionId} className="command-center-full-context mt-2 whitespace-pre-wrap rounded-xl border border-white/[0.08] bg-white/[0.035] p-3 text-sm leading-6 text-slate-200">
                 {fullDescription}
               </div>
+            ) : null}
+            {fullDescriptionError ? (
+              <div className="mt-2 text-xs leading-5 text-red-100/80" role="alert">{fullDescriptionError}</div>
             ) : null}
           </div>
         ) : null}
@@ -898,6 +937,7 @@ function WorkList({
   multiSelectActionUnion,
   onAction,
   onAnnotate,
+  onLoadDetails,
   onToggleSelected,
   selectedIds,
   selectionActive,
@@ -911,6 +951,7 @@ function WorkList({
   multiSelectActionUnion: Set<ActionKind>;
   onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
   onAnnotate: (item: CommandCenterWorkItem, mode: CommandCenterAnnotationMode) => void;
+  onLoadDetails: (id: string) => Promise<CommandCenterWorkItem | null>;
   onToggleSelected: (id: string) => void;
   selectedIds: Set<string>;
   selectionActive: boolean;
@@ -928,6 +969,7 @@ function WorkList({
           multiSelectActionUnion={multiSelectActionUnion}
           onAction={onAction}
           onAnnotate={onAnnotate}
+          onLoadDetails={onLoadDetails}
           onToggleSelected={onToggleSelected}
           selected={selectedIds.has(item.id)}
           selectionActive={selectionActive}
@@ -946,6 +988,7 @@ function InboxList({
   multiSelectActionUnion,
   onAction,
   onAnnotate,
+  onLoadDetails,
   onToggleSelected,
   selectedIds,
   selectionActive,
@@ -957,6 +1000,7 @@ function InboxList({
   multiSelectActionUnion: Set<ActionKind>;
   onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
   onAnnotate: (item: CommandCenterWorkItem, mode: CommandCenterAnnotationMode) => void;
+  onLoadDetails: (id: string) => Promise<CommandCenterWorkItem | null>;
   onToggleSelected: (id: string) => void;
   selectedIds: Set<string>;
   selectionActive: boolean;
@@ -973,6 +1017,7 @@ function InboxList({
           multiSelectActionUnion={multiSelectActionUnion}
           onAction={onAction}
           onAnnotate={onAnnotate}
+          onLoadDetails={onLoadDetails}
           onToggleSelected={onToggleSelected}
           selected={selectedIds.has(entry.item.id)}
           selectionActive={selectionActive}
@@ -992,6 +1037,7 @@ function OverviewWorkList({
   multiSelectActionUnion,
   onAction,
   onAnnotate,
+  onLoadDetails,
   onToggleSelected,
   selectedIds,
   selectionActive,
@@ -1003,6 +1049,7 @@ function OverviewWorkList({
   multiSelectActionUnion: Set<ActionKind>;
   onAction: (kind: ActionKind, item: CommandCenterWorkItem) => void;
   onAnnotate: (item: CommandCenterWorkItem, mode: CommandCenterAnnotationMode) => void;
+  onLoadDetails: (id: string) => Promise<CommandCenterWorkItem | null>;
   onToggleSelected: (id: string) => void;
   selectedIds: Set<string>;
   selectionActive: boolean;
@@ -1020,6 +1067,7 @@ function OverviewWorkList({
       multiSelectActionUnion={multiSelectActionUnion}
       onAction={onAction}
       onAnnotate={onAnnotate}
+      onLoadDetails={onLoadDetails}
       onToggleSelected={onToggleSelected}
       selected={selectedIds.has(item.id)}
       selectionActive={selectionActive}
@@ -1049,6 +1097,7 @@ export default function CommandCenterPage() {
     return value && value.trim() ? value.trim().toLowerCase() : "hermes";
   }, [location.search]);
   const [snapshot, setSnapshot] = useState<CommandCenterSnapshot | null>(null);
+  const [detailedWorkItems, setDetailedWorkItems] = useState<Map<string, CommandCenterWorkItemDetailCache>>(() => new Map());
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [activeAction, setActiveAction] = useState<ActiveAction | null>(null);
@@ -1075,7 +1124,12 @@ export default function CommandCenterPage() {
     setLoading(true);
     setError(null);
     try {
-      const next = await api.getCommandCenterSnapshot({ includeArchived: true, recentRunLimitPerBoard: 25, project: selectedProject });
+      const next = await api.getCommandCenterSnapshot({
+        includeArchived: true,
+        includeDetails: false,
+        recentRunLimitPerBoard: activeView === "runs" ? 25 : 0,
+        project: selectedProject,
+      });
       if (options?.delayBeforeApplyMs) {
         await waitForActionSettle(options.delayBeforeApplyMs);
       }
@@ -1092,7 +1146,7 @@ export default function CommandCenterPage() {
         setLoading(false);
       }
     }
-  }, [selectedProject]);
+  }, [activeView, selectedProject]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- initial async snapshot load mirrors existing dashboard data pages.
@@ -1114,25 +1168,43 @@ export default function CommandCenterPage() {
     };
   }, [refresh]);
 
+  const snapshotWorkItems = useMemo(
+    () => (snapshot?.work_items ?? []).map((item) => mergeWorkItemDetail(item, detailedWorkItems.get(item.id))),
+    [detailedWorkItems, snapshot?.work_items],
+  );
+  const loadWorkItemDetails = useCallback(async (id: string) => {
+    const cached = detailedWorkItems.get(id);
+    const summaryItem = snapshot?.work_items.find((item) => item.id === id);
+    if (cached?.full_description && summaryItem) return mergeWorkItemDetail(summaryItem, cached);
+    const result = await api.getCommandCenterWorkItem(id);
+    const detail = cacheableWorkItemDetail(result.work_item);
+    setDetailedWorkItems((current) => {
+      const next = new Map(current);
+      next.set(id, detail);
+      return next;
+    });
+    return summaryItem ? mergeWorkItemDetail(summaryItem, detail) : result.work_item;
+  }, [detailedWorkItems, snapshot?.work_items]);
+
   const inboxItems = useMemo(
-    () => snapshot?.work_items.filter(isInboxItem) ?? [],
-    [snapshot],
+    () => snapshotWorkItems.filter(isInboxItem),
+    [snapshotWorkItems],
   );
   const inboxSources = useMemo(
     () => snapshot?.sources.filter((source) => source.bucket === "inbox") ?? [],
     [snapshot],
   );
   const workItems = useMemo(
-    () => snapshot?.work_items.filter(isWorkItem) ?? [],
-    [snapshot],
+    () => snapshotWorkItems.filter(isWorkItem),
+    [snapshotWorkItems],
   );
   const archivedItems = useMemo(
-    () => (snapshot?.work_items.filter(isArchivedItem) ?? []).sort(workItemViewSort).slice(0, ARCHIVE_VIEW_ITEM_LIMIT),
-    [snapshot],
+    () => snapshotWorkItems.filter(isArchivedItem).sort(workItemViewSort).slice(0, ARCHIVE_VIEW_ITEM_LIMIT),
+    [snapshotWorkItems],
   );
   const completedItems = useMemo(
-    () => (snapshot?.work_items.filter(isCompletedItem) ?? []).sort(workItemViewSort),
-    [snapshot],
+    () => snapshotWorkItems.filter(isCompletedItem).sort(workItemViewSort),
+    [snapshotWorkItems],
   );
   const overviewItems = useMemo(() => {
     const seen = new Set<string>();
@@ -1182,8 +1254,8 @@ export default function CommandCenterPage() {
     setSelectedIds(new Set());
   }, [selectedProject]);
   const recommendations = useMemo(
-    () => snapshot?.work_items.filter((item) => item.source.kind === "self_improvement") ?? [],
-    [snapshot],
+    () => snapshotWorkItems.filter((item) => item.source.kind === "self_improvement"),
+    [snapshotWorkItems],
   );
   const visibleSelectableIds = useMemo(() => {
     const visibleItems = {
@@ -1209,7 +1281,7 @@ export default function CommandCenterPage() {
     sources: [],
   }[activeView]), [activeView, pagedArchivedItems, pagedCompletedItems, pagedInboxItems, pagedOverviewItems, pagedWorkItems, recommendations]);
   const sources = useMemo(() => snapshot?.sources ?? [], [snapshot]);
-  const workItemsById = useMemo(() => new Map((snapshot?.work_items ?? []).map((item) => [item.id, item])), [snapshot]);
+  const workItemsById = useMemo(() => new Map(snapshotWorkItems.map((item) => [item.id, item])), [snapshotWorkItems]);
   const selectedItems = useMemo(() => [...selectedIds].map((id) => workItemsById.get(id)).filter((item): item is CommandCenterWorkItem => Boolean(item)), [selectedIds, workItemsById]);
   const selectedVisibleCount = visibleSelectableIds.filter((id) => selectedIds.has(id)).length;
   const allVisibleSelected = visibleSelectableIds.length > 0 && visibleSelectableIds.every((id) => selectedIds.has(id));
@@ -1407,35 +1479,35 @@ export default function CommandCenterPage() {
             <div className="command-center-list-pane min-w-0">
               {activeView === "overview" && (
                 <>
-                  <OverviewWorkList activeAction={activeAction} emptyMessage="No recent decisions, worker boards, or active work yet." items={pagedOverviewItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+                  <OverviewWorkList activeAction={activeAction} emptyMessage="No recent decisions, worker boards, or active work yet." items={pagedOverviewItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onLoadDetails={loadWorkItemDetails} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
                   <PaginationControls label="overview" onPageChange={(page) => setPage("overview", page)} page={pages.overview} totalItems={pageTotals.overview} />
                 </>
               )}
               {activeView === "inbox" && (
                 <>
-                  <InboxList activeAction={activeAction} emptyMessage="Inbox is clear. Finished, blocked, and archiveable boards stay on Overview or Active." items={pagedInboxItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+                  <InboxList activeAction={activeAction} emptyMessage="Inbox is clear. Finished, blocked, and archiveable boards stay on Overview or Active." items={pagedInboxItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onLoadDetails={loadWorkItemDetails} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
                   <PaginationControls label="inbox" onPageChange={(page) => setPage("inbox", page)} page={pages.inbox} totalItems={pageTotals.inbox} />
                 </>
               )}
               {activeView === "work" && (
                 <>
-                  <WorkList activeAction={activeAction} emptyMessage="No active or recently shipped work is visible." items={pagedWorkItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+                  <WorkList activeAction={activeAction} emptyMessage="No active or recently shipped work is visible." items={pagedWorkItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onLoadDetails={loadWorkItemDetails} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
                   <PaginationControls label="work" onPageChange={(page) => setPage("work", page)} page={pages.work} totalItems={pageTotals.work} />
                 </>
               )}
               {activeView === "completed" && (
                 <>
-                  <WorkList activeAction={activeAction} emptyLabel="completed items" emptyMessage="Completed and shipped work items will appear here." items={pagedCompletedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
+                  <WorkList activeAction={activeAction} emptyLabel="completed items" emptyMessage="Completed and shipped work items will appear here." items={pagedCompletedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onLoadDetails={loadWorkItemDetails} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />
                   <PaginationControls label="completed" onPageChange={(page) => setPage("completed", page)} page={pages.completed} totalItems={pageTotals.completed} />
                 </>
               )}
               {activeView === "archive" && (
                 <>
-                  <WorkList activeAction={activeAction} emptyLabel="archived items" emptyMessage="Archived worker boards and work items will appear here." items={pagedArchivedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} showActions={false} />
+                  <WorkList activeAction={activeAction} emptyLabel="archived items" emptyMessage="Archived worker boards and work items will appear here." items={pagedArchivedItems} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onLoadDetails={loadWorkItemDetails} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} showActions={false} />
                   <PaginationControls label="archive" onPageChange={(page) => setPage("archive", page)} page={pages.archive} totalItems={pageTotals.archive} />
                 </>
               )}
-              {activeView === "recommendations" && <WorkList activeAction={activeAction} emptyLabel="recommendations" emptyMessage="No self-improvement recommendations are waiting." items={recommendations} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />}
+              {activeView === "recommendations" && <WorkList activeAction={activeAction} emptyLabel="recommendations" emptyMessage="No self-improvement recommendations are waiting." items={recommendations} multiSelectActionCommon={multiSelectActionCommon} multiSelectActionUnion={multiSelectActionUnion} onAction={handleAction} onAnnotate={openAnnotationDraft} onLoadDetails={loadWorkItemDetails} onToggleSelected={toggleSelected} selectedIds={selectedIds} selectionActive={selectionActive} />}
               {activeView === "runs" && (
                 <div className="grid gap-3">
                   {snapshot?.runs.length ? snapshot.runs.map((run) => (

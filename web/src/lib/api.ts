@@ -329,18 +329,23 @@ export const api = {
     fetchJSON<{ ok: boolean }>(`/api/cron/jobs/${encodeURIComponent(id)}?profile=${encodeURIComponent(profile)}`, { method: "DELETE" }),
 
   // Command Center aggregate
-  getCommandCenterSnapshot: (params?: { includeArchived?: boolean; recentRunLimitPerBoard?: number; project?: string | null }) => {
+  getCommandCenterSnapshot: (params?: { includeArchived?: boolean; recentRunLimitPerBoard?: number; project?: string | null; includeDetails?: boolean }) => {
     const qs = new URLSearchParams();
     if (params?.includeArchived) qs.set("include_archived", "true");
     if (params?.recentRunLimitPerBoard !== undefined) {
       qs.set("recent_run_limit_per_board", String(params.recentRunLimitPerBoard));
     }
     if (params?.project) qs.set("project", params.project);
+    if (params?.includeDetails !== undefined) qs.set("include_details", params.includeDetails ? "true" : "false");
     const suffix = qs.toString();
     return fetchJSON<CommandCenterSnapshot>(
       `/api/plugins/kanban/command-center/snapshot${suffix ? `?${suffix}` : ""}`,
     );
   },
+  getCommandCenterWorkItem: (workItemId: string) =>
+    fetchJSON<{ work_item: CommandCenterWorkItem }>(
+      `/api/plugins/kanban/command-center/work-items/${encodeURIComponent(workItemId)}`,
+    ),
   createCommandCenterAnnotation: (workItemId: string, body: CommandCenterAnnotationRequest) =>
     fetchJSON<CommandCenterAnnotationResponse>(
       `/api/plugins/kanban/command-center/work-items/${encodeURIComponent(workItemId)}/annotations`,
@@ -1015,6 +1020,7 @@ export interface CommandCenterWorkItem {
   summary?: string | null;
   body_preview?: string | null;
   full_description?: string | null;
+  has_full_description?: boolean;
   project?: string | null;
   priority?: string | number | null;
   priority_rank?: number;
@@ -1069,6 +1075,7 @@ export interface CommandCenterRun {
 export interface CommandCenterSnapshot {
   schema_version: number;
   generated_at: number;
+  detail_level?: "summary" | "full";
   summary: string;
   projects?: CommandCenterProject[];
   current_project?: string | null;

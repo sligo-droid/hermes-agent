@@ -15,6 +15,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import quote
 
 import pytest
 from fastapi import FastAPI
@@ -179,6 +180,7 @@ def test_command_center_snapshot_route_accepts_force_refresh(client, monkeypatch
             "include_archived": "true",
             "recent_run_limit_per_board": "7",
             "project": "Hermes",
+            "include_details": "false",
             "force_refresh": "true",
         },
     )
@@ -189,9 +191,69 @@ def test_command_center_snapshot_route_accepts_force_refresh(client, monkeypatch
             "include_archived": True,
             "recent_run_limit_per_board": 7,
             "project": "Hermes",
+            "include_details": False,
             "force_refresh": True,
         }
     ]
+
+
+def test_command_center_work_item_detail_route_returns_full_item(client, monkeypatch):
+    pa = sys.modules["hermes_dashboard_plugin_kanban_test"]
+
+    def fake_find_work_item(work_item_id):
+        assert work_item_id == "kanban-board:board-1"
+        return {
+            "id": work_item_id,
+            "title": "Board 1",
+            "full_description": "Full context",
+            "raw": {"board": {"slug": "board-1"}},
+        }
+
+    monkeypatch.setattr(pa, "_find_command_center_work_item", fake_find_work_item)
+
+    response = client.get("/api/plugins/kanban/command-center/work-items/kanban-board:board-1")
+
+    assert response.status_code == 200
+    assert response.json()["work_item"]["full_description"] == "Full context"
+    assert response.json()["work_item"]["raw"] == {"board": {"slug": "board-1"}}
+
+
+def test_command_center_work_item_routes_decode_encoded_id_metacharacters(client, monkeypatch):
+    pa = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    work_item_id = "self-improvement:proposal 100%?#:trail"
+    encoded_id = quote(work_item_id, safe="")
+    seen: list[str] = []
+
+    def fake_find_work_item(received_id):
+        seen.append(received_id)
+        assert received_id == work_item_id
+        return {
+            "id": received_id,
+            "title": "Proposal",
+            "summary": "Summary",
+            "status": "proposed",
+            "source": {"kind": "self_improvement", "ref": {"proposal_id": "proposal 100%?#:trail"}},
+            "execution": {},
+        }
+
+    def fake_record_annotation(**kwargs):
+        return {"id": 1, **kwargs}
+
+    monkeypatch.setattr(pa, "_find_command_center_work_item", fake_find_work_item)
+    monkeypatch.setattr(pa.command_center_annotations, "record_annotation", fake_record_annotation)
+    monkeypatch.setattr(pa.command_center, "invalidate_snapshot_cache", lambda: None)
+
+    detail = client.get(f"/api/plugins/kanban/command-center/work-items/{encoded_id}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["work_item"]["id"] == work_item_id
+
+    annotation = client.post(
+        f"/api/plugins/kanban/command-center/work-items/{encoded_id}/annotations",
+        json={"mode": "note", "text": "Encoded route id survives."},
+    )
+    assert annotation.status_code == 200, annotation.text
+    assert annotation.json()["work_item_id"] == work_item_id
+    assert seen == [work_item_id, work_item_id]
 
 
 def test_command_center_annotation_invalidates_snapshot_cache(client, monkeypatch):
