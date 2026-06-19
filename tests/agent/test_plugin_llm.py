@@ -295,6 +295,24 @@ class TestStructuredMessageBuilding:
         assert messages[0]["role"] == "system"
         assert "JSON object" in messages[0]["content"]
 
+    def test_json_schema_adds_json_directive_and_schema_context(self):
+        schema = {"type": "object", "properties": {"title": {"type": "string"}}}
+
+        messages = _build_structured_messages(
+            instructions="Extract fields",
+            inputs=[PluginLlmTextInput(text="content")],
+            json_mode=False,
+            json_schema=schema,
+            schema_name="thing",
+            system_prompt=None,
+        )
+
+        assert messages[0]["role"] == "system"
+        assert "JSON object" in messages[0]["content"]
+        header = messages[1]["content"][0]["text"]
+        assert "Schema name: thing" in header
+        assert "JSON schema:" in header
+
     def test_schema_name_appended_to_header(self):
         messages = _build_structured_messages(
             instructions="Extract fields",
