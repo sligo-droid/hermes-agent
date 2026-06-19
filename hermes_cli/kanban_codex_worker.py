@@ -14,7 +14,6 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 from agent.transports.codex_app_server_session import CodexAppServerSession
-from hermes_constants import get_github_cli_config_dir
 from hermes_cli import kanban_db
 from hermes_cli.discord_worker_boards import (
     DEV_TICKET_BODY_GUIDANCE,
@@ -37,6 +36,12 @@ from hermes_cli.discord_worker_boards import (
     mark_dispatch_dirty,
     record_codex_worker_event,
     record_codex_worker_result,
+)
+from hermes_cli.github_remote import (
+    github_cli_env,
+    github_remote_preflight_error,
+    github_repo_from_url,
+    github_repo_from_value,
 )
 from hermes_cli.pr_body_format import check_project_state_requirement
 from hermes_cli.worker_autoreview import materialize_autoreview_helper
@@ -190,12 +195,7 @@ def _github_cli_env() -> dict[str, str]:
     the same or approved worker boards block forever on ``gh`` 401s after all
     role tasks are done.
     """
-
-    env = os.environ.copy()
-    gh_config_dir = get_github_cli_config_dir(env)
-    if gh_config_dir:
-        env["GH_CONFIG_DIR"] = gh_config_dir
-    return env
+    return github_cli_env()
 
 
 def _run_gh(args: list[str], *, root: Path, timeout: int | float) -> subprocess.CompletedProcess[str]:
@@ -2037,38 +2037,11 @@ def _checkpoint_commit(workspace: str, task_id: str, summary: str) -> None:
         return
 
 
-def _github_repo_from_url(url: str) -> Optional[str]:
-    raw = str(url or "").strip()
-    if not raw:
-        return None
-    raw = re.sub(r"^git\+", "", raw)
-    patterns = (
-        r"^https?://github\.com/([^/]+)/([^/#?]+?)(?:\.git)?/?(?:[#?].*)?$",
-        r"^ssh://git@github\.com/([^/]+)/([^/#?]+?)(?:\.git)?/?(?:[#?].*)?$",
-        r"^git@github\.com:([^/]+)/([^/#?]+?)(?:\.git)?$",
-    )
-    for pattern in patterns:
-        match = re.match(pattern, raw)
-        if match:
-            owner, repo = match.groups()
-            return f"{owner}/{repo}"
-    return None
-
-
-def _github_repo_from_value(value: object) -> Optional[str]:
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    if re.match(r"^[^/\s]+/[^/\s]+$", raw):
-        return raw.removesuffix(".git")
-    return _github_repo_from_url(raw)
-
-
 def _resolve_github_repo(worker: dict[str, Any], root: Path) -> Optional[str]:
     context = worker.get("project_context") if isinstance(worker.get("project_context"), dict) else {}
     for source in (context, worker):
         for key in ("github_pr_target_repo", "pr_target_repo"):
-            repo = _github_repo_from_value(source.get(key))
+            repo = github_repo_from_value(source.get(key))
             if repo:
                 return repo
 
@@ -2083,13 +2056,13 @@ def _resolve_github_repo(worker: dict[str, Any], root: Path) -> Optional[str]:
     except Exception:
         remote = None
     if remote is not None and remote.returncode == 0:
-        repo = _github_repo_from_url(remote.stdout)
+        repo = github_repo_from_url(remote.stdout)
         if repo:
             return repo
 
     for source in (context, worker):
         for key in ("github_url", "project_github_url", "repo_url", "repository_url"):
-            repo = _github_repo_from_url(str(source.get(key) or ""))
+            repo = github_repo_from_url(str(source.get(key) or ""))
             if repo:
                 return repo
     return None
@@ -2540,12 +2513,21 @@ def _ensure_pr_open(
     base: str,
     board: Optional[str],
 ) -> bool:
+    remote_error = github_remote_preflight_error(root, operation="create/finalize PR")
+    if remote_error:
+        worker["pr_error"] = remote_error
+        worker["pr_checks_status"] = "not checked"
+        worker["pr_merge_state"] = "unknown"
+        worker["pr_blocker"] = remote_error
+        return False
+
     pushed = subprocess.run(
         ["git", "push", "-u", "origin", branch],
         cwd=root,
         capture_output=True,
         text=True,
         timeout=300,
+        env=_github_cli_env(),
     )
     if pushed.returncode != 0:
         worker["pr_error"] = (pushed.stderr or pushed.stdout or "git push failed").strip()
@@ -2701,6 +2683,7 @@ def _sync_canonical_checkout_after_merge(worker: dict[str, Any], *, branch: str)
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=_github_cli_env(),
         )
 
     def fail(

@@ -1,4 +1,9 @@
-"""Helpers for loading Hermes .env files consistently across entrypoints."""
+"""Helpers for loading Hermes .env files consistently across entrypoints.
+
+Hermes ``.env`` files are dotenv files, not shell scripts. Do not source them
+from bash; values may contain shell metacharacters that are valid dotenv data.
+Use ``load_hermes_dotenv()`` or ``get_hermes_env_value()`` for targeted reads.
+"""
 
 from __future__ import annotations
 
