@@ -68,25 +68,34 @@ export function isProgressReportingAvailable(): boolean {
  * When supported, BSU/ESU sequences prevent visible flicker during redraws.
  */
 export function isCmuxSession(env: NodeJS.ProcessEnv = process.env): boolean {
-  return Boolean(env.CMUX_WORKSPACE_ID || env.CMUX_SURFACE_ID)
+  return Boolean(
+    env.CMUX_WORKSPACE_ID ||
+      env.CMUX_SURFACE_ID ||
+      env.CMUX_TAB_ID ||
+      env.CMUX_PANEL_ID ||
+      env.CMUX_SOCKET_PATH ||
+      env.__CFBundleIdentifier === 'com.cmuxterm.app'
+  )
+}
+
+export function isSynchronizedOutputUnsafeSession(env: NodeJS.ProcessEnv = process.env): boolean {
+  // tmux/screen/cmux/SSH are intermediate transport layers between Hermes and
+  // the physical terminal. A positive DEC 2026 reply from the outer emulator
+  // only proves that the ENDPOINT knows synchronized updates; it does not prove
+  // that the layer in the middle preserves BSU/ESU atomicity around DECSTBM
+  // scroll-region shifts. When that assumption is wrong, the ScrollBox fast
+  // path can leave the bottom of the transcript blank after final-answer
+  // tail-follow. Prefer the slower full-row rewrite path in these sessions.
+  return Boolean(isTmuxSession(env) || env.STY || isCmuxSession(env) || env.SSH_CONNECTION || env.SSH_TTY)
 }
 
 export function isSynchronizedOutputSupported(env: NodeJS.ProcessEnv = process.env): boolean {
-  // tmux parses and proxies every byte but doesn't implement DEC 2026.
-  // BSU/ESU pass through to the outer terminal but tmux has already
-  // broken atomicity by chunking. Skip to save 16 bytes/frame + parser work.
-  if (isTmuxSession(env)) {
+  if (isSynchronizedOutputUnsafeSession(env)) {
     return false
   }
 
   const termProgram = env.TERM_PROGRAM
   const term = env.TERM
-
-  // cmux is Ghostty-backed. Some local shells/remotes strip Ghostty's
-  // TERM_PROGRAM/TERM markers but preserve CMUX_*; keep atomic redraws on.
-  if (isCmuxSession(env)) {
-    return true
-  }
 
   // Modern terminals with known DEC 2026 support
   if (
@@ -224,7 +233,7 @@ export function isRuntimeSynchronizedOutputSupported(): boolean {
 }
 
 export function enableSynchronizedOutputFromTerminalQuery(env: NodeJS.ProcessEnv = process.env): void {
-  if (!isTmuxSession(env)) {
+  if (!isSynchronizedOutputUnsafeSession(env)) {
     runtimeSyncOutputSupported = true
   }
 }

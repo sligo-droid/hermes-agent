@@ -5,6 +5,7 @@ import {
   isCmuxSession,
   isRuntimeSynchronizedOutputSupported,
   isSynchronizedOutputSupported,
+  isSynchronizedOutputUnsafeSession,
   needsAltScreenResizeScrollbackClear,
   resetSynchronizedOutputSupportForTest
 } from './terminal.js'
@@ -26,14 +27,26 @@ describe('synchronized output support', () => {
     resetSynchronizedOutputSupportForTest(false)
   })
 
-  it('treats cmux as Ghostty-backed even when Ghostty env vars are missing', () => {
+  it('treats cmux as an unsafe synchronized-output transport layer', () => {
     expect(isCmuxSession({ CMUX_WORKSPACE_ID: 'workspace:1' })).toBe(true)
-    expect(isSynchronizedOutputSupported({ CMUX_WORKSPACE_ID: 'workspace:1' })).toBe(true)
-    expect(isSynchronizedOutputSupported({ CMUX_SURFACE_ID: 'surface:1' })).toBe(true)
+    expect(isCmuxSession({ CMUX_SURFACE_ID: 'surface:1' })).toBe(true)
+    expect(isCmuxSession({ CMUX_TAB_ID: 'tab:1' })).toBe(true)
+    expect(isCmuxSession({ __CFBundleIdentifier: 'com.cmuxterm.app' })).toBe(true)
+    expect(isSynchronizedOutputUnsafeSession({ CMUX_WORKSPACE_ID: 'workspace:1' })).toBe(true)
+    expect(isSynchronizedOutputSupported({ CMUX_WORKSPACE_ID: 'workspace:1' })).toBe(false)
+    expect(isSynchronizedOutputSupported({ CMUX_SURFACE_ID: 'surface:1' })).toBe(false)
   })
 
-  it('keeps tmux out of synchronized output even inside cmux', () => {
+  it('disables synchronized output across SSH transports', () => {
+    expect(isSynchronizedOutputUnsafeSession({ SSH_CONNECTION: 'client server' })).toBe(true)
+    expect(isSynchronizedOutputUnsafeSession({ SSH_TTY: '/dev/pts/9' })).toBe(true)
+    expect(isSynchronizedOutputSupported({ TERM_PROGRAM: 'ghostty', SSH_CONNECTION: 'client server' })).toBe(false)
+    expect(isSynchronizedOutputSupported({ TERM: 'xterm-ghostty', SSH_TTY: '/dev/pts/9' })).toBe(false)
+  })
+
+  it('keeps tmux and screen out of synchronized output', () => {
     expect(isSynchronizedOutputSupported({ CMUX_WORKSPACE_ID: 'workspace:1', TMUX: '/tmp/tmux' })).toBe(false)
+    expect(isSynchronizedOutputSupported({ STY: 'screen' })).toBe(false)
   })
 
   it('starts disabled when SSH leaves only generic xterm TERM', () => {
@@ -59,13 +72,22 @@ describe('synchronized output support', () => {
     expect(isRuntimeSynchronizedOutputSupported()).toBe(true)
   })
 
-  it('does not let terminal query override tmux safety gate', () => {
+  it('does not let terminal query override unsafe transport gates', () => {
     resetSynchronizedOutputSupportForTest(false)
 
     enableSynchronizedOutputFromTerminalQuery({ TERM: 'xterm-256color', TMUX: '/tmp/tmux' })
     expect(isRuntimeSynchronizedOutputSupported()).toBe(false)
 
     enableSynchronizedOutputFromTerminalQuery({ TERM_PROGRAM: 'tmux' })
+    expect(isRuntimeSynchronizedOutputSupported()).toBe(false)
+
+    enableSynchronizedOutputFromTerminalQuery({ CMUX_WORKSPACE_ID: 'workspace:1' })
+    expect(isRuntimeSynchronizedOutputSupported()).toBe(false)
+
+    enableSynchronizedOutputFromTerminalQuery({ SSH_TTY: '/dev/pts/9' })
+    expect(isRuntimeSynchronizedOutputSupported()).toBe(false)
+
+    enableSynchronizedOutputFromTerminalQuery({ STY: 'screen' })
     expect(isRuntimeSynchronizedOutputSupported()).toBe(false)
   })
 
