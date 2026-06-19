@@ -1202,6 +1202,7 @@ def _self_improvement_card_with_downstream(card: dict[str, Any] | None) -> dict[
     if str(enriched.get("status") or "").lower() == "recovery_needed":
         recovery_metadata = _latest_self_improvement_recovery_metadata(proposal_id)
         if recovery_metadata:
+            enriched["recovery_metadata"] = recovery_metadata
             enriched["recovery_required"] = True
             enriched["recovery_reason"] = recovery_metadata.get("recovery_reason")
             enriched["recovery_evidence_kind"] = recovery_metadata.get("evidence_kind")

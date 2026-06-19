@@ -842,6 +842,8 @@ def test_self_improvement_proposal_api_reconciles_cancelled_named_worker_board(c
     conn = kb.connect(board=board)
     try:
         task_id = kb.create_task(conn, title="Cancelled named worker proposal", board=board)
+        with conn:
+            conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200, task_id))
     finally:
         conn.close()
     proposal_storage.record_approval(
@@ -867,6 +869,8 @@ def test_self_improvement_proposal_api_reconciles_cancelled_named_worker_board(c
         assert enriched["recovery_required"] is True
         assert enriched["observed_terminal_status"] == "cancelled"
         assert enriched["recovery_evidence_kind"] == "worker_board"
+        assert enriched["recovery_metadata"]["evidence_kind"] == "worker_board"
+        assert enriched["recovery_metadata"]["kanban_task_id"] == task_id
         assert "non-success terminal status cancelled" in enriched["recovery_reason"]
 
     audit = proposal_storage.list_audit_events(card["proposal_id"])

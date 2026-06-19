@@ -863,13 +863,63 @@ def _worker_terminal_failure_status(worker: dict[str, Any]) -> str:
     return ""
 
 
+def _worker_explicit_success_evidence(worker: dict[str, Any]) -> str:
+    board_summary_value = worker.get("board_summary")
+    board_summary: dict[str, Any] = board_summary_value if isinstance(board_summary_value, dict) else {}
+    goal_status = str(worker.get("goal_status") or board_summary.get("goal_status") or "").lower()
+    phase = str(worker.get("phase") or board_summary.get("phase") or "").lower()
+    if goal_status in _TERMINAL_SUCCESS_STATUSES:
+        return goal_status
+    if phase in _TERMINAL_SUCCESS_STATUSES:
+        return phase
+
+    thread_state = str(worker.get("thread_state") or board_summary.get("thread_state") or "").lower()
+    if thread_state in _TERMINAL_SUCCESS_STATUSES:
+        return thread_state
+    synced_state = str(worker.get("terminal_reaction_synced_state") or board_summary.get("terminal_reaction_synced_state") or "").lower()
+    if synced_state in _TERMINAL_SUCCESS_STATUSES:
+        return synced_state
+
+    review_value = board_summary.get("review")
+    review: dict[str, Any] = review_value if isinstance(review_value, dict) else {}
+    final_verdict_value = review.get("final_verdict")
+    final_verdict: dict[str, Any] = final_verdict_value if isinstance(final_verdict_value, dict) else {}
+    if str(final_verdict.get("status") or "").lower() == "approved":
+        return "review_approved"
+
+    pr_summary_value = board_summary.get("pr")
+    pr_summary: dict[str, Any] = pr_summary_value if isinstance(pr_summary_value, dict) else {}
+    pr_state = str(worker.get("pr_state") or pr_summary.get("state") or "").upper()
+    checks_status = str(worker.get("pr_checks_status") or pr_summary.get("checks_status") or "").lower()
+    if pr_state == "MERGED" and (
+        checks_status in _SUCCESS_CHECK_STATUSES
+        or worker.get("pr_merged_at")
+        or pr_summary.get("merged_at")
+    ):
+        return "pull_request_merged"
+
+    canonical_sync_state = str(worker.get("canonical_sync_state") or board_summary.get("canonical_sync_state") or "").lower()
+    if canonical_sync_state == "synced" and (
+        worker.get("canonical_sync_head")
+        or worker.get("canonical_sync_merge_commit")
+        or board_summary.get("canonical_sync_head")
+        or board_summary.get("canonical_sync_merge_commit")
+    ):
+        return "canonical_sync"
+    return ""
+
+
 def _task_terminal_evidence_owns_proposal(board: str | None, board_meta: dict[str, Any] | None) -> bool:
     if not board or board == kanban_db.DEFAULT_BOARD or _board_is_archived(board_meta):
         return True
     worker = _board_worker_meta(board_meta or {})
     if not worker:
         return True
-    return bool(_worker_terminal_success_status(worker) or _worker_terminal_failure_status(worker))
+    if _worker_terminal_success_status(worker):
+        return True
+    if _worker_terminal_failure_status(worker):
+        return bool(_worker_explicit_success_evidence(worker))
+    return False
 
 
 def _proposal_evidence_base(
@@ -959,7 +1009,7 @@ def _proposal_recovery_metadata(
     else:
         worker = _board_worker_meta(board_meta or {})
         observed = _worker_terminal_failure_status(worker)
-        if observed and board:
+        if observed and board and not _worker_explicit_success_evidence(worker):
             evidence_kind = "worker_board"
             reason = f"linked worker board reached non-success terminal status {observed}"
 

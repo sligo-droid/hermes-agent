@@ -459,6 +459,74 @@ def test_snapshot_reconciles_active_terminal_worker_board_to_recovery_rollup(tmp
         assert not any(row["id"] == f"self-improvement:{card['proposal_id']}" for row in snapshot["work_items"])
 
 
+def test_snapshot_prefers_worker_board_failure_over_task_success_evidence(tmp_path, monkeypatch):
+    cases = [
+        ("failed", "task_done"),
+        ("cancelled", "run_success"),
+        ("errored", "task_done"),
+        ("timed_out", "run_success"),
+    ]
+    cards = _ingest_cards(monkeypatch, tmp_path, len(cases))
+    boards: list[tuple[dict, str, str, str, str]] = []
+    for card, (terminal_status, evidence_kind) in zip(cards, cases):
+        board = f"discord-{terminal_status.replace('_', '-')}-success-conflict"
+        meta = kanban_db.write_board_metadata(board, name=f"{terminal_status.title()} Success Conflict")
+        meta[command_center.DISCORD_WORKER_META_KEY] = {
+            "kind": "discord_worker_board",
+            "goal_status": terminal_status,
+            "phase": terminal_status,
+            "cancelled": terminal_status == "cancelled",
+        }
+        kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+        conn = kanban_db.connect(board=board)
+        try:
+            task_id = kanban_db.create_task(conn, title=f"{terminal_status.title()} proposal task", board=board)
+            with conn:
+                if evidence_kind == "task_done":
+                    conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200, task_id))
+                else:
+                    conn.execute(
+                        "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                        (task_id, "done", 100, 200, "completed"),
+                    )
+        finally:
+            conn.close()
+        proposal_storage.record_approval(
+            card["proposal_id"],
+            kanban_task_id=task_id,
+            worker_url=f"/workers/{board}/tickets/{task_id}",
+            actor="operator",
+            metadata={"board": board},
+        )
+        boards.append((card, terminal_status, evidence_kind, board, task_id))
+
+    snapshot = command_center.build_command_center_snapshot()
+
+    for card, terminal_status, evidence_kind, board, task_id in boards:
+        recovered = proposal_storage.get_card(card["proposal_id"])
+        events = proposal_storage.list_audit_events(card["proposal_id"])
+        assert recovered["status"] == "recovery_needed"
+        assert [event["action"] for event in events] == ["approved", "recovery_needed"]
+        assert events[-1]["metadata"]["board"] == board
+        assert events[-1]["metadata"]["kanban_task_id"] == task_id
+        assert events[-1]["metadata"]["observed_terminal_status"] == terminal_status
+        assert events[-1]["metadata"]["evidence_kind"] == "worker_board"
+        assert "success_evidence_kind" not in events[-1]["metadata"]
+        assert f"non-success terminal status {terminal_status}" in events[-1]["metadata"]["recovery_reason"]
+
+        item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+        assert item["status"] == "blocked"
+        assert item["status_detail"] == "recovery_needed"
+        assert item["execution"]["recovery_required"] is True
+        assert item["execution"]["observed_terminal_status"] == terminal_status
+        assert item["execution"]["evidence_kind"] == "worker_board"
+        if evidence_kind == "task_done":
+            assert item["raw"]["rollup"]["task_counts"]["done"] == 1
+        else:
+            run = next(run for run in snapshot["runs"] if run["board"] == board and run["task_id"] == task_id)
+            assert run["outcome"] == "completed"
+
+
 def test_snapshot_keeps_missing_board_only_worker_url_approved(tmp_path, monkeypatch):
     _ingest_valid(monkeypatch, tmp_path)
     card = _first_card()
