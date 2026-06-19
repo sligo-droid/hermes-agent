@@ -1338,6 +1338,7 @@ def _proposal_work_item(
         ("Rationale", card.get("rationale")),
         ("Source excerpts", _source_excerpt_text(source_excerpts)),
     )
+    is_recovery_needed = canonical_status == "blocked" and str(card.get("status") or "").lower() == "recovery_needed"
     return {
         "id": f"self-improvement:{card['proposal_id']}",
         "title": card.get("title") or card.get("proposal_id"),
@@ -1354,7 +1355,7 @@ def _proposal_work_item(
         "updated_at": card.get("updated_at"),
         "source": _proposal_source(card),
         "decision": {
-            "needed": canonical_status == "proposed",
+            "needed": canonical_status == "proposed" or is_recovery_needed,
             "proposal_id": card.get("proposal_id"),
             "approve_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/approve",
             "reject_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/reject",

@@ -353,8 +353,10 @@ def test_snapshot_reconciles_default_board_archived_task_to_recovery_needed(tmp_
     item = next(item for item in snapshot["work_items"] if item["id"] == f"self-improvement:{card['proposal_id']}")
     assert item["status"] == "blocked"
     assert item["status_detail"] == "recovery_needed"
+    assert item["decision"]["needed"] is True
     assert item["execution"]["board"] == kanban_db.DEFAULT_BOARD
     assert item["execution"]["task_status"] == "archived"
+    assert item["execution"]["worker_url"] is None
     assert item["execution"]["recovery_required"] is True
     assert "archived without terminal success evidence" in item["execution"]["recovery_reason"]
     assert proposal_storage.summarize_feedback_history(project="pid", prong="airflow_scraper_doctor")["projects"] == []
@@ -394,8 +396,13 @@ def test_snapshot_reconciles_worker_url_only_default_archived_task_to_recovery_n
     assert events[-1]["metadata"]["kanban_task_id"] == task_id
     item = next(item for item in snapshot["work_items"] if item["id"] == f"self-improvement:{card['proposal_id']}")
     assert item["status"] == "blocked"
+    assert item["status_detail"] == "recovery_needed"
+    assert item["decision"]["needed"] is True
     assert item["execution"]["task_id"] == task_id
+    assert item["execution"]["task_status"] == "archived"
     assert item["execution"]["task_url"] == f"/workers?task={task_id}"
+    assert item["execution"]["worker_url"] is None
+    assert item["execution"]["recovery_required"] is True
 
 
 def test_snapshot_reconciles_archived_board_with_non_success_task_to_recovery_needed(tmp_path, monkeypatch):
@@ -631,10 +638,13 @@ def test_snapshot_prefers_archived_worker_board_failure_over_task_success_eviden
         assert item["status"] == "blocked"
         assert item["status_detail"] == "recovery_needed"
         assert item["execution"]["recovery_required"] is True
+        assert item["execution"]["resumable"] is False
         assert item["execution"]["observed_terminal_status"] == terminal_status
         assert item["execution"]["task_status"] == expected_task_status
         assert item["execution"]["evidence_kind"] == "worker_board"
         assert item["execution"]["archive_path"] == archived_path
+        if evidence_kind == "run_success":
+            assert item["execution"]["worker_url"] == f"/workers/{board}"
 
 
 def test_snapshot_keeps_missing_board_only_worker_url_approved(tmp_path, monkeypatch):

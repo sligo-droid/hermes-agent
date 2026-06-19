@@ -163,11 +163,11 @@ function RunningMeter() {
 }
 
 function isInboxItem(item: CommandCenterWorkItem): boolean {
-  return Boolean(item.decision?.needed) || item.status === "proposed";
+  return Boolean(item.decision?.needed) || item.status === "proposed" || isOperatorAttentionOnlyItem(item);
 }
 
 function isWorkItem(item: CommandCenterWorkItem): boolean {
-  return item.status !== "proposed" && item.status !== "rejected" && item.status !== "archived" && !isCompletedItem(item);
+  return item.status !== "proposed" && item.status !== "rejected" && item.status !== "archived" && !isCompletedItem(item) && !isOperatorAttentionOnlyItem(item);
 }
 
 function isArchivedItem(item: CommandCenterWorkItem): boolean {
@@ -180,6 +180,10 @@ function isCompletedItem(item: CommandCenterWorkItem): boolean {
 
 function isRunningWorkItem(item: CommandCenterWorkItem): boolean {
   return item.status === "running" || Boolean(item.execution?.active_run_id) || Boolean(item.runs?.some(runIsActive));
+}
+
+function isOperatorAttentionOnlyItem(item: CommandCenterWorkItem): boolean {
+  return Boolean(item.execution?.recovery_required && item.execution?.resumable !== true);
 }
 
 function workItemRecency(item: CommandCenterWorkItem): number {
@@ -223,7 +227,7 @@ function availableActionKinds(item: CommandCenterWorkItem): ActionKind[] {
   const proposalCanArchive = Boolean(proposalId && ["queued", "running", "review", "blocked", "accepted", "paused"].includes(item.status));
   const canApproveReject = Boolean(proposalId && item.status === "proposed");
   const canPause = Boolean(["queued", "running", "review", "accepted"].includes(item.status) && (proposalId || (item.execution?.pause_action && board)) && !item.execution?.paused);
-  const canResume = Boolean((item.status === "paused" || item.execution?.paused || item.execution?.resumable) && (proposalId || (item.execution?.resume_action && board)) && item.status !== "archived");
+  const canResume = Boolean(item.execution?.resumable === true && (proposalId || (item.execution?.resume_action && board)) && item.status !== "archived");
   const canUndo = Boolean(isCompletedItem(item) && ((proposalId && item.decision?.undo_followup_action) || (board && item.execution?.undo_followup_action)));
   const canArchive = Boolean((item.execution?.archiveable && board && board !== "default" && item.id.startsWith("kanban-board:")) || proposalCanArchive);
   const canRepair = Boolean(item.status === "blocked" && item.execution?.board && item.execution?.repair_action && item.execution?.repairable !== false && !item.execution?.repair_task_id);

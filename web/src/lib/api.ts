@@ -972,6 +972,8 @@ export interface CommandCenterExecution {
   repair_worker_url?: string | null;
   repair_blocked?: boolean;
   repair_status_detail?: string | null;
+  recovery_required?: boolean;
+  recovery_reason?: string | null;
   paused?: boolean;
   resumable?: boolean;
   archiveable?: boolean;
