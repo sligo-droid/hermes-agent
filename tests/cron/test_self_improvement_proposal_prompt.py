@@ -3,9 +3,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cron.scheduler import _build_job_prompt, tick
+from hermes_cli import kanban_db
 from hermes_cli.config import DEFAULT_CONFIG
 from self_improvement import proposal_storage
-from self_improvement.proposals import CONTRACT_VERSION
+from self_improvement.proposals import CONTRACT_VERSION, build_cron_proposal_guidance
 
 
 def test_cron_job_prompt_includes_self_improvement_proposal_guidance():
@@ -126,6 +127,38 @@ def test_cron_job_prompt_includes_scoped_feedback_context(tmp_path, monkeypatch)
     assert "Rejected feedback card" in prompt
     assert "not enough signal" in prompt
     assert "Full accepted body should not be injected" not in prompt
+
+
+def test_cron_guidance_reconciles_archived_proposal_task_before_feedback(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    proposal_storage.ingest_proposal_output(json.dumps(_proposal_payload()))
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    conn = kanban_db.connect()
+    try:
+        task_id = kanban_db.create_task(conn, title="Archived proposal task")
+        assert kanban_db.archive_task(conn, task_id) is True
+    finally:
+        conn.close()
+    proposal_storage.record_approval(
+        card["proposal_id"],
+        kanban_task_id=task_id,
+        worker_url=f"/workers?task={task_id}",
+        actor="operator",
+    )
+
+    guidance = build_cron_proposal_guidance("pid", "airflow_scraper_doctor")
+    reconciled = proposal_storage.get_card(card["proposal_id"])
+
+    assert "Accepted recently:" not in guidance
+    assert "Tighten proposal ingestion" not in guidance
+    assert task_id not in guidance
+    assert reconciled["status"] == "recovery_needed"
+    events = proposal_storage.list_audit_events(card["proposal_id"])
+    assert [event["action"] for event in events] == ["approved", "recovery_needed"]
+    assert events[-1]["kanban_task_id"] == task_id
+    assert events[-1]["metadata"]["board"] == kanban_db.DEFAULT_BOARD
+    assert events[-1]["metadata"]["observed_terminal_status"] == "archived"
+    assert events[-1]["metadata"]["recovery_required"] is True
 
 
 def _proposal_payload(*, cards=None, run_id="cron-run-1"):

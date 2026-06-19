@@ -799,6 +799,134 @@ def test_self_improvement_cards_include_downstream_task_status(client):
     assert enriched["downstream_task"]["id"] == approved.json()["task"]["id"]
 
 
+def test_self_improvement_proposal_api_reconciles_archived_downstream_task(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    assert approved.status_code == 200, approved.text
+    task_id = approved.json()["task"]["id"]
+    conn = kb.connect()
+    try:
+        assert kb.archive_task(conn, task_id) is True
+    finally:
+        conn.close()
+
+    grouped = client.get("/api/plugins/kanban/self-improvement/proposals")
+    detail = client.get(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}")
+
+    assert detail.status_code == 200, detail.text
+    assert grouped.status_code == 200, grouped.text
+    detail_card = detail.json()["card"]
+    grouped_card = grouped.json()["projects"][0]["prongs"][0]["cards"][0]
+    assert detail_card["status"] == "recovery_needed"
+    assert detail_card["downstream_task_status"] == "archived"
+    assert grouped_card["status"] == "recovery_needed"
+    assert grouped_card["downstream_task_status"] == "archived"
+    assert [event["action"] for event in proposal_storage.list_audit_events(card["proposal_id"])] == [
+        "approved",
+        "recovery_needed",
+    ]
+
+    client.get(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}")
+    assert [event["action"] for event in proposal_storage.list_audit_events(card["proposal_id"])] == [
+        "approved",
+        "recovery_needed",
+    ]
+
+
+def test_self_improvement_proposal_api_reconciles_cancelled_named_worker_board(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    board = "discord-cancelled-proposal-api"
+    _write_discord_worker_metadata(board, {"goal_status": "cancelled", "phase": "cancelled", "cancelled": True})
+    conn = kb.connect(board=board)
+    try:
+        task_id = kb.create_task(conn, title="Cancelled named worker proposal", board=board)
+        with conn:
+            conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200, task_id))
+    finally:
+        conn.close()
+    proposal_storage.record_approval(
+        card["proposal_id"],
+        kanban_task_id=task_id,
+        worker_url=f"/workers/{board}/tickets/{task_id}",
+        metadata={"board": board},
+    )
+
+    grouped = client.get("/api/plugins/kanban/self-improvement/proposals")
+    detail = client.get(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}")
+
+    assert detail.status_code == 200, detail.text
+    assert grouped.status_code == 200, grouped.text
+    detail_card = detail.json()["card"]
+    grouped_card = grouped.json()["projects"][0]["prongs"][0]["cards"][0]
+    for enriched in (detail_card, grouped_card):
+        assert enriched["status"] == "recovery_needed"
+        assert enriched["downstream_board"] == board
+        assert enriched["downstream_board_status"] == "cancelled"
+        assert enriched["downstream_board_phase"] == "cancelled"
+        assert enriched["downstream_task_status"] == "cancelled"
+        assert enriched["recovery_required"] is True
+        assert enriched["observed_terminal_status"] == "cancelled"
+        assert enriched["recovery_evidence_kind"] == "worker_board"
+        assert enriched["recovery_metadata"]["evidence_kind"] == "worker_board"
+        assert enriched["recovery_metadata"]["kanban_task_id"] == task_id
+        assert "non-success terminal status cancelled" in enriched["recovery_reason"]
+
+    audit = proposal_storage.list_audit_events(card["proposal_id"])
+    assert [event["action"] for event in audit] == ["approved", "recovery_needed"]
+    assert audit[-1]["metadata"]["board"] == board
+    assert audit[-1]["metadata"]["evidence_kind"] == "worker_board"
+
+
+def test_self_improvement_proposal_api_reconciles_archived_failed_worker_board_before_task_success(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    board = "discord-archived-failed-proposal-api"
+    _write_discord_worker_metadata(board, {"goal_status": "failed", "phase": "failed"})
+    conn = kb.connect(board=board)
+    try:
+        task_id = kb.create_task(conn, title="Failed archived named worker proposal", board=board)
+        with conn:
+            conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200, task_id))
+    finally:
+        conn.close()
+    proposal_storage.record_approval(
+        card["proposal_id"],
+        kanban_task_id=task_id,
+        worker_url=f"/workers/{board}/tickets/{task_id}",
+        metadata={"board": board},
+    )
+    archived = kb.remove_board(board)
+
+    grouped = client.get("/api/plugins/kanban/self-improvement/proposals")
+    detail = client.get(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}")
+
+    assert detail.status_code == 200, detail.text
+    assert grouped.status_code == 200, grouped.text
+    detail_card = detail.json()["card"]
+    grouped_card = grouped.json()["projects"][0]["prongs"][0]["cards"][0]
+    for enriched in (detail_card, grouped_card):
+        assert enriched["status"] == "recovery_needed"
+        assert enriched["downstream_board"] == board
+        assert enriched["downstream_task_status"] == "missing"
+        assert enriched["downstream_task_missing"] is True
+        assert enriched["recovery_required"] is True
+        assert enriched["observed_terminal_status"] == "failed"
+        assert enriched["observed_task_status"] == "done"
+        assert enriched["recovery_evidence_kind"] == "worker_board"
+        assert enriched["recovery_metadata"]["archive_path"] == archived["new_path"]
+        assert enriched["recovery_metadata"]["evidence_kind"] == "worker_board"
+        assert enriched["recovery_metadata"]["kanban_task_id"] == task_id
+        assert "archived worker board reached non-success terminal status failed" in enriched["recovery_reason"]
+
+    audit = proposal_storage.list_audit_events(card["proposal_id"])
+    assert [event["action"] for event in audit] == ["approved", "recovery_needed"]
+    assert audit[-1]["metadata"]["board"] == board
+    assert audit[-1]["metadata"]["archive_path"] == archived["new_path"]
+    assert audit[-1]["metadata"]["evidence_kind"] == "worker_board"
+
+
 def test_self_improvement_halt_archives_in_flight_task_and_audits(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]

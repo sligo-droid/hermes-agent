@@ -34,6 +34,8 @@ COMMAND_CENTER_REPAIR_ACTIVE_STATUSES = {"triage", "todo", "ready", "running", "
 
 _TERMINAL_TASK_STATUSES = {"done", "archived"}
 _TERMINAL_SUCCESS_STATUSES = {"done", "shipped", "complete", "completed"}
+_TERMINAL_FAILURE_STATUSES = {"archived", "cancelled", "canceled", "failed", "errored", "error", "gave_up", "crashed", "timed_out"}
+_SUCCESS_RUN_OUTCOMES = {"completed", "done", "success", "successful"}
 _SUCCESS_CHECK_STATUSES = {"passed", "success", "successful", "green", "ok"}
 _WAITING_TASK_STATUSES = {"triage", "todo", "scheduled", "ready"}
 _RUNNING_TASK_STATUSES = {"running"}
@@ -712,6 +714,8 @@ def _canonical_status_from_proposal(card: dict[str, Any], task: dict[str, Any] |
     status = str(card.get("status") or "").lower()
     if status == "completed":
         return "shipped", status
+    if status == "recovery_needed":
+        return "blocked", status
     if status == "archived" or (card.get("archived_at") and status != "rejected"):
         return "archived", status or "archived"
     if status == "rejected":
@@ -723,7 +727,11 @@ def _canonical_status_from_proposal(card: dict[str, Any], task: dict[str, Any] |
     return "proposed", status or "proposed"
 
 
-def _latest_self_improvement_metadata(proposal_id: str) -> dict[str, Any]:
+def _latest_self_improvement_metadata(
+    proposal_id: str,
+    *,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
     """Return durable proposal metadata without losing approval artifacts.
 
     Follow-up audit events such as halt/undo often carry small metadata payloads
@@ -734,7 +742,7 @@ def _latest_self_improvement_metadata(proposal_id: str) -> dict[str, Any]:
     """
 
     try:
-        events = proposal_storage.list_audit_events(proposal_id)
+        events = proposal_storage.list_audit_events(proposal_id, db_path=db_path)
     except Exception:
         return {}
     merged: dict[str, Any] = {}
@@ -814,7 +822,168 @@ def _task_from_board_db(task_id: str, *, board: str, db_path: Path) -> tuple[dic
         conn.close()
 
 
+def _board_archive_path(board_meta: dict[str, Any] | None) -> Any:
+    return (board_meta or {}).get("archive_path") or (board_meta or {}).get("archived_path")
+
+
+def _board_is_archived(board_meta: dict[str, Any] | None) -> bool:
+    meta = board_meta or {}
+    return bool(meta.get("archived") or meta.get("archive_path") or meta.get("archived_path"))
+
+
+def _task_success_evidence(task: dict[str, Any] | None, runs: list[dict[str, Any]]) -> str | None:
+    if not task:
+        return None
+    status = str(task.get("status") or "").lower()
+    if status == "done":
+        return "task_status"
+    if task.get("completed_at") is not None:
+        return "task_completed_at"
+    for run in runs:
+        outcome = str(run.get("outcome") or "").lower()
+        run_status = str(run.get("status") or "").lower()
+        if outcome in _SUCCESS_RUN_OUTCOMES or run_status in _TERMINAL_SUCCESS_STATUSES:
+            return "task_run"
+    return None
+
+
+def _worker_terminal_success_status(worker: dict[str, Any]) -> str:
+    goal_status = str(worker.get("goal_status") or "").lower()
+    phase = str(worker.get("phase") or "").lower()
+    if goal_status in _TERMINAL_SUCCESS_STATUSES:
+        return goal_status
+    if phase in _TERMINAL_SUCCESS_STATUSES:
+        return phase
+    return ""
+
+
+def _worker_terminal_failure_status(worker: dict[str, Any]) -> str:
+    goal_status = str(worker.get("goal_status") or "").lower()
+    phase = str(worker.get("phase") or "").lower()
+    if goal_status in _TERMINAL_FAILURE_STATUSES:
+        return goal_status
+    if phase in _TERMINAL_FAILURE_STATUSES:
+        return phase
+    return ""
+
+
+def _worker_explicit_success_evidence(worker: dict[str, Any]) -> str:
+    board_summary_value = worker.get("board_summary")
+    board_summary: dict[str, Any] = board_summary_value if isinstance(board_summary_value, dict) else {}
+    goal_status = str(worker.get("goal_status") or board_summary.get("goal_status") or "").lower()
+    phase = str(worker.get("phase") or board_summary.get("phase") or "").lower()
+    if goal_status in _TERMINAL_SUCCESS_STATUSES:
+        return goal_status
+    if phase in _TERMINAL_SUCCESS_STATUSES:
+        return phase
+
+    thread_state = str(worker.get("thread_state") or board_summary.get("thread_state") or "").lower()
+    if thread_state in _TERMINAL_SUCCESS_STATUSES:
+        return thread_state
+    synced_state = str(worker.get("terminal_reaction_synced_state") or board_summary.get("terminal_reaction_synced_state") or "").lower()
+    if synced_state in _TERMINAL_SUCCESS_STATUSES:
+        return synced_state
+
+    review_value = board_summary.get("review")
+    review: dict[str, Any] = review_value if isinstance(review_value, dict) else {}
+    final_verdict_value = review.get("final_verdict")
+    final_verdict: dict[str, Any] = final_verdict_value if isinstance(final_verdict_value, dict) else {}
+    if str(final_verdict.get("status") or "").lower() == "approved":
+        return "review_approved"
+
+    pr_summary_value = board_summary.get("pr")
+    pr_summary: dict[str, Any] = pr_summary_value if isinstance(pr_summary_value, dict) else {}
+    pr_state = str(worker.get("pr_state") or pr_summary.get("state") or "").upper()
+    checks_status = str(worker.get("pr_checks_status") or pr_summary.get("checks_status") or "").lower()
+    if pr_state == "MERGED" and (
+        checks_status in _SUCCESS_CHECK_STATUSES
+        or worker.get("pr_merged_at")
+        or pr_summary.get("merged_at")
+    ):
+        return "pull_request_merged"
+
+    canonical_sync_state = str(worker.get("canonical_sync_state") or board_summary.get("canonical_sync_state") or "").lower()
+    if canonical_sync_state == "synced" and (
+        worker.get("canonical_sync_head")
+        or worker.get("canonical_sync_merge_commit")
+        or board_summary.get("canonical_sync_head")
+        or board_summary.get("canonical_sync_merge_commit")
+    ):
+        return "canonical_sync"
+    return ""
+
+
+def _task_terminal_evidence_owns_proposal(board: str | None, board_meta: dict[str, Any] | None) -> bool:
+    if not board or board == kanban_db.DEFAULT_BOARD:
+        return True
+    worker = _board_worker_meta(board_meta or {})
+    if not worker:
+        return True
+    if _worker_terminal_success_status(worker):
+        return True
+    if _worker_terminal_failure_status(worker):
+        return bool(_worker_explicit_success_evidence(worker))
+    if _board_is_archived(board_meta):
+        return True
+    return False
+
+
+def _proposal_evidence_base(
+    card: dict[str, Any],
+    *,
+    board: str | None,
+    board_meta: dict[str, Any] | None,
+    task_id: str | None,
+    evidence_kind: str,
+    observed_terminal_status: str,
+) -> dict[str, Any]:
+    return {
+        "proposal_id": card.get("proposal_id"),
+        "kanban_task_id": task_id or None,
+        "board": board or kanban_db.DEFAULT_BOARD,
+        "board_db_path": (board_meta or {}).get("db_path"),
+        "archive_path": _board_archive_path(board_meta),
+        "observed_terminal_status": observed_terminal_status,
+        "evidence_kind": evidence_kind,
+    }
+
+
 def _proposal_terminal_metadata(
+    card: dict[str, Any],
+    *,
+    task: dict[str, Any] | None,
+    runs: list[dict[str, Any]],
+    board: str | None,
+    board_meta: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    task_id = _proposal_task_id(card)
+    task_success = _task_success_evidence(task, runs)
+    if task_id and task and task_success and _task_terminal_evidence_owns_proposal(board, board_meta):
+        metadata = _proposal_evidence_base(
+            card,
+            board=board,
+            board_meta=board_meta,
+            task_id=task_id,
+            evidence_kind="kanban_task",
+            observed_terminal_status=str(task.get("status") or "done").lower() or "done",
+        )
+        metadata["success_evidence_kind"] = task_success
+        return metadata
+    worker = _board_worker_meta(board_meta or {})
+    observed = _worker_terminal_success_status(worker)
+    if board and observed:
+        return _proposal_evidence_base(
+            card,
+            board=board,
+            board_meta=board_meta,
+            task_id=task_id or None,
+            evidence_kind="worker_board",
+            observed_terminal_status=observed,
+        )
+    return None
+
+
+def _proposal_recovery_metadata(
     card: dict[str, Any],
     *,
     task: dict[str, Any] | None,
@@ -822,52 +991,86 @@ def _proposal_terminal_metadata(
     board_meta: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     task_id = _proposal_task_id(card)
-    if task_id and task and str(task.get("status") or "").lower() == "done":
-        return {
-            "proposal_id": card.get("proposal_id"),
-            "kanban_task_id": task_id,
-            "board": board or kanban_db.DEFAULT_BOARD,
-            "board_db_path": (board_meta or {}).get("db_path"),
-            "archive_path": (board_meta or {}).get("archive_path") or (board_meta or {}).get("archived_path"),
-            "observed_terminal_status": "done",
-            "evidence_kind": "kanban_task",
-        }
+    task_status = str((task or {}).get("status") or "").lower()
+    observed = ""
+    evidence_kind = ""
+    reason = ""
     worker = _board_worker_meta(board_meta or {})
-    goal_status = str(worker.get("goal_status") or "").lower()
-    phase = str(worker.get("phase") or "").lower()
-    observed = goal_status if goal_status in _TERMINAL_SUCCESS_STATUSES else phase if phase in _TERMINAL_SUCCESS_STATUSES else ""
-    if board and observed:
-        return {
-            "proposal_id": card.get("proposal_id"),
-            "kanban_task_id": task_id or None,
-            "board": board,
-            "board_db_path": (board_meta or {}).get("db_path"),
-            "archive_path": (board_meta or {}).get("archive_path") or (board_meta or {}).get("archived_path"),
-            "observed_terminal_status": observed,
-            "evidence_kind": "worker_board",
-        }
-    return None
+    worker_failure = _worker_terminal_failure_status(worker)
+
+    if worker_failure and board and not _worker_explicit_success_evidence(worker):
+        observed = worker_failure
+        evidence_kind = "worker_board"
+        archived_prefix = "archived " if _board_is_archived(board_meta) else ""
+        reason = f"linked {archived_prefix}worker board reached non-success terminal status {observed}"
+    elif task_id and task_status == "archived" and _task_terminal_evidence_owns_proposal(board, board_meta):
+        observed = "archived"
+        evidence_kind = "kanban_task"
+        reason = "linked Kanban task is archived without terminal success evidence"
+    elif _board_is_archived(board_meta) and task_id and task is not None:
+        observed = task_status or "archived"
+        evidence_kind = "worker_board"
+        reason = f"linked worker board is archived with non-success task status {observed}"
+    elif _board_is_archived(board_meta) and task_id and task is None:
+        observed = "archived"
+        evidence_kind = "worker_board"
+        reason = "linked worker board is archived and the proposal task was not found"
+    elif _board_is_archived(board_meta) and not task_id:
+        observed = "archived"
+        evidence_kind = "worker_board"
+        reason = "linked worker board is archived without terminal success evidence"
+
+    if not reason:
+        return None
+    metadata = _proposal_evidence_base(
+        card,
+        board=board,
+        board_meta=board_meta,
+        task_id=task_id or None,
+        evidence_kind=evidence_kind,
+        observed_terminal_status=observed,
+    )
+    metadata["recovery_required"] = True
+    metadata["recovery_reason"] = reason
+    if task_status:
+        metadata["observed_task_status"] = task_status
+    return metadata
 
 
 def _reconcile_terminal_proposal(
     card: dict[str, Any],
     *,
     task: dict[str, Any] | None,
+    runs: list[dict[str, Any]],
     board: str | None,
     board_meta: dict[str, Any] | None,
+    proposal_db_path: Path | None = None,
 ) -> dict[str, Any]:
-    if str(card.get("status") or "").lower() != "approved":
+    status = str(card.get("status") or "").lower()
+    if status not in {"approved", "recovery_needed"}:
         return card
-    metadata = _proposal_terminal_metadata(card, task=task, board=board, board_meta=board_meta)
-    if not metadata:
-        return card
-    return proposal_storage.record_completion(
-        str(card.get("proposal_id") or ""),
-        actor="command-center-reconciliation",
-        reason="mapped Kanban worker reached terminal success",
-        kanban_task_id=_proposal_task_id(card) or None,
-        metadata=metadata,
-    )
+    metadata = _proposal_terminal_metadata(card, task=task, runs=runs, board=board, board_meta=board_meta)
+    if metadata:
+        return proposal_storage.record_completion(
+            str(card.get("proposal_id") or ""),
+            actor="command-center-reconciliation",
+            reason="mapped Kanban worker reached terminal success",
+            kanban_task_id=_proposal_task_id(card) or None,
+            metadata=metadata,
+            db_path=proposal_db_path,
+        )
+    if status == "approved":
+        recovery_metadata = _proposal_recovery_metadata(card, task=task, board=board, board_meta=board_meta)
+        if recovery_metadata:
+            return proposal_storage.record_recovery_needed(
+                str(card.get("proposal_id") or ""),
+                actor="command-center-reconciliation",
+                reason=str(recovery_metadata.get("recovery_reason") or "linked Kanban worker needs recovery"),
+                kanban_task_id=_proposal_task_id(card) or None,
+                metadata=recovery_metadata,
+                db_path=proposal_db_path,
+            )
+    return card
 
 
 def _task_to_dict(task: kanban_db.Task) -> dict[str, Any]:
@@ -1088,7 +1291,7 @@ def _proposal_work_item(
     canonical_status, status_detail = _canonical_status_from_proposal(card, task)
     public_url = metadata.get("discord_board_public_url") or metadata.get("board_public_url")
     worker_url_fallback = metadata.get("worker_url") or card.get("worker_url")
-    task_id = str(card.get("kanban_task_id") or "").strip()
+    task_id = _proposal_task_id(card)
     execution = None
     if task_id:
         effective_board = board or kanban_db.DEFAULT_BOARD
@@ -1105,6 +1308,28 @@ def _proposal_work_item(
             execution["task_url"] = _worker_ticket_url(task_id, board=effective_board, public_url=str(public_url))
         elif worker_url_fallback:
             execution["task_url"] = str(worker_url_fallback)
+    if str(card.get("status") or "").lower() == "recovery_needed":
+        effective_board = board or kanban_db.DEFAULT_BOARD
+        if execution is None:
+            effective_meta = board_meta or kanban_db.read_board_metadata(effective_board)
+            execution = {
+                "board": effective_board,
+                "board_name": effective_meta.get("name") or effective_board,
+                "task_id": task_id or None,
+                "task_status": metadata.get("observed_task_status") or metadata.get("observed_terminal_status"),
+                "task_url": _worker_ticket_url(task_id, board=effective_board, public_url=str(public_url)) if task_id else None,
+                "worker_url": None,
+                "console_url": _worker_console_url(task_id, board=effective_board) if task_id else None,
+                "active_run_id": None,
+                "paused": True,
+                "resumable": False,
+            }
+        execution["recovery_required"] = True
+        execution["recovery_reason"] = metadata.get("recovery_reason") or "linked Kanban worker needs recovery"
+        execution["observed_terminal_status"] = metadata.get("observed_terminal_status")
+        execution["evidence_kind"] = metadata.get("evidence_kind")
+        if metadata.get("archive_path"):
+            execution["archive_path"] = metadata.get("archive_path")
     source_excerpts = card.get("source_excerpts") or []
     full_description = _full_description_from_sections(
         ("Title", card.get("title")),
@@ -1240,10 +1465,41 @@ def _board_work_item(
     repair_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     canonical_status, status_detail = _canonical_status_from_board(tasks, board_meta=board_meta, runs=runs)
+    recovery_metadata = (
+        proposal_action_context.get("recovery_metadata")
+        if isinstance(proposal_action_context, dict) and isinstance(proposal_action_context.get("recovery_metadata"), dict)
+        else None
+    )
+    if recovery_metadata and (recovery_metadata.get("recovery_required") or recovery_metadata.get("recovery_reason")):
+        canonical_status = "blocked"
+        status_detail = "recovery_needed"
     if repair_context and canonical_status in {"running", "accepted", "queued", "review"}:
         canonical_status = "blocked"
         status_detail = "repair_required"
     execution = _execution_from_board(board=board, board_meta=board_meta, tasks=tasks, runs=runs, repair_context=repair_context)
+    if recovery_metadata and (recovery_metadata.get("recovery_required") or recovery_metadata.get("recovery_reason")):
+        worker = _board_worker_meta(board_meta)
+        public_url = worker.get("public_url") if isinstance(worker, dict) else None
+        task_id = str(recovery_metadata.get("kanban_task_id") or "").strip()
+        observed_task_status = str(
+            recovery_metadata.get("observed_task_status")
+            or recovery_metadata.get("observed_terminal_status")
+            or ""
+        ).strip()
+        execution["recovery_required"] = True
+        execution["recovery_reason"] = recovery_metadata.get("recovery_reason") or "linked Kanban worker needs recovery"
+        execution["observed_terminal_status"] = recovery_metadata.get("observed_terminal_status")
+        execution["evidence_kind"] = recovery_metadata.get("evidence_kind")
+        execution["paused"] = True
+        execution["resumable"] = False
+        if task_id:
+            execution["task_id"] = task_id
+            execution["task_url"] = _worker_ticket_url(task_id, board=board, public_url=public_url)
+            execution["console_url"] = _worker_console_url(task_id, board=board)
+        if observed_task_status:
+            execution["task_status"] = observed_task_status
+        if recovery_metadata.get("archive_path"):
+            execution["archive_path"] = recovery_metadata.get("archive_path")
     if canonical_status == "blocked" and execution.get("repair_blocked"):
         canonical_status = "mega_blocked"
         status_detail = "repair_blocked"
@@ -1322,22 +1578,73 @@ def _artifacts_from_task_and_board(task: dict[str, Any], board_meta: dict[str, A
     return artifacts
 
 
-def _all_proposal_cards(*, include_archived: bool) -> list[dict[str, Any]]:
+def _all_proposal_cards(
+    *,
+    include_archived: bool,
+    db_path: Path | None = None,
+) -> list[dict[str, Any]]:
     try:
         return proposal_storage.list_cards(
             include_rejected=include_archived,
             include_archived=include_archived,
+            db_path=db_path,
         ).get("cards", [])
     except AttributeError:
         return []
 
 
+def reconcile_self_improvement_proposals(
+    *,
+    include_archived: bool = False,
+    project: str | None = None,
+    prong: str | None = None,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    """Persist proposal lifecycle state from linked Kanban source-of-truth data.
+
+    This is the active reconciliation path used by Command Center reads. Cron
+    proposal feedback also invokes it before accepted history is summarized so
+    stale approved proposal cards cannot suppress new work merely because no
+    dashboard/API snapshot has been read yet.
+    """
+
+    project_filter = _normalize_project_key(project)
+    prong_filter = str(prong).strip() if prong else None
+    checked = 0
+    changed = 0
+    for card in _all_proposal_cards(include_archived=include_archived, db_path=db_path):
+        if project_filter and _normalize_project_key(card.get("project")) != project_filter:
+            continue
+        if prong_filter and str(card.get("prong") or "").strip() != prong_filter:
+            continue
+        status = str(card.get("status") or "").lower()
+        if status not in {"approved", "recovery_needed"}:
+            continue
+        checked += 1
+        task, task_runs, board, board_meta = _load_task_for_proposal(card, proposal_db_path=db_path)
+        reconciled = _reconcile_terminal_proposal(
+            card,
+            task=task,
+            runs=task_runs,
+            board=board,
+            board_meta=board_meta,
+            proposal_db_path=db_path,
+        )
+        if str(reconciled.get("status") or "").lower() != status:
+            changed += 1
+    if changed:
+        invalidate_snapshot_cache()
+    return {"checked": checked, "changed": changed}
+
+
 def _load_task_for_proposal(
     card: dict[str, Any],
+    *,
+    proposal_db_path: Path | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str | None, dict[str, Any] | None]:
     task_id = _proposal_task_id(card)
     proposal_id = str(card.get("proposal_id") or "")
-    metadata = _latest_self_improvement_metadata(proposal_id)
+    metadata = _latest_self_improvement_metadata(proposal_id, db_path=proposal_db_path)
     board_candidates = _proposal_board_candidates(card, metadata, include_default=bool(task_id))
     if not task_id and not board_candidates:
         return None, [], None, None
@@ -1471,10 +1778,14 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
     sources: list[dict[str, Any]] = []
     runs: list[dict[str, Any]] = []
     board_proposal_action_context: dict[str, dict[str, Any]] = {}
+    reconciled_proposals = False
 
     for card in _all_proposal_cards(include_archived=include_archived):
         task, task_runs, board, board_meta = _load_task_for_proposal(card)
-        card = _reconcile_terminal_proposal(card, task=task, board=board, board_meta=board_meta)
+        previous_proposal_status = str(card.get("status") or "").lower()
+        card = _reconcile_terminal_proposal(card, task=task, runs=task_runs, board=board, board_meta=board_meta)
+        if str(card.get("status") or "").lower() != previous_proposal_status:
+            reconciled_proposals = True
         metadata = _latest_self_improvement_metadata(str(card.get("proposal_id") or ""))
         item = _proposal_work_item(
             card,
@@ -1490,29 +1801,44 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
             and item.get("status") not in {"proposed", "rejected", "archived"}
             and kanban_db.board_exists(board)
         )
-        if not has_board_rollup and item.get("status") in {"proposed", "rejected", "archived"}:
+        standalone_recovery = str(card.get("status") or "").lower() == "recovery_needed"
+        if not has_board_rollup and (item.get("status") in {"proposed", "rejected", "archived"} or standalone_recovery):
             work_items.append(item)
         elif board:
             proposal_id = card.get("proposal_id")
             if proposal_id and item.get("source", {}).get("kind") == "self_improvement":
-                board_proposal_action_context.setdefault(
-                    board,
-                    {
-                        "proposal_id": proposal_id,
-                        "title": card.get("title"),
-                        "summary": card.get("summary"),
-                        "body": card.get("body"),
-                        "rationale": card.get("rationale"),
-                        "body_preview": item.get("body_preview"),
-                        "project": item.get("project"),
-                        "priority": item.get("priority"),
-                        "priority_rank": item.get("priority_rank"),
-                        "severity": item.get("severity"),
-                        "source": item.get("source"),
-                        "artifacts": item.get("artifacts") or [],
-                        "source_excerpts": item.get("source_excerpts") or [],
-                    },
-                )
+                proposal_context = {
+                    "proposal_id": proposal_id,
+                    "title": card.get("title"),
+                    "summary": card.get("summary"),
+                    "body": card.get("body"),
+                    "rationale": card.get("rationale"),
+                    "body_preview": item.get("body_preview"),
+                    "project": item.get("project"),
+                    "priority": item.get("priority"),
+                    "priority_rank": item.get("priority_rank"),
+                    "severity": item.get("severity"),
+                    "source": item.get("source"),
+                    "artifacts": item.get("artifacts") or [],
+                    "source_excerpts": item.get("source_excerpts") or [],
+                    "recovery_metadata": {
+                        key: metadata.get(key)
+                        for key in (
+                            "recovery_required",
+                            "recovery_reason",
+                            "observed_terminal_status",
+                            "observed_task_status",
+                            "evidence_kind",
+                            "kanban_task_id",
+                            "archive_path",
+                        )
+                        if metadata.get(key) is not None
+                    }
+                    if str(card.get("status") or "").lower() == "recovery_needed"
+                    else None,
+                }
+                if board not in board_proposal_action_context or proposal_context.get("recovery_metadata"):
+                    board_proposal_action_context[board] = proposal_context
     proposal_runs = proposal_storage.list_runs().get("runs", [])
     for run in proposal_runs:
         sources.append(_source_from_proposal_run(run))
@@ -1649,6 +1975,9 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
             runs=runs,
             boards=boards,
         )
+
+    if reconciled_proposals:
+        invalidate_snapshot_cache()
 
     command_center_annotations.enrich_work_items(work_items)
 

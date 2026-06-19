@@ -428,6 +428,33 @@ def test_completed_cards_are_hidden_from_active_grouping_and_feedback_suppressio
     assert [event["action"] for event in proposal_storage.list_audit_events(completed_card["proposal_id"])] == ["approved", "completed"]
 
 
+def test_record_recovery_needed_is_idempotent_and_not_accepted_feedback(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    proposal_storage.ingest_proposal_output(_fenced("proposal_run_pid_valid.json"))
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    proposal_storage.record_approval(card["proposal_id"], kanban_task_id="t_archived", worker_url="/workers?task=t_archived")
+
+    recovery = proposal_storage.record_recovery_needed(
+        card["proposal_id"],
+        actor="test",
+        reason="linked task archived",
+        metadata={"observed_terminal_status": "archived", "evidence_kind": "kanban_task"},
+    )
+    again = proposal_storage.record_recovery_needed(card["proposal_id"], actor="test")
+
+    assert recovery["status"] == "recovery_needed"
+    assert again["updated_at"] == recovery["updated_at"]
+    grouped_cards = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"]
+    assert grouped_cards[0]["proposal_id"] == card["proposal_id"]
+    assert grouped_cards[0]["status"] == "recovery_needed"
+    summary = proposal_storage.summarize_feedback_history(project="pid", prong="airflow_scraper_doctor")
+    assert summary["projects"] == []
+    assert [event["action"] for event in proposal_storage.list_audit_events(card["proposal_id"])] == [
+        "approved",
+        "recovery_needed",
+    ]
+
+
 def test_reingesting_rejected_card_preserves_review_state_and_hidden_grouping(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     source = _fenced("proposal_run_pid_valid.json")

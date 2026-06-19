@@ -967,6 +967,19 @@ def _latest_self_improvement_board(proposal_id: str) -> str:
     return "default"
 
 
+def _latest_self_improvement_recovery_metadata(proposal_id: str) -> dict[str, Any]:
+    try:
+        events = proposal_storage.list_audit_events(proposal_id)
+    except Exception:
+        return {}
+    for event in reversed(events):
+        if event.get("action") != "recovery_needed":
+            continue
+        metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+        return metadata if isinstance(metadata, dict) else {}
+    return {}
+
+
 def _discord_worker_meta(board: str | None) -> dict[str, Any]:
     board = str(board or "").strip()
     if not board or board == "default":
@@ -1185,11 +1198,22 @@ def _self_improvement_card_with_downstream(card: dict[str, Any] | None) -> dict[
     if card is None:
         return None
     enriched = dict(card)
+    proposal_id = str(enriched.get("proposal_id") or "")
+    if str(enriched.get("status") or "").lower() == "recovery_needed":
+        recovery_metadata = _latest_self_improvement_recovery_metadata(proposal_id)
+        if recovery_metadata:
+            enriched["recovery_metadata"] = recovery_metadata
+            enriched["recovery_required"] = True
+            enriched["recovery_reason"] = recovery_metadata.get("recovery_reason")
+            enriched["recovery_evidence_kind"] = recovery_metadata.get("evidence_kind")
+            enriched["observed_terminal_status"] = recovery_metadata.get("observed_terminal_status")
+            if recovery_metadata.get("observed_task_status") is not None:
+                enriched["observed_task_status"] = recovery_metadata.get("observed_task_status")
     task_id = enriched.get("kanban_task_id")
     if not task_id:
         return enriched
     _repair_card_worker_url(enriched)
-    board = _latest_self_improvement_board(str(enriched.get("proposal_id") or ""))
+    board = _latest_self_improvement_board(proposal_id)
     enriched["downstream_board"] = board
     worker = _discord_worker_meta(board)
     board_status = ""
@@ -2043,6 +2067,9 @@ def self_improvement_runs_endpoint():
 
 @router.get("/self-improvement/proposals/{proposal_id}")
 def self_improvement_proposal_detail_endpoint(proposal_id: str):
+    from hermes_cli import command_center
+
+    command_center.build_command_center_snapshot()
     card = proposal_storage.get_card(proposal_id)
     if card is None:
         raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")

@@ -82,6 +82,7 @@ Important invariants:
 5. Stored legacy `proposal_cards.worker_url` values remain visible as execution/artifact fallbacks.
 6. Work Item descriptions are split by intent: `summary` and `body_preview` stay compact for default row rendering, while optional `full_description` is backend-provided plain text for an operator-controlled expanded view.
 7. Worker-board rollup status may treat blocked/paused Discord thread state as stale when stronger terminal-success evidence exists: terminal worker metadata, no non-terminal task counts, approved reviewer verdict or merged/green PR metadata, and/or canonical sync evidence. Active runs still take precedence over stale terminal metadata.
+8. Approved self-improvement proposals linked only to archived or non-success terminal Kanban evidence are persisted as `recovery_needed` and rendered as blocked Work Items, not left as active approved duplicate suppressors.
 
 ## Operator Annotations
 
