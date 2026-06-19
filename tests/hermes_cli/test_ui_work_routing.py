@@ -204,7 +204,7 @@ def test_missing_model_errors_when_fallback_disabled():
     assert "provider and ui_work.model" in decision.error
 
 
-def test_missing_model_fails_closed_even_when_fallback_allowed():
+def test_missing_model_falls_back_when_fallback_allowed():
     cfg = _cfg()
     cfg["ui_work"]["model"] = ""
     cfg["ui_work"]["fallback"]["allow_default_worker"] = True
@@ -213,5 +213,6 @@ def test_missing_model_fails_closed_even_when_fallback_allowed():
 
     assert decision.matched is True
     assert decision.fallback_allowed is True
-    assert "ui_work.provider and ui_work.model" in decision.error
+    assert decision.error == ""
+    assert "falling back to default worker" in decision.reason
     assert decision.backend_config == {}

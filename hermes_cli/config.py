@@ -1790,7 +1790,10 @@ DEFAULT_CONFIG = {
             ],
         },
         "fallback": {
-            "allow_default_worker": False,
+            # If the specialist route is unavailable (for example OpenRouter
+            # billing/credentials are not enabled), keep the work moving with
+            # the normal coding-worker model instead of failing the whole task.
+            "allow_default_worker": True,
         },
         "route_delegate_task": False,
     },

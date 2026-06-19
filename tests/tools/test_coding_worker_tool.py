@@ -189,7 +189,7 @@ def test_ui_work_uses_codex_model_overlay(monkeypatch, tmp_path):
         "provider": "openrouter",
         "model": "z-ai/glm-5.2",
         "backend": "codex",
-        "fallback_allowed": False,
+        "fallback_allowed": True,
         "error": "",
     }
     assert FakeSession.instances[0].kwargs["extra_args"] == [
@@ -203,6 +203,62 @@ def test_ui_work_uses_codex_model_overlay(monkeypatch, tmp_path):
         'model_providers.openrouter.base_url="https://openrouter.ai/api/v1"',
         "-c",
         'model_providers.openrouter.env_key="OPENROUTER_API_KEY"',
+        "-c",
+        'model_reasoning_effort="medium"',
+    ]
+
+
+def test_ui_work_provider_failure_falls_back_to_default_codex_model(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = [
+        TurnResult(
+            error="codex app-server startup failed: Model provider `openrouter` not found",
+            should_retire=True,
+        ),
+        TurnResult(
+            final_text="Changed src/app.py and ran pytest.",
+            thread_id="thread-default",
+            turn_id="turn-default",
+            tool_iterations=1,
+        ),
+    ]
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["backend"] = "codex"
+    cfg["ui_work"]["fallback"]["allow_default_worker"] = True
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Implement the frontend dashboard layout polish",
+            context="Keep the Command Center responsive.",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert result["thread_id"] == "thread-default"
+    assert result["ui_work_route"]["fallback_used"] is True
+    assert "openrouter" in result["ui_work_route"]["fallback_reason"].lower()
+    assert len(FakeSession.instances) == 2
+    assert FakeSession.instances[0].kwargs["extra_args"] == [
+        "-c",
+        'model_provider="openrouter"',
+        "-c",
+        'model="z-ai/glm-5.2"',
+        "-c",
+        'model_providers.openrouter.name="openrouter"',
+        "-c",
+        'model_providers.openrouter.base_url="https://openrouter.ai/api/v1"',
+        "-c",
+        'model_providers.openrouter.env_key="OPENROUTER_API_KEY"',
+        "-c",
+        'model_reasoning_effort="medium"',
+    ]
+    assert FakeSession.instances[1].kwargs["extra_args"] == [
         "-c",
         'model_reasoning_effort="medium"',
     ]
