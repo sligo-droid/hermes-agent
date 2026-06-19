@@ -300,9 +300,15 @@ def test_command_center_work_item_full_description_toggle_is_accessible_plain_te
     card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
 
     assert "full_description?: string | null;" in api_source
+    assert "has_full_description?: boolean;" in api_source
+    assert "getCommandCenterWorkItem" in api_source
+    assert "includeDetails?: boolean" in api_source
+    assert 'qs.set("include_details", params.includeDetails ? "true" : "false")' in api_source
     assert "const compactDescription = item.summary || item.body_preview || \"No summary yet.\";" in card_source
     assert "const fullDescription = item.full_description?.trim();" in card_source
-    assert "canShowFullDescription" in card_source
+    assert "item.has_full_description" in card_source
+    assert "onLoadDetails(item.id)" in card_source
+    assert "Loading context" in card_source
     assert "ChevronDown" in source
     assert "command-center-description-disclosure" in card_source
     assert "Full context" in card_source
@@ -318,6 +324,60 @@ def test_command_center_work_item_full_description_toggle_is_accessible_plain_te
     assert "event.stopPropagation();" in card_source
     assert "item.raw" not in card_source
     assert "dangerouslySetInnerHTML" not in card_source
+
+
+def test_command_center_detail_cache_cannot_override_refreshed_summary_state():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    detail_type = source.split("type CommandCenterWorkItemDetailCache", 1)[1].split("const ACTION_SETTLE_MS", 1)[0]
+    cache_helper = source.split("function cacheableWorkItemDetail", 1)[1].split("function mergeWorkItemDetail", 1)[0]
+    merge_helper = source.split("function mergeWorkItemDetail", 1)[1].split("function availableActionKinds", 1)[0]
+    page_source = source.split("export default function CommandCenterPage", 1)[1]
+    snapshot_source = page_source.split("const snapshotWorkItems = useMemo", 1)[1].split("const inboxItems = useMemo", 1)[0]
+
+    assert 'Pick<CommandCenterWorkItem, "full_description" | "raw" | "source_excerpts">' in detail_type
+    assert "useState<Map<string, CommandCenterWorkItemDetailCache>>" in page_source
+    assert "full_description: item.full_description" in cache_helper
+    assert "raw: item.raw" in cache_helper
+    assert "source_excerpts: item.source_excerpts" in cache_helper
+    assert "mergeWorkItemDetail(item, detailedWorkItems.get(item.id))" in snapshot_source
+    assert "cacheableWorkItemDetail(result.work_item)" in snapshot_source
+    assert "{ ...item, ...detail }" in merge_helper
+    assert "{ ...item, ...detail }" not in snapshot_source
+    for volatile_field in (
+        "status",
+        "execution",
+        "decision",
+        "annotations",
+        "operator_note_count",
+        "latest_operator_note",
+        "latest_correction",
+        "runs",
+        "artifacts",
+        "priority",
+        "created_at",
+        "updated_at",
+    ):
+        assert volatile_field not in detail_type
+        assert f"{volatile_field}: item.{volatile_field}" not in cache_helper
+
+
+def test_command_center_client_encodes_work_item_ids_with_metacharacters():
+    api_source = (ROOT / "web/src/lib/api.ts").read_text(encoding="utf-8")
+    detail_source = api_source.split("getCommandCenterWorkItem", 1)[1].split("createCommandCenterAnnotation", 1)[0]
+    annotation_source = api_source.split("createCommandCenterAnnotation", 1)[1].split("archiveKanbanBoard", 1)[0]
+
+    assert "/command-center/work-items/${encodeURIComponent(workItemId)}" in detail_source
+    assert "/command-center/work-items/${encodeURIComponent(workItemId)}/annotations" in annotation_source
+
+
+def test_command_center_initial_snapshot_uses_summary_payload_and_lazy_runs():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    refresh_source = source.split("const refresh = useCallback", 1)[1].split("useEffect(() => {", 1)[0]
+
+    assert "includeDetails: false" in refresh_source
+    assert 'recentRunLimitPerBoard: activeView === "runs" ? 25 : 0' in refresh_source
+    assert "loadWorkItemDetails" in source
+    assert "api.getCommandCenterWorkItem(id)" in source
 
 
 def test_command_center_annotation_submit_surfaces_partial_failures_and_refreshes():

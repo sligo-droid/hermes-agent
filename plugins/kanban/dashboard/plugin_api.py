@@ -1903,6 +1903,7 @@ def command_center_snapshot(
     include_archived: bool = Query(False),
     recent_run_limit_per_board: int = Query(20, ge=0, le=100),
     project: str | None = Query(None),
+    include_details: bool = Query(True),
     force_refresh: bool = Query(False),
 ):
     """Return Sligo Labs' canonical operator read model.
@@ -1915,8 +1916,16 @@ def command_center_snapshot(
         include_archived=include_archived,
         recent_run_limit_per_board=recent_run_limit_per_board,
         project=project,
+        include_details=include_details,
         force_refresh=force_refresh,
     )
+
+
+@router.get("/command-center/work-items/{work_item_id}")
+def command_center_work_item_detail(work_item_id: str):
+    """Return a full-detail Command Center Work Item for lazy row expansion."""
+
+    return {"work_item": _find_command_center_work_item(work_item_id)}
 
 
 @router.post("/command-center/work-items/{work_item_id}/annotations")

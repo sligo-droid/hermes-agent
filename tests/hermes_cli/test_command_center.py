@@ -88,8 +88,35 @@ def test_snapshot_cache_keys_include_project_archived_and_recent_run_limit(tmp_p
     command_center.get_cached_command_center_snapshot(project="pid", include_archived=False, recent_run_limit_per_board=20)
     command_center.get_cached_command_center_snapshot(project="hermes", include_archived=True, recent_run_limit_per_board=20)
     command_center.get_cached_command_center_snapshot(project="hermes", include_archived=False, recent_run_limit_per_board=5)
+    command_center.get_cached_command_center_snapshot(
+        project="hermes",
+        include_archived=False,
+        recent_run_limit_per_board=20,
+        include_details=False,
+    )
 
-    assert call_count == 4
+    assert call_count == 5
+
+
+def test_summary_snapshot_omits_heavy_detail_fields(tmp_path, monkeypatch):
+    _ingest_valid(monkeypatch, tmp_path)
+    card = _first_card()
+
+    full_snapshot = command_center.build_command_center_snapshot(include_archived=True, include_details=True)
+    summary_snapshot = command_center.build_command_center_snapshot(include_archived=True, include_details=False)
+
+    full_item = next(item for item in full_snapshot["work_items"] if item["id"] == f"self-improvement:{card['proposal_id']}")
+    summary_item = next(item for item in summary_snapshot["work_items"] if item["id"] == full_item["id"])
+
+    assert full_item["full_description"]
+    assert full_item["raw"]
+    assert full_item["runs"] == []
+    assert summary_snapshot["detail_level"] == "summary"
+    assert summary_item["full_description"] is None
+    assert summary_item["has_full_description"] is True
+    assert "raw" not in summary_item
+    assert "source_excerpts" not in summary_item
+    assert "runs" not in summary_item
 
 
 def test_snapshot_hides_rejected_cards_by_default_and_exposes_source_ids(tmp_path, monkeypatch):
