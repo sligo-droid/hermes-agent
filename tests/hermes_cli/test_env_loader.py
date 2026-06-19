@@ -1,8 +1,13 @@
 import importlib
 import os
+import subprocess
 import sys
 
-from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.env_loader import get_hermes_env_value, load_hermes_dotenv
+
+
+def _dotenv_double_quote(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def test_user_env_overrides_stale_shell_values(tmp_path, monkeypatch):
@@ -84,6 +89,58 @@ def test_null_bytes_in_user_env_are_stripped(tmp_path, monkeypatch):
     assert loaded == [env_file]
     assert os.getenv("GLM_API_KEY") == "abc"
     assert os.getenv("OPENAI_API_KEY") == "sk-123"
+
+
+def test_get_hermes_env_value_preserves_shell_metacharacters(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    sentinel = tmp_path / "dotenv_was_executed"
+    value = f"ghp_$HOME; touch {sentinel} & quoted='yes' eq=tail space token"
+    env_file = home / ".env"
+    env_file.write_text(
+        f'GITHUB_TOKEN="{_dotenv_double_quote(value)}"\n',
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    assert get_hermes_env_value("GITHUB_TOKEN", hermes_home=home) == value
+    assert not sentinel.exists()
+
+
+def test_env_loader_module_cli_is_safe_for_shell_assignment(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    sentinel = tmp_path / "dotenv_cli_was_executed"
+    value = f"ghp_$HOME; touch {sentinel} & quoted='yes' eq=tail space token"
+    (home / ".env").write_text(
+        f'GITHUB_TOKEN="{_dotenv_double_quote(value)}"\n',
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    command = (
+        'GITHUB_TOKEN="$("$1" -m hermes_cli.env_loader GITHUB_TOKEN '
+        '--hermes-home "$2")"; printf "%s" "$GITHUB_TOKEN"'
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            command,
+            "bash",
+            sys.executable,
+            str(home),
+        ],
+        check=True,
+        cwd=str(os.getcwd()),
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.stdout == value
+    assert not sentinel.exists()
 
 
 def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):

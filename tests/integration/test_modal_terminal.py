@@ -21,26 +21,15 @@ import sys
 import json
 from pathlib import Path
 
-# Try to load .env file if python-dotenv is available
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    # Manually load .env if dotenv not available
-    env_file = Path(__file__).parent.parent.parent / ".env"
-    if env_file.exists():
-        with open(env_file) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    key, value = line.split('=', 1)
-                    # Remove quotes if present
-                    value = value.strip().strip('"').strip("'")
-                    os.environ.setdefault(key.strip(), value)
-
 # Add project root to path for imports
 parent_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(parent_dir))
+
+# Load the repo/dev .env through Hermes' central dotenv loader.  This keeps
+# shell metacharacters as data instead of scraping KEY=VALUE text by hand.
+from hermes_cli.env_loader import load_hermes_dotenv
+
+load_hermes_dotenv(project_env=parent_dir / ".env")
 
 # Import terminal_tool module directly using importlib to avoid tools/__init__.py
 import importlib.util

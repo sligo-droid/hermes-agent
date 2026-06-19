@@ -225,8 +225,7 @@ check_key() {
     local var="$1"
     local kc_account="$2"
     local kc_service="$3"
-    if grep -q "^${var}=" ~/.hermes/.env 2>/dev/null && \
-       [ -n "$(grep "^${var}=" ~/.hermes/.env | cut -d= -f2-)" ]; then
+    if [ -n "$(python -m hermes_cli.env_loader "$var" 2>/dev/null || true)" ]; then
         return 0
     fi
     if command -v security >/dev/null 2>&1 && \

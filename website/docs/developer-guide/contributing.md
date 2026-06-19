@@ -124,13 +124,12 @@ except (ImportError, NotImplementedError):
 
 ### 2. File encoding
 
-Some environments may save `.env` files in non-UTF-8 encodings:
+Some environments may save `.env` files in non-UTF-8 encodings. Use the central Hermes loader instead of calling `python-dotenv` directly:
 
 ```python
-try:
-    load_dotenv(env_path)
-except UnicodeDecodeError:
-    load_dotenv(env_path, encoding="latin-1")
+from hermes_cli.env_loader import load_hermes_dotenv
+
+load_hermes_dotenv(hermes_home=hermes_home)
 ```
 
 ### 3. Process management

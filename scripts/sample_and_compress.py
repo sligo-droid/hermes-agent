@@ -21,9 +21,10 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple
 import fire
 
-# Load environment variables
-from dotenv import load_dotenv
-load_dotenv()
+# Load Hermes environment variables without treating .env as shell syntax.
+from hermes_cli.env_loader import load_hermes_dotenv
+
+load_hermes_dotenv(project_env=Path.cwd() / ".env")
 
 
 # Default datasets to sample from

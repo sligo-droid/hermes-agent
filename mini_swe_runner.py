@@ -30,14 +30,15 @@ import json
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 import fire
-from dotenv import load_dotenv
 from agent.tool_dispatch_helpers import make_tool_result_message
+from hermes_cli.env_loader import load_hermes_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load Hermes environment variables without treating .env as shell syntax.
+load_hermes_dotenv(project_env=Path.cwd() / ".env")
 
 
 def _effective_temperature_for_model(

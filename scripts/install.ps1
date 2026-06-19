@@ -1723,6 +1723,43 @@ function Install-NodeDeps {
     }
 }
 
+function Get-HermesEnvValue {
+    param([string]$Name)
+
+    $pythonExe = if ((-not $NoVenv) -and (Test-Path "$InstallDir\venv\Scripts\python.exe")) {
+        "$InstallDir\venv\Scripts\python.exe"
+    } else {
+        "python"
+    }
+
+    $oldHermesHome = $env:HERMES_HOME
+    $oldPythonPath = $env:PYTHONPATH
+    try {
+        $env:HERMES_HOME = $HermesHome
+        if ($oldPythonPath) {
+            $env:PYTHONPATH = "$InstallDir;$oldPythonPath"
+        } else {
+            $env:PYTHONPATH = $InstallDir
+        }
+        $value = & $pythonExe -m hermes_cli.env_loader $Name --hermes-home $HermesHome 2>$null
+        if ($LASTEXITCODE -eq 0 -and $value) {
+            return ($value -join "`n")
+        }
+        return ""
+    } finally {
+        if ($null -eq $oldHermesHome) {
+            Remove-Item Env:\HERMES_HOME -ErrorAction SilentlyContinue
+        } else {
+            $env:HERMES_HOME = $oldHermesHome
+        }
+        if ($null -eq $oldPythonPath) {
+            Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
+        } else {
+            $env:PYTHONPATH = $oldPythonPath
+        }
+    }
+}
+
 function Install-PlatformSdks {
     # Ensure messaging-platform SDKs matching tokens the user added to
     # ~/.hermes/.env are importable.  Two problems this solves:
@@ -1752,7 +1789,6 @@ function Install-PlatformSdks {
 
     $envPath = "$HermesHome\.env"
     if (-not (Test-Path $envPath)) { return }
-    $envLines = Get-Content $envPath -ErrorAction SilentlyContinue
 
     # Map: env var set in .env -> (import name, pip spec matching [messaging] extra).
     # Specs mirror pyproject.toml to avoid version drift.
@@ -1767,12 +1803,8 @@ function Install-PlatformSdks {
     # Which tokens are actually set (not placeholder)?
     $needed = @()
     foreach ($sdk in $sdkMap) {
-        $match = $envLines | Where-Object {
-            $_ -match ("^" + [regex]::Escape($sdk.Var) + "=.+") `
-            -and $_ -notmatch "your-token-here" `
-            -and $_ -notmatch "^\s*#"
-        }
-        if ($match) { $needed += $sdk }
+        $value = Get-HermesEnvValue $sdk.Var
+        if ($value -and $value -ne "your-token-here") { $needed += $sdk }
     }
     if ($needed.Count -eq 0) { return }
 
@@ -1867,10 +1899,9 @@ function Start-GatewayIfConfigured {
     if (-not (Test-Path $envPath)) { return }
 
     $hasMessaging = $false
-    $content = Get-Content $envPath -ErrorAction SilentlyContinue
     foreach ($var in @("TELEGRAM_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "WHATSAPP_ENABLED")) {
-        $match = $content | Where-Object { $_ -match "^${var}=.+" -and $_ -notmatch "your-token-here" }
-        if ($match) { $hasMessaging = $true; break }
+        $value = Get-HermesEnvValue $var
+        if ($value -and $value -ne "your-token-here") { $hasMessaging = $true; break }
     }
 
     if (-not $hasMessaging) { return }
@@ -1881,7 +1912,7 @@ function Start-GatewayIfConfigured {
     }
 
     # If WhatsApp is enabled but not yet paired, run foreground for QR scan
-    $whatsappEnabled = $content | Where-Object { $_ -match "^WHATSAPP_ENABLED=true" }
+    $whatsappEnabled = (Get-HermesEnvValue "WHATSAPP_ENABLED") -eq "true"
     $whatsappSession = "$HermesHome\whatsapp\session\creds.json"
     if ($whatsappEnabled -and -not (Test-Path $whatsappSession)) {
         Write-Host ""

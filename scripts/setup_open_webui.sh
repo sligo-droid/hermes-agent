@@ -39,6 +39,8 @@ HERMES_API_MODEL_NAME="${HERMES_API_MODEL_NAME:-Hermes Agent}"
 HERMES_API_BASE_URL="http://${HERMES_API_CONNECT_HOST}:${HERMES_API_PORT}/v1"
 LAUNCHER_PATH="$HOME/.local/bin/start-open-webui-hermes.sh"
 LOG_DIR="$HOME/.hermes/logs"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 log() {
   printf '[open-webui-bootstrap] %s\n' "$*"
@@ -98,19 +100,11 @@ PY
 get_env_value() {
   local key="$1"
   local file="$2"
-  python3 - "$file" "$key" <<'PY'
-from pathlib import Path
-import sys
-path = Path(sys.argv[1])
-key = sys.argv[2]
-if not path.exists():
-    raise SystemExit(0)
-for raw in path.read_text().splitlines():
-    line = raw.strip()
-    if line.startswith(f"{key}="):
-        print(line.split("=", 1)[1])
-        raise SystemExit(0)
-PY
+  local home_dir py
+  home_dir="$(dirname "$file")"
+  py="$(choose_python)"
+  PYTHONPATH="$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    "$py" -m hermes_cli.env_loader "$key" --hermes-home "$home_dir" 2>/dev/null || true
 }
 
 generate_secret() {
@@ -170,8 +164,9 @@ install_open_webui() {
 write_launcher() {
   mkdir -p "$(dirname "$LAUNCHER_PATH")" "$OPEN_WEBUI_DATA_DIR" "$LOG_DIR"
 
-  local quoted_data_dir quoted_name quoted_base_url quoted_host quoted_port quoted_venv
+  local quoted_data_dir quoted_env_file quoted_name quoted_base_url quoted_host quoted_port quoted_venv
   quoted_data_dir="$(shell_quote "$OPEN_WEBUI_DATA_DIR")"
+  quoted_env_file="$(shell_quote "$HERMES_ENV_FILE")"
   quoted_name="$(shell_quote "$OPEN_WEBUI_NAME")"
   quoted_base_url="$(shell_quote "$HERMES_API_BASE_URL")"
   quoted_host="$(shell_quote "$OPEN_WEBUI_HOST")"
@@ -182,14 +177,14 @@ write_launcher() {
 #!/usr/bin/env bash
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-API_KEY=\$(python3 - <<'PY'
-from pathlib import Path
-p = Path.home()/'.hermes'/'.env'
-for raw in p.read_text().splitlines():
-    line = raw.strip()
-    if line.startswith('API_SERVER_KEY='):
-        print(line.split('=', 1)[1])
-        break
+source ${quoted_venv}/bin/activate
+API_KEY=\$(python - ${quoted_env_file} <<'PY'
+import sys
+from dotenv import dotenv_values
+
+value = dotenv_values(sys.argv[1]).get("API_SERVER_KEY")
+if value:
+    print(value)
 PY
 )
 export DATA_DIR=${quoted_data_dir}
@@ -210,7 +205,6 @@ export DO_NOT_TRACK=true
 export ANONYMIZED_TELEMETRY=false
 export HOST=${quoted_host}
 export PORT=${quoted_port}
-source ${quoted_venv}/bin/activate
 exec open-webui serve
 EOF
 

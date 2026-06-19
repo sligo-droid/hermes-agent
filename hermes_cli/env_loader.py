@@ -247,6 +247,61 @@ def load_hermes_dotenv(
     return loaded
 
 
+def get_hermes_env_value(
+    key: str,
+    *,
+    hermes_home: str | os.PathLike | None = None,
+    project_env: str | os.PathLike | None = None,
+) -> str | None:
+    """Return one env value after loading Hermes dotenv files safely.
+
+    This is intended for shell snippets that need a single secret for
+    assignment.  It delegates parsing to ``load_hermes_dotenv()`` instead of
+    scraping ``~/.hermes/.env`` as shell-like text.
+    """
+    _validate_env_key(key)
+    load_hermes_dotenv(hermes_home=hermes_home, project_env=project_env)
+    return os.environ.get(key)
+
+
+def _validate_env_key(key: str) -> None:
+    if not key:
+        raise ValueError("env key must not be empty")
+    if not key.isascii():
+        raise ValueError(f"invalid env key: {key!r}")
+    if not (key[0].isalpha() or key[0] == "_"):
+        raise ValueError(f"invalid env key: {key!r}")
+    if any(not (ch.isalnum() or ch == "_") for ch in key):
+        raise ValueError(f"invalid env key: {key!r}")
+
+
+def _main(argv: list[str] | None = None) -> int:
+    """Print one safely parsed Hermes env value for shell assignment."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Print one value from Hermes dotenv/configured secret sources."
+    )
+    parser.add_argument("key", help="Environment variable name to print")
+    parser.add_argument("--hermes-home", help="Hermes home containing .env")
+    parser.add_argument("--project-env", help="Optional project .env fallback")
+    args = parser.parse_args(argv)
+
+    try:
+        value = get_hermes_env_value(
+            args.key,
+            hermes_home=args.hermes_home,
+            project_env=args.project_env,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if not value:
+        return 1
+    sys.stdout.write(value)
+    return 0
+
+
 def _apply_external_secret_sources(home_path: Path) -> None:
     """Pull secrets from external sources (currently Bitwarden) into env.
 
@@ -342,3 +397,7 @@ def _load_secrets_config(home_path: Path) -> dict:
     except Exception:  # noqa: BLE001
         return {}
     return data.get("secrets") or {}
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

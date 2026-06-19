@@ -127,7 +127,7 @@ systemctl list-timers hermes-teams-pipeline-maintain.timer
 0 */12 * * * /usr/local/bin/hermes teams-pipeline maintain-subscriptions >> /var/log/hermes/teams-pipeline-maintain.log 2>&1
 ```
 
-确保 cron 环境中包含 `MSGRAPH_*` 凭据。最简单的方法：在 crontab 调用的包装脚本顶部 source `~/.hermes/.env`。
+`hermes teams-pipeline maintain-subscriptions` 命令会通过 Hermes 的 dotenv 加载器自行读取 `~/.hermes/.env`，包装脚本不应把该文件作为 shell 语法 source。
 
 #### 验证续期是否正常工作
 
