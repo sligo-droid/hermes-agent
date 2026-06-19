@@ -185,7 +185,7 @@ def test_ui_work_uses_codex_model_overlay(monkeypatch, tmp_path):
     assert result["ui_work_route"] == {
         "matched": True,
         "enabled": True,
-        "reason": "ui keyword: frontend",
+        "reason": "visual ui work: implement + layout polish",
         "provider": "openrouter",
         "model": "z-ai/glm-5.2",
         "backend": "codex",
@@ -243,6 +243,33 @@ def test_ui_work_matched_route_fails_closed_when_codex_overlay_unavailable(monke
     assert FakeSession.instances == []
 
 
+def test_tui_terminal_work_does_not_use_ui_model_overlay(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["backend"] = "codex"
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Fix Hermes TUI terminal rendering layout in the session transcript",
+            context="This is command-line TUI repaint work, not web UI development.",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert result["ui_work_route"]["matched"] is False
+    assert FakeSession.instances[0].kwargs["extra_args"] == [
+        "-c",
+        'model_reasoning_effort="medium"',
+    ]
+
+
 def test_ui_work_missing_model_fails_before_worker(monkeypatch, tmp_path):
     FakeSession.instances = []
     cfg = copy.deepcopy(DEFAULT_CONFIG)
@@ -256,7 +283,7 @@ def test_ui_work_missing_model_fails_before_worker(monkeypatch, tmp_path):
 
     result = json.loads(
         cwt.delegate_coding_task(
-            task="Fix frontend chart labels",
+            task="Polish frontend chart labels",
             parent_agent=_parent(tmp_path),
         )
     )
