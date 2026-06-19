@@ -140,6 +140,130 @@ def test_codex_adapter_response_format_conversion():
     }
 
 
+def test_codex_adapter_json_word_detector_requires_standalone_word():
+    assert not OpenAICodexAdapter._messages_include_json_word([
+        {"role": "user", "content": "Please jsonify the answer."}
+    ])
+    assert OpenAICodexAdapter._messages_include_json_word([
+        {"role": "user", "content": "Return application/JSON."}
+    ])
+    assert OpenAICodexAdapter._messages_include_json_word([
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "Return a JSON-only object."}],
+        }
+    ])
+
+
+@pytest.mark.parametrize(
+    "response_format",
+    [
+        {"type": "json_object"},
+        {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "Thing",
+                "schema": {"type": "object", "properties": {"x": {"type": "string"}}},
+            },
+        },
+    ],
+)
+def test_codex_adapter_rejects_json_mode_without_json_word_before_credentials(
+    monkeypatch,
+    response_format,
+):
+    class FakeRequest:
+        async def json(self):
+            return {
+                "model": "gpt-5.4-mini",
+                "messages": [{"role": "user", "content": "Return an object with x."}],
+                "response_format": response_format,
+            }
+
+    credential_mock = MagicMock(side_effect=AssertionError("credentials should not be resolved"))
+    upstream_mock = MagicMock(side_effect=AssertionError("upstream should not be called"))
+    cooldown_mock = MagicMock(side_effect=AssertionError("cooldown routing should not run"))
+    monkeypatch.setattr(OpenAICodexAdapter, "get_credential", credential_mock)
+    monkeypatch.setattr(OpenAICodexAdapter, "_effective_model_for_cooldown", cooldown_mock)
+    monkeypatch.setattr(
+        OpenAICodexAdapter,
+        "_run_responses_stream_with_retry",
+        staticmethod(upstream_mock),
+    )
+
+    response = asyncio.run(OpenAICodexAdapter()._handle_chat_completions(FakeRequest()))
+    body = json.loads(response.text)
+
+    assert response.status == 400
+    assert body["error"]["code"] == "invalid_json_mode_request"
+    assert "standalone word 'json'" in body["error"]["message"]
+    cooldown_mock.assert_not_called()
+    credential_mock.assert_not_called()
+    upstream_mock.assert_not_called()
+
+
+def test_codex_adapter_allows_json_mode_with_multimodal_text_part(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    class FakeRequest:
+        async def json(self):
+            return {
+                "model": "gpt-5.4-mini",
+                "messages": [
+                    {"role": "system", "content": "Formatting rules."},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Return a JSON object with x."},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,ZmFrZQ=="},
+                            },
+                        ],
+                    },
+                ],
+                "response_format": {"type": "json_object"},
+            }
+
+    class FakeResponse:
+        def model_dump(self):
+            return {"id": "resp-json", "created_at": 123, "usage": {}}
+
+    async def fake_run(responses_payload, cred):
+        captured["payload"] = responses_payload
+        captured["cred"] = cred
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        OpenAICodexAdapter,
+        "get_credential",
+        lambda self: UpstreamCredential(
+            bearer="token",
+            base_url="https://example.test/backend-api/codex",
+        ),
+    )
+    monkeypatch.setattr(
+        OpenAICodexAdapter,
+        "_run_responses_stream_with_retry",
+        staticmethod(fake_run),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex._normalize_codex_response",
+        lambda _response: (SimpleNamespace(content='{"x":"ok"}', tool_calls=[]), "stop"),
+    )
+
+    response = asyncio.run(OpenAICodexAdapter()._handle_chat_completions(FakeRequest()))
+    body = json.loads(response.text)
+
+    assert response.status == 200
+    assert body["choices"][0]["message"]["content"] == '{"x":"ok"}'
+    assert captured["payload"]["text"] == {"format": {"type": "json_object"}}
+    assert captured["payload"]["input"][0]["content"][0] == {
+        "type": "input_text",
+        "text": "Return a JSON object with x.",
+    }
+
+
 def test_codex_adapter_preserves_minimal_reasoning_effort():
     assert OpenAICodexAdapter._responses_reasoning("minimal") == {
         "effort": "minimal",
