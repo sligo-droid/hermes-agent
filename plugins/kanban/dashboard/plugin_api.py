@@ -2043,6 +2043,9 @@ def self_improvement_runs_endpoint():
 
 @router.get("/self-improvement/proposals/{proposal_id}")
 def self_improvement_proposal_detail_endpoint(proposal_id: str):
+    from hermes_cli import command_center
+
+    command_center.build_command_center_snapshot()
     card = proposal_storage.get_card(proposal_id)
     if card is None:
         raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")

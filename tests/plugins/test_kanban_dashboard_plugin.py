@@ -799,6 +799,41 @@ def test_self_improvement_cards_include_downstream_task_status(client):
     assert enriched["downstream_task"]["id"] == approved.json()["task"]["id"]
 
 
+def test_self_improvement_proposal_api_reconciles_archived_downstream_task(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    assert approved.status_code == 200, approved.text
+    task_id = approved.json()["task"]["id"]
+    conn = kb.connect()
+    try:
+        assert kb.archive_task(conn, task_id) is True
+    finally:
+        conn.close()
+
+    grouped = client.get("/api/plugins/kanban/self-improvement/proposals")
+    detail = client.get(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}")
+
+    assert detail.status_code == 200, detail.text
+    assert grouped.status_code == 200, grouped.text
+    detail_card = detail.json()["card"]
+    grouped_card = grouped.json()["projects"][0]["prongs"][0]["cards"][0]
+    assert detail_card["status"] == "recovery_needed"
+    assert detail_card["downstream_task_status"] == "archived"
+    assert grouped_card["status"] == "recovery_needed"
+    assert grouped_card["downstream_task_status"] == "archived"
+    assert [event["action"] for event in proposal_storage.list_audit_events(card["proposal_id"])] == [
+        "approved",
+        "recovery_needed",
+    ]
+
+    client.get(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}")
+    assert [event["action"] for event in proposal_storage.list_audit_events(card["proposal_id"])] == [
+        "approved",
+        "recovery_needed",
+    ]
+
+
 def test_self_improvement_halt_archives_in_flight_task_and_audits(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]

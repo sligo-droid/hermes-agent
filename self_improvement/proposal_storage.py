@@ -774,7 +774,7 @@ def record_completion(
             status = str(row["status"] or "").lower()
             if status == "completed":
                 return _row_to_card(row)
-            if status != "approved":
+            if status not in {"approved", "recovery_needed"}:
                 return _row_to_card(row)
             effective_task_id = kanban_task_id or row["kanban_task_id"] or None
             conn.execute(
@@ -789,6 +789,58 @@ def record_completion(
                 """
                 INSERT INTO proposal_audit_events(proposal_id, action, actor, kanban_task_id, reason, metadata_json, created_at)
                 VALUES (?, 'completed', ?, ?, ?, ?, ?)
+                """,
+                (proposal_id, actor, effective_task_id, reason, _json_dumps(metadata or {}), now),
+            )
+        card = get_card(proposal_id, db_path=db_path)
+        assert card is not None
+        return card
+    finally:
+        conn.close()
+
+
+def record_recovery_needed(
+    proposal_id: str,
+    *,
+    actor: str | None = None,
+    reason: str | None = None,
+    kanban_task_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    """Mark an approved proposal as blocked on recovery work.
+
+    This is used when the linked Kanban evidence is terminal or inert without
+    separate success evidence. The operation is idempotent for read-model
+    reconciliation so snapshot/API polling does not churn audit history.
+    """
+
+    init_db(db_path)
+    now = utc_now()
+    conn = connect(db_path)
+    try:
+        with conn:
+            row = conn.execute("SELECT * FROM proposal_cards WHERE proposal_id = ?", (proposal_id,)).fetchone()
+            if not row:
+                raise KeyError(proposal_id)
+            status = str(row["status"] or "").lower()
+            if status == "recovery_needed":
+                return _row_to_card(row)
+            if status != "approved":
+                return _row_to_card(row)
+            effective_task_id = kanban_task_id or row["kanban_task_id"] or None
+            conn.execute(
+                """
+                UPDATE proposal_cards
+                SET status = 'recovery_needed', rejected_reason = NULL, updated_at = ?
+                WHERE proposal_id = ?
+                """,
+                (now, proposal_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO proposal_audit_events(proposal_id, action, actor, kanban_task_id, reason, metadata_json, created_at)
+                VALUES (?, 'recovery_needed', ?, ?, ?, ?, ?)
                 """,
                 (proposal_id, actor, effective_task_id, reason, _json_dumps(metadata or {}), now),
             )
