@@ -527,6 +527,89 @@ def test_snapshot_prefers_worker_board_failure_over_task_success_evidence(tmp_pa
             assert run["outcome"] == "completed"
 
 
+def test_snapshot_prefers_archived_worker_board_failure_over_task_success_evidence(tmp_path, monkeypatch):
+    cases = [
+        ("failed", "task_done"),
+        ("cancelled", "run_success"),
+        ("errored", "task_done"),
+        ("timed_out", "run_success"),
+        ("failed", "task_done_with_review_success"),
+    ]
+    cards = _ingest_cards(monkeypatch, tmp_path, len(cases))
+    boards: list[tuple[dict, str, str, str, str, str]] = []
+    for card, (terminal_status, evidence_kind) in zip(cards, cases):
+        board = f"discord-archived-{terminal_status.replace('_', '-')}-{evidence_kind}"
+        meta = kanban_db.write_board_metadata(board, name=f"Archived {terminal_status.title()} Conflict")
+        worker = {
+            "kind": "discord_worker_board",
+            "goal_status": terminal_status,
+            "phase": terminal_status,
+            "cancelled": terminal_status == "cancelled",
+        }
+        if evidence_kind == "task_done_with_review_success":
+            worker["board_summary"] = {"review": {"final_verdict": {"status": "approved"}}}
+        meta[command_center.DISCORD_WORKER_META_KEY] = worker
+        kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+        conn = kanban_db.connect(board=board)
+        try:
+            task_id = kanban_db.create_task(conn, title=f"{terminal_status.title()} archived proposal task", board=board)
+            with conn:
+                if evidence_kind.startswith("task_done"):
+                    conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200, task_id))
+                else:
+                    conn.execute(
+                        "INSERT INTO task_runs(task_id, status, started_at, ended_at, outcome) VALUES (?, ?, ?, ?, ?)",
+                        (task_id, "done", 100, 200, "completed"),
+                    )
+        finally:
+            conn.close()
+        proposal_storage.record_approval(
+            card["proposal_id"],
+            kanban_task_id=task_id,
+            worker_url=f"/workers/{board}/tickets/{task_id}",
+            actor="operator",
+            metadata={"board": board},
+        )
+        archived_result = kanban_db.remove_board(board)
+        boards.append((card, terminal_status, evidence_kind, board, task_id, archived_result["new_path"]))
+
+    snapshot = command_center.build_command_center_snapshot(include_archived=True)
+
+    for card, terminal_status, evidence_kind, board, task_id, archived_path in boards:
+        reconciled = proposal_storage.get_card(card["proposal_id"])
+        events = proposal_storage.list_audit_events(card["proposal_id"])
+        if evidence_kind == "task_done_with_review_success":
+            assert reconciled["status"] == "completed"
+            assert [event["action"] for event in events] == ["approved", "completed"]
+            assert events[-1]["metadata"]["archive_path"] == archived_path
+            assert events[-1]["metadata"]["evidence_kind"] == "kanban_task"
+            continue
+
+        assert reconciled["status"] == "recovery_needed"
+        assert [event["action"] for event in events] == ["approved", "recovery_needed"]
+        assert events[-1]["metadata"]["board"] == board
+        assert events[-1]["metadata"]["archive_path"] == archived_path
+        assert events[-1]["metadata"]["kanban_task_id"] == task_id
+        assert events[-1]["metadata"]["observed_terminal_status"] == terminal_status
+        expected_task_status = "done" if evidence_kind == "task_done" else "ready"
+        assert events[-1]["metadata"]["observed_task_status"] == expected_task_status
+        assert events[-1]["metadata"]["evidence_kind"] == "worker_board"
+        assert "success_evidence_kind" not in events[-1]["metadata"]
+        assert (
+            f"archived worker board reached non-success terminal status {terminal_status}"
+            in events[-1]["metadata"]["recovery_reason"]
+        )
+
+        item = next(item for item in snapshot["work_items"] if item["id"] == f"self-improvement:{card['proposal_id']}")
+        assert item["status"] == "blocked"
+        assert item["status_detail"] == "recovery_needed"
+        assert item["execution"]["recovery_required"] is True
+        assert item["execution"]["observed_terminal_status"] == terminal_status
+        assert item["execution"]["task_status"] == expected_task_status
+        assert item["execution"]["evidence_kind"] == "worker_board"
+        assert item["execution"]["archive_path"] == archived_path
+
+
 def test_snapshot_keeps_missing_board_only_worker_url_approved(tmp_path, monkeypatch):
     _ingest_valid(monkeypatch, tmp_path)
     card = _first_card()

@@ -910,7 +910,7 @@ def _worker_explicit_success_evidence(worker: dict[str, Any]) -> str:
 
 
 def _task_terminal_evidence_owns_proposal(board: str | None, board_meta: dict[str, Any] | None) -> bool:
-    if not board or board == kanban_db.DEFAULT_BOARD or _board_is_archived(board_meta):
+    if not board or board == kanban_db.DEFAULT_BOARD:
         return True
     worker = _board_worker_meta(board_meta or {})
     if not worker:
@@ -919,6 +919,8 @@ def _task_terminal_evidence_owns_proposal(board: str | None, board_meta: dict[st
         return True
     if _worker_terminal_failure_status(worker):
         return bool(_worker_explicit_success_evidence(worker))
+    if _board_is_archived(board_meta):
+        return True
     return False
 
 
@@ -989,8 +991,15 @@ def _proposal_recovery_metadata(
     observed = ""
     evidence_kind = ""
     reason = ""
+    worker = _board_worker_meta(board_meta or {})
+    worker_failure = _worker_terminal_failure_status(worker)
 
-    if task_id and task_status == "archived" and _task_terminal_evidence_owns_proposal(board, board_meta):
+    if worker_failure and board and not _worker_explicit_success_evidence(worker):
+        observed = worker_failure
+        evidence_kind = "worker_board"
+        archived_prefix = "archived " if _board_is_archived(board_meta) else ""
+        reason = f"linked {archived_prefix}worker board reached non-success terminal status {observed}"
+    elif task_id and task_status == "archived" and _task_terminal_evidence_owns_proposal(board, board_meta):
         observed = "archived"
         evidence_kind = "kanban_task"
         reason = "linked Kanban task is archived without terminal success evidence"
@@ -1006,12 +1015,6 @@ def _proposal_recovery_metadata(
         observed = "archived"
         evidence_kind = "worker_board"
         reason = "linked worker board is archived without terminal success evidence"
-    else:
-        worker = _board_worker_meta(board_meta or {})
-        observed = _worker_terminal_failure_status(worker)
-        if observed and board and not _worker_explicit_success_evidence(worker):
-            evidence_kind = "worker_board"
-            reason = f"linked worker board reached non-success terminal status {observed}"
 
     if not reason:
         return None
