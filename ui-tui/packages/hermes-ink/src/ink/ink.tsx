@@ -124,17 +124,17 @@ const ALT_SCREEN_ANCHOR_CURSOR = Object.freeze({
 
 const CURSOR_HOME_PATCH = Object.freeze({
   type: 'stdout' as const,
-  content: CURSOR_HOME
+  content: RESET_SCROLL_REGION + CURSOR_HOME
 })
 
 const ERASE_THEN_HOME_PATCH = Object.freeze({
   type: 'stdout' as const,
-  content: ERASE_SCREEN + CURSOR_HOME
+  content: RESET_SCROLL_REGION + ERASE_SCREEN + CURSOR_HOME
 })
 
 const DEEP_ERASE_THEN_HOME_PATCH = Object.freeze({
   type: 'stdout' as const,
-  content: ERASE_SCREEN + ERASE_SCROLLBACK + CURSOR_HOME
+  content: RESET_SCROLL_REGION + ERASE_SCREEN + ERASE_SCROLLBACK + CURSOR_HOME
 })
 
 // Cached per-Ink-instance, invalidated on resize. frame.cursor.y for
@@ -1448,6 +1448,7 @@ export default class Ink {
     // first to drop any lingering DEC 1003 hover from before re-entry.
     this.options.stdout.write(
       ENTER_ALT_SCREEN +
+        RESET_SCROLL_REGION +
         ERASE_SCREEN +
         CURSOR_HOME +
         DISABLE_MOUSE_TRACKING +
