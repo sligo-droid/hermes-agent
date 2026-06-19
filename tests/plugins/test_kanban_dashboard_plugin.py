@@ -834,6 +834,47 @@ def test_self_improvement_proposal_api_reconciles_archived_downstream_task(clien
     ]
 
 
+def test_self_improvement_proposal_api_reconciles_cancelled_named_worker_board(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    board = "discord-cancelled-proposal-api"
+    _write_discord_worker_metadata(board, {"goal_status": "cancelled", "phase": "cancelled", "cancelled": True})
+    conn = kb.connect(board=board)
+    try:
+        task_id = kb.create_task(conn, title="Cancelled named worker proposal", board=board)
+    finally:
+        conn.close()
+    proposal_storage.record_approval(
+        card["proposal_id"],
+        kanban_task_id=task_id,
+        worker_url=f"/workers/{board}/tickets/{task_id}",
+        metadata={"board": board},
+    )
+
+    grouped = client.get("/api/plugins/kanban/self-improvement/proposals")
+    detail = client.get(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}")
+
+    assert detail.status_code == 200, detail.text
+    assert grouped.status_code == 200, grouped.text
+    detail_card = detail.json()["card"]
+    grouped_card = grouped.json()["projects"][0]["prongs"][0]["cards"][0]
+    for enriched in (detail_card, grouped_card):
+        assert enriched["status"] == "recovery_needed"
+        assert enriched["downstream_board"] == board
+        assert enriched["downstream_board_status"] == "cancelled"
+        assert enriched["downstream_board_phase"] == "cancelled"
+        assert enriched["downstream_task_status"] == "cancelled"
+        assert enriched["recovery_required"] is True
+        assert enriched["observed_terminal_status"] == "cancelled"
+        assert enriched["recovery_evidence_kind"] == "worker_board"
+        assert "non-success terminal status cancelled" in enriched["recovery_reason"]
+
+    audit = proposal_storage.list_audit_events(card["proposal_id"])
+    assert [event["action"] for event in audit] == ["approved", "recovery_needed"]
+    assert audit[-1]["metadata"]["board"] == board
+    assert audit[-1]["metadata"]["evidence_kind"] == "worker_board"
+
+
 def test_self_improvement_halt_archives_in_flight_task_and_audits(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]

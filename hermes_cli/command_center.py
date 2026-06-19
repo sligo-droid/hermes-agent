@@ -1405,10 +1405,41 @@ def _board_work_item(
     repair_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     canonical_status, status_detail = _canonical_status_from_board(tasks, board_meta=board_meta, runs=runs)
+    recovery_metadata = (
+        proposal_action_context.get("recovery_metadata")
+        if isinstance(proposal_action_context, dict) and isinstance(proposal_action_context.get("recovery_metadata"), dict)
+        else None
+    )
+    if recovery_metadata and (recovery_metadata.get("recovery_required") or recovery_metadata.get("recovery_reason")):
+        canonical_status = "blocked"
+        status_detail = "recovery_needed"
     if repair_context and canonical_status in {"running", "accepted", "queued", "review"}:
         canonical_status = "blocked"
         status_detail = "repair_required"
     execution = _execution_from_board(board=board, board_meta=board_meta, tasks=tasks, runs=runs, repair_context=repair_context)
+    if recovery_metadata and (recovery_metadata.get("recovery_required") or recovery_metadata.get("recovery_reason")):
+        worker = _board_worker_meta(board_meta)
+        public_url = worker.get("public_url") if isinstance(worker, dict) else None
+        task_id = str(recovery_metadata.get("kanban_task_id") or "").strip()
+        observed_task_status = str(
+            recovery_metadata.get("observed_task_status")
+            or recovery_metadata.get("observed_terminal_status")
+            or ""
+        ).strip()
+        execution["recovery_required"] = True
+        execution["recovery_reason"] = recovery_metadata.get("recovery_reason") or "linked Kanban worker needs recovery"
+        execution["observed_terminal_status"] = recovery_metadata.get("observed_terminal_status")
+        execution["evidence_kind"] = recovery_metadata.get("evidence_kind")
+        execution["paused"] = True
+        execution["resumable"] = False
+        if task_id:
+            execution["task_id"] = task_id
+            execution["task_url"] = _worker_ticket_url(task_id, board=board, public_url=public_url)
+            execution["console_url"] = _worker_console_url(task_id, board=board)
+        if observed_task_status:
+            execution["task_status"] = observed_task_status
+        if recovery_metadata.get("archive_path"):
+            execution["archive_path"] = recovery_metadata.get("archive_path")
     if canonical_status == "blocked" and execution.get("repair_blocked"):
         canonical_status = "mega_blocked"
         status_detail = "repair_blocked"
@@ -1665,24 +1696,38 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
         elif board:
             proposal_id = card.get("proposal_id")
             if proposal_id and item.get("source", {}).get("kind") == "self_improvement":
-                board_proposal_action_context.setdefault(
-                    board,
-                    {
-                        "proposal_id": proposal_id,
-                        "title": card.get("title"),
-                        "summary": card.get("summary"),
-                        "body": card.get("body"),
-                        "rationale": card.get("rationale"),
-                        "body_preview": item.get("body_preview"),
-                        "project": item.get("project"),
-                        "priority": item.get("priority"),
-                        "priority_rank": item.get("priority_rank"),
-                        "severity": item.get("severity"),
-                        "source": item.get("source"),
-                        "artifacts": item.get("artifacts") or [],
-                        "source_excerpts": item.get("source_excerpts") or [],
-                    },
-                )
+                proposal_context = {
+                    "proposal_id": proposal_id,
+                    "title": card.get("title"),
+                    "summary": card.get("summary"),
+                    "body": card.get("body"),
+                    "rationale": card.get("rationale"),
+                    "body_preview": item.get("body_preview"),
+                    "project": item.get("project"),
+                    "priority": item.get("priority"),
+                    "priority_rank": item.get("priority_rank"),
+                    "severity": item.get("severity"),
+                    "source": item.get("source"),
+                    "artifacts": item.get("artifacts") or [],
+                    "source_excerpts": item.get("source_excerpts") or [],
+                    "recovery_metadata": {
+                        key: metadata.get(key)
+                        for key in (
+                            "recovery_required",
+                            "recovery_reason",
+                            "observed_terminal_status",
+                            "observed_task_status",
+                            "evidence_kind",
+                            "kanban_task_id",
+                            "archive_path",
+                        )
+                        if metadata.get(key) is not None
+                    }
+                    if str(card.get("status") or "").lower() == "recovery_needed"
+                    else None,
+                }
+                if board not in board_proposal_action_context or proposal_context.get("recovery_metadata"):
+                    board_proposal_action_context[board] = proposal_context
     proposal_runs = proposal_storage.list_runs().get("runs", [])
     for run in proposal_runs:
         sources.append(_source_from_proposal_run(run))
