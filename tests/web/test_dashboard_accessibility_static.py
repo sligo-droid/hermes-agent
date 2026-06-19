@@ -48,6 +48,26 @@ def test_command_center_project_tabs_render_above_work_state_and_preserve_lanes(
     assert "Sligo operator navigation" not in source
 
 
+def test_command_center_uses_cohesive_list_and_audit_layout_without_kpi_chrome():
+    source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    styles = (ROOT / "web/src/index.css").read_text(encoding="utf-8")
+    page_source = source.split("export default function CommandCenterPage", 1)[1]
+
+    assert "command-center-shell" in page_source
+    assert "command-center-content-grid" in page_source
+    assert "command-center-list-pane" in page_source
+    assert "function AuditPane" in source
+    assert 'aria-label="Command Center detail and audit"' in source
+    assert "Detail / Audit" in source
+    assert "selectedItems[0] || visibleWorkItemsForAudit[0] || null" in source
+    assert ".command-center-content-grid" in styles
+    assert ".command-center-audit-sticky" in styles
+    assert "@media (min-width: 1180px)" in styles
+    assert "grid-template-columns: minmax(0, 1fr) minmax(18rem, 22rem);" in styles
+    for forbidden in ("Operator Surface", "KPI", "status distribution", "Work states by status"):
+        assert forbidden not in source
+
+
 def test_command_center_worker_and_ticket_links_open_new_tabs():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
     card_source = source.split("function WorkItemCard", 1)[1].split("function SourceCard", 1)[0]
@@ -152,14 +172,18 @@ def test_command_center_completed_lane_preserves_revert_and_archive_buttons():
 def test_command_center_archive_action_renders_last_in_row_rail():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
     action_source = source.split("function availableActionKinds", 1)[1].split("function actionSet", 1)[0]
-    row_rail = source.split('className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/[0.08] pt-3"', 1)[1].split("</div>", 1)[0]
+    row_footer = source.split('className="command-center-card-footer mt-4 border-t border-white/[0.08] pt-3"', 1)[1].split("</article>", 1)[0]
 
     assert action_source.index('actions.push("approve", "archive")') < action_source.index('actions.push("archive")')
     assert action_source.index('actions.push("replay")') < action_source.index('actions.push("archive")')
     assert action_source.index('actions.push("pause")') < action_source.index('actions.push("archive")')
     assert action_source.index('actions.push("undo")') < action_source.index('actions.push("archive")')
-    assert "actions.map((kind)" in row_rail
-    assert "kind={kind}" in row_rail
+    assert "command-center-card-link-group" in row_footer
+    assert "command-center-card-action-group" in row_footer
+    assert row_footer.index("command-center-card-link-group") < row_footer.index("command-center-card-action-group")
+    assert "actions.map((kind)" in row_footer
+    assert "kind={kind}" in row_footer
+    assert "command-center-card-timestamp" in row_footer
 
 
 def test_command_center_repair_action_wiring_and_footer_removed():
@@ -188,6 +212,7 @@ def test_command_center_row_actions_lock_during_refresh_settle():
     assert "const actionDisabled = (kind: ActionKind) => (Boolean(activeAction) && !actionBusy(kind)) || (selectionActive && (!selected || !multiSelectActionCommon.has(kind)));" in card_source
     assert "aria-busy={rowBusy || undefined}" in card_source
     assert "<div aria-busy={rowBusy}" in card_source
+    assert "command-center-card-footer" in card_source
     assert "aria-live=\"polite\"" in card_source
     assert "const disabled = actionDisabled(kind);" in card_source
     assert "disabled={disabled}" in card_source
