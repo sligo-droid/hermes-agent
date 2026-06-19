@@ -80,9 +80,20 @@ class CodexAppServerClient:
     ) -> None:
         self._codex_bin = codex_bin
         explicit_env = env or {}
-        spawn_env = dict(env) if replace_env and env is not None else os.environ.copy()
-        if env and not replace_env:
-            spawn_env.update(env)
+        explicit_workspace = explicit_env.get("HERMES_CODEX_WORKER_WORKSPACE") or explicit_env.get(
+            "HERMES_KANBAN_WORKSPACE"
+        )
+        if env is None:
+            spawn_env = os.environ.copy()
+        else:
+            try:
+                from tools.environments.local import _sanitize_subprocess_env
+
+                spawn_env = _sanitize_subprocess_env({} if replace_env else os.environ, env)
+            except Exception:
+                spawn_env = dict(env) if replace_env else os.environ.copy()
+                if not replace_env:
+                    spawn_env.update(env)
         if codex_home:
             spawn_env["CODEX_HOME"] = codex_home
         try:
@@ -121,7 +132,11 @@ class CodexAppServerClient:
                 in {"1", "true", "yes", "on"}
                 else "false"
             )
-            workspace = spawn_env.get("HERMES_KANBAN_WORKSPACE")
+            workspace = (
+                spawn_env.get("HERMES_CODEX_WORKER_WORKSPACE")
+                or spawn_env.get("HERMES_KANBAN_WORKSPACE")
+                or explicit_workspace
+            )
             if workspace and os.path.isabs(workspace) and workspace not in writable_roots:
                 writable_roots.append(workspace)
             app_server_args.extend(

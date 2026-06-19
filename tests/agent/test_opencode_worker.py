@@ -1016,7 +1016,42 @@ def test_process_wraps_opencode_run_in_gateway_child_scope(monkeypatch, tmp_path
     assert captured["popen_kwargs"]["stdin"] == ow.subprocess.DEVNULL
 
 
-def test_process_startup_timeout_kills_no_output_child(tmp_path):
+def test_opencode_process_env_overlays_explicit_worker_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/host-agent.sock")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-parent-secret")
+    monkeypatch.setenv("GH_TOKEN", "gho_parent_secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_parent_secret")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-parent-secret")
+    config_home = tmp_path / "isolated-config"
+
+    env = ow._opencode_process_env(
+        config_home,
+        env={
+            "GH_CONFIG_DIR": "/home/droid/.config/gh",
+            "HERMES_CODEX_WORKER_NETWORK_ACCESS": "1",
+            "SSH_AUTH_SOCK": "/tmp/worker-agent.sock",
+            "OPENAI_API_KEY": "sk-explicit-secret",
+            "GH_TOKEN": "gho_explicit_secret",
+            "GITHUB_TOKEN": "ghp_explicit_secret",
+            "OPENROUTER_API_KEY": "sk-or-explicit-secret",
+        },
+    )
+
+    assert env is not None
+    assert env["PATH"] == "/usr/bin"
+    assert env["GH_CONFIG_DIR"] == "/home/droid/.config/gh"
+    assert env["HERMES_CODEX_WORKER_NETWORK_ACCESS"] == "1"
+    assert env["SSH_AUTH_SOCK"] == "/tmp/worker-agent.sock"
+    assert env["XDG_CONFIG_HOME"] == str(config_home)
+    assert "OPENAI_API_KEY" not in env
+    assert "GH_TOKEN" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert "OPENROUTER_API_KEY" not in env
+
+
+def test_process_startup_timeout_kills_no_output_child(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
     result = ow._run_opencode_process(
         [sys.executable, "-c", "import time; time.sleep(5)"],
         workdir=str(tmp_path),
@@ -1029,7 +1064,8 @@ def test_process_startup_timeout_kills_no_output_child(tmp_path):
     assert result.duration_seconds < 2
 
 
-def test_process_startup_timeout_zero_waits_for_turn_timeout(tmp_path):
+def test_process_startup_timeout_zero_waits_for_turn_timeout(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
     result = ow._run_opencode_process(
         [sys.executable, "-c", "import time; time.sleep(5)"],
         workdir=str(tmp_path),
@@ -1042,7 +1078,8 @@ def test_process_startup_timeout_zero_waits_for_turn_timeout(tmp_path):
     assert result.duration_seconds < 2
 
 
-def test_process_timeout_preserves_partial_stdout(tmp_path):
+def test_process_timeout_preserves_partial_stdout(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_GATEWAY_CHILD_SYSTEMD", "0")
     result = ow._run_opencode_process(
         [
             sys.executable,

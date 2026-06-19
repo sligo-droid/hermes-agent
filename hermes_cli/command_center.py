@@ -51,7 +51,7 @@ _PROJECT_ALIASES = {
 _ARCHIVED_BOARD_DIR_RE = re.compile(r"^(?P<slug>.+)-(?P<timestamp>\d{9,})(?:-\d+)?$")
 _ARCHIVED_BOARD_METADATA_CACHE: tuple[tuple[str, int], list[dict[str, Any]]] | None = None
 _SNAPSHOT_CACHE_TTL_SECONDS = 3.0
-_SNAPSHOT_CACHE: dict[tuple[str | None, bool, int], tuple[float, dict[str, Any]]] = {}
+_SNAPSHOT_CACHE: dict[tuple[str | None, bool, int, bool], tuple[float, dict[str, Any]]] = {}
 _SNAPSHOT_CACHE_HOME: Path | None = None
 
 
@@ -1745,11 +1745,17 @@ def get_cached_command_center_snapshot(
     include_archived: bool = False,
     recent_run_limit_per_board: int = 20,
     project: str | None = None,
+    include_details: bool = True,
     force_refresh: bool = False,
 ) -> dict[str, Any]:
     """Return a short-lived cached Command Center snapshot for API polling."""
 
-    cache_key = (_normalize_project_key(project), bool(include_archived), int(recent_run_limit_per_board))
+    cache_key = (
+        _normalize_project_key(project),
+        bool(include_archived),
+        int(recent_run_limit_per_board),
+        bool(include_details),
+    )
     _invalidate_snapshot_cache_if_home_changed()
     monotonic_now = time.monotonic()
     if not force_refresh:
@@ -1761,12 +1767,39 @@ def get_cached_command_center_snapshot(
         include_archived=include_archived,
         recent_run_limit_per_board=recent_run_limit_per_board,
         project=project,
+        include_details=include_details,
     )
     _SNAPSHOT_CACHE[cache_key] = (monotonic_now, copy.deepcopy(snapshot))
     return snapshot
 
 
-def build_command_center_snapshot(*, include_archived: bool = False, recent_run_limit_per_board: int = 20, project: str | None = None) -> dict[str, Any]:
+def _summary_work_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Return the lightweight Work Item shape used by initial dashboard loads."""
+
+    summary = dict(item)
+    full_description = str(summary.get("full_description") or "").strip()
+    summary["has_full_description"] = bool(full_description)
+    summary["full_description"] = None
+    summary.pop("raw", None)
+    summary.pop("source_excerpts", None)
+    summary.pop("runs", None)
+    return summary
+
+
+def _summary_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    summarized = dict(snapshot)
+    summarized["work_items"] = [_summary_work_item(item) for item in snapshot.get("work_items", [])]
+    summarized["detail_level"] = "summary"
+    return summarized
+
+
+def build_command_center_snapshot(
+    *,
+    include_archived: bool = False,
+    recent_run_limit_per_board: int = 20,
+    project: str | None = None,
+    include_details: bool = True,
+) -> dict[str, Any]:
     """Return the read-only Command Center snapshot.
 
     The response is intentionally denormalized: the frontend needs a fast,
@@ -1987,10 +2020,11 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
     runs.sort(key=lambda run: _epoch_or_none(run.get("ended_at") or run.get("started_at")) or 0, reverse=True)
 
     metrics = _metrics(work_items=work_items, sources=sources, runs=runs, boards=boards)
-    return {
+    snapshot = {
         "schema_version": 1,
         "generated_at": now,
         "summary": "Sources create canonical Work Items; worker boards and task runs are execution detail.",
+        "detail_level": "full" if include_details else "summary",
         "projects": projects,
         "current_project": project_filter,
         "work_items": work_items,
@@ -1999,6 +2033,9 @@ def build_command_center_snapshot(*, include_archived: bool = False, recent_run_
         "boards": boards,
         "metrics": metrics,
     }
+    if not include_details:
+        return _summary_snapshot(snapshot)
+    return snapshot
 
 
 def _item_project(item: dict[str, Any]) -> str | None:

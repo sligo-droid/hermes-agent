@@ -1328,7 +1328,16 @@ def _opencode_process_env(
 ) -> Optional[dict[str, str]]:
     if env is None and config_home is None:
         return None
-    process_env = dict(env) if env is not None else os.environ.copy()
+    if env is None:
+        process_env = os.environ.copy()
+    else:
+        try:
+            from tools.environments.local import _sanitize_subprocess_env
+
+            process_env = _sanitize_subprocess_env(os.environ, env)
+        except Exception:
+            process_env = os.environ.copy()
+            process_env.update(env)
     if config_home is not None:
         process_env["XDG_CONFIG_HOME"] = str(config_home)
     return process_env
