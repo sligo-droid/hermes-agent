@@ -144,6 +144,18 @@ class UIWorkRouteDecision:
     backend_config: dict[str, Any] = field(default_factory=dict)
     fallback_allowed: bool = False
     error: str = ""
+    route_decision: str = "default_coding_worker"
+    route_decision_source: str = "deterministic_default"
+    route_decision_confidence: float | None = None
+    route_decision_rationale: str = ""
+    selected_route: str = "default_coding_worker"
+    selected_provider: str = ""
+    selected_model: str = ""
+    fallback_used: bool = False
+    fallback_reason: str = ""
+    advisory_matched: bool = False
+    advisory_reason: str = ""
+    launch_worker: bool = True
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -155,7 +167,48 @@ class UIWorkRouteDecision:
             "backend": self.backend,
             "fallback_allowed": self.fallback_allowed,
             "error": self.error,
+            "route_decision": self.route_decision,
+            "route_decision_source": self.route_decision_source,
+            "route_decision_confidence": self.route_decision_confidence,
+            "route_decision_rationale": self.route_decision_rationale,
+            "selected_route": self.selected_route,
+            "selected_provider": self.selected_provider,
+            "selected_model": self.selected_model,
+            "fallback_used": self.fallback_used,
+            "fallback_reason": self.fallback_reason,
+            "advisory_matched": self.advisory_matched,
+            "advisory_reason": self.advisory_reason,
         }
+
+
+@dataclass(frozen=True)
+class _RouteDecisionInput:
+    route: str
+    source: str
+    confidence: float | None = None
+    rationale: str = ""
+    error: str = ""
+
+
+_DEFAULT_ROUTE = "default_coding_worker"
+_UI_SPECIALIST_ROUTE = "ui_visual_specialist"
+_NO_WORKER_ROUTES = {"review_only_no_worker", "ask_human"}
+_ROUTE_ALIASES = {
+    "default": _DEFAULT_ROUTE,
+    "default_worker": _DEFAULT_ROUTE,
+    "default_coding_worker": _DEFAULT_ROUTE,
+    "codex_default": _DEFAULT_ROUTE,
+    "ui": _UI_SPECIALIST_ROUTE,
+    "ui_specialist": _UI_SPECIALIST_ROUTE,
+    "visual_specialist": _UI_SPECIALIST_ROUTE,
+    "ui_visual_specialist": _UI_SPECIALIST_ROUTE,
+    "review_only": "review_only_no_worker",
+    "review_only_no_worker": "review_only_no_worker",
+    "no_worker": "review_only_no_worker",
+    "ask_human": "ask_human",
+    "human": "ask_human",
+}
+_VALID_ROUTES = {_DEFAULT_ROUTE, _UI_SPECIALIST_ROUTE, *_NO_WORKER_ROUTES}
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -173,6 +226,75 @@ def _as_list(value: Any) -> list[str]:
 def _normalize_text(*parts: Any) -> str:
     text = "\n".join(str(part or "") for part in parts if part is not None)
     return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def _normalize_route_name(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    raw = re.sub(r"[\s-]+", "_", raw)
+    return _ROUTE_ALIASES.get(raw, raw)
+
+
+def _normalize_confidence(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return None
+    if 0.0 <= confidence <= 1.0:
+        return confidence
+    return None
+
+
+def _normalize_route_decision(value: Any) -> _RouteDecisionInput:
+    if value is None or value == "":
+        return _RouteDecisionInput(
+            route=_DEFAULT_ROUTE,
+            source="deterministic_default",
+            rationale=(
+                "No orchestrator route decision was provided; default coding "
+                "worker selected."
+            ),
+        )
+    if isinstance(value, str):
+        route = _normalize_route_name(value)
+        source = "orchestrator"
+        confidence = None
+        rationale = ""
+    elif isinstance(value, dict):
+        route = _normalize_route_name(
+            value.get("route")
+            or value.get("decision")
+            or value.get("selected_route")
+            or value.get("worker_route")
+        )
+        source = str(value.get("source") or "orchestrator").strip() or "orchestrator"
+        confidence = _normalize_confidence(value.get("confidence"))
+        rationale = str(value.get("rationale") or value.get("reason") or "").strip()
+    else:
+        return _RouteDecisionInput(
+            route="",
+            source="orchestrator",
+            error="route_decision must be a string or object",
+        )
+    if route not in _VALID_ROUTES:
+        label = route or "<empty>"
+        valid = ", ".join(sorted(_VALID_ROUTES))
+        return _RouteDecisionInput(
+            route=route,
+            source=source,
+            confidence=confidence,
+            rationale=rationale,
+            error=f"unknown route_decision route {label!r}; expected one of: {valid}",
+        )
+    return _RouteDecisionInput(
+        route=route,
+        source=source,
+        confidence=confidence,
+        rationale=rationale,
+    )
 
 
 def _contains_keyword(text: str, keyword: str) -> bool:
@@ -263,6 +385,7 @@ def resolve_ui_work_route(
     cwd: str = "",
     project: str = "",
     backend: str = "codex",
+    route_decision: Any = None,
 ) -> UIWorkRouteDecision:
     """Return a secret-free UI-work routing decision.
 
@@ -273,7 +396,7 @@ def resolve_ui_work_route(
     enabled = bool(ui_cfg.get("enabled", False))
     fallback_cfg = _as_dict(ui_cfg.get("fallback"))
     fallback_allowed = bool(fallback_cfg.get("allow_default_worker", True))
-    matched, reason = _classify_ui_work(
+    advisory_matched, advisory_reason = _classify_ui_work(
         config=ui_cfg,
         task=task,
         title=title,
@@ -284,26 +407,65 @@ def resolve_ui_work_route(
     provider = str(ui_cfg.get("provider") or "").strip()
     model = str(ui_cfg.get("model") or "").strip()
     normalized_backend = str(backend or "codex").strip().lower() or "codex"
+    requested = _normalize_route_decision(route_decision)
 
-    if not matched:
+    base_fields = {
+        "provider": provider,
+        "model": model,
+        "backend": normalized_backend,
+        "fallback_allowed": fallback_allowed,
+        "route_decision": requested.route,
+        "route_decision_source": requested.source,
+        "route_decision_confidence": requested.confidence,
+        "route_decision_rationale": requested.rationale,
+        "advisory_matched": advisory_matched,
+        "advisory_reason": advisory_reason,
+    }
+
+    if requested.error:
+        return UIWorkRouteDecision(
+            matched=False,
+            enabled=enabled,
+            reason=requested.error,
+            selected_route=_DEFAULT_ROUTE,
+            error=requested.error,
+            **base_fields,
+        )
+
+    if requested.route in _NO_WORKER_ROUTES:
+        reason = f"orchestrator route requested {requested.route}; no coding worker launched"
         return UIWorkRouteDecision(
             matched=False,
             enabled=enabled,
             reason=reason,
-            provider=provider,
-            model=model,
-            backend=normalized_backend,
-            fallback_allowed=fallback_allowed,
+            selected_route=requested.route,
+            launch_worker=False,
+            **base_fields,
         )
+
+    if requested.route == _DEFAULT_ROUTE:
+        reason = (
+            "orchestrator route selected default coding worker"
+            if requested.source != "deterministic_default"
+            else requested.rationale
+        )
+        return UIWorkRouteDecision(
+            matched=False,
+            enabled=enabled,
+            reason=reason,
+            selected_route=_DEFAULT_ROUTE,
+            **base_fields,
+        )
+
     if not enabled:
         return UIWorkRouteDecision(
             matched=True,
             enabled=False,
-            reason="ui routing disabled",
-            provider=provider,
-            model=model,
-            backend=normalized_backend,
-            fallback_allowed=fallback_allowed,
+            reason="ui routing disabled; falling back to default worker",
+            selected_route=_DEFAULT_ROUTE,
+            fallback_used=True,
+            fallback_reason="ui_work.enabled is false",
+            **base_fields,
         )
     if not provider or not model:
         error = "ui_work routing matched but ui_work.provider and ui_work.model must both be configured"
@@ -312,20 +474,18 @@ def resolve_ui_work_route(
                 matched=True,
                 enabled=True,
                 reason="missing provider/model; falling back to default worker",
-                provider=provider,
-                model=model,
-                backend=normalized_backend,
-                fallback_allowed=True,
+                selected_route=_DEFAULT_ROUTE,
+                fallback_used=True,
+                fallback_reason="ui_work.provider or ui_work.model is missing",
+                **base_fields,
             )
         return UIWorkRouteDecision(
             matched=True,
             enabled=True,
             reason="missing provider/model",
-            provider=provider,
-            model=model,
-            backend=normalized_backend,
-            fallback_allowed=fallback_allowed,
+            selected_route=_UI_SPECIALIST_ROUTE,
             error=error,
+            **base_fields,
         )
 
     backend_cfg = _as_dict(ui_cfg.get(normalized_backend))
@@ -339,20 +499,18 @@ def resolve_ui_work_route(
                     matched=True,
                     enabled=True,
                     reason="incomplete codex config; falling back to default worker",
-                    provider=provider,
-                    model=model,
-                    backend=normalized_backend,
-                    fallback_allowed=True,
+                    selected_route=_DEFAULT_ROUTE,
+                    fallback_used=True,
+                    fallback_reason="ui_work.codex provider/model config keys are incomplete",
+                    **base_fields,
                 )
             return UIWorkRouteDecision(
                 matched=True,
                 enabled=True,
                 reason="incomplete codex config",
-                provider=provider,
-                model=model,
-                backend=normalized_backend,
-                fallback_allowed=fallback_allowed,
+                selected_route=_UI_SPECIALIST_ROUTE,
                 error=error,
+                **base_fields,
             )
         route_backend_config = {
             "provider_config_key": provider_key,
@@ -367,31 +525,29 @@ def resolve_ui_work_route(
                     matched=True,
                     enabled=True,
                     reason=f"missing {normalized_backend} config; falling back to default worker",
-                    provider=provider,
-                    model=model,
-                    backend=normalized_backend,
-                    fallback_allowed=True,
+                    selected_route=_DEFAULT_ROUTE,
+                    fallback_used=True,
+                    fallback_reason=f"ui_work.{normalized_backend} is not configured",
+                    **base_fields,
                 )
             return UIWorkRouteDecision(
                 matched=True,
                 enabled=True,
                 reason=f"missing {normalized_backend} config",
-                provider=provider,
-                model=model,
-                backend=normalized_backend,
-                fallback_allowed=fallback_allowed,
+                selected_route=_UI_SPECIALIST_ROUTE,
                 error=f"ui_work routing matched but ui_work.{normalized_backend} is not configured",
+                **base_fields,
             )
 
     return UIWorkRouteDecision(
         matched=True,
         enabled=True,
-        reason=reason,
-        provider=provider,
-        model=model,
-        backend=normalized_backend,
+        reason="orchestrator route selected ui visual specialist",
         backend_config=route_backend_config,
-        fallback_allowed=fallback_allowed,
+        selected_route=_UI_SPECIALIST_ROUTE,
+        selected_provider=provider,
+        selected_model=model,
+        **base_fields,
     )
 
 

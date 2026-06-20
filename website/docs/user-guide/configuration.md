@@ -1697,6 +1697,29 @@ The delegation provider uses the same credential resolution as CLI/gateway start
 
 **Width and depth:** `max_concurrent_children` caps how many subagents run in parallel per batch (default `3`, floor of 1, no ceiling). Can also be set via the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var. When the model submits a `tasks` array longer than the cap, `delegate_task` returns a tool error explaining the limit rather than silently truncating. `max_spawn_depth` controls the delegation tree depth (clamped to 1-3). At the default `1`, delegation is flat: children cannot spawn grandchildren, and passing `role="orchestrator"` silently degrades to `leaf`. Raise to `2` so orchestrator children can spawn leaf grandchildren; `3` for three-level trees. The agent opts into orchestration per call via `role="orchestrator"`; `orchestrator_enabled: false` forces every child back to leaf regardless. Cost scales multiplicatively — at `max_spawn_depth: 3` with `max_concurrent_children: 3`, the tree can reach 3×3×3 = 27 concurrent leaf agents. See [Subagent Delegation → Depth Limit and Nested Orchestration](features/delegation.md#depth-limit-and-nested-orchestration) for usage patterns.
 
+## Coding Worker Routes
+
+`delegate_coding_task` accepts an optional `route_decision` object from the parent/orchestrator:
+
+```json
+{
+  "route": "ui_visual_specialist",
+  "confidence": 0.82,
+  "rationale": "Visual implementation work for a web dashboard"
+}
+```
+
+Supported routes are `default_coding_worker`, `ui_visual_specialist`, `review_only_no_worker`, and `ask_human`. The UI specialist provider/model is used only for an explicit `ui_visual_specialist` route and only when the `ui_work` config guardrails allow it. Keyword detection remains advisory metadata and fallback evidence; a route of `default_coding_worker` keeps the normal Codex worker even when visual UI keywords appear.
+
+```yaml
+ui_work:
+  enabled: true
+  provider: openrouter
+  model: z-ai/glm-5.2
+  fallback:
+    allow_default_worker: true
+```
+
 ## Clarify
 
 Configure the clarification prompt behavior:

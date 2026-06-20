@@ -243,23 +243,38 @@ def test_ui_work_uses_codex_model_overlay(monkeypatch, tmp_path):
 
     result = json.loads(
         cwt.delegate_coding_task(
-            task="Implement the frontend dashboard layout polish",
+            task="Review feedback: implement the frontend dashboard layout polish",
             context="Keep the Command Center responsive.",
+            route_decision={
+                "route": "ui_visual_specialist",
+                "confidence": 0.86,
+                "rationale": "review feedback requires visual implementation",
+            },
             parent_agent=_parent(tmp_path),
         )
     )
 
     assert result["success"] is True
-    assert result["ui_work_route"] == {
-        "matched": True,
-        "enabled": True,
-        "reason": "visual ui work: implement + layout polish",
-        "provider": "openrouter",
-        "model": "z-ai/glm-5.2",
-        "backend": "codex",
-        "fallback_allowed": True,
-        "error": "",
-    }
+    route = result["ui_work_route"]
+    assert route["matched"] is True
+    assert route["enabled"] is True
+    assert route["reason"] == "orchestrator route selected ui visual specialist"
+    assert route["provider"] == "openrouter"
+    assert route["model"] == "z-ai/glm-5.2"
+    assert route["backend"] == "codex"
+    assert route["fallback_allowed"] is True
+    assert route["error"] == ""
+    assert route["route_decision"] == "ui_visual_specialist"
+    assert route["route_decision_source"] == "orchestrator"
+    assert route["route_decision_confidence"] == 0.86
+    assert route["route_decision_rationale"] == "review feedback requires visual implementation"
+    assert route["selected_route"] == "ui_visual_specialist"
+    assert route["selected_provider"] == "openrouter"
+    assert route["selected_model"] == "z-ai/glm-5.2"
+    assert route["fallback_used"] is False
+    assert route["fallback_reason"] == ""
+    assert route["advisory_matched"] is False
+    assert "negative keyword: review" in route["advisory_reason"]
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
         'model_provider="openrouter"',
@@ -274,6 +289,79 @@ def test_ui_work_uses_codex_model_overlay(monkeypatch, tmp_path):
         "-c",
         'model_reasoning_effort="medium"',
     ]
+
+
+def test_explicit_default_route_keeps_default_codex_despite_visual_keywords(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["backend"] = "codex"
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Implement the frontend dashboard layout polish",
+            context="Keep the Command Center responsive.",
+            route_decision={
+                "route": "default_coding_worker",
+                "confidence": 0.74,
+                "rationale": "mostly data plumbing despite visual context",
+            },
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    route = result["ui_work_route"]
+    assert route["matched"] is False
+    assert route["selected_route"] == "default_coding_worker"
+    assert route["selected_provider"] == ""
+    assert route["selected_model"] == ""
+    assert route["route_decision_source"] == "orchestrator"
+    assert route["route_decision_confidence"] == 0.74
+    assert route["route_decision_rationale"] == "mostly data plumbing despite visual context"
+    assert route["advisory_matched"] is True
+    assert "visual ui work" in route["advisory_reason"]
+    assert FakeSession.instances[0].kwargs["extra_args"] == [
+        "-c",
+        'model_reasoning_effort="medium"',
+    ]
+
+
+def test_unknown_route_decision_errors_before_worker_launch(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Implement the frontend dashboard layout polish",
+            route_decision={
+                "route": "glm_visual",
+                "confidence": 0.7,
+                "rationale": "bad route",
+            },
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "error"
+    assert "unknown route_decision route" in result["error"]
+    route = result["ui_work_route"]
+    assert route["route_decision"] == "glm_visual"
+    assert route["route_decision_source"] == "orchestrator"
+    assert route["route_decision_confidence"] == 0.7
+    assert route["route_decision_rationale"] == "bad route"
+    assert route["selected_route"] == "default_coding_worker"
+    assert FakeSession.instances == []
 
 
 def test_ui_work_provider_failure_falls_back_to_default_codex_model(monkeypatch, tmp_path):
@@ -303,6 +391,7 @@ def test_ui_work_provider_failure_falls_back_to_default_codex_model(monkeypatch,
         cwt.delegate_coding_task(
             task="Implement the frontend dashboard layout polish",
             context="Keep the Command Center responsive.",
+            route_decision={"route": "ui_visual_specialist"},
             parent_agent=_parent(tmp_path),
         )
     )
@@ -311,6 +400,9 @@ def test_ui_work_provider_failure_falls_back_to_default_codex_model(monkeypatch,
     assert result["thread_id"] == "thread-default"
     assert result["ui_work_route"]["fallback_used"] is True
     assert "openrouter" in result["ui_work_route"]["fallback_reason"].lower()
+    assert result["ui_work_route"]["selected_route"] == "default_coding_worker"
+    assert result["ui_work_route"]["selected_provider"] == ""
+    assert result["ui_work_route"]["selected_model"] == ""
     assert len(FakeSession.instances) == 2
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
@@ -358,6 +450,7 @@ def test_ui_work_matched_route_fails_closed_when_codex_overlay_unavailable(monke
     result = json.loads(
         cwt.delegate_coding_task(
             task="Implement frontend dashboard polish",
+            route_decision={"route": "ui_visual_specialist"},
             parent_agent=_parent(tmp_path),
         )
     )
@@ -408,6 +501,7 @@ def test_ui_work_missing_model_fails_before_worker(monkeypatch, tmp_path):
     result = json.loads(
         cwt.delegate_coding_task(
             task="Polish frontend chart labels",
+            route_decision={"route": "ui_visual_specialist"},
             parent_agent=_parent(tmp_path),
         )
     )
