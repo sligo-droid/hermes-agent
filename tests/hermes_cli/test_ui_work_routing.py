@@ -25,11 +25,24 @@ def test_matches_new_visual_web_ui_development_and_overlay_args(task):
         _cfg(),
         task=task,
         backend="codex",
+        route_decision={
+            "route": "ui_visual_specialist",
+            "confidence": 0.91,
+            "rationale": "visual implementation",
+        },
     )
 
     assert decision.matched is True
     assert decision.enabled is True
-    assert "visual ui work" in decision.reason
+    assert decision.reason == "orchestrator route selected ui visual specialist"
+    assert decision.route_decision_source == "orchestrator"
+    assert decision.route_decision_confidence == 0.91
+    assert decision.route_decision_rationale == "visual implementation"
+    assert decision.selected_route == "ui_visual_specialist"
+    assert decision.selected_provider == "openrouter"
+    assert decision.selected_model == "z-ai/glm-5.2"
+    assert decision.advisory_matched is True
+    assert "visual ui work" in decision.advisory_reason
     assert decision.provider == "openrouter"
     assert decision.model == "z-ai/glm-5.2"
     assert decision.backend_config["provider_config_key"] == "model_provider"
@@ -55,7 +68,7 @@ def test_tui_terminal_rendering_work_does_not_route():
     )
 
     assert decision.matched is False
-    assert "negative keyword" in decision.reason
+    assert "negative keyword" in decision.advisory_reason
 
 
 def test_review_or_look_at_ui_does_not_route():
@@ -65,7 +78,46 @@ def test_review_or_look_at_ui_does_not_route():
     )
 
     assert decision.matched is False
-    assert "negative keyword" in decision.reason
+    assert "negative keyword" in decision.advisory_reason
+
+
+def test_explicit_ui_route_overrides_review_keyword_veto():
+    decision = resolve_ui_work_route(
+        _cfg(),
+        task="Review comments asked us to implement visual polish on the dashboard.",
+        route_decision={
+            "route": "ui_visual_specialist",
+            "confidence": 0.8,
+            "rationale": "review feedback requires visual implementation",
+        },
+    )
+
+    assert decision.matched is True
+    assert decision.enabled is True
+    assert decision.selected_route == "ui_visual_specialist"
+    assert decision.selected_provider == "openrouter"
+    assert decision.route_decision_source == "orchestrator"
+    assert decision.route_decision_confidence == 0.8
+    assert decision.route_decision_rationale == "review feedback requires visual implementation"
+    assert decision.advisory_matched is False
+    assert "negative keyword: review" in decision.advisory_reason
+
+
+def test_visual_keywords_without_route_are_advisory_only():
+    decision = resolve_ui_work_route(
+        _cfg(),
+        task="Implement responsive dashboard card visual polish.",
+    )
+
+    assert decision.matched is False
+    assert decision.selected_route == "default_coding_worker"
+    assert decision.selected_provider == ""
+    assert decision.selected_model == ""
+    assert decision.route_decision_source == "deterministic_default"
+    assert decision.route_decision_confidence is None
+    assert decision.advisory_matched is True
+    assert "visual ui work" in decision.advisory_reason
+    assert codex_ui_work_extra_args(decision) == []
 
 
 def test_negative_backend_only_overrides_ui_keyword():
@@ -76,7 +128,7 @@ def test_negative_backend_only_overrides_ui_keyword():
     )
 
     assert decision.matched is False
-    assert "negative keyword" in decision.reason
+    assert "negative keyword" in decision.advisory_reason
 
 
 def test_backend_api_work_with_ui_context_does_not_route():
@@ -87,7 +139,7 @@ def test_backend_api_work_with_ui_context_does_not_route():
     )
 
     assert decision.matched is False
-    assert "negative keyword" in decision.reason
+    assert "negative keyword" in decision.advisory_reason
 
 
 @pytest.mark.parametrize(
@@ -123,7 +175,7 @@ def test_non_visual_domain_table_chart_or_interface_work_does_not_route(task):
     decision = resolve_ui_work_route(_cfg(), task=task)
 
     assert decision.matched is False
-    assert "non-visual domain keyword" in decision.reason
+    assert "non-visual domain keyword" in decision.advisory_reason
 
 
 @pytest.mark.parametrize(
@@ -140,11 +192,12 @@ def test_non_visual_domain_table_chart_or_interface_work_does_not_route(task):
         "Polish Command Center card colors.",
     ],
 )
-def test_visual_table_chart_and_card_work_routes_despite_domain_words(task):
+def test_visual_table_chart_and_card_work_is_advisory_despite_domain_words(task):
     decision = resolve_ui_work_route(_cfg(), task=task)
 
-    assert decision.matched is True
-    assert "visual ui work" in decision.reason
+    assert decision.matched is False
+    assert decision.advisory_matched is True
+    assert "visual ui work" in decision.advisory_reason
 
 
 def test_pr_review_follow_up_around_page_layout_does_not_route():
@@ -154,7 +207,7 @@ def test_pr_review_follow_up_around_page_layout_does_not_route():
     )
 
     assert decision.matched is False
-    assert "negative keyword" in decision.reason
+    assert "negative keyword" in decision.advisory_reason
 
 
 def test_pid_project_name_alone_does_not_route():
@@ -174,21 +227,29 @@ def test_pid_dashboard_work_routes():
         task="Polish dashboard row spacing for PID source ledger.",
         cwd="/home/droid/workspaces/pid",
         project="PID",
+        route_decision="ui_visual_specialist",
     )
 
     assert decision.matched is True
-    assert "spacing" in decision.reason
+    assert "spacing" in decision.advisory_reason
 
 
 def test_disabled_config_reports_match_without_overlay():
     cfg = _cfg()
     cfg["ui_work"]["enabled"] = False
 
-    decision = resolve_ui_work_route(cfg, task="Polish frontend chart labels.")
+    decision = resolve_ui_work_route(
+        cfg,
+        task="Polish frontend chart labels.",
+        route_decision="ui_visual_specialist",
+    )
 
     assert decision.matched is True
     assert decision.enabled is False
     assert decision.backend_config == {}
+    assert decision.selected_route == "default_coding_worker"
+    assert decision.fallback_used is True
+    assert "ui_work.enabled" in decision.fallback_reason
     assert codex_ui_work_extra_args(decision) == []
 
 
@@ -197,7 +258,11 @@ def test_missing_model_errors_when_fallback_disabled():
     cfg["ui_work"]["model"] = ""
     cfg["ui_work"]["fallback"]["allow_default_worker"] = False
 
-    decision = resolve_ui_work_route(cfg, task="Polish frontend chart labels.")
+    decision = resolve_ui_work_route(
+        cfg,
+        task="Polish frontend chart labels.",
+        route_decision="ui_visual_specialist",
+    )
 
     assert decision.matched is True
     assert decision.error
@@ -209,10 +274,16 @@ def test_missing_model_falls_back_when_fallback_allowed():
     cfg["ui_work"]["model"] = ""
     cfg["ui_work"]["fallback"]["allow_default_worker"] = True
 
-    decision = resolve_ui_work_route(cfg, task="Polish frontend chart labels.")
+    decision = resolve_ui_work_route(
+        cfg,
+        task="Polish frontend chart labels.",
+        route_decision="ui_visual_specialist",
+    )
 
     assert decision.matched is True
     assert decision.fallback_allowed is True
     assert decision.error == ""
     assert "falling back to default worker" in decision.reason
+    assert decision.fallback_used is True
+    assert decision.selected_route == "default_coding_worker"
     assert decision.backend_config == {}

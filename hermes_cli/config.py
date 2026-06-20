@@ -1575,9 +1575,10 @@ DEFAULT_CONFIG = {
         },
     },
 
-    # UI-work routing for coding workers. This keeps new visual web/app
-    # interface development on a configurable specialist model without changing
-    # the default backend for non-visual work.
+    # UI-work routing for coding workers. delegate_coding_task only applies the
+    # configurable specialist provider/model when the orchestrator passes an
+    # explicit route_decision.route=ui_visual_specialist. Keyword detection is
+    # retained as advisory metadata/default guardrail evidence.
     "ui_work": {
         "enabled": True,
         "provider": "openrouter",

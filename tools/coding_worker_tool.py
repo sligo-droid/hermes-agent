@@ -102,6 +102,9 @@ def _mark_ui_route_fallback(metadata: dict[str, Any], reason: str) -> dict[str, 
     updated = dict(metadata)
     updated["fallback_used"] = True
     updated["fallback_reason"] = str(reason or "specialist route unavailable")
+    updated["selected_route"] = "default_coding_worker"
+    updated["selected_provider"] = ""
+    updated["selected_model"] = ""
     return updated
 
 
@@ -586,6 +589,7 @@ def delegate_coding_task(
     cwd: Optional[str] = None,
     turn_timeout_seconds: Optional[float] = None,
     allow_git_pr_lifecycle: bool = False,
+    route_decision: Any = None,
     parent_agent: Any = None,
     parent_messages: Optional[list[dict]] = None,
 ) -> str:
@@ -614,21 +618,6 @@ def delegate_coding_task(
         canonical_error = None
     if canonical_error:
         return tool_error(canonical_error)
-    project_context = _worker_project_context(workdir)
-    skill_context = _parent_skill_context(
-        parent_agent,
-        parent_messages,
-        task=task_text,
-        context=str(context or ""),
-    )
-    repo_state_notes = _repo_state_guard_notes(workdir)
-    dependency_notes = _prepare_pnpm_dependency_links(workdir)
-    try:
-        from hermes_cli.worker_autoreview import autoreview_prompt_note, materialize_autoreview_helper
-
-        autoreview_note = autoreview_prompt_note(materialize_autoreview_helper(workdir))
-    except Exception as exc:
-        autoreview_note = f"Autoreview helper materialization failed before worker start: {exc}"
 
     try:
         from hermes_cli.config import load_config
@@ -636,13 +625,6 @@ def delegate_coding_task(
         loaded_config = load_config() or {}
     except Exception:
         loaded_config = {}
-
-    timeout = (
-        float(turn_timeout_seconds)
-        if turn_timeout_seconds is not None
-        else _load_coding_worker_timeout()
-    )
-    timeout = max(30.0, timeout)
 
     try:
         from agent.opencode_worker import BACKEND_OPENCODE, load_coding_worker_backend
@@ -663,11 +645,10 @@ def delegate_coding_task(
             context=str(context or ""),
             cwd=workdir,
             backend=backend,
+            route_decision=route_decision,
         )
     except Exception:
         ui_route = None
-    if ui_route is not None and ui_route.error:
-        return tool_error(ui_route.error)
     ui_route_metadata = (
         ui_route.metadata()
         if ui_route is not None
@@ -680,8 +661,68 @@ def delegate_coding_task(
             "backend": backend,
             "fallback_allowed": False,
             "error": "",
+            "route_decision": "default_coding_worker",
+            "route_decision_source": "routing_unavailable",
+            "route_decision_confidence": None,
+            "route_decision_rationale": "",
+            "selected_route": "default_coding_worker",
+            "selected_provider": "",
+            "selected_model": "",
+            "fallback_used": False,
+            "fallback_reason": "",
+            "advisory_matched": False,
+            "advisory_reason": "",
         }
     )
+    if ui_route is not None and ui_route.error:
+        return json.dumps(
+            {
+                "success": False,
+                "status": "error",
+                "summary": "",
+                "error": ui_route.error,
+                "cwd": workdir,
+                "backend": backend,
+                "ui_work_route": ui_route_metadata,
+            },
+            ensure_ascii=False,
+        )
+    if ui_route is not None and not ui_route.launch_worker:
+        return json.dumps(
+            {
+                "success": False,
+                "status": "skipped",
+                "summary": "",
+                "error": ui_route.reason,
+                "cwd": workdir,
+                "backend": backend,
+                "ui_work_route": ui_route_metadata,
+            },
+            ensure_ascii=False,
+        )
+
+    project_context = _worker_project_context(workdir)
+    skill_context = _parent_skill_context(
+        parent_agent,
+        parent_messages,
+        task=task_text,
+        context=str(context or ""),
+    )
+    repo_state_notes = _repo_state_guard_notes(workdir)
+    dependency_notes = _prepare_pnpm_dependency_links(workdir)
+    try:
+        from hermes_cli.worker_autoreview import autoreview_prompt_note, materialize_autoreview_helper
+
+        autoreview_note = autoreview_prompt_note(materialize_autoreview_helper(workdir))
+    except Exception as exc:
+        autoreview_note = f"Autoreview helper materialization failed before worker start: {exc}"
+
+    timeout = (
+        float(turn_timeout_seconds)
+        if turn_timeout_seconds is not None
+        else _load_coding_worker_timeout()
+    )
+    timeout = max(30.0, timeout)
 
     worker_label = "OpenCode" if backend == BACKEND_OPENCODE else "Codex"
     worker_prompt_parts = [
@@ -1134,6 +1175,44 @@ CODING_WORKER_SCHEMA = {
                     "updating main."
                 ),
             },
+            "route_decision": {
+                "type": "object",
+                "description": (
+                    "Optional orchestrator-controlled worker route decision. "
+                    "Use route=ui_visual_specialist only when this specific "
+                    "coding worker should run on the configured UI specialist "
+                    "provider/model; route=default_coding_worker keeps the "
+                    "normal Codex worker even if visual keywords are present. "
+                    "route=review_only_no_worker or route=ask_human records "
+                    "the decision and skips launching a coding worker."
+                ),
+                "properties": {
+                    "route": {
+                        "type": "string",
+                        "enum": [
+                            "default_coding_worker",
+                            "ui_visual_specialist",
+                            "review_only_no_worker",
+                            "ask_human",
+                        ],
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "description": "Optional orchestrator confidence from 0 to 1.",
+                    },
+                    "rationale": {
+                        "type": "string",
+                        "description": "Short reason for the route decision.",
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Decision source label; defaults to orchestrator.",
+                    },
+                },
+                "required": ["route"],
+            },
         },
         "required": ["task"],
     },
@@ -1150,6 +1229,7 @@ registry.register(
         cwd=args.get("cwd"),
         turn_timeout_seconds=args.get("turn_timeout_seconds"),
         allow_git_pr_lifecycle=bool(args.get("allow_git_pr_lifecycle", False)),
+        route_decision=args.get("route_decision"),
         parent_agent=kw.get("parent_agent"),
         parent_messages=args.get("_parent_messages") or kw.get("parent_messages"),
     ),
