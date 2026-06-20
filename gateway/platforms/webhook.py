@@ -147,6 +147,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # is alive.
         self._github_pr_amend_locks: set[str] = set()
         self._github_pr_amend_lock_boards: dict[str, str] = {}
+        self._github_pr_amend_reaction_actor_login: str | None = None
 
         # Body size limit (auth-before-body pattern)
         self._max_body_bytes: int = int(
@@ -1354,6 +1355,57 @@ mutation($subjectId: ID!, $content: ReactionContent!) {
         logger.info("[github-pr-amend] GraphQL reaction %s node=%s content=%s", action, node_id, content)
         return True
 
+    async def _github_pr_amend_authenticated_login(self) -> str:
+        """Return the login used by gh for PR-amend reactions, cached per adapter."""
+
+        if self._github_pr_amend_reaction_actor_login is not None:
+            return self._github_pr_amend_reaction_actor_login
+        argv = ["gh", "api", "user"]
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("[github-pr-amend] reaction actor lookup failed: %s", exc)
+            self._github_pr_amend_reaction_actor_login = ""
+            return ""
+        if result.returncode != 0:
+            logger.warning(
+                "[github-pr-amend] gh reaction actor lookup failed exit=%s stderr=%s",
+                result.returncode,
+                (result.stderr or "").strip()[:500],
+            )
+            self._github_pr_amend_reaction_actor_login = ""
+            return ""
+        try:
+            data = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError:
+            logger.warning("[github-pr-amend] gh reaction actor lookup returned invalid JSON")
+            self._github_pr_amend_reaction_actor_login = ""
+            return ""
+        if not isinstance(data, dict):
+            self._github_pr_amend_reaction_actor_login = ""
+            return ""
+        login = str(data.get("login") or "").strip()
+        self._github_pr_amend_reaction_actor_login = login
+        return login
+
+    async def _github_pr_amend_reaction_owned_by_actor(self, reaction: dict[str, Any]) -> bool:
+        raw_user = reaction.get("user")
+        user: dict[str, Any] = raw_user if isinstance(raw_user, dict) else {}
+        login = str(user.get("login") or "").strip()
+        if login:
+            actor_login = await self._github_pr_amend_authenticated_login()
+            return bool(actor_login and login.lower() == actor_login.lower())
+        # Older tests/fixtures and some bot-shaped API payloads omit login. Keep
+        # the legacy behavior only when there is no login to compare, so we do
+        # not delete human or third-party-bot reactions on real GitHub comments.
+        return str(user.get("type") or "").lower() == "bot"
+
     async def _delete_prior_github_pr_amend_reactions(
         self,
         request: Any,
@@ -1405,8 +1457,7 @@ mutation($subjectId: ID!, $content: ReactionContent!) {
             prior = str(reaction.get("content") or "")
             if prior not in status_reactions:
                 continue
-            user = reaction.get("user") if isinstance(reaction.get("user"), dict) else {}
-            if str(user.get("type") or "").lower() != "bot":
+            if not await self._github_pr_amend_reaction_owned_by_actor(reaction):
                 continue
             if prior == content:
                 already_present = True

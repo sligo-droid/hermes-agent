@@ -714,6 +714,26 @@ def _comment_review_id(comment: dict[str, Any]) -> str:
     return str(comment.get("pull_request_review_id") or comment.get("review_id") or "").strip()
 
 
+def _format_review_reaction_target(
+    review: dict[str, Any],
+    *,
+    repo: str,
+    pr_number: str,
+) -> dict[str, str] | None:
+    review_id = str(review.get("id") or "").strip()
+    node_id = str(review.get("node_id") or "").strip()
+    if not (review_id or node_id):
+        return None
+    return {
+        "repo": repo,
+        "pr_number": pr_number,
+        "source_kind": "review",
+        "source_id": review_id,
+        "source_node_id": node_id,
+        "source_url": str(review.get("html_url") or review.get("url") or "").strip(),
+    }
+
+
 def _format_review_comment(comment: dict[str, Any], index: int) -> list[str]:
     comment_id = str(comment.get("id") or "").strip()
     review_id = _comment_review_id(comment)
@@ -744,21 +764,39 @@ def _format_review_comment(comment: dict[str, Any], index: int) -> list[str]:
 def github_pr_amend_reaction_targets(artifact: dict[str, Any]) -> list[dict[str, str]]:
     """Return GitHub objects that should carry PR-amend status reactions."""
 
-    source = artifact.get("source") if isinstance(artifact.get("source"), dict) else {}
-    fetched = artifact.get("fetched_context") if isinstance(artifact.get("fetched_context"), dict) else {}
+    raw_source = artifact.get("source")
+    source: dict[str, Any] = raw_source if isinstance(raw_source, dict) else {}
+    raw_fetched = artifact.get("fetched_context")
+    fetched: dict[str, Any] = raw_fetched if isinstance(raw_fetched, dict) else {}
+    reviews = [item for item in fetched.get("reviews") or [] if isinstance(item, dict)]
     comments = [item for item in fetched.get("review_comments") or [] if isinstance(item, dict)]
     source_kind = str(source.get("kind") or "").strip()
     source_id = str(source.get("id") or "").strip()
+    source_node_id = str(source.get("node_id") or "").strip()
+    source_url = str(source.get("html_url") or source.get("url") or "").strip()
     repo = str(_dig(artifact, "repository", "full_name", default="") or "")
     pr_number = str(_dig(artifact, "pull_request", "number", default="") or "")
 
     selected_comments: list[dict[str, Any]] = []
+    selected_review = None
     if source_kind == "review":
+        selected_review = next((review for review in reviews if str(review.get("id") or "") == source_id), None)
         selected_comments = [comment for comment in comments if _comment_review_id(comment) == source_id]
     elif source_kind == "review_comment":
         selected_comments = [comment for comment in comments if str(comment.get("id") or "") == source_id]
 
     targets: list[dict[str, str]] = []
+    if source_kind == "review":
+        review_source: dict[str, Any] = {"id": source_id, "node_id": source_node_id, "html_url": source_url}
+        if selected_review:
+            review_source.update({key: value for key, value in selected_review.items() if str(value or "").strip()})
+        review_target = _format_review_reaction_target(
+            review_source,
+            repo=repo,
+            pr_number=pr_number,
+        )
+        if review_target:
+            targets.append(review_target)
     for comment in selected_comments:
         comment_id = str(comment.get("id") or "").strip()
         if not comment_id:
