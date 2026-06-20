@@ -124,7 +124,8 @@ def test_command_center_proposal_archive_action_uses_halt_flow():
     run_action_source = source.split("const runActionForItem = useCallback", 1)[1].split("const handleAction = useCallback", 1)[0]
 
     assert 'type ActionKind = "approve" | "pause" | "replay" | "repair" | "undo" | "archive";' in source
-    assert 'if (canApproveReject) actions.push("approve", "archive");' in source
+    assert 'if (canApproveReject) actions.push("approve");' in source
+    assert 'const proposalCanArchive = Boolean(proposalId && ["proposed", "queued", "running", "review", "blocked", "accepted", "paused"].includes(item.status));' in source
     assert 'window.prompt("Reject reason for future prong feedback?"' not in source
     assert 'rejectReason' not in handle_source
     assert 'await api.rejectSelfImprovementProposal' not in run_action_source
@@ -174,7 +175,8 @@ def test_command_center_archive_action_renders_last_in_row_rail():
     action_source = source.split("function availableActionKinds", 1)[1].split("function actionSet", 1)[0]
     row_footer = source.split('className="command-center-card-footer mt-4 border-t border-white/[0.08] pt-3"', 1)[1].split("</article>", 1)[0]
 
-    assert action_source.index('actions.push("approve", "archive")') < action_source.index('actions.push("archive")')
+    assert action_source.count('actions.push("archive")') == 1
+    assert action_source.index('actions.push("approve")') < action_source.index('actions.push("archive")')
     assert action_source.index('actions.push("replay")') < action_source.index('actions.push("archive")')
     assert action_source.index('actions.push("pause")') < action_source.index('actions.push("archive")')
     assert action_source.index('actions.push("undo")') < action_source.index('actions.push("archive")')

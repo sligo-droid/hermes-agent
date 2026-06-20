@@ -354,6 +354,9 @@ def test_snapshot_reconciles_default_board_archived_task_to_recovery_needed(tmp_
     assert item["status"] == "blocked"
     assert item["status_detail"] == "recovery_needed"
     assert item["decision"]["needed"] is True
+    assert item["decision"]["approve_action"].endswith(
+        f"/self-improvement/proposals/{card['proposal_id']}/approve"
+    )
     assert item["execution"]["board"] == kanban_db.DEFAULT_BOARD
     assert item["execution"]["task_status"] == "archived"
     assert item["execution"]["worker_url"] is None
@@ -398,6 +401,9 @@ def test_snapshot_reconciles_worker_url_only_default_archived_task_to_recovery_n
     assert item["status"] == "blocked"
     assert item["status_detail"] == "recovery_needed"
     assert item["decision"]["needed"] is True
+    assert item["decision"]["approve_action"].endswith(
+        f"/self-improvement/proposals/{card['proposal_id']}/approve"
+    )
     assert item["execution"]["task_id"] == task_id
     assert item["execution"]["task_status"] == "archived"
     assert item["execution"]["task_url"] == f"/workers?task={task_id}"
@@ -435,6 +441,10 @@ def test_snapshot_reconciles_archived_board_with_non_success_task_to_recovery_ne
     assert events[-1]["metadata"]["evidence_kind"] == "worker_board"
     item = next(item for item in snapshot["work_items"] if item["id"] == f"self-improvement:{card['proposal_id']}")
     assert item["status"] == "blocked"
+    assert item["decision"]["needed"] is True
+    assert item["decision"]["approve_action"].endswith(
+        f"/self-improvement/proposals/{card['proposal_id']}/approve"
+    )
     assert item["execution"]["archive_path"] == archived_result["new_path"]
     assert "archived with non-success task status blocked" in item["execution"]["recovery_reason"]
 
