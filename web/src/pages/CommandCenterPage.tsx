@@ -224,15 +224,19 @@ function mergeWorkItemDetail(item: CommandCenterWorkItem, detail?: CommandCenter
 function availableActionKinds(item: CommandCenterWorkItem): ActionKind[] {
   const proposalId = item.decision?.proposal_id;
   const board = item.execution?.board;
-  const proposalCanArchive = Boolean(proposalId && ["queued", "running", "review", "blocked", "accepted", "paused"].includes(item.status));
-  const canApproveReject = Boolean(proposalId && item.status === "proposed");
+  const proposalCanArchive = Boolean(proposalId && ["proposed", "queued", "running", "review", "blocked", "accepted", "paused"].includes(item.status));
+  const canApproveReject = Boolean(
+    proposalId
+      && item.decision?.approve_action
+      && (item.status === "proposed" || item.decision?.needed === true),
+  );
   const canPause = Boolean(["queued", "running", "review", "accepted"].includes(item.status) && (proposalId || (item.execution?.pause_action && board)) && !item.execution?.paused);
   const canResume = Boolean(item.execution?.resumable === true && (proposalId || (item.execution?.resume_action && board)) && item.status !== "archived");
   const canUndo = Boolean(isCompletedItem(item) && ((proposalId && item.decision?.undo_followup_action) || (board && item.execution?.undo_followup_action)));
   const canArchive = Boolean((item.execution?.archiveable && board && board !== "default" && item.id.startsWith("kanban-board:")) || proposalCanArchive);
   const canRepair = Boolean(item.status === "blocked" && item.execution?.board && item.execution?.repair_action && item.execution?.repairable !== false && !item.execution?.repair_task_id);
   const actions: ActionKind[] = [];
-  if (canApproveReject) actions.push("approve", "archive");
+  if (canApproveReject) actions.push("approve");
   if (canResume) actions.push("replay");
   if (canPause) actions.push("pause");
   if (canUndo) actions.push("undo");
