@@ -401,6 +401,8 @@ class TestGitHubPrAmendPolicy:
             "reviews": [
                 {
                     "id": 4518030260,
+                    "node_id": "PRR_kwDOTopLevelReview",
+                    "html_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#pullrequestreview-4518030260",
                     "state": "CHANGES_REQUESTED",
                     "body": "@sligo-droid please address the inline comments.",
                 }
@@ -451,6 +453,14 @@ class TestGitHubPrAmendPolicy:
         assert card["project_context"]["github_pr_amend"]["source_node_id"] == payload["review"]["node_id"]
         assert card["project_context"]["github_pr_amend"]["source_key"] == "github-pr-amend:review:4518030260"
         assert card["project_context"]["github_pr_amend"]["reaction_targets"] == [
+            {
+                "repo": "reserve-protocol/reserve-index-dtf",
+                "pr_number": "182",
+                "source_kind": "review",
+                "source_id": "4518030260",
+                "source_node_id": "PRR_kwDOTopLevelReview",
+                "source_url": "https://github.com/reserve-protocol/reserve-index-dtf/pull/182#pullrequestreview-4518030260",
+            },
             {
                 "repo": "reserve-protocol/reserve-index-dtf",
                 "pr_number": "182",
@@ -1011,7 +1021,7 @@ class TestGitHubPrAmendWebhookRoute:
         )
 
     @pytest.mark.asyncio
-    async def test_github_pr_amend_terminal_reaction_uses_review_comment_targets(self):
+    async def test_github_pr_amend_terminal_reaction_uses_review_and_comment_targets(self):
         adapter = _make_adapter({"github-pr-amend": ROUTE})
         adapter._add_github_pr_amend_reaction = AsyncMock(return_value=True)
         metadata = {
@@ -1022,6 +1032,11 @@ class TestGitHubPrAmendWebhookRoute:
             "source_node_id": "PRR_kwDOReviewSummary",
             "reaction_targets": [
                 {
+                    "source_kind": "review",
+                    "source_id": "4534464625",
+                    "source_node_id": "PRR_kwDOReviewSummary",
+                },
+                {
                     "source_kind": "review_comment",
                     "source_id": "3443862311",
                     "source_node_id": "PRRC_kwDOInlineComment",
@@ -1031,11 +1046,51 @@ class TestGitHubPrAmendWebhookRoute:
 
         assert await adapter.sync_github_pr_amend_terminal_reaction(metadata, "done") is True
 
-        adapter._add_github_pr_amend_reaction.assert_awaited_once()
-        request, content = adapter._add_github_pr_amend_reaction.await_args.args
-        assert content == "+1"
-        assert request.source_kind == "review_comment"
-        assert request.source_id == "3443862311"
+        assert adapter._add_github_pr_amend_reaction.await_count == 2
+        first_request, first_content = adapter._add_github_pr_amend_reaction.await_args_list[0].args
+        second_request, second_content = adapter._add_github_pr_amend_reaction.await_args_list[1].args
+        assert first_content == "+1"
+        assert first_request.source_kind == "review"
+        assert first_request.source_id == "4534464625"
+        assert first_request.source_node_id == "PRR_kwDOReviewSummary"
+        assert second_content == "+1"
+        assert second_request.source_kind == "review_comment"
+        assert second_request.source_id == "3443862311"
+
+    @pytest.mark.asyncio
+    async def test_github_pr_amend_reaction_transition_deletes_authenticated_user_status(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD)
+        endpoint = "repos/reserve-protocol/reserve-index-dtf/issues/comments/4700001/reactions"
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            if argv == ["gh", "api", endpoint, "-H", "Accept: application/vnd.github+json", "-H", "X-GitHub-Api-Version: 2022-11-28"]:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=json.dumps(
+                        [
+                            {"id": 10, "content": "eyes", "user": {"type": "User", "login": "sligo-droid"}},
+                            {"id": 11, "content": "eyes", "user": {"type": "User", "login": "tbrent"}},
+                            {"id": 12, "content": "rocket", "user": {"type": "Bot", "login": "third-party-bot"}},
+                        ]
+                    ),
+                    stderr="",
+                )
+            if argv == ["gh", "api", "user"]:
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"login": "sligo-droid"}), stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+        with patch("gateway.platforms.webhook.subprocess.run", side_effect=fake_run):
+            assert await adapter._add_github_pr_amend_reaction(request, "rocket") is True
+
+        assert [call[:5] for call in calls if len(call) >= 5 and call[0:4] == ["gh", "api", "-X", "DELETE"]] == [
+            ["gh", "api", "-X", "DELETE", f"{endpoint}/10"]
+        ]
+        assert calls[-1][0:4] == ["gh", "api", "-X", "POST"]
+        assert "content=rocket" in calls[-1]
 
     @pytest.mark.asyncio
     async def test_github_pr_amend_reaction_list_failure_still_posts(self):
