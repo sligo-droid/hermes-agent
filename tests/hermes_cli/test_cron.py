@@ -5,6 +5,7 @@ from argparse import Namespace
 import pytest
 
 from cron.jobs import create_job, get_job, list_jobs, resume_job, update_job
+from hermes_cli.gateway import GatewayRuntimeHealth
 from hermes_cli.cron import _print_overdue_proposal_findings, cron_command, cron_list, cron_status
 
 
@@ -113,7 +114,10 @@ class TestCronCommandLifecycle:
         assert jobs[0]["profile"] == "default"
 
     def test_list_renders_terminal_auto_pause_metadata(self, tmp_cron_dir, capsys, monkeypatch):
-        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [123])
+        monkeypatch.setattr(
+            "hermes_cli.gateway.get_gateway_runtime_health",
+            lambda: GatewayRuntimeHealth(True, "process", pid=123),
+        )
         job = create_job(prompt="", schedule="every 1h", script="finite.sh", no_agent=True)
         update_job(
             job["id"],
@@ -134,7 +138,10 @@ class TestCronCommandLifecycle:
         assert "/tmp/terminal.md" in out
 
     def test_status_renders_terminal_auto_paused_jobs(self, tmp_cron_dir, capsys, monkeypatch):
-        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        monkeypatch.setattr(
+            "hermes_cli.gateway.get_gateway_runtime_health",
+            lambda: GatewayRuntimeHealth(False, "none"),
+        )
         monkeypatch.setattr("cron.jobs.audit_overdue_self_improvement_proposals", lambda: [])
         job = create_job(prompt="", schedule="every 1h", script="finite.sh", no_agent=True)
         update_job(
@@ -155,7 +162,10 @@ class TestCronCommandLifecycle:
         assert "/tmp/terminal.md" in out
 
     def test_status_ignores_resumed_terminal_success_jobs(self, tmp_cron_dir, capsys, monkeypatch):
-        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        monkeypatch.setattr(
+            "hermes_cli.gateway.get_gateway_runtime_health",
+            lambda: GatewayRuntimeHealth(False, "none"),
+        )
         monkeypatch.setattr("cron.jobs.audit_overdue_self_improvement_proposals", lambda: [])
         job = create_job(prompt="", schedule="every 1h", script="finite.sh", no_agent=True)
         update_job(
@@ -177,7 +187,10 @@ class TestCronCommandLifecycle:
         assert "/tmp/terminal.md" not in out
 
     def test_list_all_keeps_terminal_output_for_resumed_jobs(self, tmp_cron_dir, capsys, monkeypatch):
-        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [123])
+        monkeypatch.setattr(
+            "hermes_cli.gateway.get_gateway_runtime_health",
+            lambda: GatewayRuntimeHealth(True, "process", pid=123),
+        )
         job = create_job(prompt="", schedule="every 1h", script="finite.sh", no_agent=True)
         update_job(
             job["id"],
@@ -197,6 +210,28 @@ class TestCronCommandLifecycle:
         assert "[active]" in out
         assert "Paused:" not in out
         assert "Terminal output: /tmp/terminal.md" in out
+
+    def test_status_uses_fresh_runtime_heartbeat_when_pid_is_not_visible(self, tmp_cron_dir, capsys, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.gateway.get_gateway_runtime_health",
+            lambda: GatewayRuntimeHealth(
+                True,
+                "runtime_heartbeat",
+                pid=1167299,
+                gateway_state="running",
+                active_agents=4,
+            ),
+        )
+        monkeypatch.setattr("cron.jobs.audit_overdue_self_improvement_proposals", lambda: [])
+        create_job(prompt="", schedule="every 1h")
+
+        cron_status()
+
+        out = capsys.readouterr().out
+        assert "Gateway is running" in out
+        assert "Runtime heartbeat: running (PID: 1167299)" in out
+        assert "Process/service not visible from this namespace" in out
+        assert "Gateway is not running" not in out
 
 
 def test_overdue_proposal_findings_render_operator_evidence(capsys):

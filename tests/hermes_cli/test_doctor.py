@@ -91,6 +91,33 @@ def test_doctor_gateway_memory_telemetry_reports_children(monkeypatch, capsys):
     assert "token=[redacted]" in output
 
 
+def test_doctor_gateway_memory_telemetry_distinguishes_fresh_heartbeat(monkeypatch, capsys):
+    monkeypatch.setattr(
+        gateway_cli,
+        "get_gateway_runtime_snapshot",
+        lambda: gateway_cli.GatewayRuntimeSnapshot(
+            manager="manual process",
+            gateway_pids=(),
+        ),
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "get_gateway_runtime_health",
+        lambda: gateway_cli.GatewayRuntimeHealth(
+            True,
+            "runtime_heartbeat",
+            pid=1167299,
+            gateway_state="running",
+        ),
+    )
+
+    doctor._check_gateway_memory_telemetry()
+
+    output = capsys.readouterr().out
+    assert "gateway heartbeat fresh" in output
+    assert "gateway not running" not in output
+
+
 class TestDoctorEnvFileEncoding:
     """Regression for #18637 (bug 3): `hermes doctor` crashed on Windows
     Chinese locale (GBK) because `.env` was read with Path.read_text() which

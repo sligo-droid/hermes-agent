@@ -313,7 +313,7 @@ def _check_gateway_memory_telemetry() -> None:
             collect_gateway_memory_telemetry,
             format_gateway_memory_lines,
         )
-        from hermes_cli.gateway import get_gateway_runtime_snapshot
+        from hermes_cli.gateway import get_gateway_runtime_health, get_gateway_runtime_snapshot
     except Exception as exc:
         check_warn("Gateway memory telemetry", f"(could not import helpers: {exc})")
         return
@@ -322,7 +322,14 @@ def _check_gateway_memory_telemetry() -> None:
         snapshot = get_gateway_runtime_snapshot()
         pids = tuple(pid for pid in snapshot.gateway_pids if pid > 0)
         if not pids:
-            check_info("Gateway memory telemetry unavailable (gateway not running)")
+            health = get_gateway_runtime_health()
+            if health.running and health.source == "runtime_heartbeat":
+                check_info(
+                    "Gateway memory telemetry unavailable "
+                    "(gateway heartbeat fresh; process not visible from this namespace)"
+                )
+            else:
+                check_info("Gateway memory telemetry unavailable (gateway not running)")
             return
         telemetry = collect_gateway_memory_telemetry(pids)
         lines = format_gateway_memory_lines(telemetry)
