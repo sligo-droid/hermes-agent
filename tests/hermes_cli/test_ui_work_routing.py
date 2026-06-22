@@ -120,6 +120,30 @@ def test_visual_keywords_without_route_are_advisory_only():
     assert codex_ui_work_extra_args(decision) == []
 
 
+def test_command_center_polish_smoke_is_visual_advisory_only_without_route():
+    decision = resolve_ui_work_route(
+        _cfg(),
+        task="Smoke-test UI specialist route on Command Center polish.",
+    )
+
+    assert decision.matched is False
+    assert decision.selected_route == "default_coding_worker"
+    assert decision.advisory_matched is True
+    assert "visual ui work" in decision.advisory_reason
+    assert "polish" in decision.advisory_reason
+
+
+def test_non_visual_command_center_smoke_still_does_not_route():
+    decision = resolve_ui_work_route(
+        _cfg(),
+        task="Smoke-test Command Center backend API routing.",
+    )
+
+    assert decision.matched is False
+    assert decision.advisory_matched is False
+    assert "negative keyword" in decision.advisory_reason
+
+
 def test_negative_backend_only_overrides_ui_keyword():
     decision = resolve_ui_work_route(
         _cfg(),
