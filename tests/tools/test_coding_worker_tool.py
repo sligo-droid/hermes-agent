@@ -291,6 +291,42 @@ def test_ui_work_uses_codex_model_overlay(monkeypatch, tmp_path):
     ]
 
 
+def test_ui_work_smoke_title_uses_codex_model_overlay(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["backend"] = "codex"
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Smoke-test UI specialist route on Command Center polish.",
+            context="This is Command Center visual polish work; verify the UI specialist route.",
+            route_decision={"route": "ui_visual_specialist"},
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    route = result["ui_work_route"]
+    assert route["matched"] is True
+    assert route["selected_route"] == "ui_visual_specialist"
+    assert route["selected_provider"] == "openrouter"
+    assert route["selected_model"] == "z-ai/glm-5.2"
+    assert route["advisory_matched"] is True
+    assert "visual ui work" in route["advisory_reason"]
+    assert FakeSession.instances[0].kwargs["extra_args"][:4] == [
+        "-c",
+        'model_provider="openrouter"',
+        "-c",
+        'model="z-ai/glm-5.2"',
+    ]
+
+
 def test_explicit_default_route_keeps_default_codex_despite_visual_keywords(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []

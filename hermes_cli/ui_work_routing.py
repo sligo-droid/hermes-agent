@@ -132,6 +132,19 @@ _DEFAULT_VISUAL_INTENT_KEYWORDS = [
     "design system",
 ]
 
+_SOFT_VERIFICATION_NEGATIVE_KEYWORDS = {
+    "smoke",
+    "verify",
+    "validation",
+    "screenshot",
+    "visual check",
+    "test",
+    "tests",
+    "pytest",
+    "unit test",
+    "regression",
+}
+
 
 @dataclass(frozen=True)
 class UIWorkRouteDecision:
@@ -353,19 +366,21 @@ def _classify_ui_work(
 
     body_text = _normalize_text(title, task, context)
 
-    negative = _first_match(body_text, negative_keywords)
-    if negative:
-        return False, f"negative keyword: {negative}"
-
     # CWD/project names are deliberately not positive evidence: repository names
     # like PID or Command Center should not route backend, docs, test, or review
     # work to the visual specialist model.
+    negative = _first_match(body_text, negative_keywords)
+    visual_intent = _first_match(body_text, visual_intent_keywords)
+    if negative and not (
+        negative in _SOFT_VERIFICATION_NEGATIVE_KEYWORDS and visual_intent
+    ):
+        return False, f"negative keyword: {negative}"
+
     action = _first_match(body_text, action_keywords)
     if not action:
         return False, "no visual ui action"
 
     non_visual_domain = _first_match(body_text, non_visual_domain_keywords)
-    visual_intent = _first_match(body_text, visual_intent_keywords)
     if non_visual_domain and not visual_intent:
         return False, f"non-visual domain keyword: {non_visual_domain}"
 
