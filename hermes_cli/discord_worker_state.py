@@ -206,6 +206,7 @@ def record_codex_worker_result(
         "run_profile": getattr(result, "run_profile", {}),
         "service_tier": getattr(result, "service_tier", None),
         "fast_mode": getattr(result, "fast_mode", None),
+        "ui_work_route": getattr(result, "ui_work_route", None),
     }
     write_codex_worker_state(
         task_id,

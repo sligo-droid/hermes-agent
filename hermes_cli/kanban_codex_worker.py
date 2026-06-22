@@ -44,6 +44,11 @@ from hermes_cli.github_remote import (
     github_repo_from_value,
 )
 from hermes_cli.pr_body_format import check_project_state_requirement
+from hermes_cli.ui_work_routing import (
+    UIWorkRouteDecision,
+    codex_ui_work_extra_args,
+    resolve_ui_work_route,
+)
 from hermes_cli.worker_autoreview import materialize_autoreview_helper
 
 _OPENCODE_ROLES = {ROLE_PLANNER, ROLE_DEV, ROLE_REVIEWER}
@@ -76,6 +81,10 @@ _CODE_CHANGE_SIGNAL_RE = re.compile(
     r"update\s+(?:code|tests?|docs?|files?)|failing\s+(?:test|check|ci)|"
     r"test\s+failure|lint\s+failure|type\s+error|regression|bug"
     r")\b",
+    re.IGNORECASE,
+)
+_PLANNER_ROUTE_DECISION_RE = re.compile(
+    r"(?:recorded\s+planner\s+route\s+decision(?:\s+for\s+this\s+ticket)?|route_decision)\s*[:=]\s*(\{[^\n]*\})",
     re.IGNORECASE,
 )
 _KANBAN_ACTIVITY_HEARTBEAT_INTERVAL_SECONDS = 10
@@ -1116,6 +1125,118 @@ def _restore_environ(old_values: dict[str, Optional[str]]) -> None:
             os.environ[key] = old
 
 
+def _extract_task_route_decision(task: Any) -> Any:
+    explicit = getattr(task, "route_decision", None)
+    if explicit:
+        return explicit
+    text = "\n".join(
+        str(part or "")
+        for part in (
+            getattr(task, "title", ""),
+            getattr(task, "body", ""),
+        )
+    )
+    for match in _PLANNER_ROUTE_DECISION_RE.finditer(text):
+        raw = match.group(1).strip()
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and parsed.get("route"):
+            parsed.setdefault("source", "planner")
+            return parsed
+    return None
+
+
+def _resolve_task_ui_work_route(
+    task: Any,
+    role: str,
+    *,
+    workspace: str,
+    backend: str,
+) -> UIWorkRouteDecision | None:
+    if role != ROLE_DEV:
+        return None
+    route_decision = _extract_task_route_decision(task)
+    if not route_decision:
+        return None
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    decision = resolve_ui_work_route(
+        cfg,
+        title=str(getattr(task, "title", "") or ""),
+        task=str(getattr(task, "body", "") or ""),
+        context=str(getattr(task, "result", "") or ""),
+        cwd=workspace,
+        backend=backend,
+        route_decision=route_decision,
+    )
+    if not decision.matched and decision.selected_route == "default_coding_worker":
+        return None
+    return decision
+
+
+def _ui_work_route_env(decision: UIWorkRouteDecision | None) -> dict[str, str]:
+    if decision is None:
+        return {}
+    metadata = decision.metadata()
+    values = {
+        "HERMES_UI_WORK_ROUTE": metadata.get("selected_route"),
+        "HERMES_UI_WORK_ROUTE_DECISION": metadata.get("route_decision"),
+        "HERMES_UI_WORK_ROUTE_DECISION_SOURCE": metadata.get("route_decision_source"),
+        "HERMES_UI_WORK_ROUTE_DECISION_RATIONALE": metadata.get("route_decision_rationale"),
+        "HERMES_UI_WORK_SELECTED_PROVIDER": metadata.get("selected_provider"),
+        "HERMES_UI_WORK_SELECTED_MODEL": metadata.get("selected_model"),
+        "HERMES_UI_WORK_FALLBACK_USED": str(bool(metadata.get("fallback_used"))).lower(),
+    }
+    return {key: str(value) for key, value in values.items() if value not in (None, "")}
+
+
+def _ui_work_route_prompt(decision: UIWorkRouteDecision | None) -> str:
+    if decision is None:
+        return ""
+    metadata = decision.metadata()
+    return (
+        "UI specialist route metadata for this worker launch:\n"
+        f"- selected_route: {metadata.get('selected_route') or ''}\n"
+        f"- selected_provider: {metadata.get('selected_provider') or ''}\n"
+        f"- selected_model: {metadata.get('selected_model') or ''}\n"
+        f"- route_decision_source: {metadata.get('route_decision_source') or ''}\n"
+        f"- route_decision_rationale: {metadata.get('route_decision_rationale') or ''}\n"
+        f"- advisory_reason: {metadata.get('advisory_reason') or ''}\n"
+        "This is structured launch evidence; include it in route-smoke verification instead of re-inferring the route from prose.\n"
+    )
+
+
+def _record_ui_work_route(task_id: str, *, board: Optional[str], decision: UIWorkRouteDecision | None) -> None:
+    if decision is None:
+        return
+    try:
+        record_codex_worker_event(
+            task_id,
+            board=board,
+            event={
+                "method": "ui_work_route/decision",
+                "params": {"route": decision.metadata()},
+            },
+        )
+    except Exception:
+        pass
+
+
+def _attach_ui_work_route(result: Any, decision: UIWorkRouteDecision | None) -> None:
+    if decision is None:
+        return
+    try:
+        setattr(result, "ui_work_route", decision.metadata())
+    except Exception:
+        pass
+
+
 def _run_role_backend(
     prompt: str,
     workspace: str,
@@ -1128,9 +1249,35 @@ def _run_role_backend(
     materialization_note = _materialize_role_autoreview(workspace, role)
     if materialization_note:
         prompt = f"{prompt.rstrip()}\n\n{materialization_note}\n"
-    if _role_uses_opencode(role, task):
-        return _run_opencode(prompt, workspace, role, task=task, task_id=task_id, board=board)
-    return _run_codex(prompt, workspace, role, task_id=task_id, board=board)
+    uses_opencode = _role_uses_opencode(role, task)
+    ui_work_route = _resolve_task_ui_work_route(
+        task,
+        role,
+        workspace=workspace,
+        backend="opencode" if uses_opencode else "codex",
+    )
+    route_prompt = _ui_work_route_prompt(ui_work_route)
+    if route_prompt:
+        prompt = f"{prompt.rstrip()}\n\n{route_prompt}"
+    _record_ui_work_route(task_id, board=board, decision=ui_work_route)
+    if uses_opencode:
+        return _run_opencode(
+            prompt,
+            workspace,
+            role,
+            task=task,
+            task_id=task_id,
+            board=board,
+            ui_work_route=ui_work_route,
+        )
+    return _run_codex(
+        prompt,
+        workspace,
+        role,
+        task_id=task_id,
+        board=board,
+        ui_work_route=ui_work_route,
+    )
 
 
 def _materialize_role_autoreview(workspace: str, role: str) -> str:
@@ -1148,8 +1295,11 @@ def _run_codex(
     *,
     task_id: str,
     board: Optional[str],
+    ui_work_route: UIWorkRouteDecision | None = None,
 ):
     extra_args = _role_extra_args(role)
+    if ui_work_route is not None:
+        extra_args.extend(codex_ui_work_extra_args(ui_work_route))
 
     def on_event(note: dict) -> None:
         try:
@@ -1159,7 +1309,7 @@ def _run_codex(
         _heartbeat_worker_activity(task_id, board=board)
 
     guard_env, guard_dir = _role_pr_mutation_guard_env(role)
-    runtime_env = {**guard_env, **_role_read_only_discord_env(role)}
+    runtime_env = {**guard_env, **_role_read_only_discord_env(role), **_ui_work_route_env(ui_work_route)}
     try:
         attempt = 0
         while True:
@@ -1182,6 +1332,7 @@ def _run_codex(
             try:
                 result = session.run_turn(prompt, turn_timeout=_role_timeout(role))
                 _attach_scheduled_runtime(result, role)
+                _attach_ui_work_route(result, ui_work_route)
                 try:
                     record_codex_worker_result(task_id, board=board, result=result)
                 except Exception:
@@ -1271,6 +1422,7 @@ def _run_opencode(
     task: Any,
     task_id: str,
     board: Optional[str],
+    ui_work_route: UIWorkRouteDecision | None = None,
 ):
     def on_event(note: dict) -> None:
         try:
@@ -1301,7 +1453,7 @@ def _run_opencode(
         )
     )
     guard_env, guard_dir = _role_pr_mutation_guard_env(role)
-    runtime_env = {**guard_env, **_role_read_only_discord_env(role)}
+    runtime_env = {**guard_env, **_role_read_only_discord_env(role), **_ui_work_route_env(ui_work_route)}
     old_env = {key: os.environ.get(key) for key in runtime_env}
     os.environ.update(runtime_env)
     try:
@@ -1335,6 +1487,7 @@ def _run_opencode(
         _restore_environ(old_env)
         _cleanup_pr_mutation_guard(guard_dir)
     _attach_scheduled_runtime(result, role)
+    _attach_ui_work_route(result, ui_work_route)
     try:
         record_codex_worker_result(task_id, board=board, result=result)
     except Exception:

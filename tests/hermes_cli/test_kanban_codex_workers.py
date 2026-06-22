@@ -3666,6 +3666,118 @@ def test_run_codex_records_app_server_state(monkeypatch, tmp_path):
     assert "[REDACTED_PATH]" in rendered
 
 
+def test_dev_role_backend_records_planner_ui_route_decision(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import config as config_mod
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.config import DEFAULT_CONFIG
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    monkeypatch.setattr(config_mod, "load_config", lambda: cfg)
+    monkeypatch.setattr(worker, "_role_uses_opencode", lambda role, task: False)
+    monkeypatch.setattr(worker, "_materialize_role_autoreview", lambda workspace, role: "")
+    events = []
+    captured = {}
+
+    def fake_event(task_id, *, board, event):
+        events.append(event)
+
+    def fake_run_codex(prompt, workspace, role, *, task_id, board, ui_work_route=None):
+        captured.update(
+            {
+                "prompt": prompt,
+                "workspace": workspace,
+                "role": role,
+                "task_id": task_id,
+                "board": board,
+                "ui_work_route": ui_work_route,
+            }
+        )
+        return SimpleNamespace(final_text="{}", error=None)
+
+    monkeypatch.setattr(worker, "record_codex_worker_event", fake_event)
+    monkeypatch.setattr(worker, "_run_codex", fake_run_codex)
+
+    task = SimpleNamespace(
+        title="R1: Smoke ui_visual_specialist route with tiny Command Center visual polish",
+        body='Recorded planner route decision for this ticket: {"route":"ui_visual_specialist","rationale":"Command Center visual polish smoke"}',
+        result=None,
+    )
+
+    worker._run_role_backend("prompt", str(tmp_path), ROLE_DEV, task=task, task_id="t-ui", board="b-ui")
+
+    route = captured["ui_work_route"].metadata()
+    assert route["selected_route"] == "ui_visual_specialist"
+    assert route["selected_provider"] == "openrouter"
+    assert route["selected_model"] == "z-ai/glm-5.2"
+    assert route["route_decision_source"] == "planner"
+    assert "selected_route: ui_visual_specialist" in captured["prompt"]
+    assert "selected_model: z-ai/glm-5.2" in captured["prompt"]
+    assert events[0]["method"] == "ui_work_route/decision"
+    assert events[0]["params"]["route"]["selected_model"] == "z-ai/glm-5.2"
+
+
+def test_run_codex_applies_ui_route_args_env_and_result_metadata(monkeypatch, tmp_path):
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli.config import DEFAULT_CONFIG
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+    from hermes_cli.ui_work_routing import resolve_ui_work_route
+
+    board, task = _claimed_planner(monkeypatch, tmp_path)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    decision = resolve_ui_work_route(
+        DEFAULT_CONFIG,
+        task="Implement Command Center visual polish.",
+        backend="codex",
+        route_decision={"route": "ui_visual_specialist", "rationale": "visual polish"},
+    )
+    sessions = []
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            sessions.append(kwargs)
+
+        def run_turn(self, prompt, turn_timeout):
+            return SimpleNamespace(
+                final_text='{"status":"completed","summary":"ok","changed_files":[],"tests":[]}',
+                error=None,
+                interrupted=False,
+                timed_out=False,
+                should_retire=False,
+                tool_iterations=1,
+                turn_id="turn-ui",
+                thread_id="thread-ui",
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(worker, "CodexAppServerSession", FakeSession)
+
+    result = worker._run_codex(
+        "prompt",
+        str(workspace),
+        ROLE_DEV,
+        task_id=task.id,
+        board=board.slug,
+        ui_work_route=decision,
+    )
+
+    args = sessions[0]["extra_args"]
+    env = sessions[0]["env"]
+    assert 'model_provider="openrouter"' in args
+    assert 'model="z-ai/glm-5.2"' in args
+    assert env["HERMES_UI_WORK_ROUTE"] == "ui_visual_specialist"
+    assert env["HERMES_UI_WORK_SELECTED_PROVIDER"] == "openrouter"
+    assert env["HERMES_UI_WORK_SELECTED_MODEL"] == "z-ai/glm-5.2"
+    assert getattr(result, "ui_work_route")["selected_route"] == "ui_visual_specialist"
+    state = dwb.ticket_state_for_session("9001", task.id)["codex_state"]
+    assert state["result"]["ui_work_route"]["selected_provider"] == "openrouter"
+
+
 def test_kanban_backend_child_env_scrubs_control_vars_without_mutating_role_env(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_worker as worker
 
