@@ -1519,11 +1519,22 @@ def get_service_name() -> str:
 
 
 
+def _os_user_home() -> Path:
+    """Return the real OS account home, ignoring Hermes' subprocess HOME override."""
+    try:
+        import pwd
+
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except Exception:
+        home = os.path.expanduser("~")
+    return Path(home).expanduser()
+
+
 def get_systemd_unit_path(system: bool = False) -> Path:
     name = get_service_name()
     if system:
         return Path("/etc/systemd/system") / f"{name}.service"
-    return Path.home() / ".config" / "systemd" / "user" / f"{name}.service"
+    return _os_user_home() / ".config" / "systemd" / "user" / f"{name}.service"
 
 
 class UserSystemdUnavailableError(RuntimeError):
@@ -1790,7 +1801,7 @@ def _legacy_unit_search_paths() -> list[tuple[bool, Path]]:
     real filesystem paths.
     """
     return [
-        (False, Path.home() / ".config" / "systemd" / "user"),
+        (False, _os_user_home() / ".config" / "systemd" / "user"),
         (True, Path("/etc/systemd/system")),
     ]
 

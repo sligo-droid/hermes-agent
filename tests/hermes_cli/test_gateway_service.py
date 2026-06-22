@@ -17,6 +17,28 @@ from gateway.restart import (
 )
 
 
+class TestSystemdUserUnitPaths:
+    def test_user_unit_path_uses_os_home_not_subprocess_home_override(self, monkeypatch, tmp_path):
+        real_home = tmp_path / "real-home"
+        hermes_subprocess_home = tmp_path / "hermes-home" / "home"
+        monkeypatch.setenv("HOME", str(hermes_subprocess_home))
+        monkeypatch.setattr(gateway_cli, "_os_user_home", lambda: real_home)
+
+        path = gateway_cli.get_systemd_unit_path(system=False)
+
+        assert path == real_home / ".config" / "systemd" / "user" / "hermes-gateway.service"
+
+    def test_legacy_unit_search_uses_os_home_not_subprocess_home_override(self, monkeypatch, tmp_path):
+        real_home = tmp_path / "real-home"
+        hermes_subprocess_home = tmp_path / "hermes-home" / "home"
+        monkeypatch.setenv("HOME", str(hermes_subprocess_home))
+        monkeypatch.setattr(gateway_cli, "_os_user_home", lambda: real_home)
+
+        paths = gateway_cli._legacy_unit_search_paths()
+
+        assert paths[0] == (False, real_home / ".config" / "systemd" / "user")
+
+
 class TestUserSystemdPrivateSocketPreflight:
     def test_preflight_accepts_private_socket_without_dbus_bus(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "_ensure_user_systemd_env", lambda: None)
