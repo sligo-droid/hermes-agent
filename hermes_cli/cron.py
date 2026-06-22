@@ -124,8 +124,8 @@ def cron_list(show_all: bool = False):
 
         print()
 
-    from hermes_cli.gateway import find_gateway_pids
-    if not find_gateway_pids():
+    from hermes_cli.gateway import get_gateway_runtime_health
+    if not get_gateway_runtime_health().running:
         print(color("  ⚠  Gateway is not running — jobs won't fire automatically.", Colors.YELLOW))
         print(color("     Start it with: hermes gateway install", Colors.DIM))
         print(color("                    sudo hermes gateway install --system  # Linux servers", Colors.DIM))
@@ -173,14 +173,18 @@ def cron_tick():
 def cron_status():
     """Show cron execution status."""
     from cron.jobs import audit_overdue_self_improvement_proposals, list_jobs
-    from hermes_cli.gateway import find_gateway_pids
+    from hermes_cli.gateway import get_gateway_runtime_health
 
     print()
 
-    pids = find_gateway_pids()
-    if pids:
+    health = get_gateway_runtime_health()
+    if health.running:
         print(color("✓ Gateway is running — cron jobs will fire automatically", Colors.GREEN))
-        print(f"  PID: {', '.join(map(str, pids))}")
+        if health.source == "runtime_heartbeat":
+            print(f"  Runtime heartbeat: {health.gateway_state} (PID: {health.pid or 'unknown'})")
+            print("  Process/service not visible from this namespace; using fresh profile runtime status.")
+        elif health.pid:
+            print(f"  PID: {health.pid}")
     else:
         print(color("✗ Gateway is not running — cron jobs will NOT fire", Colors.RED))
         print()

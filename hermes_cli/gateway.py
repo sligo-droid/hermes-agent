@@ -5,6 +5,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
 import asyncio
+import datetime as dt
 import logging
 import os
 import shutil
@@ -62,6 +63,17 @@ class GatewayRuntimeSnapshot:
     @property
     def has_process_service_mismatch(self) -> bool:
         return self.service_installed and self.running and not self.service_running
+
+
+@dataclass(frozen=True)
+class GatewayRuntimeHealth:
+    running: bool
+    source: str
+    pid: int | None = None
+    updated_at: str | None = None
+    age_seconds: float | None = None
+    gateway_state: str | None = None
+    active_agents: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1095,6 +1107,90 @@ def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot
     return GatewayRuntimeSnapshot(
         manager="manual process",
         gateway_pids=gateway_pids,
+    )
+
+
+def _parse_runtime_updated_at(value: object) -> dt.datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def get_gateway_runtime_health(
+    *,
+    system: bool = False,
+    heartbeat_max_age_seconds: int = 900,
+) -> GatewayRuntimeHealth:
+    """Return gateway liveness, falling back to a fresh runtime heartbeat.
+
+    Some diagnostics run inside PID namespaces where the host gateway process
+    and systemd service are not visible. In that case a fresh profile-scoped
+    ``gateway_state.json`` heartbeat is stronger evidence than an empty local
+    process scan, but only while it is recent enough to avoid hiding real stops.
+    """
+    snapshot = get_gateway_runtime_snapshot(system=system)
+    if snapshot.running:
+        pids = [pid for pid in snapshot.gateway_pids if pid > 0]
+        return GatewayRuntimeHealth(
+            running=True,
+            source="process",
+            pid=pids[0] if pids else None,
+        )
+
+    try:
+        from gateway.status import read_runtime_status
+    except Exception:
+        return GatewayRuntimeHealth(running=False, source="none")
+
+    state = read_runtime_status() or {}
+    gateway_state = state.get("gateway_state")
+    updated_at = state.get("updated_at")
+    updated_dt = _parse_runtime_updated_at(updated_at)
+    age_seconds: float | None = None
+    if updated_dt is not None:
+        age_seconds = (dt.datetime.now(dt.timezone.utc) - updated_dt).total_seconds()
+
+    heartbeat_running = (
+        gateway_state in {"running", "degraded", "draining"}
+        and age_seconds is not None
+        and 0 <= age_seconds <= heartbeat_max_age_seconds
+    )
+    if not heartbeat_running:
+        return GatewayRuntimeHealth(
+            running=False,
+            source="none",
+            updated_at=updated_at if isinstance(updated_at, str) else None,
+            age_seconds=age_seconds,
+            gateway_state=gateway_state if isinstance(gateway_state, str) else None,
+        )
+
+    pid = state.get("pid")
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        pid = None
+    active_agents = state.get("active_agents")
+    try:
+        active_agents = int(active_agents)
+    except (TypeError, ValueError):
+        active_agents = None
+    return GatewayRuntimeHealth(
+        running=True,
+        source="runtime_heartbeat",
+        pid=pid,
+        updated_at=updated_at if isinstance(updated_at, str) else None,
+        age_seconds=age_seconds,
+        gateway_state=gateway_state if isinstance(gateway_state, str) else None,
+        active_agents=active_agents,
     )
 
 
@@ -5800,26 +5896,33 @@ def _gateway_command_inner(args):
                     print("  hermes gateway install")
                     print("  sudo hermes gateway install --system")
             else:
-                print("✗ Gateway is not running")
-                runtime_lines = _runtime_health_lines()
-                if runtime_lines:
-                    print()
-                    print("Recent gateway health:")
-                    for line in runtime_lines:
-                        print(f"  {line}")
-                print()
-                print("To start:")
-                print("  hermes gateway run      # Run in foreground")
-                if is_termux():
-                    print("  nohup hermes gateway run > ~/.hermes/logs/gateway.log 2>&1 &  # Best-effort background start")
-                elif is_wsl():
-                    print("  tmux new -s hermes 'hermes gateway run'         # persistent via tmux")
-                    print("  nohup hermes gateway run > ~/.hermes/logs/gateway.log 2>&1 &  # background")
-                elif is_windows():
-                    print("  hermes gateway install  # Install as Windows Scheduled Task (auto-start on login)")
+                health = get_gateway_runtime_health(system=system)
+                if health.running and health.source == "runtime_heartbeat":
+                    print(f"✓ Gateway is running (runtime heartbeat: {health.gateway_state})")
+                    print(f"  PID: {health.pid or 'unknown'}")
+                    print("  Process/service not visible from this namespace; using fresh profile runtime status.")
+                    print("  (Running manually, process-managed, or outside this process namespace)")
                 else:
-                    print("  hermes gateway install  # Install as user service")
-                    print("  sudo hermes gateway install --system  # Install as boot-time system service")
+                    print("✗ Gateway is not running")
+                    runtime_lines = _runtime_health_lines()
+                    if runtime_lines:
+                        print()
+                        print("Recent gateway health:")
+                        for line in runtime_lines:
+                            print(f"  {line}")
+                    print()
+                    print("To start:")
+                    print("  hermes gateway run      # Run in foreground")
+                    if is_termux():
+                        print("  nohup hermes gateway run > ~/.hermes/logs/gateway.log 2>&1 &  # Best-effort background start")
+                    elif is_wsl():
+                        print("  tmux new -s hermes 'hermes gateway run'         # persistent via tmux")
+                        print("  nohup hermes gateway run > ~/.hermes/logs/gateway.log 2>&1 &  # background")
+                    elif is_windows():
+                        print("  hermes gateway install  # Install as Windows Scheduled Task (auto-start on login)")
+                    else:
+                        print("  hermes gateway install  # Install as user service")
+                        print("  sudo hermes gateway install --system  # Install as boot-time system service")
 
         # Show other profiles' gateway status for multi-profile awareness
         _print_other_profiles_gateway_status()

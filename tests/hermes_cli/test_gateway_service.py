@@ -1268,6 +1268,57 @@ class TestGatewaySystemServiceRouting:
         assert "Gateway process is running for this profile" in out
         assert "PID(s): 4321" in out
 
+    def test_gateway_runtime_health_accepts_fresh_heartbeat_when_pid_hidden(self, monkeypatch):
+        from datetime import datetime, timezone
+
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_gateway_runtime_snapshot",
+            lambda system=False: gateway_cli.GatewayRuntimeSnapshot(
+                manager="manual process",
+                gateway_pids=(),
+            ),
+        )
+        monkeypatch.setattr(
+            "gateway.status.read_runtime_status",
+            lambda: {
+                "gateway_state": "running",
+                "pid": 1167299,
+                "active_agents": 4,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+        health = gateway_cli.get_gateway_runtime_health()
+
+        assert health.running is True
+        assert health.source == "runtime_heartbeat"
+        assert health.pid == 1167299
+        assert health.active_agents == 4
+
+    def test_gateway_runtime_health_rejects_stale_heartbeat_when_pid_hidden(self, monkeypatch):
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_gateway_runtime_snapshot",
+            lambda system=False: gateway_cli.GatewayRuntimeSnapshot(
+                manager="manual process",
+                gateway_pids=(),
+            ),
+        )
+        monkeypatch.setattr(
+            "gateway.status.read_runtime_status",
+            lambda: {
+                "gateway_state": "running",
+                "pid": 1167299,
+                "updated_at": "2026-01-01T00:00:00+00:00",
+            },
+        )
+
+        health = gateway_cli.get_gateway_runtime_health(heartbeat_max_age_seconds=1)
+
+        assert health.running is False
+        assert health.gateway_state == "running"
+
     def test_gateway_status_on_termux_shows_manual_guidance(self, monkeypatch, capsys):
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_termux", lambda: True)
@@ -1281,6 +1332,39 @@ class TestGatewaySystemServiceRouting:
         assert "Gateway is not running" in out
         assert "nohup hermes gateway" in out
         assert "install as user service" not in out
+
+    def test_gateway_status_uses_fresh_heartbeat_when_pid_hidden(self, monkeypatch, capsys):
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_wsl", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_gateway_runtime_snapshot",
+            lambda system=False: gateway_cli.GatewayRuntimeSnapshot(
+                manager="manual process",
+                gateway_pids=(),
+            ),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_gateway_runtime_health",
+            lambda system=False: gateway_cli.GatewayRuntimeHealth(
+                True,
+                "runtime_heartbeat",
+                pid=1167299,
+                gateway_state="running",
+            ),
+        )
+
+        gateway_cli.gateway_command(SimpleNamespace(gateway_command="status", deep=False, system=False))
+
+        out = capsys.readouterr().out
+        assert "Gateway is running (runtime heartbeat: running)" in out
+        assert "PID: 1167299" in out
+        assert "Process/service not visible from this namespace" in out
+        assert "Gateway is not running" not in out
 
     def test_gateway_restart_does_not_fallback_to_foreground_when_launchd_restart_fails(self, tmp_path, monkeypatch):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
