@@ -12,7 +12,7 @@ import json
 import logging
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -31,6 +31,11 @@ _ALLOWED_EVENTS_DEFAULT = {
 }
 
 _IMPLICIT_PR_AUTHOR_EVENTS = {"pull_request_review", "pull_request_review_comment"}
+_CHANGES_REQUESTED_STATE = "CHANGES_REQUESTED"
+
+
+def _normalize_review_state(value: Any) -> str:
+    return str(value or "").strip().upper()
 
 
 @dataclass(frozen=True)
@@ -342,6 +347,21 @@ def preflight_request(
         if request.pr_number not in allowed_numbers:
             return f"PR #{request.pr_number} is outside canary allowlist"
 
+    if request.event_type == "issue_comment":
+        return "issue_comment is not a changes-requested review signal"
+
+    if request.event_type == "pull_request_review":
+        review_state = _normalize_review_state(request.review_state)
+        if review_state != _CHANGES_REQUESTED_STATE:
+            return f"review state '{review_state or 'unknown'}' is not {_CHANGES_REQUESTED_STATE}"
+
+    if request.event_type == "pull_request_review_comment":
+        if not request.review_id:
+            return "review_comment is missing pull_request_review_id"
+        review_state = _normalize_review_state(request.review_state)
+        if review_state and review_state != _CHANGES_REQUESTED_STATE:
+            return f"parent review state '{review_state}' is not {_CHANGES_REQUESTED_STATE}"
+
     if policy.mention.lower() not in request.body.lower():
         expected_pr_author = policy.mention.lstrip("@").lower()
         if request.event_type not in _IMPLICIT_PR_AUTHOR_EVENTS:
@@ -367,6 +387,14 @@ def evaluate_request(
     preflight_reason = preflight_request(request, policy)
     if preflight_reason:
         return GitHubPrAmendDecision(False, preflight_reason)
+
+    if request.event_type == "pull_request_review_comment":
+        review_state = _normalize_review_state(request.review_state)
+        if review_state != _CHANGES_REQUESTED_STATE:
+            return GitHubPrAmendDecision(
+                False,
+                f"parent review state '{review_state or 'unknown'}' is not {_CHANGES_REQUESTED_STATE}",
+            )
 
     base_repo = _repo_full_name_from_pr(pr_info, "base") or request.repo
     head_repo = _repo_full_name_from_pr(pr_info, "head")
@@ -437,6 +465,49 @@ def fetch_pr_info(repo: str, pr_number: int, *, gh_command: str = "gh") -> dict[
     if not isinstance(data, dict):
         raise RuntimeError("gh api returned non-object PR metadata")
     return data
+
+
+def fetch_review_info(
+    repo: str,
+    pr_number: int,
+    review_id: str,
+    *,
+    gh_command: str = "gh",
+) -> dict[str, Any]:
+    """Fetch one PR review through GitHub CLI and return JSON."""
+
+    if not str(review_id or "").strip():
+        raise RuntimeError("review_id is required")
+    result = subprocess.run(
+        [gh_command, "api", f"repos/{repo}/pulls/{pr_number}/reviews/{review_id}"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=github_cli_env(),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"gh api failed with {result.returncode}")
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("gh api returned invalid JSON") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("gh api returned non-object review metadata")
+    return data
+
+
+def request_with_parent_review_state(
+    request: GitHubPrAmendRequest,
+    review_info: dict[str, Any],
+) -> GitHubPrAmendRequest:
+    """Attach parent review state to an inline review-comment request."""
+
+    if request.event_type != "pull_request_review_comment":
+        return request
+    return replace(
+        request,
+        review_state=_normalize_review_state(review_info.get("state")),
+    )
 
 
 def _parse_gh_json_documents(stdout: str) -> list[Any]:

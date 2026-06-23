@@ -23,6 +23,7 @@ from gateway.github_pr_amend import (
     fetch_pr_related_context,
     policy_from_route,
     preflight_request,
+    request_with_parent_review_state,
     resolve_pr_amend_existing_discord_route,
     write_pr_amend_intake_artifact,
 )
@@ -127,6 +128,20 @@ PR_RELATED_CONTEXT = {
 }
 
 
+def _changes_requested_review_comment_request(payload=None, *, delivery_id=""):
+    raw = json.loads(json.dumps(payload or REVIEW_COMMENT_PAYLOAD))
+    request = extract_request("pull_request_review_comment", raw, delivery_id=delivery_id)
+    return request_with_parent_review_state(request, {"state": "CHANGES_REQUESTED"})
+
+
+def _review_payload(body=None, *, state="changes_requested"):
+    payload = json.loads(json.dumps(REVIEW_PAYLOAD))
+    payload["review"]["state"] = state
+    if body is not None:
+        payload["review"]["body"] = body
+    return payload
+
+
 ROUTE = {
     "secret": _INSECURE_NO_AUTH,
     "events": ["issue_comment", "pull_request_review_comment", "pull_request_review"],
@@ -179,9 +194,9 @@ class TestGitHubPrAmendPolicy:
         request = extract_request("pull_request_review", payload)
         assert preflight_request(request, GitHubPrAmendPolicy()) == "sender 'stranger' is not allowlisted"
 
-    def test_accepts_tbrent_mention_on_canary_pr(self):
+    def test_accepts_changes_requested_review_on_canary_pr(self):
         policy = policy_from_route(ROUTE)
-        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD)
+        request = extract_request("pull_request_review", REVIEW_PAYLOAD)
         decision = evaluate_request(request, PR_INFO, policy)
         assert decision.accepted is True
         assert decision.lock_key == "sligo-droid/reserve-index-dtf:feat/irrevocable-fee-recipients"
@@ -190,7 +205,7 @@ class TestGitHubPrAmendPolicy:
         route = json.loads(json.dumps(ROUTE))
         route["github_pr_amend"].pop("canary_prs")
         policy = policy_from_route(route)
-        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD)
+        request = extract_request("pull_request_review", REVIEW_PAYLOAD)
         decision = evaluate_request(request, PR_INFO, policy)
         assert decision.accepted is True
 
@@ -199,13 +214,13 @@ class TestGitHubPrAmendPolicy:
         route["github_pr_amend"].pop("canary_prs")
         route["github_pr_amend"]["allowed_base_repos"] = ["reserve-protocol/*"]
         route["github_pr_amend"]["allowed_head_repos"] = ["sligo-droid/*", "reserve-protocol/*"]
-        payload = json.loads(json.dumps(ISSUE_COMMENT_PAYLOAD))
+        payload = _review_payload()
         payload["repository"]["full_name"] = "reserve-protocol/other-dtf"
-        payload["issue"]["number"] = 17
+        payload["pull_request"]["number"] = 17
         pr_info = json.loads(json.dumps(PR_INFO))
         pr_info["base"]["repo"]["full_name"] = "reserve-protocol/other-dtf"
         pr_info["head"]["repo"]["full_name"] = "reserve-protocol/other-dtf"
-        request = extract_request("issue_comment", payload)
+        request = extract_request("pull_request_review", payload)
         decision = evaluate_request(request, pr_info, policy_from_route(route))
         assert decision.accepted is True
         assert decision.base_repo == "reserve-protocol/other-dtf"
@@ -228,7 +243,7 @@ class TestGitHubPrAmendPolicy:
         route["github_pr_amend"]["allowed_head_repos"] = ["sligo-droid/*", "reserve-protocol/*"]
         pr_info = json.loads(json.dumps(PR_INFO))
         pr_info["head"]["repo"]["full_name"] = "someone-else/reserve-index-dtf"
-        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD)
+        request = extract_request("pull_request_review", REVIEW_PAYLOAD)
         decision = evaluate_request(request, pr_info, policy_from_route(route))
         assert decision.accepted is False
         assert "head repo" in decision.reason
@@ -236,9 +251,9 @@ class TestGitHubPrAmendPolicy:
     def test_canary_prs_only_narrows_when_configured(self):
         route = json.loads(json.dumps(ROUTE))
         route["github_pr_amend"].pop("canary_prs")
-        payload = json.loads(json.dumps(ISSUE_COMMENT_PAYLOAD))
-        payload["issue"]["number"] = 999
-        request = extract_request("issue_comment", payload)
+        payload = _review_payload()
+        payload["pull_request"]["number"] = 999
+        request = extract_request("pull_request_review", payload)
         assert preflight_request(request, policy_from_route(route)) is None
 
         route["github_pr_amend"]["canary_prs"] = {"reserve-protocol/reserve-index-dtf": [182]}
@@ -252,13 +267,11 @@ class TestGitHubPrAmendPolicy:
         assert decision.accepted is False
         assert "not allowlisted" in decision.reason
 
-    def test_rejects_missing_mention(self):
-        payload = json.loads(json.dumps(ISSUE_COMMENT_PAYLOAD))
-        payload["comment"]["body"] = "please update the tests"
-        request = extract_request("issue_comment", payload)
+    def test_rejects_issue_comments_even_with_mention(self):
+        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD)
         decision = evaluate_request(request, PR_INFO, GitHubPrAmendPolicy())
         assert decision.accepted is False
-        assert "missing mention" in decision.reason
+        assert decision.reason == "issue_comment is not a changes-requested review signal"
 
     def test_accepts_missing_mention_review_on_sligo_droid_authored_pr(self):
         payload = json.loads(json.dumps(REVIEW_PAYLOAD))
@@ -270,12 +283,41 @@ class TestGitHubPrAmendPolicy:
     def test_accepts_missing_mention_review_comment_on_sligo_droid_authored_pr(self):
         payload = json.loads(json.dumps(REVIEW_COMMENT_PAYLOAD))
         payload["comment"]["body"] = "use the existing helper here."
-        request = extract_request("pull_request_review_comment", payload)
+        request = _changes_requested_review_comment_request(payload)
         assert preflight_request(request, GitHubPrAmendPolicy()) is None
 
         decision = evaluate_request(request, PR_INFO, GitHubPrAmendPolicy())
 
         assert decision.accepted is True
+
+    def test_rejects_review_comment_without_parent_changes_requested_state(self):
+        payload = json.loads(json.dumps(REVIEW_COMMENT_PAYLOAD))
+        payload["comment"]["body"] = "use the existing helper here."
+        request = extract_request("pull_request_review_comment", payload)
+
+        decision = evaluate_request(request, PR_INFO, GitHubPrAmendPolicy())
+
+        assert decision.accepted is False
+        assert decision.reason == "parent review state 'unknown' is not CHANGES_REQUESTED"
+
+    def test_rejects_review_comment_on_commented_parent_review(self):
+        request = request_with_parent_review_state(
+            extract_request("pull_request_review_comment", REVIEW_COMMENT_PAYLOAD),
+            {"state": "COMMENTED"},
+        )
+
+        decision = evaluate_request(request, PR_INFO, GitHubPrAmendPolicy())
+
+        assert decision.accepted is False
+        assert decision.reason == "parent review state 'COMMENTED' is not CHANGES_REQUESTED"
+
+    def test_rejects_review_op_that_is_not_changes_requested(self):
+        payload = _review_payload(state="commented")
+        request = extract_request("pull_request_review", payload)
+
+        assert preflight_request(request, GitHubPrAmendPolicy()) == (
+            "review state 'COMMENTED' is not CHANGES_REQUESTED"
+        )
 
     def test_rejects_missing_mention_review_comment_on_non_sligo_droid_authored_pr(self):
         payload = json.loads(json.dumps(REVIEW_COMMENT_PAYLOAD))
@@ -321,7 +363,7 @@ class TestGitHubPrAmendPolicy:
     def test_rejects_unallowlisted_head_repo(self):
         pr_info = json.loads(json.dumps(PR_INFO))
         pr_info["head"]["repo"]["full_name"] = "someone-else/reserve-index-dtf"
-        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD)
+        request = extract_request("pull_request_review", REVIEW_PAYLOAD)
         decision = evaluate_request(request, pr_info, GitHubPrAmendPolicy())
         assert decision.accepted is False
         assert "head repo" in decision.reason
@@ -334,7 +376,7 @@ class TestGitHubPrAmendPolicy:
 
     def test_intake_artifact_contains_required_operational_contract(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
-        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD, delivery_id="delivery-artifact")
+        request = extract_request("pull_request_review", REVIEW_PAYLOAD, delivery_id="delivery-artifact")
         policy = policy_from_route(ROUTE)
         decision = evaluate_request(request, PR_INFO, policy)
 
@@ -343,7 +385,7 @@ class TestGitHubPrAmendPolicy:
             decision,
             policy,
             PR_INFO,
-            ISSUE_COMMENT_PAYLOAD,
+            REVIEW_PAYLOAD,
             PR_RELATED_CONTEXT,
         )
         path = write_pr_amend_intake_artifact(artifact)
@@ -351,13 +393,13 @@ class TestGitHubPrAmendPolicy:
 
         assert saved["artifact_version"] == 1
         assert saved["delivery_id"] == "delivery-artifact"
-        assert saved["event"] == {"type": "issue_comment", "action": "created"}
+        assert saved["event"] == {"type": "pull_request_review", "action": "submitted"}
         assert saved["sender"]["login"] == "tbrent"
         assert saved["repository"]["full_name"] == "reserve-protocol/reserve-index-dtf"
         assert saved["pull_request"]["number"] == 182
         assert saved["pull_request"]["head"]["repo"] == "sligo-droid/reserve-index-dtf"
         assert saved["pull_request"]["base"]["repo"] == "reserve-protocol/reserve-index-dtf"
-        assert saved["source"]["body"] == ISSUE_COMMENT_PAYLOAD["comment"]["body"]
+        assert saved["source"]["body"] == REVIEW_PAYLOAD["review"]["body"]
         assert saved["fetched_context"]["pull_request"]["title"] == PR_INFO["title"]
         assert saved["fetched_context"]["reviews"] == PR_RELATED_CONTEXT["reviews"]
         assert saved["fetched_context"]["review_comments"] == PR_RELATED_CONTEXT["review_comments"]
@@ -374,10 +416,10 @@ class TestGitHubPrAmendPolicy:
         assert "final public github output is pushed commits/prs plus reactions only" in instructions
 
     def test_reserve_protocol_pr_amend_card_includes_solidity_skill_hint(self, tmp_path):
-        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD, delivery_id="delivery-card")
+        request = extract_request("pull_request_review", REVIEW_PAYLOAD, delivery_id="delivery-card")
         policy = policy_from_route(ROUTE)
         decision = evaluate_request(request, PR_INFO, policy)
-        artifact = build_pr_amend_intake_artifact(request, decision, policy, PR_INFO, ISSUE_COMMENT_PAYLOAD)
+        artifact = build_pr_amend_intake_artifact(request, decision, policy, PR_INFO, REVIEW_PAYLOAD)
 
         card = build_pr_amend_discord_card(artifact, artifact_path=tmp_path / "intake.json")
 
@@ -609,10 +651,10 @@ class TestGitHubPrAmendPolicy:
         assert not any("reserve-solidity-style" in item for item in _planner_instructions(worker))
 
     def test_resolves_existing_discord_route_from_worker_board_metadata(self, monkeypatch):
-        request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD, delivery_id="delivery-route")
+        request = extract_request("pull_request_review", REVIEW_PAYLOAD, delivery_id="delivery-route")
         policy = policy_from_route(ROUTE)
         decision = evaluate_request(request, PR_INFO, policy)
-        artifact = build_pr_amend_intake_artifact(request, decision, policy, PR_INFO, ISSUE_COMMENT_PAYLOAD)
+        artifact = build_pr_amend_intake_artifact(request, decision, policy, PR_INFO, REVIEW_PAYLOAD)
 
         monkeypatch.setattr(
             kanban_db,
@@ -1270,7 +1312,7 @@ class TestGitHubPrAmendWebhookRoute:
         assert calls[-1][0:4] == ["gh", "api", "-X", "POST"]
 
     @pytest.mark.asyncio
-    async def test_signed_issue_comment_routes_to_discord_worker_board(self, tmp_path, monkeypatch):
+    async def test_signed_changes_requested_review_routes_to_discord_worker_board(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
         secret = "route-secret"
         route = json.loads(json.dumps(ROUTE))
@@ -1279,7 +1321,7 @@ class TestGitHubPrAmendWebhookRoute:
         adapter = _make_adapter({"github-pr-amend": route})
         adapter._add_github_pr_amend_reaction = AsyncMock(return_value=True)
 
-        body = json.dumps(ISSUE_COMMENT_PAYLOAD).encode()
+        body = json.dumps(REVIEW_PAYLOAD).encode()
         sig = _github_signature(body, secret)
 
         board_metadata = {
@@ -1304,7 +1346,7 @@ class TestGitHubPrAmendWebhookRoute:
                     data=body,
                     headers={
                         "Content-Type": "application/json",
-                        "X-GitHub-Event": "issue_comment",
+                        "X-GitHub-Event": "pull_request_review",
                         "X-Hub-Signature-256": sig,
                         "X-GitHub-Delivery": "delivery-accepted",
                     },
@@ -1342,6 +1384,72 @@ class TestGitHubPrAmendWebhookRoute:
         ]
         assert data["lock_key"] in adapter._github_pr_amend_locks
         assert adapter._github_pr_amend_lock_boards[data["lock_key"]] == "discord-thread-123"
+
+    @pytest.mark.asyncio
+    async def test_changes_requested_review_comment_routes_to_discord_worker_board(self, tmp_path):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        adapter._add_github_pr_amend_reaction = AsyncMock(return_value=True)
+
+        with patch("gateway.github_pr_amend.fetch_pr_info", return_value=PR_INFO), patch(
+            "gateway.github_pr_amend.fetch_review_info", return_value={"state": "CHANGES_REQUESTED"}
+        ) as fetch_review, patch(
+            "gateway.github_pr_amend.fetch_pr_related_context", return_value=PR_RELATED_CONTEXT
+        ), patch(
+            "gateway.github_pr_amend.resolve_pr_amend_discord_channel", return_value="channel-123"
+        ), patch(
+            "gateway.github_pr_amend.publish_and_activate_pr_amend_intake",
+            return_value={"discord_board": "board", "discord_thread_id": "thread"},
+        ) as publish:
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                resp = await cli.post(
+                    "/webhooks/github-pr-amend",
+                    json=REVIEW_COMMENT_PAYLOAD,
+                    headers={
+                        "X-GitHub-Event": "pull_request_review_comment",
+                        "X-GitHub-Delivery": "delivery-review-comment",
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 202
+        assert data["status"] == "queued"
+        fetch_review.assert_called_once_with(
+            "reserve-protocol/reserve-index-dtf",
+            182,
+            "123",
+        )
+        publish.assert_called_once()
+        card = publish.call_args.args[0]
+        assert card["project_context"]["github_pr_amend"]["review_state"] == "CHANGES_REQUESTED"
+        assert [call.args[1] for call in adapter._add_github_pr_amend_reaction.await_args_list] == [
+            "eyes",
+            "rocket",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_commented_review_comment_is_ignored_after_parent_review_lookup(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        adapter._add_github_pr_amend_reaction = AsyncMock()
+
+        with patch("gateway.github_pr_amend.fetch_pr_info", return_value=PR_INFO), patch(
+            "gateway.github_pr_amend.fetch_review_info", return_value={"state": "COMMENTED"}
+        ), patch("gateway.github_pr_amend.fetch_pr_related_context") as fetch_related:
+            async with TestClient(TestServer(_create_app(adapter))) as cli:
+                resp = await cli.post(
+                    "/webhooks/github-pr-amend",
+                    json=REVIEW_COMMENT_PAYLOAD,
+                    headers={
+                        "X-GitHub-Event": "pull_request_review_comment",
+                        "X-GitHub-Delivery": "delivery-commented-review-comment",
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["status"] == "ignored"
+        assert data["reason"] == "parent review state 'COMMENTED' is not CHANGES_REQUESTED"
+        fetch_related.assert_not_called()
+        adapter._add_github_pr_amend_reaction.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_non_tbrent_mention_is_ignored(self):
@@ -1396,9 +1504,8 @@ class TestGitHubPrAmendWebhookRoute:
         adapter._add_github_pr_amend_reaction.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_issue_comment_missing_mention_is_ignored_before_pr_lookup(self):
+    async def test_issue_comment_is_ignored_before_pr_lookup(self):
         payload = json.loads(json.dumps(ISSUE_COMMENT_PAYLOAD))
-        payload["comment"]["body"] = "please update the tests"
         adapter = _make_adapter({"github-pr-amend": ROUTE})
         adapter._add_github_pr_amend_reaction = AsyncMock()
 
@@ -1409,14 +1516,14 @@ class TestGitHubPrAmendWebhookRoute:
                     json=payload,
                     headers={
                         "X-GitHub-Event": "issue_comment",
-                        "X-GitHub-Delivery": "delivery-missing-mention",
+                        "X-GitHub-Delivery": "delivery-issue-comment",
                     },
                 )
                 data = await resp.json()
 
         assert resp.status == 200
         assert data["status"] == "ignored"
-        assert "missing mention" in data["reason"]
+        assert data["reason"] == "issue_comment is not a changes-requested review signal"
         fetch_pr_info.assert_not_called()
         adapter._add_github_pr_amend_reaction.assert_not_called()
 
@@ -1436,9 +1543,9 @@ class TestGitHubPrAmendWebhookRoute:
             async with TestClient(TestServer(_create_app(adapter))) as cli:
                 resp = await cli.post(
                     "/webhooks/github-pr-amend",
-                    json=ISSUE_COMMENT_PAYLOAD,
+                    json=REVIEW_PAYLOAD,
                     headers={
-                        "X-GitHub-Event": "issue_comment",
+                        "X-GitHub-Event": "pull_request_review",
                         "X-GitHub-Delivery": "delivery-reaction-failed",
                     },
                 )
@@ -1461,9 +1568,9 @@ class TestGitHubPrAmendWebhookRoute:
             async with TestClient(TestServer(_create_app(adapter))) as cli:
                 resp = await cli.post(
                     "/webhooks/github-pr-amend",
-                    json=ISSUE_COMMENT_PAYLOAD,
+                    json=REVIEW_PAYLOAD,
                     headers={
-                        "X-GitHub-Event": "issue_comment",
+                        "X-GitHub-Event": "pull_request_review",
                         "X-GitHub-Delivery": "delivery-no-channel",
                     },
                 )
@@ -1489,9 +1596,9 @@ class TestGitHubPrAmendWebhookRoute:
             async with TestClient(TestServer(_create_app(adapter))) as cli:
                 resp = await cli.post(
                     "/webhooks/github-pr-amend",
-                    json=ISSUE_COMMENT_PAYLOAD,
+                    json=REVIEW_PAYLOAD,
                     headers={
-                        "X-GitHub-Event": "issue_comment",
+                        "X-GitHub-Event": "pull_request_review",
                         "X-GitHub-Delivery": "delivery-locked",
                     },
                 )
@@ -1662,18 +1769,18 @@ class TestGitHubPrAmendWebhookRoute:
             async with TestClient(TestServer(_create_app(adapter))) as cli:
                 first = await cli.post(
                     "/webhooks/github-pr-amend",
-                    json=ISSUE_COMMENT_PAYLOAD,
+                    json=REVIEW_PAYLOAD,
                     headers={
-                        "X-GitHub-Event": "issue_comment",
+                        "X-GitHub-Event": "pull_request_review",
                         "X-GitHub-Delivery": "delivery-retryable",
                     },
                 )
                 first_data = await first.json()
                 second = await cli.post(
                     "/webhooks/github-pr-amend",
-                    json=ISSUE_COMMENT_PAYLOAD,
+                    json=REVIEW_PAYLOAD,
                     headers={
-                        "X-GitHub-Event": "issue_comment",
+                        "X-GitHub-Event": "pull_request_review",
                         "X-GitHub-Delivery": "delivery-retryable",
                     },
                 )
