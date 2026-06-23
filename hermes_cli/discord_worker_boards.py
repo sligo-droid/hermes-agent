@@ -156,6 +156,18 @@ def pr_policy_for_request(request: object) -> dict[str, str]:
 def effective_pr_policy_for_worker(worker: dict[str, Any]) -> dict[str, str]:
     """Resolve PR policy from durable board intent, not only stale metadata."""
 
+    context = worker.get("project_context") if isinstance(worker.get("project_context"), dict) else {}
+    github_pr_amend = context.get("github_pr_amend") if isinstance(context.get("github_pr_amend"), dict) else {}
+    if (
+        github_pr_amend.get("requires_head_sha_advance") is True
+        and str(github_pr_amend.get("head_repo") or "").strip()
+        and str(github_pr_amend.get("head_ref") or "").strip()
+    ):
+        return {
+            "pr_open_policy": PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL,
+            "merge_policy": MERGE_POLICY_AUTO,
+        }
+
     text_parts: list[str] = []
     for key in ("root_goal", "initial_request", "latest_planner_request"):
         value = str(worker.get(key) or "").strip()

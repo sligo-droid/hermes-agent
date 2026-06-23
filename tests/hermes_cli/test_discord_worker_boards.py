@@ -113,6 +113,45 @@ def test_worktree_base_start_ref_uses_remote_slash_branch(monkeypatch, tmp_path)
     ]
 
 
+def test_pr_amend_finalizer_policy_overrides_dev_worker_lifecycle_constraints():
+    from hermes_cli import discord_worker_boards as dwb
+
+    worker = {
+        "root_goal": "Amend the upstream PR head branch.",
+        "latest_planner_request": (
+            "Dev workers do not open PRs/push/merge. Do not merge the upstream PR."
+        ),
+        "project_context": {
+            "github_pr_amend": {
+                "requires_head_sha_advance": True,
+                "head_repo": "sligo-droid/reserve-index-dtf",
+                "head_ref": "feat/irrevocable-fee-recipients",
+            }
+        },
+    }
+
+    assert dwb.effective_pr_policy_for_worker(worker) == {
+        "pr_open_policy": dwb.PR_OPEN_POLICY_AFTER_REVIEW_APPROVAL,
+        "merge_policy": dwb.MERGE_POLICY_AUTO,
+    }
+
+
+def test_dev_worker_lifecycle_constraints_still_disable_non_amend_pr_lifecycle():
+    from hermes_cli import discord_worker_boards as dwb
+
+    worker = {
+        "root_goal": "Make local changes only.",
+        "latest_planner_request": (
+            "Dev workers do not open PRs/push/merge. Do not merge the upstream PR."
+        ),
+    }
+
+    assert dwb.effective_pr_policy_for_worker(worker) == {
+        "pr_open_policy": dwb.PR_OPEN_POLICY_NEVER,
+        "merge_policy": dwb.MERGE_POLICY_NEVER,
+    }
+
+
 def test_old_discord_worker_boards_are_not_status_targets(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
