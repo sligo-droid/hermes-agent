@@ -1,6 +1,8 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
 import json
+import sys
+import types
 from unittest.mock import ANY, call, patch
 
 
@@ -537,3 +539,49 @@ class TestDisabledToolsetsPlatformBundle:
         from toolsets import bundle_non_core_tools
         # A non-existent bundle resolves to an empty set (no tools), not a crash.
         assert bundle_non_core_tools("hermes-does-not-exist") == set()
+
+
+def test_model_tools_imports_with_older_toolsets_module(monkeypatch):
+    """Gateway imports must survive old toolsets modules during live reloads."""
+    fake_tools_registry = types.ModuleType("tools.registry")
+
+    class FakeRegistry:
+        _generation = 0
+
+        def get_definitions(self, *_args, **_kwargs):
+            return []
+
+        def get_tool_to_toolset_map(self):
+            return {}
+
+        def get_toolset_requirements(self):
+            return {}
+
+        def get_all_tool_names(self):
+            return []
+
+        def get_toolset_for_tool(self, _tool_name):
+            return ""
+
+        def get_available_toolsets(self):
+            return {}
+
+    fake_tools_registry.registry = FakeRegistry()
+    fake_tools_registry.discover_builtin_tools = lambda: []
+
+    fake_toolsets = types.ModuleType("toolsets")
+    fake_toolsets.resolve_toolset = lambda _name: ["terminal", "discord"]
+    fake_toolsets.validate_toolset = lambda _name: True
+
+    monkeypatch.setitem(sys.modules, "tools.registry", fake_tools_registry)
+    monkeypatch.setitem(sys.modules, "toolsets", fake_toolsets)
+    monkeypatch.delitem(sys.modules, "model_tools", raising=False)
+
+    import model_tools as reloaded_model_tools
+
+    assert reloaded_model_tools.bundle_non_core_tools("hermes-discord") == {
+        "terminal",
+        "discord",
+    }
+
+    monkeypatch.delitem(sys.modules, "model_tools", raising=False)
