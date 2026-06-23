@@ -518,6 +518,56 @@ def test_ensure_code_island_suppresses_terminal_stale_error_health(monkeypatch, 
     assert f"discord_worker_code_island board={board.slug}" not in caplog.text
 
 
+def test_ensure_code_island_demotes_blocked_board_stale_telemetry(monkeypatch, tmp_path, caplog):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    board = dwb.set_goal(
+        thread_id="12351b",
+        goal="Ship it",
+        project_context={"project_path": str(project)},
+    )
+    stale_error = "worker checkout is on 'review', expected 'discord/12351b'"
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "blocked",
+            "phase": "blocked",
+            "blocked_reason": "approved reviewer PR finalization failed",
+            "code_island_ready": True,
+            "code_island_pending": False,
+            "code_island_error": stale_error,
+            "worktree_path": str(tmp_path / "worktree"),
+        },
+    )
+
+    def fake_ensure(worker):
+        worker["code_island_ready"] = False
+        worker["code_island_pending"] = False
+        worker["code_island_error"] = stale_error
+
+    monkeypatch.setattr(dwb, "_ensure_code_island", fake_ensure)
+
+    with caplog.at_level("INFO", logger="hermes_cli.discord_worker_boards"):
+        assert dwb.ensure_code_island_for_board(board.slug) is False
+
+    assert f"discord_worker_code_island board={board.slug}" not in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("DEBUG", logger="hermes_cli.discord_worker_boards"):
+        assert dwb.ensure_code_island_for_board(board.slug) is False
+
+    debug_records = [
+        record
+        for record in caplog.records
+        if record.levelname == "DEBUG"
+        and record.message.startswith(f"discord_worker_code_island board={board.slug}")
+    ]
+    assert len(debug_records) == 1
+
+
 def test_ensure_code_island_many_healthy_boards_emit_bounded_info(monkeypatch, tmp_path, caplog):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb

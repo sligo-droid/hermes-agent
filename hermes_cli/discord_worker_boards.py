@@ -1700,7 +1700,8 @@ def ensure_code_island_for_board(board: str) -> bool:
     if blocker:
         _block_worker_board_for_code_island(board, worker, blocker)
     telemetry_changed = previous_telemetry_state != _code_island_telemetry_state(worker)
-    log = logger.info if health_error or blocker or telemetry_changed else logger.debug
+    actionable_transition = telemetry_changed and not _is_terminal_worker_meta(worker)
+    log = logger.info if health_error or blocker or actionable_transition else logger.debug
     log(
         "discord_worker_code_island board=%s ready=%s pending=%s elapsed_ms=%d error=%s",
         board,
