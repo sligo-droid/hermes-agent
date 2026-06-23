@@ -335,6 +335,34 @@ def get_github_cli_config_dir(env: dict | None = None) -> str | None:
     return None
 
 
+def apply_subprocess_home_env(env: dict) -> None:
+    """Apply profile HOME defaults to an already-scrubbed subprocess env."""
+    profile_home = get_subprocess_home()
+    if not profile_home:
+        return
+
+    env["HOME"] = profile_home
+    env.setdefault("HERMES_HOME", str(get_hermes_home()))
+
+    gh_config_dir = get_github_cli_config_dir(env)
+    if gh_config_dir:
+        env.setdefault("GH_CONFIG_DIR", gh_config_dir)
+
+    real_home = _process_user_home()
+    if real_home is None:
+        real_home = Path.home()
+    real_home_paths = (
+        ("GIT_CONFIG_GLOBAL", real_home / ".gitconfig", Path.is_file),
+        ("DOCKER_CONFIG", real_home / ".docker", Path.is_dir),
+        ("CODEX_HOME", real_home / ".codex", Path.is_dir),
+        ("CLOUDSDK_CONFIG", real_home / ".config" / "gcloud", Path.is_dir),
+        ("NPM_CONFIG_USERCONFIG", real_home / ".npmrc", Path.is_file),
+    )
+    for key, path, exists in real_home_paths:
+        if key not in env and exists(path):
+            env[key] = str(path)
+
+
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 

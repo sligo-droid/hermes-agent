@@ -10,6 +10,7 @@ See: https://github.com/NousResearch/hermes-agent/issues/4426
 import os
 import threading
 from pathlib import Path
+from unittest.mock import patch
 
 
 
@@ -166,6 +167,121 @@ class TestGetGitHubCliConfigDir:
         monkeypatch.setattr(hermes_constants, "_process_user_home", lambda: real_home)
 
         assert get_github_cli_config_dir({"HOME": str(child_home)}) == str(real_gh)
+
+
+class TestApplySubprocessHomeEnv:
+    """Unit tests for hermes_constants.apply_subprocess_home_env()."""
+
+    def test_imports_helper(self):
+        from hermes_constants import apply_subprocess_home_env
+
+        assert callable(apply_subprocess_home_env)
+
+    def test_applies_profile_home_when_present(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        profile_home = hermes_home / "home"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        from hermes_constants import apply_subprocess_home_env
+
+        env = {"HOME": "/root", "PATH": "/usr/bin"}
+        apply_subprocess_home_env(env)
+
+        assert env["HOME"] == str(profile_home)
+        assert env["HERMES_HOME"] == str(hermes_home)
+
+    def test_preserves_home_when_profile_home_missing(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        from hermes_constants import apply_subprocess_home_env
+
+        env = {"HOME": "/root", "PATH": "/usr/bin"}
+        apply_subprocess_home_env(env)
+
+        assert env["HOME"] == "/root"
+        assert "HERMES_HOME" not in env
+
+    def test_bridges_real_home_config_paths_when_profile_home_exists(
+        self, tmp_path, monkeypatch
+    ):
+        real_home = tmp_path / "real-home"
+        hermes_home = tmp_path / "hermes"
+        profile_home = hermes_home / "home"
+        gh_dir = real_home / ".config" / "gh"
+        gcloud_dir = real_home / ".config" / "gcloud"
+        docker_dir = real_home / ".docker"
+        codex_home = real_home / ".codex"
+        gitconfig = real_home / ".gitconfig"
+        npmrc = real_home / ".npmrc"
+        profile_home.mkdir(parents=True)
+        gh_dir.mkdir(parents=True)
+        gcloud_dir.mkdir(parents=True)
+        docker_dir.mkdir(parents=True)
+        codex_home.mkdir(parents=True)
+        (gh_dir / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
+        (docker_dir / "config.json").write_text("{}\n", encoding="utf-8")
+        gitconfig.write_text("[user]\n\temail = user@example.com\n", encoding="utf-8")
+        npmrc.write_text("registry=https://registry.npmjs.org/\n", encoding="utf-8")
+        monkeypatch.setattr(Path, "home", lambda: real_home)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+
+        import hermes_constants
+        from hermes_constants import apply_subprocess_home_env
+
+        monkeypatch.setattr(hermes_constants, "_process_user_home", lambda: real_home)
+
+        env = {"HOME": "/root", "PATH": "/usr/bin"}
+        apply_subprocess_home_env(env)
+
+        assert env["HOME"] == str(profile_home)
+        assert env["HERMES_HOME"] == str(hermes_home)
+        assert env["GH_CONFIG_DIR"] == str(gh_dir)
+        assert env["GIT_CONFIG_GLOBAL"] == str(gitconfig)
+        assert env["DOCKER_CONFIG"] == str(docker_dir)
+        assert env["CODEX_HOME"] == str(codex_home)
+        assert env["CLOUDSDK_CONFIG"] == str(gcloud_dir)
+        assert env["NPM_CONFIG_USERCONFIG"] == str(npmrc)
+
+    def test_copilot_subprocess_env_imports_helper(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        profile_home = hermes_home / "home"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HOME", "/root")
+
+        from agent.copilot_acp_client import _build_subprocess_env
+
+        env = _build_subprocess_env()
+
+        assert env["HOME"] == str(profile_home)
+        assert env["HERMES_HOME"] == str(hermes_home)
+
+    def test_execute_code_child_env_imports_helper(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        profile_home = hermes_home / "home"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HOME", "/root")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+
+        from tools.code_execution_tool import execute_code
+
+        with patch(
+            "tools.approval.check_execute_code_guard",
+            return_value={"approved": True},
+        ):
+            result = execute_code(
+                code="import os; print(os.environ['HOME']); print(os.environ['HERMES_HOME'])",
+                task_id="subprocess-home-helper-test",
+                enabled_tools=[],
+            )
+
+        assert str(profile_home) in result
+        assert str(hermes_home) in result
 
 
 # ---------------------------------------------------------------------------
