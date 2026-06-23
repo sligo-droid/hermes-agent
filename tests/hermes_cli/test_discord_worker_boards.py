@@ -4086,6 +4086,147 @@ def test_reconcile_board_blocks_when_approved_reviewer_finalizer_fails(monkeypat
     assert len(reviewer_tasks) == 1
 
 
+def test_reconcile_board_retries_retryable_pr_amend_head_advance_blocker(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker
+    from hermes_cli import kanban_db
+
+    worktree = tmp_path / "repo"
+    worktree.mkdir()
+    board = dwb.start_direct_goal(
+        thread_id="review-finalizer-pr-amend-head-lag",
+        goal="Amend upstream PR through fork branch",
+        project_context={
+            "github_pr_amend": {
+                "requires_head_sha_advance": True,
+                "upstream_repo": "reserve-protocol/reserve-index-dtf",
+                "upstream_pr_number": "182",
+                "head_sha": "oldsha",
+            }
+        },
+    )
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "phase": "blocked",
+            "goal_status": "blocked",
+            "execution_mode": "kanban_pipeline",
+            "worktree_path": str(worktree),
+            "review_loop_count": 1,
+            "blocked_reason": "approved reviewer PR finalization failed",
+            "pr_error": "PR-amend completion blocked: upstream PR head SHA did not advance from triggering review commit.",
+            "pr_blocker": "PR-amend completion blocked: upstream PR head SHA did not advance from triggering review commit.",
+            "pr_finalizer_recovery_state": "operator_blocked",
+            "pr_finalizer_recovery_blocker": "PR-amend completion blocked: upstream PR head SHA did not advance from triggering review commit.",
+            "pr_amend_head_advanced": False,
+            "pr_amend_upstream_head_sha": "oldsha",
+            "pr_amend_trigger_head_sha": "oldsha",
+        },
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        reviewer_id = kanban_db.create_task(
+            conn,
+            title="R1: Review Discord implementation",
+            assignee=dwb.ROLE_REVIEWER,
+            tenant=board.slug,
+        )
+        claimed = kanban_db.claim_task(conn, reviewer_id)
+        assert claimed is not None
+        kanban_db.complete_task(
+            conn,
+            reviewer_id,
+            summary="Approved.",
+            metadata={"raw": {"status": "approved"}},
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    calls = []
+
+    def fake_ensure_pr(board_arg, workspace_arg):
+        calls.append((board_arg, workspace_arg))
+        dwb._update_worker_meta(
+            board_arg,
+            {
+                "pr_error": None,
+                "pr_blocker": "",
+                "pr_checks_status": "passed",
+                "pr_checks_failed": [],
+                "pr_amend_head_advanced": True,
+                "pr_amend_upstream_head_sha": "newsha",
+                "pr_amend_trigger_head_sha": "oldsha",
+            },
+        )
+        return True
+
+    monkeypatch.setattr(kanban_codex_worker, "_ensure_pr", fake_ensure_pr)
+
+    assert dwb.reconcile_board(board.slug) == "approved_reviewer_finalized"
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert calls == [(board.slug, str(worktree))]
+    assert worker["phase"] == "complete"
+    assert worker["goal_status"] == "done"
+    assert worker["pr_error"] is None
+    assert worker["pr_blocker"] == ""
+    assert worker["pr_amend_head_advanced"] is True
+
+
+def test_ensure_pr_clears_stale_pr_amend_blocker_after_head_advances(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker
+    from hermes_cli import kanban_db
+
+    worktree = tmp_path / "repo"
+    worktree.mkdir()
+    board = dwb.start_direct_goal(
+        thread_id="review-finalizer-clear-stale-pr-amend-blocker",
+        goal="Amend upstream PR through fork branch",
+        project_context={
+            "github_pr_target_repo": "sligo-droid/reserve-index-dtf",
+            "github_pr_amend": {
+                "requires_head_sha_advance": True,
+                "upstream_repo": "reserve-protocol/reserve-index-dtf",
+                "upstream_pr_number": "182",
+                "head_sha": "oldsha",
+            },
+        },
+    )
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "worktree_path": str(worktree),
+            "pr_open_policy": dwb.PR_OPEN_POLICY_NEVER,
+            "merge_policy": dwb.MERGE_POLICY_NEVER,
+            "pr_error": "PR-amend completion blocked: upstream PR head SHA did not advance from triggering review commit.",
+            "pr_blocker": "PR-amend completion blocked: upstream PR head SHA did not advance from triggering review commit.",
+            "pr_amend_head_advanced": False,
+            "pr_amend_upstream_head_sha": "oldsha",
+            "pr_amend_trigger_head_sha": "oldsha",
+        },
+    )
+
+    def fake_verify(worker, *, root):
+        worker["pr_amend_head_advanced"] = True
+        worker["pr_amend_upstream_head_sha"] = "newsha"
+        worker["pr_amend_trigger_head_sha"] = "oldsha"
+        return True
+
+    monkeypatch.setattr(kanban_codex_worker, "_verify_pr_amend_head_advanced", fake_verify)
+
+    assert kanban_codex_worker._ensure_pr(board.slug, str(worktree)) is True
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["pr_error"] is None
+    assert worker["pr_blocker"] == ""
+    assert worker["pr_amend_head_advanced"] is True
+    assert worker["pr_amend_upstream_head_sha"] == "newsha"
+
+
 def test_reconcile_board_blocks_pr_body_check_finalizer_without_recovery_round(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
