@@ -100,6 +100,17 @@ _PRE_REVIEW_MAX_TASKS = 5
 _PRE_REVIEW_MAX_LIST_ITEMS = 8
 _PRE_REVIEW_MAX_TEXT_CHARS = 800
 _PRE_REVIEW_SECRET_KEY_RE = re.compile(r"token|secret|password|api[_-]?key|auth|credential", re.IGNORECASE)
+_PR_FINALIZER_RECOVERY_ROUTE_TEXT_RE = re.compile(
+    r"delegate_coding_task\s*\(\s*route_decision|"
+    r"ui_visual_specialist|"
+    r"z-ai/glm-5\.2|"
+    r"selected_provider\s*=\s*openrouter|"
+    r"selected_model\s*=\s*z-ai/glm-5\.2",
+    re.IGNORECASE,
+)
+_PR_FINALIZER_RECOVERY_NEUTRAL_ROOT_GOAL = (
+    "Recover PR finalization for the already approved implementation by addressing the current PR blocker."
+)
 
 
 class TicketMoveConflict(RuntimeError):
@@ -6273,6 +6284,26 @@ def _pr_finalizer_failure_is_merge_conflict(worker: dict[str, Any]) -> bool:
     )
 
 
+def _strip_pr_finalizer_recovery_route_text(value: Any) -> str:
+    lines: list[str] = []
+    for raw_line in str(value or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if _PR_FINALIZER_RECOVERY_ROUTE_TEXT_RE.search(line):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _pr_finalizer_recovery_root_goal(worker: dict[str, Any]) -> str:
+    for key in ("root_goal", "initial_request"):
+        root_goal = _strip_pr_finalizer_recovery_route_text(worker.get(key))
+        if root_goal:
+            return root_goal
+    return _PR_FINALIZER_RECOVERY_NEUTRAL_ROOT_GOAL
+
+
 def _create_pr_finalizer_recovery_task(
     board: str,
     worker: dict[str, Any],
@@ -6287,12 +6318,20 @@ def _create_pr_finalizer_recovery_task(
     blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "PR finalization failed").strip()
     payload = {
         "role": ROLE_DEV,
-        "root_goal": worker.get("root_goal") or worker.get("initial_request") or "",
+        "root_goal": _pr_finalizer_recovery_root_goal(worker),
+        "route_decision": {
+            "route": "default_coding_worker",
+            "source": "pr_finalizer_recovery",
+            "confidence": 0.99,
+            "rationale": (
+                "PR check/merge-conflict recovery uses mainline coding worker; "
+                "specialized visual routes are not inherited."
+            ),
+        },
         "pr_url": pr_url,
         "blocker": blocker,
         "instructions": instructions,
         "context_pack": _context_pack_summary(board),
-        "requirements": worker.get("requirements") or [],
     }
     if extra_payload:
         payload.update(extra_payload)
