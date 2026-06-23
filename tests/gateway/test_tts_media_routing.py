@@ -77,7 +77,7 @@ async def test_base_adapter_routes_telegram_flac_media_tag_to_document_sender(tm
     adapter.send_document.assert_awaited_once_with(
         chat_id="chat-1",
         file_path=str(media_file),
-        metadata=None,
+        metadata={"notify": True},
     )
     adapter.send_voice.assert_not_awaited()
 
@@ -96,7 +96,7 @@ async def test_base_adapter_routes_non_voice_telegram_ogg_media_tag_to_document_
     adapter.send_document.assert_awaited_once_with(
         chat_id="chat-1",
         file_path=str(media_file),
-        metadata=None,
+        metadata={"notify": True},
     )
     adapter.send_voice.assert_not_awaited()
 
@@ -117,7 +117,7 @@ async def test_base_adapter_routes_voice_tagged_telegram_ogg_media_tag_to_voice_
     adapter.send_voice.assert_awaited_once_with(
         chat_id="chat-1",
         audio_path=str(media_file),
-        metadata=None,
+        metadata={"notify": True},
     )
     adapter.send_document.assert_not_awaited()
 

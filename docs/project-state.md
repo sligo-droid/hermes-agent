@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-23 10:49 UTC
+Last updated: 2026-06-23 16:11 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -17,6 +17,7 @@ This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork
 | --- | --- | --- |
 | Main branch | verified | `/home/droid/hermes` is clean on `main` and tracking `origin/main` after the autonomous operations loop docs landed. |
 | Open PRs | verified | `gh pr list --state open --limit 10` returned no rows during the autonomous operations loop state refresh. |
+| Upstream sync workflow | implemented | `docs/runbooks/upstream-sync.md` records the worktree-based `upstream/main` merge procedure, conservative fork-preserving conflict policy, and the 2026-06-23 sync evidence (`upstream/main` `351afd353`, `scripts/run_tests.sh`: 856 passed). |
 | Repo-state transition | merged | PR #320 added `docs/project-state.md`, `docs/context.md`, and `docs/decisions/0001-repo-backed-project-state.md`; `AGENTS.md` now routes workers here. |
 | Command Center model | merged | `docs/sligo-command-center.md` records the Work Item / Source / Worker Run model, Hermes/PID project scoping, and current UX contract. The primary lanes are Overview, Inbox, Active, Completed, and Archive; the current visual target is quiet chrome, grouped row actions/artifacts, and a right Detail / Audit pane. Live runtime must still be smoked separately when code changes. |
 | Autonomous operations loop | planned | `docs/plans/2026-06-08-autonomous-operations-loop-goalplan.md` defines the complete Observe -> Diagnose -> Decide -> Execute -> Verify -> Learn loop, with Command Center as the canonical ledger and policy-gated autonomy boundaries. |
@@ -82,6 +83,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Hardened GitHub PR-amend review-summary coverage so top-level review comments are included alongside matching inline comments for context and reaction targets, and REST status-reaction replacement now deletes only authenticated Sligo/bot-owned prior statuses before adding the next status.
 - [x] Fixed accepted PR-amend review-summary webhooks without an existing source worker-board route so they publish into the configured project worker-board channel instead of immediately degrading to thumbs-down with no Discord work item.
 - [x] Hardened worker PR-boundary subprocesses so local-only remotes fail with actionable GitHub-remote guidance before `gh pr` finalization, profile-isolated `gh`/git subprocesses see host `GH_CONFIG_DIR` without inheriting GitHub token env vars, Hermes `.env` stays documented as dotenv-only, and delegate-coding canonical-cwd blocks point to absolute `/home/droid/workspaces/...` retry paths.
+- [x] Added an upstream-sync runbook after merging `upstream/main` into the fork, documenting the worktree flow, conflict policy, and smoke-test gate for future syncs.
 
 ## In Progress
 

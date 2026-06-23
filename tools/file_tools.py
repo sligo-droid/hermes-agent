@@ -5,6 +5,7 @@ import errno
 import json
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 
@@ -253,6 +254,26 @@ _SENSITIVE_PATH_PREFIXES = (
     "/private/etc/", "/private/var/",
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
+_hermes_config_resolved: str | None = None
+_hermes_config_resolved_loaded = False
+_hermes_config_resolved_lock = threading.Lock()
+
+
+def _get_hermes_config_resolved() -> str | None:
+    global _hermes_config_resolved, _hermes_config_resolved_loaded
+    if _hermes_config_resolved_loaded:
+        return _hermes_config_resolved
+    with _hermes_config_resolved_lock:
+        if _hermes_config_resolved_loaded:
+            return _hermes_config_resolved
+        try:
+            from hermes_cli.config import get_config_path
+
+            _hermes_config_resolved = str(get_config_path().expanduser().resolve())
+        except Exception:
+            _hermes_config_resolved = None
+        _hermes_config_resolved_loaded = True
+        return _hermes_config_resolved
 
 
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
@@ -271,6 +292,16 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err
+    hermes_config = _get_hermes_config_resolved()
+    if hermes_config:
+        try:
+            if os.path.realpath(resolved) == os.path.realpath(hermes_config):
+                return (
+                    f"Refusing to write Hermes config directly: {filepath}\n"
+                    "Use Hermes config commands or explicit operator-approved terminal edits."
+                )
+        except (OSError, ValueError):
+            pass
     return None
 
 
@@ -483,6 +514,18 @@ def _is_internal_file_status_text(content: str) -> bool:
             len(stripped) <= 2 * len(_READ_DEDUP_STATUS_MESSAGE):
         return True
     return False
+
+
+_READ_FILE_LINE_PREFIX_RE = re.compile(r"^\s*\d+\|")
+
+
+def _is_read_file_line_numbered_content(content: str) -> bool:
+    if not isinstance(content, str):
+        return False
+    nonblank = [line for line in content.splitlines() if line.strip()]
+    if len(nonblank) < 2:
+        return False
+    return all(_READ_FILE_LINE_PREFIX_RE.match(line) for line in nonblank[:2])
 
 
 def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
@@ -1000,6 +1043,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     if _is_internal_file_status_text(content):
         return tool_error(
             "Refusing to write internal read_file status text as file content. "
+            "Re-read the file or reconstruct the intended file contents before writing."
+        )
+    if _is_read_file_line_numbered_content(content):
+        return tool_error(
+            "Refusing to write line-numbered read_file output as file content. "
             "Re-read the file or reconstruct the intended file contents before writing."
         )
     try:

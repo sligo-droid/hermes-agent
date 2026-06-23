@@ -30,7 +30,7 @@ import time
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
-from toolsets import resolve_toolset, validate_toolset
+from toolsets import bundle_non_core_tools, resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
 
@@ -389,10 +389,14 @@ def _compute_tool_definitions(
     if disabled_toolsets:
         for toolset_name in disabled_toolsets:
             if validate_toolset(toolset_name):
-                resolved = resolve_toolset(toolset_name)
+                resolved = (
+                    bundle_non_core_tools(toolset_name)
+                    if toolset_name.startswith("hermes-")
+                    else set(resolve_toolset(toolset_name))
+                )
                 tools_to_include.difference_update(resolved)
                 if not quiet_mode:
-                    print(f"🚫 Disabled toolset '{toolset_name}': {', '.join(resolved) if resolved else 'no tools'}")
+                    print(f"🚫 Disabled toolset '{toolset_name}': {', '.join(sorted(resolved)) if resolved else 'no tools'}")
             elif toolset_name in _LEGACY_TOOLSET_MAP:
                 legacy_tools = _LEGACY_TOOLSET_MAP[toolset_name]
                 tools_to_include.difference_update(legacy_tools)
@@ -931,6 +935,23 @@ def handle_function_call(
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
 
+        middleware_trace: List[Dict[str, Any]] = []
+        if isinstance(function_args, dict):
+            try:
+                from hermes_cli.middleware import apply_tool_request_middleware
+
+                request_result = apply_tool_request_middleware(
+                    function_name,
+                    function_args,
+                    task_id=task_id or "",
+                    session_id=session_id or "",
+                    tool_call_id=tool_call_id or "",
+                )
+                function_args = request_result.payload
+                middleware_trace = list(request_result.trace)
+            except Exception as _middleware_err:
+                logger.debug("tool_request middleware error: %s", _middleware_err)
+
         # Check plugin hooks for a block directive (unless caller already
         # checked — e.g. run_agent._invoke_tool passes skip=True to
         # avoid double-firing the hook).
@@ -951,12 +972,36 @@ def handle_function_call(
                     task_id=task_id or "",
                     session_id=session_id or "",
                     tool_call_id=tool_call_id or "",
+                    middleware_trace=middleware_trace,
                 )
             except Exception as _hook_err:
                 logger.debug("pre_tool_call hook error: %s", _hook_err)
 
             if block_message is not None:
-                return json.dumps({"error": block_message}, ensure_ascii=False)
+                blocked_result = json.dumps({"error": block_message}, ensure_ascii=False)
+                try:
+                    from hermes_cli.plugins import has_hook, invoke_hook
+
+                    if has_hook("post_tool_call"):
+                        invoke_hook(
+                            "post_tool_call",
+                            tool_name=function_name,
+                            args=function_args if isinstance(function_args, dict) else {},
+                            result=blocked_result,
+                            task_id=task_id or "",
+                            session_id=session_id or "",
+                            tool_call_id=tool_call_id or "",
+                            turn_id="",
+                            api_request_id="",
+                            duration_ms=0,
+                            status="blocked",
+                            error_type="plugin_block",
+                            error_message=block_message,
+                            middleware_trace=middleware_trace,
+                        )
+                except Exception as _hook_err:
+                    logger.debug("blocked post_tool_call hook error: %s", _hook_err)
+                return blocked_result
 
         # ACP/Zed edit approval runs before any file mutation.  The requester
         # is bound via ContextVar only for ACP sessions, so CLI/gateway paths
@@ -989,21 +1034,37 @@ def handle_function_call(
         # to wrap every tool manually.  We use monotonic() so the value is
         # unaffected by wall-clock adjustments during the call.
         _dispatch_start = time.monotonic()
-        if function_name == "execute_code":
-            # Prefer the caller-provided list so subagents can't overwrite
-            # the parent's tool set via the process-global.
-            sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
-            result = registry.dispatch(
-                function_name, function_args,
-                task_id=task_id,
-                enabled_tools=sandbox_enabled,
-            )
-        else:
-            result = registry.dispatch(
-                function_name, function_args,
+
+        def _dispatch_tool(effective_args: Dict[str, Any]) -> str:
+            if function_name == "execute_code":
+                # Prefer the caller-provided list so subagents can't overwrite
+                # the parent's tool set via the process-global.
+                sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
+                return registry.dispatch(
+                    function_name, effective_args,
+                    task_id=task_id,
+                    enabled_tools=sandbox_enabled,
+                )
+            return registry.dispatch(
+                function_name, effective_args,
                 task_id=task_id,
                 user_task=user_task,
             )
+
+        try:
+            from hermes_cli.middleware import run_tool_execution_middleware
+
+            result = run_tool_execution_middleware(
+                function_name,
+                function_args,
+                _dispatch_tool,
+                task_id=task_id or "",
+                session_id=session_id or "",
+                tool_call_id=tool_call_id or "",
+                middleware_trace=middleware_trace,
+            )
+        except Exception:
+            raise
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 
         from agent.tool_executor import apply_tool_result_hooks
@@ -1015,6 +1076,7 @@ def handle_function_call(
             session_id=session_id or "",
             tool_call_id=tool_call_id or "",
             duration_ms=duration_ms,
+            middleware_trace=middleware_trace,
         )
 
         return result
