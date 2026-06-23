@@ -1,4 +1,5 @@
 import sys
+import json
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -196,3 +197,69 @@ async def test_acp_prompt_drains_queued_turns_after_current_run():
     assert state.queued_prompts == []
     agent_messages = [u for _sid, u in conn.updates if getattr(u, "session_update", None) == "agent_message_chunk"]
     assert len(agent_messages) >= 2
+
+
+@pytest.mark.asyncio
+async def test_acp_history_replay_suppresses_blocked_delegate_coding_startup_artifact():
+    acp_agent, state, _fake, conn = make_agent_and_state()
+    state.history = [
+        {"role": "user", "content": "fix hermes"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-delegate",
+                    "function": {
+                        "name": "delegate_coding_task",
+                        "arguments": json.dumps({"cwd": "/home/droid/hermes", "task": "fix"}),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-delegate",
+            "content": json.dumps(
+                {
+                    "error": "BLOCKED: delegate_coding_task was pointed at a protected canonical checkout on main"
+                }
+            ),
+        },
+    ]
+
+    await acp_agent._replay_session_history(state)
+
+    tool_updates = [u for _sid, u in conn.updates if str(getattr(u, "session_update", "")).startswith("tool_call")]
+    assert tool_updates == []
+
+
+@pytest.mark.asyncio
+async def test_acp_history_replay_keeps_active_delegate_coding_results():
+    acp_agent, state, _fake, conn = make_agent_and_state()
+    state.history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-delegate",
+                    "function": {
+                        "name": "delegate_coding_task",
+                        "arguments": json.dumps({"cwd": "/home/droid/workspaces/hermes-fix", "task": "fix"}),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-delegate",
+            "content": json.dumps({"success": True, "summary": "worker finished"}),
+        },
+    ]
+
+    await acp_agent._replay_session_history(state)
+
+    tool_updates = [u for _sid, u in conn.updates if str(getattr(u, "session_update", "")).startswith("tool_call")]
+    statuses = [getattr(update, "status", None) for update in tool_updates]
+    assert statuses == [None, "completed"]

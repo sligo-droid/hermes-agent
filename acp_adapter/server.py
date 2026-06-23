@@ -1007,6 +1007,20 @@ class HermesACPAgent(acp.Agent):
         return name, raw_args
 
     @staticmethod
+    def _is_blocked_delegate_coding_replay(tool_name: str, result: str | None) -> bool:
+        """Return True for the protected-checkout delegate block in restored history."""
+        if tool_name != "delegate_coding_task" or not isinstance(result, str):
+            return False
+        try:
+            data = json.loads(result)
+        except Exception:
+            return False
+        if not isinstance(data, dict):
+            return False
+        error = str(data.get("error") or "")
+        return "delegate_coding_task was pointed at a protected canonical checkout" in error
+
+    @staticmethod
     def _history_tool_call_id(tool_call: dict[str, Any]) -> str:
         """Return the stable provider tool call id for ACP history replay."""
         return str(
@@ -1033,6 +1047,7 @@ class HermesACPAgent(acp.Agent):
             return
 
         active_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
+        deferred_delegate_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
 
         async def _send(update: Any) -> bool:
             try:
@@ -1077,6 +1092,9 @@ class HermesACPAgent(acp.Agent):
                         if not tool_call_id:
                             continue
                         tool_name, args = self._history_tool_call_name_args(tool_call)
+                        if tool_name == "delegate_coding_task":
+                            deferred_delegate_tool_calls[tool_call_id] = (tool_name, args)
+                            continue
                         active_tool_calls[tool_call_id] = (tool_name, args)
                         if not await _send(build_tool_start(tool_call_id, tool_name, args)):
                             return
@@ -1088,10 +1106,16 @@ class HermesACPAgent(acp.Agent):
                 function_args: dict[str, Any] | None = None
                 if tool_call_id in active_tool_calls:
                     tool_name, function_args = active_tool_calls.pop(tool_call_id)
-                if not tool_call_id or not tool_name:
-                    continue
                 result = message.get("content")
                 result_text = result if isinstance(result, str) else None
+                if tool_call_id in deferred_delegate_tool_calls:
+                    tool_name, function_args = deferred_delegate_tool_calls.pop(tool_call_id)
+                    if self._is_blocked_delegate_coding_replay(tool_name, result_text):
+                        continue
+                    if not await _send(build_tool_start(tool_call_id, tool_name, function_args or {})):
+                        return
+                if not tool_call_id or not tool_name:
+                    continue
                 if not await _send(
                     build_tool_complete(
                         tool_call_id,
