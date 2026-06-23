@@ -403,10 +403,14 @@ export const api = {
     fetchJSON<{ card: SelfImprovementProposalCard }>(
       `/api/plugins/kanban/self-improvement/proposals/${encodeURIComponent(proposalId)}`,
     ),
-  approveSelfImprovementProposal: (proposalId: string) =>
+  approveSelfImprovementProposal: (proposalId: string, route: SelfImprovementApprovalRoute = "native") =>
     fetchJSON<SelfImprovementProposalActionResponse>(
       `/api/plugins/kanban/self-improvement/proposals/${encodeURIComponent(proposalId)}/approve`,
-      { method: "POST" },
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ route }),
+      },
     ),
   rejectSelfImprovementProposal: (proposalId: string, reason: string) =>
     fetchJSON<{ card: SelfImprovementProposalCard }>(
@@ -1143,6 +1147,8 @@ export interface SelfImprovementProposalCard {
   cron_job_id?: string | null;
   cron_output_path?: string | null;
 }
+
+export type SelfImprovementApprovalRoute = "native" | "worker_board";
 
 export interface SelfImprovementProposalActionResponse {
   card: SelfImprovementProposalCard;

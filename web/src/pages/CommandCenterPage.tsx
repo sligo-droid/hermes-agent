@@ -17,6 +17,7 @@ import {
   MessageSquarePlus,
   PauseCircle,
   RefreshCw,
+  XCircle,
   RotateCcw,
   Wrench,
 } from "lucide-react";
@@ -37,7 +38,7 @@ import { cn } from "@/lib/utils";
 
 type ViewKey = "overview" | "inbox" | "work" | "completed" | "archive" | "runs" | "recommendations" | "sources";
 type PaginatedViewKey = "overview" | "inbox" | "work" | "completed" | "archive";
-type ActionKind = "approve" | "pause" | "replay" | "repair" | "undo" | "archive";
+type ActionKind = "approve" | "approve_worker_board" | "reject" | "pause" | "replay" | "repair" | "undo" | "archive";
 type ActiveAction = { ids: string[]; kind: ActionKind };
 type AnnotationDraft = { item: CommandCenterWorkItem; mode: CommandCenterAnnotationMode };
 type InboxPageItem = { type: "work"; item: CommandCenterWorkItem } | { type: "source"; source: CommandCenterSource };
@@ -50,6 +51,8 @@ const COMMAND_CENTER_PAGE_SIZE = 20;
 const ARCHIVE_VIEW_ITEM_LIMIT = 100;
 const ACTION_PROGRESS_LABELS: Record<ActionKind, string> = {
   approve: "Approving",
+  approve_worker_board: "Creating worker board",
+  reject: "Rejecting",
   pause: "Pausing",
   replay: "Replaying",
   repair: "Repairing",
@@ -230,13 +233,18 @@ function availableActionKinds(item: CommandCenterWorkItem): ActionKind[] {
       && item.decision?.approve_action
       && (item.status === "proposed" || item.decision?.needed === true),
   );
-  const canPause = Boolean(["queued", "running", "review", "accepted"].includes(item.status) && (proposalId || (item.execution?.pause_action && board)) && !item.execution?.paused);
+  const hasProposalExecution = Boolean(proposalId && item.execution);
+  const canPause = Boolean(["queued", "running", "review", "accepted"].includes(item.status) && (hasProposalExecution || (item.execution?.pause_action && board)) && !item.execution?.paused);
   const canResume = Boolean(item.execution?.resumable === true && (proposalId || (item.execution?.resume_action && board)) && item.status !== "archived");
   const canUndo = Boolean(isCompletedItem(item) && ((proposalId && item.decision?.undo_followup_action) || (board && item.execution?.undo_followup_action)));
   const canArchive = Boolean((item.execution?.archiveable && board && board !== "default" && item.id.startsWith("kanban-board:")) || proposalCanArchive);
   const canRepair = Boolean(item.status === "blocked" && item.execution?.board && item.execution?.repair_action && item.execution?.repairable !== false && !item.execution?.repair_task_id);
   const actions: ActionKind[] = [];
-  if (canApproveReject) actions.push("approve");
+  if (canApproveReject) {
+    actions.push("approve");
+    actions.push("approve_worker_board");
+    actions.push("reject");
+  }
   if (canResume) actions.push("replay");
   if (canPause) actions.push("pause");
   if (canUndo) actions.push("undo");
@@ -357,7 +365,9 @@ function ActionButton({
 }) {
   const tooltipId = useId();
   const config = {
-    approve: { label: "Approve", icon: Check, className: "border-emerald-200/70 bg-emerald-400 text-emerald-950 hover:bg-emerald-300 focus-visible:ring-emerald-100/75" },
+    approve: { label: "Approve native", icon: Check, className: "border-emerald-200/70 bg-emerald-400 text-emerald-950 hover:bg-emerald-300 focus-visible:ring-emerald-100/75" },
+    approve_worker_board: { label: "Worker board", icon: MessageSquarePlus, className: "border-cyan-100/50 bg-cyan-500 text-cyan-950 hover:bg-cyan-400 focus-visible:ring-cyan-100/75" },
+    reject: { label: "Reject", icon: XCircle, className: "border-red-200/75 bg-red-500 text-white hover:bg-red-400 focus-visible:ring-red-100/75", strong: true },
     pause: { label: "Pause", icon: PauseCircle, className: "border-orange-200/70 bg-orange-400 text-orange-950 hover:bg-orange-300 focus-visible:ring-orange-100/75", strong: true },
     replay: { label: "Replay", icon: RefreshCw, className: "border-emerald-200/70 bg-emerald-400 text-emerald-950 hover:bg-emerald-300 focus-visible:ring-emerald-100/75", strong: true },
     repair: { label: "Repair", icon: Wrench, className: "border-amber-200/70 bg-amber-300 text-amber-950 hover:bg-amber-200 focus-visible:ring-amber-100/75", strong: true },
@@ -1386,13 +1396,21 @@ export default function CommandCenterPage() {
     const proposalId = typeof item.decision?.proposal_id === "string" && item.decision.proposal_id.trim() ? item.decision.proposal_id : null;
     const board = item.execution?.board;
     const recoveryArchive = Boolean(proposalId && (item.status_detail === "recovery_needed" || item.execution?.recovery_required));
+    const proposalHasDownstreamExecution = Boolean(item.execution?.task_id || item.execution?.board);
     if (kind === "archive") {
       if (proposalId && recoveryArchive) await api.archiveSelfImprovementProposal(proposalId);
       else if (board && board !== "default") await api.archiveKanbanBoard(board);
       else if (proposalId && item.status === "proposed") await api.archiveSelfImprovementProposal(proposalId);
+      else if (proposalId && !proposalHasDownstreamExecution) await api.archiveSelfImprovementProposal(proposalId);
       else if (proposalId) await api.haltSelfImprovementProposal(proposalId);
     } else if (proposalId && kind === "approve") {
-      await api.approveSelfImprovementProposal(proposalId);
+      await api.approveSelfImprovementProposal(proposalId, "native");
+    } else if (proposalId && kind === "approve_worker_board") {
+      await api.approveSelfImprovementProposal(proposalId, "worker_board");
+    } else if (proposalId && kind === "reject") {
+      const reason = window.prompt("Reason for rejecting this proposal?", "Not actionable.");
+      if (!reason?.trim()) return;
+      await api.rejectSelfImprovementProposal(proposalId, reason.trim());
     } else if (kind === "pause") {
       if (proposalId) await api.pauseSelfImprovementProposal(proposalId);
       else if (board) await api.pauseKanbanBoard(board);

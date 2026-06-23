@@ -623,6 +623,10 @@ class ProposalRejectBody(BaseModel):
     reason: str = Field(..., min_length=1, max_length=2000)
 
 
+class ProposalApproveBody(BaseModel):
+    route: Optional[str] = None
+
+
 class ProposalFollowupBody(BaseModel):
     reason: Optional[str] = Field(default=None, max_length=2000)
 
@@ -648,6 +652,15 @@ class CommandCenterAnnotationBody(BaseModel):
 
 def _proposal_actor() -> str:
     return os.environ.get("USER") or os.environ.get("USERNAME") or "dashboard"
+
+
+def _proposal_approval_route(payload: ProposalApproveBody | None) -> str:
+    route = str(payload.route or "native").strip().lower().replace("-", "_") if payload else "native"
+    if route in {"", "native", "no_board", "noboard"}:
+        return "native"
+    if route in {"worker_board", "kanban"}:
+        return "worker_board"
+    raise HTTPException(status_code=400, detail="approval route must be native or worker_board")
 
 
 def _proposal_task_body(card: dict[str, Any]) -> str:
@@ -2136,13 +2149,14 @@ def self_improvement_proposal_detail_endpoint(proposal_id: str):
 
 
 @router.post("/self-improvement/proposals/{proposal_id}/approve")
-def self_improvement_proposal_approve_endpoint(proposal_id: str):
+def self_improvement_proposal_approve_endpoint(proposal_id: str, payload: ProposalApproveBody | None = None):
     card = proposal_storage.get_card(proposal_id)
     if card is None:
         raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")
     if card.get("status") == "rejected":
         raise HTTPException(status_code=409, detail="rejected proposals cannot be approved")
 
+    route = _proposal_approval_route(payload)
     task_payload = card.get("kanban_task") if isinstance(card.get("kanban_task"), dict) else {}
     existing_route = _latest_discord_approval_metadata(proposal_id)
     existing_task_id = str(card.get("kanban_task_id") or "").strip()
@@ -2166,6 +2180,25 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
             "task": _task_dict(task) if task else None,
             "worker_url": worker_url,
         }
+    if card.get("status") == "approved":
+        return {"card": _self_improvement_card_with_downstream(card), "task": None, "worker_url": ""}
+
+    idempotency_key = f"self-improvement:{proposal_id}"
+    if route == "native":
+        approval_metadata = {
+            "idempotency_key": idempotency_key,
+            "execution_route": "native",
+            "worker_url": "",
+        }
+        approved = proposal_storage.record_approval(
+            proposal_id,
+            kanban_task_id="",
+            worker_url="",
+            actor=_proposal_actor(),
+            metadata=approval_metadata,
+        )
+        command_center.invalidate_snapshot_cache()
+        return {"card": _self_improvement_card_with_downstream(approved), "task": None, "worker_url": ""}
 
     channel_id = discord_publish.configured_project_channel_id(card.get("project"))
     discord_route = (
@@ -2177,12 +2210,12 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
         if channel_id
         else None
     )
-    idempotency_key = f"self-improvement:{proposal_id}"
     task = None
     task_id = ""
     if discord_route and discord_route.thread_id and (discord_route.error or not discord_route.board):
         metadata = {
             "idempotency_key": idempotency_key,
+            "execution_route": "worker_board",
             "board": discord_route.board or "",
             **discord_route.metadata(),
         }
@@ -2200,6 +2233,7 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
     if discord_route and discord_route.board:
         route_metadata = {
             "idempotency_key": idempotency_key,
+            "execution_route": "worker_board",
             "board": discord_route.board or "",
             **discord_route.metadata(),
         }
@@ -2219,6 +2253,7 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
                 reason=discord_route.error,
                 metadata={
                     "idempotency_key": idempotency_key,
+                    "execution_route": "worker_board",
                     "board": board or "",
                     **discord_route.metadata(),
                 },
@@ -2263,6 +2298,7 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str):
     worker_url = _approval_worker_url(task_id, discord_route, board)
     approval_metadata = {
         "idempotency_key": idempotency_key,
+        "execution_route": "worker_board",
         "board": board or "default",
         **(discord_route.metadata() if discord_route else {}),
         **({"discord_channel_id": channel_id, "discord_publish": "unavailable"} if channel_id and not discord_route else {}),
@@ -2359,7 +2395,8 @@ def self_improvement_proposal_archive_endpoint(proposal_id: str):
     if card is None:
         raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")
     status = str(card.get("status") or "").lower()
-    if status == "approved" or (card.get("kanban_task_id") and status != "recovery_needed"):
+    has_downstream = bool(card.get("kanban_task_id") or card.get("worker_url"))
+    if (status == "approved" and has_downstream) or (card.get("kanban_task_id") and status != "recovery_needed"):
         raise HTTPException(status_code=409, detail="approved proposals must be halted or archived through their downstream worker")
     archived = proposal_storage.record_archive(
         proposal_id,
