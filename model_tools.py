@@ -30,7 +30,12 @@ import time
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
-from toolsets import bundle_non_core_tools, resolve_toolset, validate_toolset
+from toolsets import resolve_toolset, validate_toolset
+try:
+    from toolsets import bundle_non_core_tools
+except ImportError:
+    def bundle_non_core_tools(toolset_name: str) -> set[str]:
+        return set(resolve_toolset(toolset_name))
 
 logger = logging.getLogger(__name__)
 
