@@ -197,6 +197,7 @@ def test_authorized_git_pr_lifecycle_updates_prompt_and_codex_env(monkeypatch, t
     assert env["GH_CONFIG_DIR"] == str(gh_config)
     assert env["GIT_CONFIG_GLOBAL"] == str(git_config)
     assert env["SSH_AUTH_SOCK"] == "/tmp/ssh-agent.sock"
+    assert env["GIT_SSH_COMMAND"] == "ssh -F none"
     assert "GITHUB_TOKEN" not in env
     assert "GH_TOKEN" not in env
     prompt = FakeSession.instances[0].run_calls[0]["user_input"]
@@ -206,10 +207,37 @@ def test_authorized_git_pr_lifecycle_updates_prompt_and_codex_env(monkeypatch, t
     assert "Do not merge PRs" in prompt
 
 
+def test_authorized_git_pr_lifecycle_preserves_explicit_git_ssh_command(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -F /custom/config")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+    monkeypatch.setenv("GH_TOKEN", "gho_secret")
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix and open a PR",
+            parent_agent=_parent(tmp_path),
+            allow_git_pr_lifecycle=True,
+        )
+    )
+
+    assert result["success"] is True
+    env = FakeSession.instances[0].kwargs["env"]
+    assert env["GIT_SSH_COMMAND"] == "ssh -F /custom/config"
+    assert "GITHUB_TOKEN" not in env
+    assert "GH_TOKEN" not in env
+
+
 def test_default_coding_worker_keeps_restricted_codex_env(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.invalid:8080")
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -F /custom/config")
     monkeypatch.setattr(
         "agent.transports.codex_app_server_session.CodexAppServerSession",
         FakeSession,
@@ -227,6 +255,7 @@ def test_default_coding_worker_keeps_restricted_codex_env(monkeypatch, tmp_path)
     assert kwargs["replace_env"] is False
     assert kwargs["env"] == {"HERMES_SESSION_KEY": "discord:123"}
     assert "HTTPS_PROXY" not in kwargs["env"]
+    assert "GIT_SSH_COMMAND" not in kwargs["env"]
     assert "HERMES_CODEX_WORKER_NETWORK_ACCESS" not in kwargs["env"]
 
 

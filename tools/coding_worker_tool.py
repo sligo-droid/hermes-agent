@@ -20,6 +20,9 @@ from typing import Any, Optional
 from tools.registry import registry, tool_error
 
 
+DEFAULT_CODING_WORKER_GIT_SSH_COMMAND = "ssh -F none"
+
+
 def check_coding_worker_requirements() -> bool:
     try:
         from agent.opencode_worker import BACKEND_OPENCODE, check_opencode_binary, load_coding_worker_backend
@@ -177,6 +180,7 @@ def _coding_worker_git_lifecycle_env(workdir: str, parent_agent: Any) -> dict[st
         env.update(extra)
     for secret_key in ("GH_TOKEN", "GITHUB_TOKEN"):
         env.pop(secret_key, None)
+    env.setdefault("GIT_SSH_COMMAND", DEFAULT_CODING_WORKER_GIT_SSH_COMMAND)
     return env
 
 
