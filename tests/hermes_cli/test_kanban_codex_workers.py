@@ -3720,14 +3720,18 @@ def test_dev_role_backend_records_planner_ui_route_decision(monkeypatch, tmp_pat
 
 def test_run_codex_applies_ui_route_args_env_and_result_metadata(monkeypatch, tmp_path):
     from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import config as config_mod
     from hermes_cli import kanban_codex_worker as worker
     from hermes_cli.config import DEFAULT_CONFIG
     from hermes_cli.discord_worker_boards import ROLE_DEV
     from hermes_cli.ui_work_routing import resolve_ui_work_route
+    from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 
     board, task = _claimed_planner(monkeypatch, tmp_path)
     workspace = tmp_path / "repo"
     workspace.mkdir()
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(config_mod, "get_env_value", lambda key: "or-secret" if key == "OPENROUTER_API_KEY" else None)
     decision = resolve_ui_work_route(
         DEFAULT_CONFIG,
         task="Implement Command Center visual polish.",
@@ -3773,6 +3777,8 @@ def test_run_codex_applies_ui_route_args_env_and_result_metadata(monkeypatch, tm
     assert env["HERMES_UI_WORK_ROUTE"] == "ui_visual_specialist"
     assert env["HERMES_UI_WORK_SELECTED_PROVIDER"] == "openrouter"
     assert env["HERMES_UI_WORK_SELECTED_MODEL"] == "z-ai/glm-5.2"
+    assert env[f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}OPENROUTER_API_KEY"] == "or-secret"
+    assert "OPENROUTER_API_KEY" not in env
     assert getattr(result, "ui_work_route")["selected_route"] == "ui_visual_specialist"
     state = dwb.ticket_state_for_session("9001", task.id)["codex_state"]
     assert state["result"]["ui_work_route"]["selected_provider"] == "openrouter"
