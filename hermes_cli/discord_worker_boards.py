@@ -4513,7 +4513,7 @@ def render_public_session_board_html(
 
 def _workers_page_css() -> str:
     return """
-    :root { color-scheme: light; --bg: #f7f7f5; --panel: #ffffff; --panel-soft: #fbfbfa; --line: #d7d7d2; --line-soft: #e6e6e2; --text: #1f2933; --muted: #52606d; --link: #1d4ed8; --code: #5965f2; --status-running: #0ea5e9; --status-queued: #6366f1; --status-idle: #94a3b8; --status-blocked: #ef4444; --status-degraded: #f59e0b; --status-paused: #f97316; --status-done: #10b981; }
+    :root { color-scheme: light; --bg: #f7f7f5; --panel: #ffffff; --panel-soft: #fbfbfa; --line: #d7d7d2; --line-soft: #e6e6e2; --text: #1f2933; --muted: #52606d; --link: #1d4ed8; --code: #5965f2; --runtime-on-dark: #ffffff; --status-running: #075985; --status-queued: #4338ca; --status-idle: #475569; --status-blocked: #991b1b; --status-stalled: #92400e; --status-degraded: #854d0e; --status-paused: #9a3412; --status-done: #047857; --status-cancelled: #4b5563; }
     * { box-sizing: border-box; }
     body { margin: 0; min-height: 100vh; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
     header { border-bottom: 1px solid var(--line); background: var(--panel); padding: 24px 28px; }
@@ -4541,14 +4541,16 @@ def _workers_page_css() -> str:
     .meta span { white-space: nowrap; }
     .chips { margin-top: 8px; }
     .chip { color: var(--muted); font-size: 13px; }
-    .runtime { border-radius: 4px; color: #fff; display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: 0.05em; padding: 2px 8px; text-transform: uppercase; }
-    .runtime-running { background: var(--status-running); }
-    .runtime-queued { background: var(--status-queued); }
-    .runtime-idle { background: var(--status-idle); }
-    .runtime-blocked { background: var(--status-blocked); }
-    .runtime-degraded { background: var(--status-degraded); }
-    .runtime-paused { background: var(--status-paused); }
-    .runtime-done { background: var(--status-done); }
+    .runtime { background: var(--status-idle); border-radius: 4px; color: var(--runtime-on-dark); display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: 0.05em; padding: 2px 8px; text-transform: uppercase; }
+    .runtime-running { background: var(--status-running); color: var(--runtime-on-dark); }
+    .runtime-queued { background: var(--status-queued); color: var(--runtime-on-dark); }
+    .runtime-idle { background: var(--status-idle); color: var(--runtime-on-dark); }
+    .runtime-blocked { background: var(--status-blocked); color: var(--runtime-on-dark); }
+    .runtime-stalled { background: var(--status-stalled); color: var(--runtime-on-dark); }
+    .runtime-degraded { background: var(--status-degraded); color: var(--runtime-on-dark); }
+    .runtime-paused { background: var(--status-paused); color: var(--runtime-on-dark); }
+    .runtime-done { background: var(--status-done); color: var(--runtime-on-dark); }
+    .runtime-cancelled { background: var(--status-cancelled); color: var(--runtime-on-dark); }
     .board-card-body { display: block; padding: 0; }
     .status-grid { color: var(--muted); font-size: 13px; margin-top: 8px; }
     .status-cell { display: inline; }
