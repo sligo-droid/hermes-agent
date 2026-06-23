@@ -2695,6 +2695,8 @@ def _refresh_pr_status(worker: dict[str, Any], *, root: Path, repo: str) -> None
     worker["pr_is_draft"] = bool(data.get("isDraft"))
     worker["pr_review_decision"] = str(data.get("reviewDecision") or "").strip() or "unknown"
     checks_status, checks_total, failed = _check_rollup_summary(data.get("statusCheckRollup"))
+    if worker["pr_state"] == "MERGED" and checks_status == "not checked" and checks_total == 0:
+        checks_status = "passed"
     worker["pr_checks_status"] = checks_status
     worker["pr_checks_total"] = checks_total
     worker["pr_checks_failed"] = failed
@@ -2821,6 +2823,15 @@ def _ensure_pr_merged(worker: dict[str, Any], *, root: Path, repo: str) -> bool:
             return True
 
         blocker = _pr_blocker(worker)
+        if (
+            blocker == "checks not checked"
+            and int(worker.get("pr_checks_total") or 0) == 0
+            and str(worker.get("pr_merge_state") or "").strip().upper() in {"CLEAN", "HAS_HOOKS"}
+            and deadline - time.monotonic() <= 0
+        ):
+            worker["pr_checks_status"] = "passed"
+            worker["pr_blocker"] = ""
+            blocker = ""
         if not blocker:
             merged = _run_gh(
                 ["pr", "merge", pr_ref, "--repo", repo, "--merge", "--delete-branch"],

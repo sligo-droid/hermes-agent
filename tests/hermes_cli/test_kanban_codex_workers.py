@@ -4746,6 +4746,59 @@ def test_ensure_pr_waits_for_checks_before_merging(monkeypatch, tmp_path):
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
 
 
+def test_ensure_pr_merges_clean_pr_with_no_reported_checks_after_wait(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_PR_MERGE_WAIT_SECONDS", "0")
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="no-check-pr",
+        goal="Ship PR without checks",
+        project_context={"github_url": "https://github.com/sligo-labs/PID.git"},
+    )
+    workspace = tmp_path / "repo"
+    project_path = tmp_path / "canonical"
+    workspace.mkdir()
+    project_path.mkdir()
+    dwb._update_worker_meta(board.slug, {"project_path": str(project_path)})
+    calls = []
+    view_states = iter(
+        [
+            _pr_view_json(number=129, state="OPEN", merge_state="CLEAN", checks=[]),
+            _pr_view_json(number=129, state="MERGED", merge_state="CLEAN", checks=[]),
+        ]
+    )
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-labs/PID/pull/129\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(returncode=0, stdout=next(view_states), stderr="")
+        if cmd[:3] == ["gh", "pr", "merge"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        sync_result = _canonical_sync_result(cmd)
+        if sync_result is not None:
+            return sync_result
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker._ensure_pr(board.slug, str(workspace)) is True
+
+    assert any(cmd[:3] == ["gh", "pr", "merge"] for cmd in calls)
+    meta = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert meta["pr_state"] == "MERGED"
+    assert meta["pr_checks_status"] == "passed"
+    assert meta["pr_checks_total"] == 0
+    assert meta["pr_blocker"] == ""
+
+
+
 def test_ensure_pr_polls_passed_unstable_before_merging(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     monkeypatch.setenv("HERMES_KANBAN_PR_MERGE_WAIT_SECONDS", "1")
