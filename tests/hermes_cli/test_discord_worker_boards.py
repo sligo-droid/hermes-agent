@@ -409,19 +409,93 @@ def test_ensure_code_island_keeps_unchanged_healthy_check_below_info(monkeypatch
     assert "ready=True" in debug_records[0].message
 
 
-def test_ensure_code_island_blocks_active_board_without_project_mapping(monkeypatch, tmp_path):
+def test_ensure_code_island_persists_active_stale_error_recovery_once(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    board = dwb.start_direct_goal(
+        thread_id="12347d",
+        goal="Ship it",
+        project_context={"project_path": str(project)},
+    )
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "code_island_ready": False,
+            "code_island_pending": False,
+            "code_island_error": "stale historical checkout failure",
+            "worktree_path": str(tmp_path / "worktree"),
+        },
+    )
+
+    def fake_ensure(worker):
+        worker["code_island_ready"] = True
+        worker["code_island_pending"] = False
+        worker.pop("code_island_error", None)
+
+    monkeypatch.setattr(dwb, "_ensure_code_island", fake_ensure)
+
+    with caplog.at_level("INFO", logger="hermes_cli.discord_worker_boards"):
+        assert dwb.ensure_code_island_for_board(board.slug) is True
+
+    info_records = [
+        record
+        for record in caplog.records
+        if record.levelname == "INFO"
+        and record.message.startswith(f"discord_worker_code_island board={board.slug}")
+    ]
+    assert len(info_records) == 1
+    assert "ready=True" in info_records[0].message
+    assert "pending=False" in info_records[0].message
+    assert "error=False" in info_records[0].message
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "code_island_error" not in worker
+
+    caplog.clear()
+    with caplog.at_level("DEBUG", logger="hermes_cli.discord_worker_boards"):
+        assert dwb.ensure_code_island_for_board(board.slug) is True
+
+    info_records = [
+        record
+        for record in caplog.records
+        if record.levelname == "INFO"
+        and record.message.startswith(f"discord_worker_code_island board={board.slug}")
+    ]
+    debug_records = [
+        record
+        for record in caplog.records
+        if record.levelname == "DEBUG"
+        and record.message.startswith(f"discord_worker_code_island board={board.slug}")
+    ]
+    assert info_records == []
+    assert len(debug_records) == 1
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "code_island_error" not in worker
+
+
+def test_ensure_code_island_blocks_active_board_without_project_mapping(monkeypatch, tmp_path, caplog):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_db
 
     board = dwb.set_goal(thread_id="12348", goal="Ship it")
 
-    assert dwb.ensure_code_island_for_board(board.slug) is False
+    with caplog.at_level("INFO", logger="hermes_cli.discord_worker_boards"):
+        assert dwb.ensure_code_island_for_board(board.slug) is False
 
     worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert worker["goal_status"] == "blocked"
     assert worker["phase"] == "blocked"
     assert "No project checkout is mapped" in worker["blocked_reason"]
+    assert f"discord_worker_code_island board={board.slug}" in caplog.text
+    assert "error=True" in caplog.text
 
 
 def test_ensure_code_island_blocks_active_board_on_checkout_error(monkeypatch, tmp_path):

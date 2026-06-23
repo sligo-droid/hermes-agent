@@ -1675,15 +1675,32 @@ def ensure_code_island_for_board(board: str) -> bool:
         for key in (
             "code_island_ready",
             "code_island_pending",
-            "code_island_error",
             "worktree_path",
             "project_path",
         )
         if key in worker
     }
+    code_island_updates["code_island_error"] = worker.get("code_island_error", _DELETE_META)
+
+    def apply_code_island_updates(
+        current_metadata: dict[str, Any],
+        current_worker: dict[str, Any],
+    ) -> bool:
+        changed = False
+        for key, value in code_island_updates.items():
+            previous_value = current_worker.get(key)
+            if value is _DELETE_META:
+                if key in current_worker:
+                    current_worker.pop(key, None)
+                    changed = True
+            elif previous_value != value:
+                current_worker[key] = value
+                changed = True
+        return changed
+
     written = _mutate_worker_metadata(
         board,
-        lambda current_metadata, current_worker: (current_worker.update(code_island_updates) or True),
+        apply_code_island_updates,
         warning_action="ensure Discord worker board code island metadata",
     )
     if written is None:
