@@ -1196,6 +1196,24 @@ def _ui_work_route_env(decision: UIWorkRouteDecision | None) -> dict[str, str]:
     return {key: str(value) for key, value in values.items() if value not in (None, "")}
 
 
+def _ui_work_route_provider_env(decision: UIWorkRouteDecision | None) -> dict[str, str]:
+    """Return intentionally scoped provider credentials for a selected UI route."""
+    if decision is None or not decision.matched or not decision.enabled:
+        return {}
+    provider = str(decision.selected_provider or decision.provider or "").strip().lower()
+    if provider != "openrouter":
+        return {}
+    try:
+        from hermes_cli.config import get_env_value
+        from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
+    except Exception:
+        return {}
+    value = str(get_env_value("OPENROUTER_API_KEY") or "").strip()
+    if not value:
+        return {}
+    return {f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}OPENROUTER_API_KEY": value}
+
+
 def _ui_work_route_prompt(decision: UIWorkRouteDecision | None) -> str:
     if decision is None:
         return ""
@@ -1309,7 +1327,12 @@ def _run_codex(
         _heartbeat_worker_activity(task_id, board=board)
 
     guard_env, guard_dir = _role_pr_mutation_guard_env(role)
-    runtime_env = {**guard_env, **_role_read_only_discord_env(role), **_ui_work_route_env(ui_work_route)}
+    runtime_env = {
+        **guard_env,
+        **_role_read_only_discord_env(role),
+        **_ui_work_route_env(ui_work_route),
+        **_ui_work_route_provider_env(ui_work_route),
+    }
     try:
         attempt = 0
         while True:
@@ -1453,7 +1476,12 @@ def _run_opencode(
         )
     )
     guard_env, guard_dir = _role_pr_mutation_guard_env(role)
-    runtime_env = {**guard_env, **_role_read_only_discord_env(role), **_ui_work_route_env(ui_work_route)}
+    runtime_env = {
+        **guard_env,
+        **_role_read_only_discord_env(role),
+        **_ui_work_route_env(ui_work_route),
+        **_ui_work_route_provider_env(ui_work_route),
+    }
     old_env = {key: os.environ.get(key) for key in runtime_env}
     os.environ.update(runtime_env)
     try:
