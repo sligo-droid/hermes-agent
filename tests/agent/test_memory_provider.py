@@ -1,11 +1,13 @@
 """Tests for the memory provider interface, manager, and builtin provider."""
 
 import json
-import pytest
+import logging
 from unittest.mock import MagicMock
 
+import pytest
+
 from agent.memory_provider import MemoryProvider
-from agent.memory_manager import MemoryManager
+from agent.memory_manager import MemoryManager, sanitize_context
 
 # ---------------------------------------------------------------------------
 # Concrete test provider
@@ -89,6 +91,15 @@ class MessagesMemoryProvider(FakeMemoryProvider):
 
     def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
         self.synced_turns.append((user_content, assistant_content, session_id, messages))
+
+
+class SanitizingMemoryProvider(FakeMemoryProvider):
+    """Provider that exercises the Honcho sanitize_context text boundary."""
+
+    def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
+        clean_user = sanitize_context(user_content or "").strip()
+        clean_assistant = sanitize_context(assistant_content or "").strip()
+        self.synced_turns.append((clean_user, clean_assistant, session_id, messages))
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +276,69 @@ class TestMemoryManager:
 
         assert p.synced_turns == [("user msg", "assistant msg")]
 
+    def test_sync_all_normalizes_bytes_and_none_content(self):
+        mgr = MemoryManager()
+        p = FakeMemoryProvider("external")
+        mgr.add_provider(p)
+
+        mgr.sync_all(b"user bytes", None)
+
+        assert p.synced_turns == [("user bytes", "")]
+
+    def test_sync_all_normalizes_multimodal_content_before_provider_dispatch(self, caplog):
+        mgr = MemoryManager()
+        p = SanitizingMemoryProvider("honcho")
+        mgr.add_provider(p)
+        user_payload = [
+            {"type": "text", "text": "Please inspect this."},
+            {"type": "image_url", "image_url": {"url": "https://private.example/image.png"}},
+            {"type": "input_text", "text": b"and decoded bytes"},
+            {"type": "input_image", "image_url": "data:image/png;base64,private"},
+            b"\x89PNG\r\n\x1a\nprivate",
+            {"type": "unknown_widget", "payload": {"transcript": "hidden text"}},
+        ]
+        assistant_payload = [
+            {"type": "output_text", "text": "I can help."},
+            {"type": "refusal", "refusal": "I will not include the image payload."},
+            {"type": "file", "file": {"file_data": "private-file"}},
+            {"type": "message", "content": [{"type": "text", "text": "Next step."}]},
+        ]
+        messages = [{"role": "user", "content": user_payload}]
+
+        with caplog.at_level(logging.WARNING):
+            mgr.sync_all(
+                user_payload,
+                assistant_payload,
+                session_id="sess-1",
+                messages=messages,
+            )
+
+        assert len(p.synced_turns) == 1
+        user_text, assistant_text, session_id, passed_messages = p.synced_turns[0]
+        assert session_id == "sess-1"
+        assert passed_messages is messages
+        assert "Please inspect this." in user_text
+        assert "and decoded bytes" in user_text
+        assert user_text.index("Please inspect this.") < user_text.index("and decoded bytes")
+        assert "image_url=1" in user_text
+        assert "input_image=1" in user_text
+        assert "bytes=1" in user_text
+        assert "unknown_widget=1" in user_text
+        assert "I can help." in assistant_text
+        assert "I will not include the image payload." in assistant_text
+        assert "file=1" in assistant_text
+        assert "Next step." in assistant_text
+        for private_fragment in (
+            "https://private.example",
+            "data:image/png",
+            "private-file",
+            "hidden text",
+        ):
+            assert private_fragment not in user_text
+            assert private_fragment not in assistant_text
+        assert "sync_turn failed" not in caplog.text
+        assert "expected string or bytes-like object" not in caplog.text
+
     def test_read_only_blocks_write_lifecycle_hooks(self):
         mgr = MemoryManager(read_only=True)
         p = FakeMemoryProvider("external")
@@ -282,7 +356,7 @@ class TestMemoryManager:
         assert result == ""
         assert p.memory_writes == []
 
-    def test_sync_failure_doesnt_block_others(self):
+    def test_sync_failure_doesnt_block_others(self, caplog):
         """If one provider's sync fails, others still run."""
         mgr = MemoryManager()
         p1 = FakeMemoryProvider("builtin")
@@ -291,9 +365,11 @@ class TestMemoryManager:
         mgr.add_provider(p1)
         mgr.add_provider(p2)
 
-        mgr.sync_all("user", "assistant")
+        with caplog.at_level(logging.WARNING):
+            mgr.sync_all("user", "assistant")
         # p1 failed but p2 still synced
         assert p2.synced_turns == [("user", "assistant")]
+        assert "Memory provider 'builtin' sync_turn failed: boom" in caplog.text
 
     # -- Tool routing -------------------------------------------------------
 
