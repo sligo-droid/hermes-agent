@@ -181,6 +181,7 @@ export function useMainApp(gw: GatewayClient) {
   const [voiceRecordKey, setVoiceRecordKey] = useState<ParsedVoiceRecordKey>(DEFAULT_VOICE_RECORD_KEY)
   const [sessionStartedAt, setSessionStartedAt] = useState(() => Date.now())
   const [turnStartedAt, setTurnStartedAt] = useState<null | number>(null)
+  const [lastTurnEndedAt, setLastTurnEndedAt] = useState<null | number>(null)
   const [goodVibesTick, setGoodVibesTick] = useState(0)
   const [bellOnComplete, setBellOnComplete] = useState(false)
 
@@ -526,7 +527,13 @@ export function useMainApp(gw: GatewayClient) {
     if (ui.busy) {
       setTurnStartedAt(prev => prev ?? Date.now())
     } else {
-      setTurnStartedAt(null)
+      setTurnStartedAt(prev => {
+        if (prev !== null) {
+          setLastTurnEndedAt(Date.now())
+        }
+
+        return null
+      })
     }
   }, [ui.busy])
 
@@ -800,6 +807,7 @@ export function useMainApp(gw: GatewayClient) {
         composer: {
           enqueue: composerActions.enqueue,
           hasSelection,
+          openEditor: composerActions.openEditor,
           paste,
           queueRef: composerRefs.queueRef,
           selection,
@@ -1048,6 +1056,7 @@ export function useMainApp(gw: GatewayClient) {
     () => ({
       cwdLabel: fmtCwdBranch(cwd, gitBranch),
       goodVibesTick,
+      lastTurnEndedAt,
       sessionStartedAt: ui.sid ? sessionStartedAt : null,
       showStickyPrompt: !!stickyPrompt,
       statusColor: statusColorOf(ui.status, ui.theme.color),
@@ -1061,6 +1070,7 @@ export function useMainApp(gw: GatewayClient) {
       cwd,
       gitBranch,
       goodVibesTick,
+      lastTurnEndedAt,
       sessionStartedAt,
       stickyPrompt,
       turnStartedAt,

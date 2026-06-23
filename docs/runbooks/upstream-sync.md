@@ -26,12 +26,13 @@ Use this when pulling `NousResearch/hermes-agent` `upstream/main` into the Sligo
 - For fork-deleted CI workflows or upstream surfaces, keep the fork deletion unless the current fork explicitly needs the upstream workflow again.
 - For files upstream deleted but the fork still modifies, keep the fork file when it backs active fork functionality.
 - For content conflicts in fork-owned runtime surfaces, prefer fork-side behavior first, then reintroduce upstream code only when tests or local evidence show it composes.
-- For dependency manifests, do not convert package managers during the sync. Keep the repository's current lockfile strategy unless the upstream merge requires a separate package-management migration.
+- For dependency manifests, do not convert package managers during the sync. Keep root/workspace manifests and the lockfile as one contract, then verify the install command used by CI.
 - For broad upstream docs/skill catalog reshuffles, accept clean upstream changes but preserve local current-state docs and Sligo-specific operational guidance.
 
 ## Verification
 
 - Minimum local gate: `scripts/run_tests.sh` from the merge worktree.
+- If npm workspaces or lockfiles changed, run `npm ci` and the Typecheck workflow's package commands locally before pushing.
 - If smoke fails, run focused tests for the failing areas, fix the smallest integration break, then rerun smoke.
 - Before committing, check for unmerged paths and conflict markers: `git diff --name-only --diff-filter=U` and a search for `<<<<<<<` / `>>>>>>>`.
 - In the PR body, include upstream head SHA, divergence counts, conflict policy, and test results.
@@ -42,4 +43,5 @@ Use this when pulling `NousResearch/hermes-agent` `upstream/main` into the Sligo
 - Initial divergence was `10126 2538` from `git rev-list --left-right --count origin/main...upstream/main`.
 - First-pass conflicts used the conservative fork-side policy above; upstream non-conflicting changes were retained.
 - Smoke initially exposed regressions in tool middleware/hooks, file write safety guards, skills-hub recursive vetting, browse progress callbacks, and platform-bundle disabling. Those were fixed before commit.
+- CI exposed npm workspace manifest/lockfile drift and TUI prop-contract drift; root/workspace manifests were realigned with the lockfile, `npm ci` and the Typecheck package commands passed locally, and the workflow now installs the declared npm version before `npm ci`.
 - Verification: `scripts/run_tests.sh` passed with `856 passed, 16 warnings`.
