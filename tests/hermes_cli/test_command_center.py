@@ -2118,6 +2118,54 @@ def test_completed_board_rollup_exposes_revert_and_archive_actions(tmp_path, mon
     assert summary["missing_revert_count"] == 0
 
 
+def test_pid_filtered_last_page_board_archives_through_api(tmp_path, monkeypatch):
+    from plugins.kanban.dashboard import plugin_api
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    for idx in range(21):
+        board = f"pid-last-page-archive-{idx:02d}"
+        kanban_db.write_board_metadata(board, name=f"PID Last Page Archive {idx:02d}")
+        conn = kanban_db.connect(board=board)
+        try:
+            task_id = kanban_db.create_task(conn, title=f"PID issue {idx:02d}", tenant="pid", board=board)
+            with conn:
+                conn.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?", (200 + idx, task_id))
+        finally:
+            conn.close()
+
+    snapshot = plugin_api.command_center_snapshot(
+        include_archived=True,
+        include_details=False,
+        project="pid",
+        recent_run_limit_per_board=0,
+        force_refresh=True,
+    )
+    active_items = [item for item in snapshot["work_items"] if item["status"] != "archived"]
+    last_page_item = active_items[20]
+    board_to_archive = last_page_item["execution"]["board"]
+
+    response = plugin_api.delete_board(board_to_archive, delete=False)
+    assert response["result"]["action"] == "archived"
+
+    refreshed = plugin_api.command_center_snapshot(
+        include_archived=True,
+        include_details=False,
+        project="pid",
+        recent_run_limit_per_board=0,
+        force_refresh=True,
+    )
+    active_ids = {item["id"] for item in refreshed["work_items"] if item["status"] != "archived"}
+    archived_item = next(
+        item
+        for item in refreshed["work_items"]
+        if item.get("execution", {}).get("board") == board_to_archive and item["status"] == "archived"
+    )
+
+    assert last_page_item["id"] not in active_ids
+    assert archived_item["project"] == "pid"
+    assert archived_item["execution"]["archiveable"] is False
+
+
 def test_self_improvement_board_rollup_preserves_proposal_naming_and_context(tmp_path, monkeypatch):
     _ingest_valid(monkeypatch, tmp_path)
     card = _first_card()

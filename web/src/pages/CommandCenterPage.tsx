@@ -1280,6 +1280,14 @@ export default function CommandCenterPage() {
     }[activeView];
     return visibleItems.map((item) => item.id);
   }, [activeView, pagedArchivedItems, pagedCompletedItems, pagedInboxItems, pagedOverviewItems, pagedWorkItems, recommendations]);
+  useEffect(() => {
+    const visibleIds = new Set(visibleSelectableIds);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- page changes must drop stale off-page selections before row actions can run.
+    setSelectedIds((current) => {
+      if ([...current].every((id) => visibleIds.has(id))) return current;
+      return new Set([...current].filter((id) => visibleIds.has(id)));
+    });
+  }, [visibleSelectableIds]);
   const visibleWorkItemsForAudit = useMemo(() => ({
     overview: pagedOverviewItems,
     inbox: pagedInboxItems.filter((entry) => entry.type === "work").map((entry) => entry.item),
@@ -1421,7 +1429,7 @@ export default function CommandCenterPage() {
         delayBeforeApplyMs: Math.max(0, ACTION_SETTLE_MS - (Date.now() - startedAt)),
         settleAfterApplyMs: ACTION_SETTLE_MS,
       });
-      if (targetItems.length > 1) clearSelection();
+      clearSelection();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
