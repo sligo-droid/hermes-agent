@@ -1058,6 +1058,108 @@ class TestGitHubPrAmendWebhookRoute:
         assert second_request.source_id == "3443862311"
 
     @pytest.mark.asyncio
+    async def test_github_pr_amend_terminal_failure_targets_trigger_only_not_child_comments(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        adapter._add_github_pr_amend_reaction = AsyncMock(return_value=True)
+        metadata = {
+            "repo": "reserve-protocol/reserve-index-dtf",
+            "pr_number": "182",
+            "source_kind": "review",
+            "source_id": "4553549454",
+            "source_node_id": "PRR_kwDOTopLevelReview",
+            "reaction_targets": [
+                {
+                    "source_kind": "review",
+                    "source_id": "4553549454",
+                    "source_node_id": "PRR_kwDOTopLevelReview",
+                },
+                {
+                    "source_kind": "review_comment",
+                    "source_id": "3459970539",
+                    "source_node_id": "PRRC_kwDOParentInlineComment",
+                },
+                {
+                    "source_kind": "review_comment",
+                    "source_id": "3459980220",
+                    "source_node_id": "PRRC_kwDOChildInlineComment",
+                },
+            ],
+        }
+
+        assert await adapter.sync_github_pr_amend_terminal_reaction(metadata, "blocked") is True
+
+        adapter._add_github_pr_amend_reaction.assert_awaited_once()
+        request, content = adapter._add_github_pr_amend_reaction.await_args.args
+        assert content == "-1"
+        assert request.source_kind == "review"
+        assert request.source_id == "4553549454"
+        assert request.source_node_id == "PRR_kwDOTopLevelReview"
+
+    @pytest.mark.asyncio
+    async def test_github_pr_amend_terminal_success_removes_stale_child_thumbs_down(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        parent_endpoint = "repos/reserve-protocol/reserve-index-dtf/pulls/comments/3459970539/reactions"
+        child_endpoint = "repos/reserve-protocol/reserve-index-dtf/pulls/comments/3459980220/reactions"
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            if argv[:2] == ["gh", "api"] and "-X" not in argv:
+                if parent_endpoint in argv:
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        stdout=json.dumps(
+                            [{"id": 405396274, "content": "-1", "user": {"login": "sligo-droid"}}]
+                        ),
+                        stderr="",
+                    )
+                if child_endpoint in argv:
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        stdout=json.dumps(
+                            [{"id": 405396275, "content": "-1", "user": {"login": "sligo-droid"}}]
+                        ),
+                        stderr="",
+                    )
+            if argv == ["gh", "api", "user"]:
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"login": "sligo-droid"}), stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+        metadata = {
+            "repo": "reserve-protocol/reserve-index-dtf",
+            "pr_number": "182",
+            "source_kind": "review_comment",
+            "source_id": "3459970539",
+            "source_node_id": "PRRC_kwDOParentInlineComment",
+            "reaction_targets": [
+                {
+                    "source_kind": "review_comment",
+                    "source_id": "3459970539",
+                    "source_node_id": "PRRC_kwDOParentInlineComment",
+                },
+                {
+                    "source_kind": "review_comment",
+                    "source_id": "3459980220",
+                    "source_node_id": "PRRC_kwDOChildInlineComment",
+                },
+            ],
+        }
+
+        with patch("gateway.platforms.webhook.subprocess.run", side_effect=fake_run):
+            assert await adapter.sync_github_pr_amend_terminal_reaction(metadata, "done") is True
+
+        delete_calls = [call for call in calls if call[:4] == ["gh", "api", "-X", "DELETE"]]
+        post_calls = [call for call in calls if call[:4] == ["gh", "api", "-X", "POST"]]
+        assert [call[:5] for call in delete_calls] == [
+            ["gh", "api", "-X", "DELETE", f"{parent_endpoint}/405396274"],
+            ["gh", "api", "-X", "DELETE", f"{child_endpoint}/405396275"],
+        ]
+        assert [call[4] for call in post_calls] == [parent_endpoint, child_endpoint]
+        assert all("content=+1" in call for call in post_calls)
+
+    @pytest.mark.asyncio
     async def test_github_pr_amend_reaction_transition_deletes_authenticated_user_status(self):
         adapter = _make_adapter({"github-pr-amend": ROUTE})
         request = extract_request("issue_comment", ISSUE_COMMENT_PAYLOAD)

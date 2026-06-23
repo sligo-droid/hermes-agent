@@ -1081,7 +1081,13 @@ class WebhookAdapter(BasePlatformAdapter):
     async def sync_github_pr_amend_terminal_reaction(self, metadata: dict[str, Any], state: str) -> bool:
         """Best-effort terminal reaction sync for a PR-amend trigger."""
         content = "+1" if str(state or "").strip() == "done" else "-1"
-        requests = self._github_pr_amend_reaction_requests(metadata)
+        request_metadata = metadata
+        if content == "-1":
+            # A worker-board blocked/error state is aggregate state for the trigger.
+            # Do not stamp every fetched inline child comment as failed merely
+            # because the parent review/discussion is non-green.
+            request_metadata = {key: value for key, value in metadata.items() if key != "reaction_targets"}
+        requests = self._github_pr_amend_reaction_requests(request_metadata)
         if not requests:
             return False
         results = [await self._add_github_pr_amend_reaction(request, content) for request in requests]
