@@ -772,9 +772,49 @@ def compress_context(
             compressed_tokens=_compressed_est,
         )
         if _churn_details:
-            _release_lock()
-            logger.error("compression churn breaker triggered: %s", _churn_details)
-            raise CompressionChurnError(_churn_details)
+            emergency_shrink = getattr(agent.context_compressor, "emergency_shrink", None)
+            if callable(emergency_shrink):
+                try:
+                    _shrunken, _shrink_stats = emergency_shrink(
+                        compressed,
+                        target_tokens=_churn_threshold_tokens(agent) or None,
+                    )
+                except Exception:
+                    logger.debug("compression churn emergency shrink failed", exc_info=True)
+                else:
+                    if _shrunken is not compressed:
+                        _shrunken_est = estimate_request_tokens_rough(
+                            _shrunken,
+                            system_prompt=new_system_prompt or "",
+                            tools=agent.tools or None,
+                        )
+                        _post_shrink_churn = _compression_churn_details(
+                            agent,
+                            messages,
+                            original_tokens=approx_tokens,
+                            compressed_tokens=_shrunken_est,
+                        )
+                        if not _post_shrink_churn:
+                            logger.info(
+                                "compression churn avoided by emergency shrink: %s -> %s tokens (stats=%s)",
+                                f"{_compressed_est:,}",
+                                f"{_shrunken_est:,}",
+                                _shrink_stats,
+                            )
+                            compressed = _shrunken
+                            _compressed_est = _shrunken_est
+                            _churn_details = None
+                        else:
+                            _post_shrink_churn["emergency_shrink"] = {
+                                "attempted": True,
+                                "stats": _shrink_stats or {},
+                                "compressed_tokens_after_shrink": _shrunken_est,
+                            }
+                            _churn_details = _post_shrink_churn
+            if _churn_details:
+                _release_lock()
+                logger.error("compression churn breaker triggered: %s", _churn_details)
+                raise CompressionChurnError(_churn_details)
 
     if agent._session_db:
         try:
