@@ -592,9 +592,62 @@ def test_self_improvement_approve_is_idempotent_and_audited(client):
 
     assert first.status_code == 200, first.text
     assert second.status_code == 200, second.text
+    assert first.json()["task"] is None
+    assert second.json()["task"] is None
+    assert first.json()["worker_url"] == ""
+    assert second.json()["worker_url"] == ""
+    assert not first.json()["card"].get("kanban_task_id")
+    assert first.json()["card"]["worker_url"] == ""
+    assert second.json()["card"]["status"] == "approved"
+
+    conn = kb.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+    audit = proposal_storage.list_audit_events(card["proposal_id"])
+    assert [event["action"] for event in audit] == ["approved"]
+    assert audit[0]["kanban_task_id"] == ""
+    assert audit[0]["metadata"]["execution_route"] == "native"
+
+
+def test_self_improvement_native_approved_proposal_can_archive_without_downstream_task(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+
+    approved = client.post(
+        f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve",
+        json={"route": "native"},
+    )
+    archived = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/archive")
+
+    assert approved.status_code == 200, approved.text
+    assert archived.status_code == 200, archived.text
+    assert archived.json()["card"]["status"] == "archived"
+    audit = proposal_storage.list_audit_events(card["proposal_id"])
+    assert [event["action"] for event in audit] == ["approved", "archived"]
+    assert audit[0]["metadata"]["execution_route"] == "native"
+    assert audit[1]["metadata"]["previous_status"] == "approved"
+
+
+def test_self_improvement_approve_worker_board_route_creates_task(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+
+    first = client.post(
+        f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve",
+        json={"route": "kanban"},
+    )
+    second = client.post(
+        f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve",
+        json={"route": "worker_board"},
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
     assert first.json()["task"]["id"] == second.json()["task"]["id"]
     assert first.json()["card"]["kanban_task_id"] == first.json()["task"]["id"]
-    assert first.json()["card"]["worker_url"] == f"/workers?task={first.json()['task']['id']}"
     assert first.json()["worker_url"] == f"/workers?task={first.json()['task']['id']}"
 
     conn = kb.connect()
@@ -609,7 +662,21 @@ def test_self_improvement_approve_is_idempotent_and_audited(client):
 
     audit = proposal_storage.list_audit_events(card["proposal_id"])
     assert [event["action"] for event in audit] == ["approved"]
-    assert {event["kanban_task_id"] for event in audit} == {first.json()["task"]["id"]}
+    assert audit[0]["kanban_task_id"] == first.json()["task"]["id"]
+    assert audit[0]["metadata"]["execution_route"] == "worker_board"
+
+
+def test_self_improvement_approve_rejects_unknown_route(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+
+    response = client.post(
+        f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve",
+        json={"route": "spaceship"},
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == "approval route must be native or worker_board"
 
 
 def test_command_center_annotation_validates_and_persists_proposed_without_approval(client):
@@ -755,7 +822,7 @@ def test_command_center_annotation_context_is_included_on_later_approval(client)
     )
     assert created.status_code == 200, created.text
 
-    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
 
     assert approved.status_code == 200, approved.text
     conn = kb.connect()
@@ -825,7 +892,7 @@ def test_command_center_archived_correction_returns_409(client):
 def test_command_center_completed_correction_reports_followup_failure(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
-    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
     assert approved.status_code == 200, approved.text
     conn = kb.connect()
     try:
@@ -849,7 +916,7 @@ def test_command_center_completed_correction_reports_followup_failure(client):
 def test_self_improvement_cards_include_downstream_task_status(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
-    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
     assert approved.status_code == 200, approved.text
 
     grouped = client.get("/api/plugins/kanban/self-improvement/proposals")
@@ -903,7 +970,7 @@ def test_self_improvement_resume_uses_recovery_metadata_task_id(kanban_home):
 def test_self_improvement_proposal_api_reconciles_archived_downstream_task(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
-    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
     assert approved.status_code == 200, approved.text
     task_id = approved.json()["task"]["id"]
     conn = kb.connect()
@@ -1031,7 +1098,7 @@ def test_self_improvement_proposal_api_reconciles_archived_failed_worker_board_b
 def test_self_improvement_halt_archives_in_flight_task_and_audits(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
-    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
     assert approved.status_code == 200, approved.text
 
     halted = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/halt")
@@ -1063,7 +1130,7 @@ def test_self_improvement_archive_handles_unapproved_proposal(client):
 def test_self_improvement_archive_handles_recovery_needed_proposal(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
-    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
     assert approved.status_code == 200, approved.text
     approved_card = proposal_storage.get_card(card["proposal_id"])
     assert approved_card is not None
@@ -1089,7 +1156,7 @@ def test_self_improvement_archive_handles_recovery_needed_proposal(client):
 def test_self_improvement_archive_rejects_approved_proposal(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
-    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
     assert approved.status_code == 200, approved.text
 
     archived = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/archive")
@@ -1100,7 +1167,7 @@ def test_self_improvement_archive_rejects_approved_proposal(client):
 def test_self_improvement_pause_resume_is_repeatable_and_audited(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
-    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
     assert approved.status_code == 200, approved.text
 
     first_pause = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/pause")
@@ -1569,7 +1636,7 @@ def test_discord_worker_board_resume_guard_permits_resumable_board(kanban_home):
 def test_self_improvement_undo_followup_for_done_task_is_idempotent(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
-    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
     assert approved.status_code == 200, approved.text
     task_id = approved.json()["task"]["id"]
     conn = kb.connect()
@@ -1593,7 +1660,7 @@ def test_self_improvement_undo_followup_for_done_task_is_idempotent(client):
 def test_self_improvement_undo_followup_inherits_completed_task_workspace(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
-    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
     assert approved.status_code == 200, approved.text
     task_id = approved.json()["task"]["id"]
     workspace_path = "/tmp/hermes-test-self-improvement"
@@ -1672,7 +1739,7 @@ def test_self_improvement_approve_creates_task_on_discord_thread_board(client, m
     monkeypatch.setattr(discord_publish, "configured_project_channel_id", fake_channel_id)
     monkeypatch.setattr(discord_publish, "publish_approved_proposal", fake_publish)
 
-    first = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    first = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
     second = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
 
     assert first.status_code == 200, first.text
@@ -1712,9 +1779,11 @@ def test_self_improvement_approve_creates_task_on_discord_thread_board(client, m
     assert audit[-2]["action"] == "approval_route_created"
     assert audit[-2]["metadata"]["board"] == "discord-777-m-555"
     assert audit[-2]["metadata"]["idempotency_key"] == f"self-improvement:{card['proposal_id']}"
+    assert audit[-2]["metadata"]["execution_route"] == "worker_board"
     assert audit[-2]["metadata"]["discord_top_level_message_id"] == "555"
     assert audit[-2]["metadata"]["discord_thread_id"] == "777"
     assert audit[-1]["action"] == "approved"
+    assert audit[-1]["metadata"]["execution_route"] == "worker_board"
     assert audit[-1]["metadata"]["board"] == "discord-777-m-555"
     assert audit[-1]["metadata"]["discord_top_level_message_id"] == "555"
     assert audit[-1]["metadata"]["discord_thread_id"] == "777"
@@ -1844,8 +1913,8 @@ def test_self_improvement_approve_retry_reattaches_after_record_approval_failure
     monkeypatch.setattr(discord_publish, "publish_approved_proposal", fake_publish)
     monkeypatch.setattr(proposal_storage, "record_approval", flaky_record_approval)
 
-    first = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
-    second = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    first = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
+    second = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
 
     assert first.status_code == 500, first.text
     assert "retry will reattach" in first.json()["detail"]
@@ -1874,7 +1943,7 @@ def test_self_improvement_approve_short_circuits_already_approved_card(client, m
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
     monkeypatch.setattr(discord_publish, "configured_project_channel_id", lambda project: "")
 
-    first = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    first = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
     assert first.status_code == 200, first.text
 
     monkeypatch.setattr(discord_publish, "configured_project_channel_id", lambda project: "12345")
@@ -1912,7 +1981,7 @@ def test_self_improvement_approve_falls_back_without_discord_channel(client, mon
         lambda card_arg, *, channel_id, existing=None: (_ for _ in ()).throw(AssertionError("should not publish")),
     )
 
-    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
 
     assert response.status_code == 200, response.text
     assert response.json()["task"]["id"]
@@ -1940,7 +2009,7 @@ def test_self_improvement_approve_ignores_board_default_workdir_for_worker_jobs(
         lambda card_arg, *, channel_id, existing=None: (_ for _ in ()).throw(AssertionError("should not publish")),
     )
 
-    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
 
     assert response.status_code == 200, response.text
     conn = kb.connect()
@@ -1972,7 +2041,7 @@ def test_self_improvement_approve_falls_back_when_discord_publish_fails(client, 
         ),
     )
 
-    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
 
     assert response.status_code == 200, response.text
     audit = proposal_storage.list_audit_events(card["proposal_id"])
@@ -2000,7 +2069,7 @@ def test_self_improvement_approve_fails_visibly_when_discord_thread_has_no_board
         ),
     )
 
-    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
 
     assert response.status_code == 500, response.text
     assert "Discord worker board failed" in response.json()["detail"]
@@ -2051,7 +2120,7 @@ def test_self_improvement_approve_record_approval_failure_records_retry_metadata
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("storage unavailable")),
     )
 
-    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
 
     assert response.status_code == 500, response.text
     assert "retry will reattach" in response.json()["detail"]
@@ -2103,7 +2172,7 @@ def test_self_improvement_approve_maps_critical_priority_above_high(client):
     finally:
         conn.close()
 
-    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
 
     assert response.status_code == 200, response.text
     assert response.json()["task"]["priority"] == 4
@@ -2126,6 +2195,8 @@ def test_self_improvement_reject_archives_and_persists_feedback(client):
     assert client.get("/api/plugins/kanban/self-improvement/proposals").json()["projects"] == []
     detail = client.get(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}")
     assert detail.json()["card"]["status"] == "rejected"
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    assert approved.status_code == 409, approved.text
 
     conn = proposal_storage.connect()
     try:

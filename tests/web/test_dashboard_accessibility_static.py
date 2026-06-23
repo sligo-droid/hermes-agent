@@ -123,13 +123,25 @@ def test_command_center_proposal_archive_action_uses_halt_flow():
     handle_source = source.split("const handleAction = useCallback", 1)[1].split("return (", 1)[0]
     run_action_source = source.split("const runActionForItem = useCallback", 1)[1].split("const handleAction = useCallback", 1)[0]
 
-    assert 'type ActionKind = "approve" | "pause" | "replay" | "repair" | "undo" | "archive";' in source
-    assert 'if (canApproveReject) actions.push("approve");' in source
+    assert 'type ActionKind = "approve" | "approve_worker_board" | "reject" | "pause" | "replay" | "repair" | "undo" | "archive";' in source
+    assert 'approve: { label: "Approve native"' in source
+    assert 'approve_worker_board: { label: "Worker board"' in source
+    assert 'if (canApproveReject) {' in source
+    assert 'actions.push("approve");' in source
+    assert 'actions.push("approve_worker_board");' in source
+    assert 'actions.push("reject");' in source
+    assert 'const hasProposalExecution = Boolean(proposalId && item.execution);' in source
+    assert '(hasProposalExecution || (item.execution?.pause_action && board))' in source
     assert 'const proposalCanArchive = Boolean(proposalId && ["proposed", "queued", "running", "review", "blocked", "accepted", "paused"].includes(item.status));' in source
     assert 'window.prompt("Reject reason for future prong feedback?"' not in source
     assert 'rejectReason' not in handle_source
-    assert 'await api.rejectSelfImprovementProposal' not in run_action_source
+    assert 'window.prompt("Reason for rejecting this proposal?"' in run_action_source
+    assert 'await api.rejectSelfImprovementProposal(proposalId, reason.trim());' in run_action_source
+    assert 'await api.approveSelfImprovementProposal(proposalId, "native");' in run_action_source
+    assert 'await api.approveSelfImprovementProposal(proposalId, "worker_board");' in run_action_source
+    assert 'const proposalHasDownstreamExecution = Boolean(item.execution?.task_id || item.execution?.board);' in run_action_source
     assert 'else if (proposalId && item.status === "proposed") await api.archiveSelfImprovementProposal(proposalId);' in run_action_source
+    assert 'else if (proposalId && !proposalHasDownstreamExecution) await api.archiveSelfImprovementProposal(proposalId);' in run_action_source
     assert 'else if (proposalId) await api.haltSelfImprovementProposal(proposalId);' in run_action_source
     assert "targetItems" in handle_source
 
@@ -177,6 +189,8 @@ def test_command_center_archive_action_renders_last_in_row_rail():
 
     assert action_source.count('actions.push("archive")') == 1
     assert action_source.index('actions.push("approve")') < action_source.index('actions.push("archive")')
+    assert action_source.index('actions.push("approve_worker_board")') < action_source.index('actions.push("archive")')
+    assert action_source.index('actions.push("reject")') < action_source.index('actions.push("archive")')
     assert action_source.index('actions.push("replay")') < action_source.index('actions.push("archive")')
     assert action_source.index('actions.push("pause")') < action_source.index('actions.push("archive")')
     assert action_source.index('actions.push("undo")') < action_source.index('actions.push("archive")')
