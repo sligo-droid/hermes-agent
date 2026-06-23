@@ -1060,6 +1060,32 @@ def test_self_improvement_archive_handles_unapproved_proposal(client):
     assert audit[-1]["action"] == "archived"
 
 
+def test_self_improvement_archive_handles_recovery_needed_proposal(client):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    approved = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve")
+    assert approved.status_code == 200, approved.text
+    approved_card = proposal_storage.get_card(card["proposal_id"])
+    assert approved_card is not None
+    proposal_storage.record_recovery_needed(
+        card["proposal_id"],
+        actor="test",
+        reason="downstream worker errored",
+        kanban_task_id=approved_card["kanban_task_id"],
+        metadata={"board": "default", "observed_terminal_status": "archived"},
+    )
+
+    archived = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/archive")
+
+    assert archived.status_code == 200, archived.text
+    assert archived.json()["card"]["status"] == "archived"
+    assert archived.json()["card"]["archived_at"]
+    assert proposal_storage.grouped_cards()["projects"] == []
+    audit = proposal_storage.list_audit_events(card["proposal_id"])
+    assert [event["action"] for event in audit] == ["approved", "recovery_needed", "archived"]
+    assert audit[-1]["metadata"]["previous_status"] == "recovery_needed"
+
+
 def test_self_improvement_archive_rejects_approved_proposal(client):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]

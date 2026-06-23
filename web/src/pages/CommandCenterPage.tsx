@@ -1373,10 +1373,12 @@ export default function CommandCenterPage() {
     }
   }, [annotationBusy, annotationDraft, refresh]);
   const runActionForItem = useCallback(async (kind: ActionKind, item: CommandCenterWorkItem) => {
-    const proposalId = item.decision?.proposal_id;
+    const proposalId = typeof item.decision?.proposal_id === "string" && item.decision.proposal_id.trim() ? item.decision.proposal_id : null;
     const board = item.execution?.board;
+    const recoveryArchive = Boolean(proposalId && (item.status_detail === "recovery_needed" || item.execution?.recovery_required));
     if (kind === "archive") {
-      if (board && board !== "default") await api.archiveKanbanBoard(board);
+      if (proposalId && recoveryArchive) await api.archiveSelfImprovementProposal(proposalId);
+      else if (board && board !== "default") await api.archiveKanbanBoard(board);
       else if (proposalId && item.status === "proposed") await api.archiveSelfImprovementProposal(proposalId);
       else if (proposalId) await api.haltSelfImprovementProposal(proposalId);
     } else if (proposalId && kind === "approve") {

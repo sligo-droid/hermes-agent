@@ -354,8 +354,8 @@ def test_snapshot_reconciles_default_board_archived_task_to_recovery_needed(tmp_
     assert item["status"] == "blocked"
     assert item["status_detail"] == "recovery_needed"
     assert item["decision"]["needed"] is True
-    assert item["decision"]["approve_action"].endswith(
-        f"/self-improvement/proposals/{card['proposal_id']}/approve"
+    assert item["decision"]["archive_action"].endswith(
+        f"/self-improvement/proposals/{card['proposal_id']}/archive"
     )
     assert item["execution"]["board"] == kanban_db.DEFAULT_BOARD
     assert item["execution"]["task_status"] == "archived"
