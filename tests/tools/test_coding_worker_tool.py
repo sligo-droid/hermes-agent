@@ -267,6 +267,37 @@ def test_authorized_git_pr_lifecycle_bypasses_system_ssh_config_for_ssh_remotes(
     assert env["GIT_SSH_COMMAND"] == "ssh -F /dev/null"
 
 
+def test_authorized_git_pr_lifecycle_does_not_set_git_ssh_command_for_https_remotes(
+    monkeypatch, tmp_path
+):
+    FakeSession.instances = []
+    FakeSession.results = []
+    cwt.subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=cwt.subprocess.PIPE)
+    cwt.subprocess.run(
+        ["git", "remote", "add", "origin", "https://github.com/sligo-labs/hermes.git"],
+        cwd=tmp_path,
+        check=True,
+    )
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix and open a PR",
+            parent_agent=_parent(tmp_path),
+            allow_git_pr_lifecycle=True,
+            trusted_allow_git_pr_lifecycle=True,
+        )
+    )
+
+    assert result["success"] is True
+    env = FakeSession.instances[0].kwargs["env"]
+    assert "GIT_SSH_COMMAND" not in env
+
+
 def test_untrusted_git_pr_lifecycle_request_stays_local_only(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []
