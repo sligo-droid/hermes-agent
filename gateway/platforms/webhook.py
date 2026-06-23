@@ -1061,7 +1061,10 @@ class WebhookAdapter(BasePlatformAdapter):
         fallback: Any,
         content: str,
     ) -> None:
-        for request in self._github_pr_amend_reaction_requests(metadata, fallback):
+        request_metadata = metadata
+        if content == "-1" and isinstance(metadata, dict):
+            request_metadata = {key: value for key, value in metadata.items() if key != "reaction_targets"}
+        for request in self._github_pr_amend_reaction_requests(request_metadata, fallback):
             await self._safe_github_pr_amend_reaction(request, content)
 
     async def _safe_github_pr_amend_reaction(self, request: Any, content: str) -> None:
@@ -1080,7 +1083,10 @@ class WebhookAdapter(BasePlatformAdapter):
 
     async def sync_github_pr_amend_terminal_reaction(self, metadata: dict[str, Any], state: str) -> bool:
         """Best-effort terminal reaction sync for a PR-amend trigger."""
-        content = "+1" if str(state or "").strip() == "done" else "-1"
+        normalized_state = str(state or "").strip().lower()
+        if normalized_state == "blocked":
+            return True
+        content = "+1" if normalized_state == "done" else "-1"
         request_metadata = metadata
         if content == "-1":
             # A worker-board blocked/error state is aggregate state for the trigger.

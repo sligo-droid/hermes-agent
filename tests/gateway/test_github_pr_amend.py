@@ -1058,7 +1058,30 @@ class TestGitHubPrAmendWebhookRoute:
         assert second_request.source_id == "3443862311"
 
     @pytest.mark.asyncio
-    async def test_github_pr_amend_terminal_failure_targets_trigger_only_not_child_comments(self):
+    async def test_github_pr_amend_terminal_blocked_does_not_add_thumbs_down(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        adapter._add_github_pr_amend_reaction = AsyncMock(return_value=True)
+        metadata = {
+            "repo": "reserve-protocol/reserve-index-dtf",
+            "pr_number": "182",
+            "source_kind": "review_comment",
+            "source_id": "3459980220",
+            "source_node_id": "PRRC_kwDOChildInlineComment",
+            "reaction_targets": [
+                {
+                    "source_kind": "review_comment",
+                    "source_id": "3459980220",
+                    "source_node_id": "PRRC_kwDOChildInlineComment",
+                },
+            ],
+        }
+
+        assert await adapter.sync_github_pr_amend_terminal_reaction(metadata, "blocked") is True
+
+        adapter._add_github_pr_amend_reaction.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_github_pr_amend_terminal_error_targets_trigger_only_not_child_comments(self):
         adapter = _make_adapter({"github-pr-amend": ROUTE})
         adapter._add_github_pr_amend_reaction = AsyncMock(return_value=True)
         metadata = {
@@ -1086,7 +1109,7 @@ class TestGitHubPrAmendWebhookRoute:
             ],
         }
 
-        assert await adapter.sync_github_pr_amend_terminal_reaction(metadata, "blocked") is True
+        assert await adapter.sync_github_pr_amend_terminal_reaction(metadata, "errored") is True
 
         adapter._add_github_pr_amend_reaction.assert_awaited_once()
         request, content = adapter._add_github_pr_amend_reaction.await_args.args
@@ -1094,6 +1117,40 @@ class TestGitHubPrAmendWebhookRoute:
         assert request.source_kind == "review"
         assert request.source_id == "4553549454"
         assert request.source_node_id == "PRR_kwDOTopLevelReview"
+
+    @pytest.mark.asyncio
+    async def test_github_pr_amend_enqueue_failure_targets_trigger_only_not_child_comments(self):
+        adapter = _make_adapter({"github-pr-amend": ROUTE})
+        adapter._add_github_pr_amend_reaction = AsyncMock(return_value=True)
+        fallback = extract_request("pull_request_review_comment", REVIEW_COMMENT_PAYLOAD)
+        metadata = {
+            "repo": "reserve-protocol/reserve-index-dtf",
+            "pr_number": "182",
+            "source_kind": "review_comment",
+            "source_id": "4800001",
+            "source_node_id": "PRRC_kwDOReviewComment",
+            "reaction_targets": [
+                {
+                    "source_kind": "review_comment",
+                    "source_id": "4800001",
+                    "source_node_id": "PRRC_kwDOReviewComment",
+                },
+                {
+                    "source_kind": "review_comment",
+                    "source_id": "4800002",
+                    "source_node_id": "PRRC_kwDOFetchedInlineComment",
+                },
+            ],
+        }
+
+        await adapter._safe_github_pr_amend_reactions(metadata, fallback, "-1")
+
+        adapter._add_github_pr_amend_reaction.assert_awaited_once()
+        request, content = adapter._add_github_pr_amend_reaction.await_args.args
+        assert content == "-1"
+        assert request.source_kind == "review_comment"
+        assert request.source_id == "4800001"
+        assert request.source_node_id == "PRRC_kwDOReviewComment"
 
     @pytest.mark.asyncio
     async def test_github_pr_amend_terminal_success_removes_stale_child_thumbs_down(self):
