@@ -1034,7 +1034,11 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
         stdout.flush()
         return Proc()
 
-    monkeypatch.setattr(workers, "_worker_config", lambda: {"codex_home_root": str(tmp_path / "homes")})
+    monkeypatch.setattr(
+        workers,
+        "_worker_config",
+        lambda: {"backend": "codex", "codex_home_root": str(tmp_path / "homes")},
+    )
     monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
 
@@ -1085,7 +1089,11 @@ def test_codex_role_worker_pythonpath_prefers_runtime_venv_owner(monkeypatch, tm
         return Proc()
 
     monkeypatch.setattr(workers.sys, "executable", str(python))
-    monkeypatch.setattr(workers, "_worker_config", lambda: {"codex_home_root": str(tmp_path / "homes")})
+    monkeypatch.setattr(
+        workers,
+        "_worker_config",
+        lambda: {"backend": "codex", "codex_home_root": str(tmp_path / "homes")},
+    )
     monkeypatch.setattr(workers, "_write_minimal_codex_home", lambda path: None)
     monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
@@ -1139,7 +1147,7 @@ def test_codex_role_worker_uses_systemd_worker_handle_when_enabled(monkeypatch, 
     monkeypatch.setattr(
         workers,
         "_worker_config",
-        lambda: {"codex_home_root": str(tmp_path / "homes")},
+        lambda: {"backend": "codex", "codex_home_root": str(tmp_path / "homes")},
     )
     monkeypatch.setattr(
         workers,
@@ -1259,7 +1267,7 @@ def test_codex_role_worker_falls_back_to_direct_spawn_when_systemd_launch_fails(
     monkeypatch.setattr(
         workers,
         "_worker_config",
-        lambda: {"codex_home_root": str(tmp_path / "homes")},
+        lambda: {"backend": "codex", "codex_home_root": str(tmp_path / "homes")},
     )
     monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(kanban_db, "_should_use_systemd_worker", lambda: True)
@@ -1338,7 +1346,11 @@ def test_codex_role_worker_inherits_available_pool_credential(monkeypatch, tmp_p
         captured.update({"env": env})
         return Proc()
 
-    monkeypatch.setattr(workers, "_worker_config", lambda: {"codex_home_root": str(tmp_path / "homes")})
+    monkeypatch.setattr(
+        workers,
+        "_worker_config",
+        lambda: {"backend": "codex", "codex_home_root": str(tmp_path / "homes")},
+    )
     monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
 
@@ -1442,7 +1454,11 @@ def test_codex_role_worker_does_not_copy_inherited_worker_codex_home(monkeypatch
         captured.update({"env": env})
         return Proc()
 
-    monkeypatch.setattr(workers, "_worker_config", lambda: {"codex_home_root": str(tmp_path / "homes")})
+    monkeypatch.setattr(
+        workers,
+        "_worker_config",
+        lambda: {"backend": "codex", "codex_home_root": str(tmp_path / "homes")},
+    )
     monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
 
@@ -1481,7 +1497,11 @@ def test_codex_role_worker_does_not_copy_external_codex_home(monkeypatch, tmp_pa
         captured.update({"env": env})
         return Proc()
 
-    monkeypatch.setattr(workers, "_worker_config", lambda: {"codex_home_root": str(tmp_path / "homes")})
+    monkeypatch.setattr(
+        workers,
+        "_worker_config",
+        lambda: {"backend": "codex", "codex_home_root": str(tmp_path / "homes")},
+    )
     monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
 
@@ -1494,6 +1514,7 @@ def test_codex_role_worker_does_not_copy_external_codex_home(monkeypatch, tmp_pa
 
 
 def test_codex_role_worker_logs_scheduled_runtime_settings(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
     from hermes_cli import kanban_codex_workers as workers
     from hermes_cli import kanban_db
 
@@ -1513,6 +1534,7 @@ def test_codex_role_worker_logs_scheduled_runtime_settings(monkeypatch, tmp_path
             "roles": {"planner": {"reasoning": "xhigh", "service_tier": "fast"}},
         },
     )
+    monkeypatch.setattr(ow, "check_opencode_binary", lambda: (True, "/bin/opencode"))
     monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(workers.subprocess, "Popen", lambda *args, **kwargs: Proc())
 
@@ -1520,7 +1542,7 @@ def test_codex_role_worker_logs_scheduled_runtime_settings(monkeypatch, tmp_path
 
     log = kanban_db.read_worker_log(task.id, board=board.slug)
     assert log is not None
-    assert "[kanban dispatcher] scheduled Codex role worker: role=planner reasoning=xhigh mode=fast" in log
+    assert "[kanban dispatcher] scheduled OpenCode role worker: role=planner reasoning=xhigh mode=fast" in log
 
 
 def test_planner_worker_env_carries_effective_opencode_backend(monkeypatch, tmp_path):
@@ -1612,6 +1634,54 @@ def test_command_center_repair_foreman_uses_codex_with_codex_config(monkeypatch,
     log = kanban_db.read_worker_log(task.id, board=board)
     assert log is not None
     assert "scheduled Codex role worker: role=foreman reasoning=xhigh mode=normal" in log
+
+
+def test_foreman_worker_env_defaults_to_opencode(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_workers as workers
+    from hermes_cli import kanban_db
+    from agent import opencode_worker as ow
+
+    _home(monkeypatch, tmp_path)
+    board = "repair-opencode-board"
+    kanban_db.create_board(board, name="Repair OpenCode Board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Repair blocked board",
+            assignee="foreman",
+            created_by="command-center-repair",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        task = kanban_db.claim_task(conn, task_id)
+    finally:
+        conn.close()
+    assert task is not None
+    captured = {}
+
+    class Proc:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, cwd, stdout, stderr, env, start_new_session):
+        captured.update({"env": env})
+        return Proc()
+
+    monkeypatch.setattr(workers, "_worker_config", lambda: {})
+    monkeypatch.setattr(ow, "check_opencode_binary", lambda: (True, "/bin/opencode"))
+    monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(workers.subprocess, "Popen", fake_popen)
+
+    workers.spawn_codex_worker(task, str(tmp_path), board=board)
+
+    assert captured["env"]["HERMES_CODING_WORKER_BACKEND"] == "opencode"
+    assert "CODEX_HOME" not in captured["env"]
+    log = kanban_db.read_worker_log(task.id, board=board)
+    assert log is not None
+    assert "scheduled OpenCode role worker: role=foreman reasoning=xhigh mode=normal" in log
 
 
 def test_role_extra_args_use_scheduled_runtime_env(monkeypatch):
@@ -2556,6 +2626,7 @@ def test_docker_runner_logs_immediate_registry_failure(monkeypatch, tmp_path):
         workers,
         "_worker_config",
         lambda: {
+            "backend": "codex",
             "runner": "docker",
             "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
             "codex_home_root": str(tmp_path / "homes"),
@@ -2599,6 +2670,7 @@ def test_docker_runner_mounts_gh_config_read_only(monkeypatch, tmp_path):
         workers,
         "_worker_config",
         lambda: {
+            "backend": "codex",
             "runner": "docker",
             "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
             "codex_home_root": str(tmp_path / "homes"),
@@ -2637,6 +2709,7 @@ def test_docker_runner_uses_absolute_runtime_script(monkeypatch, tmp_path):
         workers,
         "_worker_config",
         lambda: {
+            "backend": "codex",
             "runner": "docker",
             "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
             "codex_home_root": str(tmp_path / "homes"),
@@ -2679,6 +2752,7 @@ def test_docker_runner_forwards_public_frontend_env_only(monkeypatch, tmp_path):
         workers,
         "_worker_config",
         lambda: {
+            "backend": "codex",
             "runner": "docker",
             "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
             "codex_home_root": str(tmp_path / "homes"),
@@ -2731,6 +2805,7 @@ def test_docker_runner_uses_read_broker_without_discord_credentials(monkeypatch,
         workers,
         "_worker_config",
         lambda: {
+            "backend": "codex",
             "runner": "docker",
             "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
             "codex_home_root": str(tmp_path / "homes"),

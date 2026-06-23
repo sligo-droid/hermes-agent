@@ -113,11 +113,11 @@ def _coding_backend(cfg: dict[str, Any]) -> str:
 
         return load_coding_worker_backend(worker_config=cfg)
     except Exception:
-        return "codex"
+        return "opencode"
 
 
 def _task_forces_opencode(task: Any = None) -> bool:
-    """Return whether a task must bypass the configured Codex backend.
+    """Return whether a task must bypass the configured coding backend.
 
     No current task type forces OpenCode. Command Center repair work follows the
     same configured coding-worker backend as every other role lane.
@@ -128,7 +128,7 @@ def _task_forces_opencode(task: Any = None) -> bool:
 def _role_backend(role: str, configured_backend: str, task: Any = None) -> str:
     if _task_forces_opencode(task):
         return "opencode"
-    if configured_backend == "opencode" and role in _OPENCODE_ROLES:
+    if configured_backend == "opencode":
         return "opencode"
     return "codex"
 
@@ -420,7 +420,8 @@ def spawn_codex_worker(task: Any, workspace: str, *, board: Optional[str] = None
     if backend == "opencode" and _runner_kind(cfg) == "docker":
         raise RuntimeError(
             "OpenCode worker backend currently supports only host runner; "
-            "set kanban.discord_worker.runner=host or coding_worker.backend=codex."
+            "set kanban.discord_worker.runner=host or explicitly use "
+            "coding_worker.backend=codex for the legacy container path."
         )
     if _runner_kind(cfg) == "docker":
         return _spawn_docker_worker(
@@ -709,7 +710,7 @@ def _write_minimal_codex_home(path: Path) -> Optional[str]:
 
 
 def spawn_or_default(task: Any, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
-    """Dispatch role-lane tasks to Codex, everything else to legacy Kanban."""
+    """Dispatch role-lane tasks to the configured coding worker backend."""
     role = str(getattr(task, "assignee", "") or "").strip().lower()
     if role in ROLE_ASSIGNEES:
         return spawn_codex_worker(task, workspace, board=board)

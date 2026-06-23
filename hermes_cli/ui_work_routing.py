@@ -421,8 +421,15 @@ def resolve_ui_work_route(
     )
     provider = str(ui_cfg.get("provider") or "").strip()
     model = str(ui_cfg.get("model") or "").strip()
-    normalized_backend = str(backend or "codex").strip().lower() or "codex"
     requested = _normalize_route_decision(route_decision)
+    normalized_backend = str(backend or "opencode").strip().lower() or "opencode"
+    if (
+        requested.route == _UI_SPECIALIST_ROUTE
+        and normalized_backend != "codex"
+        and not _as_dict(ui_cfg.get(normalized_backend))
+        and _as_dict(ui_cfg.get("codex"))
+    ):
+        normalized_backend = "codex"
 
     base_fields = {
         "provider": provider,

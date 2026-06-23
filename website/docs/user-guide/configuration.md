@@ -1709,7 +1709,7 @@ The delegation provider uses the same credential resolution as CLI/gateway start
 }
 ```
 
-Supported routes are `default_coding_worker`, `ui_visual_specialist`, `review_only_no_worker`, and `ask_human`. The UI specialist provider/model is used only for an explicit `ui_visual_specialist` route and only when the `ui_work` config guardrails allow it. Keyword detection remains advisory metadata and fallback evidence; a route of `default_coding_worker` keeps the normal Codex worker even when visual UI keywords appear.
+Supported routes are `default_coding_worker`, `ui_visual_specialist`, `review_only_no_worker`, and `ask_human`. The UI specialist provider/model is used only for an explicit `ui_visual_specialist` route and only when the `ui_work` config guardrails allow it. Keyword detection remains advisory metadata and fallback evidence; a route of `default_coding_worker` keeps the default coding worker even when visual UI keywords appear.
 
 ```yaml
 ui_work:

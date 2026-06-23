@@ -1118,4 +1118,13 @@ def test_backend_ignores_removed_codex_worker_config_key(monkeypatch):
     monkeypatch.delenv("HERMES_CODING_WORKER_BACKEND", raising=False)
     cfg = {"codex_worker": {"backend": "opencode"}}
 
-    assert ow.load_coding_worker_backend(cfg) == "codex"
+    assert ow.load_coding_worker_backend(cfg) == "opencode"
+
+
+def test_backend_defaults_to_opencode_for_missing_or_unknown_config(monkeypatch):
+    monkeypatch.delenv("HERMES_CODING_WORKER_BACKEND", raising=False)
+
+    assert ow.normalize_coding_worker_backend("") == "opencode"
+    assert ow.normalize_coding_worker_backend("unknown") == "opencode"
+    assert ow.load_coding_worker_backend({}) == "opencode"
+    assert ow.load_coding_worker_backend({"coding_worker": {"backend": "codex"}}) == "codex"
