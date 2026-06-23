@@ -638,7 +638,7 @@ def delegate_coding_task(
         except TypeError:
             backend = load_coding_worker_backend()
     except Exception:
-        backend = "codex"
+        backend = "opencode"
 
     try:
         from hermes_cli.ui_work_routing import resolve_ui_work_route
@@ -704,6 +704,8 @@ def delegate_coding_task(
             },
             ensure_ascii=False,
         )
+    if ui_route is not None and ui_route.matched and ui_route.enabled and ui_route.backend == "codex":
+        backend = "codex"
 
     project_context = _worker_project_context(workdir)
     skill_context = _parent_skill_context(
@@ -1186,7 +1188,7 @@ CODING_WORKER_SCHEMA = {
                     "Use route=ui_visual_specialist only when this specific "
                     "coding worker should run on the configured UI specialist "
                     "provider/model; route=default_coding_worker keeps the "
-                    "normal Codex worker even if visual keywords are present. "
+                    "default coding worker even if visual keywords are present. "
                     "route=review_only_no_worker or route=ask_human records "
                     "the decision and skips launching a coding worker."
                 ),

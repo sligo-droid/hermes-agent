@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-22 18:05 UTC
+Last updated: 2026-06-23 00:00 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -39,6 +39,7 @@ This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork
 | GitHub PR-amend missing-origin route fallback | implemented | Accepted `pull_request_review` PR-amend events with no resolvable originating Discord worker board now route to the configured project Discord worker-board channel when one exists instead of immediately degrading to a terminal thumbs-down; missing Discord channel still degrades visibly. |
 | Worker PR boundary hardening | implemented | Deterministic worker PR finalization now preflights checkout remotes before push/`gh pr` operations, reports local/file-only remotes as a repository-boundary issue instead of an auth failure, and bridges host GitHub CLI config through sanitized PR subprocess environments without copying GitHub token env vars. Delegate-coding canonical-checkout errors now explicitly direct agents to retry with an absolute `/home/droid/workspaces/...` worktree cwd. |
 | UI specialist route smoke metadata | implemented | Explicit `ui_visual_specialist` route decisions for Command Center visual-polish smokes now survive soft verification wording like “smoke”/“test”, select the configured Codex OpenRouter/model overlay, and are persisted into Kanban worker launch evidence (`ui_work_route/decision`, worker env, prompt, and result sidecar metadata) so route smokes can verify the actual worker path instead of inferring from prose. |
+| Coding worker backend default | implemented | Hermes coding-worker defaults are back on OpenCode for delegate and Kanban role-worker launches. Explicit `backend: codex` compatibility and the narrow UI visual-specialist Codex/OpenRouter overlay remain available, but normal coding-worker execution no longer depends on Codex app-server. |
 | Dirty secondary main worktree quarantine | in_progress | `/home/droid/workspaces/hermes-self-improvement-live-test` is explicitly excluded from Discord role-worker selection via `kanban.discord_worker.excluded_workspaces`; `docs/runbooks/worktree-quarantine-2026-06-17.md` records the 247-file dirty inventory, reference checks, and human-approval cleanup plan. |
 
 Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `merged`, `deployed`, `verified`, `superseded`.

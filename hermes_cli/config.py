@@ -1559,7 +1559,7 @@ DEFAULT_CONFIG = {
     # the configured backend.
     "coding_worker": {
         "enabled": True,
-        "backend": "codex",  # codex | opencode
+        "backend": "opencode",  # opencode | codex
         "turn_timeout_seconds": 1800,  # 30 minutes
         "simple_build_reasoning_level": "medium",
         "complex_plan_reasoning_level": "xhigh",
@@ -2167,13 +2167,14 @@ DEFAULT_CONFIG = {
             # /workers/<session_id>. When empty, Discord embeds omit the
             # Kanban Board field.
             "public_base_url": "",
-            # "host" runs the local role worker directly. "docker" is opt-in
-            # for Codex installs with a reachable worker image; OpenCode uses
-            # host mode in this version.
-            "backend": "",  # empty inherits coding_worker.backend; codex | opencode
+            # "host" runs the local role worker directly. "docker" remains an
+            # explicit legacy Codex-worker option; OpenCode uses host mode in
+            # this version.
+            "backend": "",  # empty inherits coding_worker.backend; opencode | codex
             "runner": "host",
-            # Container image expected to include Python, Codex CLI, git/gh,
-            # common build tools, and this repo's runtime dependencies.
+            # Legacy Codex container image expected to include Python, Codex
+            # CLI, git/gh, common build tools, and this repo's runtime
+            # dependencies.
             "docker_image": "ghcr.io/nousresearch/hermes-codex-worker:latest",
             "docker_bin": "docker",
             "codex_home_root": "",

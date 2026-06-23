@@ -987,7 +987,7 @@ def _configured_backend() -> str:
 
         return load_coding_worker_backend()
     except Exception:
-        return "codex"
+        return "opencode"
 
 
 def _backend_label(role: str, task: Any = None) -> str:
@@ -997,7 +997,7 @@ def _backend_label(role: str, task: Any = None) -> str:
 
 
 def _task_forces_opencode(task: Any = None) -> bool:
-    """Return whether a role task must bypass the configured Codex backend.
+    """Return whether a role task must bypass the configured coding backend.
 
     No current task type forces OpenCode. Command Center repair work follows the
     same configured coding-worker backend as every other role lane.
@@ -1008,7 +1008,7 @@ def _task_forces_opencode(task: Any = None) -> bool:
 def _role_uses_opencode(role: str, task: Any = None) -> bool:
     if _task_forces_opencode(task):
         return True
-    return role in _OPENCODE_ROLES and _configured_backend() == "opencode"
+    return _configured_backend() == "opencode"
 
 
 def _role_pr_mutation_guard_env(role: str) -> tuple[dict[str, str], Optional[Path]]:
@@ -1283,6 +1283,8 @@ def _run_role_backend(
         workspace=workspace,
         backend="opencode" if uses_opencode else "codex",
     )
+    if ui_work_route is not None and ui_work_route.matched and ui_work_route.enabled and ui_work_route.backend == "codex":
+        uses_opencode = False
     route_prompt = _ui_work_route_prompt(ui_work_route)
     if route_prompt:
         prompt = f"{prompt.rstrip()}\n\n{route_prompt}"

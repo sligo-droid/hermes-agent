@@ -584,11 +584,30 @@ def check_honcho_watchdog_status(
     record_honcho_watchdog_result(watchdog_status, issues, facts)
 
 
-def check_codex_worker(issues: list[dict[str, str]], facts: dict[str, Any]) -> None:
+def check_coding_worker(issues: list[dict[str, str]], facts: dict[str, Any]) -> None:
     backend = coding_worker_backend()
     facts["coding_worker_backend"] = backend
+    if backend == "opencode":
+        code = r'''
+import json
+import sys
+from agent.opencode_worker import check_opencode_binary
+
+ok, detail = check_opencode_binary()
+print(json.dumps({'phase': 'binary', 'ok': ok, 'detail': detail}, sort_keys=True))
+if not ok:
+    sys.exit(1)
+'''
+        smoke = python_smoke(code, timeout=60)
+        facts["coding_worker_smoke_exit"] = smoke["exit"]
+        facts["coding_worker_smoke_output"] = smoke["output"]
+        if smoke["exit"] != 0:
+            add_issue(issues, "critical", "OpenCode coding-worker binary check failed", smoke["output"])
+        return
+
     if backend != "codex":
-        add_issue(issues, "critical", "coding worker backend is not Codex", backend)
+        add_issue(issues, "critical", "coding worker backend is not supported", backend)
+        return
 
     code = r'''
 import json
@@ -628,8 +647,8 @@ if result.error or result.interrupted or marker not in (result.final_text or '')
     sys.exit(1)
 '''
     smoke = python_smoke(code, timeout=540)
-    facts["codex_worker_smoke_exit"] = smoke["exit"]
-    facts["codex_worker_smoke_output"] = smoke["output"]
+    facts["coding_worker_smoke_exit"] = smoke["exit"]
+    facts["coding_worker_smoke_output"] = smoke["output"]
     if smoke["exit"] != 0 or "CODEX_CODING_WORKER_OK" not in smoke["output"]:
         add_issue(issues, "critical", "Codex coding-worker inference smoke failed", smoke["output"])
 
@@ -692,7 +711,7 @@ def main() -> int:
         "--skip-opencode-smoke",
         dest="skip_coding_worker_smoke",
         action="store_true",
-        help="skip expensive Codex coding-worker smoke",
+        help="skip coding-worker smoke",
     )
     parser.add_argument("--install-live", action="store_true", help="install this repo-managed script to $HERMES_HOME/scripts")
     parser.add_argument("--dry-run", action="store_true", help="show install-live actions without changing files")
@@ -716,7 +735,7 @@ def main() -> int:
     check_compression_inference(issues, facts)
     check_honcho(issues, facts)
     if not args.skip_coding_worker_smoke:
-        check_codex_worker(issues, facts)
+        check_coding_worker(issues, facts)
 
     STATE.parent.mkdir(parents=True, exist_ok=True)
     STATE.write_text(json.dumps({"issues": issues, "facts": facts}, indent=2, sort_keys=True) + "\n")
