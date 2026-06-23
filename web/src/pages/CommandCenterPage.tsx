@@ -809,11 +809,13 @@ function RunCard({ run }: { run: CommandCenterRun }) {
 
 function EmptyState({ label, message }: { label: string; message?: string }) {
   return (
-    <Card className="border-white/10 bg-white/[0.035]">
-      <CardContent className="flex flex-col items-center gap-3 py-16 text-center text-sm text-slate-400">
-        <Inbox className="h-9 w-9 text-cyan-100/75" />
+    <Card className="command-center-empty-state border-white/10 bg-white/[0.035]">
+      <CardContent className="flex flex-col items-center gap-4 py-16 text-center text-sm text-slate-400">
+        <div className="flex h-14 w-14 items-center justify-center rounded-full border border-white/[0.08] bg-white/[0.025]">
+          <Inbox className="h-7 w-7 text-cyan-100/70" />
+        </div>
         <div className="text-lg font-semibold text-white">No {label}</div>
-        <p className="max-w-md leading-6">{message || "Nothing is waiting in this view."}</p>
+        <p className="max-w-md leading-6 text-slate-400">{message || "Nothing is waiting in this view."}</p>
       </CardContent>
     </Card>
   );
@@ -1449,10 +1451,19 @@ export default function CommandCenterPage() {
       />
 
       {error && (
-        <Card className="border-red-300/30 bg-red-950/30">
+        <Card className="command-center-error-card border-red-300/30 bg-red-950/30">
           <CardContent className="flex items-start gap-3 py-4 text-sm text-red-100">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-            <span>{error}</span>
+            <div className="min-w-0 flex-1">
+              <span className="block break-words">{error}</span>
+              <button
+                className="mt-2 inline-flex items-center gap-1.5 rounded-full border border-red-200/30 px-3 py-1 text-xs font-semibold text-red-100 transition hover:border-red-200/50 hover:bg-red-200/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-100/30"
+                onClick={() => void refresh()}
+                type="button"
+              >
+                <RotateCcw className="h-3 w-3" /> Retry
+              </button>
+            </div>
           </CardContent>
         </Card>
       )}
@@ -1466,10 +1477,22 @@ export default function CommandCenterPage() {
         </Card>
       )}
 
+      {loading && snapshot ? (
+        <div className="flex items-center gap-2 text-xs text-slate-400" role="status" aria-live="polite">
+          <Spinner className="h-3 w-3" /> Refreshing…
+        </div>
+      ) : null}
+
       {loading && !snapshot ? (
-        <Card className="border-white/10 bg-white/[0.035]">
-          <CardContent className="flex items-center justify-center gap-3 py-20 text-slate-300">
-            <Spinner /> Loading Command Center…
+        <Card className="command-center-loading-card border-white/10 bg-white/[0.035]">
+          <CardContent className="flex flex-col items-center gap-4 py-20 text-slate-300">
+            <Spinner />
+            <div className="text-sm font-semibold text-slate-200">Loading Command Center…</div>
+            <div className="w-full max-w-md space-y-2" aria-hidden="true">
+              <div className="h-3 rounded-full bg-white/[0.06]" />
+              <div className="h-3 w-4/5 rounded-full bg-white/[0.045]" />
+              <div className="h-3 w-3/5 rounded-full bg-white/[0.035]" />
+            </div>
           </CardContent>
         </Card>
       ) : (

@@ -100,6 +100,17 @@ _PRE_REVIEW_MAX_TASKS = 5
 _PRE_REVIEW_MAX_LIST_ITEMS = 8
 _PRE_REVIEW_MAX_TEXT_CHARS = 800
 _PRE_REVIEW_SECRET_KEY_RE = re.compile(r"token|secret|password|api[_-]?key|auth|credential", re.IGNORECASE)
+_PR_FINALIZER_RECOVERY_ROUTE_TEXT_RE = re.compile(
+    r"delegate_coding_task\s*\(\s*route_decision|"
+    r"ui_visual_specialist|"
+    r"z-ai/glm-5\.2|"
+    r"selected_provider\s*=\s*openrouter|"
+    r"selected_model\s*=\s*z-ai/glm-5\.2",
+    re.IGNORECASE,
+)
+_PR_FINALIZER_RECOVERY_NEUTRAL_ROOT_GOAL = (
+    "Recover PR finalization for the already approved implementation by addressing the current PR blocker."
+)
 
 
 class TicketMoveConflict(RuntimeError):
@@ -1675,15 +1686,32 @@ def ensure_code_island_for_board(board: str) -> bool:
         for key in (
             "code_island_ready",
             "code_island_pending",
-            "code_island_error",
             "worktree_path",
             "project_path",
         )
         if key in worker
     }
+    code_island_updates["code_island_error"] = worker.get("code_island_error", _DELETE_META)
+
+    def apply_code_island_updates(
+        current_metadata: dict[str, Any],
+        current_worker: dict[str, Any],
+    ) -> bool:
+        changed = False
+        for key, value in code_island_updates.items():
+            previous_value = current_worker.get(key)
+            if value is _DELETE_META:
+                if key in current_worker:
+                    current_worker.pop(key, None)
+                    changed = True
+            elif previous_value != value:
+                current_worker[key] = value
+                changed = True
+        return changed
+
     written = _mutate_worker_metadata(
         board,
-        lambda current_metadata, current_worker: (current_worker.update(code_island_updates) or True),
+        apply_code_island_updates,
         warning_action="ensure Discord worker board code island metadata",
     )
     if written is None:
@@ -1700,7 +1728,8 @@ def ensure_code_island_for_board(board: str) -> bool:
     if blocker:
         _block_worker_board_for_code_island(board, worker, blocker)
     telemetry_changed = previous_telemetry_state != _code_island_telemetry_state(worker)
-    log = logger.info if health_error or blocker or telemetry_changed else logger.debug
+    actionable_transition = telemetry_changed and not _is_terminal_worker_meta(worker)
+    log = logger.info if health_error or blocker or actionable_transition else logger.debug
     log(
         "discord_worker_code_island board=%s ready=%s pending=%s elapsed_ms=%d error=%s",
         board,
@@ -4513,7 +4542,7 @@ def render_public_session_board_html(
 
 def _workers_page_css() -> str:
     return """
-    :root { color-scheme: light; --bg: #f7f7f5; --panel: #ffffff; --panel-soft: #fbfbfa; --line: #d7d7d2; --line-soft: #e6e6e2; --text: #1f2933; --muted: #52606d; --link: #1d4ed8; --code: #5965f2; }
+    :root { color-scheme: light; --bg: #f7f7f5; --panel: #ffffff; --panel-soft: #fbfbfa; --line: #d7d7d2; --line-soft: #e6e6e2; --text: #1f2933; --muted: #52606d; --link: #1d4ed8; --code: #5965f2; --runtime-on-dark: #ffffff; --status-running: #075985; --status-queued: #4338ca; --status-idle: #475569; --status-blocked: #991b1b; --status-stalled: #92400e; --status-degraded: #854d0e; --status-paused: #9a3412; --status-done: #047857; --status-cancelled: #4b5563; }
     * { box-sizing: border-box; }
     body { margin: 0; min-height: 100vh; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
     header { border-bottom: 1px solid var(--line); background: var(--panel); padding: 24px 28px; }
@@ -4530,15 +4559,27 @@ def _workers_page_css() -> str:
     a:hover { text-decoration: underline; }
     code { color: var(--code); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; }
     p { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
-    .board-list { list-style: none; margin: 0; max-width: 900px; padding: 0; }
-    .board-card, .column, .criteria { background: var(--panel); border: 1px solid var(--line-soft); border-radius: 6px; }
-    .board-card { margin-bottom: 10px; padding: 12px; }
+    .board-list { list-style: none; margin: 0; max-width: 920px; padding: 0; }
+    .board-card, .column, .criteria { background: var(--panel); border: 1px solid var(--line-soft); border-radius: 8px; }
+    .board-card { margin-bottom: 14px; padding: 16px 18px; transition: border-color 120ms ease, box-shadow 120ms ease; }
+    .board-card:hover { border-color: var(--line); box-shadow: 0 2px 12px rgba(15, 23, 42, 0.06); }
     .board-card-head { display: block; padding: 0; }
-    .board-title { font-size: 16px; font-weight: 700; line-height: 1.25; text-decoration: none; }
-    .board-meta, .meta { color: var(--muted); display: flex; flex-wrap: wrap; gap: 8px 12px; font-size: 14px; margin-top: 8px; }
+    .board-title { font-size: 16px; font-weight: 700; line-height: 1.3; text-decoration: none; }
+    .board-title:hover { text-decoration: none; border-bottom: 2px solid var(--link); }
+    .board-meta, .meta { color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 13px; margin-top: 8px; }
+    .meta span { white-space: nowrap; }
     .chips { margin-top: 8px; }
     .chip { color: var(--muted); font-size: 13px; }
-    .runtime { font-weight: 700; text-transform: uppercase; }
+    .runtime { background: var(--status-idle); border-radius: 4px; color: var(--runtime-on-dark); display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: 0.05em; padding: 2px 8px; text-transform: uppercase; }
+    .runtime-running { background: var(--status-running); color: var(--runtime-on-dark); }
+    .runtime-queued { background: var(--status-queued); color: var(--runtime-on-dark); }
+    .runtime-idle { background: var(--status-idle); color: var(--runtime-on-dark); }
+    .runtime-blocked { background: var(--status-blocked); color: var(--runtime-on-dark); }
+    .runtime-stalled { background: var(--status-stalled); color: var(--runtime-on-dark); }
+    .runtime-degraded { background: var(--status-degraded); color: var(--runtime-on-dark); }
+    .runtime-paused { background: var(--status-paused); color: var(--runtime-on-dark); }
+    .runtime-done { background: var(--status-done); color: var(--runtime-on-dark); }
+    .runtime-cancelled { background: var(--status-cancelled); color: var(--runtime-on-dark); }
     .board-card-body { display: block; padding: 0; }
     .status-grid { color: var(--muted); font-size: 13px; margin-top: 8px; }
     .status-cell { display: inline; }
@@ -4547,17 +4588,20 @@ def _workers_page_css() -> str:
     .status-cell span::after { content: ":"; }
     .status-cell span { margin-right: 0; }
     .reason { color: var(--muted); font-size: 13px; margin-top: 8px; }
-    .actions { margin-top: 10px; }
+    .actions { margin-top: 12px; }
     form { display: inline; margin: 0; }
-    button, .button-link { background: var(--text); border: 1px solid var(--text); border-radius: 6px; color: #ffffff; cursor: pointer; font: inherit; padding: 6px 10px; text-decoration: none; }
+    button, .button-link { background: var(--text); border: 1px solid var(--text); border-radius: 6px; color: #ffffff; cursor: pointer; font: inherit; padding: 6px 12px; text-decoration: none; transition: background 120ms ease; }
     button:hover, .button-link:hover { background: #374151; }
-    .board { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
-    .column { min-height: 190px; overflow: hidden; transition: border-color 120ms ease, box-shadow 120ms ease; }
+    .board { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+    .column { min-height: 200px; overflow: hidden; transition: border-color 120ms ease, box-shadow 120ms ease; }
     .column.column-drop { border-color: var(--code); box-shadow: 0 0 0 2px rgba(89, 101, 242, 0.16); }
     .column.column-disabled { opacity: 0.72; }
-    .column h2 { align-items: center; border-bottom: 1px solid var(--line-soft); display: flex; font-size: 14px; justify-content: space-between; margin: 0; padding: 12px; text-transform: uppercase; }
-    .column ul { list-style: none; margin: 0; min-height: 132px; padding: 10px; }
-    .column li { background: var(--panel-soft); border: 1px solid var(--line-soft); border-radius: 6px; margin-bottom: 8px; padding: 10px; }
+    .column h2 { align-items: center; border-bottom: 1px solid var(--line-soft); display: flex; font-size: 13px; justify-content: space-between; margin: 0; padding: 12px 14px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .column h2 span[data-column-count] { background: var(--line-soft); border-radius: 99px; color: var(--muted); font-size: 11px; font-weight: 700; min-width: 20px; padding: 1px 7px; text-align: center; }
+    .column ul { list-style: none; margin: 0; min-height: 140px; padding: 10px; }
+    .column li { background: var(--panel-soft); border: 1px solid var(--line-soft); border-radius: 6px; margin-bottom: 8px; padding: 10px 12px; transition: border-color 100ms ease; }
+    .column li:hover { border-color: var(--line); }
+    .column-empty { align-items: center; color: var(--muted); display: flex; font-size: 13px; font-style: italic; justify-content: center; min-height: 140px; opacity: 0.6; padding: 24px; text-align: center; }
     .ticket-card { cursor: grab; touch-action: manipulation; }
     .ticket-card.dragging { opacity: 0.48; }
     .ticket-card:active { cursor: grabbing; }
@@ -4565,27 +4609,33 @@ def _workers_page_css() -> str:
     .ticket { appearance: none; background: transparent; border: 0; color: inherit; cursor: pointer; display: block; font: inherit; padding: 0; text-align: left; width: 100%; }
     .ticket:hover strong { color: var(--link); text-decoration: underline; }
     .ticket:focus-visible { outline: 2px solid var(--code); outline-offset: 3px; }
-    .ticket strong { display: block; font-size: 14px; line-height: 1.25; }
-    .ticket p { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .ticket strong { display: block; font-size: 14px; line-height: 1.3; }
+    .ticket > div { margin-top: 2px; }
+    .ticket p { color: var(--muted); font-size: 13px; margin: 6px 0 0; }
+    .ticket-brief, .ticket-summary { margin: 4px 0 0; }
     .ticket-console { align-items: center; background: #111827; border: 1px solid #374151; border-radius: 6px; color: #f9fafb; display: inline-flex; font: 700 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; justify-content: center; min-height: 28px; min-width: 32px; padding: 6px 7px; text-decoration: none; }
     .ticket-console:hover { background: #1f2937; color: #ffffff; text-decoration: none; }
     .ticket-console:focus-visible { outline: 2px solid var(--code); outline-offset: 2px; }
-    .move-error { background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; color: #991b1b; font-size: 13px; margin-bottom: 12px; padding: 10px 12px; }
+    .move-error { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; color: #991b1b; font-size: 13px; margin-bottom: 12px; padding: 10px 14px; }
     .move-error[hidden] { display: none; }
-    .criteria { margin-bottom: 18px; padding: 14px; }
-    .criteria strong { display: block; font-size: 14px; margin-bottom: 8px; }
+    .criteria { margin-bottom: 18px; padding: 16px; }
+    .criteria strong { display: block; font-size: 14px; font-weight: 700; margin-bottom: 10px; }
     .criteria ol { margin: 0; padding-left: 20px; }
-    .criteria li { color: var(--text); margin: 4px 0; }
-    .board-summary pre { color: var(--text); font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 0; white-space: pre-wrap; word-break: break-word; }
+    .criteria li { color: var(--text); margin: 6px 0; }
+    .board-summary pre { color: var(--text); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 0; white-space: pre-wrap; word-break: break-word; }
+    .empty-state { align-items: center; color: var(--muted); display: flex; flex-direction: column; gap: 8px; justify-content: center; padding: 64px 24px; text-align: center; }
+    .empty-state h2 { color: var(--muted); font-size: 18px; font-weight: 700; margin: 0; }
+    .empty-state p { font-size: 14px; margin: 0; max-width: 420px; }
+    .degraded-banner { background: #fffbeb; border: 1px solid #fcd34d; border-radius: 8px; color: #92400e; font-size: 13px; margin-bottom: 14px; padding: 10px 14px; }
     .modal { align-items: center; background: rgba(15, 23, 42, 0.54); display: none; inset: 0; justify-content: center; padding: 20px; position: fixed; z-index: 20; }
     .modal[aria-hidden="false"] { display: flex; }
-    .modal-panel { background: #ffffff; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 24px 60px rgba(15, 23, 42, 0.28); max-height: min(86vh, 900px); max-width: min(920px, 96vw); min-width: min(720px, 96vw); overflow: hidden; }
-    .modal-head { align-items: center; border-bottom: 1px solid var(--line-soft); display: flex; gap: 16px; justify-content: space-between; padding: 14px 16px; }
+    .modal-panel { background: #ffffff; border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 24px 60px rgba(15, 23, 42, 0.28); max-height: min(86vh, 900px); max-width: min(920px, 96vw); min-width: min(720px, 96vw); overflow: hidden; }
+    .modal-head { align-items: center; border-bottom: 1px solid var(--line-soft); display: flex; gap: 16px; justify-content: space-between; padding: 14px 18px; }
     .modal-head h2 { font-size: 16px; margin: 0; }
     .modal-close { background: #f3f4f6; border: 1px solid var(--line); color: var(--text); }
     .modal-close:hover { background: #e5e7eb; }
-    .modal-body { background: #111827; color: #f9fafb; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 0; max-height: calc(min(86vh, 900px) - 58px); overflow: auto; padding: 14px; white-space: pre-wrap; word-break: break-word; }
-    @media (max-width: 760px) { .modal-panel { min-width: min(100%, 96vw); } }
+    .modal-body { background: #111827; color: #f9fafb; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 0; max-height: calc(min(86vh, 900px) - 58px); overflow: auto; padding: 16px 18px; white-space: pre-wrap; word-break: break-word; }
+    @media (max-width: 760px) { .modal-panel { min-width: min(100%, 96vw); } .board { grid-template-columns: 1fr; } }
     """
 
 
@@ -4624,6 +4674,8 @@ def _render_public_board_html(
             f'<p class="ticket-summary"><b>Latest:</b> {esc(summary)}</p>'
             if summary else ""
         )
+        assignee_raw = str(item.get("assignee") or "").strip()
+        assignee_html = f' <span class="chip">[{esc(assignee_raw)}]</span>' if assignee_raw else ""
         return (
             "<li class=\"ticket-card\" draggable=\"true\" data-ticket-item "
             "data-ticket-id=\"{id}\" data-ticket-status=\"{status}\" "
@@ -4634,7 +4686,8 @@ def _render_public_board_html(
             "data-ticket-state-url=\"{state_url}\" "
             "data-ticket-terminal-page-url=\"{terminal_page_url}\" "
             "data-ticket-terminal-url=\"{terminal_url}\">"
-            "<strong>{title}</strong><br><code>{id}</code> {assignee}{brief}{summary}"
+            "<strong>{title}</strong>"
+            "<div><code>{id}</code>{assignee}</div>{brief}{summary}"
             "</button>"
             "<a class=\"ticket-console\" href=\"{console_url}\" "
             "data-ticket-console-url=\"{console_url}\" "
@@ -4650,7 +4703,7 @@ def _render_public_board_html(
                 terminal_url=esc(f"{ticket_url}/terminal.json"),
                 console_url=esc(f"{ticket_url}/console"),
                 move_url=esc(f"{ticket_url}/move"),
-                assignee=esc(item["assignee"] or ""),
+                assignee=assignee_html,
                 brief=brief_html,
                 summary=summary_html,
             )
@@ -4660,13 +4713,16 @@ def _render_public_board_html(
     for status in columns:
         items = by_status.get(status, [])
         body = "\n".join(render_ticket_card(item, status) for item in items)
+        column_body = f"<ul data-ticket-list>{body}</ul>" if items else (
+            f'<ul data-ticket-list class="column-empty">No {esc(status)} tickets</ul>'
+        )
         disabled = " column-disabled" if status == "running" else ""
         drop_disabled = "true" if status == "running" else "false"
         cards.append(
             f"<section class=\"column{disabled}\" data-column data-status=\"{esc(status)}\" "
             f"data-drop-disabled=\"{drop_disabled}\"><h2>{esc(status)} "
             f"<span data-column-count>{len(items)}</span></h2>"
-            f"<ul data-ticket-list>{body}</ul></section>"
+            f"{column_body}</section>"
         )
     criteria = "\n".join(
         f"<li>{esc(c.get('text') if isinstance(c, dict) else c)}</li>"
@@ -5168,12 +5224,22 @@ def render_public_board_index_html() -> str:
             flags.append(f"blocked: {blocked_reason}")
         flags_text = " ".join(flags)
         primary_action = _runtime_action_form_html(session_id, runtime)
+        corruption = board.get("corruption") if isinstance(board.get("corruption"), dict) else {}
+        corruption_banner = ""
+        if corruption.get("status") == "degraded":
+            corruption_reason = str(corruption.get("reason") or "").strip()
+            corruption_banner = (
+                f'<div class="degraded-banner">Board data is degraded'
+                f'{" — " + esc(corruption_reason) if corruption_reason else ""}.'
+                f' Some details may be unavailable.</div>'
+            )
         items.append(
             '<li class="board-card">'
+            '{corruption_banner}'
             '<strong>{link}</strong><br>'
-            '{session} {status}'
+            '<div class="meta">{session} · Status: {status}</div>'
             '<p>Runtime: <strong class="runtime runtime-{runtime_class}">{runtime}</strong></p>'
-            '<p>{counts}</p>'
+            '<p>Tasks: {counts}</p>'
             '<p>{reason_label}: {reason}</p>'
             '<p>Running: {running}</p>'
             '<p>{branch}{mode}{pr}{review}</p>'
@@ -5197,9 +5263,15 @@ def render_public_board_index_html() -> str:
                 timestamps=timestamps,
                 flags=f"<p>{esc(flags_text)}</p>" if flags_text else "",
                 action=primary_action,
+                corruption_banner=corruption_banner,
             )
         )
-    body = "\n".join(items) or "<li>No public Discord Kanban boards yet.</li>"
+    body = "\n".join(items) or (
+        '<li class="empty-state">'
+        '<h2>No public worker boards</h2>'
+        '<p>Discord worker boards will appear here once they are created.</p>'
+        '</li>'
+    )
     return f"""<!doctype html>
 <html>
 <head>
@@ -6230,6 +6302,26 @@ def _pr_finalizer_failure_is_merge_conflict(worker: dict[str, Any]) -> bool:
     )
 
 
+def _strip_pr_finalizer_recovery_route_text(value: Any) -> str:
+    lines: list[str] = []
+    for raw_line in str(value or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if _PR_FINALIZER_RECOVERY_ROUTE_TEXT_RE.search(line):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _pr_finalizer_recovery_root_goal(worker: dict[str, Any]) -> str:
+    for key in ("root_goal", "initial_request"):
+        root_goal = _strip_pr_finalizer_recovery_route_text(worker.get(key))
+        if root_goal:
+            return root_goal
+    return _PR_FINALIZER_RECOVERY_NEUTRAL_ROOT_GOAL
+
+
 def _create_pr_finalizer_recovery_task(
     board: str,
     worker: dict[str, Any],
@@ -6244,12 +6336,20 @@ def _create_pr_finalizer_recovery_task(
     blocker = str(worker.get("pr_blocker") or worker.get("pr_error") or "PR finalization failed").strip()
     payload = {
         "role": ROLE_DEV,
-        "root_goal": worker.get("root_goal") or worker.get("initial_request") or "",
+        "root_goal": _pr_finalizer_recovery_root_goal(worker),
+        "route_decision": {
+            "route": "default_coding_worker",
+            "source": "pr_finalizer_recovery",
+            "confidence": 0.99,
+            "rationale": (
+                "PR check/merge-conflict recovery uses mainline coding worker; "
+                "specialized visual routes are not inherited."
+            ),
+        },
         "pr_url": pr_url,
         "blocker": blocker,
         "instructions": instructions,
         "context_pack": _context_pack_summary(board),
-        "requirements": worker.get("requirements") or [],
     }
     if extra_payload:
         payload.update(extra_payload)

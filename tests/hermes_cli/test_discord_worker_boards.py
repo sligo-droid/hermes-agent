@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -21,6 +22,48 @@ def _home(monkeypatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
     monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://example.test")
     return root
+
+
+def _css_rule_properties(css: str, class_name: str) -> dict[str, str]:
+    match = re.search(rf"\.{re.escape(class_name)}\s*\{{([^}}]+)\}}", css)
+    assert match is not None, f"missing .{class_name} CSS rule"
+    return {
+        name.strip(): value.strip()
+        for name, value in re.findall(r"([\w-]+)\s*:\s*([^;]+)", match.group(1))
+    }
+
+
+def _css_variables(css: str) -> dict[str, str]:
+    return {
+        name: value
+        for name, value in re.findall(r"(--[\w-]+)\s*:\s*(#[0-9a-fA-F]{6})", css)
+    }
+
+
+def _resolve_css_color(value: str, variables: dict[str, str]) -> str:
+    value = value.strip()
+    match = re.fullmatch(r"var\((--[\w-]+)\)", value)
+    if match:
+        return variables[match.group(1)]
+    return value
+
+
+def _relative_luminance(color: str) -> float:
+    assert re.fullmatch(r"#[0-9a-fA-F]{6}", color), f"unsupported color {color!r}"
+    channels = [int(color[index : index + 2], 16) / 255 for index in (1, 3, 5)]
+    linear = [
+        value / 12.92 if value <= 0.03928 else ((value + 0.055) / 1.055) ** 2.4
+        for value in channels
+    ]
+    return (0.2126 * linear[0]) + (0.7152 * linear[1]) + (0.0722 * linear[2])
+
+
+def _contrast_ratio(first: str, second: str) -> float:
+    light, dark = sorted(
+        (_relative_luminance(first), _relative_luminance(second)),
+        reverse=True,
+    )
+    return (light + 0.05) / (dark + 0.05)
 
 
 def test_ensure_discord_thread_board_creates_public_metadata(monkeypatch, tmp_path):
@@ -409,19 +452,93 @@ def test_ensure_code_island_keeps_unchanged_healthy_check_below_info(monkeypatch
     assert "ready=True" in debug_records[0].message
 
 
-def test_ensure_code_island_blocks_active_board_without_project_mapping(monkeypatch, tmp_path):
+def test_ensure_code_island_persists_active_stale_error_recovery_once(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    board = dwb.start_direct_goal(
+        thread_id="12347d",
+        goal="Ship it",
+        project_context={"project_path": str(project)},
+    )
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "code_island_ready": False,
+            "code_island_pending": False,
+            "code_island_error": "stale historical checkout failure",
+            "worktree_path": str(tmp_path / "worktree"),
+        },
+    )
+
+    def fake_ensure(worker):
+        worker["code_island_ready"] = True
+        worker["code_island_pending"] = False
+        worker.pop("code_island_error", None)
+
+    monkeypatch.setattr(dwb, "_ensure_code_island", fake_ensure)
+
+    with caplog.at_level("INFO", logger="hermes_cli.discord_worker_boards"):
+        assert dwb.ensure_code_island_for_board(board.slug) is True
+
+    info_records = [
+        record
+        for record in caplog.records
+        if record.levelname == "INFO"
+        and record.message.startswith(f"discord_worker_code_island board={board.slug}")
+    ]
+    assert len(info_records) == 1
+    assert "ready=True" in info_records[0].message
+    assert "pending=False" in info_records[0].message
+    assert "error=False" in info_records[0].message
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "code_island_error" not in worker
+
+    caplog.clear()
+    with caplog.at_level("DEBUG", logger="hermes_cli.discord_worker_boards"):
+        assert dwb.ensure_code_island_for_board(board.slug) is True
+
+    info_records = [
+        record
+        for record in caplog.records
+        if record.levelname == "INFO"
+        and record.message.startswith(f"discord_worker_code_island board={board.slug}")
+    ]
+    debug_records = [
+        record
+        for record in caplog.records
+        if record.levelname == "DEBUG"
+        and record.message.startswith(f"discord_worker_code_island board={board.slug}")
+    ]
+    assert info_records == []
+    assert len(debug_records) == 1
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "code_island_error" not in worker
+
+
+def test_ensure_code_island_blocks_active_board_without_project_mapping(monkeypatch, tmp_path, caplog):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
     from hermes_cli import kanban_db
 
     board = dwb.set_goal(thread_id="12348", goal="Ship it")
 
-    assert dwb.ensure_code_island_for_board(board.slug) is False
+    with caplog.at_level("INFO", logger="hermes_cli.discord_worker_boards"):
+        assert dwb.ensure_code_island_for_board(board.slug) is False
 
     worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
     assert worker["goal_status"] == "blocked"
     assert worker["phase"] == "blocked"
     assert "No project checkout is mapped" in worker["blocked_reason"]
+    assert f"discord_worker_code_island board={board.slug}" in caplog.text
+    assert "error=True" in caplog.text
 
 
 def test_ensure_code_island_blocks_active_board_on_checkout_error(monkeypatch, tmp_path):
@@ -516,6 +633,56 @@ def test_ensure_code_island_suppresses_terminal_stale_error_health(monkeypatch, 
     assert worker["code_island_error"] == "stale historical checkout failure"
     assert "blocked_reason" not in worker
     assert f"discord_worker_code_island board={board.slug}" not in caplog.text
+
+
+def test_ensure_code_island_demotes_blocked_board_stale_telemetry(monkeypatch, tmp_path, caplog):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    board = dwb.set_goal(
+        thread_id="12351b",
+        goal="Ship it",
+        project_context={"project_path": str(project)},
+    )
+    stale_error = "worker checkout is on 'review', expected 'discord/12351b'"
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "blocked",
+            "phase": "blocked",
+            "blocked_reason": "approved reviewer PR finalization failed",
+            "code_island_ready": True,
+            "code_island_pending": False,
+            "code_island_error": stale_error,
+            "worktree_path": str(tmp_path / "worktree"),
+        },
+    )
+
+    def fake_ensure(worker):
+        worker["code_island_ready"] = False
+        worker["code_island_pending"] = False
+        worker["code_island_error"] = stale_error
+
+    monkeypatch.setattr(dwb, "_ensure_code_island", fake_ensure)
+
+    with caplog.at_level("INFO", logger="hermes_cli.discord_worker_boards"):
+        assert dwb.ensure_code_island_for_board(board.slug) is False
+
+    assert f"discord_worker_code_island board={board.slug}" not in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("DEBUG", logger="hermes_cli.discord_worker_boards"):
+        assert dwb.ensure_code_island_for_board(board.slug) is False
+
+    debug_records = [
+        record
+        for record in caplog.records
+        if record.levelname == "DEBUG"
+        and record.message.startswith(f"discord_worker_code_island board={board.slug}")
+    ]
+    assert len(debug_records) == 1
 
 
 def test_ensure_code_island_many_healthy_boards_emit_bounded_info(monkeypatch, tmp_path, caplog):
@@ -2412,6 +2579,34 @@ def test_public_board_index_lists_operational_row_data(monkeypatch, tmp_path):
     assert "share_token" not in html
 
 
+def test_worker_runtime_chip_css_covers_runtime_states_with_readable_contrast():
+    from hermes_cli import discord_worker_boards as dwb
+
+    css = dwb._workers_page_css()
+    variables = _css_variables(css)
+    base = _css_rule_properties(css, "runtime")
+
+    for state in (
+        "running",
+        "queued",
+        "idle",
+        "blocked",
+        "stalled",
+        "paused",
+        "done",
+        "cancelled",
+        "degraded",
+    ):
+        props = _css_rule_properties(css, f"runtime-{state}")
+        background = _resolve_css_color(
+            props.get("background") or props.get("background-color") or base["background"],
+            variables,
+        )
+        foreground = _resolve_css_color(props.get("color") or base["color"], variables)
+
+        assert _contrast_ratio(foreground, background) >= 4.5, state
+
+
 def test_public_board_index_shows_pause_control_for_active_board(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -2602,10 +2797,37 @@ def test_public_board_index_does_not_show_dead_pid_as_running(monkeypatch, tmp_p
         conn.close()
 
     html = dwb.render_public_board_index_html()
+    session_html = dwb.render_public_session_board_html("5155")
 
-    assert 'class="runtime runtime-stalled">stalled</strong>' in html
-    assert "running ticket has no live worker" in html
-    assert "Pause</button>" not in html
+    for rendered in (html, session_html):
+        assert ".runtime-stalled" in rendered
+        assert 'class="runtime runtime-stalled">stalled</strong>' in rendered
+        assert "running ticket has no live worker" in rendered
+        assert "Pause</button>" not in rendered
+
+
+def test_public_worker_pages_render_cancelled_runtime_chip(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(thread_id="5159", goal="Stop the thing")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "cancelled",
+            "phase": "cancelled",
+            "cancelled": True,
+        },
+    )
+
+    index_html = dwb.render_public_board_index_html()
+    session_html = dwb.render_public_session_board_html("5159")
+
+    for rendered in (index_html, session_html):
+        assert ".runtime-cancelled" in rendered
+        assert 'class="runtime runtime-cancelled">cancelled</strong>' in rendered
+        assert "cancelled" in rendered
+        assert 'action="/workers/5159/pause' not in rendered
 
 
 def test_public_board_index_done_board_has_no_pause_action(monkeypatch, tmp_path):
@@ -3943,6 +4165,46 @@ def test_reconcile_board_blocks_pr_body_check_finalizer_without_recovery_round(m
     assert actionable == []
 
 
+def _assert_pr_finalizer_recovery_defaults_to_mainline_route(task):
+    from hermes_cli import kanban_codex_worker
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+
+    body = task.body or ""
+    assert "ui_visual_specialist" not in body
+    assert "z-ai/glm-5.2" not in body
+    assert "selected_provider=openrouter" not in body
+    assert "delegate_coding_task(route_decision" not in body
+
+    payload = json.loads(body)
+    assert "requirements" not in payload
+    assert payload["root_goal"] == "Keep the approved implementation and fix only the PR finalizer blocker."
+    assert payload["route_decision"]["route"] == "default_coding_worker"
+    assert payload["route_decision"]["source"] == "pr_finalizer_recovery"
+    assert "mainline coding worker" in payload["route_decision"]["rationale"]
+    assert (
+        kanban_codex_worker._resolve_task_ui_work_route(
+            task,
+            ROLE_DEV,
+            workspace="",
+            backend="codex",
+        )
+        is None
+    )
+
+
+def _route_poisoned_pr_finalizer_context():
+    return "\n".join(
+        [
+            "Keep the approved implementation and fix only the PR finalizer blocker.",
+            (
+                "implementation worker MUST launch via "
+                'delegate_coding_task(route_decision={"route":"ui_visual_specialist"})'
+            ),
+            "Close out with selected_provider=openrouter selected_model=z-ai/glm-5.2 metadata.",
+        ]
+    )
+
+
 def test_reconcile_board_creates_dev_recovery_for_real_failed_pr_checks(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -3959,6 +4221,12 @@ def test_reconcile_board_creates_dev_recovery_for_real_failed_pr_checks(monkeypa
             "review_loop_count": 1,
             "merge_policy": "auto",
             "pr_open_policy": "after_review_approval",
+            "root_goal": _route_poisoned_pr_finalizer_context(),
+            "initial_request": _route_poisoned_pr_finalizer_context(),
+            "requirements": [
+                "implementation worker MUST launch via delegate_coding_task(route_decision={route:ui_visual_specialist})",
+                "Close out with selected_provider=openrouter selected_model=z-ai/glm-5.2 metadata.",
+            ],
         },
     )
     conn = kanban_db.connect(board=board.slug)
@@ -4017,6 +4285,9 @@ def test_reconcile_board_creates_dev_recovery_for_real_failed_pr_checks(monkeypa
     assert len(recovery_tasks) == 1
     assert recovery_tasks[0].assignee == dwb.ROLE_DEV
     assert recovery_tasks[0].title.startswith("R2: Fix failing PR checks")
+    _assert_pr_finalizer_recovery_defaults_to_mainline_route(recovery_tasks[0])
+    payload = json.loads(recovery_tasks[0].body or "{}")
+    assert payload["failed_checks"] == ["Basic Tests"]
 
 
 def test_reconcile_blocked_approved_board_with_generic_pr_blocker_stays_finalizer_blocked(monkeypatch, tmp_path):
@@ -4203,6 +4474,12 @@ def test_reconcile_board_creates_dev_recovery_for_pr_merge_conflict_finalizer(mo
             "review_loop_count": 1,
             "merge_policy": "auto",
             "pr_open_policy": "after_review_approval",
+            "root_goal": _route_poisoned_pr_finalizer_context(),
+            "initial_request": _route_poisoned_pr_finalizer_context(),
+            "requirements": [
+                "implementation worker MUST launch via delegate_coding_task(route_decision={route:ui_visual_specialist})",
+                "Close out with selected_provider=openrouter selected_model=z-ai/glm-5.2 metadata.",
+            ],
         },
     )
     conn = kanban_db.connect(board=board.slug)
@@ -4266,6 +4543,7 @@ def test_reconcile_board_creates_dev_recovery_for_pr_merge_conflict_finalizer(mo
     assert len(recovery_tasks) == 1
     assert recovery_tasks[0].assignee == dwb.ROLE_DEV
     assert recovery_tasks[0].title.startswith("R2: Resolve PR merge conflicts")
+    _assert_pr_finalizer_recovery_defaults_to_mainline_route(recovery_tasks[0])
     payload = json.loads(recovery_tasks[0].body or "{}")
     assert payload["conflict_files"] == ["dashboard/static/CHANGELOG.md", "docs/project-state.md"]
     instructions = "\n".join(payload["instructions"])

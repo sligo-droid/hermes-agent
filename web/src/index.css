@@ -312,6 +312,20 @@ code { font-size: 0.875rem; }
   overflow: auto;
 }
 
+.command-center-error-card {
+  border-color: rgb(252 165 165 / 0.32);
+}
+
+.command-center-loading-card {
+  border-color: rgb(255 255 255 / 0.08);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.026), 0 10px 24px rgb(0 0 0 / 0.12);
+}
+
+.command-center-empty-state {
+  border-color: rgb(255 255 255 / 0.07);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.022);
+}
+
 @media (min-width: 1180px) {
   .command-center-content-grid {
     grid-template-columns: minmax(0, 1fr) minmax(18rem, 22rem);
@@ -688,6 +702,18 @@ code { font-size: 0.875rem; }
 }
 .sligo-light .command-center-card-timestamp {
   border-left-color: rgb(203 213 225 / 0.84);
+}
+.sligo-light .command-center-error-card {
+  background-color: rgb(254 242 242 / 0.92) !important;
+  border-color: rgb(185 28 28 / 0.24) !important;
+}
+.sligo-light .command-center-loading-card {
+  background-color: rgb(255 255 255 / 0.86) !important;
+  border-color: rgb(203 213 225 / 0.84) !important;
+}
+.sligo-light .command-center-empty-state {
+  background-color: rgb(255 255 255 / 0.84) !important;
+  border-color: rgb(203 213 225 / 0.72) !important;
 }
 .sligo-light .command-center-full-context {
   background-color: rgb(248 250 252 / 0.94) !important;

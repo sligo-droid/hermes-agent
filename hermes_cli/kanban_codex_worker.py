@@ -1129,11 +1129,20 @@ def _extract_task_route_decision(task: Any) -> Any:
     explicit = getattr(task, "route_decision", None)
     if explicit:
         return explicit
+    body = str(getattr(task, "body", "") or "")
+    try:
+        parsed_body = json.loads(body)
+    except Exception:
+        parsed_body = None
+    if isinstance(parsed_body, dict):
+        parsed_decision = parsed_body.get("route_decision")
+        if isinstance(parsed_decision, dict) and parsed_decision.get("route"):
+            return parsed_decision
     text = "\n".join(
         str(part or "")
         for part in (
             getattr(task, "title", ""),
-            getattr(task, "body", ""),
+            body,
         )
     )
     for match in _PLANNER_ROUTE_DECISION_RE.finditer(text):
