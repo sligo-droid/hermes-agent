@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -21,6 +22,48 @@ def _home(monkeypatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
     monkeypatch.setenv("HERMES_PUBLIC_KANBAN_BASE_URL", "https://example.test")
     return root
+
+
+def _css_rule_properties(css: str, class_name: str) -> dict[str, str]:
+    match = re.search(rf"\.{re.escape(class_name)}\s*\{{([^}}]+)\}}", css)
+    assert match is not None, f"missing .{class_name} CSS rule"
+    return {
+        name.strip(): value.strip()
+        for name, value in re.findall(r"([\w-]+)\s*:\s*([^;]+)", match.group(1))
+    }
+
+
+def _css_variables(css: str) -> dict[str, str]:
+    return {
+        name: value
+        for name, value in re.findall(r"(--[\w-]+)\s*:\s*(#[0-9a-fA-F]{6})", css)
+    }
+
+
+def _resolve_css_color(value: str, variables: dict[str, str]) -> str:
+    value = value.strip()
+    match = re.fullmatch(r"var\((--[\w-]+)\)", value)
+    if match:
+        return variables[match.group(1)]
+    return value
+
+
+def _relative_luminance(color: str) -> float:
+    assert re.fullmatch(r"#[0-9a-fA-F]{6}", color), f"unsupported color {color!r}"
+    channels = [int(color[index : index + 2], 16) / 255 for index in (1, 3, 5)]
+    linear = [
+        value / 12.92 if value <= 0.03928 else ((value + 0.055) / 1.055) ** 2.4
+        for value in channels
+    ]
+    return (0.2126 * linear[0]) + (0.7152 * linear[1]) + (0.0722 * linear[2])
+
+
+def _contrast_ratio(first: str, second: str) -> float:
+    light, dark = sorted(
+        (_relative_luminance(first), _relative_luminance(second)),
+        reverse=True,
+    )
+    return (light + 0.05) / (dark + 0.05)
 
 
 def test_ensure_discord_thread_board_creates_public_metadata(monkeypatch, tmp_path):
@@ -2412,6 +2455,34 @@ def test_public_board_index_lists_operational_row_data(monkeypatch, tmp_path):
     assert "share_token" not in html
 
 
+def test_worker_runtime_chip_css_covers_runtime_states_with_readable_contrast():
+    from hermes_cli import discord_worker_boards as dwb
+
+    css = dwb._workers_page_css()
+    variables = _css_variables(css)
+    base = _css_rule_properties(css, "runtime")
+
+    for state in (
+        "running",
+        "queued",
+        "idle",
+        "blocked",
+        "stalled",
+        "paused",
+        "done",
+        "cancelled",
+        "degraded",
+    ):
+        props = _css_rule_properties(css, f"runtime-{state}")
+        background = _resolve_css_color(
+            props.get("background") or props.get("background-color") or base["background"],
+            variables,
+        )
+        foreground = _resolve_css_color(props.get("color") or base["color"], variables)
+
+        assert _contrast_ratio(foreground, background) >= 4.5, state
+
+
 def test_public_board_index_shows_pause_control_for_active_board(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
@@ -2602,10 +2673,37 @@ def test_public_board_index_does_not_show_dead_pid_as_running(monkeypatch, tmp_p
         conn.close()
 
     html = dwb.render_public_board_index_html()
+    session_html = dwb.render_public_session_board_html("5155")
 
-    assert 'class="runtime runtime-stalled">stalled</strong>' in html
-    assert "running ticket has no live worker" in html
-    assert "Pause</button>" not in html
+    for rendered in (html, session_html):
+        assert ".runtime-stalled" in rendered
+        assert 'class="runtime runtime-stalled">stalled</strong>' in rendered
+        assert "running ticket has no live worker" in rendered
+        assert "Pause</button>" not in rendered
+
+
+def test_public_worker_pages_render_cancelled_runtime_chip(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.set_goal(thread_id="5159", goal="Stop the thing")
+    dwb._update_worker_meta(
+        board.slug,
+        {
+            "goal_status": "cancelled",
+            "phase": "cancelled",
+            "cancelled": True,
+        },
+    )
+
+    index_html = dwb.render_public_board_index_html()
+    session_html = dwb.render_public_session_board_html("5159")
+
+    for rendered in (index_html, session_html):
+        assert ".runtime-cancelled" in rendered
+        assert 'class="runtime runtime-cancelled">cancelled</strong>' in rendered
+        assert "cancelled" in rendered
+        assert 'action="/workers/5159/pause' not in rendered
 
 
 def test_public_board_index_done_board_has_no_pause_action(monkeypatch, tmp_path):
