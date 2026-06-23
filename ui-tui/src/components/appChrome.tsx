@@ -4,7 +4,7 @@ import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } 
 import unicodeSpinners from 'unicode-animations'
 
 import { $delegationState } from '../app/delegationStore.js'
-import type { IndicatorStyle } from '../app/interfaces.js'
+import type { IndicatorStyle, Notice } from '../app/interfaces.js'
 import { useTurnSelector } from '../app/turnStore.js'
 import { $uiState } from '../app/uiStore.js'
 import { FACES } from '../content/faces.js'
@@ -576,6 +576,9 @@ interface StatusRuleProps {
   model: string
   modelFast?: boolean
   modelReasoningEffort?: string
+  indicatorStyle?: IndicatorStyle
+  lastTurnEndedAt?: null | number
+  notice?: Notice | null
   sessionStartedAt?: null | number
   showCost: boolean
   status: string

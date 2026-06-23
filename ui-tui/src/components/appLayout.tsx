@@ -9,6 +9,7 @@ import { $uiState } from '../app/uiStore.js'
 import { INLINE_MODE, SHOW_FPS, TERMUX_TUI_MODE } from '../config/env.js'
 import { FULL_RENDER_TAIL_ITEMS } from '../config/limits.js'
 import { PLACEHOLDER } from '../content/placeholders.js'
+import { prevRenderedMsg } from '../domain/blockLayout.js'
 import {
   COMPOSER_PROMPT_GAP_WIDTH,
   composerPromptWidth,
@@ -127,6 +128,11 @@ const TranscriptPane = memo(function TranscriptPane({
                   detailsModeCommandOverride={ui.detailsModeCommandOverride}
                   limitHistoryRender={row.index < transcript.historyItems.length - FULL_RENDER_TAIL_ITEMS}
                   msg={row.msg}
+                  prev={prevRenderedMsg(
+                    i => transcript.virtualRows[i]?.msg,
+                    row.index,
+                    { commandOverride: ui.detailsModeCommandOverride, detailsMode: ui.detailsMode, sections: ui.sections }
+                  )}
                   sections={ui.sections}
                   t={ui.theme}
                 />
@@ -143,6 +149,7 @@ const TranscriptPane = memo(function TranscriptPane({
             compact={ui.compact}
             detailsMode={ui.detailsMode}
             detailsModeCommandOverride={ui.detailsModeCommandOverride}
+            prevMsg={transcript.historyItems[transcript.historyItems.length - 1]}
             progress={progress}
             sections={ui.sections}
           />
@@ -259,12 +266,12 @@ const ComposerPane = memo(function ComposerPane({
           cols={composer.cols}
           compIdx={composer.compIdx}
           completions={composer.completions}
-          onActiveSessionSelect={actions.activateLiveSession}
           onActiveSessionClose={actions.closeLiveSession}
+          onActiveSessionSelect={actions.activateLiveSession}
           onModelSelect={actions.onModelSelect}
           onNewLiveSession={actions.newLiveSession}
           onNewPromptSession={actions.newPromptSession}
-          onPickerSelect={actions.resumeById}
+          onResumeSelect={actions.resumeById}
           pagerPageSize={composer.pagerPageSize}
         />
 
@@ -365,10 +372,13 @@ const StatusRulePane = memo(function StatusRulePane({
         busy={ui.busy}
         cols={composer.cols}
         cwdLabel={status.cwdLabel}
+        indicatorStyle={ui.indicatorStyle}
+        lastTurnEndedAt={status.lastTurnEndedAt}
         liveSessionCount={ui.liveSessionCount}
         model={ui.info?.model ?? ''}
         modelFast={ui.info?.fast || ui.info?.service_tier === 'priority'}
         modelReasoningEffort={ui.info?.reasoning_effort}
+        notice={ui.notice}
         onSessionCountClick={() => patchOverlayState({ sessions: true })}
         sessionStartedAt={status.sessionStartedAt}
         showCost={ui.showCost}

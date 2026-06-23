@@ -254,25 +254,37 @@ def apply_tool_result_hooks(
     session_id: str = "",
     tool_call_id: str = "",
     duration_ms: int = 0,
+    middleware_trace: list[dict[str, Any]] | None = None,
 ) -> Any:
     """Run observational and transform hooks for a completed tool result."""
     try:
-        from hermes_cli.plugins import invoke_hook
-        invoke_hook(
-            "post_tool_call",
-            tool_name=function_name,
-            args=function_args,
-            result=function_result,
-            task_id=task_id or "",
-            session_id=session_id or "",
-            tool_call_id=tool_call_id or "",
-            duration_ms=duration_ms,
-        )
+        from hermes_cli.plugins import has_hook, invoke_hook
+
+        if has_hook("post_tool_call"):
+            invoke_hook(
+                "post_tool_call",
+                tool_name=function_name,
+                args=function_args,
+                result=function_result,
+                task_id=task_id or "",
+                session_id=session_id or "",
+                tool_call_id=tool_call_id or "",
+                turn_id="",
+                api_request_id="",
+                duration_ms=duration_ms,
+                status="ok",
+                error_type=None,
+                error_message=None,
+                middleware_trace=list(middleware_trace or []),
+            )
     except Exception as _hook_err:
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
     try:
-        from hermes_cli.plugins import invoke_hook
+        from hermes_cli.plugins import has_hook, invoke_hook
+
+        if not has_hook("transform_tool_result"):
+            return function_result
         hook_results = invoke_hook(
             "transform_tool_result",
             tool_name=function_name,
@@ -281,7 +293,12 @@ def apply_tool_result_hooks(
             task_id=task_id or "",
             session_id=session_id or "",
             tool_call_id=tool_call_id or "",
+            turn_id="",
+            api_request_id="",
             duration_ms=duration_ms,
+            status="ok",
+            error_type=None,
+            error_message=None,
         )
         for hook_result in hook_results:
             if isinstance(hook_result, str):

@@ -24,7 +24,7 @@ from rich.table import Table
 # Lazy imports to avoid circular dependencies and slow startup.
 # tools.skills_hub and tools.skills_guard are imported inside functions.
 from hermes_constants import display_hermes_home
-from agent.skill_utils import is_excluded_skill_path
+from agent.skill_utils import EXCLUDED_SKILL_DIRS, is_excluded_skill_path
 
 _console = Console()
 
@@ -174,10 +174,21 @@ def _find_local_skill_dirs(root: Path, include_nested: bool = False) -> list[Pat
     root_skill = root / "SKILL.md"
     if root_skill.is_file() and not include_nested and not is_excluded_skill_path(root_skill):
         return [root]
-    return sorted(
+    if include_nested:
+        def _is_cache_or_dep(path: Path) -> bool:
+            return any(part in EXCLUDED_SKILL_DIRS for part in path.parts)
+
+        return sorted(
+            {p.parent for p in root.rglob("SKILL.md") if not _is_cache_or_dep(p)},
+            key=lambda p: str(p.relative_to(root)),
+        )
+    found = sorted(
         {p.parent for p in root.rglob("SKILL.md") if not is_excluded_skill_path(p)},
         key=lambda p: str(p.relative_to(root)),
     )
+    if root_skill.is_file() and not is_excluded_skill_path(root_skill) and root not in found:
+        return [root, *found]
+    return found
 
 
 def _skill_pack_result_to_dict(
@@ -443,13 +454,20 @@ def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
         "lobehub": 500, "browse-sh": 500,
     }
 
-    with c.status("[bold]Fetching skills from registries..."):
+    with c.status("[bold]Fetching skills from registries...") as status:
+        def _on_source_done(source_id: str, count: int) -> None:
+            try:
+                status.update(f"[bold]Fetching skills from registries...[/] {source_id}: {count}")
+            except Exception:
+                pass
+
         all_results, source_counts, timed_out = parallel_search_sources(
             sources,
             query="",
             per_source_limits=_PER_SOURCE_LIMIT,
             source_filter=source,
             overall_timeout=30,
+            on_source_done=_on_source_done,
         )
 
     if not all_results:

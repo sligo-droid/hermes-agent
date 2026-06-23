@@ -88,6 +88,21 @@ def _check_ws_token(provided: Optional[str]) -> bool:
     return hmac.compare_digest(str(provided), str(expected))
 
 
+def _ws_upgrade_authorized(ws: WebSocket) -> bool:
+    try:
+        from hermes_cli import web_server as _ws
+    except Exception:
+        return _check_ws_token(ws.query_params.get("token"))
+
+    checker = getattr(_ws, "_ws_auth_ok", None)
+    if callable(checker):
+        try:
+            return bool(checker(ws))
+        except Exception:
+            return False
+    return _check_ws_token(ws.query_params.get("token"))
+
+
 def _resolve_board(board: Optional[str]) -> Optional[str]:
     """Validate and normalise a board slug from a query param.
 
@@ -3837,8 +3852,7 @@ async def stream_events(ws: WebSocket):
     # Enforce the dashboard session token as a query param — browsers can't
     # set Authorization on a WS upgrade. This matches how the PTY bridge
     # authenticates in hermes_cli/web_server.py.
-    token = ws.query_params.get("token")
-    if not _check_ws_token(token):
+    if not _ws_upgrade_authorized(ws):
         await ws.close(code=http_status.WS_1008_POLICY_VIOLATION)
         return
     await ws.accept()

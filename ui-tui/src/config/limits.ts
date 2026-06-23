@@ -3,6 +3,9 @@ export const LARGE_PASTE = { lines: 5 }
 export const LIVE_RENDER_MAX_CHARS = 16_000
 export const LIVE_RENDER_MAX_LINES = 240
 
+export const VERBOSE_TRAIL_MAX_CHARS = 800
+export const VERBOSE_TRAIL_MAX_LINES = 12
+
 // History-render bounds for messages outside FULL_RENDER_TAIL. Each rendered
 // line ≈ 1 Yoga/Text node + inline spans, so this is the dominant lever on
 // cold-mount cost during PageUp catch-up. 16 lines × 25 mounted ≈ 400 nodes
