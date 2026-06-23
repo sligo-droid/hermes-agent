@@ -754,10 +754,12 @@ class WebhookAdapter(BasePlatformAdapter):
             extract_request,
             fetch_pr_info,
             fetch_pr_related_context,
+            fetch_review_info,
             github_pr_amend_reaction_targets,
             policy_from_route,
             preflight_request,
             publish_and_activate_pr_amend_intake,
+            request_with_parent_review_state,
             resolve_pr_amend_existing_discord_route,
             resolve_pr_amend_discord_channel,
             write_pr_amend_intake_artifact,
@@ -814,9 +816,17 @@ class WebhookAdapter(BasePlatformAdapter):
 
         try:
             pr_info = await asyncio.to_thread(fetch_pr_info, request.repo, request.pr_number)
+            if request.event_type == "pull_request_review_comment":
+                review_info = await asyncio.to_thread(
+                    fetch_review_info,
+                    request.repo,
+                    request.pr_number,
+                    request.review_id,
+                )
+                request = request_with_parent_review_state(request, review_info)
         except Exception as exc:
             logger.warning(
-                "[github-pr-amend] failed to fetch PR metadata route=%s repo=%s pr=%s delivery=%s: %s",
+                "[github-pr-amend] failed to fetch PR/review metadata route=%s repo=%s pr=%s delivery=%s: %s",
                 route_name,
                 request.repo,
                 request.pr_number,
@@ -825,7 +835,7 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             self._seen_deliveries.pop(delivery_id, None)
             return web.json_response(
-                {"status": "error", "error": "Failed to fetch PR metadata"},
+                {"status": "error", "error": "Failed to fetch PR/review metadata"},
                 status=502,
             )
 
