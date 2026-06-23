@@ -25,9 +25,9 @@ Usage in run_agent.py:
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
-import inspect
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -56,6 +56,23 @@ _INTERNAL_NOTE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_MEMORY_TEXT_PART_TYPES = {"text", "input_text", "output_text", "refusal"}
+_MEMORY_TEXT_PART_VALUE_KEYS = ("text", "content", "refusal")
+_MEMORY_NESTED_TEXT_PART_TYPES = {"message", "input_message", "output_message"}
+_MEMORY_MEDIA_PART_TYPES = {
+    "audio",
+    "binary",
+    "document",
+    "file",
+    "image",
+    "image_url",
+    "input_audio",
+    "input_file",
+    "input_image",
+    "video",
+}
+_MEMORY_PART_TYPE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
 
 def sanitize_context(text: str) -> str:
     """Strip fence tags, injected context blocks, and system notes from provider output."""
@@ -63,6 +80,105 @@ def sanitize_context(text: str) -> str:
     text = _INTERNAL_NOTE_RE.sub('', text)
     text = _FENCE_TAG_RE.sub('', text)
     return text
+
+
+def _safe_memory_part_type(raw_type: Any) -> str:
+    """Return bounded structural metadata for an omitted content part."""
+    part_type = str(raw_type or "unknown").strip().lower() or "unknown"
+    part_type = _MEMORY_PART_TYPE_RE.sub("_", part_type)
+    return part_type[:40] or "unknown"
+
+
+def _looks_textual(text: str) -> bool:
+    """Reject decoded bytes that still look like binary/control payloads."""
+    return not any(
+        (ord(ch) < 32 and ch not in "\t\n\r") or ord(ch) == 127
+        for ch in text
+    )
+
+
+def _decode_textual_bytes(data: bytes) -> Optional[str]:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not _looks_textual(text):
+        return None
+    return text
+
+
+def _format_omitted_memory_parts(omitted: Dict[str, int]) -> str:
+    summary = ", ".join(f"{part_type}={count}" for part_type, count in omitted.items())
+    return f"[omitted non-text memory content: {summary}]"
+
+
+def normalize_memory_turn_content(content: Any) -> str:
+    """Convert completed-turn content into safe provider-facing text.
+
+    Runtime messages can be plain strings, bytes, or OpenAI-style multimodal
+    part lists. Memory providers historically accept text, so this extracts
+    text parts in order and replaces non-text/binary/media parts with bounded
+    type/count markers that do not include raw URLs, data URLs, or payloads.
+    """
+    parts: list[str] = []
+    omitted: Dict[str, int] = {}
+
+    def flush_omitted() -> None:
+        if omitted:
+            parts.append(_format_omitted_memory_parts(omitted))
+            omitted.clear()
+
+    def add_text(text: str) -> None:
+        if text:
+            flush_omitted()
+            parts.append(text)
+
+    def omit(part_type: Any) -> None:
+        safe_type = _safe_memory_part_type(part_type)
+        omitted[safe_type] = omitted.get(safe_type, 0) + 1
+
+    def walk(value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, str):
+            add_text(value)
+            return
+        if isinstance(value, bytes):
+            text = _decode_textual_bytes(value)
+            if text is None:
+                omit("bytes")
+            else:
+                add_text(text)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item)
+            return
+        if isinstance(value, dict):
+            raw_type = value.get("type")
+            part_type = _safe_memory_part_type(raw_type)
+            if part_type in _MEMORY_TEXT_PART_TYPES:
+                for key in _MEMORY_TEXT_PART_VALUE_KEYS:
+                    if key in value:
+                        walk(value.get(key))
+                        break
+                return
+            if not raw_type and "text" in value:
+                walk(value.get("text"))
+                return
+            if part_type in _MEMORY_NESTED_TEXT_PART_TYPES and "content" in value:
+                walk(value.get("content"))
+                return
+            if part_type in _MEMORY_MEDIA_PART_TYPES:
+                omit(part_type)
+                return
+            omit(part_type)
+            return
+        omit(type(value).__name__)
+
+    walk(content)
+    flush_omitted()
+    return "\n".join(parts)
 
 
 class StreamingContextScrubber:
@@ -398,28 +514,35 @@ class MemoryManager:
 
     def sync_all(
         self,
-        user_content: str,
-        assistant_content: str,
+        user_content: Any,
+        assistant_content: Any,
         *,
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """Sync a completed turn to all providers."""
+        """Sync a completed turn to all providers.
+
+        Completed-turn content can arrive as strings, bytes, or multimodal
+        part lists. Normalize once at this shared boundary so legacy providers
+        continue receiving plain strings.
+        """
         if self.read_only:
             return
+        normalized_user_content = normalize_memory_turn_content(user_content)
+        normalized_assistant_content = normalize_memory_turn_content(assistant_content)
         for provider in self._providers:
             try:
                 if messages is not None and self._provider_sync_accepts_messages(provider):
                     provider.sync_turn(
-                        user_content,
-                        assistant_content,
+                        normalized_user_content,
+                        normalized_assistant_content,
                         session_id=session_id,
                         messages=messages,
                     )
                 else:
                     provider.sync_turn(
-                        user_content,
-                        assistant_content,
+                        normalized_user_content,
+                        normalized_assistant_content,
                         session_id=session_id,
                     )
             except Exception as e:
