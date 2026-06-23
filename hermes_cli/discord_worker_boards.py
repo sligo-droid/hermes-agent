@@ -5207,7 +5207,7 @@ def render_public_board_index_html() -> str:
             '{corruption_banner}'
             '<strong>{link}</strong><br>'
             '<div class="meta">{session} · Status: {status}</div>'
-            '<p>Runtime: <span class="runtime runtime-{runtime_class}">{runtime}</span></p>'
+            '<p>Runtime: <strong class="runtime runtime-{runtime_class}">{runtime}</strong></p>'
             '<p>Tasks: {counts}</p>'
             '<p>{reason_label}: {reason}</p>'
             '<p>Running: {running}</p>'
