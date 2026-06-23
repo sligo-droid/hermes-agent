@@ -24,6 +24,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - run: npm install -g npm@11.14.1
       - run: npm ci
       - run: npm run --prefix ${{ matrix.package }} typecheck
 
@@ -41,5 +42,6 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - run: npm install -g npm@11.14.1
       - run: npm ci
       - run: npm run --prefix apps/desktop build
