@@ -1,4 +1,4 @@
-import { forceRedraw, requestRepaint, useInput } from '@hermes/ink'
+import { forceRedraw, useInput } from '@hermes/ink'
 import { useStore } from '@nanostores/react'
 import { useEffect, useRef } from 'react'
 
@@ -11,7 +11,6 @@ import type {
   SudoRespondResponse,
   VoiceRecordResponse
 } from '../gatewayTypes.js'
-import { pagerVisibleRows } from '../lib/pager.js'
 import { isAction, isCopyShortcut, isMac, isVoiceToggleKey } from '../lib/platform.js'
 import { computePrecisionWheelStep, initPrecisionWheel } from '../lib/precisionWheel.js'
 import { computeWheelStep, initWheelAccelForHost } from '../lib/wheelAccel.js'
@@ -104,7 +103,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
 
   const overlay = useStore($overlayState)
   const isBlocked = useStore($isBlocked)
-  const pagerPageSize = pagerVisibleRows(terminal.stdout?.rows ?? 24)
+  const pagerPageSize = Math.max(5, (terminal.stdout?.rows ?? 24) - 6)
   const scrollIdleTimer = useRef<null | ReturnType<typeof setTimeout>>(null)
 
   // Wheel accel ported from claude-code: inter-event timing drives step size,
@@ -133,11 +132,6 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     // ink's copySelection() already calls setClipboard() which handles
     // pbcopy (macOS), wl-copy/xclip (Linux), tmux, and OSC 52 fallback.
     terminal.selection.copySelection()
-  }
-
-  const closePager = () => {
-    requestRepaint(terminal.stdout ?? process.stdout)
-    patchOverlayState({ pager: null })
   }
 
   const clearSelection = () => {
@@ -313,7 +307,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
 
       if (overlay.pager) {
         if (key.escape || isCtrl(key, ch, 'c') || ch === 'q') {
-          return closePager()
+          return patchOverlayState({ pager: null })
         }
 
         const move = (delta: number | 'top' | 'bottom') =>
@@ -351,19 +345,13 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
         }
 
         if (key.return || ch === ' ' || key.pageDown) {
-          const { lines, offset } = overlay.pager
-          const max = Math.max(0, lines.length - pagerPageSize)
-
-          if (offset >= max) {
-            return closePager()
-          }
-
           patchOverlayState(prev => {
             if (!prev.pager) {
               return prev
             }
 
-            const { offset } = prev.pager
+            const { lines, offset } = prev.pager
+            const max = Math.max(0, lines.length - pagerPageSize)
 
             // Clamp to `max` so the offset matches what the line/page-back
             // handlers can reach (prevents a snap-back jump on the next
