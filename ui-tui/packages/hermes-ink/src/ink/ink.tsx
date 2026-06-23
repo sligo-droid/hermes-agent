@@ -91,8 +91,7 @@ import {
   ENABLE_KITTY_KEYBOARD,
   ENABLE_MODIFY_OTHER_KEYS,
   ERASE_SCREEN,
-  ERASE_SCROLLBACK,
-  RESET_SCROLL_REGION
+  ERASE_SCROLLBACK
 } from './termio/csi.js'
 import {
   DBP,
@@ -124,17 +123,17 @@ const ALT_SCREEN_ANCHOR_CURSOR = Object.freeze({
 
 const CURSOR_HOME_PATCH = Object.freeze({
   type: 'stdout' as const,
-  content: RESET_SCROLL_REGION + CURSOR_HOME
+  content: CURSOR_HOME
 })
 
 const ERASE_THEN_HOME_PATCH = Object.freeze({
   type: 'stdout' as const,
-  content: RESET_SCROLL_REGION + ERASE_SCREEN + CURSOR_HOME
+  content: ERASE_SCREEN + CURSOR_HOME
 })
 
 const DEEP_ERASE_THEN_HOME_PATCH = Object.freeze({
   type: 'stdout' as const,
-  content: RESET_SCROLL_REGION + ERASE_SCREEN + ERASE_SCROLLBACK + CURSOR_HOME
+  content: ERASE_SCREEN + ERASE_SCROLLBACK + CURSOR_HOME
 })
 
 // Cached per-Ink-instance, invalidated on resize. frame.cursor.y for
@@ -619,8 +618,6 @@ export default class Ink {
         // disable mouse (no-op if off)
         (this.altScreenActive ? '' : '\x1b[?1049h') +
         // enter alt (already in alt if fullscreen)
-        RESET_SCROLL_REGION +
-        // reset inherited/private scroll margins
         '\x1b[?1004l' +
         // disable focus reporting
         '\x1b[0m' +
@@ -649,8 +646,6 @@ export default class Ink {
     this.options.stdout.write(
       (this.altScreenActive ? ENTER_ALT_SCREEN : '') +
         // re-enter alt — vim's rmcup dropped us to main
-        RESET_SCROLL_REGION +
-        // reset scroll margins before clearing/repainting Ink
         '\x1b[2J' +
         // clear screen (now alt if fullscreen)
         '\x1b[H' +
@@ -1259,28 +1254,6 @@ export default class Ink {
   }
 
   /**
-   * Request an erase-backed repaint on the next alt-screen render.
-   *
-   * Use when a large floating overlay has just appeared/disappeared:
-   * diff-only repaint can miss cells that are already blank in the virtual
-   * buffers but still contain stale physical terminal glyphs.
-   */
-  requestRepaint(): void {
-    if (!this.options.stdout.isTTY || this.isUnmounted || this.isPaused) {
-      return
-    }
-
-    if (this.altScreenActive) {
-      this.resetFramesForAltScreen()
-      this.needsEraseBeforePaint = true
-
-      return
-    }
-
-    this.prevFrameContaminated = true
-  }
-
-  /**
    * Called by the <AlternateScreen> component on mount/unmount.
    * Controls cursor.y clamping in the renderer and gates alt-screen-aware
    * behavior in SIGCONT/resize/unmount handlers. Repaints on change so
@@ -1448,7 +1421,6 @@ export default class Ink {
     // first to drop any lingering DEC 1003 hover from before re-entry.
     this.options.stdout.write(
       ENTER_ALT_SCREEN +
-        RESET_SCROLL_REGION +
         ERASE_SCREEN +
         CURSOR_HOME +
         DISABLE_MOUSE_TRACKING +
@@ -2434,7 +2406,7 @@ export default class Ink {
       if (this.altScreenActive) {
         // <AlternateScreen>'s unmount effect won't run during signal-exit.
         // Exit alt screen FIRST so other cleanup sequences go to the main screen.
-        writeSync(1, EXIT_ALT_SCREEN + RESET_SCROLL_REGION)
+        writeSync(1, EXIT_ALT_SCREEN)
       }
 
       // Disable mouse tracking — unconditional because altScreenActive can be

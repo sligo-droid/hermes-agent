@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest'
 
-import { queueSummaryText, shouldRenderQueueDetails } from '../components/queuedMessages.js'
 import { removeAtInPlace } from '../hooks/useQueue.js'
 
 describe('removeAtInPlace', () => {
@@ -25,23 +24,5 @@ describe('removeAtInPlace', () => {
 
     expect(same).toBe(arr)
     expect(arr).toEqual([])
-  })
-})
-
-describe('queue summary display', () => {
-  it('uses one compact line for queued items', () => {
-    expect(queueSummaryText(['also, what to do about emails?'], 80)).toBe(
-      'queued (1) · next: also, what to do about emails?'
-    )
-  })
-
-  it('truncates the preview to fit narrow composers', () => {
-    expect(queueSummaryText(['abcdefghijklmnopqrstuvwxyz'], 32)).toBe('queued (1) · next: abcdefghijkl…')
-  })
-
-  it('only renders queue details while editing', () => {
-    expect(shouldRenderQueueDetails(['a'], null)).toBe(false)
-    expect(shouldRenderQueueDetails(['a'], 0)).toBe(true)
-    expect(shouldRenderQueueDetails([], 0)).toBe(false)
   })
 })

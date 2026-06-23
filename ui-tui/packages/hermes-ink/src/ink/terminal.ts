@@ -111,7 +111,7 @@ export function isSynchronizedOutputSupported(env: NodeJS.ProcessEnv = process.e
   }
 
   // kitty sets TERM=xterm-kitty or KITTY_WINDOW_ID
-  if (term?.includes('kitty') || env.KITTY_WINDOW_ID) {
+  if (term?.includes('kitty') || process.env.KITTY_WINDOW_ID) {
     return true
   }
 
@@ -131,17 +131,17 @@ export function isSynchronizedOutputSupported(env: NodeJS.ProcessEnv = process.e
   }
 
   // Zed uses the alacritty_terminal crate which supports DEC 2026
-  if (env.ZED_TERM) {
+  if (process.env.ZED_TERM) {
     return true
   }
 
   // Windows Terminal
-  if (env.WT_SESSION) {
+  if (process.env.WT_SESSION) {
     return true
   }
 
   // VTE-based terminals (GNOME Terminal, Tilix, etc.) since VTE 0.68
-  const vteVersion = env.VTE_VERSION
+  const vteVersion = process.env.VTE_VERSION
 
   if (vteVersion) {
     const version = parseInt(vteVersion, 10)

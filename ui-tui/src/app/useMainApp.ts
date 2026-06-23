@@ -1,12 +1,4 @@
-import {
-  requestRepaint,
-  type ScrollBoxHandle,
-  useApp,
-  useHasSelection,
-  useSelection,
-  useStdout,
-  useTerminalTitle
-} from '@hermes/ink'
+import { forceRedraw, useApp, useHasSelection, useSelection, useStdout, useTerminalTitle, type ScrollBoxHandle } from '@hermes/ink'
 import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
@@ -29,7 +21,6 @@ import { useGitBranch } from '../hooks/useGitBranch.js'
 import { useVirtualHistory } from '../hooks/useVirtualHistory.js'
 import { composerPromptWidth } from '../lib/inputMetrics.js'
 import { appendTranscriptMessage } from '../lib/messages.js'
-import { pagerContentWidth, pagerVisualLines } from '../lib/pager.js'
 import { DEFAULT_VOICE_RECORD_KEY, isMac, type ParsedVoiceRecordKey } from '../lib/platform.js'
 import { asRpcResult, rpcErrorMessage } from '../lib/rpc.js'
 import { terminalParityHints } from '../lib/terminalParity.js'
@@ -414,16 +405,13 @@ export function useMainApp(gw: GatewayClient) {
   const sys = useCallback((text: string) => appendMessage({ role: 'system', text }), [appendMessage])
 
   const page = useCallback(
-    (text: string, title?: string) => {
-      requestRepaint(stdout ?? process.stdout)
-      patchOverlayState({ pager: { lines: pagerVisualLines(text, pagerContentWidth(colsRef.current)), offset: 0, title } })
-    },
-    [stdout]
+    (text: string, title?: string) => patchOverlayState({ pager: { lines: text.split('\n'), offset: 0, title } }),
+    []
   )
 
   const scheduleTailFollow = useCallback(() => {
     scheduleStickyTailFollow({
-      requestPaint: () => requestRepaint(stdout ?? process.stdout),
+      requestPaint: () => forceRedraw(stdout ?? process.stdout),
       scrollRef
     })
   }, [stdout])

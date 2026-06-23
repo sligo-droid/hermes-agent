@@ -3,7 +3,7 @@ import { c as _c } from 'react/compiler-runtime'
 
 import instances from '../instances.js'
 import { isRuntimeSynchronizedOutputSupported } from '../terminal.js'
-import { CURSOR_HOME, ERASE_SCREEN, ERASE_SCROLLBACK, RESET_SCROLL_REGION } from '../termio/csi.js'
+import { CURSOR_HOME, ERASE_SCREEN, ERASE_SCROLLBACK } from '../termio/csi.js'
 import {
   BSU,
   DISABLE_MOUSE_TRACKING,
@@ -78,7 +78,6 @@ export function AlternateScreen(t0: Props) {
       // the point of the preset.
       const enter =
         ENTER_ALT_SCREEN +
-        RESET_SCROLL_REGION +
         ERASE_SCROLLBACK +
         ERASE_SCREEN +
         CURSOR_HOME +
@@ -103,7 +102,7 @@ export function AlternateScreen(t0: Props) {
         // tracking (it unconditionally resets all four modes). Sending it
         // on every teardown means a crash mid-mount can't leak DEC modes
         // back to the host shell.
-        const exit = DISABLE_MOUSE_TRACKING + RESET_SCROLL_REGION + EXIT_ALT_SCREEN
+        const exit = DISABLE_MOUSE_TRACKING + EXIT_ALT_SCREEN
         writeRaw(isRuntimeSynchronizedOutputSupported() ? BSU + exit + ESU : exit)
       }
     }
