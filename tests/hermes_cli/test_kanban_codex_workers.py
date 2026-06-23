@@ -1267,7 +1267,7 @@ def test_codex_role_worker_falls_back_to_direct_spawn_when_systemd_launch_fails(
     monkeypatch.setattr(
         workers,
         "_worker_config",
-        lambda: {"codex_home_root": str(tmp_path / "homes")},
+        lambda: {"backend": "codex", "codex_home_root": str(tmp_path / "homes")},
     )
     monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(kanban_db, "_should_use_systemd_worker", lambda: True)
@@ -1514,6 +1514,7 @@ def test_codex_role_worker_does_not_copy_external_codex_home(monkeypatch, tmp_pa
 
 
 def test_codex_role_worker_logs_scheduled_runtime_settings(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
     from hermes_cli import kanban_codex_workers as workers
     from hermes_cli import kanban_db
 
@@ -1533,6 +1534,7 @@ def test_codex_role_worker_logs_scheduled_runtime_settings(monkeypatch, tmp_path
             "roles": {"planner": {"reasoning": "xhigh", "service_tier": "fast"}},
         },
     )
+    monkeypatch.setattr(ow, "check_opencode_binary", lambda: (True, "/bin/opencode"))
     monkeypatch.setattr(workers.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(workers.subprocess, "Popen", lambda *args, **kwargs: Proc())
 

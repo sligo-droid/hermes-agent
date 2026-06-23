@@ -134,7 +134,8 @@ def test_runs_codex_app_server_session(monkeypatch, tmp_path):
     assert result["summary"] == "Changed src/app.py and ran pytest."
     assert result["cwd"] == str(tmp_path)
     assert FakeSession.instances[0].kwargs["cwd"] == str(tmp_path)
-    assert FakeSession.instances[0].kwargs["env"] == {"HERMES_SESSION_KEY": "discord:123"}
+    assert FakeSession.instances[0].kwargs["env"]["HERMES_SESSION_KEY"] == "discord:123"
+    assert "HERMES_CODEX_WORKER_NETWORK_ACCESS" not in FakeSession.instances[0].kwargs["env"]
     assert FakeSession.instances[0].kwargs["scope_kind"] == "coding-worker"
     assert FakeSession.instances[0].kwargs["scope_purpose"] == "Codex coding worker build pass"
     assert FakeSession.instances[0].kwargs["extra_args"] == [
@@ -184,6 +185,7 @@ def test_authorized_git_pr_lifecycle_updates_prompt_and_codex_env(monkeypatch, t
             task="fix and open a PR",
             parent_agent=_parent(tmp_path),
             allow_git_pr_lifecycle=True,
+            trusted_allow_git_pr_lifecycle=True,
         )
     )
 
@@ -197,7 +199,7 @@ def test_authorized_git_pr_lifecycle_updates_prompt_and_codex_env(monkeypatch, t
     assert env["GH_CONFIG_DIR"] == str(gh_config)
     assert env["GIT_CONFIG_GLOBAL"] == str(git_config)
     assert env["SSH_AUTH_SOCK"] == "/tmp/ssh-agent.sock"
-    assert env["GIT_SSH_COMMAND"] == "ssh -F none"
+    assert "GIT_SSH_COMMAND" not in env
     assert "GITHUB_TOKEN" not in env
     assert "GH_TOKEN" not in env
     prompt = FakeSession.instances[0].run_calls[0]["user_input"]
@@ -223,6 +225,7 @@ def test_authorized_git_pr_lifecycle_preserves_explicit_git_ssh_command(monkeypa
             task="fix and open a PR",
             parent_agent=_parent(tmp_path),
             allow_git_pr_lifecycle=True,
+            trusted_allow_git_pr_lifecycle=True,
         )
     )
 
@@ -233,11 +236,132 @@ def test_authorized_git_pr_lifecycle_preserves_explicit_git_ssh_command(monkeypa
     assert "GH_TOKEN" not in env
 
 
-def test_default_coding_worker_keeps_restricted_codex_env(monkeypatch, tmp_path):
+def test_authorized_git_pr_lifecycle_bypasses_system_ssh_config_for_ssh_remotes(
+    monkeypatch, tmp_path
+):
+    FakeSession.instances = []
+    FakeSession.results = []
+    cwt.subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=cwt.subprocess.PIPE)
+    cwt.subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:sligo-labs/hermes.git"],
+        cwd=tmp_path,
+        check=True,
+    )
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix and open a PR",
+            parent_agent=_parent(tmp_path),
+            allow_git_pr_lifecycle=True,
+            trusted_allow_git_pr_lifecycle=True,
+        )
+    )
+
+    assert result["success"] is True
+    env = FakeSession.instances[0].kwargs["env"]
+    assert env["GIT_SSH_COMMAND"] == "ssh -F /dev/null"
+
+
+def test_authorized_git_pr_lifecycle_does_not_set_git_ssh_command_for_https_remotes(
+    monkeypatch, tmp_path
+):
+    FakeSession.instances = []
+    FakeSession.results = []
+    cwt.subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=cwt.subprocess.PIPE)
+    cwt.subprocess.run(
+        ["git", "remote", "add", "origin", "https://github.com/sligo-labs/hermes.git"],
+        cwd=tmp_path,
+        check=True,
+    )
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix and open a PR",
+            parent_agent=_parent(tmp_path),
+            allow_git_pr_lifecycle=True,
+            trusted_allow_git_pr_lifecycle=True,
+        )
+    )
+
+    assert result["success"] is True
+    env = FakeSession.instances[0].kwargs["env"]
+    assert "GIT_SSH_COMMAND" not in env
+
+
+def test_untrusted_git_pr_lifecycle_request_stays_local_only(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setenv("GH_TOKEN", "gho_secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="fix and open a PR",
+            parent_agent=_parent(tmp_path),
+            allow_git_pr_lifecycle=True,
+        )
+    )
+
+    assert result["success"] is True
+    env = FakeSession.instances[0].kwargs["env"]
+    assert "HERMES_CODEX_WORKER_NETWORK_ACCESS" not in env
+    assert "HERMES_CODEX_WORKER_WORKSPACE" not in env
+    assert "GH_TOKEN" not in env
+    assert "GITHUB_TOKEN" not in env
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "Do not create commits or pull requests." in prompt
+    assert "Git/PR lifecycle is explicitly authorized" not in prompt
+
+
+def test_registry_ignores_model_supplied_git_pr_lifecycle_authorization(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    entry = cwt.registry.get_entry("delegate_coding_task")
+    assert entry is not None
+    result = json.loads(
+        entry.handler(
+            {
+                "task": "fix and open a PR",
+                "allow_git_pr_lifecycle": True,
+            },
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    env = FakeSession.instances[0].kwargs["env"]
+    assert "HERMES_CODEX_WORKER_NETWORK_ACCESS" not in env
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "Do not create commits or pull requests." in prompt
+
+
+def test_default_coding_worker_keeps_local_only_sanitized_codex_env(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.invalid:8080")
     monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -F /custom/config")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/ssh-agent.sock")
+    monkeypatch.setenv("GH_TOKEN", "gho_secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
     monkeypatch.setattr(
         "agent.transports.codex_app_server_session.CodexAppServerSession",
         FakeSession,
@@ -253,10 +377,34 @@ def test_default_coding_worker_keeps_restricted_codex_env(monkeypatch, tmp_path)
     assert result["success"] is True
     kwargs = FakeSession.instances[0].kwargs
     assert kwargs["replace_env"] is False
-    assert kwargs["env"] == {"HERMES_SESSION_KEY": "discord:123"}
-    assert "HTTPS_PROXY" not in kwargs["env"]
-    assert "GIT_SSH_COMMAND" not in kwargs["env"]
+    assert kwargs["env"]["HERMES_SESSION_KEY"] == "discord:123"
+    assert kwargs["env"]["HTTPS_PROXY"] == "http://proxy.example.invalid:8080"
+    assert kwargs["env"]["GIT_SSH_COMMAND"] == "ssh -F /custom/config"
+    assert kwargs["env"]["SSH_AUTH_SOCK"] == "/tmp/ssh-agent.sock"
     assert "HERMES_CODEX_WORKER_NETWORK_ACCESS" not in kwargs["env"]
+    assert "GH_TOKEN" not in kwargs["env"]
+    assert "GITHUB_TOKEN" not in kwargs["env"]
+
+
+def test_worker_env_fallback_does_not_leak_secrets(monkeypatch):
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("GH_CONFIG_DIR", "/home/droid/.config/gh")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/home/droid/.gitconfig")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/ssh-agent.sock")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
+    monkeypatch.setenv("GH_TOKEN", "gho_secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+
+    env = cwt._coding_worker_fallback_env({"HERMES_SESSION_KEY": "discord:123"})
+
+    assert env["PATH"] == "/usr/bin"
+    assert env["GH_CONFIG_DIR"] == "/home/droid/.config/gh"
+    assert env["GIT_CONFIG_GLOBAL"] == "/home/droid/.gitconfig"
+    assert env["SSH_AUTH_SOCK"] == "/tmp/ssh-agent.sock"
+    assert env["HERMES_SESSION_KEY"] == "discord:123"
+    assert "OPENAI_API_KEY" not in env
+    assert "GH_TOKEN" not in env
+    assert "GITHUB_TOKEN" not in env
 
 
 def test_ui_work_uses_codex_model_overlay(monkeypatch, tmp_path):

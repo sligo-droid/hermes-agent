@@ -20,7 +20,19 @@ from typing import Any, Optional
 from tools.registry import registry, tool_error
 
 
-DEFAULT_CODING_WORKER_GIT_SSH_COMMAND = "ssh -F none"
+DEFAULT_CODING_WORKER_GIT_SSH_COMMAND = "ssh -F /dev/null"
+_CODING_WORKER_FALLBACK_ENV_KEYS = frozenset({
+    "ALL_PROXY",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_SSH_COMMAND",
+    "GH_CONFIG_DIR",
+    "HOME",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "PATH",
+    "SSH_AUTH_SOCK",
+})
 
 
 def check_coding_worker_requirements() -> bool:
@@ -176,16 +188,68 @@ def _coding_worker_git_lifecycle_env(workdir: str, parent_agent: Any) -> dict[st
 
         env = _sanitize_subprocess_env(os.environ, extra)
     except Exception:
-        env = dict(os.environ)
-        env.update(extra)
+        env = _coding_worker_fallback_env(extra)
     for secret_key in ("GH_TOKEN", "GITHUB_TOKEN"):
         env.pop(secret_key, None)
-    env.setdefault("GIT_SSH_COMMAND", DEFAULT_CODING_WORKER_GIT_SSH_COMMAND)
+    if _repo_has_ssh_remote(workdir):
+        env.setdefault("GIT_SSH_COMMAND", DEFAULT_CODING_WORKER_GIT_SSH_COMMAND)
+    return env
+
+
+def _repo_has_ssh_remote(workdir: str) -> bool:
+    """Return True when git operations in this repo would use ssh remotes."""
+    try:
+        result = subprocess.run(
+            ["git", "remote", "-v"],
+            cwd=workdir,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return False
+    remotes = result.stdout or ""
+    return bool(re.search(r"(?m)\b(?:git@|ssh://)", remotes))
+
+
+def _coding_worker_fallback_env(extra: dict[str, str]) -> dict[str, str]:
+    """Minimal fallback if the shared sanitizer is unavailable."""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in _CODING_WORKER_FALLBACK_ENV_KEYS
+    }
+    env.update(extra)
     return env
 
 
 def _coding_worker_basic_env(parent_agent: Any) -> dict[str, str]:
-    return {"HERMES_SESSION_KEY": str(getattr(parent_agent, "session_key", "") or "")}
+    """Build a local-only, secret-scrubbed worker env for repo inspection."""
+    extra = {"HERMES_SESSION_KEY": str(getattr(parent_agent, "session_key", "") or "")}
+    try:
+        from tools.environments.local import _sanitize_subprocess_env
+
+        env = _sanitize_subprocess_env(os.environ, extra)
+    except Exception:
+        env = _coding_worker_fallback_env(extra)
+    for secret_key in ("GH_TOKEN", "GITHUB_TOKEN"):
+        env.pop(secret_key, None)
+    return env
+
+
+def _trusted_git_pr_lifecycle_enabled(
+    parent_agent: Any,
+    requested: bool,
+    trusted_allow_git_pr_lifecycle: bool,
+) -> bool:
+    """Gate remote git/PR authority behind trusted orchestrator state only."""
+    if not requested:
+        return False
+    if trusted_allow_git_pr_lifecycle:
+        return True
+    return bool(getattr(parent_agent, "_allow_git_pr_lifecycle", False))
 
 
 _SKILL_ACTIVATION_RE = re.compile(r"(?m)^\[IMPORTANT:.*?\bskill\b.*?\]")
@@ -593,6 +657,7 @@ def delegate_coding_task(
     cwd: Optional[str] = None,
     turn_timeout_seconds: Optional[float] = None,
     allow_git_pr_lifecycle: bool = False,
+    trusted_allow_git_pr_lifecycle: bool = False,
     route_decision: Any = None,
     parent_agent: Any = None,
     parent_messages: Optional[list[dict]] = None,
@@ -610,6 +675,12 @@ def delegate_coding_task(
     task_text = str(task or "").strip()
     if not task_text:
         return tool_error("delegate_coding_task requires a non-empty task.")
+
+    allow_git_pr_lifecycle = _trusted_git_pr_lifecycle_enabled(
+        parent_agent,
+        bool(allow_git_pr_lifecycle),
+        trusted_allow_git_pr_lifecycle,
+    )
 
     workdir = _resolve_cwd(cwd, parent_agent)
     if not Path(workdir).exists():
@@ -1172,15 +1243,6 @@ CODING_WORKER_SCHEMA = {
                     "minimum 30 seconds."
                 ),
             },
-            "allow_git_pr_lifecycle": {
-                "type": "boolean",
-                "description": (
-                    "Explicitly authorize the worker to create a feature branch, "
-                    "commit, push, and open a non-draft PR for the requested "
-                    "worktree. Defaults to false; never authorizes merging or "
-                    "updating main."
-                ),
-            },
             "route_decision": {
                 "type": "object",
                 "description": (
@@ -1234,7 +1296,8 @@ registry.register(
         context=args.get("context"),
         cwd=args.get("cwd"),
         turn_timeout_seconds=args.get("turn_timeout_seconds"),
-        allow_git_pr_lifecycle=bool(args.get("allow_git_pr_lifecycle", False)),
+        allow_git_pr_lifecycle=False,
+        trusted_allow_git_pr_lifecycle=False,
         route_decision=args.get("route_decision"),
         parent_agent=kw.get("parent_agent"),
         parent_messages=args.get("_parent_messages") or kw.get("parent_messages"),
