@@ -2289,7 +2289,12 @@ def _reset_pr_status_fields(worker: dict[str, Any]) -> None:
         "canonical_sync_merge_commit",
         "canonical_synced_at",
     ):
-        worker.pop(key, None)
+        # Keep previously persisted keys present so the final metadata merge
+        # overwrites stale blockers. Popping only clears the local dict; it does
+        # not delete/clear existing fields in board metadata. Do not introduce
+        # absent fields just to clear them.
+        if key in worker:
+            worker[key] = None
 
 
 def _is_foreman_generated_worker(worker: dict[str, Any]) -> bool:

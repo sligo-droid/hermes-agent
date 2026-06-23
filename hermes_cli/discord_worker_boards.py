@@ -6536,6 +6536,31 @@ def _recover_approved_reviewer_finalizer(board: str, worker: dict[str, Any], con
     return "approved_reviewer_finalizer_blocked"
 
 
+def _pr_amend_head_advance_blocker_is_retryable(worker: dict[str, Any], blocker: str) -> bool:
+    """Return whether a stale PR-amend head-advance blocker should retry finalization.
+
+    GitHub can lag after the fork branch is pushed. A previous retry may have
+    correctly blocked because the upstream PR head had not advanced yet, but
+    that is not a permanent operator blocker: a later poll can observe the new
+    upstream head and complete the board.
+    """
+
+    raw_context = worker.get("project_context")
+    context = raw_context if isinstance(raw_context, dict) else {}
+    raw_amend = context.get("github_pr_amend")
+    amend = raw_amend if isinstance(raw_amend, dict) else {}
+    if amend.get("requires_head_sha_advance") is not True:
+        return False
+    normalized = str(blocker or "").strip().lower()
+    if "pr-amend completion blocked" not in normalized or "head sha" not in normalized:
+        return False
+    if worker.get("pr_amend_head_advanced") is True:
+        return False
+    upstream_head = str(worker.get("pr_amend_upstream_head_sha") or "").strip()
+    trigger_head = str(worker.get("pr_amend_trigger_head_sha") or amend.get("head_sha") or "").strip()
+    return not upstream_head or not trigger_head or upstream_head == trigger_head
+
+
 def _recover_blocked_approved_reviewer_finalizer(
     board: str,
     worker: dict[str, Any],
@@ -6562,6 +6587,7 @@ def _recover_blocked_approved_reviewer_finalizer(
         str(worker.get("pr_finalizer_recovery_state") or "") == "operator_blocked"
         and str(worker.get("pr_finalizer_recovery_blocker") or "") == finalizer_blocker
         and not _pr_finalizer_failure_is_merge_conflict(worker)
+        and not _pr_amend_head_advance_blocker_is_retryable(worker, finalizer_blocker)
     ):
         return None
 
