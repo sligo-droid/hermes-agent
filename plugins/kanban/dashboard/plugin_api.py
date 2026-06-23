@@ -2358,12 +2358,13 @@ def self_improvement_proposal_archive_endpoint(proposal_id: str):
     card = proposal_storage.get_card(proposal_id)
     if card is None:
         raise HTTPException(status_code=404, detail=f"proposal {proposal_id!r} not found")
-    if card.get("kanban_task_id") or card.get("status") == "approved":
+    status = str(card.get("status") or "").lower()
+    if status == "approved" or (card.get("kanban_task_id") and status != "recovery_needed"):
         raise HTTPException(status_code=409, detail="approved proposals must be halted or archived through their downstream worker")
     archived = proposal_storage.record_archive(
         proposal_id,
         actor=_proposal_actor(),
-        metadata={"source": "command-center"},
+        metadata={"source": "command-center", "previous_status": status or None},
     )
     command_center.invalidate_snapshot_cache()
     return {"card": _self_improvement_card_with_downstream(archived)}

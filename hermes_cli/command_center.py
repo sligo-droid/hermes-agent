@@ -1361,7 +1361,11 @@ def _proposal_work_item(
             "reject_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/reject",
             "pause_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/pause",
             "resume_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/resume",
-            "archive_action": f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/archive" if canonical_status == "proposed" else f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/halt",
+            "archive_action": (
+                f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/archive"
+                if canonical_status == "proposed" or is_recovery_needed
+                else f"/api/plugins/kanban/self-improvement/proposals/{quote(str(card['proposal_id']), safe='')}/halt"
+            ),
         },
         "execution": execution,
         "runs": runs,
