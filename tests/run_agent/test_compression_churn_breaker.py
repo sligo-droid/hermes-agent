@@ -179,6 +179,79 @@ def test_compress_context_trips_when_zero_message_lineage_keeps_little_headroom(
         assert details["zero_message_child_count"] == 2
 
 
+def test_compress_context_emergency_shrinks_before_churn_failure():
+    from agent.conversation_compression import compress_context
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = SessionDB(db_path=Path(tmpdir) / "state.db")
+        db.create_session("root", "cli")
+        db.update_token_counts("root", input_tokens=190_000, absolute=True)
+        db.end_session("root", "compression")
+        db.create_session("child1", "cli", parent_session_id="root")
+        db.update_token_counts("child1", input_tokens=186_000, absolute=True)
+        db.end_session("child1", "compression")
+        db.create_session("child2", "cli", parent_session_id="child1")
+        db.update_token_counts("child2", input_tokens=170_000, api_call_count=3, absolute=True)
+
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                session_db=db,
+                session_id="child2",
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        agent._build_system_prompt = lambda _system_message: "system"
+        agent.commit_memory_session = lambda _messages: None
+        agent.context_compressor.threshold_tokens = 190_400
+
+        huge_output = "line one\n" + ("x" * 360_000)
+        compressed_candidate = [
+            {"role": "user", "content": "original request"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_terminal",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": '{"command":"scripts/run_tests.sh"}'},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_terminal", "content": huge_output},
+            {"role": "assistant", "content": "Plan: keep the important result and continue."},
+            {"role": "user", "content": "continue from the plan"},
+        ]
+        agent.context_compressor.compress = lambda _messages, **_kwargs: compressed_candidate
+
+        captured = {}
+
+        def estimate(messages_arg, **_kwargs):
+            captured["messages"] = messages_arg
+            return 164_000 if messages_arg is compressed_candidate else 20_000
+
+        with patch("agent.conversation_compression.estimate_request_tokens_rough", side_effect=estimate):
+            compressed, new_system_prompt = compress_context(
+                agent,
+                [{"role": "user", "content": "start"}, {"role": "assistant", "content": "x"}],
+                "system",
+                approx_tokens=195_000,
+            )
+
+    serialized = json.dumps(captured["messages"])
+    assert compressed == captured["messages"]
+    assert new_system_prompt == "system"
+    assert agent.session_id != "child2"
+    assert len(serialized) < 10_000
+    assert "[terminal] ran `scripts/run_tests.sh`" in serialized
+    assert "Plan: keep the important result and continue." in serialized
+    assert "continue from the plan" in serialized
+
+
 def test_compress_context_ignores_recovered_large_zero_message_ancestor():
     from agent.conversation_compression import compress_context
     from hermes_state import SessionDB
