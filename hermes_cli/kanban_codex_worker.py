@@ -39,6 +39,7 @@ from hermes_cli.discord_worker_boards import (
 )
 from hermes_cli.github_remote import (
     github_cli_env,
+    github_origin_repo,
     github_remote_preflight_error,
     github_repo_from_url,
     github_repo_from_value,
@@ -2565,6 +2566,30 @@ def _validate_pr_amend_target(worker: dict[str, Any], *, repo: str, base: str) -
     return ""
 
 
+def _validate_pr_push_remote(worker: dict[str, Any], *, root: Path, repo: str) -> str:
+    origin_repo = github_origin_repo(root)
+    if not origin_repo or origin_repo == repo:
+        return ""
+    amend = _github_pr_amend_context(worker)
+    if amend:
+        upstream_repo = str(amend.get("upstream_repo") or "").strip()
+        head_repo = str(amend.get("head_repo") or "").strip()
+        review_context = (
+            f" Upstream/base repo {upstream_repo} is source/review context only;"
+            if upstream_repo
+            else " Upstream/base repo is source/review context only;"
+        )
+        head_context = f" target repo must be PR head repo {head_repo}." if head_repo else " target repo must be the PR head repo."
+        return (
+            f"PR-amend checkout origin mismatch: origin repo {origin_repo} is not finalizer target repo {repo}."
+            f"{review_context}{head_context} Fix checkout origin before finalization."
+        )
+    return (
+        f"Checkout origin mismatch: origin repo {origin_repo} is not finalizer target repo {repo}. "
+        "Fix checkout origin before PR finalization."
+    )
+
+
 def _verify_pr_amend_head_advanced(worker: dict[str, Any], *, root: Path) -> bool:
     if not _pr_amend_requires_head_sha_advance(worker):
         return True
@@ -2718,6 +2743,13 @@ def _ensure_pr_open(
         worker["pr_checks_status"] = "not checked"
         worker["pr_merge_state"] = "unknown"
         worker["pr_blocker"] = remote_error
+        return False
+    origin_error = _validate_pr_push_remote(worker, root=root, repo=repo)
+    if origin_error:
+        worker["pr_error"] = origin_error
+        worker["pr_checks_status"] = "not checked"
+        worker["pr_merge_state"] = "unknown"
+        worker["pr_blocker"] = origin_error
         return False
 
     pushed = subprocess.run(
