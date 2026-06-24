@@ -210,6 +210,31 @@ def github_remote_preflight_error(
     )
 
 
+def github_origin_repo(root: str | Path) -> str | None:
+    """Return the normalized GitHub owner/repo for ``git push origin``.
+
+    ``git remote -v`` prints both fetch and push URLs. If they differ, ``git
+    push origin ...`` uses the push URL, so prefer the explicit ``(push)`` line
+    when present and fall back to the first origin GitHub URL otherwise.
+    """
+    lines = _remote_lines(Path(root))
+    if lines is None:
+        return None
+    fallback: str | None = None
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 2 or parts[0].strip() != "origin":
+            continue
+        repo = github_repo_from_url(parts[1].strip())
+        if not repo:
+            continue
+        if fallback is None:
+            fallback = repo
+        if len(parts) >= 3 and parts[2].strip() == "(push)":
+            return repo
+    return fallback
+
+
 def _format_remote_preflight_error(
     *,
     operation: str,
