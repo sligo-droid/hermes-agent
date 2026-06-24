@@ -1785,6 +1785,31 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.warning("[%s] Failed to update Discord project summary topic: %s", self.name, exc)
             return False
 
+    def _metadata_has_github_url(self, metadata: Dict[str, Optional[str]]) -> bool:
+        repo = self._normalize_github_remote_url(str(metadata.get("repo_url") or ""))
+        if not repo:
+            return False
+        return repo.startswith("https://github.com/")
+
+    def _project_topic_needs_repo_refresh(
+        self,
+        channel: Any,
+        metadata: Dict[str, Optional[str]],
+        existing: Any,
+    ) -> bool:
+        if not self._metadata_has_github_url(metadata):
+            return False
+        topic = str(getattr(channel, "topic", "") or "")
+        rendered = self._render_project_summary_line(metadata)
+        if topic == rendered:
+            return False
+        if not isinstance(existing, dict):
+            return True
+        existing_repo = self._normalize_github_remote_url(str(existing.get("repo_url") or ""))
+        if not existing_repo:
+            return True
+        return not self._same_feature_summary_url(existing_repo, metadata.get("repo_url"))
+
     async def initialize_project_summary(
         self,
         channel: Any,
@@ -1800,16 +1825,25 @@ class DiscordAdapter(BasePlatformAdapter):
         state = self._read_project_summary_state()
         existing = state.get(key)
         if isinstance(existing, dict) and existing.get("success"):
-            return None
+            topic = str(getattr(channel, "topic", "") or "").lower()
+            if not existing.get("pending_github_url") and "pending" not in topic:
+                return None
         context_with_channel = dict(project_context or {})
         context_with_channel.setdefault("channel_name", getattr(channel, "name", None))
         metadata = self._collect_discord_project_metadata(context_with_channel)
+        has_github_url = self._metadata_has_github_url(metadata)
+        if isinstance(existing, dict) and existing.get("success"):
+            if not self._project_topic_needs_repo_refresh(channel, metadata, existing):
+                return None
         ok = await self._edit_project_summary_topic(channel, metadata)
         state[key] = {
             "channel_id": channel_id,
             "guild_id": str(getattr(getattr(channel, "guild", None), "id", "") or ""),
             "attempted_at": time.time(),
-            "success": bool(ok),
+            "success": bool(ok and has_github_url),
+            "repo_url": self._normalize_github_remote_url(str(metadata.get("repo_url") or "")) or None,
+            "production_url": str(metadata.get("production_url") or "").strip() or None,
+            "pending_github_url": not has_github_url,
         }
         try:
             self._write_project_summary_state(state)
