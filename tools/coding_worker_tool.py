@@ -131,6 +131,133 @@ def _resolve_cwd(cwd: Optional[str], parent_agent: Any) -> str:
     return str(path.resolve())
 
 
+_TASK_CONTEXT_MARKERS = (
+    "task:",
+    "task details:",
+    "what i need now:",
+    "requested change:",
+)
+_TASK_CONTEXT_STOP_MARKERS = {
+    "constraints",
+    "context",
+    "context from hermes",
+    "non-goals",
+    "return",
+    "verification",
+}
+
+
+def _squash_task_text(text: str, *, limit: int = 800) -> str:
+    squashed = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(squashed) <= limit:
+        return squashed
+    return squashed[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _infer_task_from_context(context: Any) -> str:
+    """Best-effort recovery when a provider omits required ``task``.
+
+    Some tool-call backends do not enforce JSON Schema ``required`` fields.
+    Treating a rich ``context``-only call as a hard validation error wastes a
+    model round and creates noisy CLI false starts, so recover a concise task
+    from common worker-brief sections instead.
+    """
+
+    text = str(context or "").strip()
+    if not text:
+        return ""
+
+    lines = [line.strip() for line in text.splitlines()]
+    for idx, line in enumerate(lines):
+        lower = line.lower()
+        marker = next((m for m in _TASK_CONTEXT_MARKERS if lower.startswith(m)), "")
+        if not marker:
+            continue
+        inline = line[len(marker) :].strip()
+        collected: list[str] = [inline] if inline else []
+        for next_line in lines[idx + 1 :]:
+            stripped = next_line.strip()
+            if not stripped:
+                if collected:
+                    break
+                continue
+            heading = stripped.lower().rstrip(":")
+            if heading in _TASK_CONTEXT_STOP_MARKERS:
+                break
+            collected.append(stripped)
+            if len(" ".join(collected)) >= 800:
+                break
+        candidate = _squash_task_text(" ".join(part for part in collected if part))
+        if candidate:
+            return candidate
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower().startswith("user request:"):
+            return _squash_task_text(stripped.split(":", 1)[1].strip() or stripped)
+
+    return _squash_task_text(text)
+
+
+def _normalize_task_and_context(task: Any, context: Any) -> tuple[str, str, bool]:
+    task_text = str(task or "").strip()
+    context_text = str(context or "").strip()
+    if task_text:
+        return task_text, context_text, False
+    inferred = _infer_task_from_context(context_text)
+    if not inferred:
+        return "", context_text, False
+    repair_note = (
+        "Hermes tool-call repair: delegate_coding_task was invoked without "
+        "the required `task` field. Hermes inferred the Task below from the "
+        "supplied context instead of spending another model round on a "
+        "validation error."
+    )
+    repaired_context = f"{repair_note}\n\n{context_text}" if context_text else repair_note
+    return inferred, repaired_context, True
+
+
+def _workspace_fallback_for_missing_cwd(workdir: str) -> tuple[str, dict[str, str]] | tuple[None, None]:
+    """Return a safe existing start directory for a missing requested cwd.
+
+    This is intentionally narrow: only use an existing ancestor that is clearly
+    a workspace-style directory. That lets workers locate/clone a missing repo
+    without silently running from arbitrary parents like ``/tmp`` or ``/home``.
+    """
+
+    requested = Path(str(workdir or "")).expanduser()
+    if not requested.is_absolute():
+        return None, None
+    parent = requested.parent
+    try:
+        parent_resolved = parent.resolve()
+    except Exception:
+        parent_resolved = parent
+    try:
+        exists = parent_resolved.exists() and parent_resolved.is_dir()
+    except Exception:
+        exists = False
+    if not exists:
+        return None, None
+    parts = {part.lower() for part in parent_resolved.parts}
+    if parent_resolved.name.lower() not in {"workspace", "workspaces"} and not (
+        {"workspace", "workspaces"} & parts
+    ):
+        return None, None
+    fallback = str(parent_resolved)
+    return fallback, {"requested_cwd": str(requested), "fallback_cwd": fallback, "reason": "requested cwd did not exist"}
+
+
+def _prepend_context_note(context: str, note: str) -> str:
+    context_text = str(context or "").strip()
+    note_text = str(note or "").strip()
+    if not note_text:
+        return context_text
+    return f"{note_text}\n\n{context_text}" if context_text else note_text
+
+
 def _call_opencode_task(run_opencode_task: Any, *args: Any, scope_session_key: str = "", **kwargs: Any) -> Any:
     """Call the OpenCode backend with parent session scoping when supported."""
     scoped_kwargs = dict(kwargs)
@@ -672,7 +799,7 @@ def delegate_coding_task(
             "is already running on codex_app_server."
         )
 
-    task_text = str(task or "").strip()
+    task_text, context_text, task_inferred_from_context = _normalize_task_and_context(task, context)
     if not task_text:
         return tool_error("delegate_coding_task requires a non-empty task.")
 
@@ -683,8 +810,22 @@ def delegate_coding_task(
     )
 
     workdir = _resolve_cwd(cwd, parent_agent)
+    cwd_fallback_metadata: dict[str, str] | None = None
     if not Path(workdir).exists():
-        return tool_error(f"cwd does not exist: {workdir}")
+        fallback_workdir, cwd_fallback_metadata = _workspace_fallback_for_missing_cwd(workdir)
+        if not fallback_workdir:
+            return tool_error(f"cwd does not exist: {workdir}")
+        context_text = _prepend_context_note(
+            context_text,
+            (
+                "Hermes cwd repair: the requested worker cwd did not exist: "
+                f"{workdir}. The worker was started from the existing workspace "
+                f"directory {fallback_workdir}. First locate an existing checkout "
+                "or clone/create the intended repository path before editing; "
+                "preserve unrelated local work."
+            ),
+        )
+        workdir = fallback_workdir
     try:
         from tools.canonical_repo_guard import canonical_main_worker_violation
 
@@ -717,7 +858,7 @@ def delegate_coding_task(
         ui_route = resolve_ui_work_route(
             loaded_config,
             task=task_text,
-            context=str(context or ""),
+            context=context_text,
             cwd=workdir,
             backend=backend,
             route_decision=route_decision,
@@ -778,21 +919,35 @@ def delegate_coding_task(
     if ui_route is not None and ui_route.matched and ui_route.enabled and ui_route.backend == "codex":
         backend = "codex"
 
-    project_context = _worker_project_context(workdir)
+    repo_specific_preflight = cwd_fallback_metadata is None
+    project_context = _worker_project_context(workdir) if repo_specific_preflight else ""
     skill_context = _parent_skill_context(
         parent_agent,
         parent_messages,
         task=task_text,
-        context=str(context or ""),
+        context=context_text,
     )
-    repo_state_notes = _repo_state_guard_notes(workdir)
-    dependency_notes = _prepare_pnpm_dependency_links(workdir)
+    repo_state_notes = _repo_state_guard_notes(workdir) if repo_specific_preflight else ""
+    dependency_notes = _prepare_pnpm_dependency_links(workdir) if repo_specific_preflight else []
     try:
         from hermes_cli.worker_autoreview import autoreview_prompt_note, materialize_autoreview_helper
 
-        autoreview_note = autoreview_prompt_note(materialize_autoreview_helper(workdir))
+        helper_path = (
+            materialize_autoreview_helper(workdir)
+            if cwd_fallback_metadata is None
+            else None
+        )
+        autoreview_note = autoreview_prompt_note(helper_path)
     except Exception as exc:
         autoreview_note = f"Autoreview helper materialization failed before worker start: {exc}"
+    if cwd_fallback_metadata is not None:
+        autoreview_note = (
+            "Autoreview helper materialization was deferred because the requested "
+            "repository cwd did not exist at worker launch. After locating or "
+            "creating the actual repo checkout, run any repo-local closeout helper "
+            "if available; otherwise report that it was unavailable because the "
+            "worker began from a workspace parent."
+        )
 
     timeout = (
         float(turn_timeout_seconds)
@@ -877,8 +1032,8 @@ def delegate_coding_task(
     if repo_state_notes:
         worker_prompt_parts.extend(["", repo_state_notes])
     worker_prompt_parts.extend(["", "Task:", task_text])
-    if context and str(context).strip():
-        worker_prompt_parts.extend(["", "Context from Hermes:", str(context).strip()])
+    if context_text:
+        worker_prompt_parts.extend(["", "Context from Hermes:", context_text])
     if dependency_notes:
         worker_prompt_parts.extend(
             [
@@ -889,7 +1044,7 @@ def delegate_coding_task(
         )
     worker_prompt = "\n".join(worker_prompt_parts)
 
-    classification_context = f"{task_text}\n{context or ''}"
+    classification_context = f"{task_text}\n{context_text}"
     worker_env = (
         _coding_worker_git_lifecycle_env(workdir, parent_agent)
         if allow_git_pr_lifecycle
@@ -932,21 +1087,24 @@ def delegate_coding_task(
         duration = round(time.monotonic() - started, 2)
         success = bool(result.final_text) and not result.error and not result.interrupted
         payload = {
-                "success": success,
-                "status": "completed" if success else "partial",
-                "summary": result.final_text,
-                "error": result.error,
-                "interrupted": result.interrupted,
-                "duration_seconds": duration,
-                "cwd": workdir,
-                "backend": "opencode",
-                "agents": result.agents,
-                "plan_used": bool(result.plan_text),
-                "thread_id": result.thread_id,
-                "turn_id": result.turn_id,
-                "tool_iterations": result.tool_iterations,
-                "ui_work_route": ui_route_metadata,
+            "success": success,
+            "status": "completed" if success else "partial",
+            "summary": result.final_text,
+            "error": result.error,
+            "interrupted": result.interrupted,
+            "duration_seconds": duration,
+            "cwd": workdir,
+            "backend": "opencode",
+            "agents": result.agents,
+            "plan_used": bool(result.plan_text),
+            "thread_id": result.thread_id,
+            "turn_id": result.turn_id,
+            "tool_iterations": result.tool_iterations,
+            "ui_work_route": ui_route_metadata,
+            "task_inferred_from_context": task_inferred_from_context,
         }
+        if cwd_fallback_metadata is not None:
+            payload["cwd_fallback"] = cwd_fallback_metadata
         no_final_metadata = getattr(result, "no_final_metadata", None)
         if no_final_metadata:
             payload["evidence_status"] = no_final_metadata.get("evidence_status") or "degraded"
@@ -1183,26 +1341,27 @@ def delegate_coding_task(
     projected_message_count = sum(
         len(getattr(item, "projected_messages", []) or []) for item in turns
     )
-    return json.dumps(
-        {
-            "success": success,
-            "status": "completed" if success else "partial",
-            "summary": turn.final_text,
-            "error": turn.error,
-            "interrupted": turn.interrupted,
-            "duration_seconds": duration,
-            "cwd": workdir,
-            "backend": "codex",
-            "agents": agents,
-            "plan_used": bool(plan_text),
-            "thread_id": turn.thread_id,
-            "turn_id": turn.turn_id,
-            "tool_iterations": tool_iterations,
-            "projected_message_count": projected_message_count,
-            "ui_work_route": ui_route_metadata,
-        },
-        ensure_ascii=False,
-    )
+    payload = {
+        "success": success,
+        "status": "completed" if success else "partial",
+        "summary": turn.final_text,
+        "error": turn.error,
+        "interrupted": turn.interrupted,
+        "duration_seconds": duration,
+        "cwd": workdir,
+        "backend": "codex",
+        "agents": agents,
+        "plan_used": bool(plan_text),
+        "thread_id": turn.thread_id,
+        "turn_id": turn.turn_id,
+        "tool_iterations": tool_iterations,
+        "projected_message_count": projected_message_count,
+        "ui_work_route": ui_route_metadata,
+        "task_inferred_from_context": task_inferred_from_context,
+    }
+    if cwd_fallback_metadata is not None:
+        payload["cwd_fallback"] = cwd_fallback_metadata
+    return json.dumps(payload, ensure_ascii=False)
 
 
 CODING_WORKER_SCHEMA = {
