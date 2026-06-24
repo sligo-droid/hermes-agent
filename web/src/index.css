@@ -303,6 +303,29 @@ code { font-size: 0.875rem; }
   height: 100%;
 }
 
+.sligo-light .command-center-ai-budget {
+  background: linear-gradient(135deg, rgb(255 255 255 / 0.94), rgb(236 254 255 / 0.88));
+  border-color: rgb(14 116 144 / 0.24);
+  box-shadow: 0 1px 2px rgb(15 23 42 / 0.08), inset 0 1px 0 rgb(255 255 255 / 0.78);
+  color: rgb(15 23 42 / 0.9);
+}
+
+.sligo-light .command-center-ai-budget-kicker {
+  color: rgb(8 107 129 / 0.9);
+}
+
+.sligo-light .command-center-ai-budget-main {
+  color: rgb(15 23 42 / 0.96);
+}
+
+.sligo-light .command-center-ai-budget-sub {
+  color: rgb(51 65 85 / 0.88);
+}
+
+.sligo-light .command-center-ai-budget-track {
+  background: rgb(14 116 144 / 0.16);
+}
+
 @media (max-width: 820px) {
   .command-center-topline {
     display: grid;
