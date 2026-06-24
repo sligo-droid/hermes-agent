@@ -4345,6 +4345,154 @@ def test_ensure_pr_open_uses_sanitized_github_env_for_push_and_gh(
         assert "GITHUB_TOKEN" not in env
 
 
+def test_ensure_pr_open_blocks_pr_amend_when_origin_is_upstream_repo(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "remote", "-v"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "origin\tgit@github.com:reserve-protocol/reserve-index-dtf.git (fetch)\n"
+                    "origin\tgit@github.com:reserve-protocol/reserve-index-dtf.git (push)\n"
+                ),
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+    data = {
+        "project_context": {
+            "github_pr_amend": {
+                "upstream_repo": "reserve-protocol/reserve-index-dtf",
+                "head_repo": "sligo-droid/reserve-index-dtf",
+                "head_ref": "feat/irrevocable-fee-recipients",
+            }
+        }
+    }
+
+    assert not worker._ensure_pr_open(
+        data,
+        root=tmp_path,
+        repo="sligo-droid/reserve-index-dtf",
+        branch="discord/pr-amend-target",
+        base="feat/irrevocable-fee-recipients",
+        board="discord-pr-amend-target",
+    )
+
+    assert data["pr_error"] == (
+        "PR-amend checkout origin mismatch: origin repo reserve-protocol/reserve-index-dtf is not finalizer target repo "
+        "sligo-droid/reserve-index-dtf. Upstream/base repo reserve-protocol/reserve-index-dtf is source/review "
+        "context only; target repo must be PR head repo sligo-droid/reserve-index-dtf. Fix checkout origin before finalization."
+    )
+    assert not any(cmd[:3] == ["git", "push", "-u"] for cmd in calls)
+    assert not any(cmd[:2] == ["gh", "pr"] for cmd in calls)
+
+
+def test_ensure_pr_open_blocks_pr_amend_when_origin_fetch_is_head_but_push_is_upstream(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_codex_worker as worker
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "remote", "-v"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "origin\tgit@github.com:sligo-droid/reserve-index-dtf.git (fetch)\n"
+                    "origin\tgit@github.com:reserve-protocol/reserve-index-dtf.git (push)\n"
+                ),
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+    data = {
+        "project_context": {
+            "github_pr_amend": {
+                "upstream_repo": "reserve-protocol/reserve-index-dtf",
+                "head_repo": "sligo-droid/reserve-index-dtf",
+                "head_ref": "feat/irrevocable-fee-recipients",
+            }
+        }
+    }
+
+    assert not worker._ensure_pr_open(
+        data,
+        root=tmp_path,
+        repo="sligo-droid/reserve-index-dtf",
+        branch="discord/pr-amend-target",
+        base="feat/irrevocable-fee-recipients",
+        board="discord-pr-amend-target",
+    )
+
+    assert (
+        "origin repo reserve-protocol/reserve-index-dtf is not finalizer target repo sligo-droid/reserve-index-dtf"
+        in data["pr_error"]
+    )
+    assert not any(cmd[:3] == ["git", "push", "-u"] for cmd in calls)
+    assert not any(cmd[:2] == ["gh", "pr"] for cmd in calls)
+
+
+def test_ensure_pr_open_allows_pr_amend_when_origin_is_head_repo(monkeypatch, tmp_path):
+    from hermes_cli import kanban_codex_worker as worker
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "remote", "-v"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "origin\tgit@github.com:sligo-droid/reserve-index-dtf.git (fetch)\n"
+                    "origin\tgit@github.com:sligo-droid/reserve-index-dtf.git (push)\n"
+                ),
+                stderr="",
+            )
+        if cmd[:3] == ["git", "push", "-u"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return SimpleNamespace(returncode=0, stdout="https://github.com/sligo-droid/reserve-index-dtf/pull/7\n", stderr="")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(returncode=0, stdout=_pr_view_json(number=7, state="OPEN"), stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+    data = {
+        "summary": "Opened finalizer PR.",
+        "project_context": {
+            "github_pr_amend": {
+                "upstream_repo": "reserve-protocol/reserve-index-dtf",
+                "head_repo": "sligo-droid/reserve-index-dtf",
+                "head_ref": "feat/irrevocable-fee-recipients",
+            }
+        },
+    }
+
+    assert worker._ensure_pr_open(
+        data,
+        root=tmp_path,
+        repo="sligo-droid/reserve-index-dtf",
+        branch="discord/pr-amend-target",
+        base="feat/irrevocable-fee-recipients",
+        board="discord-pr-amend-target",
+    )
+
+    assert ["git", "push", "-u", "origin", "discord/pr-amend-target"] in calls
+    pr_create = next(cmd for cmd in calls if cmd[:3] == ["gh", "pr", "create"])
+    assert pr_create[pr_create.index("--repo") + 1] == "sligo-droid/reserve-index-dtf"
+    assert pr_create[pr_create.index("--base") + 1] == "feat/irrevocable-fee-recipients"
+
+
 def test_ensure_pr_uses_explicit_repo_base_and_head_from_project_context(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
