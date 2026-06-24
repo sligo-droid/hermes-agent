@@ -64,7 +64,6 @@ Stable repo map lives in `AGENTS.md`; this section is the product-level map.
 ## External References
 
 - Sligo Command Center model: `docs/sligo-command-center.md`.
-- Tiny Discord dev-loop smoke target: `docs/discord-dev-loop-smoke.md`.
 - Network egress/security design: `docs/security/network-egress-isolation.md`.
 - Implementation plans: `docs/plans/`.
 - Current state and next actions: `docs/project-state.md`.

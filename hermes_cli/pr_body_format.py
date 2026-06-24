@@ -48,8 +48,6 @@ _OPERATIONAL_WEB_PATHS = {
     "web/src/index.css",
     "web/src/lib/api.ts",
     "web/src/pages/CommandCenterPage.tsx",
-    "web/src/pages/SelfImprovementBoardPage.tsx",
-    "web/src/pages/SligoOperatorPage.tsx",
 }
 
 _OPERATIONAL_FILE_PATTERNS = (
