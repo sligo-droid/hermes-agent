@@ -89,7 +89,7 @@ import { useTheme } from "@/themes";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 import { currentDashboardSurface, sligoHostUrl } from "@/lib/dashboard-host";
 import { api } from "@/lib/api";
-import type { AccountUsageResponse, AccountUsageWindow, StatusResponse } from "@/lib/api";
+import type { StatusResponse } from "@/lib/api";
 
 function RootRedirect({ to }: { to: string }) {
   return <Navigate to={to} replace />;
@@ -394,8 +394,6 @@ type SligoColorMode = "dark" | "light";
 
 function SligoSurfaceShell({ routes }: { routes: DashboardRoute[] }) {
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [usage, setUsage] = useState<AccountUsageResponse | null>(null);
-  const [usageLoading, setUsageLoading] = useState(true);
   const [sligoMode, setSligoMode] = useState<SligoColorMode>(() => {
     try {
       return localStorage.getItem(SLIGO_COLOR_MODE_KEY) === "light" ? "light" : "dark";
@@ -428,46 +426,6 @@ function SligoSurfaceShell({ routes }: { routes: DashboardRoute[] }) {
       return next;
     });
   }, []);
-  const loadUsage = useCallback(async () => {
-    setUsageLoading(true);
-    try {
-      setUsage(await api.getAccountUsage());
-    } catch {
-      setUsage({
-        available: false,
-        provider: "",
-        title: "Account limits",
-        windows: [],
-        details: [],
-        unavailable_reason: "AI budget data is unavailable.",
-      });
-    } finally {
-      setUsageLoading(false);
-    }
-  }, []);
-  useEffect(() => {
-    void loadUsage();
-  }, [loadUsage]);
-
-  const usageWindow = useMemo<AccountUsageWindow | null>(() => {
-    const windows = usage?.windows ?? [];
-    return (
-      windows.find((window) => window.used_percent !== null && /week/i.test(window.label)) ??
-      windows.find((window) => window.used_percent !== null) ??
-      null
-    );
-  }, [usage]);
-  const budgetLabel = usageLoading
-    ? "AI budget loading"
-    : usage?.available && usageWindow
-      ? `AI budget: ${Math.round(usageWindow.used_percent ?? 0)}% used / ${Math.round(usageWindow.remaining_percent ?? 0)}% left`
-      : "AI budget unavailable";
-  const budgetTitle = usage?.available
-    ? [usage.provider, usageWindow?.label, usageWindow?.detail, usageWindow?.reset_at ? `resets ${usageWindow.reset_at}` : null]
-        .filter(Boolean)
-        .join(" • ")
-    : usage?.unavailable_reason;
-
   return (
     <div
       data-layout-variant="sligo-operator"
@@ -498,16 +456,6 @@ function SligoSurfaceShell({ routes }: { routes: DashboardRoute[] }) {
           </NavLink>
 
           <div className="flex flex-wrap items-center gap-2">
-            <span
-              className={cn(
-                "inline-flex h-9 items-center rounded-full border px-3 text-[0.68rem] font-medium uppercase tracking-[0.12em]",
-                isLight ? "border-slate-300/80 bg-white/70 text-slate-500" : "border-white/10 bg-white/[0.04] text-slate-400",
-              )}
-              role="status"
-              title={budgetTitle || undefined}
-            >
-              {budgetLabel}
-            </span>
             <button
               aria-label={isLight ? "Switch Command Center to dark mode" : "Switch Command Center to light mode"}
               className={cn(
