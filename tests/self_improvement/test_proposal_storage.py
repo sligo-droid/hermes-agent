@@ -345,6 +345,25 @@ def test_dashboard_read_only_routes_return_proposal_shapes(tmp_path, monkeypatch
     assert payload["work_items"][0]["source"]["id"].startswith("source:self-improvement-proposal:")
 
 
+def test_dashboard_reject_route_accepts_missing_reason(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    proposal_storage.ingest_proposal_output(_fenced("proposal_run_pid_valid.json"))
+
+    from plugins.kanban.dashboard.plugin_api import router
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api/plugins/kanban")
+    client = TestClient(app)
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+
+    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/reject", json={})
+
+    assert response.status_code == 200
+    rejected = response.json()["card"]
+    assert rejected["status"] == "rejected"
+    assert rejected["rejected_reason"] == ""
+
+
 def test_approval_and_rejection_state_are_persisted_and_audited(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     proposal_storage.ingest_proposal_output(_fenced("proposal_run_pid_valid.json"))

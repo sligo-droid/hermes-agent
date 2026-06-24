@@ -135,8 +135,8 @@ def test_command_center_proposal_archive_action_uses_halt_flow():
     assert 'const proposalCanArchive = Boolean(proposalId && ["proposed", "queued", "running", "review", "blocked", "accepted", "paused"].includes(item.status));' in source
     assert 'window.prompt("Reject reason for future prong feedback?"' not in source
     assert 'rejectReason' not in handle_source
-    assert 'window.prompt("Reason for rejecting this proposal?"' in run_action_source
-    assert 'await api.rejectSelfImprovementProposal(proposalId, reason.trim());' in run_action_source
+    assert 'window.prompt("Reason for rejecting this proposal?"' not in run_action_source
+    assert 'await api.rejectSelfImprovementProposal(proposalId);' in run_action_source
     assert 'await api.approveSelfImprovementProposal(proposalId, "native");' in run_action_source
     assert 'await api.approveSelfImprovementProposal(proposalId, "worker_board");' in run_action_source
     assert 'const proposalHasDownstreamExecution = Boolean(item.execution?.task_id || item.execution?.board);' in run_action_source

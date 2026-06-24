@@ -635,7 +635,7 @@ class CreateTaskBody(BaseModel):
 
 
 class ProposalRejectBody(BaseModel):
-    reason: str = Field(..., min_length=1, max_length=2000)
+    reason: Optional[str] = Field(default=None, max_length=2000)
 
 
 class ProposalApproveBody(BaseModel):
@@ -2625,7 +2625,7 @@ def self_improvement_proposal_reject_endpoint(proposal_id: str, payload: Proposa
         raise HTTPException(status_code=409, detail="approved proposals cannot be rejected")
     rejected = proposal_storage.record_rejection(
         proposal_id,
-        reason=payload.reason.strip(),
+        reason=payload.reason.strip() if payload.reason else "",
         actor=_proposal_actor(),
     )
     command_center.invalidate_snapshot_cache()
