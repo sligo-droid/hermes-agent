@@ -345,8 +345,28 @@ def build_session_context_prompt(
                 "**Mapped Project:** unresolved. This Discord channel looks like a "
                 "project channel, but Hermes has no channel-ID mapping yet and found "
                 "no unique project directory. Do not assume this is the Hermes Agent "
-                "codebase; ask for or create an explicit project mapping before "
-                "editing files."
+                "codebase."
+            )
+            lines.append(
+                "  - If the user is initializing a new project, use the Discord "
+                "channel name as the canonical repo/project slug unless the user "
+                "explicitly gives a different canonical slug."
+            )
+            lines.append(
+                "  - New Sligo Labs project repos must be created under "
+                "`sligo-labs/<channel-slug>` and private by default; never use a "
+                "message title/working title suffix for the repo slug unless the "
+                "user explicitly asks for it."
+            )
+            lines.append(
+                "  - Do not report project initialization complete until local "
+                "content has an origin remote for that repo, the default branch has "
+                "been pushed, and GitHub reports the repo is non-empty/private."
+            )
+            lines.append(
+                "  - After the verified GitHub URL exists, create/update the explicit "
+                "Discord project mapping and channel topic; do not leave the topic "
+                "at a placeholder GitHub value."
             )
 
     # User identity.
