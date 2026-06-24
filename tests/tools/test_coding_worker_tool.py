@@ -1292,6 +1292,58 @@ def test_delegate_opencode_preserves_parent_scope_when_backend_supports_it(monke
     assert seen["scope_session_key"] == "discord:123"
 
 
+def test_preflight_repairs_canonical_cwd_to_existing_worktree(monkeypatch, tmp_path):
+    canonical = tmp_path / "canonical" / "hermes"
+    workspace_root = tmp_path / "workspaces"
+    worktree = workspace_root / "hermes"
+    canonical.mkdir(parents=True)
+    worktree.mkdir(parents=True)
+    parent = _parent(canonical)
+    parent._coding_worker_required_this_turn = True
+
+    monkeypatch.setattr(cwt, "_workspaces_path", lambda: workspace_root)
+    monkeypatch.setattr(
+        "tools.canonical_repo_guard.canonical_main_worker_violation",
+        lambda workdir: "BLOCKED: delegate_coding_task was pointed at a protected canonical checkout",
+    )
+    monkeypatch.setattr(
+        cwt,
+        "_mutable_worktree_for_canonical_cwd",
+        lambda workdir: str(worktree),
+    )
+
+    preflight = cwt.preflight_delegate_coding_task(
+        {"task": "fix startup", "cwd": str(canonical), "context": "details"},
+        parent,
+    )
+
+    assert preflight.suppressed_result is None
+    assert preflight.args["cwd"] == str(worktree)
+    assert "protected canonical cwd" in preflight.args["context"]
+
+
+def test_preflight_suppresses_missing_worktree_for_required_canonical_cwd(monkeypatch, tmp_path):
+    canonical = tmp_path / "canonical" / "hermes"
+    canonical.mkdir(parents=True)
+    parent = _parent(canonical)
+    parent._coding_worker_required_this_turn = True
+
+    monkeypatch.setattr(
+        "tools.canonical_repo_guard.canonical_main_worker_violation",
+        lambda workdir: "BLOCKED: delegate_coding_task was pointed at a protected canonical checkout",
+    )
+    monkeypatch.setattr(cwt, "_mutable_worktree_for_canonical_cwd", lambda workdir: None)
+
+    preflight = cwt.preflight_delegate_coding_task(
+        {"task": "fix startup", "cwd": str(canonical)},
+        parent,
+    )
+
+    result = json.loads(preflight.suppressed_result)
+    assert "could not find a mutable" in result["error"]
+    assert "BLOCKED:" not in result["error"]
+
+
 def test_delegate_opencode_omits_parent_scope_for_legacy_backend(monkeypatch, tmp_path):
     from agent import opencode_worker as ow
 

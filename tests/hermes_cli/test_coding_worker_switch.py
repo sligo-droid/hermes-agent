@@ -210,6 +210,8 @@ def test_hermes_coding_request_mandates_coding_worker(monkeypatch, tmp_path):
     assert decision.required is True
     assert decision.should_delegate is True
     assert "must call `delegate_coding_task`" in decision.guidance
+    assert "/home/droid/workspaces/" in decision.guidance
+    assert "protected canonical checkout" in decision.guidance
 
 
 def test_qmd_service_setup_in_hermes_cwd_stays_operational(monkeypatch, tmp_path):

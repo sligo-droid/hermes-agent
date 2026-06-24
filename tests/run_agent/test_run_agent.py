@@ -3349,6 +3349,61 @@ class TestRunConversation:
         assert "patch ran" in tool_messages[1]["content"]
         assert "delegate_coding_task first" not in tool_messages[1]["content"]
 
+    def test_delegate_coding_task_preflight_repairs_cwd_before_dispatch(
+        self, agent, monkeypatch, tmp_path
+    ):
+        self._setup_agent(agent)
+        canonical = tmp_path / "hermes"
+        worktree = tmp_path / "workspaces" / "hermes"
+        canonical.mkdir()
+        worktree.mkdir(parents=True)
+        agent.session_cwd = str(canonical)
+        agent._coding_worker_required_this_turn = True
+        agent.valid_tool_names.update({"delegate_coding_task"})
+        monkeypatch.setattr(
+            "hermes_cli.coding_worker_switch._known_hermes_roots",
+            lambda: (canonical,),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.coding_worker_switch._git_common_dir",
+            lambda cwd: None,
+        )
+
+        monkeypatch.setattr(
+            "tools.canonical_repo_guard.canonical_main_worker_violation",
+            lambda workdir: "BLOCKED: delegate_coding_task was pointed at a protected canonical checkout",
+        )
+        monkeypatch.setattr(
+            "tools.coding_worker_tool._mutable_worktree_for_canonical_cwd",
+            lambda workdir: str(worktree),
+        )
+
+        delegate_tc = _mock_tool_call(
+            name="delegate_coding_task",
+            arguments=json.dumps({"task": "fix startup", "cwd": str(canonical)}),
+            call_id="c1",
+        )
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[delegate_tc])
+        resp2 = _mock_response(content="Done", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+        seen = {}
+
+        def fake_dispatch(args):
+            seen.update(args)
+            return json.dumps({"success": True, "status": "completed", "summary": "ok"})
+
+        with (
+            patch.object(agent, "_dispatch_coding_task", side_effect=fake_dispatch),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("fix startup")
+
+        assert result["final_response"] == "Done"
+        assert seen["cwd"] == str(worktree)
+        assert "BLOCKED:" not in result["messages"][-2]["content"]
+
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

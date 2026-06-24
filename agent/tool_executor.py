@@ -182,6 +182,17 @@ def _coding_worker_result_attempted(result: object) -> bool:
     return isinstance(result, str)
 
 
+def _preflight_delegate_coding_task(function_args: dict[str, Any], agent: Any) -> tuple[dict[str, Any], str | None]:
+    try:
+        from tools.coding_worker_tool import preflight_delegate_coding_task
+
+        preflight = preflight_delegate_coding_task(function_args, agent)
+        return preflight.args, preflight.suppressed_result
+    except Exception:
+        logger.debug("delegate_coding_task preflight failed", exc_info=True)
+        return dict(function_args or {}), None
+
+
 def _record_turn_tool_runtime(
     agent: Any,
     function_name: str,
@@ -435,10 +446,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # checkpoint state (dedup slot, real snapshots).
         block_result = None
         blocked_by_guardrail = False
+        if function_name == "delegate_coding_task":
+            function_args, block_result = _preflight_delegate_coding_task(function_args, agent)
         if _ts_scope_block is not None:
             # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
             block_result = _ts_scope_block
-        else:
+        elif block_result is None:
             block_message = _coding_worker_mutation_block(agent, function_name, function_args)
             if block_message is None:
                 try:
@@ -868,11 +881,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         )
         except Exception:
             pass
+        _preflight_block_result: str | None = None
+        if function_name == "delegate_coding_task":
+            function_args, _preflight_block_result = _preflight_delegate_coding_task(function_args, agent)
         storage_args = _storage_safe_tool_args(function_name, function_args)
 
         # Check plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
-        if _ts_scope_block is not None:
+        if _preflight_block_result is not None:
+            pass
+        elif _ts_scope_block is not None:
             _block_msg = _ts_scope_block
         else:
             _block_msg = _coding_worker_mutation_block(agent, function_name, function_args)
@@ -891,7 +909,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if not guardrail_decision.allows_execution:
                 _guardrail_block_decision = guardrail_decision
 
-        _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
+        _execution_blocked = (
+            _preflight_block_result is not None
+            or _block_msg is not None
+            or _guardrail_block_decision is not None
+        )
 
         if _execution_blocked:
             # Tool blocked by plugin or guardrail policy — skip counters,
@@ -966,7 +988,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         tool_start_time = time.time()
         _hooks_applied_by_dispatch = False
 
-        if _block_msg is not None:
+        if _preflight_block_result is not None:
+            function_result = _preflight_block_result
+            tool_duration = 0.0
+        elif _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
             function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
             tool_duration = 0.0
