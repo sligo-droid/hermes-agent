@@ -26,6 +26,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@nous-research/ui/ui/c
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { api } from "@/lib/api";
 import type {
+  AccountUsageResponse,
   CommandCenterAnnotationMode,
   CommandCenterProject,
   CommandCenterRun,
@@ -162,6 +163,50 @@ function RunningMeter() {
       <span />
       <span />
     </span>
+  );
+}
+
+function formatBudgetReset(value?: string | null): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" });
+}
+
+function preferredBudgetWindow(usage: AccountUsageResponse) {
+  return usage.windows.find((window) => /week/i.test(window.label)) || usage.windows[0] || null;
+}
+
+function AIBudgetPill({ usage }: { usage: AccountUsageResponse | null }) {
+  if (!usage?.available) return null;
+  const budgetWindow = preferredBudgetWindow(usage);
+  const detail = budgetWindow?.detail || usage.details.find((line) => !line.startsWith("Top up:")) || null;
+  if (!budgetWindow && !detail) return null;
+
+  const usedPercent = typeof budgetWindow?.used_percent === "number" ? Math.min(Math.max(budgetWindow.used_percent, 0), 100) : null;
+  const remainingPercent = typeof budgetWindow?.remaining_percent === "number" ? Math.min(Math.max(budgetWindow.remaining_percent, 0), 100) : null;
+  const reset = formatBudgetReset(budgetWindow?.reset_at);
+  const title = [usage.title, usage.plan, detail, reset ? `resets ${reset}` : null]
+    .filter(Boolean)
+    .join(" · ");
+
+  return (
+    <div aria-label="AI weekly budget" className="command-center-ai-budget" title={title || undefined}>
+      <span className="command-center-ai-budget-kicker">AI budget</span>
+      {budgetWindow ? (
+        <span className="command-center-ai-budget-main">
+          {budgetWindow.label}: {remainingPercent !== null ? `${Math.round(remainingPercent)}% left` : "usage available"}
+        </span>
+      ) : (
+        <span className="command-center-ai-budget-main">{detail}</span>
+      )}
+      {reset ? <span className="command-center-ai-budget-sub">resets {reset}</span> : detail && budgetWindow ? <span className="command-center-ai-budget-sub">{detail}</span> : null}
+      {usedPercent !== null ? (
+        <span className="command-center-ai-budget-track" aria-hidden="true">
+          <span style={{ width: `${usedPercent}%` }} />
+        </span>
+      ) : null}
+    </div>
   );
 }
 
@@ -1117,6 +1162,7 @@ export default function CommandCenterPage() {
     return value && value.trim() ? value.trim().toLowerCase() : "hermes";
   }, [location.search]);
   const [snapshot, setSnapshot] = useState<CommandCenterSnapshot | null>(null);
+  const [accountUsage, setAccountUsage] = useState<AccountUsageResponse | null>(null);
   const [detailedWorkItems, setDetailedWorkItems] = useState<Map<string, CommandCenterWorkItemDetailCache>>(() => new Map());
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -1167,6 +1213,20 @@ export default function CommandCenterPage() {
       }
     }
   }, [activeView, selectedProject]);
+
+  const loadAccountUsage = useCallback(async () => {
+    try {
+      const next = await api.getAccountUsage();
+      setAccountUsage(next);
+    } catch {
+      setAccountUsage(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial async budget load mirrors the command-center snapshot fetch.
+    void loadAccountUsage();
+  }, [loadAccountUsage]);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- initial async snapshot load mirrors existing dashboard data pages.
@@ -1455,11 +1515,14 @@ export default function CommandCenterPage() {
 
   return (
     <div className="command-center-shell flex flex-col gap-5">
-      <ProjectTabs
-        currentProject={snapshot?.current_project || selectedProject}
-        pathname={location.pathname}
-        projects={snapshot?.projects ?? []}
-      />
+      <div className="command-center-topline">
+        <ProjectTabs
+          currentProject={snapshot?.current_project || selectedProject}
+          pathname={location.pathname}
+          projects={snapshot?.projects ?? []}
+        />
+        <AIBudgetPill usage={accountUsage} />
+      </div>
       <WorkStatePanel
         activeView={activeView}
         laneCounts={laneCounts}

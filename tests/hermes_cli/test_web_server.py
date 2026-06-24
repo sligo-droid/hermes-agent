@@ -1147,6 +1147,71 @@ class TestNewEndpoints:
         assert top_skill["total_count"] == 1
         assert top_skill["last_used_at"] is not None
 
+    def test_account_usage_endpoint_serializes_weekly_budget(self, monkeypatch):
+        from datetime import datetime, timezone
+
+        import agent.account_usage as account_usage
+        import hermes_cli.web_server as web_server
+        from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
+
+        seen = {}
+
+        def fake_fetch(provider, *, base_url=None, api_key=None):
+            seen.update({"provider": provider, "base_url": base_url, "api_key": api_key})
+            return AccountUsageSnapshot(
+                provider="openai-codex",
+                source="usage_api",
+                fetched_at=datetime(2026, 6, 24, 12, 0, tzinfo=timezone.utc),
+                title="Account limits",
+                plan="Pro",
+                windows=(
+                    AccountUsageWindow(
+                        label="Weekly",
+                        used_percent=37.4,
+                        reset_at=datetime(2026, 6, 29, 0, 0, tzinfo=timezone.utc),
+                    ),
+                ),
+                details=("Credits balance: $12.50",),
+            )
+
+        monkeypatch.setattr(
+            web_server,
+            "load_config",
+            lambda: {"model": {"provider": "openai-codex", "base_url": "https://chatgpt.example/codex"}},
+        )
+        monkeypatch.setattr(account_usage, "fetch_account_usage", fake_fetch)
+
+        resp = self.client.get("/api/account-usage")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["available"] is True
+        assert data["provider"] == "openai-codex"
+        assert data["plan"] == "Pro"
+        assert data["windows"][0]["label"] == "Weekly"
+        assert data["windows"][0]["used_percent"] == 37.4
+        assert data["windows"][0]["remaining_percent"] == pytest.approx(62.6)
+        assert data["windows"][0]["reset_at"] == "2026-06-29T00:00:00+00:00"
+        assert data["details"] == ["Credits balance: $12.50"]
+        assert seen == {
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.example/codex",
+            "api_key": None,
+        }
+
+    def test_account_usage_endpoint_fails_open(self, monkeypatch):
+        import agent.account_usage as account_usage
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("usage API down")
+
+        monkeypatch.setattr(account_usage, "fetch_account_usage", boom)
+
+        resp = self.client.get("/api/account-usage")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["available"] is False
+        assert data["windows"] == []
+
     def test_session_token_endpoint_removed(self):
         """GET /api/auth/session-token no longer exists."""
         resp = self.client.get("/api/auth/session-token")
