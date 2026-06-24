@@ -4429,6 +4429,7 @@ class AIAgent:
             context=function_args.get("context"),
             cwd=function_args.get("cwd"),
             turn_timeout_seconds=function_args.get("turn_timeout_seconds"),
+            route_decision=function_args.get("route_decision"),
             parent_agent=self,
             parent_messages=parent_messages,
         )

@@ -420,6 +420,36 @@ def test_registry_ignores_model_supplied_git_pr_lifecycle_authorization(monkeypa
     assert "Do not create commits or pull requests." in prompt
 
 
+def test_registry_forwards_route_decision(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_delegate_coding_task(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"success": True})
+
+    monkeypatch.setattr(cwt, "delegate_coding_task", fake_delegate_coding_task)
+    entry = cwt.registry.get_entry("delegate_coding_task")
+    assert entry is not None
+    route_decision = {
+        "route": "ui_visual_specialist",
+        "confidence": 0.91,
+        "rationale": "visual implementation",
+    }
+
+    result = json.loads(
+        entry.handler(
+            {
+                "task": "polish the AI budget dashboard",
+                "route_decision": route_decision,
+            },
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result == {"success": True}
+    assert captured["route_decision"] is route_decision
+
+
 def test_default_coding_worker_keeps_local_only_sanitized_codex_env(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []
