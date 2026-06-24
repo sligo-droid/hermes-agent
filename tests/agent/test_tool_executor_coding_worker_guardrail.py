@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 from agent import tool_executor as te
@@ -127,3 +128,51 @@ def test_coding_worker_partial_result_counts_as_attempt_and_unblocks():
 def test_coding_worker_plain_string_result_counts_as_attempt():
     assert _coding_worker_result_attempted("worker returned an error") is True
     assert _coding_worker_result_attempted({"success": False}) is False
+
+
+def test_delegate_preflight_suppresses_empty_probe_without_attempt(monkeypatch):
+    agent = _agent(session_cwd="/tmp")
+
+    args, result = te._preflight_delegate_coding_task({"task": "", "context": ""}, agent)
+
+    assert args["task"] == ""
+    assert json.loads(result)["error"] == "delegate_coding_task requires a non-empty task."
+    assert agent._coding_worker_used_this_turn is False
+
+
+def test_delegate_preflight_repairs_required_canonical_cwd(monkeypatch, tmp_path):
+    canonical = tmp_path / "hermes"
+    worktree = tmp_path / "workspaces" / "hermes"
+    canonical.mkdir()
+    worktree.mkdir(parents=True)
+    agent = _agent(session_cwd=str(canonical))
+
+    monkeypatch.setattr(
+        "tools.coding_worker_tool._mutable_worktree_for_canonical_cwd",
+        lambda workdir: str(worktree),
+    )
+    monkeypatch.setattr(
+        "tools.canonical_repo_guard.canonical_main_worker_violation",
+        lambda workdir: "BLOCKED: delegate_coding_task was pointed at a protected canonical checkout",
+    )
+
+    args, result = te._preflight_delegate_coding_task({"task": "fix bug", "cwd": str(canonical)}, agent)
+
+    assert result is None
+    assert args["cwd"] == str(worktree)
+    assert "routing repair" in args["context"]
+
+
+def test_delegate_preflight_keeps_real_invalid_canonical_call_visible(monkeypatch, tmp_path):
+    canonical = tmp_path / "hermes"
+    canonical.mkdir()
+    agent = _agent(_coding_worker_required_this_turn=False, session_cwd=str(canonical))
+    monkeypatch.setattr(
+        "tools.canonical_repo_guard.canonical_main_worker_violation",
+        lambda workdir: "BLOCKED: delegate_coding_task was pointed at a protected canonical checkout",
+    )
+
+    args, result = te._preflight_delegate_coding_task({"task": "fix bug", "cwd": str(canonical)}, agent)
+
+    assert result is None
+    assert args["cwd"] == str(canonical)

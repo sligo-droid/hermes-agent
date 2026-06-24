@@ -219,6 +219,135 @@ def _normalize_task_and_context(task: Any, context: Any) -> tuple[str, str, bool
     return inferred, repaired_context, True
 
 
+@dataclass(frozen=True)
+class DelegateCodingTaskPreflight:
+    args: dict[str, Any]
+    suppressed_result: str | None = None
+
+
+def _workspaces_path() -> Path:
+    return Path("/home/droid/workspaces").resolve(strict=False)
+
+
+def _path_inside(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except Exception:
+        return False
+
+
+def _mutable_worktree_for_canonical_cwd(workdir: str) -> str | None:
+    """Return an existing mutable worktree for a protected canonical checkout."""
+
+    try:
+        from tools.canonical_repo_guard import _repo_info_for_path
+
+        info = _repo_info_for_path(workdir)
+    except Exception:
+        info = None
+    if info is None:
+        return None
+
+    workspace_root = _workspaces_path()
+    repo_name = info.repo_root.name
+    preferred = workspace_root / repo_name
+    candidates: list[Path] = []
+    try:
+        proc = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=str(info.repo_root),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        proc = None
+    if proc is not None and proc.returncode == 0:
+        for line in (proc.stdout or "").splitlines():
+            if not line.startswith("worktree "):
+                continue
+            raw = line.split(" ", 1)[1].strip()
+            if not raw:
+                continue
+            candidate = Path(raw).expanduser()
+            try:
+                candidate = candidate.resolve(strict=False)
+            except Exception:
+                pass
+            if candidate == info.repo_root or not _path_inside(candidate, workspace_root):
+                continue
+            if candidate.exists() and candidate.is_dir():
+                candidates.append(candidate)
+
+    if preferred in candidates:
+        return str(preferred)
+    for candidate in candidates:
+        if candidate.name == repo_name:
+            return str(candidate)
+    for candidate in candidates:
+        if candidate.name.startswith(f"{repo_name}-"):
+            return str(candidate)
+    return str(candidates[0]) if candidates else None
+
+
+def preflight_delegate_coding_task(function_args: dict[str, Any] | None, parent_agent: Any) -> DelegateCodingTaskPreflight:
+    """Normalize/suppress malformed worker starts before visible execution."""
+
+    args = dict(function_args or {})
+    task_text, context_text, _task_inferred = _normalize_task_and_context(
+        args.get("task"),
+        args.get("context"),
+    )
+    args["task"] = task_text
+    args["context"] = context_text
+    if not task_text:
+        return DelegateCodingTaskPreflight(
+            args=args,
+            suppressed_result=tool_error("delegate_coding_task requires a non-empty task."),
+        )
+
+    try:
+        workdir = _resolve_cwd(args.get("cwd"), parent_agent)
+    except Exception:
+        return DelegateCodingTaskPreflight(args=args)
+
+    try:
+        from tools.canonical_repo_guard import canonical_main_worker_violation
+
+        canonical_error = canonical_main_worker_violation(workdir)
+    except Exception:
+        canonical_error = None
+    if not canonical_error:
+        return DelegateCodingTaskPreflight(args=args)
+    if not getattr(parent_agent, "_coding_worker_required_this_turn", False):
+        return DelegateCodingTaskPreflight(args=args)
+
+    repaired_cwd = _mutable_worktree_for_canonical_cwd(workdir)
+    if repaired_cwd:
+        args["cwd"] = repaired_cwd
+        args["context"] = _prepend_context_note(
+            context_text,
+            (
+                "Hermes worker routing repair: delegate_coding_task was invoked "
+                f"with protected canonical cwd {workdir}. Hermes redirected the "
+                f"coding worker to mutable worktree {repaired_cwd} before launch."
+            ),
+        )
+        return DelegateCodingTaskPreflight(args=args)
+
+    return DelegateCodingTaskPreflight(
+        args=args,
+        suppressed_result=tool_error(
+            "delegate_coding_task routing preflight could not find a mutable "
+            f"/home/droid/workspaces/ worktree for protected canonical cwd {workdir}. "
+            "Create or select a Hermes worktree and retry with cwd set to that absolute path."
+        ),
+    )
+
+
 def _workspace_fallback_for_missing_cwd(workdir: str) -> tuple[str, dict[str, str]] | tuple[None, None]:
     """Return a safe existing start directory for a missing requested cwd.
 

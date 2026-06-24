@@ -1712,6 +1712,15 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         return _finish(agent._dispatch_delegate_task(function_args))
     elif function_name == "delegate_coding_task":
         function_args = dict(function_args or {})
+        try:
+            from tools.coding_worker_tool import preflight_delegate_coding_task
+
+            _preflight = preflight_delegate_coding_task(function_args, agent)
+            function_args = _preflight.args
+            if _preflight.suppressed_result is not None:
+                return _preflight.suppressed_result
+        except Exception:
+            logger.debug("delegate_coding_task preflight failed", exc_info=True)
         function_args["_parent_messages"] = list(messages or [])
         return _finish(agent._dispatch_coding_task(function_args))
     else:
