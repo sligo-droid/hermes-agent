@@ -3343,6 +3343,8 @@ def _sync_codex_pool_entries(
     auth_store: Dict[str, Any],
     tokens: Dict[str, str],
     last_refresh: Optional[str],
+    *,
+    previous_access_token: str = "",
 ) -> None:
     """Mirror a fresh Codex re-auth into the credential_pool OAuth entries.
 
@@ -3357,13 +3359,10 @@ def _sync_codex_pool_entries(
     * ``device_code`` — the singleton-seeded entry written by the device-code
       OAuth flow when the user logged in via ``hermes setup`` / the model
       picker.  Always synced with the fresh tokens.
-    * ``manual:device_code`` — entries created by ``hermes auth add openai-codex``
-      that use the same device-code OAuth mechanism.  An interactive re-auth
-      proves the user owns the ChatGPT account, so it is safe (and expected)
-      to refresh these entries too.  Without this, a user who once ran the
-      ``hermes auth add`` workaround for #33000 would silently leave that
-      manual entry stale on every subsequent re-auth, recreating the issue
-      reported in #33538.
+    * ``manual:device_code`` — refreshed only when the entry's current
+      access_token matches the previous singleton access_token. That preserves
+      legacy workaround aliases without clobbering independent ChatGPT accounts
+      added through ``hermes auth add openai-codex``.
 
     What does NOT get refreshed:
 
@@ -3371,11 +3370,8 @@ def _sync_codex_pool_entries(
       are independent credentials (an explicit API key, a different ChatGPT
       account, etc.) and must not be overwritten by a single re-auth.
 
-    Error markers (``last_status``, ``last_error_*``) are also cleared on
-    every device-code-backed entry — even those whose tokens we did not
-    rewrite — so that an interactive re-auth gives every relevant pool entry
-    a fresh selection chance instead of leaving them marked unhealthy from a
-    pre-re-auth 401.
+    Error markers (``last_status``, ``last_error_*``) are cleared only on
+    entries whose tokens were actually refreshed.
     """
     access_token = tokens.get("access_token")
     if not access_token:
@@ -3387,15 +3383,15 @@ def _sync_codex_pool_entries(
     entries = pool.get("openai-codex")
     if not isinstance(entries, list):
         return
-    # Sources whose tokens should be rewritten by a fresh Codex device-code
-    # OAuth re-auth.  ``manual:api_key`` and unknown sources are intentionally
-    # excluded — they represent independent credentials.
-    REFRESHABLE_SOURCES = {"device_code", "manual:device_code"}
     for entry in entries:
         if not isinstance(entry, dict):
             continue
         source = entry.get("source")
-        if source not in REFRESHABLE_SOURCES:
+        should_refresh = source == "device_code"
+        if source == "manual:device_code":
+            entry_access = str(entry.get("access_token") or "").strip()
+            should_refresh = bool(previous_access_token) and entry_access == previous_access_token
+        if not should_refresh:
             continue
         entry["access_token"] = access_token
         if refresh_token:
@@ -3422,11 +3418,20 @@ def _save_codex_tokens(
     with _auth_store_lock():
         auth_store = _load_auth_store()
         state = _load_provider_state(auth_store, "openai-codex") or {}
+        previous_tokens = state.get("tokens")
+        previous_access_token = ""
+        if isinstance(previous_tokens, dict):
+            previous_access_token = str(previous_tokens.get("access_token") or "").strip()
         state["tokens"] = tokens
         state["last_refresh"] = last_refresh
         state["auth_mode"] = "chatgpt"
         _store_provider_state(auth_store, "openai-codex", state, set_active=set_active)
-        _sync_codex_pool_entries(auth_store, tokens, last_refresh)
+        _sync_codex_pool_entries(
+            auth_store,
+            tokens,
+            last_refresh,
+            previous_access_token=previous_access_token,
+        )
         _save_auth_store(auth_store)
 
 
@@ -3569,11 +3574,17 @@ def _refresh_codex_auth_tokens(
     
     Saves the new tokens to Hermes auth store automatically.
     """
-    refreshed = refresh_codex_oauth_pure(
-        str(tokens.get("access_token", "") or ""),
-        str(tokens.get("refresh_token", "") or ""),
-        timeout_seconds=timeout_seconds,
-    )
+    try:
+        refreshed = refresh_codex_oauth_pure(
+            str(tokens.get("access_token", "") or ""),
+            str(tokens.get("refresh_token", "") or ""),
+            timeout_seconds=timeout_seconds,
+        )
+    except AuthError as exc:
+        recovered = _recover_codex_cli_tokens_after_relogin_error(exc)
+        if recovered is not None:
+            return recovered
+        raise
     updated_tokens = dict(tokens)
     updated_tokens["access_token"] = refreshed["access_token"]
     updated_tokens["refresh_token"] = refreshed["refresh_token"]
@@ -3618,6 +3629,26 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
         return None
 
 
+def _recover_codex_cli_tokens_after_relogin_error(error: AuthError) -> Optional[Dict[str, str]]:
+    if not error.relogin_required:
+        return None
+    if error.code == "codex_auth_missing":
+        return None
+    tokens = _import_codex_cli_tokens()
+    if not isinstance(tokens, dict):
+        return None
+    access_token = str(tokens.get("access_token") or "").strip()
+    refresh_token = str(tokens.get("refresh_token") or "").strip()
+    if not access_token or not refresh_token:
+        return None
+    recovered = dict(tokens)
+    recovered["access_token"] = access_token
+    recovered["refresh_token"] = refresh_token
+    last_refresh = recovered.pop("last_refresh", None)
+    _save_codex_tokens(recovered, last_refresh=last_refresh)
+    return recovered
+
+
 def resolve_codex_runtime_credentials(
     *,
     force_refresh: bool = False,
@@ -3637,7 +3668,7 @@ def resolve_codex_runtime_credentials(
     """
     try:
         data = _read_codex_tokens()
-    except AuthError:
+    except AuthError as exc:
         pool_token = _pool_codex_access_token()
         if pool_token:
             base_url = (
@@ -3655,7 +3686,21 @@ def resolve_codex_runtime_credentials(
         rate_limited = _codex_pool_rate_limited_error()
         if rate_limited is not None:
             raise rate_limited
-        raise
+        recovered = _recover_codex_cli_tokens_after_relogin_error(exc)
+        if recovered is not None:
+            base_url = (
+                os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+                or DEFAULT_CODEX_BASE_URL
+            )
+            return {
+                "provider": "openai-codex",
+                "base_url": base_url,
+                "api_key": recovered["access_token"],
+                "source": "hermes-auth-store",
+                "last_refresh": None,
+                "auth_mode": "chatgpt",
+            }
+        raise exc
 
     tokens = dict(data["tokens"])
     access_token = str(tokens.get("access_token", "") or "").strip()
@@ -6834,15 +6879,32 @@ def _codex_device_code_login() -> Dict[str, Any]:
     # Step 1: Request device code
     try:
         with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-            resp = client.post(
-                f"{issuer}/api/accounts/deviceauth/usercode",
-                json={"client_id": client_id},
-                headers={"Content-Type": "application/json"},
-            )
+            resp = None
+            retry_after = None
+            for attempt in range(4):
+                resp = client.post(
+                    f"{issuer}/api/accounts/deviceauth/usercode",
+                    json={"client_id": client_id},
+                    headers={"Content-Type": "application/json"},
+                )
+                if resp.status_code != 429:
+                    break
+                retry_after = _parse_retry_after_seconds(getattr(resp, "headers", None))
+                if attempt < 3:
+                    _time.sleep(retry_after if retry_after is not None else 1)
     except Exception as exc:
         raise AuthError(
             f"Failed to request device code: {exc}",
             provider="openai-codex", code="device_code_request_failed",
+        )
+
+    if resp is not None and resp.status_code == 429:
+        retry_text = f" after {retry_after}s" if retry_after is not None else ""
+        raise AuthError(
+            f"Codex device-code request hit OpenAI rate-limiting; retry{retry_text}.",
+            provider="openai-codex",
+            code=CODEX_RATE_LIMITED_CODE,
+            relogin_required=False,
         )
 
     if resp.status_code != 200:

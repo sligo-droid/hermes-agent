@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-24 16:44 UTC
+Last updated: 2026-06-24 16:54 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -71,6 +71,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Added reusable worker autoreview helper materialization so Sligo worker-board role workers and delegated coding workers get a repo-local advisory helper by default instead of reporting autoreview discovery as skipped when no external OpenClaw install exists.
 - [x] Added read-only overdue-run visibility for enabled self-improvement proposal cron jobs so missed proposal schedules are visible from `hermes cron status` with scheduler/session/output evidence instead of requiring manual absence audits.
 - [x] Fixed `hermes auth add openai-codex` after successful device-code login so first Codex credentials can mark the provider active without crashing on a missing auth-store helper; Qwen OAuth active-marker persistence and pool-only Codex rate-limit status now use the same auth-store contracts.
+- [x] Fixed Codex auth rotation churn so singleton re-auth no longer overwrites independent `manual:device_code` pool accounts, relogin-required stale Hermes tokens can self-heal from complete Codex CLI tokens, and initial device-code `429`s retry/classify as rate-limited instead of forcing re-auth loops.
 - [x] Closed the Discord worker PR finalization gap that let auto-merged PRs mark boards complete before the canonical `project_path` checkout was fast-forwarded; merged workers now block visibly on dirty, missing, non-fast-forwardable, or merge-commit-missing checkouts.
 - [x] Repaired worker board `discord-1516079773099491498` from a corruption-paused Kanban DB and added public worker-board read repair so future repairable corruption incidents do not surface as `Kanban not found`.
 - [x] Tightened Kanban board discovery so metadata-only boards and non-empty legacy DB-only boards remain visible while zero-byte non-default `kanban.db` stubs without `board.json` are excluded from normal active listings without mutation.
