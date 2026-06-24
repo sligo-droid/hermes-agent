@@ -1330,6 +1330,42 @@ def get_active_provider() -> Optional[str]:
     return auth_store.get("active_provider")
 
 
+def mark_provider_active_if_unset(provider_id: str) -> bool:
+    """Set ``active_provider`` only when the auth store has no active provider.
+
+    Returns True when the provider was marked active.
+    """
+    normalized = (provider_id or "").strip().lower()
+    if not normalized:
+        return False
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        if auth_store.get("active_provider"):
+            return False
+        auth_store["active_provider"] = normalized
+        _save_auth_store(auth_store)
+        return True
+
+
+def _mark_qwen_oauth_active(creds: Dict[str, Any]) -> None:
+    """Persist Qwen OAuth as the active provider without copying tokens."""
+    state = {
+        "auth_mode": "qwen_cli",
+        "base_url": str(creds.get("base_url") or DEFAULT_QWEN_BASE_URL).strip(),
+        "source": str(creds.get("source") or "qwen-cli").strip(),
+    }
+    auth_file = str(creds.get("auth_file") or "").strip()
+    if auth_file:
+        state["auth_file"] = auth_file
+    expires_at_ms = creds.get("expires_at_ms")
+    if expires_at_ms is not None:
+        state["expires_at_ms"] = expires_at_ms
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        _store_provider_state(auth_store, "qwen-oauth", state, set_active=True)
+        _save_auth_store(auth_store)
+
+
 def is_provider_explicitly_configured(provider_id: str) -> bool:
     """Return True only if the user has explicitly configured this provider.
 
@@ -3616,6 +3652,9 @@ def resolve_codex_runtime_credentials(
                 "last_refresh": None,
                 "auth_mode": "chatgpt",
             }
+        rate_limited = _codex_pool_rate_limited_error()
+        if rate_limited is not None:
+            raise rate_limited
         raise
 
     tokens = dict(data["tokens"])
@@ -3693,6 +3732,39 @@ def _pool_codex_access_token() -> str:
     except Exception:
         logger.debug("Codex pool fallback lookup failed", exc_info=True)
     return ""
+
+
+def _codex_pool_rate_limited_error() -> Optional[AuthError]:
+    try:
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+        pool = auth_store.get("credential_pool")
+        if not isinstance(pool, dict):
+            return None
+        entries = pool.get("openai-codex")
+        if not isinstance(entries, list):
+            return None
+        now = time.time()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("last_status") != "exhausted" or entry.get("last_error_code") != 429:
+                continue
+            reset_at = entry.get("last_error_reset_at")
+            if isinstance(reset_at, (int, float)) and reset_at <= now:
+                continue
+            message = str(entry.get("last_error_message") or "").strip()
+            if not message:
+                message = "Codex provider quota exhausted. Credentials are still valid."
+            return AuthError(
+                message,
+                provider="openai-codex",
+                code=CODEX_RATE_LIMITED_CODE,
+                relogin_required=False,
+            )
+    except Exception:
+        logger.debug("Codex pool rate-limit lookup failed", exc_info=True)
+    return None
 
 
 # =============================================================================
@@ -5606,11 +5678,21 @@ def get_codex_auth_status() -> Dict[str, Any]:
             "api_key": creds.get("api_key"),
         }
     except AuthError as exc:
-        return {
+        status = {
             "logged_in": False,
             "auth_store": str(_auth_file_path()),
             "error": str(exc),
         }
+        if is_rate_limited_auth_error(exc):
+            status.update(
+                {
+                    "logged_in": True,
+                    "rate_limited": True,
+                    "error_code": CODEX_RATE_LIMITED_CODE,
+                    "source": "credential_pool",
+                }
+            )
+        return status
 
 
 def get_xai_oauth_auth_status() -> Dict[str, Any]:
