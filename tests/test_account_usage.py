@@ -6,6 +6,7 @@ from agent.account_usage import (
     fetch_account_usage,
     render_account_usage_lines,
 )
+from hermes_cli.auth import AuthError
 
 
 class _Response:
@@ -24,6 +25,7 @@ class _Response:
 class _Client:
     def __init__(self, payload):
         self._payload = payload
+        self.requests = []
 
     def __enter__(self):
         return self
@@ -32,6 +34,7 @@ class _Client:
         return False
 
     def get(self, url, headers=None):
+        self.requests.append((url, headers or {}))
         return _Response(self._payload)
 
 
@@ -93,6 +96,46 @@ def test_fetch_account_usage_codex(monkeypatch):
     assert snapshot.windows[0].used_percent == 15.0
     assert snapshot.windows[0].reset_at == datetime.fromtimestamp(1_900_000_000, tz=timezone.utc)
     assert "Credits balance: $12.50" in snapshot.details
+
+
+def test_fetch_account_usage_codex_without_token_metadata_omits_account_id(monkeypatch):
+    monkeypatch.setattr(
+        "agent.account_usage.resolve_codex_runtime_credentials",
+        lambda refresh_if_expiring=True: {
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "access-token",
+        },
+    )
+    monkeypatch.setattr(
+        "agent.account_usage._read_codex_tokens",
+        lambda: (_ for _ in ()).throw(AuthError("missing codex auth store")),
+    )
+    client = _Client(
+        {
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 15,
+                    "reset_at": 1_900_000_000,
+                },
+            },
+            "credits": {"has_credits": True, "balance": 12.5},
+        }
+    )
+    monkeypatch.setattr(
+        "agent.account_usage.httpx.Client",
+        lambda timeout=15.0: client,
+    )
+
+    snapshot = fetch_account_usage("openai-codex")
+
+    assert snapshot is not None
+    assert snapshot.available is True
+    assert snapshot.windows[0].label == "Session"
+    assert snapshot.windows[0].used_percent == 15.0
+    assert len(client.requests) == 1
+    assert "ChatGPT-Account-Id" not in client.requests[0][1]
 
 
 def test_render_account_usage_lines_includes_reset_and_provider():
