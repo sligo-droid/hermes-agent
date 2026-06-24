@@ -229,6 +229,63 @@ def test_delegate_falls_back_to_workspace_parent_for_missing_cwd(monkeypatch, tm
     assert not (workspace / ".agents" / "skills" / "autoreview").exists()
 
 
+def test_delegate_preserves_json_route_decision_with_missing_cwd_fallback(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    workspace = tmp_path / "workspaces"
+    workspace.mkdir()
+    requested = workspace / "missing-command-center-checkout"
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["backend"] = "codex"
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Implement Command Center card footer visual polish.",
+            context="Requested checkout is absent; start from workspace parent.",
+            cwd=str(requested),
+            route_decision=json.dumps(
+                {
+                    "route": "ui_visual_specialist",
+                    "source": "orchestrator",
+                    "confidence": 0.97,
+                    "rationale": "Command Center UI task",
+                }
+            ),
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert result["cwd"] == str(workspace.resolve())
+    assert result["cwd_fallback"] == {
+        "requested_cwd": str(requested),
+        "fallback_cwd": str(workspace.resolve()),
+        "reason": "requested cwd did not exist",
+    }
+    route = result["ui_work_route"]
+    assert route["matched"] is True
+    assert route["reason"] == "orchestrator route selected ui visual specialist"
+    assert route["route_decision"] == "ui_visual_specialist"
+    assert route["route_decision_source"] == "orchestrator"
+    assert route["route_decision_confidence"] == 0.97
+    assert route["route_decision_rationale"] == "Command Center UI task"
+    assert route["selected_route"] == "ui_visual_specialist"
+    assert route["selected_provider"] == "openrouter"
+    assert route["selected_model"] == "z-ai/glm-5.2"
+    assert FakeSession.instances[0].kwargs["cwd"] == str(workspace.resolve())
+    assert FakeSession.instances[0].kwargs["extra_args"][:4] == [
+        "-c",
+        'model_provider="openrouter"',
+        "-c",
+        'model="z-ai/glm-5.2"',
+    ]
+
+
 def test_authorized_git_pr_lifecycle_updates_prompt_and_codex_env(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []

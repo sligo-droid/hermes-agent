@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
 
@@ -78,6 +79,32 @@ def test_visual_specialist_keeps_codex_overlay_when_default_backend_is_opencode(
     assert decision.selected_provider == "openrouter"
     assert decision.selected_model == "z-ai/glm-5.2"
     assert codex_ui_work_extra_args(decision)
+
+
+def test_visual_specialist_accepts_json_encoded_route_decision():
+    decision = resolve_ui_work_route(
+        _cfg(),
+        task="Implement Command Center card footer visuals and responsive styling.",
+        backend="codex",
+        route_decision=json.dumps(
+            {
+                "route": "ui_visual_specialist",
+                "source": "orchestrator",
+                "confidence": 0.97,
+                "rationale": "Command Center UI task",
+            }
+        ),
+    )
+
+    assert decision.matched is True
+    assert decision.reason == "orchestrator route selected ui visual specialist"
+    assert decision.route_decision == "ui_visual_specialist"
+    assert decision.route_decision_source == "orchestrator"
+    assert decision.route_decision_confidence == 0.97
+    assert decision.route_decision_rationale == "Command Center UI task"
+    assert decision.selected_route == "ui_visual_specialist"
+    assert decision.selected_provider == "openrouter"
+    assert decision.selected_model == "z-ai/glm-5.2"
 
 
 def test_tui_terminal_rendering_work_does_not_route():
