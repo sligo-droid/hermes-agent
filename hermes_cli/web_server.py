@@ -3726,8 +3726,99 @@ async def update_config_raw(body: RawConfigUpdate):
 
 
 # ---------------------------------------------------------------------------
-# Token / cost analytics endpoint
+# Account usage / token-cost analytics endpoints
 # ---------------------------------------------------------------------------
+
+
+def _active_model_usage_config() -> tuple[str, str | None, str | None]:
+    """Return provider/base_url/api_key config for account-usage probes.
+
+    The dashboard only needs enough runtime context to call provider-side usage
+    APIs. Do not expose credentials; api_key is passed internally to helpers that
+    already resolve/redact provider auth.
+    """
+
+    cfg = load_config()
+    model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+    provider = ""
+    base_url: str | None = None
+    api_key: str | None = None
+    if isinstance(model_cfg, dict):
+        provider = str(model_cfg.get("provider") or "").strip()
+        base_url = str(model_cfg.get("base_url") or "").strip() or None
+        api_key = str(model_cfg.get("api_key") or "").strip() or None
+    if not provider and isinstance(cfg, dict):
+        provider = str(cfg.get("provider") or "").strip()
+        base_url = base_url or str(cfg.get("base_url") or "").strip() or None
+        api_key = api_key or str(cfg.get("api_key") or "").strip() or None
+    return provider, base_url, api_key
+
+
+def _serialize_account_usage_window(window: Any) -> dict[str, Any]:
+    used_percent = getattr(window, "used_percent", None)
+    used_value = float(used_percent) if isinstance(used_percent, (int, float)) and not isinstance(used_percent, bool) else None
+    reset_at = getattr(window, "reset_at", None)
+    reset_isoformat = getattr(reset_at, "isoformat", None)
+    return {
+        "label": getattr(window, "label", "") or "",
+        "used_percent": used_value,
+        "remaining_percent": max(0.0, min(100.0, 100.0 - used_value)) if used_value is not None else None,
+        "reset_at": reset_isoformat() if callable(reset_isoformat) else None,
+        "detail": getattr(window, "detail", None),
+    }
+
+
+def _serialize_account_usage_snapshot(snapshot: Any, *, provider: str) -> dict[str, Any]:
+    if snapshot is None:
+        return {
+            "available": False,
+            "provider": provider,
+            "source": None,
+            "title": "Account limits",
+            "plan": None,
+            "windows": [],
+            "details": [],
+            "unavailable_reason": None,
+            "fetched_at": None,
+        }
+    fetched_at = getattr(snapshot, "fetched_at", None)
+    fetched_isoformat = getattr(fetched_at, "isoformat", None)
+    return {
+        "available": bool(getattr(snapshot, "available", False)),
+        "provider": getattr(snapshot, "provider", None) or provider,
+        "source": getattr(snapshot, "source", None),
+        "title": getattr(snapshot, "title", None) or "Account limits",
+        "plan": getattr(snapshot, "plan", None),
+        "windows": [_serialize_account_usage_window(window) for window in (getattr(snapshot, "windows", None) or ())],
+        "details": [str(detail) for detail in (getattr(snapshot, "details", None) or ())],
+        "unavailable_reason": getattr(snapshot, "unavailable_reason", None),
+        "fetched_at": fetched_isoformat() if callable(fetched_isoformat) else None,
+    }
+
+
+@app.get("/api/account-usage")
+async def get_account_usage():
+    """Provider-side account usage for lightweight dashboard budget indicators.
+
+    Fail-open: the command center should never break because a provider usage
+    endpoint is down or the active provider has no quota API.
+    """
+
+    provider, base_url, api_key = _active_model_usage_config()
+    try:
+        import importlib
+
+        account_usage = importlib.import_module("agent.account_usage")
+        snapshot = await asyncio.to_thread(
+            account_usage.fetch_account_usage,
+            provider,
+            base_url=base_url,
+            api_key=api_key,
+        )
+        return _serialize_account_usage_snapshot(snapshot, provider=provider)
+    except Exception:
+        _log.debug("dashboard account usage probe failed", exc_info=True)
+        return _serialize_account_usage_snapshot(None, provider=provider)
 
 
 @app.get("/api/analytics/usage")

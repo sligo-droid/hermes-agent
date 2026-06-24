@@ -258,6 +258,7 @@ export const api = {
   },
   getAnalytics: (days: number) =>
     fetchJSON<AnalyticsResponse>(`/api/analytics/usage?days=${days}`),
+  getAccountUsage: () => fetchJSON<AccountUsageResponse>("/api/account-usage"),
   getModelsAnalytics: (days: number) =>
     fetchJSON<ModelsAnalyticsResponse>(`/api/analytics/models?days=${days}`),
   getConfig: () => fetchJSON<Record<string, unknown>>("/api/config"),
@@ -786,6 +787,26 @@ export interface SessionMessagesResponse {
 export interface LogsResponse {
   file: string;
   lines: string[];
+}
+
+export interface AccountUsageWindow {
+  label: string;
+  used_percent: number | null;
+  remaining_percent: number | null;
+  reset_at: string | null;
+  detail?: string | null;
+}
+
+export interface AccountUsageResponse {
+  available: boolean;
+  provider: string;
+  source?: string | null;
+  title: string;
+  plan?: string | null;
+  windows: AccountUsageWindow[];
+  details: string[];
+  unavailable_reason?: string | null;
+  fetched_at?: string | null;
 }
 
 export interface AnalyticsDailyEntry {
