@@ -1408,9 +1408,7 @@ export default function CommandCenterPage() {
     } else if (proposalId && kind === "approve_worker_board") {
       await api.approveSelfImprovementProposal(proposalId, "worker_board");
     } else if (proposalId && kind === "reject") {
-      const reason = window.prompt("Reason for rejecting this proposal?", "Not actionable.");
-      if (!reason?.trim()) return;
-      await api.rejectSelfImprovementProposal(proposalId, reason.trim());
+      await api.rejectSelfImprovementProposal(proposalId);
     } else if (kind === "pause") {
       if (proposalId) await api.pauseSelfImprovementProposal(proposalId);
       else if (board) await api.pauseKanbanBoard(board);

@@ -412,13 +412,13 @@ export const api = {
         body: JSON.stringify({ route }),
       },
     ),
-  rejectSelfImprovementProposal: (proposalId: string, reason: string) =>
+  rejectSelfImprovementProposal: (proposalId: string, reason?: string) =>
     fetchJSON<{ card: SelfImprovementProposalCard }>(
       `/api/plugins/kanban/self-improvement/proposals/${encodeURIComponent(proposalId)}/reject`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ reason }),
+        body: JSON.stringify({ reason: reason || undefined }),
       },
     ),
   haltSelfImprovementProposal: (proposalId: string, reason?: string) =>
