@@ -121,8 +121,6 @@ def test_project_state_requirement_fails_operational_change_without_evidence():
         "web/src/index.css",
         "web/src/lib/api.ts",
         "web/src/pages/CommandCenterPage.tsx",
-        "web/src/pages/SelfImprovementBoardPage.tsx",
-        "web/src/pages/SligoOperatorPage.tsx",
     ],
 )
 def test_project_state_requirement_fails_command_center_dashboard_change_without_evidence(changed_path):
@@ -144,8 +142,6 @@ def test_project_state_requirement_fails_command_center_dashboard_change_without
         "web/src/index.css",
         "web/src/lib/api.ts",
         "web/src/pages/CommandCenterPage.tsx",
-        "web/src/pages/SelfImprovementBoardPage.tsx",
-        "web/src/pages/SligoOperatorPage.tsx",
     ],
 )
 def test_project_state_requirement_passes_command_center_dashboard_change_with_not_needed_justification(changed_path):

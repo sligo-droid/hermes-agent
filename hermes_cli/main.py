@@ -1272,7 +1272,6 @@ _TUI_BUILD_INPUT_FILES = (
     "package-lock.json",
     "tsconfig.json",
     "tsconfig.build.json",
-    "babel.compiler.config.cjs",
     "scripts/build.mjs",
     "packages/hermes-ink/package.json",
     "packages/hermes-ink/package-lock.json",
