@@ -272,6 +272,14 @@ def _normalize_route_decision(value: Any) -> _RouteDecisionInput:
             ),
         )
     if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("{"):
+            try:
+                parsed = json.loads(stripped)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                return _normalize_route_decision(parsed)
         route = _normalize_route_name(value)
         source = "orchestrator"
         confidence = None
