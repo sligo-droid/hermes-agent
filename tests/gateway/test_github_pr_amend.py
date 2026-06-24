@@ -693,6 +693,54 @@ class TestGitHubPrAmendPolicy:
             "discord_summary_message_id": "bot-summary-msg",
         }
 
+    @pytest.mark.parametrize(
+        ("terminal_metadata", "expected"),
+        [
+            ({"thread_state": "done"}, {}),
+            ({"goal_status": "done"}, {}),
+            ({"phase": "complete"}, {}),
+            ({"cancelled": True}, {}),
+            ({"thread_state": "active", "goal_status": "running", "phase": "active"}, {
+                "discord_channel_id": "channel-123",
+                "discord_top_level_message_id": "user-request-msg",
+                "discord_thread_id": "done-thread",
+                "discord_thread_url": "",
+                "discord_board": "discord-done-thread",
+                "discord_board_public_url": "",
+                "discord_guild_id": "",
+                "discord_summary_message_id": "",
+            }),
+        ],
+    )
+    def test_does_not_reuse_terminal_existing_discord_route(self, monkeypatch, terminal_metadata, expected):
+        request = extract_request("pull_request_review", REVIEW_PAYLOAD, delivery_id="delivery-route")
+        policy = policy_from_route(ROUTE)
+        decision = evaluate_request(request, PR_INFO, policy)
+        artifact = build_pr_amend_intake_artifact(request, decision, policy, PR_INFO, REVIEW_PAYLOAD)
+
+        monkeypatch.setattr(
+            kanban_db,
+            "list_boards",
+            lambda include_archived=False: [{"slug": "discord-done-thread"}],
+        )
+        worker_metadata = {
+            **terminal_metadata,
+            "thread_id": "done-thread",
+            "source_message_id": "user-request-msg",
+            "parent_channel_id": "channel-123",
+            "project_context": {
+                "github_pr_target_repo": "sligo-droid/reserve-index-dtf",
+                "base_branch": "feat/irrevocable-fee-recipients",
+            },
+        }
+        monkeypatch.setattr(
+            kanban_db,
+            "read_board_metadata",
+            lambda board: {"discord_worker": worker_metadata},
+        )
+
+        assert resolve_pr_amend_existing_discord_route(artifact) == expected
+
     def test_fetch_pr_related_context_fetches_paginated_lists(self, monkeypatch):
         calls = []
 

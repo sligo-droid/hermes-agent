@@ -1161,6 +1161,14 @@ def resolve_pr_amend_existing_discord_route(artifact: dict[str, Any]) -> dict[st
         worker = metadata.get(DISCORD_WORKER_META_KEY) if isinstance(metadata, dict) else None
         if not isinstance(worker, dict):
             continue
+        terminal_markers = {
+            str(worker.get("thread_state") or "").strip().lower(),
+            str(worker.get("goal_status") or "").strip().lower(),
+            str(worker.get("phase") or "").strip().lower(),
+        }
+        terminal_states = {"done", "complete", "completed", "cancelled", "failed", "archived"}
+        if worker.get("cancelled") is True or terminal_markers & terminal_states:
+            continue
         context = worker.get("project_context") if isinstance(worker.get("project_context"), dict) else {}
         github_context = context.get("github_pr_amend") if isinstance(context.get("github_pr_amend"), dict) else {}
         candidates = {
