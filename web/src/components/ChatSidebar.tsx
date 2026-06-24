@@ -70,14 +70,14 @@ const STATE_TONE: Record<
 
 interface ChatSidebarProps {
   channel: string;
-  ptyConnected: boolean;
-  onVisibleTuiSlash(slashCommand: string): boolean;
+  ptyConnected?: boolean;
+  onVisibleTuiSlash?(slashCommand: string): boolean;
   className?: string;
 }
 
 export function ChatSidebar({
   channel,
-  ptyConnected,
+  ptyConnected = false,
   onVisibleTuiSlash,
   className,
 }: ChatSidebarProps) {
@@ -297,7 +297,7 @@ export function ChatSidebar({
   // Send it into the visible PTY so the rendered TUI session owns the mutation.
   const onModelSubmit = useCallback(
     (slashCommand: string) => {
-      if (!ptyConnected || !onVisibleTuiSlash(slashCommand)) {
+      if (!ptyConnected || !onVisibleTuiSlash?.(slashCommand)) {
         setError(
           "visible chat is not connected — reload the Chat tab before switching models",
         );

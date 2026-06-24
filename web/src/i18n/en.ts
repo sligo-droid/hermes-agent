@@ -299,6 +299,7 @@ export const en: Translations = {
       "Lowercase letters, digits, _ and - only; must start with a letter or digit; up to 64 characters.",
     invalidName: "Invalid profile name",
     cloneFrom: "Clone config from",
+    cloneFromDefault: "Clone from default profile",
     cloneFromNone: "None (blank)",
     allProfiles: "Profiles",
     noProfiles: "No profiles found.",

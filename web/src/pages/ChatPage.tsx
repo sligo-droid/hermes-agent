@@ -144,6 +144,17 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const { setEnd } = usePageHeader();
   const { t } = useI18n();
   const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
+  const sendVisibleTuiSlash = useCallback((slashCommand: string): boolean => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(slashCommand);
+    setTimeout(() => {
+      const current = wsRef.current;
+      if (current && current.readyState === WebSocket.OPEN) current.send("\r");
+    }, 100);
+    termRef.current?.focus();
+    return true;
+  }, []);
   const modelToolsLabel = useMemo(
     () => `${t.app.modelToolsSheetTitle} ${t.app.modelToolsSheetSubtitle}`,
     [t.app.modelToolsSheetSubtitle, t.app.modelToolsSheetTitle],
@@ -806,7 +817,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               "border-t border-current/10",
             )}
           >
-            <ChatSidebar channel={channel} />
+            <ChatSidebar
+              channel={channel}
+              ptyConnected={wsRef.current?.readyState === WebSocket.OPEN}
+              onVisibleTuiSlash={sendVisibleTuiSlash}
+            />
           </div>
         </div>
       </>,
@@ -874,7 +889,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             className="flex min-h-0 shrink-0 flex-col overflow-hidden lg:h-full lg:w-80"
           >
             <div className="min-h-0 flex-1 overflow-hidden">
-              <ChatSidebar channel={channel} />
+              <ChatSidebar
+                channel={channel}
+                ptyConnected={wsRef.current?.readyState === WebSocket.OPEN}
+                onVisibleTuiSlash={sendVisibleTuiSlash}
+              />
             </div>
           </div>
         )}

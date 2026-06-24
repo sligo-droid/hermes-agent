@@ -356,6 +356,7 @@ export interface Translations {
     nameRule: string;
     invalidName: string;
     cloneFrom: string;
+    cloneFromDefault?: string;
     cloneFromNone: string;
     allProfiles: string;
     noProfiles: string;
