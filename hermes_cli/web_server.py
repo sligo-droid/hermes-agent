@@ -79,6 +79,17 @@ except ImportError:
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
 
+
+def _start_desktop_cron_ticker(stop_event: threading.Event, interval: int = 60):
+    from cron.scheduler import tick as cron_tick
+
+    while not stop_event.is_set():
+        try:
+            cron_tick(verbose=False, sync=False)
+        except Exception as exc:
+            _log.debug("Desktop cron tick error: %s", exc)
+        stop_event.wait(interval)
+
 app = FastAPI(title="Hermes Agent", version=__version__)
 
 # ---------------------------------------------------------------------------
