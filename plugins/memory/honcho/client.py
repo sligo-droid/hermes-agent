@@ -142,7 +142,7 @@ def _parse_context_tokens(host_val, root_val) -> int | None:
             return int(val)
         except (ValueError, TypeError):
             pass
-    return 1200
+    return 700
 
 
 def _parse_int_config(host_val, root_val, default: int) -> int:
@@ -334,7 +334,7 @@ class HonchoClientConfig:
     # "session" (flush on session end), or int (every N turns)
     write_frequency: str | int = "async"
     # Prefetch budget. Set contextTokens to null to opt out explicitly.
-    context_tokens: int | None = 1200
+    context_tokens: int | None = 700
     # Dialectic (peer.chat) settings
     # reasoning_level: "minimal" | "low" | "medium" | "high" | "max"
     dialectic_reasoning_level: str = "low"
