@@ -276,6 +276,33 @@ async def test_tagged_parent_message_initializes_project_and_feature_summaries(a
 
 
 @pytest.mark.asyncio
+async def test_ack_prefixed_run_pipeline_request_gets_feature_summary(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    parent = FakeTextChannel(channel_id=100, topic="Existing channel note")
+    thread = FakeThread(channel_id=200, parent=parent)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+
+    await adapter._handle_message(
+        _make_message(
+            adapter,
+            channel=parent,
+            content=(
+                "<@999> okay the pangram API key billing has been resolved, "
+                "run the entire pipeline for 2024-time-restricted-eating from scratch"
+            ),
+        )
+    )
+
+    assert len(thread.sent) == 1
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.channel_prompt is None
+    assert event.feature_summary is not None
+    assert event.feature_summary["thread_id"] == "200"
+    assert event.text.startswith("okay the pangram API key billing has been resolved")
+
+
+@pytest.mark.asyncio
 async def test_non_goal_feature_summary_does_not_start_kanban_pipeline(adapter, monkeypatch):
     from hermes_cli import discord_worker_boards as dwb
 
