@@ -994,12 +994,8 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
         }).encode()
         content_type = "application/x-www-form-urlencoded"
 
-    token_endpoints = [
-        "https://platform.claude.com/v1/oauth/token",
-        "https://console.anthropic.com/v1/oauth/token",
-    ]
     last_error = None
-    for endpoint in token_endpoints:
+    for endpoint in _OAUTH_TOKEN_ENDPOINTS:
         req = urllib.request.Request(
             endpoint,
             data=data,
@@ -1297,10 +1293,49 @@ def run_oauth_setup_token() -> Optional[str]:
 # Stores credentials in ~/.hermes/.anthropic_oauth.json (our own file).
 
 _OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+_OAUTH_TOKEN_ENDPOINTS = (
+    "https://platform.claude.com/v1/oauth/token",
+    "https://console.anthropic.com/v1/oauth/token",
+)
+_OAUTH_TOKEN_URL = _OAUTH_TOKEN_ENDPOINTS[-1]
 _OAUTH_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
 _OAUTH_SCOPES = "org:create_api_key user:profile user:inference"
 _HERMES_OAUTH_FILE = get_hermes_home() / ".anthropic_oauth.json"
+
+
+def exchange_anthropic_oauth_token(
+    data: bytes,
+    *,
+    content_type: str = "application/json",
+    timeout: int = 15,
+    user_agent: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Exchange Anthropic OAuth data using platform-first endpoint fallback."""
+    import urllib.request
+
+    last_error = None
+    headers = {
+        "Content-Type": content_type,
+        "User-Agent": user_agent or f"claude-cli/{_get_claude_code_version()} (external, cli)",
+    }
+    for endpoint in _OAUTH_TOKEN_ENDPOINTS:
+        req = urllib.request.Request(
+            endpoint,
+            data=data,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as exc:
+            last_error = exc
+            logger.debug("Anthropic token exchange failed at %s: %s", endpoint, exc)
+            continue
+
+    if last_error is not None:
+        raise last_error
+    raise ValueError("Anthropic token exchange failed")
 
 
 def _generate_pkce() -> tuple:
@@ -1384,8 +1419,6 @@ def run_hermes_oauth_login_pure() -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        import urllib.request
-
         exchange_data = json.dumps({
             "grant_type": "authorization_code",
             "client_id": _OAUTH_CLIENT_ID,
@@ -1395,18 +1428,7 @@ def run_hermes_oauth_login_pure() -> Optional[Dict[str, Any]]:
             "code_verifier": verifier,
         }).encode()
 
-        req = urllib.request.Request(
-            _OAUTH_TOKEN_URL,
-            data=exchange_data,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
-            },
-            method="POST",
-        )
-
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            result = json.loads(resp.read().decode())
+        result = exchange_anthropic_oauth_token(exchange_data, timeout=15)
     except Exception as e:
         print(f"Token exchange failed: {e}")
         return None

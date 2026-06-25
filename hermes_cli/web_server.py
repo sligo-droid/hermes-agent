@@ -2121,9 +2121,9 @@ _oauth_sessions_lock = threading.Lock()
 try:
     from agent.anthropic_adapter import (
         _OAUTH_CLIENT_ID as _ANTHROPIC_OAUTH_CLIENT_ID,
-        _OAUTH_TOKEN_URL as _ANTHROPIC_OAUTH_TOKEN_URL,
         _OAUTH_REDIRECT_URI as _ANTHROPIC_OAUTH_REDIRECT_URI,
         _OAUTH_SCOPES as _ANTHROPIC_OAUTH_SCOPES,
+        exchange_anthropic_oauth_token as _exchange_anthropic_oauth_token,
         _generate_pkce as _generate_pkce_pair,
     )
     _ANTHROPIC_OAUTH_AVAILABLE = True
@@ -2276,18 +2276,12 @@ def _submit_anthropic_pkce(session_id: str, code_input: str) -> Dict[str, Any]:
         "redirect_uri": _ANTHROPIC_OAUTH_REDIRECT_URI,
         "code_verifier": sess["verifier"],
     }).encode()
-    req = urllib.request.Request(
-        _ANTHROPIC_OAUTH_TOKEN_URL,
-        data=exchange_data,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "hermes-dashboard/1.0",
-        },
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            result = json.loads(resp.read().decode())
+        result = _exchange_anthropic_oauth_token(
+            exchange_data,
+            timeout=20,
+            user_agent="hermes-dashboard/1.0",
+        )
     except Exception as e:
         with _oauth_sessions_lock:
             sess["status"] = "error"
