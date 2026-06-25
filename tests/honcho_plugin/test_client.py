@@ -174,7 +174,7 @@ class TestFromGlobalConfig:
         config_file = tmp_path / "config.json"
         config_file.write_text(json.dumps({"apiKey": "***"}))
         config = HonchoClientConfig.from_global_config(config_path=config_file)
-        assert config.context_tokens == 1200
+        assert config.context_tokens == 700
 
     def test_context_tokens_explicit_sets_cap(self, tmp_path):
         """Explicit contextTokens in config sets the cap."""

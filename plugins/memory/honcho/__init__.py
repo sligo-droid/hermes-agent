@@ -36,13 +36,11 @@ _NOISY_CONTEXT_PATTERNS = (
     re.compile(r"\b\d{4}-\d{2}-\d{2}\b.*\b(?:implemented|merged|verified|blocked|completed|failed)\b", re.IGNORECASE),
 )
 _CONTEXT_SECTION_CHAR_LIMITS = {
-    "summary": 900,
-    "representation": 1200,
-    "card": 900,
-    "ai_representation": 600,
-    "ai_card": 600,
+    "summary": 650,
+    "card": 650,
+    "ai_card": 650,
 }
-_CONTEXT_CARD_ITEM_LIMIT = 8
+_CONTEXT_CARD_ITEM_LIMIT = 6
 
 
 # ---------------------------------------------------------------------------
@@ -568,17 +566,9 @@ class HonchoMemoryProvider(MemoryProvider):
         if summary:
             parts.append(f"## Session Summary\n{summary}")
 
-        rep = self._clean_context_section("representation", ctx.get("representation", ""))
-        if rep:
-            parts.append(f"## User Representation\n{rep}")
-
         card = self._clean_context_section("card", ctx.get("card", ""), is_card=True)
         if card:
             parts.append(f"## User Peer Card\n{card}")
-
-        ai_rep = self._clean_context_section("ai_representation", ctx.get("ai_representation", ""))
-        if ai_rep:
-            parts.append(f"## AI Self-Representation\n{ai_rep}")
 
         ai_card = self._clean_context_section("ai_card", ctx.get("ai_card", ""), is_card=True)
         if ai_card:
@@ -645,7 +635,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
         Returns only the mode header and tool instructions — static text
         that doesn't change between turns (prompt-cache friendly).
-        Live context (representation, card) is injected via prefetch().
+        Live context (summary and peer cards) is injected via prefetch().
         """
         if self._cron_skipped:
             return ""
@@ -691,7 +681,7 @@ class HonchoMemoryProvider(MemoryProvider):
         return header
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Return base context (representation + card) plus dialectic supplement.
+        """Return base context (summary + cards) plus dialectic supplement.
 
         Assembles two layers:
         1. Base context from peer.context() — cached, refreshed on context_cadence
@@ -719,7 +709,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
         parts = []
 
-        # ----- Layer 1: Base context (representation + card) -----
+        # ----- Layer 1: Base context (summary + cards) -----
         # On first call, fetch synchronously so turn 1 isn't empty.
         # After that, serve from cache and refresh in background on cadence.
         with self._base_context_lock:
@@ -849,7 +839,7 @@ class HonchoMemoryProvider(MemoryProvider):
         """Fire background prefetch threads for the upcoming turn.
 
         B5: Checks cadence independently for dialectic and context refresh.
-        Context refresh updates the base layer (representation + card).
+        Context refresh updates the base layer (summary + cards).
         Dialectic fires the LLM reasoning supplement.
         """
         if self._cron_skipped:

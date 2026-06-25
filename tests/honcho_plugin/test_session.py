@@ -931,7 +931,7 @@ class TestTruncateToBudget:
         provider = HonchoMemoryProvider()
         provider._config = HonchoClientConfig(context_tokens=1200)
 
-        # Simulate a massive representation (10k chars)
+        # Simulate a massive context block (10k chars)
         huge_text = "x" * 10000
         result = provider._truncate_to_budget(huge_text)
 
@@ -1051,7 +1051,7 @@ class TestBaseContextSummary:
         }
         formatted = provider._format_first_turn_context(ctx)
         assert "## Session Summary" in formatted
-        assert formatted.index("Session Summary") < formatted.index("User Representation")
+        assert formatted.index("Session Summary") < formatted.index("User Peer Card")
 
     def test_format_without_summary(self):
         """No summary key means no summary section."""
@@ -1059,7 +1059,8 @@ class TestBaseContextSummary:
         ctx = {"representation": "Eri is a developer.", "card": "Name: Eri"}
         formatted = provider._format_first_turn_context(ctx)
         assert "Session Summary" not in formatted
-        assert "User Representation" in formatted
+        assert "User Representation" not in formatted
+        assert "User Peer Card" in formatted
 
     def test_format_empty_summary_skipped(self):
         """Empty summary string should not produce a section."""
@@ -1069,7 +1070,7 @@ class TestBaseContextSummary:
         assert "Session Summary" not in formatted
 
     def test_format_filters_stale_task_logs_and_bounds_sections(self):
-        """Default injection should keep durable facts without dumping task logs."""
+        """Default injection should keep small cards without dumping representations."""
         provider = HonchoMemoryProvider()
         ctx = {
             "summary": "\n".join([
@@ -1077,11 +1078,28 @@ class TestBaseContextSummary:
                 "2026-06-12 worker task log implemented PR #123 and checks run: pytest.",
                 "Final response: Changed files: many stale files.",
             ]),
-            "representation": "Durable preference: never send email. " + ("noise " * 400),
-            "card": "\n".join(f"fact {i}" for i in range(20)),
-            "ai_representation": "AI self task history: PR run merged #999.\nIdentity: sligo-droid bot.",
+            "representation": (
+                "User Representation task history: PR #999 merged after worker task logs. "
+                "Durable preference: never send email. " + ("noise " * 400)
+            ),
+            "card": "\n".join([
+                "PREFERENCE: Keep troubleshooting evidence-first.",
+                "INSTRUCTION: Ask before sending external messages.",
+                "TRAIT: Direct and concise.",
+                "fact 3",
+                "fact 4",
+                "fact 5",
+                "fact 6",
+                "fact 7",
+            ]),
+            "ai_representation": (
+                "AI Self-Representation task history: PR run merged #999.\n"
+                "Identity: sligo-droid bot."
+            ),
             "ai_card": "\n".join([
                 "PREFERENCE: Use verification evidence before finalizing.",
+                "INSTRUCTION: Keep auto-injected context compact.",
+                "TRAIT: Reliability-focused assistant.",
                 "Changed files: stale task log should disappear.",
             ]),
         }
@@ -1089,14 +1107,21 @@ class TestBaseContextSummary:
         formatted = provider._format_first_turn_context(ctx)
 
         assert "evidence-first troubleshooting" in formatted
-        assert "never send email" in formatted
-        assert "Identity: sligo-droid bot" in formatted
+        assert "PREFERENCE: Keep troubleshooting evidence-first." in formatted
+        assert "INSTRUCTION: Ask before sending external messages." in formatted
+        assert "TRAIT: Direct and concise." in formatted
         assert "Use verification evidence before finalizing" in formatted
+        assert "INSTRUCTION: Keep auto-injected context compact." in formatted
+        assert "TRAIT: Reliability-focused assistant." in formatted
+        assert "User Representation" not in formatted
+        assert "AI Self-Representation" not in formatted
+        assert "never send email" not in formatted
+        assert "Identity: sligo-droid bot" not in formatted
         assert "worker task log" not in formatted
         assert "Changed files" not in formatted
         assert "PR run merged" not in formatted
-        assert "fact 8" not in formatted
-        assert len(formatted) < 3500
+        assert "fact 6" not in formatted
+        assert len(formatted) < 1600
         assert "transient task/log item(s) omitted" in formatted
 
 
