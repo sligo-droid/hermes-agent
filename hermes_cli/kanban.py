@@ -1870,9 +1870,14 @@ def _cmd_board_health_diagnostics(args: argparse.Namespace) -> int:
             f"integrity={board['integrity_status'] or ''}",
             f"wal={board['wal_present']}",
             f"shm={board['shm_present']}",
-            f"corrupt_backups={board['corrupt_backup_count']}",
         ]
         print(f"  {board['slug']}  {board['db_path']}  " + " | ".join(parts))
+        historical_count = int(board.get("historical_corrupt_backup_count") or board.get("corrupt_backup_count") or 0)
+        if historical_count:
+            print(
+                "       historical cleanup artifacts: "
+                f"corrupt_backups={historical_count} (not live board-health failures)"
+            )
     return 0
 
 
@@ -2517,7 +2522,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
             print(f"  {who:20s}  {parts}")
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
-        print(f"\nOldest ready task age: {int(age)}s")
+        print(f"\nStale ready queue debt: oldest ready task age {int(age)}s")
     return 0
 
 

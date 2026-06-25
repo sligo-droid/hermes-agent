@@ -338,14 +338,8 @@ class OpenAICodexAdapter(UpstreamAdapter):
             return _chat_json_error(400, "Missing required field: messages.", code="invalid_request")
 
         text_format = self._responses_text_format(payload.get("response_format"))
-        if text_format and not self._messages_include_json_word(messages):
-            return _chat_json_error(
-                400,
-                "response_format requests JSON output, but no message content contains "
-                "the standalone word 'json'. Add a system or user instruction such "
-                "as 'Respond with JSON.' before retrying.",
-                code="invalid_json_mode_request",
-            )
+        if text_format:
+            messages = self._ensure_json_mode_instruction(messages)
 
         try:
             cred = self.get_credential()
@@ -663,6 +657,12 @@ class OpenAICodexAdapter(UpstreamAdapter):
                 if _text_contains_json_word(text):
                     return True
         return False
+
+    @staticmethod
+    def _ensure_json_mode_instruction(messages: list[Any]) -> list[Any]:
+        if OpenAICodexAdapter._messages_include_json_word(messages):
+            return messages
+        return [{"role": "system", "content": "Respond with JSON."}, *messages]
 
     @staticmethod
     def _split_instructions(messages: list[Any]) -> tuple[str, list[dict[str, Any]]]:
