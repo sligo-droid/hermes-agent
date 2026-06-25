@@ -1360,7 +1360,8 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             result is used for prompt injection. When omitted, the script
             (if any) runs inline as before.
     """
-    prompt = str(job.get("prompt") or "")
+    user_prompt = str(job.get("prompt") or "")
+    prompt = user_prompt
     skills = job.get("skills")
 
     proposal = _self_improvement_proposal_config(job)
@@ -1379,6 +1380,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             success, script_output = _run_job_script(script_path)
         if success:
             if script_output:
+                script_output = _scan_trusted_cron_context(str(script_output), job)
                 prompt = (
                     "## Script Output\n"
                     "The following data was collected by a pre-run script. "
@@ -1390,6 +1392,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 # Script produced no output — nothing to report, skip AI call.
                 return None
         else:
+            script_output = _scan_trusted_cron_context(str(script_output), job)
             prompt = (
                 "## Script Error\n"
                 "The data-collection script failed. Report this to the user.\n\n"
@@ -1431,6 +1434,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 if len(latest_output) > _MAX_CONTEXT_CHARS:
                     latest_output = latest_output[:_MAX_CONTEXT_CHARS] + "\n\n[... output truncated ...]"
                 if latest_output:
+                    latest_output = _scan_trusted_cron_context(latest_output, job)
                     prompt = (
                         f"## Output from job '{source_job_id}'\n"
                         "The following is the most recent output from a preceding "
@@ -1457,6 +1461,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "Never combine [SILENT] with content — either report your "
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
+    _scan_assembled_cron_prompt(cron_hint + user_prompt, job, has_skills=False)
     prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")
@@ -1466,14 +1471,25 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
 
     skill_names = [str(name).strip() for name in skills if str(name).strip()]
     if not skill_names:
-        return _scan_assembled_cron_prompt(prompt, job, has_skills=False)
+        return prompt
 
     from tools.skills_tool import skill_view
     from tools.skill_usage import bump_use
+    from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
 
     parts = []
     skipped: list[str] = []
     for skill_name in skill_names:
+        bundle_key = resolve_bundle_command_key(skill_name)
+        if bundle_key:
+            bundle_message = build_bundle_invocation_message(bundle_key)
+            if bundle_message is not None:
+                message, _loaded, missing = bundle_message
+                if parts:
+                    parts.append("")
+                parts.append(_sanitize_trusted_skill_content(message))
+                skipped.extend(missing)
+                continue
         try:
             loaded = json.loads(skill_view(skill_name))
         except (json.JSONDecodeError, TypeError):
@@ -1492,7 +1508,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         except Exception:
             logger.debug("Cron job: failed to bump skill usage for '%s'", skill_name, exc_info=True)
 
-        content = str(loaded.get("content") or "").strip()
+        content = _sanitize_trusted_skill_content(str(loaded.get("content") or "").strip())
         if parts:
             parts.append("")
         parts.extend(
@@ -1514,37 +1530,50 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
 
     if prompt:
         parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
-    return _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
+    return "\n".join(parts)
+
+
+def _sanitize_trusted_skill_content(text: str) -> str:
+    from tools.cronjob_tools import _scan_cron_skill_assembled
+
+    cleaned, _scan_error = _scan_cron_skill_assembled(text)
+    return cleaned
+
+
+def _scan_trusted_cron_context(text: str, job: dict) -> str:
+    """Scan runtime data without treating trusted prose as job instructions."""
+    return _scan_assembled_cron_prompt(text, job, has_skills=True)
 
 
 def _scan_assembled_cron_prompt(assembled: str, job: dict, *, has_skills: bool = False) -> str:
-    """Scan the fully-assembled cron prompt for injection patterns. Raises
+    """Scan untrusted cron prompt/context content for injection patterns. Raises
     ``CronPromptInjectionBlocked`` when a match fires so ``run_job`` can
     surface a clear refusal to the operator.
 
-    Plugs the #3968 gap: ``_scan_cron_prompt`` runs on the user-supplied
-    prompt at create/update, but skill content is loaded from disk at
-    runtime and was never scanned. Since cron runs non-interactively
-    (auto-approves tool calls), a malicious skill carrying an injection
-    payload bypassed every gate.
+    Cron jobs assemble a final agent prompt from several trust classes. This
+    scanner must cover user/job-authored prompts and runtime data, but not
+    trusted local skill wrappers or bundled skill markdown that were vetted at
+    install/update time.
 
     Two pattern tiers:
 
     - When ``has_skills=False`` (no skills attached) the assembled prompt
       is essentially the user prompt + the cron hint, so the STRICT
       ``_scan_cron_prompt`` patterns apply.
-    - When ``has_skills=True`` the assembled prompt includes loaded skill
-      markdown — often security docs / runbooks that *describe* attack
-      commands in prose. The LOOSER ``_scan_cron_skill_assembled``
-      pattern set is used: only unambiguous prompt-injection directives
-      and invisible unicode block, command-shape patterns are dropped
-      to avoid false-positives. Skill bodies are vetted at install time
-      by ``skills_guard.py``.
+    - When ``has_skills=True`` the scanned content is trusted runtime data
+      such as script output or ``context_from`` output. The LOOSER
+      ``_scan_cron_skill_assembled`` pattern set is used: only unambiguous
+      prompt-injection directives are blocked, command-shape patterns are
+      dropped to avoid false-positives in quoted logs/security reports, and
+      invisible unicode is sanitized.
     """
     from tools.cronjob_tools import _scan_cron_prompt, _scan_cron_skill_assembled
 
-    scanner = _scan_cron_skill_assembled if has_skills else _scan_cron_prompt
-    scan_error = scanner(assembled)
+    if has_skills:
+        cleaned, scan_error = _scan_cron_skill_assembled(assembled)
+    else:
+        cleaned = assembled
+        scan_error = _scan_cron_prompt(assembled)
     if scan_error:
         job_label = job.get("name") or job.get("id") or "<unknown>"
         logger.warning(
@@ -1553,7 +1582,7 @@ def _scan_assembled_cron_prompt(assembled: str, job: dict, *, has_skills: bool =
             scan_error,
         )
         raise CronPromptInjectionBlocked(scan_error)
-    return assembled
+    return cleaned
 
 
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:

@@ -18,6 +18,16 @@ def _load_package_data():
     return tool["setuptools"]["package-data"]
 
 
+def test_pyproject_version_matches_package_version():
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject_path.open("rb") as handle:
+        project_version = tomllib.load(handle)["project"]["version"]
+
+    from hermes_cli import __version__
+
+    assert project_version == __version__
+
+
 def test_matrix_extra_not_in_all():
     """The [matrix] extra pulls `mautrix[encryption]` -> `python-olm`,
     which has Linux-only wheels and no native build path on Windows or

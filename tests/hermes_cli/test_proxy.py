@@ -168,10 +168,12 @@ def test_codex_adapter_json_word_detector_requires_standalone_word():
         },
     ],
 )
-def test_codex_adapter_rejects_json_mode_without_json_word_before_credentials(
+def test_codex_adapter_adds_json_mode_instruction_without_json_word(
     monkeypatch,
     response_format,
 ):
+    captured: dict[str, Any] = {}
+
     class FakeRequest:
         async def json(self):
             return {
@@ -180,26 +182,42 @@ def test_codex_adapter_rejects_json_mode_without_json_word_before_credentials(
                 "response_format": response_format,
             }
 
-    credential_mock = MagicMock(side_effect=AssertionError("credentials should not be resolved"))
-    upstream_mock = MagicMock(side_effect=AssertionError("upstream should not be called"))
-    cooldown_mock = MagicMock(side_effect=AssertionError("cooldown routing should not run"))
-    monkeypatch.setattr(OpenAICodexAdapter, "get_credential", credential_mock)
-    monkeypatch.setattr(OpenAICodexAdapter, "_effective_model_for_cooldown", cooldown_mock)
+    class FakeResponse:
+        def model_dump(self):
+            return {"id": "resp-json", "created_at": 123, "usage": {}}
+
+    async def fake_run(responses_payload, cred):
+        captured["payload"] = responses_payload
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        OpenAICodexAdapter,
+        "get_credential",
+        lambda self: UpstreamCredential(
+            bearer="token",
+            base_url="https://example.test/backend-api/codex",
+        ),
+    )
     monkeypatch.setattr(
         OpenAICodexAdapter,
         "_run_responses_stream_with_retry",
-        staticmethod(upstream_mock),
+        staticmethod(fake_run),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.proxy.adapters.openai_codex._normalize_codex_response",
+        lambda _response: (SimpleNamespace(content='{"x":"ok"}', tool_calls=[]), "stop"),
     )
 
     response = asyncio.run(OpenAICodexAdapter()._handle_chat_completions(FakeRequest()))
     body = json.loads(response.text)
 
-    assert response.status == 400
-    assert body["error"]["code"] == "invalid_json_mode_request"
-    assert "standalone word 'json'" in body["error"]["message"]
-    cooldown_mock.assert_not_called()
-    credential_mock.assert_not_called()
-    upstream_mock.assert_not_called()
+    assert response.status == 200
+    assert body["choices"][0]["message"]["content"] == '{"x":"ok"}'
+    assert captured["payload"]["instructions"] == "Respond with JSON."
+    assert captured["payload"]["input"][0] == {
+        "role": "user",
+        "content": "Return an object with x.",
+    }
 
 
 def test_codex_adapter_allows_json_mode_with_multimodal_text_part(monkeypatch):

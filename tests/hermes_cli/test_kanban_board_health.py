@@ -133,11 +133,31 @@ def test_sidecars_and_corrupt_backups_are_reported_without_deletion(fresh_home):
     assert row["shm_present"] is True
     assert row["shm_size"] == 4
     assert row["corrupt_backup_count"] == 2
+    assert row["historical_corrupt_backup_count"] == 2
+    assert row["historical_artifact_count"] == 2
+    assert row["historical_artifacts_status"] == "cleanup_noise"
     assert row["latest_corrupt_backup_mtime"] == 200
     assert wal_path.exists()
     assert shm_path.exists()
     assert backup_old.exists()
     assert backup_new.exists()
+
+
+def test_cli_board_health_labels_corrupt_backups_as_historical_noise(fresh_home, capsys):
+    board_dir = kb.board_dir("healthy-with-history")
+    board_dir.mkdir(parents=True)
+    (board_dir / "board.json").write_text("{}", encoding="utf-8")
+    kb.init_db(board="healthy-with-history")
+    backup = board_dir / "kanban.db.corrupt.2222222222.bbbb.bak"
+    backup.write_bytes(b"old corrupt db")
+
+    rc = _kanban_cli("diagnostics", "--board-health")
+    output = capsys.readouterr().out
+
+    assert rc == 0
+    assert "integrity=ok" in output
+    assert "historical cleanup artifacts: corrupt_backups=1" in output
+    assert "not live board-health failures" in output
 
 
 def test_healthy_initialized_db_reports_valid_header_and_ok_integrity(fresh_home):

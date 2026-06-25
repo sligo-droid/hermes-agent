@@ -160,6 +160,9 @@ def scan_board(slug: str) -> dict[str, Any]:
         "shm_size": shm["size"],
         "shm_stat_error": shm["stat_error"],
         "corrupt_backup_count": backup_count,
+        "historical_corrupt_backup_count": backup_count,
+        "historical_artifact_count": backup_count,
+        "historical_artifacts_status": "cleanup_noise" if backup_count else "none",
         "latest_corrupt_backup_mtime": latest_backup_mtime,
     }
 
