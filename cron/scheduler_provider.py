@@ -172,7 +172,7 @@ class InProcessCronScheduler(CronScheduler):
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
         # Heartbeat once before the first sleep so `hermes cron status` sees a
         # live ticker immediately after startup, not only after the first tick.
-        record_ticker_heartbeat()
+        record_ticker_heartbeat(success=False)
         while not stop_event.is_set():
             ok = False
             try:
