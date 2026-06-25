@@ -21944,6 +21944,7 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     image/audio/document cache + expired ``hermes debug share`` pastes
     once per hour.
     """
+    from cron.jobs import record_ticker_heartbeat
     from cron.scheduler import tick as cron_tick
     from gateway.platforms.base import cleanup_image_cache, cleanup_document_cache
     from hermes_cli.debug import _sweep_expired_pastes
@@ -21957,7 +21958,9 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     tick_count = 0
     while not stop_event.is_set():
         try:
+            record_ticker_heartbeat(success=False)
             cron_tick(verbose=False, adapters=adapters, loop=loop, sync=False)
+            record_ticker_heartbeat(success=True)
         except Exception as e:
             logger.debug("Cron tick error: %s", e)
 

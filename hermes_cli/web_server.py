@@ -81,11 +81,14 @@ _log = logging.getLogger(__name__)
 
 
 def _start_desktop_cron_ticker(stop_event: threading.Event, interval: int = 60):
+    from cron.jobs import record_ticker_heartbeat
     from cron.scheduler import tick as cron_tick
 
     while not stop_event.is_set():
         try:
+            record_ticker_heartbeat(success=False)
             cron_tick(verbose=False, sync=False)
+            record_ticker_heartbeat(success=True)
         except Exception as exc:
             _log.debug("Desktop cron tick error: %s", exc)
         stop_event.wait(interval)
