@@ -354,10 +354,12 @@ function WorkStatePanel({
 
 function ProjectTabs({
   currentProject,
+  pendingProject,
   pathname,
   projects,
 }: {
   currentProject: string | null;
+  pendingProject?: string | null;
   pathname: string;
   projects: CommandCenterProject[];
 }) {
@@ -368,14 +370,15 @@ function ProjectTabs({
   };
   return (
     <div className="command-center-project-tab-row flex flex-wrap items-center justify-between gap-2 border-b border-white/[0.08] pb-1">
-      <nav aria-label="Command Center projects" className="command-center-project-tabs flex flex-wrap">
+      <nav aria-busy={Boolean(pendingProject) || undefined} aria-label="Command Center projects" className="command-center-project-tabs flex flex-wrap">
         {projects.map((project) => {
           const selected = currentProject === project.key;
+          const projectPending = pendingProject === project.key;
           return (
             <Link
               aria-current={selected ? "page" : undefined}
               className={cn(
-                "command-center-project-tab relative -mb-px border-b-2 px-3 py-2 text-sm font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
+                "command-center-project-tab relative -mb-px inline-flex items-center gap-2 border-b-2 px-3 py-2 text-sm font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40",
                 selected
                   ? "command-center-project-tab-selected border-cyan-200 bg-cyan-100/[0.06] text-cyan-50"
                   : "border-transparent text-slate-400 hover:border-cyan-100/30 hover:bg-white/[0.025] hover:text-slate-100",
@@ -384,10 +387,23 @@ function ProjectTabs({
               to={{ pathname, search: tabSearch(project.key) }}
             >
               <span>{project.label}</span>
+              <span
+                aria-hidden={!projectPending}
+                className={cn(
+                  "command-center-project-tab-loading-slot inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center transition-opacity",
+                  projectPending ? "opacity-100" : "opacity-0",
+                )}
+              >
+                {projectPending ? <Spinner className="h-3 w-3" /> : null}
+              </span>
+              {projectPending ? <span className="sr-only">Loading {project.label}</span> : null}
             </Link>
           );
         })}
       </nav>
+      <span className="sr-only" role="status" aria-live="polite">
+        {pendingProject ? `Loading ${projects.find((project) => project.key === pendingProject)?.label || pendingProject} project` : ""}
+      </span>
       <a className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.08] px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.14em] text-slate-300 transition hover:border-cyan-100/30 hover:bg-cyan-100/[0.045] hover:text-cyan-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-100/40" href="/workers" rel="noopener noreferrer" target="_blank">
         Kanban <ExternalLink className="h-3.5 w-3.5" /><span aria-hidden="true">↗</span><span className="sr-only">opens in a new tab</span>
       </a>
@@ -1392,6 +1408,8 @@ export default function CommandCenterPage() {
     archive: archivedItems.length,
   }), [archivedItems.length, completedItems.length, inboxItems.length, inboxSources.length, overviewItems.length, workItems.length]);
   const projectSearch = useMemo(() => `?project=${encodeURIComponent(selectedProject)}`, [selectedProject]);
+  const snapshotProject = snapshot?.current_project?.toLowerCase() || selectedProject;
+  const projectSwitchPending = Boolean(snapshot && snapshotProject !== selectedProject && !error);
   const toggleSelected = useCallback((id: string) => {
     setSelectedIds((current) => {
       const next = new Set(current);
@@ -1517,7 +1535,8 @@ export default function CommandCenterPage() {
     <div className="command-center-shell flex flex-col gap-5">
       <div className="command-center-topline">
         <ProjectTabs
-          currentProject={snapshot?.current_project || selectedProject}
+          currentProject={selectedProject}
+          pendingProject={projectSwitchPending ? selectedProject : null}
           pathname={location.pathname}
           projects={snapshot?.projects ?? []}
         />
@@ -1556,7 +1575,7 @@ export default function CommandCenterPage() {
         </Card>
       )}
 
-      {loading && snapshot ? (
+      {loading && snapshot && !projectSwitchPending ? (
         <div className="flex items-center gap-2 text-xs text-slate-400" role="status" aria-live="polite">
           <Spinner className="h-3 w-3" /> Refreshing…
         </div>

@@ -30,13 +30,24 @@ def test_work_state_is_only_command_center_navigation_filter():
 
 def test_command_center_project_tabs_render_above_work_state_and_preserve_lanes():
     source = (ROOT / "web/src/pages/CommandCenterPage.tsx").read_text(encoding="utf-8")
+    styles = (ROOT / "web/src/index.css").read_text(encoding="utf-8")
     page_source = source.split("export default function CommandCenterPage", 1)[1]
     render_source = page_source.split("return (", 1)[1]
 
     assert "Command Center projects" in source
     assert "command-center-project-tabs" in source
     assert "command-center-project-tab-row" in source
+    assert "pendingProject?: string | null;" in source
+    assert "aria-busy={Boolean(pendingProject) || undefined}" in source
+    assert "const projectPending = pendingProject === project.key;" in source
+    assert "command-center-project-tab-loading-slot" in source
+    assert "Loading {project.label}" in source
+    assert ".sligo-light .command-center-project-tab-loading-slot" in styles
     assert "projects={snapshot?.projects ?? []}" in source
+    assert "currentProject={selectedProject}" in source
+    assert "pendingProject={projectSwitchPending ? selectedProject : null}" in source
+    assert "const projectSwitchPending = Boolean(snapshot && snapshotProject !== selectedProject && !error);" in source
+    assert "{loading && snapshot && !projectSwitchPending ?" in source
     assert "to={{ pathname, search: tabSearch(project.key) }}" in source
     assert "to={{ pathname: lane.href, search }}" in source
     assert 'href="/workers" rel="noopener noreferrer" target="_blank"' in source
