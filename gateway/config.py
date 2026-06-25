@@ -992,12 +992,15 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(ac, list):
                         ac = ",".join(str(v) for v in ac)
                     os.environ["DISCORD_ALLOWED_CHANNELS"] = str(ac)
-                # feature_request_channels: skip LLM triage in known request lanes
-                frc2 = discord_cfg.get("feature_request_channels")
+                # action_request_channels: skip LLM triage in known action-request lanes
+                frc2 = discord_cfg.get("action_request_channels")
+                if frc2 is None:
+                    frc2 = discord_cfg.get("feature_request_channels")
                 if frc2 is not None and not os.getenv("DISCORD_FEATURE_REQUEST_CHANNELS"):
                     if isinstance(frc2, list):
                         frc2 = ",".join(str(v) for v in frc2)
                     os.environ["DISCORD_FEATURE_REQUEST_CHANNELS"] = str(frc2)
+                    os.environ.setdefault("DISCORD_ACTION_REQUEST_CHANNELS", str(frc2))
                 # no_thread_channels: channels where bot responds directly without creating thread
                 ntc = discord_cfg.get("no_thread_channels")
                 if ntc is not None and not os.getenv("DISCORD_NO_THREAD_CHANNELS"):

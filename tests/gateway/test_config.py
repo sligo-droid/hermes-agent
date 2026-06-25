@@ -902,6 +902,25 @@ class TestLoadGatewayConfig:
         assert os.getenv("DISCORD_HISTORY_BACKFILL_FEATURE_CHANNELS") == "false"
         assert os.getenv("DISCORD_FEATURE_SUMMARY_TRIAGE_TIMEOUT") == "3"
 
+    def test_bridges_discord_action_request_channel_alias_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  action_request_channels: [\"333\", \"444\"]\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("DISCORD_ACTION_REQUEST_CHANNELS", raising=False)
+        monkeypatch.delenv("DISCORD_FEATURE_REQUEST_CHANNELS", raising=False)
+
+        load_gateway_config()
+
+        assert os.getenv("DISCORD_ACTION_REQUEST_CHANNELS") == "333,444"
+        assert os.getenv("DISCORD_FEATURE_REQUEST_CHANNELS") == "333,444"
+
     def test_bridges_telegram_channel_prompts_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

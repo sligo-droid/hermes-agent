@@ -257,7 +257,7 @@ async def test_no_thread_channel_skips_auto_thread(adapter, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_normal_channel_still_auto_threads_feature_requests(adapter, monkeypatch):
-    """Channels NOT in no_thread_channels still auto-thread feature requests."""
+    """Channels NOT in no_thread_channels still auto-thread action requests."""
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
     monkeypatch.setenv("DISCORD_NO_THREAD_CHANNELS", "800")
     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)

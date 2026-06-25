@@ -77,8 +77,8 @@ _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-
 _CODEX_APP_SERVER_ACTIVITY_PREFIX = "Codex app-server event:"
 _MEETING_GOAL_SKILL_NAMES = {"meeting", "discord-meeting-intake"}
 _MEETING_AUTO_GOAL_TEXT = "Follow up on the todos from this meeting."
-_DISCORD_FEATURE_REQUEST_FAST_PATH_PROMPT = (
-    "Discord feature-request thread guidance: treat the latest user message as "
+_DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT = (
+    "Discord action-request thread guidance: treat the latest user message as "
     "the authoritative task. Earlier transcript, [Recent channel messages], and "
     "context compaction summaries are background only unless the latest message "
     "explicitly revives them. Move directly from that latest request to "
@@ -91,6 +91,7 @@ _DISCORD_FEATURE_REQUEST_FAST_PATH_PROMPT = (
     "security effects, or the definition of done. For low-stakes ambiguity, "
     "state the assumption and continue."
 )
+_DISCORD_FEATURE_REQUEST_FAST_PATH_PROMPT = _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT
 
 def _kanban_dispatch_health_candidate(board_slug: str, discord_worker_boards: Any) -> bool:
     """Return whether a board should count toward dispatcher stuck health.
@@ -128,11 +129,11 @@ def _gateway_flow_route_type(event: Any, command: Optional[str] = None) -> str:
     return "mainline"
 
 
-def _is_standard_discord_feature_request(
+def _is_standard_discord_action_request(
     source: Any,
     feature_summary: Optional[Dict[str, Any]],
 ) -> bool:
-    """True for ordinary Discord feature threads, excluding /goal worker threads."""
+    """True for ordinary Discord action-request threads, excluding /goal worker threads."""
     if getattr(source, "platform", None) != Platform.DISCORD:
         return False
     if not isinstance(feature_summary, dict):
@@ -143,20 +144,33 @@ def _is_standard_discord_feature_request(
     return not bool(feature_summary.get("kanban_board"))
 
 
-def _discord_feature_request_reasoning_config(config: Optional[dict]) -> dict | None:
-    """Reasoning override for ordinary Discord feature-request threads."""
+def _is_standard_discord_feature_request(
+    source: Any,
+    feature_summary: Optional[Dict[str, Any]],
+) -> bool:
+    return _is_standard_discord_action_request(source, feature_summary)
+
+
+def _discord_action_request_reasoning_config(config: Optional[dict]) -> dict | None:
+    """Reasoning override for ordinary Discord action-request threads."""
     from hermes_constants import parse_reasoning_effort
 
-    raw = cfg_get(config or {}, "discord", "feature_request_reasoning_effort", default="xhigh")
+    raw = cfg_get(config or {}, "discord", "action_request_reasoning_effort", default=None)
+    if raw is None:
+        raw = cfg_get(config or {}, "discord", "feature_request_reasoning_effort", default="xhigh")
     effort = str(raw or "xhigh").strip() or "xhigh"
     parsed = parse_reasoning_effort(effort)
     if parsed is not None:
         return parsed
     logger.warning(
-        "Unknown discord.feature_request_reasoning_effort '%s', using xhigh",
+        "Unknown Discord action-request reasoning effort '%s', using xhigh",
         effort,
     )
     return parse_reasoning_effort("xhigh")
+
+
+def _discord_feature_request_reasoning_config(config: Optional[dict]) -> dict | None:
+    return _discord_action_request_reasoning_config(config)
 
 
 def _gateway_flow_telemetry_fields(
@@ -19503,7 +19517,7 @@ class GatewayRunner:
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
         session_cwd = _resolve_gateway_session_cwd(source, user_config)
-        standard_discord_feature_request = _is_standard_discord_feature_request(
+        standard_discord_action_request = _is_standard_discord_action_request(
             source,
             feature_summary,
         )
@@ -20181,11 +20195,11 @@ class GatewayRunner:
             event_channel_prompt = (channel_prompt or "").strip()
             if event_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
-            if standard_discord_feature_request:
+            if standard_discord_action_request:
                 combined_ephemeral = (
                     combined_ephemeral
                     + "\n\n"
-                    + _DISCORD_FEATURE_REQUEST_FAST_PATH_PROMPT
+                    + _DISCORD_ACTION_REQUEST_FAST_PATH_PROMPT
                 ).strip()
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
@@ -20218,8 +20232,8 @@ class GatewayRunner:
                 source=source,
                 session_key=session_key,
             )
-            if standard_discord_feature_request:
-                reasoning_config = _discord_feature_request_reasoning_config(user_config)
+            if standard_discord_action_request:
+                reasoning_config = _discord_action_request_reasoning_config(user_config)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             # Set up stream consumer for token streaming or interim commentary.
@@ -20339,9 +20353,10 @@ class GatewayRunner:
                 cache_keys={
                     **self._extract_cache_busting_config(user_config),
                     "gateway.session_cwd": session_cwd,
-                    "gateway.discord_feature_request_fast_path": standard_discord_feature_request,
+                    "gateway.discord_action_request_fast_path": standard_discord_action_request,
+                    "gateway.discord_feature_request_fast_path": standard_discord_action_request,
                     "gateway.discord_default_kanban_intake": default_discord_kanban_intake,
-                    "gateway.tool_delay": 0.0 if standard_discord_feature_request else None,
+                    "gateway.tool_delay": 0.0 if standard_discord_action_request else None,
                 },
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
@@ -20398,7 +20413,7 @@ class GatewayRunner:
                     "session_db": self._session_db,
                     "fallback_model": self._fallback_model,
                 }
-                if standard_discord_feature_request:
+                if standard_discord_action_request:
                     agent_kwargs["tool_delay"] = 0.0
                 agent = AIAgent(**agent_kwargs)
                 if _cache_lock and _cache is not None:

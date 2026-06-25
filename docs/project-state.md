@@ -1,6 +1,6 @@
 # Project State
 
-Last updated: 2026-06-24 16:54 UTC
+Last updated: 2026-06-25 20:24 UTC
 State owner: Sligo Labs agent
 
 This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
@@ -44,6 +44,7 @@ This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork
 | Coding worker GitHub auth env | implemented | Delegated coding workers now get sanitized host git/GitHub config paths for local inspection without token env leakage, model/tool-call arguments cannot authorize push/PR lifecycle, and trusted PR workers only bypass unreadable system SSH config for SSH remotes. |
 | UI specialist route smoke metadata | implemented | Explicit `ui_visual_specialist` route decisions for Command Center visual-polish smokes now survive soft verification wording like “smoke”/“test”, select the configured Codex OpenRouter/model overlay, and are persisted into Kanban worker launch evidence (`ui_work_route/decision`, worker env, prompt, and result sidecar metadata) so route smokes can verify the actual worker path instead of inferring from prose. |
 | Coding worker backend default | implemented | Hermes coding-worker defaults are back on OpenCode for delegate and Kanban role-worker launches. Explicit `backend: codex` compatibility and the narrow UI visual-specialist Codex/OpenRouter overlay remain available, but normal coding-worker execution no longer depends on Codex app-server. |
+| Discord action-request terminology | implemented | Discord intake now describes the non-question work classifier as an action-request path, adds clearer `action_request_*` config aliases while preserving legacy `feature_request_*` names, and keeps action asks such as pipeline runs on the threaded work path. |
 | Dirty secondary main worktree quarantine | in_progress | `/home/droid/workspaces/hermes-self-improvement-live-test` is explicitly excluded from Discord role-worker selection via `kanban.discord_worker.excluded_workspaces`; `docs/runbooks/worktree-quarantine-2026-06-17.md` records the 247-file dirty inventory, reference checks, and human-approval cleanup plan. |
 
 Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `merged`, `deployed`, `verified`, `superseded`.
@@ -88,6 +89,7 @@ Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `me
 - [x] Fixed accepted PR-amend review-summary webhooks without an existing source worker-board route so they publish into the configured project worker-board channel instead of immediately degrading to thumbs-down with no Discord work item.
 - [x] Hardened worker PR-boundary subprocesses so local-only remotes fail with actionable GitHub-remote guidance before `gh pr` finalization, profile-isolated `gh`/git subprocesses see host `GH_CONFIG_DIR` without inheriting GitHub token env vars, Hermes `.env` stays documented as dotenv-only, and delegate-coding canonical-cwd blocks point to absolute `/home/droid/workspaces/...` retry paths.
 - [x] Added an upstream-sync runbook after merging `upstream/main` into the fork, documenting the worktree flow, conflict policy, and smoke-test gate for future syncs.
+- [x] Renamed the Discord non-question work path in prompts, docs, and config aliases from “feature request” to “action request” while preserving legacy internal names and persisted feature-summary compatibility.
 
 ## In Progress
 
@@ -115,7 +117,7 @@ This is product intention, so it belongs in repo state/docs, not in a skill. If 
 
 These are known ideas or cleanup candidates, not the active target unless the user promotes them:
 
-- Normal Discord feature-request global concurrency limiter: designed previously, not implemented.
+- Normal Discord action-request global concurrency limiter: designed previously, not implemented.
 - Browser/typed-input secret redaction hardening: useful core safety work, not this transition.
 - Orphan-DAG tests and PID-specific Operations checks: belong in PID repo state, not Hermes state, unless the Hermes orchestration layer changes.
 - Broad stale-worktree cleanup: useful hygiene, but should not distract from the repo-state boundary unless it blocks current work.

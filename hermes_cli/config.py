@@ -1905,8 +1905,10 @@ DEFAULT_CONFIG = {
         "require_mention": True,       # Require @mention to respond in server channels
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
-        "feature_request_channels": "", # Channel IDs where @mention asks skip LLM feature triage
-        "feature_request_reasoning_effort": "xhigh", # Reasoning effort for non-Kanban Discord feature requests
+        "action_request_channels": "", # Channel IDs where @mention action asks skip LLM triage
+        "feature_request_channels": "", # Legacy alias for action_request_channels
+        "action_request_reasoning_effort": "xhigh", # Reasoning effort for non-Kanban Discord action requests
+        "feature_request_reasoning_effort": "xhigh", # Legacy alias for action_request_reasoning_effort
         "project_channel_cwd": "",     # Cwd for mapped project channels; project_path still injects mapped repo context
         "channel_cwds": {},            # Per-channel cwd overrides keyed by Discord channel ID
         "project_mapping_ignored_channel_names": "",  # Comma-separated channel name/glob patterns ignored by project auto-mapping
@@ -1916,8 +1918,8 @@ DEFAULT_CONFIG = {
         "voice_auto_tag": False,          # If True, native Discord voice messages auto-trigger without @mention
         "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
-        "history_backfill_feature_channels": False, # Skip scrollback in known feature-request channels by default
-        "feature_summary_triage_timeout": 4, # Seconds for ambiguous feature-request classifier calls
+        "history_backfill_feature_channels": False, # Skip scrollback in known action-request channels by default
+        "feature_summary_triage_timeout": 4, # Seconds for ambiguous action-request classifier calls
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-channel ephemeral system prompts (forum parents apply to child threads)
         # Opt-in DM role-based auth (#12136). By default, DISCORD_ALLOWED_ROLES
