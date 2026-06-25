@@ -431,13 +431,6 @@ def resolve_ui_work_route(
     model = str(ui_cfg.get("model") or "").strip()
     requested = _normalize_route_decision(route_decision)
     normalized_backend = str(backend or "opencode").strip().lower() or "opencode"
-    if (
-        requested.route == _UI_SPECIALIST_ROUTE
-        and normalized_backend != "codex"
-        and not _as_dict(ui_cfg.get(normalized_backend))
-        and _as_dict(ui_cfg.get("codex"))
-    ):
-        normalized_backend = "codex"
 
     base_fields = {
         "provider": provider,
@@ -549,25 +542,6 @@ def resolve_ui_work_route(
         }
     else:
         route_backend_config = _as_dict(backend_cfg)
-        if not route_backend_config:
-            if fallback_allowed:
-                return UIWorkRouteDecision(
-                    matched=True,
-                    enabled=True,
-                    reason=f"missing {normalized_backend} config; falling back to default worker",
-                    selected_route=_DEFAULT_ROUTE,
-                    fallback_used=True,
-                    fallback_reason=f"ui_work.{normalized_backend} is not configured",
-                    **base_fields,
-                )
-            return UIWorkRouteDecision(
-                matched=True,
-                enabled=True,
-                reason=f"missing {normalized_backend} config",
-                selected_route=_UI_SPECIALIST_ROUTE,
-                error=f"ui_work routing matched but ui_work.{normalized_backend} is not configured",
-                **base_fields,
-            )
 
     return UIWorkRouteDecision(
         matched=True,
@@ -602,3 +576,14 @@ def codex_ui_work_extra_args(decision: UIWorkRouteDecision) -> list[str]:
             args.extend(["-c", f"{key}={json.dumps(value)}"])
     args.extend(str(item) for item in cfg.get("extra_args") or [])
     return args
+
+
+def opencode_ui_work_worker_config(decision: UIWorkRouteDecision) -> dict[str, Any]:
+    """Build OpenCode worker_config overrides for an enabled UI route."""
+    if not decision.matched or not decision.enabled or decision.backend != "opencode":
+        return {}
+    provider = str(decision.provider or "").strip()
+    model = str(decision.model or "").strip()
+    if not provider or not model:
+        return {}
+    return {"opencode": {"model": f"{provider}/{model}"}}

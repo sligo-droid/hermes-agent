@@ -496,12 +496,11 @@ def _coding_worker_basic_env(parent_agent: Any) -> dict[str, str]:
 
 
 def _allow_ui_route_provider_env(env: dict[str, str], ui_route: Any) -> None:
-    """Allow only the provider credential required by an explicit UI Codex route."""
+    """Allow only the provider credential required by an explicit UI route."""
     if (
         ui_route is None
         or not getattr(ui_route, "matched", False)
         or not getattr(ui_route, "enabled", False)
-        or getattr(ui_route, "backend", "") != "codex"
         or str(getattr(ui_route, "provider", "") or "").strip().lower() != "openrouter"
     ):
         return
@@ -1203,6 +1202,11 @@ def delegate_coding_task(
         except Exception as exc:
             return tool_error(f"could not import OpenCode worker backend: {exc}")
 
+        try:
+            from hermes_cli.ui_work_routing import opencode_ui_work_worker_config
+        except Exception:
+            opencode_ui_work_worker_config = None
+
         def _touch_opencode_activity(event: dict) -> None:
             try:
                 event_type = str(event.get("type") or event.get("method") or "event")
@@ -1221,7 +1225,13 @@ def delegate_coding_task(
             "title": "Hermes delegated coding task",
             "on_event": _touch_opencode_activity,
         }
+        if opencode_ui_work_worker_config is not None and ui_route is not None:
+            ui_opencode_config = opencode_ui_work_worker_config(ui_route)
+            if ui_opencode_config:
+                opencode_kwargs["worker_config"] = ui_opencode_config
         if allow_git_pr_lifecycle:
+            opencode_kwargs["env"] = worker_env
+        elif ui_route is not None and ui_route.matched and ui_route.enabled:
             opencode_kwargs["env"] = worker_env
         result = _call_opencode_task(
             run_opencode_task,
