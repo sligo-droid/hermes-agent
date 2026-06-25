@@ -495,6 +495,22 @@ def _coding_worker_basic_env(parent_agent: Any) -> dict[str, str]:
     return env
 
 
+def _allow_ui_route_provider_env(env: dict[str, str], ui_route: Any) -> None:
+    """Allow only the provider credential required by an explicit UI Codex route."""
+    if (
+        ui_route is None
+        or not getattr(ui_route, "matched", False)
+        or not getattr(ui_route, "enabled", False)
+        or getattr(ui_route, "backend", "") != "codex"
+        or str(getattr(ui_route, "provider", "") or "").strip().lower() != "openrouter"
+    ):
+        return
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        return
+    env["_HERMES_FORCE_OPENROUTER_API_KEY"] = key
+
+
 def _trusted_git_pr_lifecycle_enabled(
     parent_agent: Any,
     requested: bool,
@@ -1179,6 +1195,7 @@ def delegate_coding_task(
         if allow_git_pr_lifecycle
         else _coding_worker_basic_env(parent_agent)
     )
+    _allow_ui_route_provider_env(worker_env, ui_route)
 
     if backend == BACKEND_OPENCODE:
         try:

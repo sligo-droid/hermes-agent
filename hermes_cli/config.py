@@ -2064,6 +2064,8 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Scheduler provider plugin. Empty = built-in in-process ticker.
+        "provider": "",
         # Wrap delivered cron responses with a header (task name) and footer
         # ("The agent cannot see this message").  Set to false for clean output.
         "wrap_response": True,

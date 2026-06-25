@@ -172,14 +172,26 @@ def cron_tick():
 
 def cron_status():
     """Show cron execution status."""
-    from cron.jobs import audit_overdue_self_improvement_proposals, list_jobs
+    from cron.jobs import (
+        audit_overdue_self_improvement_proposals,
+        get_ticker_heartbeat_age,
+        get_ticker_success_age,
+        list_jobs,
+    )
     from hermes_cli.gateway import get_gateway_runtime_health
 
     print()
 
     health = get_gateway_runtime_health()
     if health.running:
-        print(color("✓ Gateway is running — cron jobs will fire automatically", Colors.GREEN))
+        heartbeat_age = get_ticker_heartbeat_age()
+        success_age = get_ticker_success_age()
+        if heartbeat_age is None or heartbeat_age > 300:
+            print(color("⚠ Gateway is running but cron ticker is STALLED", Colors.YELLOW))
+        elif success_age is None or success_age > 300:
+            print(color("⚠ Gateway is running but no tick has succeeded recently", Colors.YELLOW))
+        else:
+            print(color("✓ Gateway is running — cron jobs will fire automatically", Colors.GREEN))
         if health.source == "runtime_heartbeat":
             print(f"  Runtime heartbeat: {health.gateway_state} (PID: {health.pid or 'unknown'})")
             print("  Process/service not visible from this namespace; using fresh profile runtime status.")

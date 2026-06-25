@@ -2495,7 +2495,98 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def tick(verbose: bool = True, adapters=None, loop=None) -> int:
+def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = True) -> bool:
+    """Run one cron job through the shared execute/save/deliver/mark path.
+
+    Used by external scheduler providers and immediate cron-tool runs after
+    they have claimed a due fire via ``claim_job_for_fire``. The built-in ticker
+    keeps its own due-job loop but should stay behaviorally aligned with this
+    helper.
+    """
+    manual_run = job.get("manual_run") if isinstance(job.get("manual_run"), dict) else None
+    manual_run_id = manual_run.get("run_id") if manual_run and manual_run.get("state") == "queued" else None
+    output_file = None
+    if manual_run_id:
+        mark_manual_run_started(job["id"], manual_run_id, os.getpid())
+    try:
+        success, output, final_response, error = run_job(job)
+        final_response = str(final_response or "")
+        run_time = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if not str(output or "").strip():
+            status = "silent" if success and SILENT_MARKER in final_response.upper() else "empty"
+            output = _render_job_status_stub(
+                job,
+                status=status,
+                run_time=run_time,
+                message=(
+                    "Cron job intentionally produced no deliverable output."
+                    if status == "silent"
+                    else "Cron job returned an empty output artifact."
+                ),
+            )
+        output_file = save_job_output(job["id"], output)
+        if manual_run_id:
+            mark_manual_run_finished(
+                job["id"],
+                manual_run_id,
+                success=success,
+                output_path=str(output_file),
+                error=error,
+            )
+        if verbose:
+            logger.info("Output saved to: %s", output_file)
+
+        deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+        should_deliver = bool(deliver_content.strip())
+        if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+            logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+            should_deliver = False
+
+        if should_deliver:
+            _ingest_self_improvement_proposal_output(job, output, Path(output_file), final_response)
+
+        delivery_error = None
+        if should_deliver:
+            try:
+                delivery_error = _deliver_result(
+                    job,
+                    deliver_content,
+                    adapters=adapters,
+                    loop=loop,
+                )
+            except Exception as de:
+                delivery_error = str(de)
+                logger.error("Delivery failed for job %s: %s", job["id"], de)
+
+        if success and not final_response.strip():
+            success = False
+            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+        terminal_success_reason = _terminal_success_reason(job, success, final_response)
+        mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        if terminal_success_reason:
+            mark_job_terminal_success(
+                job["id"],
+                output_path=str(output_file),
+                reason=terminal_success_reason,
+            )
+        return bool(success)
+
+    except Exception as e:
+        logger.error("Error processing job %s: %s", job['id'], e)
+        if manual_run_id:
+            mark_manual_run_finished(
+                job["id"],
+                manual_run_id,
+                success=False,
+                error=str(e),
+            )
+        mark_job_run(job["id"], False, str(e))
+        return False
+
+
+def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = False) -> int:
     """
     Check and run all due jobs.
     
@@ -2573,114 +2664,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark."""
-            manual_run = job.get("manual_run") if isinstance(job.get("manual_run"), dict) else None
-            manual_run_id = manual_run.get("run_id") if manual_run and manual_run.get("state") == "queued" else None
-            run_time = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
-            running_stub = _render_job_status_stub(
-                job,
-                status="running",
-                run_time=run_time,
-                message="Cron job is running; this artifact will be atomically replaced at closeout.",
-            )
-            output_file = save_job_output(job["id"], running_stub)
-            if manual_run_id:
-                mark_manual_run_started(job["id"], manual_run_id, os.getpid(), output_path=str(output_file))
-            try:
-                success, output, final_response, error = run_job(job)
-
-                if not str(output or "").strip():
-                    status = "silent" if success and SILENT_MARKER in str(final_response or "").upper() else "empty"
-                    output = _render_job_status_stub(
-                        job,
-                        status=status,
-                        run_time=run_time,
-                        message=(
-                            "Cron job intentionally produced no deliverable output."
-                            if status == "silent"
-                            else "Cron job returned an empty output artifact."
-                        ),
-                    )
-                if output_file:
-                    update_job_output(output_file, output)
-                if manual_run_id:
-                    mark_manual_run_finished(
-                        job["id"],
-                        manual_run_id,
-                        success=success,
-                        output_path=str(output_file),
-                        error=error,
-                    )
-                if verbose:
-                    logger.info("Output saved to: %s", output_file)
-                # Deliver the final response to the origin/target chat.
-                # If the agent responded with [SILENT], skip delivery (but
-                # output is already saved above).  Failed jobs always deliver.
-                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
-                # Treat whitespace-only final responses the same as empty
-                # responses: do not deliver a blank message, and let the
-                # empty-response guard below mark the run as a soft failure.
-                should_deliver = bool(deliver_content.strip())
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-                    should_deliver = False
-
-                if should_deliver:
-                    _ingest_self_improvement_proposal_output(job, output, Path(output_file), final_response)
-
-                delivery_error = None
-                if should_deliver:
-                    try:
-                        delivery_error = _deliver_result(
-                            job,
-                            deliver_content,
-                            adapters=adapters,
-                            loop=loop,
-                            cron_feature_summaries=success,
-                        )
-                    except Exception as de:
-                        delivery_error = str(de)
-                        logger.error("Delivery failed for job %s: %s", job["id"], de)
-
-                # Treat empty final_response as a soft failure so last_status
-                # is not "ok" — the agent ran but produced nothing useful.
-                # (issue #8585)
-                if success and not final_response.strip():
-                    success = False
-                    error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
-
-                terminal_success_reason = _terminal_success_reason(job, success, final_response)
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-                if terminal_success_reason:
-                    mark_job_terminal_success(
-                        job["id"],
-                        output_path=str(output_file),
-                        reason=terminal_success_reason,
-                    )
-                return True
-
-            except Exception as e:
-                logger.error("Error processing job %s: %s", job['id'], e)
-                failed_stub = _render_job_status_stub(
-                    job,
-                    status="failed",
-                    run_time=run_time,
-                    error_class=type(e).__name__,
-                    message=f"Cron job failed before final output closeout: {e}",
-                )
-                try:
-                    if output_file:
-                        update_job_output(output_file, failed_stub)
-                except Exception as write_exc:
-                    logger.error("Error writing failure output for job %s: %s", job["id"], write_exc)
-                if manual_run_id:
-                    mark_manual_run_finished(
-                        job["id"],
-                        manual_run_id,
-                        success=False,
-                        error=str(e),
-                    )
-                mark_job_run(job["id"], False, str(e))
-                return False
+            return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
 
         # Partition due jobs: jobs with a per-job workdir and/or profile touch
         # process-global runtime state inside run_job. Workdir jobs temporarily

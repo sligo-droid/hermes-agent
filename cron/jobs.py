@@ -44,6 +44,8 @@ JOBS_FILE = CRON_DIR / "jobs.json"
 # concurrent mark_job_run / advance_next_run calls can clobber each other.
 _jobs_file_lock = threading.Lock()
 OUTPUT_DIR = CRON_DIR / "output"
+TICKER_HEARTBEAT_FILE = CRON_DIR / "ticker_heartbeat"
+TICKER_SUCCESS_FILE = CRON_DIR / "ticker_last_success"
 ONESHOT_GRACE_SECONDS = 120
 
 # Fields on a cron job that must never change after creation. ``id`` is used
@@ -176,12 +178,95 @@ def _secure_file(path: Path):
         pass
 
 
+def _refresh_cron_paths_from_home() -> None:
+    global HERMES_DIR, CRON_DIR, JOBS_FILE, OUTPUT_DIR, TICKER_HEARTBEAT_FILE, TICKER_SUCCESS_FILE
+
+    current_home = get_hermes_home().resolve()
+    if current_home == HERMES_DIR:
+        return
+
+    old_cron_dir = HERMES_DIR / "cron"
+    old_jobs_file = old_cron_dir / "jobs.json"
+    old_output_dir = old_cron_dir / "output"
+    old_heartbeat_file = old_cron_dir / "ticker_heartbeat"
+    old_success_file = old_cron_dir / "ticker_last_success"
+
+    HERMES_DIR = current_home
+    new_cron_dir = HERMES_DIR / "cron"
+    cron_dir_was_default = CRON_DIR == old_cron_dir
+    if cron_dir_was_default:
+        CRON_DIR = new_cron_dir
+
+    # Preserve explicit test/runtime monkeypatches, but do not let a temporary
+    # CRON_DIR monkeypatch poison the core jobs path when HERMES_HOME changes
+    # during the same worker process. Default dependents follow the new home;
+    # custom dependents remain custom until their monkeypatch restores them.
+    dependent_base = new_cron_dir if cron_dir_was_default else new_cron_dir
+    if JOBS_FILE == old_jobs_file:
+        JOBS_FILE = dependent_base / "jobs.json"
+    if OUTPUT_DIR == old_output_dir:
+        OUTPUT_DIR = dependent_base / "output"
+    if TICKER_HEARTBEAT_FILE == old_heartbeat_file:
+        TICKER_HEARTBEAT_FILE = dependent_base / "ticker_heartbeat"
+    if TICKER_SUCCESS_FILE == old_success_file:
+        TICKER_SUCCESS_FILE = dependent_base / "ticker_last_success"
+
+
 def ensure_dirs():
     """Ensure cron directories exist with secure permissions."""
+    _refresh_cron_paths_from_home()
     CRON_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     _secure_dir(CRON_DIR)
     _secure_dir(OUTPUT_DIR)
+
+
+def _atomic_write_epoch(path: Path, value: float) -> None:
+    ensure_dirs()
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix='.tmp', prefix='.hb_')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(str(value))
+            f.flush()
+            os.fsync(f.fileno())
+        atomic_replace(tmp_path, path)
+        _secure_file(path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def record_ticker_heartbeat(success: bool = False, now: Optional[datetime] = None) -> None:
+    """Record scheduler liveness, and success when a tick completes cleanly."""
+    try:
+        epoch = (now or _hermes_now()).timestamp()
+        _atomic_write_epoch(TICKER_HEARTBEAT_FILE, epoch)
+        if success:
+            _atomic_write_epoch(TICKER_SUCCESS_FILE, epoch)
+    except Exception:
+        return
+
+
+def _ticker_age(path: Path, now: Optional[datetime] = None) -> Optional[float]:
+    try:
+        raw = path.read_text(encoding='utf-8').strip()
+        if not raw:
+            return None
+        current = (now or _hermes_now()).timestamp()
+        return max(0.0, current - float(raw))
+    except Exception:
+        return None
+
+
+def get_ticker_heartbeat_age(now: Optional[datetime] = None) -> Optional[float]:
+    return _ticker_age(TICKER_HEARTBEAT_FILE, now=now)
+
+
+def get_ticker_success_age(now: Optional[datetime] = None) -> Optional[float]:
+    return _ticker_age(TICKER_SUCCESS_FILE, now=now)
 
 
 # =============================================================================
@@ -659,6 +744,8 @@ def load_jobs() -> List[Dict[str, Any]]:
 def save_jobs(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage."""
     ensure_dirs()
+    JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _secure_dir(JOBS_FILE.parent)
     fd, tmp_path = tempfile.mkstemp(dir=str(JOBS_FILE.parent), suffix='.tmp', prefix='.jobs_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1233,6 +1320,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
                 job["last_error"] = error if not success else None
+                job["fire_claim"] = None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
                 
@@ -1347,6 +1435,83 @@ def advance_next_run(job_id: str) -> bool:
                     return True
                 return False
         return False
+
+
+def claim_job_for_fire(job_id: str, claim_ttl_seconds: int = 600) -> bool:
+    """Atomically claim a due cron job fire.
+
+    External schedulers and immediate/manual runs call this before executing a
+    job outside the built-in ticker. The claim is a storage-level compare and
+    set: only a job whose ``next_run_at`` is currently due can be claimed. A
+    successful claim advances/clears ``next_run_at`` before execution so a
+    concurrent retry or gateway tick cannot run the same fire twice.
+
+    Returns ``True`` when this caller owns the fire, otherwise ``False``.
+    """
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        now_dt = _hermes_now()
+        now_iso = now_dt.isoformat()
+
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            if not job.get("enabled", True) or job.get("state") == "paused":
+                return False
+
+            claim = job.get("fire_claim") if isinstance(job.get("fire_claim"), dict) else None
+            if claim:
+                claimed_at = _parse_cron_timestamp(claim.get("claimed_at"))
+                if claimed_at and (now_dt - claimed_at).total_seconds() < claim_ttl_seconds:
+                    return False
+
+            manual = job.get("manual_run") if isinstance(job.get("manual_run"), dict) else None
+            if manual and manual.get("state") == "running":
+                return False
+
+            next_run = job.get("next_run_at")
+            if not next_run:
+                return False
+
+            try:
+                next_run_dt = _ensure_aware(datetime.fromisoformat(next_run))
+            except (TypeError, ValueError):
+                logger.error("claim_job_for_fire: invalid next_run_at for job %s: %r", job_id, next_run)
+                return False
+
+            schedule = job.get("schedule", {}) if isinstance(job.get("schedule"), dict) else {}
+            kind = schedule.get("kind")
+            if kind in {"cron", "interval"}:
+                grace = _compute_grace_seconds(schedule)
+                if (now_dt - next_run_dt).total_seconds() > grace:
+                    new_next = compute_next_run(schedule, now_iso)
+                    if new_next:
+                        job["next_run_at"] = new_next
+                        save_jobs(jobs)
+                    return False
+
+                new_next = compute_next_run(schedule, now_iso)
+                if not new_next:
+                    return False
+                job["next_run_at"] = new_next
+                if job.get("state") != "paused":
+                    job["state"] = "scheduled"
+            else:
+                # One-shot/manual fire: clear the due timestamp so a retry does
+                # not also win before mark_job_run disables/completes the job.
+                job["next_run_at"] = None
+                if job.get("state") != "paused":
+                    job["state"] = "running"
+
+            job["fire_claim"] = {
+                "claimed_at": now_iso,
+                "claimed_for": next_run,
+                "token": uuid.uuid4().hex,
+            }
+            save_jobs(jobs)
+            return True
+
+    return False
 
 
 def get_due_jobs() -> List[Dict[str, Any]]:
