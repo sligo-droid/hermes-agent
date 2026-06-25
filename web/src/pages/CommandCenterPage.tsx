@@ -25,6 +25,7 @@ import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@nous-research/ui/ui/components/card";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { api } from "@/lib/api";
+import { commandCenterLoadingState } from "@/lib/command-center-loading-state";
 import type {
   AccountUsageResponse,
   CommandCenterAnnotationMode,
@@ -1410,6 +1411,14 @@ export default function CommandCenterPage() {
   const projectSearch = useMemo(() => `?project=${encodeURIComponent(selectedProject)}`, [selectedProject]);
   const snapshotProject = snapshot?.current_project?.toLowerCase() || selectedProject;
   const projectSwitchPending = Boolean(snapshot && snapshotProject !== selectedProject && !error);
+  const loadingState = useMemo(
+    () => commandCenterLoadingState({ loading, snapshot, projectSwitchPending }),
+    [loading, snapshot, projectSwitchPending],
+  );
+  const switchingProjectLabel = useMemo(() => {
+    const found = snapshot?.projects?.find((project) => project.key === selectedProject);
+    return found?.label || selectedProject;
+  }, [selectedProject, snapshot?.projects]);
   const toggleSelected = useCallback((id: string) => {
     setSelectedIds((current) => {
       const next = new Set(current);
@@ -1575,17 +1584,19 @@ export default function CommandCenterPage() {
         </Card>
       )}
 
-      {loading && snapshot && !projectSwitchPending ? (
+      {loadingState === "refreshing" ? (
         <div className="flex items-center gap-2 text-xs text-slate-400" role="status" aria-live="polite">
           <Spinner className="h-3 w-3" /> Refreshing…
         </div>
       ) : null}
 
-      {loading && !snapshot ? (
-        <Card className="command-center-loading-card border-white/10 bg-white/[0.035]">
+      {loadingState === "initial" || loadingState === "switching" ? (
+        <Card className="command-center-loading-card border-white/10 bg-white/[0.035]" role="status" aria-live="polite">
           <CardContent className="flex flex-col items-center gap-4 py-20 text-slate-300">
             <Spinner />
-            <div className="text-sm font-semibold text-slate-200">Loading Command Center…</div>
+            <div className="text-sm font-semibold text-slate-200">
+              {loadingState === "switching" ? `Loading ${switchingProjectLabel}…` : "Loading Command Center…"}
+            </div>
             <div className="w-full max-w-md space-y-2" aria-hidden="true">
               <div className="h-3 rounded-full bg-white/[0.06]" />
               <div className="h-3 w-4/5 rounded-full bg-white/[0.045]" />
