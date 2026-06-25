@@ -2803,28 +2803,53 @@ class DiscordAdapter(BasePlatformAdapter):
             "build", "create", "add", "implement", "fix", "change", "update",
             "remove", "delete", "ship", "deploy", "make", "refactor", "wire",
             "integrate", "set up", "setup", "turn on", "enable", "disable",
-            "support", "replace", "migrate", "simplify", "clean up",
+            "support", "replace", "migrate", "simplify", "clean up", "run",
+            "rerun", "re-run", "execute", "regenerate",
         )
         feature_phrases = (
             "please build", "please create", "please add", "please implement",
             "please fix", "please update", "please change", "please remove",
+            "please run", "please rerun", "please re-run", "please execute",
             "can you build", "can you create", "can you add", "can you implement",
+            "can you run", "can you rerun", "can you re-run", "can you execute",
             "can we add", "can we make", "can we support", "could we add",
             "could we make", "could you add", "could you fix", "could you update",
+            "could you run", "could you rerun", "could you re-run", "could you execute",
             "we need to build", "we need to add", "we need to fix", "we need to update",
+            "we need to run", "we need to rerun", "we need to re-run", "we need to execute",
             "we need a", "we should add", "we should make", "we should support",
+            "we should run", "we should rerun", "we should re-run", "we should execute",
             "i need you to build", "i need you to add", "i need you to fix",
+            "i need you to run", "i need you to rerun", "i need you to re-run",
+            "i need you to execute", "run the pipeline", "run the entire pipeline",
+            "execute the pipeline", "execute the entire pipeline",
             "feature request", "new feature", "bug fix", "make the app",
         )
         direct_starts = (
             "hello", "hi", "hey", "thanks", "thank you", "ok", "okay",
             "quick question", "question:",
         )
+        leading_ack = re.sub(
+            r"^(?:ok|okay|sure|great|cool|thanks|thank you)[\s,!.:\-]+",
+            "",
+            cleaned,
+        ).strip()
+        intent_candidates = tuple(dict.fromkeys(c for c in (cleaned, leading_ack) if c))
+
+        def _starts_any(candidate: str, prefixes: tuple[str, ...]) -> bool:
+            return candidate.startswith(prefixes)
+
+        def _has_feature_intent() -> bool:
+            return any(
+                _starts_any(candidate, feature_starts)
+                or any(phrase in candidate for phrase in feature_phrases)
+                for candidate in intent_candidates
+            )
 
         if cleaned.endswith("?") or cleaned.startswith(question_starts):
-            if not cleaned.startswith(feature_starts) and not any(p in cleaned for p in feature_phrases):
+            if not _has_feature_intent():
                 return False
-        if cleaned.startswith(feature_starts) or any(p in cleaned for p in feature_phrases):
+        if _has_feature_intent():
             return True
         if cleaned in direct_starts or cleaned.startswith(tuple(f"{p} " for p in direct_starts)):
             return False
