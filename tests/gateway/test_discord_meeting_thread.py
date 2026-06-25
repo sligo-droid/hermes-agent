@@ -34,7 +34,7 @@ async def test_bare_text_meeting_command_creates_thread_anchored_to_audio_messag
     monkeypatch.setattr(adapter, "_cache_discord_audio", fake_cache)
     monkeypatch.setattr(adapter, "handle_message", fake_handle)
     classifier = AsyncMock(return_value=False)
-    monkeypatch.setattr(adapter, "_classify_discord_feature_request", classifier)
+    monkeypatch.setattr(adapter, "_classify_discord_action_request", classifier)
     feature_summary = AsyncMock()
     feature_summary.return_value = {"thread_id": "777", "message_id": "summary-1"}
     monkeypatch.setattr(adapter, "initialize_feature_summary", feature_summary)
@@ -104,7 +104,7 @@ async def test_mentioned_meeting_command_with_audio_canonicalizes_after_mention_
     monkeypatch.setattr(adapter, "_cache_discord_audio", fake_cache)
     monkeypatch.setattr(adapter, "handle_message", fake_handle)
     classifier = AsyncMock(return_value=False)
-    monkeypatch.setattr(adapter, "_classify_discord_feature_request", classifier)
+    monkeypatch.setattr(adapter, "_classify_discord_action_request", classifier)
 
     guild = SimpleNamespace(id=42, name="Guild")
     channel = SimpleNamespace(id=12345, name="general", guild=guild)
@@ -159,7 +159,7 @@ async def test_mentioned_audio_without_meeting_command_triggers_meeting_intake(a
     monkeypatch.setattr(adapter, "_cache_discord_audio", fake_cache)
     monkeypatch.setattr(adapter, "handle_message", fake_handle)
     classifier = AsyncMock(return_value=False)
-    monkeypatch.setattr(adapter, "_classify_discord_feature_request", classifier)
+    monkeypatch.setattr(adapter, "_classify_discord_action_request", classifier)
     feature_summary = AsyncMock()
     feature_summary.return_value = {"thread_id": "778", "message_id": "summary-2"}
     monkeypatch.setattr(adapter, "initialize_feature_summary", feature_summary)
@@ -215,7 +215,7 @@ async def test_mentioned_text_without_audio_does_not_trigger_meeting_intake(adap
 
     monkeypatch.setattr(adapter, "handle_message", fake_handle)
     classifier = AsyncMock(return_value=False)
-    monkeypatch.setattr(adapter, "_classify_discord_feature_request", classifier)
+    monkeypatch.setattr(adapter, "_classify_discord_action_request", classifier)
     # This test isolates the meeting-intake gate: plain mentioned text should
     # not be promoted to /meeting. Disable the separate generic auto-thread
     # path so its direct-question thread creation does not mask that assertion.
@@ -269,7 +269,7 @@ async def test_bare_text_meeting_command_reuses_existing_recording_thread(adapte
 
     monkeypatch.setattr(adapter, "_cache_discord_audio", fake_cache)
     monkeypatch.setattr(adapter, "handle_message", fake_handle)
-    monkeypatch.setattr(adapter, "_classify_discord_feature_request", AsyncMock(return_value=False))
+    monkeypatch.setattr(adapter, "_classify_discord_action_request", AsyncMock(return_value=False))
 
     guild = SimpleNamespace(id=42, name="Guild")
     channel = SimpleNamespace(id=12345, name="general", guild=guild)

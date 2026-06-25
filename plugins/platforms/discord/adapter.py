@@ -118,8 +118,8 @@ _OBSIDIAN_PROJECT_ACCESS_HEADINGS = {
     "demo credentials",
 }
 _DISCORD_DIRECT_QUESTION_PROMPT = (
-    "This Discord trigger was classified as a direct question/request, not a "
-    "feature request. Answer in place. Do not start a branch, PR, deployment, "
+    "This Discord trigger was classified as a direct question, not an "
+    "action request. Answer in place. Do not start a branch, PR, deployment, "
     "feature summary, or long-lived client-project coding workflow unless the "
     "user explicitly asks for implementation work."
 )
@@ -2786,7 +2786,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.debug("[%s] Failed to clear Discord terminal summary sync flag", self.name, exc_info=True)
         return str(target.get("sync_key") or board)
 
-    def _heuristic_feature_request_intent(self, text: str) -> Optional[bool]:
+    def _heuristic_action_request_intent(self, text: str) -> Optional[bool]:
         cleaned = re.sub(r"<@[!&]?\d+>", "", str(text or "")).strip()
         cleaned = re.sub(r"<#\d+>", "", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
@@ -2823,7 +2823,7 @@ class DiscordAdapter(BasePlatformAdapter):
             "i need you to run", "i need you to rerun", "i need you to re-run",
             "i need you to execute", "run the pipeline", "run the entire pipeline",
             "execute the pipeline", "execute the entire pipeline",
-            "feature request", "new feature", "bug fix", "make the app",
+            "action request", "feature request", "new feature", "bug fix", "make the app",
         )
         direct_starts = (
             "hello", "hi", "hey", "thanks", "thank you", "ok", "okay",
@@ -2854,6 +2854,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if cleaned in direct_starts or cleaned.startswith(tuple(f"{p} " for p in direct_starts)):
             return False
         return None
+
+    def _heuristic_feature_request_intent(self, text: str) -> Optional[bool]:
+        return self._heuristic_action_request_intent(text)
 
     def _contains_discord_message_link(self, text: str) -> bool:
         return bool(
@@ -2904,18 +2907,18 @@ class DiscordAdapter(BasePlatformAdapter):
             return True
         return False
 
-    async def _classify_discord_feature_request(self, text: str) -> bool:
+    async def _classify_discord_action_request(self, text: str) -> bool:
         if not str(text or "").strip():
             return False
-        heuristic = self._heuristic_feature_request_intent(text)
+        heuristic = self._heuristic_action_request_intent(text)
         if heuristic is not None:
             return heuristic
 
         prompt = (
             "Classify this Discord message for a software-development assistant.\n"
-            "Return exactly one word: feature or question.\n\n"
-            "feature = the user is asking Hermes to implement, change, fix, deploy, "
-            "or otherwise perform project work that should get a feature thread.\n"
+            "Return exactly one word: action or question.\n\n"
+            "action = the user is asking Hermes to implement, change, fix, deploy, run, "
+            "or otherwise do something that should get an action thread.\n"
             "question = the user is asking for an explanation, status, advice, or "
             "short direct answer, even if it is about code.\n\n"
             f"Message:\n{text[:2000]}"
@@ -2929,7 +2932,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a strict intent classifier. Return only feature or question.",
+                        "content": "You are a strict intent classifier. Return only action or question.",
                     },
                     {"role": "user", "content": prompt},
                 ],
@@ -2938,14 +2941,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 timeout=self._feature_triage_timeout_seconds(),
             )
             verdict = (response.choices[0].message.content or "").strip().lower()
-            if verdict.startswith("feature"):
+            if verdict.startswith("action") or verdict.startswith("feature"):
                 return True
             if verdict.startswith("question"):
                 return False
         except Exception as exc:
-            logger.debug("[%s] Discord feature-request triage failed: %s", self.name, exc)
+            logger.debug("[%s] Discord action-request triage failed: %s", self.name, exc)
 
         return False
+
+    async def _classify_discord_feature_request(self, text: str) -> bool:
+        return await self._classify_discord_action_request(text)
 
     async def _preprocess_voice_for_feature_triage(
         self,
@@ -7285,10 +7291,14 @@ class DiscordAdapter(BasePlatformAdapter):
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
 
-    def _discord_feature_request_channels(self) -> set:
-        """Return channel IDs where incoming asks should skip LLM triage."""
-        raw = self.config.extra.get("feature_request_channels")
+    def _discord_action_request_channels(self) -> set:
+        """Return channel IDs where incoming action asks should skip LLM triage."""
+        raw = self.config.extra.get("action_request_channels")
+        if raw in (None, ""):
+            raw = self.config.extra.get("feature_request_channels")
         if raw is None:
+            raw = os.getenv("DISCORD_ACTION_REQUEST_CHANNELS", "")
+        if raw in (None, ""):
             raw = os.getenv("DISCORD_FEATURE_REQUEST_CHANNELS", "")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
@@ -7296,6 +7306,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if s:
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
+
+    def _discord_feature_request_channels(self) -> set:
+        return self._discord_action_request_channels()
 
     def _discord_history_backfill_feature_channels(self) -> bool:
         """Return whether known feature channels should fetch mention history."""
@@ -7522,7 +7535,7 @@ class DiscordAdapter(BasePlatformAdapter):
         """Return root project channels known to Hermes' Discord project map.
 
         Project channels like ``#pid`` are often not listed in
-        ``allowed_channels`` / ``feature_request_channels`` because normal
+        ``allowed_channels`` / ``action_request_channels`` because normal
         routing resolves them through the project mapping DB.  Recovery must
         include those exact mapped roots, but only those roots — never every
         guild channel — to avoid historical sweeps.
@@ -7565,7 +7578,7 @@ class DiscordAdapter(BasePlatformAdapter):
         ids.update(self._discord_channel_cwd_root_channel_ids())
         ids.update(self._discord_project_mapping_root_channel_ids())
         ids.update(ch for ch in self._discord_free_response_channels() if ch != "*")
-        ids.update(ch for ch in self._discord_feature_request_channels() if ch != "*")
+        ids.update(ch for ch in self._discord_action_request_channels() if ch != "*")
         ids.update(ch for ch in self._discord_no_thread_channel_ids() if ch != "*")
         try:
             state = self._read_discord_root_mention_recovery_state()
@@ -9687,11 +9700,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 return
 
             free_channels = self._discord_free_response_channels()
-            feature_channels = self._discord_feature_request_channels()
+            action_channels = self._discord_action_request_channels()
             if parent_channel_id:
                 channel_ids.add(parent_channel_id)
-            is_feature_request_channel = (
-                "*" in feature_channels or bool(channel_ids & feature_channels)
+            is_action_request_channel = (
+                "*" in action_channels or bool(channel_ids & action_channels)
             )
 
             require_mention = self._discord_require_mention()
@@ -9732,10 +9745,10 @@ class DiscordAdapter(BasePlatformAdapter):
         project_context = project_context_obj.to_dict() if project_context_obj else None
         preprocessed_attachment_media: Dict[int, Tuple[str, str]] = {}
         direct_question_prompt = False
-        feature_request_intent: Optional[bool] = None
-        voice_feature_transcript = ""
+        action_request_intent: Optional[bool] = None
+        voice_action_transcript = ""
 
-        # Auto-thread: when enabled, automatically create a thread for feature
+        # Auto-thread: when enabled, automatically create a thread for action
         # requests in text channels so each implementation conversation is
         # isolated. Explicitly tagged direct questions also get a thread, but
         # skip the feature-summary embed.
@@ -9794,14 +9807,14 @@ class DiscordAdapter(BasePlatformAdapter):
                         message_is_voice=message_is_voice,
                     )
                     triage_text = voice_triage_text
-                    voice_feature_transcript = voice_triage_text
-                feature_request_intent = (
+                    voice_action_transcript = voice_triage_text
+                action_request_intent = (
                     True
-                    if has_discord_message_link or slash_command_starts_threaded_work or is_feature_request_channel
-                    else await self._classify_discord_feature_request(triage_text)
+                    if has_discord_message_link or slash_command_starts_threaded_work or is_action_request_channel
+                    else await self._classify_discord_action_request(triage_text)
                 )
                 self._mark_discord_stage(_intake_timing, "triage", _stage_started)
-                direct_question_prompt = not feature_request_intent
+                direct_question_prompt = not action_request_intent
 
             should_auto_thread_direct_question = bool(
                 direct_question_prompt
@@ -9811,7 +9824,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
             )
             if should_consider_auto_thread and (
-                feature_request_intent or should_auto_thread_direct_question
+                action_request_intent or should_auto_thread_direct_question
             ):
                 _stage_started = time.perf_counter()
                 thread = await self._auto_create_thread(message)
@@ -9830,7 +9843,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     )
 
         if (
-            feature_request_intent is None
+            action_request_intent is None
             and not is_meeting_command_message
             and not grill_me_trigger
             and (
@@ -9839,13 +9852,13 @@ class DiscordAdapter(BasePlatformAdapter):
             )
         ):
             _stage_started = time.perf_counter()
-            feature_request_intent = (
+            action_request_intent = (
                 True
-                if is_feature_request_channel
-                else await self._classify_discord_feature_request(normalized_content)
+                if is_action_request_channel
+                else await self._classify_discord_action_request(normalized_content)
             )
             self._mark_discord_stage(_intake_timing, "triage", _stage_started)
-            direct_question_prompt = not feature_request_intent
+            direct_question_prompt = not action_request_intent
 
         project_summary_handle = None
         feature_summary_handle = None
@@ -9871,14 +9884,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 parent_channel=message.channel,
                 initial_request=normalized_content,
                 project_context=project_context,
-                transcript_quote=voice_feature_transcript if message_is_voice else None,
+                transcript_quote=voice_action_transcript if message_is_voice else None,
                 source_message_id=str(message.id),
             )
             self._mark_discord_stage(_intake_timing, "feature_summary", _stage_started)
         elif (
             is_thread
             and not slash_goal_uses_attachment_body
-            and (slash_command_starts_threaded_work or feature_request_intent is True)
+            and (slash_command_starts_threaded_work or action_request_intent is True)
         ):
             _stage_started = time.perf_counter()
             feature_summary_handle = await self.initialize_feature_summary(
@@ -10154,8 +10167,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not in_bot_thread
             )
             _backfill_enabled = self._discord_history_backfill()
-            _skip_feature_channel_backfill = (
-                is_feature_request_channel
+            _skip_action_channel_backfill = (
+                is_action_request_channel
                 and not self._discord_history_backfill_feature_channels()
             )
             _skip_auto_threaded_direct_question_backfill = (
@@ -10165,7 +10178,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if (
                 (_needed_mention or is_thread)
                 and _backfill_enabled
-                and not _skip_feature_channel_backfill
+                and not _skip_action_channel_backfill
                 and not _skip_auto_threaded_direct_question_backfill
                 and auto_threaded_channel is None
             ):

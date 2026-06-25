@@ -963,7 +963,7 @@ def _deliver_result(
             send_metadata = {"thread_id": thread_id} if thread_id else None
             cron_pr_urls = _extract_github_pr_urls(content) if cron_feature_summaries else []
             try:
-                # For Discord cron PR reports, create the Simple Feature Request
+                # For Discord cron PR reports, create the simple action-request
                 # / feature-summary embed first, then send the detailed text body.
                 # This keeps the channel visually anchored on the rich summary and
                 # makes the follow-up read like the post-embed evidence block.

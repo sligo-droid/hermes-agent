@@ -154,9 +154,9 @@ Current UX intention is tracked in `docs/project-state.md`; update that file whe
 6. **Compact first, rich on demand.** Work Item rows render compact `summary`/`body_preview` text by default. When `full_description` is present, the UI exposes a quiet per-row `Full context` disclosure/dropdown with a chevron. It preserves line breaks, renders plain text, and does not navigate away from the row.
 7. **UI chrome stays quiet.** Use one shell header/refresh area, one Work State lane, a left work list, and a right detail/audit pane. Avoid duplicate refresh rows, KPI cards, status bars, and stale `Operator Surface` copy.
 
-## Feature Requests Without Worker Boards
+## Action Requests Without Worker Boards
 
-Feature requests should enter the Command Center as Work Items even before a dedicated Kanban worker board exists. The request row should use a stable `source_ref` that points at the intake object, such as a Discord message, form submission, or manual operator record, and should remain separate from child worker tickets.
+Action requests should enter the Command Center as Work Items even before a dedicated Kanban worker board exists. The request row should use a stable `source_ref` that points at the intake object, such as a Discord message, form submission, or manual operator record, and should remain separate from child worker tickets.
 
 If the request later receives a worker board, attach the board slug to the Work Item execution metadata and let the board become the active execution rollup. The Work Item remains the canonical request identity; the board contributes task counts, run history, artifacts, and worker-board links.
 
@@ -164,7 +164,7 @@ Status ownership belongs to the Work Item until a worker board is attached. Afte
 
 Artifacts should be collected on the Work Item regardless of whether they originate from intake or execution. Examples include source links, Discord thread URLs, worker-board URLs, run summaries, pull requests, deployment notes, and follow-up decisions.
 
-The UI should group individual feature request cards apart from worker-board cards. Request cards should be labeled by source kind and request title, while worker-board cards should use `kanban-board:<slug>` identities and board/source badges. This prevents standalone requests from looking like individual worker tickets and keeps ticket-level detail inside the board rollup or detail panel.
+The UI should group individual action-request cards apart from worker-board cards. An action request is any user ask for Hermes to do work, not just a product feature. Request cards should be labeled by source kind and request title, while worker-board cards should use `kanban-board:<slug>` identities and board/source badges. This prevents standalone requests from looking like individual worker tickets and keeps ticket-level detail inside the board rollup or detail panel.
 
 ## Verification
 
