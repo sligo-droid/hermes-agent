@@ -20,6 +20,7 @@ The fix:
 These tests pin the corrected behavior.
 """
 import asyncio
+import json
 import time
 from datetime import datetime, timezone
 from unittest.mock import patch
@@ -458,6 +459,59 @@ def test_anthropic_pkce_branch_still_works():
     body = resp.json()
     assert body["flow"] == "pkce"
     assert "claude.ai" in body["auth_url"]
+
+
+def test_anthropic_pkce_submit_uses_platform_then_console_fallback(monkeypatch):
+    from hermes_cli import web_server as ws
+
+    session_id = "anthropic-pkce-fallback-test"
+    ws._oauth_sessions[session_id] = {
+        "session_id": session_id,
+        "provider": "anthropic",
+        "flow": "pkce",
+        "created_at": time.time(),
+        "status": "pending",
+        "error_message": None,
+        "verifier": "verifier",
+        "state": "state",
+    }
+    token_urls = []
+
+    class _FakeResponse:
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def read(self):
+            return self._body
+
+    def fake_urlopen(req, *_a, **_kw):
+        token_urls.append(req.full_url)
+        if req.full_url == "https://platform.claude.com/v1/oauth/token":
+            raise OSError("platform 404")
+        return _FakeResponse(json.dumps({
+            "access_token": "dashboard-access",
+            "refresh_token": "dashboard-refresh",
+            "expires_in": 3600,
+        }).encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(ws, "_save_anthropic_oauth_creds", lambda *args: None)
+
+    try:
+        result = ws._submit_anthropic_pkce(session_id, "auth-code#state")
+        assert result == {"ok": True, "status": "approved"}
+        assert token_urls == [
+            "https://platform.claude.com/v1/oauth/token",
+            "https://console.anthropic.com/v1/oauth/token",
+        ]
+    finally:
+        ws._oauth_sessions.pop(session_id, None)
 
 
 def test_xai_oauth_listed_as_loopback_flow():

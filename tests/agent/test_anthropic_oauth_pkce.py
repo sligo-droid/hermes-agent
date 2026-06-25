@@ -84,6 +84,34 @@ def _patch_oauth_flow(
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
 
+class _FakeResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def _patch_oauth_login_with_urlopen(monkeypatch, captured_urls, fake_urlopen):
+    import builtins
+
+    monkeypatch.setattr("webbrowser.open", lambda url: captured_urls.setdefault("auth", url))
+    monkeypatch.setattr("hermes_cli.auth._can_open_graphical_browser", lambda: True)
+
+    def fake_input(*_a, **_kw):
+        qs = parse_qs(urlparse(captured_urls["auth"]).query)
+        return f"auth-code-from-anthropic#{qs['state'][0]}"
+
+    monkeypatch.setattr(builtins, "input", fake_input)
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+
 def test_authorization_url_state_is_not_pkce_verifier(monkeypatch, tmp_path):
     """The ``state`` parameter in the authorization URL must NOT equal the
     PKCE ``code_verifier``.
@@ -174,3 +202,55 @@ def test_callback_state_mismatch_aborts(monkeypatch, tmp_path, caplog):
     assert "url" not in captured_token, (
         "token exchange must NOT happen when state mismatches"
     )
+
+
+def test_token_exchange_tries_platform_endpoint_first(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    captured_urls: Dict[str, str] = {}
+    token_urls = []
+
+    def fake_urlopen(req, *_a, **_kw):
+        token_urls.append(req.full_url)
+        return _FakeResponse(json.dumps({
+            "access_token": "sk-ant-test-access",
+            "refresh_token": "sk-ant-test-refresh",
+            "expires_in": 3600,
+        }).encode())
+
+    _patch_oauth_login_with_urlopen(monkeypatch, captured_urls, fake_urlopen)
+
+    from agent.anthropic_adapter import run_hermes_oauth_login_pure
+
+    result = run_hermes_oauth_login_pure()
+
+    assert result is not None
+    assert token_urls == ["https://platform.claude.com/v1/oauth/token"]
+
+
+def test_token_exchange_falls_back_to_console_endpoint(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    captured_urls: Dict[str, str] = {}
+    token_urls = []
+
+    def fake_urlopen(req, *_a, **_kw):
+        token_urls.append(req.full_url)
+        if req.full_url == "https://platform.claude.com/v1/oauth/token":
+            raise OSError("platform 404")
+        return _FakeResponse(json.dumps({
+            "access_token": "sk-ant-console-access",
+            "refresh_token": "sk-ant-console-refresh",
+            "expires_in": 3600,
+        }).encode())
+
+    _patch_oauth_login_with_urlopen(monkeypatch, captured_urls, fake_urlopen)
+
+    from agent.anthropic_adapter import run_hermes_oauth_login_pure
+
+    result = run_hermes_oauth_login_pure()
+
+    assert result is not None
+    assert result["access_token"] == "sk-ant-console-access"
+    assert token_urls == [
+        "https://platform.claude.com/v1/oauth/token",
+        "https://console.anthropic.com/v1/oauth/token",
+    ]
