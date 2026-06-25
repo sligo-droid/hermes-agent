@@ -113,7 +113,7 @@ Two independent layers, each on its own cadence:
 **Layer 2 — Dialectic supplement** (fired every `dialecticCadence` turns):
 Multi-pass `.chat()` reasoning about the user, appended after base context.
 
-Both layers are joined, then truncated to fit `contextTokens` budget via `_truncate_to_budget` (tokens × 4 chars, word-boundary safe).
+Base context rendering also filters transient task/PR/run-log observations, caps card items, and excerpts each section before injection. Both layers are joined, then truncated to fit `contextTokens` budget via `_truncate_to_budget` (tokens × 4 chars, word-boundary safe). If `contextTokens` is unset, Hermes uses a compact default cap; set it to `null` only when you intentionally want uncapped auto-injection.
 
 ### Cold Start vs Warm Session Prompts
 
