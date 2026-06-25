@@ -312,6 +312,98 @@ def test_ui_codex_route_forces_openrouter_key_into_worker_env(monkeypatch, tmp_p
     assert env["_HERMES_FORCE_OPENROUTER_API_KEY"] == "sk-or-test-secret"
 
 
+def test_ui_opencode_route_uses_configured_backend_and_model(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["backend"] = "opencode"
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        ow,
+        "load_coding_worker_backend",
+        lambda config=None, worker_config=None: ow.BACKEND_OPENCODE,
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-secret")
+    seen = {}
+
+    def fake_run(prompt, workspace, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(
+            final_text="Changed src/app.py and ran npm test.",
+            error=None,
+            interrupted=False,
+            agents=["build"],
+            plan_text="",
+            thread_id="ses-build",
+            turn_id="ses-build",
+            tool_iterations=1,
+        )
+
+    monkeypatch.setattr(ow, "run_opencode_task", fake_run)
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Polish the Command Center card spacing.",
+            route_decision={"route": "ui_visual_specialist"},
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert result["backend"] == "opencode"
+    route = result["ui_work_route"]
+    assert route["matched"] is True
+    assert route["backend"] == "opencode"
+    assert route["selected_provider"] == "openrouter"
+    assert route["selected_model"] == "z-ai/glm-5.2"
+    assert seen["worker_config"] == {"opencode": {"model": "openrouter/z-ai/glm-5.2"}}
+    env = seen["env"]
+    assert "OPENROUTER_API_KEY" not in env
+    assert env["_HERMES_FORCE_OPENROUTER_API_KEY"] == "sk-or-test-secret"
+
+
+def test_default_opencode_route_keeps_openrouter_key_scrubbed(monkeypatch, tmp_path):
+    from agent import opencode_worker as ow
+
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["backend"] = "opencode"
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        ow,
+        "load_coding_worker_backend",
+        lambda config=None, worker_config=None: ow.BACKEND_OPENCODE,
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-secret")
+    seen = {}
+
+    def fake_run(prompt, workspace, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(
+            final_text="Changed src/parser.py and ran pytest.",
+            error=None,
+            interrupted=False,
+            agents=["build"],
+            plan_text="",
+            thread_id="ses-build",
+            turn_id="ses-build",
+            tool_iterations=1,
+        )
+
+    monkeypatch.setattr(ow, "run_opencode_task", fake_run)
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Fix the parser bug.",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    assert result["backend"] == "opencode"
+    assert "worker_config" not in seen
+    assert "env" not in seen
+
+
 def test_default_codex_route_keeps_openrouter_key_scrubbed(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []

@@ -165,6 +165,40 @@ def test_configured_hermes_codex_model_is_preserved():
     assert cfg["model"] == "hermes-codex/gpt-5.5"
 
 
+def test_worker_config_can_override_opencode_model_for_route():
+    cfg = ow.load_opencode_config(
+        _cfg(opencode={"model": "openai/gpt-5.5"}),
+        worker_config={"opencode": {"model": "openrouter/z-ai/glm-5.2"}},
+    )
+
+    assert cfg["model"] == "openrouter/z-ai/glm-5.2"
+
+
+def test_opencode_isolated_config_env_strips_provider_credentials(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "ambient-secret")
+    monkeypatch.setenv("_HERMES_FORCE_OPENROUTER_API_KEY", "ambient-force-secret")
+
+    env = ow._opencode_process_env(tmp_path)
+
+    assert env is not None
+    assert env["XDG_CONFIG_HOME"] == str(tmp_path)
+    assert "OPENROUTER_API_KEY" not in env
+    assert "_HERMES_FORCE_OPENROUTER_API_KEY" not in env
+
+
+def test_opencode_process_env_allows_scoped_force_provider_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "ambient-secret")
+
+    env = ow._opencode_process_env(
+        tmp_path,
+        env={"_HERMES_FORCE_OPENROUTER_API_KEY": "scoped-secret"},
+    )
+
+    assert env is not None
+    assert env["OPENROUTER_API_KEY"] == "scoped-secret"
+    assert "_HERMES_FORCE_OPENROUTER_API_KEY" not in env
+
+
 def test_hermes_codex_model_inlines_worker_brief(monkeypatch, tmp_path):
     calls = []
     seen_payload = None

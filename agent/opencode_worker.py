@@ -1328,16 +1328,17 @@ def _opencode_process_env(
 ) -> Optional[dict[str, str]]:
     if env is None and config_home is None:
         return None
-    if env is None:
-        process_env = os.environ.copy()
-    else:
-        try:
-            from tools.environments.local import _sanitize_subprocess_env
+    extra_env = env or {}
+    try:
+        from tools.environments.local import _sanitize_subprocess_env
 
-            process_env = _sanitize_subprocess_env(os.environ, env)
-        except Exception:
-            process_env = os.environ.copy()
-            process_env.update(env)
+        process_env = _sanitize_subprocess_env(dict(os.environ), extra_env)
+    except Exception:
+        process_env = os.environ.copy()
+        for key in list(process_env):
+            if key.startswith("_HERMES_FORCE_"):
+                process_env.pop(key, None)
+        process_env.update(extra_env)
     if config_home is not None:
         process_env["XDG_CONFIG_HOME"] = str(config_home)
     return process_env
