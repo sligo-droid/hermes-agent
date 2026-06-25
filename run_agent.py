@@ -364,6 +364,8 @@ class AIAgent:
         interim_assistant_callback: callable = None,
         tool_gen_callback: callable = None,
         status_callback: callable = None,
+        notice_callback: callable = None,
+        notice_clear_callback: callable = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
         service_tier: str = None,
@@ -435,6 +437,8 @@ class AIAgent:
             interim_assistant_callback=interim_assistant_callback,
             tool_gen_callback=tool_gen_callback,
             status_callback=status_callback,
+            notice_callback=notice_callback,
+            notice_clear_callback=notice_clear_callback,
             max_tokens=max_tokens,
             reasoning_config=reasoning_config,
             service_tier=service_tier,
@@ -779,6 +783,22 @@ class AIAgent:
                 self.status_callback("warn", message)
             except Exception:
                 logger.debug("status_callback error in _emit_warning", exc_info=True)
+
+    def _emit_notice(self, notice) -> None:
+        """Fire a structured notice to the active driver without breaking the turn."""
+        if self.notice_callback:
+            try:
+                self.notice_callback(notice)
+            except Exception:
+                logger.debug("notice_callback error in _emit_notice", exc_info=True)
+
+    def _emit_notice_clear(self, key: str) -> None:
+        """Clear a previously fired sticky notice by key."""
+        if self.notice_clear_callback:
+            try:
+                self.notice_clear_callback(key)
+            except Exception:
+                logger.debug("notice_clear_callback error in _emit_notice_clear", exc_info=True)
 
     # ── Buffered retry/fallback status ────────────────────────────────────
     # Retry and fallback chains were flooding the CLI/gateway with status
@@ -2309,6 +2329,104 @@ class AIAgent:
     def get_rate_limit_state(self):
         """Return the last captured RateLimitState, or None."""
         return self._rate_limit_state
+
+    def _capture_credits(self, http_response: Any) -> None:
+        """Parse x-nous-credits-* headers, cache CreditsState, and fire notices."""
+        try:
+            from agent.credits_tracker import dev_fixture_credits_state
+            fixture = dev_fixture_credits_state()
+        except Exception:
+            fixture = None
+        if fixture is not None:
+            self._credits_state = fixture
+            if self._credits_session_start_micros is None:
+                self._credits_session_start_micros = fixture.remaining_micros
+            latch = getattr(self, "_credits_latch", None)
+            if isinstance(latch, dict):
+                latch["seen_below_90"] = True
+            self._emit_credits_notices()
+            return
+
+        if http_response is None:
+            return
+        headers = getattr(http_response, "headers", None)
+        if not headers:
+            return
+        try:
+            from agent.credits_tracker import parse_credits_headers
+            state = parse_credits_headers(headers, provider=self.provider)
+        except Exception:
+            return
+        if state is None:
+            return
+
+        self._credits_state = state
+        if self._credits_session_start_micros is None:
+            self._credits_session_start_micros = state.remaining_micros
+        self._emit_credits_notices()
+
+    def _emit_credits_notices(self) -> None:
+        """Run the credits threshold policy on current state and emit notices."""
+        if (
+            getattr(self, "notice_callback", None) is None
+            and getattr(self, "notice_clear_callback", None) is None
+        ):
+            return
+        if not self._credits_notices_enabled():
+            return
+        state = getattr(self, "_credits_state", None)
+        if state is None:
+            return
+        try:
+            from agent.credits_tracker import evaluate_credits_notices, is_free_tier_model
+            latch = getattr(self, "_credits_latch", None)
+            if latch is None:
+                latch = self._credits_latch = {
+                    "active": set(),
+                    "seen_below_90": False,
+                    "usage_band": None,
+                }
+            model_is_free = is_free_tier_model(
+                getattr(self, "model", "") or "",
+                getattr(self, "base_url", "") or "",
+            )
+            to_show, to_clear = evaluate_credits_notices(
+                state,
+                latch,
+                model_is_free=model_is_free,
+            )
+            for key in to_clear:
+                self._emit_notice_clear(key)
+            for notice in to_show:
+                self._emit_notice(notice)
+        except Exception:
+            logger.warning("credits notice evaluation/emit failed", exc_info=True)
+
+    def _credits_notices_enabled(self) -> bool:
+        cached = getattr(self, "_credits_notices_enabled_cache", None)
+        if cached is not None:
+            return cached
+        enabled = True
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config() or {}
+            display = cfg.get("display") if isinstance(cfg, dict) else None
+            if isinstance(display, dict) and "credits_notices" in display:
+                enabled = bool(display.get("credits_notices"))
+        except Exception:
+            enabled = True
+        self._credits_notices_enabled_cache = enabled
+        return enabled
+
+    def get_credits_state(self):
+        """Return the last captured CreditsState, or None."""
+        return self._credits_state
+
+    def get_credits_spent_micros(self):
+        """Return session-cumulative credits spent in micros, or None."""
+        if self._credits_session_start_micros is None or self._credits_state is None:
+            return None
+        return self._credits_session_start_micros - self._credits_state.remaining_micros
 
     def _check_openrouter_cache_status(self, http_response: Any) -> None:
         """Read X-OpenRouter-Cache-Status from response headers and log it.
