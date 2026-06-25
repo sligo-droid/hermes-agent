@@ -286,6 +286,54 @@ def test_delegate_preserves_json_route_decision_with_missing_cwd_fallback(monkey
     ]
 
 
+def test_ui_codex_route_forces_openrouter_key_into_worker_env(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    cfg["coding_worker"]["backend"] = "codex"
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-secret")
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Polish the Command Center card spacing.",
+            route_decision={"route": "ui_visual_specialist"},
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    env = FakeSession.instances[0].kwargs["env"]
+    assert "OPENROUTER_API_KEY" not in env
+    assert env["_HERMES_FORCE_OPENROUTER_API_KEY"] == "sk-or-test-secret"
+
+
+def test_default_codex_route_keeps_openrouter_key_scrubbed(monkeypatch, tmp_path):
+    FakeSession.instances = []
+    FakeSession.results = []
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-secret")
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FakeSession,
+    )
+
+    result = json.loads(
+        cwt.delegate_coding_task(
+            task="Fix the parser bug.",
+            parent_agent=_parent(tmp_path),
+        )
+    )
+
+    assert result["success"] is True
+    env = FakeSession.instances[0].kwargs["env"]
+    assert "OPENROUTER_API_KEY" not in env
+    assert "_HERMES_FORCE_OPENROUTER_API_KEY" not in env
+
+
 def test_authorized_git_pr_lifecycle_updates_prompt_and_codex_env(monkeypatch, tmp_path):
     FakeSession.instances = []
     FakeSession.results = []
