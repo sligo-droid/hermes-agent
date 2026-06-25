@@ -169,12 +169,12 @@ class TestFromGlobalConfig:
         config = HonchoClientConfig.from_global_config(config_path=config_file)
         assert config.session_strategy == "per-directory"
 
-    def test_context_tokens_default_is_none(self, tmp_path):
-        """Default context_tokens should be None (uncapped) unless explicitly set."""
+    def test_context_tokens_default_is_compact_cap(self, tmp_path):
+        """Default context_tokens should bound auto-injected context unless explicitly set."""
         config_file = tmp_path / "config.json"
         config_file.write_text(json.dumps({"apiKey": "***"}))
         config = HonchoClientConfig.from_global_config(config_path=config_file)
-        assert config.context_tokens is None
+        assert config.context_tokens == 1200
 
     def test_context_tokens_explicit_sets_cap(self, tmp_path):
         """Explicit contextTokens in config sets the cap."""
@@ -200,6 +200,24 @@ class TestFromGlobalConfig:
         }))
         config = HonchoClientConfig.from_global_config(config_path=config_file)
         assert config.context_tokens == 2000
+
+    def test_context_tokens_explicit_null_opts_out(self, tmp_path):
+        """Explicit contextTokens=null should remain the uncapped opt-out."""
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps({"apiKey": "key", "contextTokens": None}))
+        config = HonchoClientConfig.from_global_config(config_path=config_file)
+        assert config.context_tokens is None
+
+    def test_context_tokens_host_null_overrides_root(self, tmp_path):
+        """Host contextTokens=null should override a root cap."""
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps({
+            "apiKey": "key",
+            "contextTokens": 1000,
+            "hosts": {"hermes": {"contextTokens": None}},
+        }))
+        config = HonchoClientConfig.from_global_config(config_path=config_file)
+        assert config.context_tokens is None
 
     def test_recall_mode_from_config(self, tmp_path):
         """recallMode is read from config, host block wins."""

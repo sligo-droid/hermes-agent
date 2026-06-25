@@ -1068,6 +1068,37 @@ class TestBaseContextSummary:
         formatted = provider._format_first_turn_context(ctx)
         assert "Session Summary" not in formatted
 
+    def test_format_filters_stale_task_logs_and_bounds_sections(self):
+        """Default injection should keep durable facts without dumping task logs."""
+        provider = HonchoMemoryProvider()
+        ctx = {
+            "summary": "\n".join([
+                "User prefers evidence-first troubleshooting.",
+                "2026-06-12 worker task log implemented PR #123 and checks run: pytest.",
+                "Final response: Changed files: many stale files.",
+            ]),
+            "representation": "Durable preference: never send email. " + ("noise " * 400),
+            "card": "\n".join(f"fact {i}" for i in range(20)),
+            "ai_representation": "AI self task history: PR run merged #999.\nIdentity: sligo-droid bot.",
+            "ai_card": "\n".join([
+                "PREFERENCE: Use verification evidence before finalizing.",
+                "Changed files: stale task log should disappear.",
+            ]),
+        }
+
+        formatted = provider._format_first_turn_context(ctx)
+
+        assert "evidence-first troubleshooting" in formatted
+        assert "never send email" in formatted
+        assert "Identity: sligo-droid bot" in formatted
+        assert "Use verification evidence before finalizing" in formatted
+        assert "worker task log" not in formatted
+        assert "Changed files" not in formatted
+        assert "PR run merged" not in formatted
+        assert "fact 8" not in formatted
+        assert len(formatted) < 3500
+        assert "transient task/log item(s) omitted" in formatted
+
 
 class TestDialecticDepth:
     """Tests for the dialecticDepth multi-pass system."""

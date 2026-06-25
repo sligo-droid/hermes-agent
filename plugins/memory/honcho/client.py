@@ -123,15 +123,26 @@ def _resolve_bool(*vals, default: bool) -> bool:
     return default
 
 
+_CONTEXT_TOKENS_MISSING = object()
+
+
 def _parse_context_tokens(host_val, root_val) -> int | None:
-    """Parse contextTokens: host wins, then root, then None (uncapped)."""
+    """Parse contextTokens: host wins, then root, then default cap.
+
+    Explicit ``null`` means uncapped; an absent key means use the compact
+    default. Callers must pass ``_CONTEXT_TOKENS_MISSING`` for absent keys so
+    this can distinguish missing config from deliberate opt-out.
+    """
     for val in (host_val, root_val):
-        if val is not None:
-            try:
-                return int(val)
-            except (ValueError, TypeError):
-                pass
-    return None
+        if val is _CONTEXT_TOKENS_MISSING:
+            continue
+        if val is None:
+            return None
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            pass
+    return 1200
 
 
 def _parse_int_config(host_val, root_val, default: int) -> int:
@@ -322,8 +333,8 @@ class HonchoClientConfig:
     # Write frequency: "async" (background thread), "turn" (sync per turn),
     # "session" (flush on session end), or int (every N turns)
     write_frequency: str | int = "async"
-    # Prefetch budget (None = no cap; set to an integer to bound auto-injected context)
-    context_tokens: int | None = None
+    # Prefetch budget. Set contextTokens to null to opt out explicitly.
+    context_tokens: int | None = 1200
     # Dialectic (peer.chat) settings
     # reasoning_level: "minimal" | "low" | "medium" | "high" | "max"
     dialectic_reasoning_level: str = "low"
@@ -537,8 +548,8 @@ class HonchoClientConfig:
             save_messages=save_messages,
             write_frequency=write_frequency,
             context_tokens=_parse_context_tokens(
-                host_block.get("contextTokens"),
-                raw.get("contextTokens"),
+                host_block["contextTokens"] if "contextTokens" in host_block else _CONTEXT_TOKENS_MISSING,
+                raw["contextTokens"] if "contextTokens" in raw else _CONTEXT_TOKENS_MISSING,
             ),
             dialectic_reasoning_level=(
                 host_block.get("dialecticReasoningLevel")

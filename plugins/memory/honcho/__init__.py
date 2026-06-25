@@ -29,6 +29,22 @@ from tools.registry import tool_error
 logger = logging.getLogger(__name__)
 
 
+_NOISY_CONTEXT_PATTERNS = (
+    re.compile(r"\b(?:worker|task|job|cron|kanban|board|ticket)\s+(?:brief|log|run|result|summary)\b", re.IGNORECASE),
+    re.compile(r"\b(?:pr|pull request)\s+(?:#\d+|run|result|merged|ci|check|workflow)\b", re.IGNORECASE),
+    re.compile(r"\b(?:changed files|checks run|tests run|verification|autonom(?:ous|y)|orchestrator)\b", re.IGNORECASE),
+    re.compile(r"\b\d{4}-\d{2}-\d{2}\b.*\b(?:implemented|merged|verified|blocked|completed|failed)\b", re.IGNORECASE),
+)
+_CONTEXT_SECTION_CHAR_LIMITS = {
+    "summary": 900,
+    "representation": 1200,
+    "card": 900,
+    "ai_representation": 600,
+    "ai_card": 600,
+}
+_CONTEXT_CARD_ITEM_LIMIT = 8
+
+
 # ---------------------------------------------------------------------------
 # Tool schemas (moved from tools/honcho_tools.py)
 # ---------------------------------------------------------------------------
@@ -548,29 +564,81 @@ class HonchoMemoryProvider(MemoryProvider):
         parts = []
 
         # Session summary — session-scoped context, placed first for relevance
-        summary = ctx.get("summary", "")
+        summary = self._clean_context_section("summary", ctx.get("summary", ""))
         if summary:
             parts.append(f"## Session Summary\n{summary}")
 
-        rep = ctx.get("representation", "")
+        rep = self._clean_context_section("representation", ctx.get("representation", ""))
         if rep:
             parts.append(f"## User Representation\n{rep}")
 
-        card = ctx.get("card", "")
+        card = self._clean_context_section("card", ctx.get("card", ""), is_card=True)
         if card:
             parts.append(f"## User Peer Card\n{card}")
 
-        ai_rep = ctx.get("ai_representation", "")
+        ai_rep = self._clean_context_section("ai_representation", ctx.get("ai_representation", ""))
         if ai_rep:
             parts.append(f"## AI Self-Representation\n{ai_rep}")
 
-        ai_card = ctx.get("ai_card", "")
+        ai_card = self._clean_context_section("ai_card", ctx.get("ai_card", ""), is_card=True)
         if ai_card:
             parts.append(f"## AI Identity Card\n{ai_card}")
 
         if not parts:
             return ""
         return "\n\n".join(parts)
+
+    def _clean_context_section(self, key: str, value: Any, *, is_card: bool = False) -> str:
+        """Bound Honcho auto-injection to durable, high-signal snippets."""
+        text = self._coerce_context_text(value)
+        if not text:
+            return ""
+
+        lines = [line.strip() for line in text.splitlines()]
+        kept: list[str] = []
+        omitted = 0
+        for line in lines:
+            if not line:
+                if kept and kept[-1]:
+                    kept.append("")
+                continue
+            if self._looks_like_noisy_context(line):
+                omitted += 1
+                continue
+            kept.append(line)
+            if is_card and len([item for item in kept if item]) >= _CONTEXT_CARD_ITEM_LIMIT:
+                break
+
+        cleaned = "\n".join(kept).strip()
+        if not cleaned:
+            return ""
+
+        limit = _CONTEXT_SECTION_CHAR_LIMITS.get(key, 800)
+        if len(cleaned) > limit:
+            cleaned = cleaned[:limit].rsplit(" ", 1)[0].rstrip() + " …"
+        if omitted:
+            cleaned = f"{cleaned}\n[{omitted} transient task/log item(s) omitted]"
+        return cleaned
+
+    @staticmethod
+    def _coerce_context_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, list):
+            return "\n".join(str(item) for item in value if item)
+        return str(value).strip()
+
+    @staticmethod
+    def _looks_like_noisy_context(line: str) -> bool:
+        if len(line) > 1200 and "Durable preference:" not in line:
+            return True
+        if line.startswith(("Changed files:", "Checks run:", "Verification:", "Final response:", "Worker brief:")):
+            return True
+        if line.startswith(("PREFERENCE:", "INSTRUCTION:", "TRAIT:")):
+            return False
+        if "Durable preference:" in line:
+            return False
+        return any(pattern.search(line) for pattern in _NOISY_CONTEXT_PATTERNS)
 
     def system_prompt_block(self) -> str:
         """Return system prompt text, adapted by recall_mode.
