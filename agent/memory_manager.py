@@ -383,6 +383,18 @@ class MemoryManager:
         description = str(schema.get("description") or "")
         return bool(_WRITE_TOOL_RE.search(f"{name} {description}"))
 
+    @staticmethod
+    def is_reserved_tool_name(tool_name: str) -> bool:
+        """Return True when a memory provider tool would shadow a core tool."""
+        if not tool_name:
+            return False
+        try:
+            from toolsets import _HERMES_CORE_TOOLS
+
+            return tool_name in set(_HERMES_CORE_TOOLS)
+        except Exception:
+            return tool_name in {"clarify", "delegate_task", "memory", "session_search"}
+
     # -- Registration --------------------------------------------------------
 
     def add_provider(self, provider: MemoryProvider) -> None:
@@ -416,6 +428,13 @@ class MemoryManager:
             if self.read_only and self.is_write_like_tool_schema(schema):
                 continue
             tool_name = schema.get("name", "")
+            if self.is_reserved_tool_name(tool_name):
+                logger.warning(
+                    "Rejected memory tool '%s' from %s — reserved core tool name",
+                    tool_name,
+                    provider.name,
+                )
+                continue
             if tool_name and tool_name not in self._tool_to_provider:
                 self._tool_to_provider[tool_name] = provider
             elif tool_name in self._tool_to_provider:
@@ -563,6 +582,8 @@ class MemoryManager:
                     if self.read_only and self.is_write_like_tool_schema(schema):
                         continue
                     name = schema.get("name", "")
+                    if self.is_reserved_tool_name(name):
+                        continue
                     if name and name not in seen:
                         schemas.append(schema)
                         seen.add(name)
