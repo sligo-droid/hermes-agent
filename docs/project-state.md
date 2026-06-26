@@ -3,7 +3,7 @@
 Last updated: 2026-06-26
 State owner: Sligo Labs agent
 
-This is the active pickup-state file for Sligo Labs' `hermes-agent` fork. Keep it short and current. Move completed ledger material to `docs/archive/project-state-archive-20260626.md` or a newer dated archive instead of letting this file become historical context bloat.
+This is the active pickup-state file for Sligo Labs' `hermes-agent` fork. Keep it short and current; CI enforces a hard 10,000-byte limit on this file. Move completed ledger material to `docs/archive/project-state-archive-20260626.md` or a newer dated archive instead of letting this file become historical context bloat.
 
 ## Current Focus
 
