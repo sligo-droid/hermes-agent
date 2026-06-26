@@ -273,6 +273,8 @@ def main() -> int:
             workspace=workspace,
         ):
             return 0
+        _rollback_and_close_connection(conn)
+        conn = None
         if _recover_completed_role_output_fresh(
             task_id,
             role,
@@ -290,12 +292,6 @@ def main() -> int:
             return 0
         reason = f"{_backend_label(role, task)} worker failed: {exc}"
         try:
-            blocked = kanban_db.block_task(conn, task_id, reason=reason)
-            if blocked:
-                return 0
-        except Exception:
-            pass
-        try:
             fresh_conn = kanban_db.connect(board=board)
             try:
                 blocked = kanban_db.block_task(fresh_conn, task_id, reason=reason)
@@ -307,12 +303,24 @@ def main() -> int:
             pass
         return 1
     finally:
-        conn.close()
+        if conn is not None:
+            _rollback_and_close_connection(conn)
         if board:
             try:
                 mark_dispatch_dirty(board=board, reason=f"{role}-worker-finished")
             except Exception:
                 pass
+
+
+def _rollback_and_close_connection(conn: Any) -> None:
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+    try:
+        conn.close()
+    except Exception:
+        pass
 
 
 def _recover_completed_role_output(
