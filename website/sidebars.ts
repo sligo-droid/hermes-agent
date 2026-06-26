@@ -140,7 +140,6 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/bundled/apple/apple-apple-reminders',
                     'user-guide/skills/bundled/apple/apple-findmy',
                     'user-guide/skills/bundled/apple/apple-imessage',
-                    'user-guide/skills/bundled/apple/apple-macos-computer-use',
                   ],
                 },
                 {
@@ -153,6 +152,15 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-codex',
                     'user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent',
                     'user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-opencode',
+                  ],
+                },
+                {
+                  type: 'category',
+                  label: 'computer-use',
+                  key: 'skills-bundled-computer-use',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/computer-use/computer-use-computer-use',
                   ],
                 },
                 {
@@ -176,6 +184,7 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/bundled/creative/creative-pretext',
                     'user-guide/skills/bundled/creative/creative-sketch',
                     'user-guide/skills/bundled/creative/creative-songwriting-and-ai-music',
+                    'user-guide/skills/bundled/creative/creative-taste-skill',
                     'user-guide/skills/bundled/creative/creative-touchdesigner-mcp',
                   ],
                 },
@@ -186,6 +195,15 @@ const sidebars: SidebarsConfig = {
                   collapsed: true,
                   items: [
                     'user-guide/skills/bundled/data-science/data-science-jupyter-live-kernel',
+                  ],
+                },
+                {
+                  type: 'category',
+                  label: 'devops',
+                  key: 'skills-bundled-devops',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/devops/devops-kanban-worker',
                   ],
                 },
                 {
@@ -585,6 +603,7 @@ const sidebars: SidebarsConfig = {
                   key: 'skills-optional-web-development',
                   collapsed: true,
                   items: [
+                    'user-guide/skills/optional/web-development/web-development-cloudflare-temporary-deploy',
                     'user-guide/skills/optional/web-development/web-development-page-agent',
                   ],
                 },

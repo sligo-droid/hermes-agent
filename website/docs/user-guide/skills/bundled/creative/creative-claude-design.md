@@ -21,7 +21,7 @@ Design one-off HTML artifacts (landing, deck, prototype).
 | License | MIT |
 | Platforms | linux, macos, windows |
 | Tags | `design`, `html`, `prototype`, `ux`, `ui`, `creative`, `artifact`, `deck`, `motion`, `design-system` |
-| Related skills | [`design-md`](/docs/user-guide/skills/bundled/creative/creative-design-md), [`popular-web-designs`](/docs/user-guide/skills/bundled/creative/creative-popular-web-designs), [`excalidraw`](/docs/user-guide/skills/bundled/creative/creative-excalidraw), [`architecture-diagram`](/docs/user-guide/skills/bundled/creative/creative-architecture-diagram) |
+| Related skills | [`design-md`](/docs/user-guide/skills/bundled/creative/creative-design-md), [`popular-web-designs`](/docs/user-guide/skills/bundled/creative/creative-popular-web-designs), [`taste-skill`](/docs/user-guide/skills/bundled/creative/creative-taste-skill), [`excalidraw`](/docs/user-guide/skills/bundled/creative/creative-excalidraw), [`architecture-diagram`](/docs/user-guide/skills/bundled/creative/creative-architecture-diagram) |
 
 ## Reference: full SKILL.md
 
@@ -35,7 +35,7 @@ Use this skill when the user asks for design work that would normally fit Claude
 
 The goal is to preserve Claude Design's useful design behavior and taste while removing hosted-tool plumbing that does not exist in normal agent environments.
 
-**Before starting, check for other web-design skills like `popular-web-designs` (ready-to-paste design systems for Stripe, Linear, Vercel, Notion, etc.) and `design-md` (Google's DESIGN.md token spec format).** If the user wants a known brand's look, load `popular-web-designs` alongside this one and let it supply the visual vocabulary. If the deliverable is a token spec file rather than a rendered artifact, use `design-md` instead. Full decision table below.
+**Before starting, check for other web-design skills like `taste-skill` (anti-slop frontend quality gates), `popular-web-designs` (ready-to-paste design systems for Stripe, Linear, Vercel, Notion, etc.), and `design-md` (Google's DESIGN.md token spec format).** If the user wants a known brand's look, load `popular-web-designs` alongside this one and let it supply the visual vocabulary. If the deliverable is a token spec file rather than a rendered artifact, use `design-md` instead. Full decision table below.
 
 ## When To Use This Skill vs `popular-web-designs` vs `design-md`
 
@@ -44,6 +44,7 @@ Hermes has three design-related skills under `skills/creative/`. They do differe
 | Skill | What it gives you | Use when the user wants... |
 |---|---|---|
 | **claude-design** (this one) | Design *process and taste* — how to scope a brief, gather context, produce variants, verify a local HTML artifact, avoid AI-design slop | a from-scratch designed artifact (landing page, prototype, deck, component lab, motion study) with no specific brand or token system dictated |
+| **taste-skill** | Taste Skill anti-slop frontend checks — brief inference, consistency locks, redesign audit, and pre-flight quality gates | UI-specialist frontend implementation or polish needs a compact quality bar against generic AI-looking output |
 | **popular-web-designs** | 54 ready-to-paste design systems — exact colors, typography, components, CSS values for sites like Stripe, Linear, Vercel, Notion, Airbnb | "make it look like Stripe / Linear / Vercel", a page styled after a known brand, or a visual starting point pulled from a real product |
 | **design-md** | Google's DESIGN.md spec format — author/validate/diff/export design-token files, WCAG contrast checking, Tailwind/DTCG export | a formal, persistent, machine-readable design-system *spec file* (tokens + rationale) that lives in a repo and gets consumed by agents over time |
 
@@ -53,7 +54,7 @@ Rule of thumb:
 - **Match a known brand's look** → popular-web-designs (and let claude-design drive the process)
 - **Author the tokens spec itself** → design-md
 
-These compose: use `popular-web-designs` for the visual vocabulary, `claude-design` for how to turn a brief into a thoughtful local HTML file, and `design-md` when the output is the token file rather than a rendered artifact.
+These compose: use `taste-skill` as the quality gate, `popular-web-designs` for the visual vocabulary, `claude-design` for how to turn a brief into a thoughtful local HTML file, and `design-md` when the output is the token file rather than a rendered artifact.
 
 ## Runtime Mode
 

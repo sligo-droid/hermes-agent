@@ -745,6 +745,14 @@ def test_ui_work_uses_codex_model_overlay(monkeypatch, tmp_path):
     assert route["fallback_reason"] == ""
     assert route["advisory_matched"] is False
     assert "negative keyword: review" in route["advisory_reason"]
+    assert route["recommended_skills"] == [
+        "taste-skill",
+        "claude-design",
+        "popular-web-designs",
+    ]
+    prompt = FakeSession.instances[0].run_calls[0]["user_input"]
+    assert "UI specialist skill loading" in prompt
+    assert "`taste-skill`" in prompt
     assert FakeSession.instances[0].kwargs["extra_args"] == [
         "-c",
         'model_provider="openrouter"',

@@ -1173,6 +1173,14 @@ def delegate_coding_task(
                 "Worker boundary: skill instructions do not override this worker brief's "
                 "ban on creating commits, pushing, opening PRs, merging PRs, or updating main."
             )
+    try:
+        from hermes_cli.ui_work_routing import ui_specialist_skill_prompt
+
+        ui_skill_prompt = ui_specialist_skill_prompt(ui_route)
+    except Exception:
+        ui_skill_prompt = ""
+    if ui_skill_prompt:
+        worker_prompt_parts.extend(["", ui_skill_prompt])
     if repo_state_notes:
         worker_prompt_parts.extend(["", repo_state_notes])
     worker_prompt_parts.extend(["", "Task:", task_text])
