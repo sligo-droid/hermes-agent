@@ -1,5 +1,7 @@
 """Tests for agent/context_compressor.py — compression logic, thresholds, truncation fallback."""
 
+import json
+
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -235,8 +237,6 @@ class TestCompress:
         assert result[-1] == msgs[-1]
 
     def test_prune_compacts_oversized_historical_skill_view_in_tail(self, compressor):
-        import json
-
         skill_content = """---
 version: 2.3.4
 ---
@@ -354,6 +354,87 @@ Check the summary.
         assert "skill_view(name, file_path)" in compacted
         assert "Fetch full skill content again: skill_view(\"recovery-heavy\")" in compacted
         assert result[-1] == msgs[-1]
+
+    def test_prune_compacts_skill_view_result_with_top_level_tool_name_without_tool_call_mapping(self, compressor):
+        skill_result = json.dumps({
+            "success": True,
+            "name": "github-pr-workflow",
+            "content": "# Skill\n## Procedure\n" + ("x" * 10_000),
+        })
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "load skill"},
+            {
+                "role": "tool",
+                "tool_call_id": "missing_call",
+                "tool_name": "skill_view",
+                "content": skill_result,
+            },
+            {"role": "assistant", "content": "loaded"},
+            {"role": "user", "content": "latest ask"},
+        ]
+
+        result, pruned_count = compressor._prune_old_tool_results(
+            msgs,
+            protect_tail_count=3,
+            protect_tail_tokens=100_000,
+        )
+
+        compacted = result[2]["content"]
+        assert pruned_count == 1
+        assert compacted.startswith("[skill_view result compacted")
+        assert "Skill: github-pr-workflow" in compacted
+        assert len(compacted) < 3_000
+
+    def test_emergency_shrink_compacts_skill_view_result_with_top_level_tool_name_without_tool_call_mapping(self, compressor):
+        skill_result = json.dumps({
+            "success": True,
+            "name": "github-pr-workflow",
+            "content": "# Skill\n## Procedure\n" + ("x" * 40_000),
+        })
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "load skill"},
+            {"role": "assistant", "content": "mapping was trimmed"},
+            {
+                "role": "tool",
+                "tool_call_id": "missing_call",
+                "tool_name": "skill_view",
+                "content": skill_result,
+            },
+            {"role": "assistant", "content": "loaded"},
+            {"role": "user", "content": "latest ask must stay"},
+        ]
+
+        result, stats = compressor.emergency_shrink(msgs, target_tokens=10_000)
+
+        assert stats["tool_results"] >= 1
+        assert all(msg.get("tool_call_id") != "missing_call" for msg in result)
+        assert result[-1] == msgs[-1]
+
+    def test_static_fallback_summary_names_top_level_skill_view_without_tool_call_mapping(self, compressor):
+        skill_result = json.dumps({
+            "success": True,
+            "name": "github-pr-workflow",
+            "content": "# Skill\n## Procedure\n" + ("x" * 10_000),
+        })
+        turns_to_summarize = [
+            {"role": "user", "content": "load skill"},
+            {
+                "role": "tool",
+                "tool_call_id": "missing_call",
+                "tool_name": "skill_view",
+                "content": skill_result,
+            },
+        ]
+
+        summary = compressor._build_static_fallback_summary(turns_to_summarize, reason="test")
+
+        assert "[skill_view result compacted" in summary
+        assert "Skill: github-pr-workflow" in summary
+        assert "Fetch full skill content again" in summary
+        assert "[unknown]" not in summary
+        assert len(summary) < 12_000
 
 
 
