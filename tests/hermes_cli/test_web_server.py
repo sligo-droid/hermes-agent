@@ -357,6 +357,40 @@ class TestWebServerEndpoints:
         resp = self.client.get("/api/dashboard/plugins/rescan")
         assert resp.status_code == 200
 
+    def test_basic_auth_default_username_is_dashboard_qa_user(self, monkeypatch):
+        from starlette.testclient import TestClient
+        from hermes_cli.web_server import app
+
+        monkeypatch.delenv("HERMES_DASHBOARD_USERNAME", raising=False)
+        monkeypatch.setenv("HERMES_DASHBOARD_PASSWORD", "qa password")
+        monkeypatch.setenv("HERMES_DASHBOARD_REQUIRE_BASIC_AUTH", "1")
+        qa_raw = base64.b64encode(b"hermes_qa:qa password").decode("ascii")
+        old_raw = base64.b64encode(b"hermes:qa password").decode("ascii")
+        client = TestClient(app)
+
+        resp = client.get("/", headers={"Authorization": f"Basic {qa_raw}"})
+        assert resp.status_code != 401
+
+        resp = client.get("/", headers={"Authorization": f"Basic {old_raw}"})
+        assert resp.status_code == 401
+
+    def test_basic_auth_default_username_can_still_be_overridden(self, monkeypatch):
+        from starlette.testclient import TestClient
+        from hermes_cli.web_server import app
+
+        monkeypatch.setenv("HERMES_DASHBOARD_USERNAME", "operator")
+        monkeypatch.setenv("HERMES_DASHBOARD_PASSWORD", "qa password")
+        monkeypatch.setenv("HERMES_DASHBOARD_REQUIRE_BASIC_AUTH", "1")
+        operator_raw = base64.b64encode(b"operator:qa password").decode("ascii")
+        qa_raw = base64.b64encode(b"hermes_qa:qa password").decode("ascii")
+        client = TestClient(app)
+
+        resp = client.get("/", headers={"Authorization": f"Basic {operator_raw}"})
+        assert resp.status_code != 401
+
+        resp = client.get("/", headers={"Authorization": f"Basic {qa_raw}"})
+        assert resp.status_code == 401
+
     def test_path_traversal_blocked(self):
         """Verify URL-encoded path traversal is blocked."""
         # %2e%2e = ..

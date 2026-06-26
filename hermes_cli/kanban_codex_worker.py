@@ -109,6 +109,7 @@ _WORKER_PROJECT_STATE_JUSTIFICATION = (
     "Project-state: not needed - Discord worker board implementation; "
     "no current project-state ledger change required."
 )
+_DASHBOARD_QA_USERNAME = "hermes_qa"
 
 
 def _single_line_pr_title(value: Any) -> str:
@@ -580,6 +581,7 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
         "- Before launching ad-hoc Playwright/Chromium browser scripts or browser dogfood from this worker, run `python -m hermes_cli.browser_preflight chromium`.\n"
         "- Treat a nonzero preflight as an environment blocker for that browser-dependent check only; do not install browsers or fail unrelated non-browser work.\n\n"
     )
+    dashboard_qa_auth = _dashboard_qa_auth_prompt()
     pr_policy = _pr_policy_prompt_note(role)
     autoreview = _dev_autoreview_prompt(role)
     forced_skills = _forced_worker_skill_prompt(conn, task_id, role)
@@ -592,11 +594,21 @@ def _build_prompt(conn: Any, task_id: str, role: str) -> str:
         f"{discord_access}"
         f"{frontend_smoke}"
         f"{browser_preflight}"
+        f"{dashboard_qa_auth}"
         f"{autoreview}"
         f"{forced_skills}"
         f"{schema}\n\n"
         f"Git context:\n{git}\n\n"
         f"Kanban context:\n{context}"
+    )
+
+
+def _dashboard_qa_auth_prompt() -> str:
+    return (
+        "Protected dashboard/browser QA auth contract:\n"
+        f"- For protected Hermes dashboard or frontend smoke checks, use dashboard Basic Auth username `{_DASHBOARD_QA_USERNAME}`.\n"
+        "- Read the password from `HERMES_DASHBOARD_PASSWORD` in the worker environment; do not ask for it if that env var is absent.\n"
+        "- Never print, log, copy into prompts, or include the password value in final output, test output, screenshots, URLs, or handoff metadata.\n\n"
     )
 
 

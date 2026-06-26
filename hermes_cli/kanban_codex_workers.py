@@ -32,6 +32,7 @@ _WORKER_CONTAINER_ENV_PREFIXES = (
     "NEXT_PUBLIC_",
 )
 _WORKER_CONTAINER_ENV_KEYS = {"PYTHONPATH", "HOME"}
+_DASHBOARD_QA_USERNAME = "hermes_qa"
 
 _ROLE_DEFAULT_REASONING = {
     "planner": "xhigh",
@@ -354,6 +355,7 @@ def _worker_env() -> dict[str, str]:
     _strip_discord_credentials(env)
     _strip_inherited_codex_worker_state(env)
     _configure_discord_read_broker(env)
+    env.setdefault("HERMES_DASHBOARD_USERNAME", _DASHBOARD_QA_USERNAME)
     return env
 
 
