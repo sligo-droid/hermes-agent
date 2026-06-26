@@ -7007,8 +7007,6 @@ def running_worker_thread_targets() -> list[dict[str, Any]]:
         thread_id = str(worker.get("thread_id") or "").strip()
         if not thread_id:
             continue
-        if _worker_source_message_too_old(worker):
-            continue
         try:
             with kanban_db.connect_closing(board=board) as conn:
                 placeholders = ",".join("?" for _ in ROLE_ASSIGNEES)
