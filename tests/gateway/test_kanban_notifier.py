@@ -798,6 +798,48 @@ def test_discord_kanban_typing_watcher_pulses_running_notify_thread(tmp_path, mo
     ]
 
 
+def test_discord_kanban_typing_watcher_pulses_old_manual_rerun_board(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    old_message_id = _discord_snowflake_at(time.time() - (8 * 24 * 60 * 60))
+    board = dwb.set_goal(
+        thread_id="1519801883701543175",
+        goal="Manual rerun should keep typing while active",
+        chat_id="1519801883701543175",
+        request_id="manual-rerun",
+        board_slug="discord-1519801883701543175-m-1519918246990712904-manual-rerun",
+    )
+    worker = dict(kb.read_board_metadata(board.slug)[dwb.DISCORD_WORKER_META_KEY])
+    worker["source_message_id"] = old_message_id
+    dwb._update_worker_meta(board.slug, worker)
+
+    conn = kb.connect(board=board.slug)
+    try:
+        tid = kb.create_task(
+            conn,
+            title="Manual rerun dev work",
+            assignee=dwb.ROLE_DEV,
+            tenant=board.slug,
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+    finally:
+        conn.close()
+
+    adapter = TypingAdapter()
+    runner = _make_discord_runner(adapter)
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert adapter.typing == [
+        {
+            "chat_id": "1519801883701543175",
+            "metadata": {"thread_id": "1519801883701543175"},
+        }
+    ]
+
+
 def test_discord_kanban_typing_watcher_continues_status_sync_after_typing_collection_error(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
     from hermes_cli import discord_worker_boards as dwb

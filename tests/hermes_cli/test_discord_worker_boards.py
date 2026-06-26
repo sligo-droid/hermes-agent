@@ -5613,6 +5613,37 @@ def test_typing_targets_require_active_running_run(monkeypatch, tmp_path):
     assert [target["board"] for target in targets] == [active.slug]
 
 
+def test_typing_targets_include_old_manual_rerun_running_worker(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    old_message_id = _discord_snowflake_at(time.time() - (8 * 24 * 60 * 60))
+    board = dwb.set_goal(
+        thread_id="1519801883701543175",
+        goal="Manual rerun should keep typing while active",
+        chat_id="1519801883701543175",
+        request_id="manual-rerun",
+        board_slug="discord-1519801883701543175-m-1519918246990712904-manual-rerun",
+    )
+    worker = dict(kanban_db.read_board_metadata(board.slug)[dwb.DISCORD_WORKER_META_KEY])
+    worker["source_message_id"] = old_message_id
+    dwb._update_worker_meta(board.slug, worker)
+
+    task_id = _create_ready_dev_task(board.slug)
+    with kanban_db.connect_closing(board=board.slug) as conn:
+        kanban_db.claim_task(conn, task_id)
+
+    assert dwb.running_discord_thread_typing_targets() == [
+        {
+            "board": board.slug,
+            "thread_id": "1519801883701543175",
+            "chat_id": "1519801883701543175",
+            "running": 1,
+        }
+    ]
+
+
 def test_typing_targets_skip_blocked_board_with_stale_running_row(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
