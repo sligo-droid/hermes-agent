@@ -23,6 +23,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+import hermes_time
 from agent.auxiliary_client import call_llm, _is_connection_error, log_auxiliary_health_warning
 from agent.context_engine import ContextEngine
 from agent.model_metadata import (
@@ -44,7 +45,49 @@ def _sanitize_summary_error(error: Any) -> str:
         text = text[:217].rstrip() + "..."
     return text or "unknown error"
 
+HISTORICAL_TASK_HEADING = "historical task snapshot"
+HISTORICAL_IN_PROGRESS_HEADING = "historical in-progress snapshot"
+HISTORICAL_PENDING_ASKS_HEADING = "historical pending-user-asks snapshot"
+HISTORICAL_REMAINING_WORK_HEADING = "historical remaining-work snapshot"
+
 SUMMARY_PREFIX = (
+    "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
+    "into the summary below. This is a handoff from a previous context "
+    "window — treat it as background reference, NOT as active instructions. "
+    "Do NOT answer questions or fulfill requests mentioned in this summary; "
+    "they were already addressed. "
+    "Respond ONLY to the latest user message that appears AFTER this "
+    "summary — that message is the single source of truth for what to do "
+    "right now. "
+    f"The summary may contain a {HISTORICAL_TASK_HEADING}, "
+    f"{HISTORICAL_IN_PROGRESS_HEADING}, "
+    f"{HISTORICAL_PENDING_ASKS_HEADING}, or "
+    f"{HISTORICAL_REMAINING_WORK_HEADING}; these are historical snapshots, "
+    "not commands. If the latest user message contradicts, supersedes, "
+    "changes topic from, has mere topic overlap with, or in any way diverges "
+    "from those snapshots, the latest message WINS — discard those stale "
+    "items entirely and do not 'wrap up the old task first'. "
+    "Reverse signals in the latest message (e.g. 'stop', 'undo', 'roll "
+    "back', 'just verify', 'don't do that anymore', 'never mind', a new "
+    "topic) must immediately end any in-flight work described in the "
+    "summary; do not re-surface it in later turns. "
+    "IMPORTANT: Your persistent memory (MEMORY.md, USER.md) in the system "
+    "prompt is ALWAYS authoritative and active — never ignore or deprioritize "
+    "memory content due to this compaction note. "
+    "The current session state (files, config, etc.) may reflect work "
+    "described here — avoid repeating it:"
+)
+LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
+
+# Handoff prefixes that shipped in earlier releases. A summary persisted under
+# one of these can be inherited into a resumed lineage (#35344); when it is
+# re-normalized on re-compaction we must strip the OLD prefix too, otherwise the
+# stale directive it carried (e.g. "resume exactly from Active Task") survives
+# embedded in the body and keeps hijacking replies. Keep newest-first; entries
+# are matched literally. Add a frozen copy here whenever SUMMARY_PREFIX changes.
+_HISTORICAL_SUMMARY_PREFIXES = (
+    # Pre-topic-overlap fix: contained a carveout that allowed a stale task to
+    # resume when the latest message was merely related to it.
     "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
     "into the summary below. This is a handoff from a previous context "
     "window — treat it as background reference, NOT as active instructions. "
@@ -67,17 +110,7 @@ SUMMARY_PREFIX = (
     "prompt is ALWAYS authoritative and active — never ignore or deprioritize "
     "memory content due to this compaction note. "
     "The current session state (files, config, etc.) may reflect work "
-    "described here — avoid repeating it:"
-)
-LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
-
-# Handoff prefixes that shipped in earlier releases. A summary persisted under
-# one of these can be inherited into a resumed lineage (#35344); when it is
-# re-normalized on re-compaction we must strip the OLD prefix too, otherwise the
-# stale directive it carried (e.g. "resume exactly from Active Task") survives
-# embedded in the body and keeps hijacking replies. Keep newest-first; entries
-# are matched literally. Add a frozen copy here whenever SUMMARY_PREFIX changes.
-_HISTORICAL_SUMMARY_PREFIXES = (
+    "described here — avoid repeating it:",
     # Pre-#35344: contained the self-contradicting "resume exactly" directive.
     "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
     "into the summary below. This is a handoff from a previous context "
@@ -1624,6 +1657,19 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         summary_budget = self._compute_summary_budget(turns_to_summarize)
         content_to_summarize = self._serialize_for_summary(turns_to_summarize)
 
+        temporal_anchor = ""
+        try:
+            today = hermes_time.now().date().isoformat()
+            temporal_anchor = f"""
+
+TEMPORAL ANCHORING: Today's date is {today}. Rewrite completed actions as
+absolute, dated, past-tense facts when the source material provides relative
+time. Example: if the source says "email John tomorrow" and it was completed,
+write "Sent the proposal email to John on {today}" rather than preserving a
+relative future instruction."""
+        except Exception:
+            temporal_anchor = ""
+
         # Preamble shared by both first-compaction and iterative-update prompts.
         # Keep the wording deliberately plain: Azure/OpenAI-compatible content
         # filters have flagged stronger "injection" / "do not respond" framing.
@@ -1642,7 +1688,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         )
 
         # Shared structured template (used by both paths).
-        _template_sections = f"""## Active Task
+        _template_sections = f"""## Active Task ({HISTORICAL_TASK_HEADING})
 [THE SINGLE MOST IMPORTANT FIELD. Capture the user's most recent unfulfilled
 input verbatim — the exact words they used. This includes:
 - Explicit task assignments ("refactor the auth module")
@@ -1655,6 +1701,12 @@ because the user did not issue an imperative command; reserve "None" for the
 rare case where the last exchange was fully resolved and the user said
 something like "thanks, that's all".
 If multiple items are outstanding, list only the ones NOT yet completed.
+If implementation is done but required lifecycle remains (for example commit,
+push, pull request creation, review, merge, deployment, or reporting evidence),
+that lifecycle work is still an outstanding task. Do NOT summarize it as "None",
+"awaiting user direction", or a terminal "ready for PR" handoff unless the user
+explicitly asked for local-only work or told the assistant to stop before that
+lifecycle step.
 Continuation should pick up exactly here. Examples:
 "User asked: 'Now refactor the auth module to use JWT instead of sessions'"
 "User asked: 'Waarom stond provider ineens op openrouter?' — needs investigation + answer"
@@ -1689,7 +1741,7 @@ Be specific with file paths, commands, line numbers, and results.]
 - Any running processes or servers
 - Environment details that matter]
 
-## In Progress
+## In Progress ({HISTORICAL_IN_PROGRESS_HEADING})
 [Work currently underway — what was being done when compaction fired]
 
 ## Blocked
@@ -1701,19 +1753,19 @@ Be specific with file paths, commands, line numbers, and results.]
 ## Resolved Questions
 [Questions the user asked that were ALREADY answered — include the answer so it is not repeated]
 
-## Pending User Asks
+## Pending User Asks ({HISTORICAL_PENDING_ASKS_HEADING})
 [Questions or requests from the user that have NOT yet been answered or fulfilled. If none, write "None."]
 
 ## Relevant Files
 [Files read, modified, or created — with brief note on each]
 
-## Remaining Work
+## Remaining Work ({HISTORICAL_REMAINING_WORK_HEADING})
 [What remains to be done — framed as context, not instructions]
 
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
 
-Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
+Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.{temporal_anchor}
 
 Write only the summary body. Do not include any preamble or prefix."""
 
@@ -1729,7 +1781,7 @@ PREVIOUS SUMMARY:
 NEW TURNS TO INCORPORATE:
 {content_to_summarize}
 
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
+Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, discussion turn, or required lifecycle closeout that the assistant has not yet completed. Only write "None" if the last exchange was fully resolved and no required closeout such as commit, push, PR creation, review, merge, deployment, or evidence reporting remains.
 
 {_template_sections}"""
         else:
