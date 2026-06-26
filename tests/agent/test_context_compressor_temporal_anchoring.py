@@ -81,6 +81,22 @@ def test_iterative_update_prompt_also_contains_anchoring_rule():
     assert "2026-06-07" in prompt
 
 
+def test_iterative_update_prompt_keeps_pr_lifecycle_as_unfinished_work():
+    compressor = _compressor()
+    compressor._previous_summary = "## Active Task\nImplement PID changes"
+
+    with patch.object(hermes_time, "now", _fixed_now), patch(
+        "agent.context_compressor.call_llm", return_value=_response("updated summary")
+    ) as mock_call:
+        compressor._generate_summary(_turns())
+
+    prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+    assert "required lifecycle closeout" in prompt
+    assert "PR creation" in prompt
+    assert "ready for PR" in prompt
+    assert "awaiting user direction" in prompt
+
+
 def test_clock_failure_omits_rule_but_compaction_still_runs():
     compressor = _compressor()
 
