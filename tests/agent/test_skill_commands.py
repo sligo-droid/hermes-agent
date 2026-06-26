@@ -334,6 +334,22 @@ class TestScanSkillCommands:
                 get_skill_commands()
             assert scan_spy.call_count == 0
 
+    def test_get_skill_commands_includes_meeting_skill(self, tmp_path):
+        import agent.skill_commands as sc_mod
+        from agent.skill_commands import get_skill_commands
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch.object(sc_mod, "_skill_commands", {}),
+            patch.object(sc_mod, "_skill_commands_platform", None),
+        ):
+            _make_skill(tmp_path, "meeting")
+
+            commands = get_skill_commands()
+            resolved = resolve_skill_command_key("meeting")
+
+        assert "/meeting" in commands
+        assert resolved == "/meeting"
 
     def test_special_chars_stripped_from_cmd_key(self, tmp_path):
         """Skill names with +, /, or other special chars produce clean cmd keys."""

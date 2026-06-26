@@ -804,8 +804,8 @@ async def test_discord_slash_like_text_requires_mention_in_guild_channels(adapte
 
 
 @pytest.mark.asyncio
-async def test_discord_meeting_text_command_requires_mention_in_guild_channels(adapter, monkeypatch):
-    """Raw '/meeting ...' text + audio is also gated unless explicitly mentioned."""
+async def test_discord_meeting_text_command_with_audio_bypasses_mention_gate(adapter, monkeypatch):
+    """Raw '/meeting ...' text + audio routes even without a bot mention."""
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
@@ -813,6 +813,33 @@ async def test_discord_meeting_text_command_requires_mention_in_guild_channels(a
     message = make_message(
         channel=FakeTextChannel(channel_id=123),
         content="/meeting summarize this",
+    )
+    message.attachments = [
+        SimpleNamespace(
+            filename="meeting.ogg",
+            content_type="audio/ogg",
+            url="https://cdn.discordapp.com/attachments/fake/meeting.ogg",
+        )
+    ]
+
+    monkeypatch.setattr(adapter, "_create_meeting_thread", AsyncMock(return_value=None))
+    monkeypatch.setattr(adapter, "_cache_discord_audio", AsyncMock(return_value="/tmp/meeting.ogg"))
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_discord_audio_without_meeting_text_still_requires_mention(adapter, monkeypatch):
+    """Audio alone must not bypass mention gating in guild channels."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=123),
+        content="summarize this",
     )
     message.attachments = [
         SimpleNamespace(

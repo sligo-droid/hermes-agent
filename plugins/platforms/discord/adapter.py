@@ -9732,12 +9732,14 @@ class DiscordAdapter(BasePlatformAdapter):
             replies_to_self = self._message_replies_to_self(message)
 
             voice_auto_tag = self._discord_voice_auto_tag()
+            meeting_audio_command = bool(is_meeting_command_message and all_audio_attachments)
 
             if require_mention and not is_free_channel and not in_bot_thread:
                 if (
                     self._client.user not in message.mentions
                     and not mention_prefix
                     and not (message_is_voice and voice_auto_tag)
+                    and not meeting_audio_command
                     and not replies_to_self
                 ):
                     return
