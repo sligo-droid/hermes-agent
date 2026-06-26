@@ -8,8 +8,16 @@ from typing import Any
 
 
 _VERIFY_COMMAND_RE = re.compile(
-    r"\b(test|tests|pytest|vitest|playwright|chromium|browser|smoke|check|verify|verification|"
-    r"status|ci|deploy|deployed|production|prod|preview|modal|health)\b",
+    r"\b(pytest|vitest|playwright|chromium|browser|smoke|check|status|ci|deploy|deployed|"
+    r"production|prod|preview|modal|health|run_tests\.sh)\b|"
+    r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:[^\s;&|]*[-:]?)?(?:test|tests|verify|verification)\b|"
+    r"\b(?:cargo|go)\s+test\b|"
+    r"(?:^|[\s;&|])(?:\./)?(?:scripts/)?(?:test|tests|run_tests)\.sh\b|"
+    r"\bpython(?:\d+(?:\.\d+)?)?\s+-m\s+\S*(?:verify|verification)\b",
+    re.IGNORECASE,
+)
+_PROTECTED_CHECKOUT_GUARDRAIL_RE = re.compile(
+    r"\bBLOCKED:\s*refusing to run a non-read-only terminal command from a protected canonical checkout\b",
     re.IGNORECASE,
 )
 _BROWSER_RE = re.compile(r"\b(browser|playwright|chromium|chrome|modal)\b", re.IGNORECASE)
@@ -91,6 +99,9 @@ def classify_tool_verification_evidence(
     data = _json_object(result)
     result_text = _text(data.get("output") or data.get("error") or result)
     check_name = _text(args.get("command") or args.get("url") or args.get("route") or name, limit=160)
+
+    if name == "terminal" and _PROTECTED_CHECKOUT_GUARDRAIL_RE.search(result_text):
+        return []
 
     if name == "terminal":
         if not _VERIFY_COMMAND_RE.search(check_name):
