@@ -350,12 +350,33 @@ def _configure_discord_read_broker(env: dict[str, str]) -> None:
     env["HERMES_DISCORD_WORKER_CONTROL_TOKEN"] = access_token
 
 
+def _config_env_value(key: str) -> str:
+    try:
+        from hermes_cli.config import get_env_value
+
+        return (get_env_value(key) or "").strip()
+    except Exception:
+        return ""
+
+
+def _configure_dashboard_qa_auth(env: dict[str, str]) -> None:
+    username = (
+        env.get("HERMES_DASHBOARD_USERNAME")
+        or _config_env_value("HERMES_DASHBOARD_USERNAME")
+    ).strip()
+    env["HERMES_DASHBOARD_USERNAME"] = username or _DASHBOARD_QA_USERNAME
+    if not env.get("HERMES_DASHBOARD_PASSWORD"):
+        password = _config_env_value("HERMES_DASHBOARD_PASSWORD")
+        if password:
+            env["HERMES_DASHBOARD_PASSWORD"] = password
+
+
 def _worker_env() -> dict[str, str]:
     env = os.environ.copy()
     _strip_discord_credentials(env)
     _strip_inherited_codex_worker_state(env)
     _configure_discord_read_broker(env)
-    env.setdefault("HERMES_DASHBOARD_USERNAME", _DASHBOARD_QA_USERNAME)
+    _configure_dashboard_qa_auth(env)
     return env
 
 

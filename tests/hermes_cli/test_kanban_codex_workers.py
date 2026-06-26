@@ -1209,6 +1209,24 @@ def test_worker_env_preserves_explicit_dashboard_username(monkeypatch):
     assert env["HERMES_DASHBOARD_PASSWORD"] == "dashboard-secret"
 
 
+def test_worker_env_loads_dashboard_password_from_config_env(monkeypatch):
+    from hermes_cli import kanban_codex_workers as workers
+
+    monkeypatch.delenv("HERMES_DASHBOARD_USERNAME", raising=False)
+    monkeypatch.delenv("HERMES_DASHBOARD_PASSWORD", raising=False)
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+    values = {
+        "HERMES_DASHBOARD_USERNAME": "configured-qa",
+        "HERMES_DASHBOARD_PASSWORD": "configured-secret",
+    }
+    monkeypatch.setattr(workers, "_config_env_value", lambda key: values.get(key, ""))
+
+    env = workers._worker_env()
+
+    assert env["HERMES_DASHBOARD_USERNAME"] == "configured-qa"
+    assert env["HERMES_DASHBOARD_PASSWORD"] == "configured-secret"
+
+
 def test_codex_role_worker_pythonpath_prefers_runtime_venv_owner(monkeypatch, tmp_path):
     from hermes_cli import kanban_codex_workers as workers
 
