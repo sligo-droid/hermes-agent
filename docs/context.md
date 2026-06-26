@@ -1,6 +1,6 @@
 # Project Context
 
-This document is durable context for Sligo Labs' `hermes-agent` fork. It should change when the product model, architecture boundaries, or knowledge-store split changes. Keep transient status in `docs/project-state.md`.
+This document is durable context for Sligo Labs' `hermes-agent` fork. It should change when the product model, architecture boundaries, or knowledge-store split changes. Keep only narrow routing/pickup facts in `docs/project-state.md`.
 
 ## Product Goal
 
@@ -30,7 +30,7 @@ Use the smallest stable home for each kind of knowledge:
 
 | Store | Canonical role |
 | --- | --- |
-| Repo docs | Current Hermes project state, target, blockers, durable product context, architecture decisions, and runbooks tied to this codebase. |
+| Repo docs | Durable product context, architecture decisions, runbooks, and narrow routing/pickup pointers tied to this codebase. |
 | Skills | Reusable procedures, pitfall checklists, command recipes, and class-level workflows. Skills should not be the current-state ledger. |
 | Memory/User profile | Compact facts that must be injected every session: user preferences, stable environment facts, and hard safety constraints. |
 | Session search | Recall prior conversations and exact past claims when needed; do not encode session progress as memory. |
@@ -38,7 +38,7 @@ Use the smallest stable home for each kind of knowledge:
 | Notion | Client-facing documents, feedback, shared project folders, and source artifacts. |
 | Discord | Live conversation, approvals, operator pings, and feature threads. Not canonical state by itself. |
 
-Boundary rule: if a note says “what is true right now for this Hermes repo,” put it in `docs/project-state.md`. If it says “why this product or architecture works this way,” put it here or in `docs/decisions/`. If it says “how to debug this class of incident,” keep it in a skill/reference and link to repo docs only when needed.
+Boundary rule: if a note is an authoritative fact, put it in the source that owns it: code, tests, config, git/PRs, runtime evidence, a focused doc, or a runbook. Use `docs/project-state.md` only for tiny routing/pickup facts that tell future workers which source to inspect next. If a note says “why this product or architecture works this way,” put it here or in `docs/decisions/`. If it says “how to debug this class of incident,” keep it in a skill/reference and link to repo docs only when needed.
 
 ## Architecture Overview
 
@@ -58,7 +58,7 @@ Stable repo map lives in `AGENTS.md`; this section is the product-level map.
 - Worker boards are execution children. They should not become the source of truth for product/work status.
 - Hermes `#dev` and PID are current Command Center project tabs. Adding projects should extend the same project metadata model, not hard-code a new screen.
 - `AGENTS.md` is worker instruction; it is not a status ledger.
-- `docs/project-state.md` is current state; keep it short enough to read in under two minutes.
+- `docs/project-state.md` is a tiny routing cursor, not authoritative current state.
 - Skills are procedural. A skill may say how to inspect gateway health; it should not say what the current Hermes target is.
 
 ## External References
@@ -66,7 +66,7 @@ Stable repo map lives in `AGENTS.md`; this section is the product-level map.
 - Sligo Command Center model: `docs/sligo-command-center.md`.
 - Network egress/security design: `docs/security/network-egress-isolation.md`.
 - Implementation plans: `docs/plans/`.
-- Current state and next actions: `docs/project-state.md`.
+- Routing and pickup cursor: `docs/project-state.md`.
 - Durable decisions: `docs/decisions/`.
 
 ## Boundaries

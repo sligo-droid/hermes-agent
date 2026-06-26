@@ -147,6 +147,7 @@ def check_project_state_requirement(
         False,
         "Operational PRs must update docs/project-state.md or include "
         "`Project-state: not needed` with a short justification in the PR body. "
-        "Update docs/project-state.md when current focus, blockers, live runtime state, "
-        "Command Center behavior, or worker/gateway operational truth changed.",
+        "Update docs/project-state.md only when narrow routing/pickup facts "
+        "change; authoritative state belongs in code, tests, config, PRs, "
+        "runtime evidence, focused docs, or runbooks.",
     )

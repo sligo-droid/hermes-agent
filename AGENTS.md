@@ -4,14 +4,14 @@ Instructions for AI coding assistants and developers working on the `hermes-agen
 
 ## Repo State Entry Points
 
-Before broad Hermes work, read the repo-backed state/context split:
+Before broad Hermes work, read the repo-backed routing/context split:
 
-- `docs/project-state.md` — current Hermes operational truth, focus, blockers, and next actions.
+- `docs/project-state.md` — tiny non-authoritative routing/pickup cursor; not a history ledger or source of truth.
 - `docs/context.md` — durable Sligo/Hermes product context and knowledge-store boundaries.
 - `docs/sligo-command-center.md` — Command Center product model when that surface is in scope.
 - `docs/decisions/` — durable rationale for reversal-prone project choices.
 
-Keep current project state in repo docs, not skills. Skills are reusable procedures, pitfalls, and verification checklists; they are not the Hermes target/status ledger.
+Keep durable project state in the narrowest repo-owned source: code/tests/config, git/PRs, runtime evidence, focused docs, or runbooks. Skills are reusable procedures, pitfalls, and verification checklists; they are not the Hermes target/status ledger.
 
 ## Working Rules
 
