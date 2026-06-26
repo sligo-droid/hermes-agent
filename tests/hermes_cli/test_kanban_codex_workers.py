@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import inspect
 import os
+import sqlite3
 import stat
 import subprocess
 import time
@@ -916,6 +917,103 @@ def test_role_worker_recovers_completed_json_with_fresh_connection_after_poisone
     assert latest is not None
     assert latest.outcome == "completed"
     assert latest.summary == "Dev finished with valid JSON."
+
+
+def test_role_worker_closes_poisoned_conn_before_fresh_result_recovery(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_REVIEWER
+
+    board = "discord-worker-close-poisoned-recover-result"
+    kanban_db.create_board(board, name="Close poisoned recovery board")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(conn, title="Review", assignee=ROLE_REVIEWER)
+        claimed = kanban_db.claim_task(conn, task_id)
+        assert claimed is not None
+    finally:
+        conn.close()
+
+    payload = {
+        "status": "blocked",
+        "summary": "Reviewer reached a valid blocker.",
+        "findings": [],
+        "new_tasks": [],
+        "criteria_assessment": {},
+        "blocker": "Authenticated protected-route rendering requires a valid Agora session.",
+    }
+    real_connect = kanban_db.connect
+    real_get_task_with_retry = kanban_db.get_task_with_transient_retry
+    real_apply = worker._apply_role_output
+    first_conn = {"proxy": None}
+    calls = {"apply": 0, "fresh_before_close": 0}
+
+    class ConnProxy:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+            return self.wrapped.close()
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+    def connect_with_poison_guard(*args, **kwargs):
+        raw = real_connect(*args, **kwargs)
+        if first_conn["proxy"] is None:
+            first_conn["proxy"] = ConnProxy(raw)
+            return first_conn["proxy"]
+        if not first_conn["proxy"].closed:
+            calls["fresh_before_close"] += 1
+            raw.close()
+            raise sqlite3.OperationalError("disk I/O error")
+        return raw
+
+    def get_task_with_poisoned_original(conn, *args, **kwargs):
+        if conn is first_conn["proxy"] and kwargs.get("operation_name") == "coding_worker.recovery_get_task":
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_get_task_with_retry(conn, *args, **kwargs)
+
+    def fail_first_apply(*args, **kwargs):
+        calls["apply"] += 1
+        if calls["apply"] == 1:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    monkeypatch.setenv("HERMES_CODEX_WORKER_ROLE", ROLE_REVIEWER)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(worker, "_build_prompt", lambda _conn, _task_id, _role: "prompt")
+    monkeypatch.setattr(
+        worker,
+        "_run_role_backend",
+        lambda *args, **kwargs: SimpleNamespace(final_text=json.dumps(payload), error=None),
+    )
+    monkeypatch.setattr(kanban_db, "connect", connect_with_poison_guard)
+    monkeypatch.setattr(kanban_db, "get_task_with_transient_retry", get_task_with_poisoned_original)
+    monkeypatch.setattr(worker, "_apply_role_output", fail_first_apply)
+    monkeypatch.setattr(worker, "mark_dispatch_dirty", lambda **_kwargs: None)
+
+    assert worker.main() == 0
+    assert calls == {"apply": 2, "fresh_before_close": 0}
+    assert first_conn["proxy"] is not None
+    assert first_conn["proxy"].closed is True
+
+    conn = real_connect(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        latest = kanban_db.latest_run(conn, task_id)
+    finally:
+        conn.close()
+    assert task is not None
+    assert task.status == "blocked"
+    assert latest is not None
+    assert latest.outcome == "blocked"
+    assert latest.summary == "Authenticated protected-route rendering requires a valid Agora session."
 
 
 def test_role_worker_recovers_recorded_json_when_backend_raises_after_recording(monkeypatch, tmp_path):
