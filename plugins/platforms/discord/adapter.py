@@ -79,6 +79,7 @@ _DISCORD_GOAL_THREAD_CONTEXT_MAX_MESSAGE_CHARS = 1_500
 _DISCORD_MISSED_THREAD_BACKFILL_LIMIT = 20
 _DISCORD_MISSED_THREAD_BACKFILL_THREAD_LIMIT = 500
 _DISCORD_MISSED_THREAD_BACKFILL_MAX_AGE_SECONDS = 24 * 60 * 60
+_DISCORD_TYPING_REFRESH_SECONDS = 5.0
 _DISCORD_ROOT_MENTION_RECOVERY_STATE_FILENAME = "discord_root_channel_recovery.json"
 _DISCORD_ROOT_MENTION_RECOVERY_LIMIT = 25
 _DISCORD_ROOT_MENTION_RECOVERY_PAGE_LIMIT = 4
@@ -773,8 +774,8 @@ class DiscordAdapter(BasePlatformAdapter):
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
         self._threads = ThreadParticipationTracker("discord")
-        # Persistent typing indicator loops per channel (DMs don't reliably
-        # show the standard typing gateway event for bots)
+        # Persistent typing indicator loops per channel/thread. Discord typing
+        # expires quickly, so active work must refresh before the expiry window.
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._typing_aliases: Dict[str, set[str]] = {}
         self._bot_task: Optional[asyncio.Task] = None
@@ -5989,9 +5990,10 @@ class DiscordAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Start a persistent typing indicator for a channel.
 
-        Discord's TYPING_START gateway event is unreliable in DMs for bots.
-        Send the first heartbeat before returning so the indicator appears at
-        turn start, then keep it alive with a background refresh loop.
+        Discord typing indicators expire after a few seconds. Send the first
+        heartbeat before returning so the indicator appears at turn start, then
+        keep it alive with a background refresh loop until stop_typing() is
+        called for the chat/thread.
         """
         if not self._client:
             return
@@ -6006,19 +6008,22 @@ class DiscordAdapter(BasePlatformAdapter):
         if existing_task:
             self._typing_tasks.pop(target_id, None)
 
-        await self.send_typing_once(target_id)
+        try:
+            await self.send_typing_once(target_id)
+        except Exception as e:
+            logger.debug("Discord typing indicator failed for %s: %s", target_id, e)
 
         async def _typing_loop() -> None:
             try:
                 while True:
-                    await asyncio.sleep(8)
+                    await asyncio.sleep(_DISCORD_TYPING_REFRESH_SECONDS)
                     try:
                         await self.send_typing_once(target_id)
                     except asyncio.CancelledError:
                         return
                     except Exception as e:
                         logger.debug("Discord typing indicator failed for %s: %s", target_id, e)
-                        return
+                        continue
             except asyncio.CancelledError:
                 pass
             finally:

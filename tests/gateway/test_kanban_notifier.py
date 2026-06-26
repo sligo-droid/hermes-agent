@@ -918,6 +918,27 @@ def test_discord_kanban_typing_watcher_continues_typing_after_status_collection_
     ]
 
 
+def test_discord_kanban_typing_watcher_default_refreshes_before_discord_expiry(monkeypatch):
+    from hermes_cli import discord_worker_boards as dwb
+
+    monkeypatch.setattr(dwb, "running_discord_thread_typing_targets", lambda: [])
+    monkeypatch.setattr(dwb, "thread_status_targets", lambda: [])
+    runner = _make_discord_runner(TypingAdapter())
+    sleeps = []
+    real_sleep = asyncio.sleep
+
+    async def patched_sleep(delay):
+        sleeps.append(delay)
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", patched_sleep)
+
+    asyncio.run(runner._discord_kanban_typing_watcher())
+
+    assert sleeps == [5.0]
+
+
 def test_discord_kanban_typing_watcher_rate_limits_repeated_collection_errors(monkeypatch, caplog):
     from hermes_cli import discord_worker_boards as dwb
 
