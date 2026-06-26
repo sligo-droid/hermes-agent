@@ -49,6 +49,7 @@ from hermes_cli.ui_work_routing import (
     UIWorkRouteDecision,
     codex_ui_work_extra_args,
     resolve_ui_work_route,
+    ui_specialist_skill_prompt,
 )
 from hermes_cli.worker_autoreview import materialize_autoreview_helper
 
@@ -1253,10 +1254,12 @@ def _ui_work_route_prompt(decision: UIWorkRouteDecision | None) -> str:
         f"- selected_route: {metadata.get('selected_route') or ''}\n"
         f"- selected_provider: {metadata.get('selected_provider') or ''}\n"
         f"- selected_model: {metadata.get('selected_model') or ''}\n"
+        f"- recommended_skills: {', '.join(metadata.get('recommended_skills') or [])}\n"
         f"- route_decision_source: {metadata.get('route_decision_source') or ''}\n"
         f"- route_decision_rationale: {metadata.get('route_decision_rationale') or ''}\n"
         f"- advisory_reason: {metadata.get('advisory_reason') or ''}\n"
         "This is structured launch evidence; include it in route-smoke verification instead of re-inferring the route from prose.\n"
+        f"{ui_specialist_skill_prompt(decision)}\n"
     )
 
 

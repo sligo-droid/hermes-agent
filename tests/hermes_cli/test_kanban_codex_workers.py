@@ -3956,6 +3956,8 @@ def test_dev_role_backend_records_planner_ui_route_decision(monkeypatch, tmp_pat
     assert route["route_decision_source"] == "planner"
     assert "selected_route: ui_visual_specialist" in captured["prompt"]
     assert "selected_model: z-ai/glm-5.2" in captured["prompt"]
+    assert "recommended_skills: taste-skill, claude-design, popular-web-designs" in captured["prompt"]
+    assert "UI specialist skill loading" in captured["prompt"]
     assert events[0]["method"] == "ui_work_route/decision"
     assert events[0]["params"]["route"]["selected_model"] == "z-ai/glm-5.2"
 

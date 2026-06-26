@@ -16,7 +16,7 @@ Configure, extend, or contribute to Hermes Agent.
 |---|---|
 | Source | Bundled (installed by default) |
 | Path | `skills/autonomous-ai-agents/hermes-agent` |
-| Version | `2.1.0` |
+| Version | `2.2.0` |
 | Author | Hermes Agent + Teknium |
 | License | MIT |
 | Platforms | linux, macos, windows |
@@ -48,11 +48,21 @@ People use Hermes for software development, research, system administration, dat
 
 **Docs:** https://hermes-agent.nousresearch.com/docs/
 
+## Scope & Verification
+
+This skill is a concise operating guide, not the complete source of truth for every Hermes feature. If a Hermes feature, command, or setting is not mentioned here, do not treat that absence as evidence that it does not exist. Check the live repository and official docs before giving a negative answer.
+
+Good verification targets:
+
+- CLI commands: `hermes --help`, `hermes <command> --help`, and `hermes_cli/main.py`
+- User documentation: https://hermes-agent.nousresearch.com/docs/
+- Source tree: https://github.com/NousResearch/hermes-agent
+
 ## Quick Start
 
 ```bash
 # Install
-curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 
 # Interactive chat (default)
 hermes
@@ -157,6 +167,10 @@ hermes mcp test NAME        Test connection
 hermes mcp configure NAME   Toggle tool selection
 ```
 
+How the built-in MCP client connects servers (stdio/HTTP), auto-discovers
+their tools, and exposes them as first-class tools, plus catalog install
+(`hermes mcp install <name>`): `skill_view(name="hermes-agent", file_path="references/native-mcp.md")`.
+
 ### Gateway (Messaging Platforms)
 
 ```
@@ -204,6 +218,9 @@ hermes webhook list         List subscriptions
 hermes webhook remove NAME  Remove a subscription
 hermes webhook test NAME    Send a test POST
 ```
+
+Full setup, route config, payload templating, and event-driven agent-run
+patterns: `skill_view(name="hermes-agent", file_path="references/webhooks.md")`.
 
 ### Profiles
 
@@ -336,7 +353,6 @@ The registry of record is `hermes_cli/commands.py` — every consumer
 /commands [page]     Browse all commands (gateway)
 /usage               Codex subscription/model usage
 /insights [days]     Usage analytics
-/gquota              Show Google Gemini Code Assist quota usage (CLI)
 /status              Session info (gateway)
 /profile             Active profile info
 /debug               Upload debug report (system info + logs) and get shareable links
@@ -353,10 +369,9 @@ The registry of record is `hermes_cli/commands.py` — every consumer
 
 ```
 ~/.hermes/config.yaml       Main configuration
-~/.hermes/.env              API keys and secrets
+~/.hermes/.env              API keys and secrets (under $HERMES_HOME if set)
 $HERMES_HOME/skills/        Installed skills
-~/.hermes/sessions/         Gateway routing index, request dumps, *.jsonl transcripts (and optional per-session JSON snapshots when sessions.write_json_snapshots: true)
-~/.hermes/state.db          Canonical session store (SQLite + FTS5)
+~/.hermes/sessions/         Session transcripts
 ~/.hermes/logs/             Gateway and error logs
 ~/.hermes/auth.json         OAuth tokens and credential pools
 ~/.hermes/hermes-agent/     Source code (if git-installed)
@@ -371,9 +386,9 @@ Edit with `hermes config edit` or `hermes config set section.key value`.
 | Section | Key options |
 |---------|-------------|
 | `model` | `default`, `provider`, `base_url`, `api_key`, `context_length` |
-| `agent` | `max_turns` (1000), `tool_use_enforcement` |
+| `agent` | `max_turns` (90), `tool_use_enforcement` |
 | `terminal` | `backend` (local/docker/ssh/modal), `cwd`, `timeout` (180) |
-| `compression` | `enabled`, `threshold` (0.70), `target_ratio` (0.35), `summary_ratio` (0.25), `max_summary_tokens` (32000), `abort_on_summary_failure` (true) |
+| `compression` | `enabled`, `threshold` (0.50), `target_ratio` (0.20) |
 | `display` | `skin`, `tool_progress`, `show_reasoning`, `show_cost` |
 | `stt` | `enabled`, `provider` (local/groq/openai/mistral) |
 | `tts` | `provider` (edge/elevenlabs/openai/minimax/mistral/neutts) |
@@ -456,6 +471,55 @@ Full enumeration lives in `toolsets.py` as the `TOOLSETS` dict; `_HERMES_CORE_TO
 Tool changes take effect on `/reset` (new session). They do NOT apply mid-conversation to preserve prompt caching.
 
 ---
+
+## Project Context Files
+
+Hermes injects project-level instructions into the system prompt by reading context files from the working directory. The discovery order is **first match wins** — only one project context source is loaded per session.
+
+| File (in priority order) | Discovery | Use when |
+|---|---|---|
+| `.hermes.md` / `HERMES.md` | Walks parents up to the git root, stops at git root | You want hierarchical project rules (root + per-package overrides) |
+| `AGENTS.md` / `agents.md` | **Cwd only** — subdirectory and parent copies are ignored | You want portable agent instructions that work the same in Hermes, Claude Code, Codex, etc. |
+| `CLAUDE.md` / `claude.md` | Cwd only | Same as AGENTS.md, Claude-flavored |
+| `.cursorrules` / `.cursor/rules/*.mdc` | Cwd only | Migrating from Cursor |
+
+`SOUL.md` (in `$HERMES_HOME`) is independent and always loaded when present — it sets the agent's identity, not project rules.
+
+### Pick the right one
+
+- **Use `.hermes.md`** when you want Hermes-specific behavior that lives above the cwd (root + subtree), or when you want rules to inherit from a parent directory. The parent walk stops at the git root, so a home-level `.hermes.md` won't leak into every project (a git repo's root is the boundary).
+- **Use `AGENTS.md`** when the same project will also be worked on by other agents (Codex, Claude Code, OpenCode). Those tools all have their own conventions for `AGENTS.md`, and the "cwd only" contract keeps the file portable.
+- **Don't put project rules in `~/.hermes/AGENTS.md`** (or any other home-level location). When Hermes runs with that directory as cwd, the file loads — but only for that one directory. For cross-project context, use `SOUL.md` (in `$HERMES_HOME`, identity-only) or install a skill via `hermes skills install`.
+
+### Size and truncation
+
+Each context file is capped at 20,000 characters. Files longer than that get **head + tail** truncated (the middle is dropped, with a `[...truncated...]` marker). For large project rules, prefer splitting into multiple skills over cramming one file.
+
+### Security
+
+All context files pass through the threat-pattern scanner before reaching the system prompt. Patterns matching prompt injection or promptware are replaced with a `[BLOCKED: ...]` placeholder. This means an `AGENTS.md` containing obvious injection attempts won't reach the model — the scanner blocks the content, not the file, so the rest of the file still loads.
+
+### Disable for one session
+
+`hermes --ignore-rules` skips auto-injection of all project context files (`.hermes.md`, `AGENTS.md`, `CLAUDE.md`, `.cursorrules`) **and** `SOUL.md` identity, plus user config, plugins, and MCP servers. Use it to isolate whether a problem is your setup or Hermes itself.
+
+### Example: a small `.hermes.md`
+
+```markdown
+# My Project
+
+Hermes: when working in this repo, follow these rules.
+
+## Build
+- Always run `make test` before declaring a change done.
+- Use `uv run` for Python, not `pip install`.
+
+## Style
+- Prefer `pathlib.Path` over `os.path`.
+- No `print()` in production code — use the `logger`.
+```
+
+That file at `/home/me/projects/myrepo/.hermes.md` is auto-loaded when Hermes runs in any subdirectory of `/home/me/projects/myrepo`, but not when it runs in `/home/me/other-project`.
 
 ## Security & Privacy Toggles
 
@@ -886,7 +950,7 @@ hermes config set auxiliary.vision.model <model_name>
 | Env variables | `hermes config env-path` or [Env vars reference](https://hermes-agent.nousresearch.com/docs/reference/environment-variables) |
 | CLI commands | `hermes --help` or [CLI reference](https://hermes-agent.nousresearch.com/docs/reference/cli-commands) |
 | Gateway logs | `~/.hermes/logs/gateway.log` |
-| Session files | `hermes sessions browse` (reads state.db) |
+| Session files | `~/.hermes/sessions/` or `hermes sessions browse` |
 | Source code | `~/.hermes/hermes-agent/` |
 
 ---
@@ -894,6 +958,8 @@ hermes config set auxiliary.vision.model <model_name>
 ## Contributor Quick Reference
 
 For occasional contributors and PR authors. Full developer docs: https://hermes-agent.nousresearch.com/docs/developer-guide/
+
+When locating Hermes source, search the checked-out repo first; do not use web/community forums for file locations unless local context is missing or stale.
 
 ### Project Layout
 
@@ -912,15 +978,17 @@ hermes-agent/
 │   └── main.py           # CLI entry point and argparse
 ├── tools/                # One file per tool
 │   └── registry.py       # Central tool registry
-├── gateway/              # Messaging gateway
-│   └── platforms/        # Platform adapters (telegram, discord, etc.)
+├── gateway/              # Messaging gateway/session orchestration and core platform helpers
+│   └── platforms/        # Core helpers and non-pluginized adapters
+├── plugins/              # Plugin systems; platform adapters may live here
+│   └── platforms/discord/adapter.py  # DiscordAdapter; not discord.py package bytecode
 ├── cron/                 # Job scheduler
 ├── tests/                # ~3000 pytest tests
 └── website/              # Docusaurus docs site
 ```
 <!-- ascii-guard-ignore-end -->
 
-Config: `~/.hermes/config.yaml` (settings), `~/.hermes/.env` (API keys).
+Config: `~/.hermes/config.yaml` (settings), `~/.hermes/.env` (API keys) — both under `$HERMES_HOME` when it is set.
 
 ### Adding a Tool (3 files)
 

@@ -6,7 +6,11 @@ import json
 import pytest
 
 from hermes_cli.config import DEFAULT_CONFIG
-from hermes_cli.ui_work_routing import codex_ui_work_extra_args, resolve_ui_work_route
+from hermes_cli.ui_work_routing import (
+    codex_ui_work_extra_args,
+    opencode_ui_work_worker_config,
+    resolve_ui_work_route,
+)
 
 
 def _cfg():
@@ -42,6 +46,11 @@ def test_matches_new_visual_web_ui_development_and_overlay_args(task):
     assert decision.selected_route == "ui_visual_specialist"
     assert decision.selected_provider == "openrouter"
     assert decision.selected_model == "z-ai/glm-5.2"
+    assert decision.metadata()["recommended_skills"] == [
+        "taste-skill",
+        "claude-design",
+        "popular-web-designs",
+    ]
     assert decision.advisory_matched is True
     assert "visual ui work" in decision.advisory_reason
     assert decision.provider == "openrouter"
@@ -61,7 +70,7 @@ def test_matches_new_visual_web_ui_development_and_overlay_args(task):
     ]
 
 
-def test_visual_specialist_keeps_codex_overlay_when_default_backend_is_opencode():
+def test_visual_specialist_supports_opencode_backend_config():
     decision = resolve_ui_work_route(
         _cfg(),
         task="Implement Command Center card footer visuals and responsive styling.",
@@ -75,10 +84,13 @@ def test_visual_specialist_keeps_codex_overlay_when_default_backend_is_opencode(
 
     assert decision.matched is True
     assert decision.selected_route == "ui_visual_specialist"
-    assert decision.backend == "codex"
+    assert decision.backend == "opencode"
     assert decision.selected_provider == "openrouter"
     assert decision.selected_model == "z-ai/glm-5.2"
-    assert codex_ui_work_extra_args(decision)
+    assert codex_ui_work_extra_args(decision) == []
+    assert opencode_ui_work_worker_config(decision) == {
+        "opencode": {"model": "openrouter/z-ai/glm-5.2"}
+    }
 
 
 def test_visual_specialist_accepts_json_encoded_route_decision():
@@ -158,6 +170,7 @@ def test_visual_keywords_without_route_are_advisory_only():
 
     assert decision.matched is False
     assert decision.selected_route == "default_coding_worker"
+    assert decision.metadata()["recommended_skills"] == []
     assert decision.selected_provider == ""
     assert decision.selected_model == ""
     assert decision.route_decision_source == "deterministic_default"

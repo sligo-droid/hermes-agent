@@ -171,7 +171,7 @@ class UIWorkRouteDecision:
     launch_worker: bool = True
 
     def metadata(self) -> dict[str, Any]:
-        return {
+        metadata = {
             "matched": self.matched,
             "enabled": self.enabled,
             "reason": self.reason,
@@ -192,6 +192,28 @@ class UIWorkRouteDecision:
             "advisory_matched": self.advisory_matched,
             "advisory_reason": self.advisory_reason,
         }
+        metadata["recommended_skills"] = (
+            list(UI_SPECIALIST_SKILLS)
+            if self.selected_route == _UI_SPECIALIST_ROUTE
+            else []
+        )
+        return metadata
+
+
+def ui_specialist_skill_prompt(decision: UIWorkRouteDecision | None) -> str:
+    """Return worker prompt text for UI-specialist skill loading."""
+    if decision is None or decision.selected_route != _UI_SPECIALIST_ROUTE:
+        return ""
+    skills = ", ".join(f"`{name}`" for name in UI_SPECIALIST_SKILLS)
+    return (
+        "UI specialist skill loading: before frontend/UI edits, load and use "
+        f"these bundled Hermes skills when available: {skills}. "
+        "Use `taste-skill` as the anti-slop quality gate, `claude-design` for "
+        "design workflow, and `popular-web-designs` when a known visual "
+        "reference or design-system vocabulary is useful. If a skill cannot be "
+        "loaded by the worker runtime, continue with the task and report the "
+        "limitation in the final summary."
+    )
 
 
 @dataclass(frozen=True)
@@ -205,6 +227,7 @@ class _RouteDecisionInput:
 
 _DEFAULT_ROUTE = "default_coding_worker"
 _UI_SPECIALIST_ROUTE = "ui_visual_specialist"
+UI_SPECIALIST_SKILLS = ("taste-skill", "claude-design", "popular-web-designs")
 _NO_WORKER_ROUTES = {"review_only_no_worker", "ask_human"}
 _ROUTE_ALIASES = {
     "default": _DEFAULT_ROUTE,

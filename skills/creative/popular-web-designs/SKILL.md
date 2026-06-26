@@ -31,6 +31,10 @@ system, shadows, responsive behavior, and practical agent prompts with exact CSS
   Pair it with this skill when the user wants a thoughtfully-designed page styled
   after a known brand: `claude-design` drives the workflow, this skill supplies
   the visual vocabulary.
+- **`taste-skill`** — use for Taste Skill anti-slop frontend checks (brief
+  inference, consistency locks, redesign audit, and hard pre-flight review).
+  Pair it with this skill for UI-specialist implementation or polish so the
+  selected visual vocabulary does not become a generic template.
 - **`design-md`** — use when the deliverable is a formal DESIGN.md token spec
   file, not a rendered artifact.
 
