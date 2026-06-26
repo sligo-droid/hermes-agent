@@ -103,7 +103,7 @@ app = FastAPI(title="Hermes Agent", version=__version__)
 _SESSION_TOKEN = secrets.token_urlsafe(32)
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 _DASHBOARD_AUTH_REALM = "Hermes Dashboard"
-_DASHBOARD_DEFAULT_USERNAME = "hermes"
+_DASHBOARD_DEFAULT_USERNAME = "hermes_qa"
 _DASHBOARD_EPHEMERAL_PASSWORD = secrets.token_urlsafe(18)
 _DASHBOARD_PASSWORD_ANNOUNCED = False
 

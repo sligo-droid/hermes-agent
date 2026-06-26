@@ -292,6 +292,37 @@ def test_dev_role_prompt_includes_autoreview_closeout_contract(monkeypatch, tmp_
     assert "Autoreview closeout contract for dev workers" not in planner_prompt
 
 
+def test_worker_prompt_includes_dashboard_qa_auth_without_secret(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import kanban_codex_worker as worker
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_worker_boards import ROLE_DEV
+
+    board = "discord-worker-dashboard-qa-auth"
+    kanban_db.create_board(board, name="Dashboard QA auth")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("HERMES_DASHBOARD_PASSWORD", "super-secret-dashboard-password")
+    conn = kanban_db.connect(board=board)
+    try:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Smoke protected dashboard",
+            body="Goal: browser QA\nSuccess means: protected route checked\nStop when: verification recorded",
+            assignee=ROLE_DEV,
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+        )
+        prompt = worker._build_prompt(conn, task_id, ROLE_DEV)
+    finally:
+        conn.close()
+
+    assert "Protected dashboard/browser QA auth contract" in prompt
+    assert "hermes_qa" in prompt
+    assert "HERMES_DASHBOARD_PASSWORD" in prompt
+    assert "Never print, log" in prompt
+    assert "super-secret-dashboard-password" not in prompt
+
+
 def test_dev_role_prompt_force_loads_board_worker_skill_hints(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import kanban_codex_worker as worker
@@ -1103,6 +1134,7 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(real_home))
     monkeypatch.setenv("DISCORD_BOT_TOKEN", "discord-token")
     monkeypatch.setenv("DISCORD_ADMIN_ACTIONS", "delete,pin")
+    monkeypatch.setenv("HERMES_DASHBOARD_PASSWORD", "dashboard-secret")
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "parent-codex-home"))
     monkeypatch.setenv("HERMES_CODEX_WORKER_CREDENTIAL_ID", "parent-cred")
     monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
@@ -1153,6 +1185,8 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     assert captured["env"]["HERMES_DISCORD_WORKER_READ_TOKEN"] == "broker-secret"
     assert captured["env"]["HERMES_DISCORD_WORKER_CONTROL_URL"] == "http://127.0.0.1:9"
     assert captured["env"]["HERMES_DISCORD_WORKER_CONTROL_TOKEN"] == "broker-secret"
+    assert captured["env"]["HERMES_DASHBOARD_USERNAME"] == "hermes_qa"
+    assert captured["env"]["HERMES_DASHBOARD_PASSWORD"] == "dashboard-secret"
     assert "DISCORD_BOT_TOKEN" not in captured["env"]
     assert "DISCORD_ADMIN_ACTIONS" not in captured["env"]
     assert captured["env"]["CODEX_HOME"].endswith("/homes/" + task.id)
@@ -1160,6 +1194,19 @@ def test_codex_role_worker_defaults_to_host_runner(monkeypatch, tmp_path):
     assert captured["env"].get("HERMES_CODEX_WORKER_CREDENTIAL_ID") != "parent-cred"
     assert captured["env"]["GH_CONFIG_DIR"] == str(gh_dir)
     assert captured["start_new_session"] is True
+
+
+def test_worker_env_preserves_explicit_dashboard_username(monkeypatch):
+    from hermes_cli import kanban_codex_workers as workers
+
+    monkeypatch.setenv("HERMES_DASHBOARD_USERNAME", "operator")
+    monkeypatch.setenv("HERMES_DASHBOARD_PASSWORD", "dashboard-secret")
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+
+    env = workers._worker_env()
+
+    assert env["HERMES_DASHBOARD_USERNAME"] == "operator"
+    assert env["HERMES_DASHBOARD_PASSWORD"] == "dashboard-secret"
 
 
 def test_codex_role_worker_pythonpath_prefers_runtime_venv_owner(monkeypatch, tmp_path):
@@ -1292,6 +1339,8 @@ def test_systemd_worker_env_keeps_role_worker_runtime_keys(monkeypatch, tmp_path
             "HERMES_CODEX_WORKER_SERVICE_TIER": "fast",
             "HERMES_CODEX_WORKER_CREDENTIAL_ID": "cred-1",
             "HERMES_CODING_WORKER_BACKEND": "opencode",
+            "HERMES_DASHBOARD_USERNAME": "hermes_qa",
+            "HERMES_DASHBOARD_PASSWORD": "dashboard-secret",
             "HERMES_DISCORD_WORKER_READ_URL": "http://127.0.0.1:9",
             "HERMES_DISCORD_WORKER_READ_TOKEN": "broker-secret",
             "HERMES_DISCORD_WORKER_CONTROL_URL": "http://127.0.0.1:9",
@@ -1308,6 +1357,8 @@ def test_systemd_worker_env_keeps_role_worker_runtime_keys(monkeypatch, tmp_path
     assert filtered["HERMES_CODEX_WORKER_SERVICE_TIER"] == "fast"
     assert filtered["HERMES_CODEX_WORKER_CREDENTIAL_ID"] == "cred-1"
     assert filtered["HERMES_CODING_WORKER_BACKEND"] == "opencode"
+    assert filtered["HERMES_DASHBOARD_USERNAME"] == "hermes_qa"
+    assert filtered["HERMES_DASHBOARD_PASSWORD"] == "dashboard-secret"
     assert filtered["HERMES_DISCORD_WORKER_READ_TOKEN"] == "broker-secret"
     assert filtered["HERMES_DISCORD_WORKER_CONTROL_TOKEN"] == "broker-secret"
     assert filtered["CODEX_HOME"] == str(tmp_path / "codex-home")

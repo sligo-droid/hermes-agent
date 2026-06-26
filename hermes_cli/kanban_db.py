@@ -8256,6 +8256,8 @@ _SYSTEMD_WORKER_ENV_EXACT = frozenset({
     _KANBAN_DB_HANDOFF_MARKER_ENV,
     "CODEX_HOME",
     "GH_CONFIG_DIR",
+    "HERMES_DASHBOARD_PASSWORD",
+    "HERMES_DASHBOARD_USERNAME",
     "HOME",
     "HERMES_CODING_WORKER_BACKEND",
     "HERMES_HOME",
@@ -8282,9 +8284,8 @@ def _systemd_worker_env(env: dict[str, str]) -> dict[str, str]:
     """Return the small env surface passed to transient worker services.
 
     Do not shovel the gateway's full process environment into systemd unit
-    metadata. Workers can load credentials from ``HERMES_HOME/.env`` as usual;
-    the transient unit only needs runtime routing keys plus basic shell/Python
-    path state.
+    metadata. Keep this to runtime routing keys, basic shell/Python path state,
+    and explicit worker-contract secrets such as the dashboard QA password.
     """
     out: dict[str, str] = {}
     for key, value in env.items():
