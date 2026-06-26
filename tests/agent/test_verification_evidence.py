@@ -176,3 +176,72 @@ def test_final_response_downgrade_keeps_independent_deployed_claim_separate():
     assert "production browser verification is not verified" in downgraded
     assert "browser modal smoke" in downgraded
     assert "Production browser modal verified visible" not in downgraded
+
+
+def test_protected_canonical_checkout_guardrail_is_not_failed_verification_evidence():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    result = json.dumps(
+        {
+            "output": "",
+            "exit_code": 1,
+            "error": (
+                "BLOCKED: refusing to run a non-read-only terminal command from a protected canonical checkout "
+                "on main: /home/droid/.hermes/workspace/examine. Canonical project roots are inspection-only. "
+                "Create/use a git worktree under /home/droid/workspace."
+            ),
+        }
+    )
+
+    tool_executor._record_turn_tool_runtime(agent, "terminal", 0.1, result, True)
+    tool_executor._record_turn_verification_evidence(agent, "terminal", {"command": "pytest -q"}, result, True)
+
+    assert agent._turn_runtime_stats.get("verification_evidence", []) == []
+
+
+def test_verify_path_name_alone_is_not_verification_evidence():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    result = json.dumps(
+        {
+            "output": "Preparing worktree (detached HEAD 1234567)\nHEAD is now at 1234567 main",
+            "exit_code": 124,
+            "error": "Command timed out after 30 seconds",
+        }
+    )
+    command = (
+        "rm -rf /home/droid/workspaces/examine-main-verify\n"
+        "git -C /home/droid/.hermes/workspace/examine worktree add "
+        "/home/droid/workspaces/examine-main-verify origin/main"
+    )
+
+    tool_executor._record_turn_tool_runtime(agent, "terminal", 30.0, result, True)
+    tool_executor._record_turn_verification_evidence(agent, "terminal", {"command": command}, result, True)
+
+    assert agent._turn_runtime_stats.get("verification_evidence", []) == []
+
+
+def test_real_verification_command_still_records_blocking_evidence():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    result = json.dumps({"output": "1 failed", "exit_code": 1, "error": None})
+
+    tool_executor._record_turn_tool_runtime(agent, "terminal", 1.0, result, True)
+    tool_executor._record_turn_verification_evidence(agent, "terminal", {"command": "pytest -q"}, result, True)
+
+    evidence = agent._turn_runtime_stats["verification_evidence"]
+    constraints = claim_constraints_for_text("CI passed via pytest -q.", evidence)
+
+    assert evidence
+    assert latest_evidence_by_surface(evidence)["ci"]["status"] == "failure"
+    assert constraints["allowed"] is False
+
+
+def test_common_test_command_still_records_verification_evidence():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    result = json.dumps({"output": "test failed", "exit_code": 1, "error": None})
+
+    tool_executor._record_turn_tool_runtime(agent, "terminal", 1.0, result, True)
+    tool_executor._record_turn_verification_evidence(agent, "terminal", {"command": "npm test"}, result, True)
+
+    evidence = agent._turn_runtime_stats["verification_evidence"]
+
+    assert evidence
+    assert latest_evidence_by_surface(evidence)["ci"]["status"] == "failure"
