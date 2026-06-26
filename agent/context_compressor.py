@@ -268,6 +268,18 @@ def _extract_skill_version(result: dict[str, Any], content: str) -> str:
     return ""
 
 
+def _resolve_tool_result_metadata(
+    msg: dict[str, Any],
+    call_id_to_tool: dict[str, tuple[str, str]],
+) -> tuple[str, str]:
+    """Resolve tool metadata, falling back to persisted tool result fields."""
+    call_id = str(msg.get("tool_call_id") or "")
+    mapped_name, mapped_args = call_id_to_tool.get(call_id, ("", ""))
+    tool_name = mapped_name or msg.get("tool_name") or "unknown"
+    tool_args = mapped_args or msg.get("tool_args") or msg.get("arguments") or ""
+    return str(tool_name or "unknown"), str(tool_args or "")
+
+
 def _summarize_skill_view_result(tool_args: str, tool_content: str) -> str | None:
     """Return a bounded, recoverable summary for oversized skill_view output."""
     try:
@@ -1081,8 +1093,7 @@ class ContextCompressor(ContextEngine):
             content = msg.get("content", "")
             if not isinstance(content, str) or len(content) <= _SKILL_VIEW_TOOL_RESULT_MAX_CHARS:
                 continue
-            call_id = msg.get("tool_call_id", "")
-            tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
+            tool_name, tool_args = _resolve_tool_result_metadata(msg, call_id_to_tool)
             if tool_name != "skill_view":
                 continue
             summary = _summarize_skill_view_result(tool_args, content)
@@ -1148,8 +1159,7 @@ class ContextCompressor(ContextEngine):
                 continue
             # Only prune if the content is substantial (>200 chars)
             if len(content) > 200:
-                call_id = msg.get("tool_call_id", "")
-                tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
+                tool_name, tool_args = _resolve_tool_result_metadata(msg, call_id_to_tool)
                 if tool_name == "skill_view":
                     continue
                 summary = _summarize_tool_result(tool_name, tool_args, content)
@@ -1264,8 +1274,7 @@ class ContextCompressor(ContextEngine):
                 continue
             if not isinstance(content, str) or len(content) <= _EMERGENCY_TOOL_RESULT_MAX_CHARS:
                 continue
-            call_id = msg.get("tool_call_id", "")
-            tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
+            tool_name, tool_args = _resolve_tool_result_metadata(msg, call_id_to_tool)
             if tool_name == "skill_view":
                 summary = _summarize_skill_view_result(tool_args, content)
                 if summary:
@@ -1458,8 +1467,15 @@ class ContextCompressor(ContextEngine):
                 elif text:
                     assistant_actions.append(text)
             elif role == "tool":
-                call_id = str(msg.get("tool_call_id") or "")
-                tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
+                tool_name, tool_args = _resolve_tool_result_metadata(msg, call_id_to_tool)
+                if tool_name == "skill_view":
+                    skill_summary = _summarize_skill_view_result(
+                        tool_args,
+                        _content_text_for_contains(msg.get("content")),
+                    )
+                    if skill_summary:
+                        tool_actions.append(skill_summary)
+                        continue
                 tool_actions.append(
                     _summarize_tool_result(tool_name, tool_args, text or "")
                 )
