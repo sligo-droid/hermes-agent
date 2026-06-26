@@ -8047,9 +8047,9 @@ class GatewayRunner:
                 except Exception:
                     logger.debug("discord foreman: failed to release watcher lock", exc_info=True)
 
-    async def _discord_kanban_typing_watcher(self, interval: float = 8.0) -> None:
+    async def _discord_kanban_typing_watcher(self, interval: float = 5.0) -> None:
         """Keep Discord thread typing visible while thread workers are running."""
-        interval = max(float(interval or 8.0), 1.0)
+        interval = max(float(interval or 5.0), 1.0)
         error_backoff: dict[tuple[str, str, str], dict[str, float | int]] = {}
         error_backoff_window = 60.0
 
