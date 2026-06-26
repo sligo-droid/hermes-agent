@@ -1,133 +1,60 @@
 # Project State
 
-Last updated: 2026-06-25 20:24 UTC
+Last updated: 2026-06-26
 State owner: Sligo Labs agent
 
-This is the canonical repo-backed state file for Sligo Labs' `hermes-agent` fork. It exists to stop Hermes project continuity from drifting into skills, memories, Discord threads, or stale worktrees.
+This is the active pickup-state file for Sligo Labs' `hermes-agent` fork. Keep it short and current. Move completed ledger material to `docs/archive/project-state-archive-20260626.md` or a newer dated archive instead of letting this file become historical context bloat.
 
-## Current focus
+## Current Focus
 
-- Move Hermes project continuity and intention-setting to repo-tracked docs, matching the PID pattern: `AGENTS.md`, this file, `docs/context.md`, and focused decisions/runbooks.
-- Keep the main target stable: Hermes is Sligo Labs' command infrastructure and dev-shop operator. Stability, reliable Discord/Kanban/gateway behavior, and a clean Command Center work ledger beat novelty.
-- Treat skills as procedural memory only. If a note says what Hermes is currently trying to accomplish, what is shipped, what is blocked, or what the next session should do, it belongs here or in a linked repo doc.
+- Keep Hermes stable as Sligo Labs' command infrastructure and dev-shop operator. Reliability for Discord, Kanban, gateway, worker routing, and Command Center matters more than novelty.
+- Keep project continuity in repo docs: `AGENTS.md`, this file, `docs/context.md`, focused runbooks, and `docs/decisions/`. Skills are reusable procedures only, not the target/status ledger.
+- Use Command Center as the canonical operator ledger over the Work Item / Source / Worker Run model for Hermes and PID project scopes. Do not reintroduce competing self-improvement or worker-board ledgers.
+- Continue the skill-to-repo transition by removing current-state and target-setting prose from installed Hermes skills and replacing it with pointers to this file and `docs/context.md`.
+- Preserve the dirty secondary main worktree quarantine for `/home/droid/workspaces/hermes-self-improvement-live-test` until a human-approved reconciliation follows `docs/runbooks/worktree-quarantine-2026-06-17.md`.
 
-## Snapshot
+## Active Snapshot
 
-| Area | State | Evidence |
+| Area | State | Active pickup note |
 | --- | --- | --- |
-| Main branch | verified | `/home/droid/hermes` was clean on `main` before the live-runtime-risk repair worktree was created. |
-| Open PRs | verified | `gh pr list --state open --limit 10` returned no rows during the autonomous operations loop state refresh. |
-| Upstream sync workflow | implemented | `docs/runbooks/upstream-sync.md` records the worktree-based `upstream/main` merge procedure, conservative fork-preserving conflict policy, and the 2026-06-23 sync evidence (`upstream/main` `351afd353`, `scripts/run_tests.sh`: 856 passed). |
-| Repo-state transition | merged | PR #320 added `docs/project-state.md`, `docs/context.md`, and `docs/decisions/0001-repo-backed-project-state.md`; `AGENTS.md` now routes workers here. |
-| Command Center model | merged | `docs/sligo-command-center.md` records the Work Item / Source / Worker Run model, Hermes/PID project scoping, and current UX contract. The primary lanes are Overview, Inbox, Active, Completed, and Archive; the current visual target is quiet chrome, grouped row actions/artifacts, and a right Detail / Audit pane. Live runtime must still be smoked separately when code changes. |
-| Self-improvement approval routing | implemented | Command Center proposal approvals now expose explicit Native, Worker board, and Reject actions. Native approval records an approved no-board proposal without creating Kanban tasks; worker-board approval preserves the existing Discord/Kanban execution path. |
-| Autonomous operations loop | planned | `docs/plans/2026-06-08-autonomous-operations-loop-goalplan.md` defines the complete Observe -> Diagnose -> Decide -> Execute -> Verify -> Learn loop, with Command Center as the canonical ledger and policy-gated autonomy boundaries. |
-| Skills boundary | in_progress | Installed default-profile pointers were patched for `hermes-agent`, `hermes-operations`, and `general-coding/references/operator-command-center-ui.md`; intention-setting material should keep moving into this repo state/doc set. |
-| Worker autoreview helper | implemented | Hermes worker bootstrap now materializes `.agents/skills/autoreview/scripts/autoreview` plus `SKILL.md` into worker workspaces for Hermes and PID-style projects before role/delegated worker closeout prompts ask workers to run autoreview. The helper is deterministic/advisory and does not claim model review. |
-| Live runtime audit risks | implemented | Worktree `fix/live-runtime-audit-risks` scopes cron prompt-injection scanning to untrusted job/runtime content instead of trusted loaded skill bodies, normalizes OpenAI Codex JSON-mode proxy requests with an explicit `Respond with JSON.` instruction, aligns `pyproject.toml` to runtime version `0.17.0`, and labels Kanban corrupt backups/stale ready age as historical cleanup/queue debt. No services restarted, no live config edited, no backups deleted, and no live Kanban state mutated. |
-| Self-improvement proposal cron overdue audit | implemented | `hermes cron status` now surfaces enabled, non-paused `self_improvement_proposal` cron jobs that are overdue beyond scheduler grace, including schedule state, last output, matching session, stale-open-session status, and scheduler log evidence without rerunning or mutating jobs. |
-| Discord worker PR finalization sync | implemented | Autonomous Discord/Kanban auto-merge finalization now treats post-merge canonical checkout fast-forward sync as part of completion: after a PR is verified merged, the recorded `project_path` checkout must be clean, fast-forward to the base branch, and contain the merge commit before the board can complete. Dirty/missing/diverged checkouts block visibly instead of silently leaving `/home/droid/hermes` behind. |
-| Discord worker-board corruption route repair | implemented | Public worker-board reads now invoke the existing conservative Kanban DB repair once when a board DB is paused for corruption, so known repairable worker boards do not stay user-visible as `Kanban not found`. |
-| Kanban board discovery | implemented | Non-default board discovery now treats `board.json` as durable board metadata, keeps non-empty legacy `kanban.db`-only boards discoverable, and ignores incidental zero-byte DB stubs without deleting or repairing them. |
-| Corrupt Kanban board quarantine | implemented | Dispatcher ticks, readiness/health probes, notifier polling, and dashboard/API board-open paths now share corrupt-board quarantine state keyed by board slug and DB fingerprint. Known-corrupt boards skip repeat SQLite opens until retry expiry unless the DB fingerprint changes, and readers return degraded/corrupt responses where practical without repairing or deleting DB contents. |
-| Kanban board DB routing | implemented | Explicit Kanban `board=` routing now ignores stale ambient `HERMES_KANBAN_DB` values and resolves to deterministic board DB paths, while explicit `db_path=` callers and Hermes-marked dispatcher worker handoff remain supported. |
-| OpenAI Codex auth incident classification | implemented | Nightly Hermes system doctor and cron failure artifacts now group recent `openai-codex` `token_invalidated`/401 evidence into one secret-safe provider-route incident with affected cron IDs/names, proxy/Honcho route labels, recovered/current state, and manual operator guidance. |
-| Gateway runtime/service diagnostics | implemented | `hermes gateway status`, `hermes cron status/list`, and `hermes doctor` now distinguish fresh profile-scoped `gateway_state.json` heartbeat evidence from visible PID/service evidence, and user-scope systemd unit discovery uses the real OS home instead of Hermes' subprocess HOME override, so sandboxed diagnostics no longer misreport the default gateway stopped or uninstalled. |
-| Kanban lifecycle race regressions | implemented | Focused tests now cover concurrent first opens of fresh non-default boards, corrupt-board quarantine reuse across listing/read paths, and dashboard helper behavior that avoids double initialization or repeated corrupt-DB retries. |
-| Kanban board health diagnostics | implemented | `hermes kanban diagnostics --board-health` now performs a read-only filesystem health scan across discovered boards, reporting DB existence/size, zero-byte stubs, SQLite header classification, read-only integrity status, WAL/SHM sidecars, and corrupt backup counts/latest mtime without initializing missing DBs or repairing files. |
-| Self-improvement proposal terminal reconciliation | implemented | Command Center proposal reads and cron feedback guidance now reconcile approved self-improvement proposal cards against active and archived Kanban worker boards before duplicate-suppression history is emitted, persist terminal completion evidence for done tasks/boards, keep completed proposals out of active duplicate suppression while preserving historical cards, and prefer archived worker-board non-success terminal metadata over task/run success unless board-level success evidence is explicit. |
-| Finite no-agent cron auto-pause | implemented | Opted-in no-agent cron jobs that emit terminal-success output now pause after successful completion, preserve the terminal output path/reason for cron list/status/tool surfaces, and keep non-opted-in recurring jobs active. |
-| GitHub PR-amend worker-board routing | implemented | Accepted PR-amend webhooks now carry fetched PR/review/comment context, explicit fork target repo/base-branch metadata for worker boards, a verbatim triggering-body acceptance criterion, finalizer guards that refuse upstream-repo PR lifecycle use and refuse to push when checkout `origin` is not the resolved head-repo target, post-push upstream-head SHA evidence for review/comment amendments, an active head-branch lock until the worker board reaches terminal state, no premature done reaction at queue time, and terminal worker-board sync updates the triggering GitHub reaction from active markers to final status. |
-| GitHub PR-amend comment/reaction coverage | implemented | Review-summary PR-amend triggers now include the top-level review summary itself plus matching inline review comments as GitHub reaction targets, so comments like `#pullrequestreview-4536748103` are seen and status-reacted. REST reaction replacement now identifies the authenticated `gh` actor by login before deleting prior status reactions, preserving human/third-party reactions while keeping at most one live Sligo status reaction per comment. |
-| GitHub PR-amend missing-origin route fallback | implemented | Accepted `pull_request_review` PR-amend events with no resolvable originating Discord worker board now route to the configured project Discord worker-board channel when one exists instead of immediately degrading to a terminal thumbs-down; missing Discord channel still degrades visibly. |
-| Worker PR boundary hardening | implemented | Deterministic worker PR finalization now preflights checkout remotes before push/`gh pr` operations, reports local/file-only remotes as a repository-boundary issue instead of an auth failure, and bridges host GitHub CLI config through sanitized PR subprocess environments without copying GitHub token env vars. Delegate-coding canonical-checkout errors now explicitly direct agents to retry with an absolute `/home/droid/workspaces/...` worktree cwd. |
-| Coding worker GitHub auth env | implemented | Delegated coding workers now get sanitized host git/GitHub config paths for local inspection without token env leakage, model/tool-call arguments cannot authorize push/PR lifecycle, and trusted PR workers only bypass unreadable system SSH config for SSH remotes. |
-| UI specialist route smoke metadata | implemented | Explicit `ui_visual_specialist` route decisions for Command Center visual-polish smokes now survive soft verification wording like “smoke”/“test”, select the configured Codex OpenRouter/model overlay, and are persisted into Kanban worker launch evidence (`ui_work_route/decision`, worker env, prompt, and result sidecar metadata) so route smokes can verify the actual worker path instead of inferring from prose. |
-| Coding worker backend default | implemented | Hermes coding-worker defaults are back on OpenCode for delegate and Kanban role-worker launches. Explicit `backend: codex` compatibility and the narrow UI visual-specialist Codex/OpenRouter overlay remain available, but normal coding-worker execution no longer depends on Codex app-server. |
-| Discord action-request terminology | implemented | Discord intake now describes the non-question work classifier as an action-request path, adds clearer `action_request_*` config aliases while preserving legacy `feature_request_*` names, and keeps action asks such as pipeline runs on the threaded work path. |
-| Discord worker typing for manual reruns | implemented | Running Discord worker-board typing target enumeration no longer drops active boards solely because their source Discord message snowflake is older than the recovery age limit; focused regressions cover old manual-rerun board targets and the gateway typing watcher. |
-| Dirty secondary main worktree quarantine | in_progress | `/home/droid/workspaces/hermes-self-improvement-live-test` is explicitly excluded from Discord role-worker selection via `kanban.discord_worker.excluded_workspaces`; `docs/runbooks/worktree-quarantine-2026-06-17.md` records the 247-file dirty inventory, reference checks, and human-approval cleanup plan. |
+| Repo-state boundary | in_progress | PR #320 merged the repo-native state/context split. Future durable state changes should update this file, `docs/context.md`, a runbook, or a decision doc, not a skill. |
+| Command Center model | merged | `docs/sligo-command-center.md` is the durable product-model reference for Work Items, Sources, Worker Runs, lanes, actions, and detail/audit behavior. Live runtime still needs focused smoke tests when code changes. |
+| Autonomous operations loop | planned | `docs/plans/2026-06-08-autonomous-operations-loop-goalplan.md` remains the durable target for policy-gated Observe -> Diagnose -> Decide -> Execute -> Verify -> Learn autonomy. |
+| Skills boundary | in_progress | Installed default-profile pointers were patched for `hermes-agent`, `hermes-operations`, and `general-coding/references/operator-command-center-ui.md`; continue moving intention-setting material into repo docs. |
+| Worker autoreview helper | implemented | Hermes/PID-style worker bootstraps materialize `.agents/skills/autoreview/scripts/autoreview`; workers should run it after non-trivial edits and treat findings as deterministic advisory checks. |
+| Upstream sync workflow | implemented | `docs/runbooks/upstream-sync.md` records the worktree-based `upstream/main` merge procedure, fork-preserving conflict policy, and smoke gate. |
+| Dirty secondary main worktree quarantine | in_progress | `/home/droid/workspaces/hermes-self-improvement-live-test` remains excluded from Discord role-worker selection via `kanban.discord_worker.excluded_workspaces`; keep it out of worker routing until reconciled. |
 
 Allowed states: `planned`, `ready`, `in_progress`, `blocked`, `implemented`, `merged`, `deployed`, `verified`, `superseded`.
 
-## Done
-
-- [x] Added a repo-native Hermes state/context split so future sessions have a single pickup point instead of reconstructing target from skills and memory.
-- [x] Recorded the knowledge-store boundary: repo for Hermes project state, skills for reusable procedures, memory for compact durable facts, Obsidian for synthesis, Notion for client-facing docs/feedback.
-- [x] Preserved the existing Command Center architecture doc as the focused product-model reference instead of duplicating it here.
-- [x] Patched the installed default-profile `hermes-agent`, `hermes-operations`, and Command Center UI skill/reference pointers so they route current-state material back to repo docs.
-- [x] Tightened completed Discord worker-board terminal summaries: merged PRs are inferred from PR state/merge evidence even when GitHub reports post-merge `mergeStateStatus=UNKNOWN`, deployment status falls back to done for merged+green PRs when no separate deployment check exists, recovered reviewer verdict metadata is surfaced, stale summary sidecars are rebuilt on terminal-board views, and concise outcomes are included in the terminal block.
-- [x] Hardened self-improvement Discord worker completion routing: final Discord responses now re-arm pending terminal follow-ups on already-complete boards, archived terminal boards with ready final responses remain discoverable for one-shot completion delivery, and approval routes that already created Discord threads fail visibly instead of silently falling back to default-board work when durable worker-board creation/activation fails.
-- [x] Fixed self-improvement Discord approval embeds and Command Center artifacts so approved cron-origin worker jobs link to the specific worker board instead of a bare `/workers` index; existing audit metadata can now repair legacy worker URLs without creating duplicate Work Items.
-- [x] Fixed terminal Discord worker reaction sync so paused/cancelled boards with pending terminal sync remain status targets before archive; archive no longer gets stuck forever on the “retry after sync” guard when a stale paused board still needs its final Discord reaction.
-- [x] Changed Discord worker-board completion follow-ups without a captured final response to render like normal feature-request shipped summaries: `What changed`, `Verification`, and `Shipped` sections from board metadata instead of raw Kanban internals.
-- [x] Hardened Kanban role-worker recovery so reviewer/planner/dev/foreman tasks already blocked by the dead-PID race can still apply a fresh recorded sidecar result instead of leaving the board permanently stuck.
-- [x] Hardened Discord worker PR finalization for blocked boards: explicit local-only/no-PR contracts now skip PR creation/merge cleanly, and blocked approved-reviewer boards with existing PR-conflict recovery tasks are reactivated as actionable dev work instead of staying terminally blocked.
-- [x] Hardened Kanban worker liveness checks to verify worker process identity with PID start ticks instead of bare PID liveness, preventing recycled unrelated PIDs from extending dead worker claims until the heartbeat backstop.
-- [x] Made self-improvement proposal approval idempotent across Discord partial failures: route breadcrumbs are recorded before worker-board activation, retries can reuse existing Discord route metadata, already-approved cards short-circuit safely, and final approval persistence failures leave an audit breadcrumb telling operators that retry will reattach.
-- [x] Hardened Command Center page state so project switches clear bulk selections, overlapping snapshot refreshes cannot apply stale state, and annotation submission uses the submitted draft after async work.
-- [x] Reduced Command Center snapshot read cost with batched annotation enrichment, short in-process snapshot caching with mutation invalidation, and archived-board metadata caching keyed by archive directory mtime.
-- [x] Serialized Discord worker-board `board.json` metadata mutations behind a per-board sidecar lock so concurrent gateway, dashboard, CLI, worker, and foreman writers do not drop one-shot terminal sync flags.
-- [x] Reduced the default Kanban dispatcher tick from 10 seconds to 5 seconds and corrected stale CLI guidance that still claimed the embedded gateway dispatcher ticked every 60 seconds.
-- [x] Hardened self-improvement proposal ingestion so fenced proposal JSON is extracted as a whole fenced block, skips non-payload fences, and tolerates earlier bad JSON-looking examples before the real `self_improvement.proposal_run.v1` payload.
-- [x] Updated cron output artifacts to render a compact final-result envelope before large injected prompt/context transcripts while preserving the raw transcript later for audits and parser compatibility.
-- [x] Added reusable worker autoreview helper materialization so Sligo worker-board role workers and delegated coding workers get a repo-local advisory helper by default instead of reporting autoreview discovery as skipped when no external OpenClaw install exists.
-- [x] Added read-only overdue-run visibility for enabled self-improvement proposal cron jobs so missed proposal schedules are visible from `hermes cron status` with scheduler/session/output evidence instead of requiring manual absence audits.
-- [x] Fixed `hermes auth add openai-codex` after successful device-code login so first Codex credentials can mark the provider active without crashing on a missing auth-store helper; Qwen OAuth active-marker persistence and pool-only Codex rate-limit status now use the same auth-store contracts.
-- [x] Fixed Codex auth rotation churn so singleton re-auth no longer overwrites independent `manual:device_code` pool accounts, relogin-required stale Hermes tokens can self-heal from complete Codex CLI tokens, and initial device-code `429`s retry/classify as rate-limited instead of forcing re-auth loops.
-- [x] Closed the Discord worker PR finalization gap that let auto-merged PRs mark boards complete before the canonical `project_path` checkout was fast-forwarded; merged workers now block visibly on dirty, missing, non-fast-forwardable, or merge-commit-missing checkouts.
-- [x] Repaired worker board `discord-1516079773099491498` from a corruption-paused Kanban DB and added public worker-board read repair so future repairable corruption incidents do not surface as `Kanban not found`.
-- [x] Tightened Kanban board discovery so metadata-only boards and non-empty legacy DB-only boards remain visible while zero-byte non-default `kanban.db` stubs without `board.json` are excluded from normal active listings without mutation.
-- [x] Shared corrupt Kanban board quarantine across gateway dispatcher, readiness/health, notifier, and dashboard/API readers so a known-corrupt DB fingerprint is not reopened repeatedly during the same retry window.
-- [x] Narrowed ambient `HERMES_KANBAN_DB` precedence so stale inherited environment cannot redirect explicit board operations across boards/profiles; unsafe ambient overrides now warn, while explicit `db_path=` and marked dispatcher worker handoff paths are preserved.
-- [x] Added secret-safe OpenAI Codex auth-route incident classification so token invalidation bursts surface as one operator incident across cron, proxy/Honcho, logs, and doctor output instead of scattered application failures.
-- [x] Added deterministic Kanban lifecycle regression coverage for fresh-board open races, corrupt-board quarantine reuse, and dashboard connection helpers avoiding duplicate initialization/corruption retries.
-- [x] Added read-only Kanban board health diagnostics so operators can inspect corrupt DBs, zero-byte stubs, WAL/SHM sidecars, and corrupt backups from the existing diagnostics CLI surface without triggering board initialization or remediation.
-- [x] Added deterministic terminal-state reconciliation for self-improvement proposal cards backed by Kanban worker board/task evidence so completed execution no longer appears as active approved Command Center work.
-- [x] Added an explicit finite no-agent cron terminal-success contract so completed executor crons can auto-pause without broad heuristics that would affect watchdogs or recurring maintenance.
-- [x] Hardened GitHub PR-amend worker-board intake so accepted webhooks carry PR/review context, target the existing fork PR branch through explicit worker-board metadata/finalizer repo overrides, include the triggering review/comment body as an explicit acceptance criterion, refuse upstream-repo PR lifecycle use, require recorded post-push upstream PR head SHA evidence before terminal success, keep active branch locks until terminal boards, stop sending queue-time done reactions, and transition the triggering GitHub reaction from active markers to final handled status when the Discord worker board reaches terminal state.
-- [x] Hardened GitHub PR-amend review-summary coverage so top-level review comments are included alongside matching inline comments for context and reaction targets, and REST status-reaction replacement now deletes only authenticated Sligo/bot-owned prior statuses before adding the next status.
-- [x] Fixed accepted PR-amend review-summary webhooks without an existing source worker-board route so they publish into the configured project worker-board channel instead of immediately degrading to thumbs-down with no Discord work item.
-- [x] Hardened worker PR-boundary subprocesses so local-only remotes fail with actionable GitHub-remote guidance before `gh pr` finalization, profile-isolated `gh`/git subprocesses see host `GH_CONFIG_DIR` without inheriting GitHub token env vars, Hermes `.env` stays documented as dotenv-only, and delegate-coding canonical-cwd blocks point to absolute `/home/droid/workspaces/...` retry paths.
-- [x] Added an upstream-sync runbook after merging `upstream/main` into the fork, documenting the worktree flow, conflict policy, and smoke-test gate for future syncs.
-- [x] Renamed the Discord non-question work path in prompts, docs, and config aliases from “feature request” to “action request” while preserving legacy internal names and persisted feature-summary compatibility.
-
-## In Progress
-
-- **Skill-to-repo transition:** remove current-state and target-setting prose from installed Hermes skills over time. Leave short pointers from `hermes-agent`, `hermes-operations`, and related references to this file and `docs/context.md`.
-- **Command Center as operator ledger:** keep Hermes (`#dev`) and PID as project tabs over one Work Item / Source / Worker Run model. Do not reintroduce competing self-improvement/worker-board ledgers.
-- **Autonomous operations loop goalplan:** use `docs/plans/2026-06-08-autonomous-operations-loop-goalplan.md` as the durable completeness target for policy-gated Observe -> Diagnose -> Decide -> Execute -> Verify -> Learn autonomy.
-- **Dirty secondary main worktree quarantine:** keep `/home/droid/workspaces/hermes-self-improvement-live-test` excluded from worker selection until an operator preserves and reconciles the dirty diff per `docs/runbooks/worktree-quarantine-2026-06-17.md`.
-
 ## Current Command Center UX Intent
 
-This is product intention, so it belongs in repo state/docs, not in a skill. If the Command Center direction changes, update this section or `docs/sligo-command-center.md` in the same PR.
+This product intention belongs in repo docs, not skills. If the direction changes, update this section or `docs/sligo-command-center.md` in the same PR.
 
-- **One work-status model:** the in-body `Work State` lane is the only primary work-status navigator. Keep project scoping for Hermes/PID, but do not add duplicate top tabs, KPI rows, status-distribution bars, or stale `Operator Surface` chrome.
-- **Rows are Work Items:** show proposed recommendations, decision/intake items, and board-level worker rollups. Do not show individual Kanban task/ticket rows or accepted downstream proposal rows without a canonical Work Item/board rollup.
-- **Inbox rows are not raw Sources:** source-only cron runs, including self-improvement parse-failure provenance, stay in Sources/metrics unless converted into a canonical Work Item needing operator action.
-- **Board execution stays child-level:** worker boards, Kanban tasks, task runs, PRs, logs, and deploys are execution artifacts attached to Work Items, not a competing ledger.
-- **Layout target:** Sligo shell header with one refresh/control area; left work list plus right detail/audit pane; source/status chips before title; created-date footer; active/running work visibly above quieter proposed/non-running work.
-- **Action target:** compact icon row actions with real affordances. Proposed self-improvement items show explicit Approve native, Worker board, Reject, and Archive actions; completed jobs still show Revert plus Archive when those actions are real. Archive uses the existing halt/archive flow for downstream proposal execution, can archive native no-board approvals directly, and is one-click for archiveable non-default boards. Pause/replay/cancel/revert are shown only when source and lifecycle state make them real.
-- **Worker/source links:** show a Worker pill only after execution starts, point it directly to the worker board URL, and never use bare `/workers` as a per-item destination. Show direct Discord source/thread links when metadata exists.
-- **Descriptions:** rows show compact summaries by default. When the read model has richer request/proposal context, expose it through a quiet per-row `Full context` disclosure/dropdown (chevron/text, not a primary pill) so operators can inspect complete plain-text context without opening the worker ticket.
-- **Terminal board status:** stale blocked/paused Discord thread embed state should not override stronger terminal board evidence such as all tasks done plus approved reviewer verdict, merged/green PR metadata, or synced canonical checkout metadata. Real running work still wins over stale terminal metadata.
-- **Archive target:** Archive is a historical ledger, including boards moved under `boards/_archived/`; archived rows are not actionable as live worker boards.
+- The in-body `Work State` lane is the only primary work-status navigator. Keep Hermes/PID project scoping, but do not add duplicate top tabs, KPI rows, status-distribution bars, or stale `Operator Surface` chrome.
+- Rows are Work Items: show proposed recommendations, decision/intake items, and board-level worker rollups. Do not show individual Kanban task/ticket rows or accepted downstream proposal rows without a canonical Work Item/board rollup.
+- Source-only cron runs, including self-improvement parse-failure provenance, stay in Sources/metrics unless converted into a canonical Work Item needing operator action.
+- Worker boards, Kanban tasks, task runs, PRs, logs, and deploys are execution artifacts attached to Work Items, not a competing ledger.
+- Layout target: Sligo shell header with one refresh/control area; left work list plus right detail/audit pane; source/status chips before title; created-date footer; active/running work visibly above quieter proposed/non-running work.
+- Action target: compact icon row actions with real affordances. Proposed self-improvement items expose Approve native, Worker board, Reject, and Archive actions. Completed jobs show Revert plus Archive only when those actions are real.
+- Worker/source links: show a Worker pill only after execution starts, point it directly to the worker board URL, and never use bare `/workers` as a per-item destination. Show direct Discord source/thread links when metadata exists.
+- Descriptions: rows show compact summaries by default, with a quiet `Full context` disclosure when richer request/proposal context exists.
+- Terminal board status: stale blocked/paused Discord thread embed state should not override stronger terminal board evidence such as all tasks done, approved reviewer verdict, merged/green PR metadata, or synced canonical checkout metadata. Real running work still wins over stale terminal metadata.
+- Archive is a historical ledger, including boards moved under `boards/_archived/`; archived rows are not actionable as live worker boards.
+
+## Active Risks And Blockers
+
+- No hard blocker for the repo-state transition, but it remains incomplete until future Hermes PRs routinely update repo state docs and skills stop accumulating current-state sediment.
+- Dirty secondary main worktree cleanup is deliberately parked behind human approval; do not let automatic worker routing select `/home/droid/workspaces/hermes-self-improvement-live-test`.
+- Any code/runtime change affecting operator behavior should update this file or the focused doc/runbook in the same PR.
 
 ## Parked / Not Current Focus
 
-These are known ideas or cleanup candidates, not the active target unless the user promotes them:
-
 - Normal Discord action-request global concurrency limiter: designed previously, not implemented.
-- Browser/typed-input secret redaction hardening: useful core safety work, not this transition.
-- Orphan-DAG tests and PID-specific Operations checks: belong in PID repo state, not Hermes state, unless the Hermes orchestration layer changes.
+- Browser/typed-input secret redaction hardening: useful core safety work, but not part of the repo-state transition.
+- Orphan-DAG tests and PID-specific Operations checks: belong in PID repo state unless Hermes orchestration changes.
 - Broad stale-worktree cleanup: useful hygiene, but should not distract from the repo-state boundary unless it blocks current work.
-- Broad automatic worktree janitor/preflight: intentionally out of scope for the current dirty-main quarantine; use the runbook inventory for human-approved cleanup instead.
-
-## Blocked
-
-- No hard blocker for the initial repo-state transition.
-- The transition remains incomplete until future Hermes PRs routinely update this file when durable state changes, and skills stop accumulating current-state sediment.
+- Broad automatic worktree janitor/preflight: out of scope for the current dirty-main quarantine; use the runbook inventory for human-approved cleanup.
 
 ## External Configuration
 
@@ -138,20 +65,17 @@ Do not store secret values here. Record names and locations only.
 - Gateway/Dashboard/Command Center runtime evidence: `$HERMES_HOME/logs/`, `$HERMES_HOME/state.db`, `$HERMES_HOME/kanban/`, and systemd user services.
 - Public/internal routes and deployment handles should be recorded as evidence when they matter, not copied as long logs.
 
+## Historical Archive
+
+- Completed ledger entries and the pre-trim snapshot are preserved in `docs/archive/project-state-archive-20260626.md`.
+- Use the archive for historical lookup only. If an archived item becomes active again, copy the minimal active pickup fact back into this file instead of expanding the archive inline.
+
 ## Next Actions
 
 1. On every meaningful Hermes repo PR, update this file if current focus, blockers, live runtime state, Command Center behavior, or worker/gateway operational truth changed.
 2. Keep moving current-state material out of skills into this repo doc set. Skills should link here and keep only reusable procedure, pitfalls, and verification checklists.
 3. Add a Hermes repo QMD index only if retrieval friction remains after this file and `docs/context.md` exist. Do not use `qmd-skills` as the long-term substitute for repo state.
 4. When a broad request arrives from `#dev`, read this file before choosing work so Hermes does not chase whichever skill/reference happened to be loaded most recently.
-
-## Verification Checklist
-
-- [x] Main checkout status inspected before creating this file.
-- [x] Existing repo docs inspected; no pre-existing `docs/project-state.md`, `docs/context.md`, or `STATUS.md` was present.
-- [x] This file distinguishes implemented, verified, in-progress, blocked, and parked work.
-- [x] No secret values are stored here.
-- [ ] Future code/runtime changes that affect operator behavior update this file in the same PR.
 
 ## Future Worker Notes
 
