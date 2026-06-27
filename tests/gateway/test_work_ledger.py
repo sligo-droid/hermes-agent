@@ -292,6 +292,56 @@ def test_default_repo_project_pr_opened_but_unmerged_is_blocked(tmp_path):
     assert stored["summary_status"] == "Blocked"
 
 
+def test_review_request_allows_negative_findings_about_uncommitted_manifest_paths(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="review the current pipeline given we just added references")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response=(
+            "Reviewed. I did not edit files.\n\n"
+            "The current artifact is releasable under existing rules, but the pipeline has holes.\n\n"
+            "Recommendation: require referenced manifests or stop citing uncommitted manifest paths as evidence."
+        ),
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored is not None
+    assert stored["summary_status"] == "Complete"
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert stored["completion_gate"]["delivery_intent"] == "review_only"
+
+
+def test_uncommitted_changes_still_block_full_lifecycle_repo_work(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Implement the feature")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="Not done yet: uncommitted changes remain in the working tree.",
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored is not None
+    assert stored["summary_status"] == "Blocked"
+    assert stored["completion_gate"]["allowed_to_complete"] is False
+    assert stored["completion_gate"]["matched_markers"] == ["not_done_yet", "not_committed"]
+
+
 def test_latest_production_browser_timeout_blocks_shipped_verified_completion(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(text="Ship the production modal")
