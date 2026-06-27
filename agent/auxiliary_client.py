@@ -5449,22 +5449,32 @@ def call_llm(
                     "Auxiliary %s: refreshed %s credentials after auth error, retrying",
                     task or "call", resolved_provider,
                 )
-                return _retry_same_provider_sync(
-                    task=task,
-                    resolved_provider=resolved_provider,
-                    resolved_model=resolved_model,
-                    resolved_base_url=resolved_base_url,
-                    resolved_api_key=resolved_api_key,
-                    resolved_api_mode=resolved_api_mode,
-                    main_runtime=main_runtime,
-                    final_model=final_model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    effective_timeout=effective_timeout,
-                    effective_extra_body=effective_extra_body,
-                )
+                try:
+                    return _retry_same_provider_sync(
+                        task=task,
+                        resolved_provider=resolved_provider,
+                        resolved_model=resolved_model,
+                        resolved_base_url=resolved_base_url,
+                        resolved_api_key=resolved_api_key,
+                        resolved_api_mode=resolved_api_mode,
+                        main_runtime=main_runtime,
+                        final_model=final_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                        effective_timeout=effective_timeout,
+                        effective_extra_body=effective_extra_body,
+                    )
+                except Exception as retry_err:
+                    if not (
+                        _is_auth_error(retry_err)
+                        or _is_payment_error(retry_err)
+                        or _is_connection_error(retry_err)
+                        or _is_rate_limit_error(retry_err)
+                    ):
+                        raise
+                    first_err = retry_err
 
         # ── Same-provider credential-pool recovery ─────────────────────
         pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
@@ -5932,21 +5942,31 @@ async def async_call_llm(
                     "Auxiliary %s (async): refreshed %s credentials after auth error, retrying",
                     task or "call", resolved_provider,
                 )
-                return await _retry_same_provider_async(
-                    task=task,
-                    resolved_provider=resolved_provider,
-                    resolved_model=resolved_model,
-                    resolved_base_url=resolved_base_url,
-                    resolved_api_key=resolved_api_key,
-                    resolved_api_mode=resolved_api_mode,
-                    final_model=final_model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    effective_timeout=effective_timeout,
-                    effective_extra_body=effective_extra_body,
-                )
+                try:
+                    return await _retry_same_provider_async(
+                        task=task,
+                        resolved_provider=resolved_provider,
+                        resolved_model=resolved_model,
+                        resolved_base_url=resolved_base_url,
+                        resolved_api_key=resolved_api_key,
+                        resolved_api_mode=resolved_api_mode,
+                        final_model=final_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                        effective_timeout=effective_timeout,
+                        effective_extra_body=effective_extra_body,
+                    )
+                except Exception as retry_err:
+                    if not (
+                        _is_auth_error(retry_err)
+                        or _is_payment_error(retry_err)
+                        or _is_connection_error(retry_err)
+                        or _is_rate_limit_error(retry_err)
+                    ):
+                        raise
+                    first_err = retry_err
 
         # ── Same-provider credential-pool recovery (mirrors sync) ─────
         pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
