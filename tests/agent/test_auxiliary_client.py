@@ -1738,6 +1738,47 @@ class TestAuxiliaryFallbackLayering:
         assert chain_client.chat.completions.create.called
         main_called.assert_not_called()
 
+    def test_refreshed_explicit_provider_auth_error_uses_configured_chain(self):
+        """If auth refresh succeeds but retry still 401s, use task fallback_chain."""
+        primary_client = MagicMock()
+        primary_client.base_url = "https://api.anthropic.com"
+        primary_client.chat.completions.create.side_effect = self._make_auth_err()
+
+        refreshed_client = MagicMock()
+        refreshed_client.base_url = "https://api.anthropic.com"
+        refreshed_client.chat.completions.create.side_effect = self._make_auth_err()
+
+        chain_client = MagicMock()
+        chain_client.base_url = "https://chatgpt.com/backend-api/codex"
+        chain_client.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from refreshed auth fallback chain"))
+        ])
+
+        main_called = MagicMock()
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   side_effect=[(primary_client, "claude-sonnet-4-6"),
+                                (refreshed_client, "claude-sonnet-4-6")]), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("anthropic", "claude-sonnet-4-6", None, None, None)), \
+             patch("agent.auxiliary_client._refresh_provider_credentials", return_value=True), \
+             patch("agent.auxiliary_client._recover_provider_pool", return_value=False), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(chain_client, "gpt-5.4-mini", "fallback_chain[0](openai-codex)")), \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback",
+                   side_effect=main_called):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from refreshed auth fallback chain"
+        assert primary_client.chat.completions.create.call_count == 1
+        assert refreshed_client.chat.completions.create.call_count == 1
+        assert chain_client.chat.completions.create.call_count == 1
+        assert chain_client.chat.completions.create.call_args.kwargs["model"] == "gpt-5.4-mini"
+        main_called.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_async_explicit_provider_auth_error_uses_configured_chain(self):
         """Async auxiliary calls should mirror sync auth fallback behavior."""
@@ -1774,6 +1815,52 @@ class TestAuxiliaryFallbackLayering:
 
         assert result.choices[0].message.content == "from async auth fallback chain"
         assert async_chain_client.chat.completions.create.await_count == 1
+        main_called.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_refreshed_explicit_provider_auth_error_uses_configured_chain(self):
+        """Async auth refresh retry failures should fall through to fallback_chain."""
+        primary_client = MagicMock()
+        primary_client.base_url = "https://api.anthropic.com"
+        primary_client.chat.completions.create = AsyncMock(side_effect=self._make_auth_err())
+
+        refreshed_client = MagicMock()
+        refreshed_client.base_url = "https://api.anthropic.com"
+        refreshed_client.chat.completions.create = AsyncMock(side_effect=self._make_auth_err())
+
+        chain_client = MagicMock()
+        chain_client.base_url = "https://chatgpt.com/backend-api/codex"
+
+        async_chain_client = MagicMock()
+        async_chain_client.chat.completions.create = AsyncMock(return_value=MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from async refreshed auth fallback chain"))
+        ]))
+
+        main_called = MagicMock()
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   side_effect=[(primary_client, "claude-sonnet-4-6"),
+                                (refreshed_client, "claude-sonnet-4-6")]), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("anthropic", "claude-sonnet-4-6", None, None, None)), \
+             patch("agent.auxiliary_client._refresh_provider_credentials", return_value=True), \
+             patch("agent.auxiliary_client._recover_provider_pool", return_value=False), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(chain_client, "gpt-5.4-mini", "fallback_chain[0](openai-codex)")), \
+             patch("agent.auxiliary_client._to_async_client",
+                   return_value=(async_chain_client, "gpt-5.4-mini")), \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback",
+                   side_effect=main_called):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from async refreshed auth fallback chain"
+        assert primary_client.chat.completions.create.await_count == 1
+        assert refreshed_client.chat.completions.create.await_count == 1
+        assert async_chain_client.chat.completions.create.await_count == 1
+        assert async_chain_client.chat.completions.create.call_args.kwargs["model"] == "gpt-5.4-mini"
         main_called.assert_not_called()
 
     def test_explicit_provider_falls_back_to_main_when_chain_exhausted(self, monkeypatch):
