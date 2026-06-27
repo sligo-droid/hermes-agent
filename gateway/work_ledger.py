@@ -80,10 +80,27 @@ _REVIEW_ONLY_FINAL_PATTERNS = (
     r"\bfindings\b",
     r"\bno\s+changes\s+(?:made|required)\b",
 )
+_REVIEW_ONLY_REQUEST_PATTERNS = (
+    r"\breview\b",
+    r"\baudit\b",
+    r"\binspect\b",
+    r"\bassess\b",
+    r"\bevaluate\b",
+)
+_REVIEW_REQUEST_ACTION_PATTERNS = (
+    r"\b(?:fix|patch|implement|add|build|ship|change|update|edit|refactor|rewrite|remove|delete)\b",
+    r"\b(?:open|create)\s+(?:a\s+)?(?:pr|pull\s+request)\b",
+    r"\bmerge\b",
+    r"\bdeploy\b",
+)
 _INCOMPLETE_FINAL_PATTERNS = (
     ("not_done_yet", r"\bnot\s+done\s+yet\b"),
     ("no_commit", r"\bno\s+commit\b"),
-    ("not_committed", r"\bnot\s+committed\b|\buncommitted\b|\bworking\s+tree\b[^\n.]{0,120}\bnot\s+committed\b"),
+    (
+        "not_committed",
+        r"\bnot\s+committed\b|\buncommitted\s+(?:changes?|work|files?|edits?|diff|working\s+tree)\b|"
+        r"\bworking\s+tree\b[^\n.]{0,120}\bnot\s+committed\b",
+    ),
     ("not_pushed", r"\bnot\s+pushed\b"),
     ("no_pr", r"\bno\s+pr\b|\bpr\s+not\s+opened\b|\bno\s+pull\s+request\b|\bpull\s+request\s+not\s+opened\b"),
     ("no_deploy", r"\bno\s+deploy\b|\bnot\s+deployed\b"),
@@ -149,6 +166,12 @@ def _matches_any(text: str, patterns: tuple[str, ...]) -> bool:
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
 
 
+def _looks_like_review_only_request(text: str) -> bool:
+    if not _matches_any(text, _REVIEW_ONLY_REQUEST_PATTERNS):
+        return False
+    return not _matches_any(text, _REVIEW_REQUEST_ACTION_PATTERNS)
+
+
 def _repo_backed_discord_item(item: dict[str, Any]) -> bool:
     if item.get("platform") != "discord":
         return False
@@ -181,6 +204,8 @@ def _delivery_intent_for_item(item: dict[str, Any]) -> str:
         if re.search(r"\breview\s+only\b", request_text, flags=re.IGNORECASE):
             return "review_only"
         return "no_merge"
+    if _looks_like_review_only_request(request_text):
+        return "review_only"
     return "full_lifecycle"
 
 
