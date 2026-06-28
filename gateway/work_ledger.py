@@ -199,6 +199,25 @@ def _matches_any(text: str, patterns: tuple[str, ...]) -> bool:
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
 
 
+def _incomplete_final_markers(text: str) -> list[str]:
+    """Return incomplete-delivery markers while filtering known summary noise."""
+
+    markers: list[str] = []
+    for reason, pattern in _INCOMPLETE_FINAL_PATTERNS:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            snippet = match.group(0)
+            prefix = text[max(0, match.start() - 80) : match.start()].lower()
+            if reason == "checks_not_green" and ("→" in snippet or "phase timing" in prefix):
+                continue
+            if reason == "runtime_not_synced" and re.search(
+                r"\b(?:live\s+)?runtime\s+pickup\b", snippet, flags=re.IGNORECASE
+            ):
+                continue
+            markers.append(reason)
+            break
+    return markers
+
+
 def _looks_like_review_only_request(text: str) -> bool:
     if not _matches_any(text, _REVIEW_ONLY_REQUEST_PATTERNS):
         return False
@@ -294,7 +313,7 @@ def classify_delivery_completion(item: dict[str, Any], final_response: str | Non
         )
         return gate
 
-    matched = [reason for reason, pattern in _INCOMPLETE_FINAL_PATTERNS if re.search(pattern, final_text, flags=re.IGNORECASE)]
+    matched = _incomplete_final_markers(final_text)
     runtime_handoff_missing = _deferred_runtime_watch_missing_markers(final_text) if intent == "full_lifecycle" else []
     if not matched:
         if runtime_handoff_missing:

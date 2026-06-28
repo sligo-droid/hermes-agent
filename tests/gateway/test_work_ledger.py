@@ -402,6 +402,33 @@ def test_full_lifecycle_blocks_pending_ci(tmp_path):
     assert stored["completion_gate"]["matched_markers"] == ["checks_not_green"]
 
 
+def test_full_lifecycle_phase_timing_does_not_fake_pending_ci_or_runtime_sync(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Fix the Discord status bug")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response=(
+            "PR CI passed and the canonical checkout is synced.\n\n"
+            "Phase timing: inspect inherited/verified → edit/check → PR/CI/merge/sync "
+            "→ manual stale embed repair done; live runtime pickup pending safe restart."
+        ),
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored is not None
+    assert stored["summary_status"] == "Blocked"
+    assert stored["completion_gate"]["allowed_to_complete"] is False
+    assert stored["completion_gate"]["matched_markers"] == ["live_pickup_unverified"]
+
+
 def test_review_request_allows_negative_findings_about_uncommitted_manifest_paths(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(text="review the current pipeline given we just added references")
