@@ -23,6 +23,7 @@ from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
+    KANBAN_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     MEMORY_GUIDANCE,
     QMD_MCP_GUIDANCE,
@@ -62,6 +63,15 @@ class TestGuidanceConstants:
         assert "low-stakes" in text
         assert "recommended default" in text
         assert "user-visible behavior" in text
+
+    def test_kanban_guidance_has_simple_ui_fast_lane(self):
+        text = KANBAN_GUIDANCE
+        assert "Simple UI fast lane" in text
+        assert "sub-worker delegation" in text
+        assert "rendered visual/browser check" in text
+        assert "phase_timing" in text
+        assert "If staging or" in text
+        assert "verification failed" in text
 
 
 # =========================================================================
