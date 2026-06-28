@@ -292,6 +292,116 @@ def test_default_repo_project_pr_opened_but_unmerged_is_blocked(tmp_path):
     assert stored["summary_status"] == "Blocked"
 
 
+def test_full_lifecycle_blocks_unsynced_runtime_and_unverified_live_pickup(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Ship the runtime change")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response=(
+            "PR merged and checks passed, but private runtime is not synced yet "
+            "and live pickup is not verified."
+        ),
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored is not None
+    assert stored["summary_status"] == "Blocked"
+    assert stored["completion_gate"]["allowed_to_complete"] is False
+    assert stored["completion_gate"]["delivery_intent"] == "full_lifecycle"
+    assert stored["completion_gate"]["matched_markers"] == [
+        "runtime_not_synced",
+        "live_pickup_unverified",
+    ]
+
+
+def test_full_lifecycle_allows_background_watch_after_live_pickup(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Schedule the Airflow DAG")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response=(
+            "PR merged, checks passed, canonical/runtime checkouts synced, and "
+            "live pickup verified. The first scheduled Airflow DAG run is still "
+            "running; I started a background watcher and it will report completion."
+        ),
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored is not None
+    assert stored["summary_status"] == "Complete"
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert stored["completion_gate"]["delivery_intent"] == "full_lifecycle"
+
+
+def test_full_lifecycle_blocks_background_watch_without_live_pickup(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Schedule the Airflow DAG")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response=(
+            "PR merged and checks passed. The first scheduled Airflow DAG run is still "
+            "running; I started a background watcher and it will report completion."
+        ),
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored is not None
+    assert stored["summary_status"] == "Blocked"
+    assert stored["completion_gate"]["allowed_to_complete"] is False
+    assert stored["completion_gate"]["reason"] == "runtime_handoff_unverified"
+    assert stored["completion_gate"]["matched_markers"] == [
+        "runtime_sync_unverified",
+        "live_pickup_unverified",
+    ]
+
+
+def test_full_lifecycle_blocks_pending_ci(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Implement the feature")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="PR merged but CI is still running.",
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored is not None
+    assert stored["summary_status"] == "Blocked"
+    assert stored["completion_gate"]["allowed_to_complete"] is False
+    assert stored["completion_gate"]["matched_markers"] == ["checks_not_green"]
+
+
 def test_review_request_allows_negative_findings_about_uncommitted_manifest_paths(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(text="review the current pipeline given we just added references")
