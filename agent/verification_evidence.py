@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from typing import Any
 
 
@@ -27,6 +28,9 @@ _DEPLOY_RE = re.compile(r"\b(deploy|deployed|deployment)\b", re.IGNORECASE)
 _MERGE_RE = re.compile(r"\b(merge|merged|pull|pr)\b", re.IGNORECASE)
 _SUCCESS_RE = re.compile(r"\b(success|passed|pass|ok|complete|completed|visible|found|healthy)\b", re.IGNORECASE)
 _TIMEOUT_RE = re.compile(r"\b(timed?\s*out|timeout|deadline|expired)\b", re.IGNORECASE)
+_SHELL_SEGMENT_RE = re.compile(r"\s*(?:&&|\|\||[;\n])\s*")
+_GIT_OPTION_ARGS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}
+_NON_VERIFY_GIT_PATHSPEC_COMMANDS = {"add", "rm", "mv", "restore", "checkout", "reset"}
 
 _CLAIM_WORD_RE = re.compile(r"\b(shipped|verified|visible|checked|confirmed|passed|deployed|merged)\b", re.IGNORECASE)
 _NEGATED_CLAIM_RE = re.compile(r"\b(?:not|isn['’]?t|failed|failure|blocked|unverified|not_verified)\b", re.IGNORECASE)
@@ -80,6 +84,43 @@ def _surfaces_for(tool_name: str, check_name: str, detail: str) -> list[str]:
     return surfaces or ["verification"]
 
 
+def _is_non_verification_git_pathspec_segment(segment: str) -> bool:
+    try:
+        parts = shlex.split(segment)
+    except ValueError:
+        parts = segment.split()
+    if not parts or parts[0] != "git":
+        return False
+
+    index = 1
+    while index < len(parts):
+        token = parts[index]
+        if token in _GIT_OPTION_ARGS:
+            index += 2
+            continue
+        if any(token.startswith(f"{option}=") for option in _GIT_OPTION_ARGS):
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        break
+
+    if index >= len(parts):
+        return False
+    return parts[index] in _NON_VERIFY_GIT_PATHSPEC_COMMANDS
+
+
+def _terminal_command_looks_like_verification(command: str) -> bool:
+    for segment in _SHELL_SEGMENT_RE.split(command):
+        segment = segment.strip()
+        if not segment or _is_non_verification_git_pathspec_segment(segment):
+            continue
+        if _VERIFY_COMMAND_RE.search(segment):
+            return True
+    return False
+
+
 def classify_tool_verification_evidence(
     tool_name: str,
     tool_args: dict[str, Any] | None,
@@ -104,7 +145,7 @@ def classify_tool_verification_evidence(
         return []
 
     if name == "terminal":
-        if not _VERIFY_COMMAND_RE.search(check_name):
+        if not _terminal_command_looks_like_verification(check_name):
             return []
     elif not name.startswith("browser") and name not in {"webfetch", "web_search"}:
         return []

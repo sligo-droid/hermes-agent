@@ -219,6 +219,52 @@ def test_verify_path_name_alone_is_not_verification_evidence():
     assert agent._turn_runtime_stats.get("verification_evidence", []) == []
 
 
+def test_git_add_smoke_pathspec_failure_is_not_verification_evidence():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    result = json.dumps(
+        {
+            "output": "",
+            "exit_code": 128,
+            "error": "fatal: pathspec 'dashboard/sr' did not match any files",
+        }
+    )
+    command = (
+        "git add dashboard/static/CHANGELOG.md docs/project-state.md "
+        "dashboard/scripts/authenticated-qa-smoke.mjs dashboard/src/routes/calendar/+page.svelte dashboard/sr"
+    )
+
+    tool_executor._record_turn_tool_runtime(agent, "terminal", 0.2, result, True)
+    tool_executor._record_turn_verification_evidence(agent, "terminal", {"command": command}, result, True)
+
+    assert agent._turn_runtime_stats.get("verification_evidence", []) == []
+
+
+def test_git_add_smoke_pathspec_failure_does_not_downgrade_verified_claim():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    result = json.dumps(
+        {
+            "output": "",
+            "exit_code": 128,
+            "error": "fatal: pathspec 'dashboard/sr' did not match any files",
+        }
+    )
+    command = (
+        "git -C /repo add dashboard/static/CHANGELOG.md docs/project-state.md "
+        "dashboard/scripts/authenticated-qa-smoke.mjs dashboard/src/routes/calendar/+page.svelte dashboard/sr"
+    )
+
+    tool_executor._record_turn_tool_runtime(agent, "terminal", 0.2, result, True)
+    tool_executor._record_turn_verification_evidence(agent, "terminal", {"command": command}, result, True)
+
+    downgraded, constraints = downgrade_final_response_for_evidence(
+        "Verified with focused checks; ready for PR review.",
+        agent._turn_runtime_stats.get("verification_evidence", []),
+    )
+
+    assert constraints["allowed"] is True
+    assert downgraded == "Verified with focused checks; ready for PR review."
+
+
 def test_real_verification_command_still_records_blocking_evidence():
     agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
     result = json.dumps({"output": "1 failed", "exit_code": 1, "error": None})
@@ -240,6 +286,38 @@ def test_common_test_command_still_records_verification_evidence():
 
     tool_executor._record_turn_tool_runtime(agent, "terminal", 1.0, result, True)
     tool_executor._record_turn_verification_evidence(agent, "terminal", {"command": "npm test"}, result, True)
+
+    evidence = agent._turn_runtime_stats["verification_evidence"]
+
+    assert evidence
+    assert latest_evidence_by_surface(evidence)["ci"]["status"] == "failure"
+
+
+def test_real_smoke_command_still_records_verification_evidence():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    result = json.dumps({"output": "smoke failed", "exit_code": 1, "error": None})
+
+    tool_executor._record_turn_tool_runtime(agent, "terminal", 1.0, result, True)
+    tool_executor._record_turn_verification_evidence(
+        agent,
+        "terminal",
+        {"command": "node dashboard/scripts/authenticated-qa-smoke.mjs --preview"},
+        result,
+        True,
+    )
+
+    evidence = agent._turn_runtime_stats["verification_evidence"]
+
+    assert evidence
+    assert latest_evidence_by_surface(evidence)["verification"]["status"] == "failure"
+
+
+def test_real_status_command_still_records_verification_evidence():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    result = json.dumps({"output": "checks failing", "exit_code": 1, "error": None})
+
+    tool_executor._record_turn_tool_runtime(agent, "terminal", 1.0, result, True)
+    tool_executor._record_turn_verification_evidence(agent, "terminal", {"command": "gh pr status"}, result, True)
 
     evidence = agent._turn_runtime_stats["verification_evidence"]
 
