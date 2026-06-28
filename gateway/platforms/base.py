@@ -4381,6 +4381,7 @@ class BasePlatformAdapter(ABC):
                 if (
                     processing_outcome == ProcessingOutcome.SUCCESS
                     and not delivery_attempted
+                    and post_delivery_ok
                     and not getattr(event, "defer_work_completion", False)
                 ):
                     self._mark_work_item_completed(event)
