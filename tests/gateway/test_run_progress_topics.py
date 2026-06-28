@@ -13,6 +13,7 @@ import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource
+from gateway.work_ledger import GatewayWorkLedger
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -1131,6 +1132,60 @@ async def test_base_processing_stops_typing_before_hung_post_delivery_callback(
         ["typing-stopped"] * events.index("callback-start")
     )
     assert any(call["metadata"] == {"stopped": True} for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_discord_summary_work_not_completed_when_no_delivery_or_summary_callback(
+    monkeypatch,
+    tmp_path,
+):
+    """A streamed/already-sent Discord turn must not terminal-close a live embed.
+
+    Regression for feature-summary embeds stuck at "Generating...": when the
+    gateway handler returned ``None`` because the response had already been sent,
+    the base adapter treated the no-delivery path as success and marked the work
+    item completed even if the Discord summary update failed or never registered
+    a post-delivery callback. Completed items are not replayed, so the embed was
+    stranded forever.
+    """
+    import gateway.work_ledger as work_ledger_module
+
+    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
+
+    async def _handler(event):
+        return None
+
+    adapter.set_message_handler(_handler)
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="thread-1",
+        chat_type="thread",
+        thread_id="thread-1",
+    )
+    event = MessageEvent(
+        text="Build it",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="msg-1",
+        feature_summary={"message_id": "summary-1"},
+    )
+    session_key = "agent:main:discord:thread:thread-1:thread-1"
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+    event.work_item_id = item["id"]
+    ledger.mark_agent_running(item["id"], session_id="session-1")
+    monkeypatch.setattr(work_ledger_module, "GatewayWorkLedger", lambda: ledger)
+
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    await adapter._process_message_background(event, session_key)
+
+    item_after = ledger.get(item["id"])
+    assert item_after is not None
+    assert item_after["status"] == "agent_running"
+    assert "summary_updated_at" not in item_after
 
 
 @pytest.mark.asyncio
