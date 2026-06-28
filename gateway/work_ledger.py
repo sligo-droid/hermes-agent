@@ -139,6 +139,11 @@ _LIVE_PICKUP_VERIFIED_PATTERNS = (
     r"(?:verified|confirmed|picked\s+up)\b",
     r"\bpicked\s+up\s+(?:the\s+)?(?:merged\s+)?(?:code|change|version|commit)\b",
 )
+_SAFE_GATEWAY_RELOAD_HANDOFF_PATTERNS = (
+    r"\b(?:safe\s+)?(?:gateway\s+)?reload\s+watcher\b[^\n.]{0,160}\b(?:started|queued|running|waiting)",
+    r"\bhermes-safe-gateway-reload-[\w-]+\.service\b",
+    r"\bwill\s+send\s+SIGUSR1\b[^\n.]{0,160}\b(?:active_agents|idle|gateway)",
+)
 
 
 def default_path() -> Path:
@@ -215,6 +220,8 @@ def _incomplete_final_markers(text: str) -> list[str]:
                 continue
             markers.append(reason)
             break
+    if "live_pickup_unverified" in markers and _matches_any(text, _SAFE_GATEWAY_RELOAD_HANDOFF_PATTERNS):
+        markers = [reason for reason in markers if reason != "live_pickup_unverified"]
     return markers
 
 
