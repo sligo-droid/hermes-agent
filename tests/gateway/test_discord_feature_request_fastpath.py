@@ -163,6 +163,10 @@ async def test_discord_action_request_keeps_full_platform_tool_surface(monkeypat
     assert "at most one concise question" in init["ephemeral_system_prompt"]
     assert "recommended default" in init["ephemeral_system_prompt"]
     assert "state the assumption and continue" in init["ephemeral_system_prompt"]
+    assert "Simple UI fast lane" in init["ephemeral_system_prompt"]
+    assert "instead of spawning a coding worker" in init["ephemeral_system_prompt"]
+    assert "phase timing line" in init["ephemeral_system_prompt"]
+    assert "contradictory done/not-verified" in init["ephemeral_system_prompt"]
     assert init["ephemeral_system_prompt"].endswith("Global prompt")
 
 
