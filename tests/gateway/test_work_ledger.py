@@ -429,6 +429,35 @@ def test_full_lifecycle_phase_timing_does_not_fake_pending_ci_or_runtime_sync(tm
     assert stored["completion_gate"]["matched_markers"] == ["live_pickup_unverified"]
 
 
+def test_safe_gateway_reload_watcher_handoff_allows_final_summary(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Fix the Discord status bug")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response=(
+            "PR CI passed and canonical `/home/droid/hermes` is synced clean.\n"
+            "The running gateway process was started before the merge. I started "
+            "`hermes-safe-gateway-reload-591.service`; it's waiting for active_agents=0, "
+            "then it will send SIGUSR1.\n"
+            "Phase timing: inspect → edit/check → PR/CI/merge/sync → "
+            "stale emoji repair → live runtime pickup pending safe reload watcher queued."
+        ),
+        summary_status="Complete",
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored is not None
+    assert stored["summary_status"] == "Complete"
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+
+
 def test_review_request_allows_negative_findings_about_uncommitted_manifest_paths(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(text="review the current pipeline given we just added references")
