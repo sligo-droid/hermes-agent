@@ -105,6 +105,39 @@ _INCOMPLETE_FINAL_PATTERNS = (
     ("no_pr", r"\bno\s+pr\b|\bpr\s+not\s+opened\b|\bno\s+pull\s+request\b|\bpull\s+request\s+not\s+opened\b"),
     ("no_deploy", r"\bno\s+deploy\b|\bnot\s+deployed\b"),
     ("not_merged", r"\bnot\s+merged\b|\bleft\s+unmerged\b"),
+    (
+        "checks_not_green",
+        r"\b(?:ci|checks?|status\s+checks?)\b[^\n.]{0,80}\b"
+        r"(?:pending|still\s+running|not\s+green|not\s+passed|has\s+not\s+passed|"
+        r"haven['’]?t\s+passed|not\s+completed|failing|failed)\b",
+    ),
+    (
+        "runtime_not_synced",
+        r"\b(?:canonical|runtime|checkout|worktree|deployed\s+runtime|private\s+runtime|runtime\s+sync)\b"
+        r"[^\n.]{0,120}\b(?:not\s+synced|not\s+updated|not\s+pulled|not\s+verified|"
+        r"pending|behind|dirty|drift|lag)\b",
+    ),
+    (
+        "live_pickup_unverified",
+        r"\b(?:live\s+pickup|runtime\s+pickup|process\s+pickup|live\s+runtime\s+pickup)\b[^\n.]{0,120}\b"
+        r"(?:not\s+verified|unverified|needs?\s+verification|not\s+confirmed|unknown|pending|not\s+picked\s+up)\b|"
+        r"\b(?:not|hasn['’]?t|has\s+not)\s+picked\s+up\b",
+    ),
+)
+_DEFERRED_RUNTIME_WATCH_PATTERNS = (
+    r"\b(?:first\s+scheduled\s+)?(?:airflow\s+)?(?:dag|run|runtime\s+verification|data-writing\s+run)\b"
+    r"[^\n.]{0,140}\b(?:still\s+running|running|pending|queued|watch(?:er|ing)|background\s+watch)\b",
+    r"\bbackground\s+watch(?:er|ing)?\b[^\n.]{0,140}\b(?:airflow|dag|run|runtime\s+verification|data-writing)\b",
+)
+_RUNTIME_SYNC_VERIFIED_PATTERNS = (
+    r"\b(?:canonical|runtime|checkout|worktree|deployed\s+runtime|private\s+runtime)\b[^\n.]{0,120}\b"
+    r"(?:synced|updated|pulled|fast-forwarded|clean)\b",
+    r"\bcanonical/runtime\s+checkouts?\s+synced\b",
+)
+_LIVE_PICKUP_VERIFIED_PATTERNS = (
+    r"\b(?:live\s+pickup|runtime\s+pickup|process\s+pickup|live\s+runtime\s+pickup)\b[^\n.]{0,120}\b"
+    r"(?:verified|confirmed|picked\s+up)\b",
+    r"\bpicked\s+up\s+(?:the\s+)?(?:merged\s+)?(?:code|change|version|commit)\b",
 )
 
 
@@ -209,6 +242,24 @@ def _delivery_intent_for_item(item: dict[str, Any]) -> str:
     return "full_lifecycle"
 
 
+def _deferred_runtime_watch_missing_markers(text: str) -> list[str]:
+    """Return missing handoff evidence for a deferred long runtime watch.
+
+    A final response may hand off a newly scheduled Airflow/DAG/data-writing run
+    to a background watcher, but only after the repo/runtime handoff itself is
+    complete. This pure text gate prevents "watcher started" from masking an
+    omitted runtime sync or live-pickup verification claim.
+    """
+    if not _matches_any(text, _DEFERRED_RUNTIME_WATCH_PATTERNS):
+        return []
+    missing: list[str] = []
+    if not _matches_any(text, _RUNTIME_SYNC_VERIFIED_PATTERNS):
+        missing.append("runtime_sync_unverified")
+    if not _matches_any(text, _LIVE_PICKUP_VERIFIED_PATTERNS):
+        missing.append("live_pickup_unverified")
+    return missing
+
+
 def classify_delivery_completion(item: dict[str, Any], final_response: str | None = None) -> dict[str, Any]:
     """Classify whether a delivered Discord response may close the work item.
 
@@ -244,7 +295,18 @@ def classify_delivery_completion(item: dict[str, Any], final_response: str | Non
         return gate
 
     matched = [reason for reason, pattern in _INCOMPLETE_FINAL_PATTERNS if re.search(pattern, final_text, flags=re.IGNORECASE)]
+    runtime_handoff_missing = _deferred_runtime_watch_missing_markers(final_text) if intent == "full_lifecycle" else []
     if not matched:
+        if runtime_handoff_missing:
+            gate.update(
+                {
+                    "allowed_to_complete": False,
+                    "summary_status": "Blocked",
+                    "terminal_status": "blocked",
+                    "reason": "runtime_handoff_unverified",
+                    "matched_markers": runtime_handoff_missing,
+                }
+            )
         return gate
 
     narrow_intent = intent in {"pr_only", "review_only", "draft_pr", "no_merge"}
