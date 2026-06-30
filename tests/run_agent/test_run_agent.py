@@ -70,6 +70,25 @@ def test_default_max_iterations_is_1000():
     assert agent.iteration_budget.max_total == 1000
 
 
+def test_aiagent_accepts_read_terminal_callback():
+    callback = lambda **kwargs: '{"text":"terminal"}'
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            read_terminal_callback=callback,
+        )
+
+    assert agent.read_terminal_callback is callback
+
+
 @pytest.fixture()
 def agent():
     """Minimal AIAgent with mocked OpenAI client and tool loading."""
@@ -2552,6 +2571,20 @@ class TestConcurrentToolExecution:
             result = agent._invoke_tool("todo", {"todos": []}, "task-1")
             mock_todo.assert_called_once()
         assert "ok" in result
+
+    def test_invoke_tool_passes_read_terminal_callback(self, agent):
+        agent.read_terminal_callback = lambda **kwargs: json.dumps(
+            {"text": "visible terminal", "kwargs": kwargs}
+        )
+
+        result = json.loads(
+            agent._invoke_tool("read_terminal", {"start_line": 2, "count": 3}, "task-1")
+        )
+
+        assert result == {
+            "text": "visible terminal",
+            "kwargs": {"start": 2, "count": 3},
+        }
 
     def test_invoke_tool_runs_post_and_transform_hooks_for_agent_level_tool(self, agent, monkeypatch):
         """Agent-level tools bypass registry dispatch but still run plugin result hooks."""
