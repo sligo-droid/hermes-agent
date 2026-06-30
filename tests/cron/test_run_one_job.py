@@ -31,7 +31,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("deliver", job["id"]))
         return None
 
-    def fake_mark(jid, ok, err=None, delivery_error=None):
+    def fake_mark(jid, ok, err=None, delivery_error=None, health_details=None):
         calls.append(("mark", jid, ok))
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
@@ -110,10 +110,89 @@ def test_run_one_job_exception_marks_failure(monkeypatch):
     marks = []
     monkeypatch.setattr(
         s, "mark_job_run",
-        lambda jid, ok, err=None, delivery_error=None: marks.append((jid, ok)),
+        lambda jid, ok, err=None, delivery_error=None, health_details=None: marks.append((jid, ok)),
     )
 
     ok = s.run_one_job({"id": "j6", "name": "t"})
 
     assert ok is False
     assert marks == [("j6", False)]
+
+
+def test_run_one_job_valid_self_improvement_ingestion_keeps_health_ok(monkeypatch):
+    calls = _patch_pipeline(monkeypatch)
+    seen_health_details = []
+
+    def fake_mark(jid, ok, err=None, delivery_error=None, health_details=None):
+        calls.append(("mark", jid, ok))
+        seen_health_details.append(health_details)
+
+    monkeypatch.setattr(s, "mark_job_run", fake_mark)
+    monkeypatch.setattr(
+        s,
+        "_ingest_self_improvement_proposal_output",
+        lambda job, output, output_file, final_response: {
+            "status": "valid",
+            "card_count": 1,
+            "parse_error": None,
+            "source_key": "cron:j7:j7.txt",
+            "run_id": 17,
+        },
+    )
+
+    ok = s.run_one_job({"id": "j7", "name": "t", "self_improvement_proposal": {"project": "p", "prong": "q"}})
+
+    assert ok is True
+    assert seen_health_details == [None]
+
+
+def test_run_one_job_malformed_self_improvement_ingestion_records_health(monkeypatch):
+    calls = _patch_pipeline(monkeypatch)
+    seen_health_details = []
+
+    def fake_mark(jid, ok, err=None, delivery_error=None, health_details=None):
+        calls.append(("mark", jid, ok))
+        seen_health_details.append(health_details)
+
+    parse_error = "proposal JSON parse error at line 1, column 2: no secret payload"
+    monkeypatch.setattr(s, "mark_job_run", fake_mark)
+    monkeypatch.setattr(
+        s,
+        "_ingest_self_improvement_proposal_output",
+        lambda job, output, output_file, final_response: {
+            "status": "malformed",
+            "card_count": 0,
+            "parse_error": parse_error,
+            "source_key": "cron:j8:j8.txt",
+            "run_id": 18,
+        },
+    )
+
+    ok = s.run_one_job({"id": "j8", "name": "t", "self_improvement_proposal": {"project": "p", "prong": "q"}})
+
+    assert ok is True
+    detail = seen_health_details[0]["self_improvement_proposal_ingestion"]
+    assert detail == {
+        "status": "malformed",
+        "card_count": 0,
+        "parse_error": parse_error,
+        "cron_output_path": "/tmp/j8.txt",
+        "source_key": "cron:j8:j8.txt",
+        "run_id": 18,
+    }
+
+
+def test_run_one_job_non_self_improvement_has_no_ingestion_health(monkeypatch):
+    calls = _patch_pipeline(monkeypatch)
+    seen_health_details = []
+
+    def fake_mark(jid, ok, err=None, delivery_error=None, health_details=None):
+        calls.append(("mark", jid, ok))
+        seen_health_details.append(health_details)
+
+    monkeypatch.setattr(s, "mark_job_run", fake_mark)
+
+    ok = s.run_one_job({"id": "j9", "name": "t"})
+
+    assert ok is True
+    assert seen_health_details == [None]

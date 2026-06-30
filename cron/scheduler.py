@@ -1349,6 +1349,33 @@ def _ingest_self_improvement_proposal_output(
     return result
 
 
+def _self_improvement_ingestion_health(result: dict | None, output_file: Path) -> dict | None:
+    """Return persisted cron health detail for proposal ingestion failures only."""
+
+    if not result:
+        return None
+    status = str(result.get("status") or "").strip()
+    try:
+        card_count = int(result.get("card_count") or 0)
+    except (TypeError, ValueError):
+        card_count = 0
+    if status == "valid" and card_count > 0:
+        return None
+    parse_error = " ".join(str(result.get("parse_error") or "").split())
+    if len(parse_error) > 240:
+        parse_error = parse_error[:237].rstrip() + "..."
+    return {
+        "self_improvement_proposal_ingestion": {
+            "status": status or "unknown",
+            "card_count": card_count,
+            "parse_error": parse_error or None,
+            "cron_output_path": str(output_file),
+            "source_key": result.get("source_key"),
+            "run_id": result.get("run_id"),
+        }
+    }
+
+
 def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
@@ -2572,8 +2599,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = True) ->
             logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
             should_deliver = False
 
+        ingestion_health_details = None
         if should_deliver:
-            _ingest_self_improvement_proposal_output(job, output, Path(output_file), final_response)
+            ingestion_result = _ingest_self_improvement_proposal_output(job, output, Path(output_file), final_response)
+            ingestion_health_details = _self_improvement_ingestion_health(ingestion_result, Path(output_file))
 
         delivery_error = None
         if should_deliver:
@@ -2593,7 +2622,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = True) ->
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         terminal_success_reason = _terminal_success_reason(job, success, final_response)
-        mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        mark_job_run(
+            job["id"],
+            success,
+            error,
+            delivery_error=delivery_error,
+            health_details=ingestion_health_details,
+        )
         if terminal_success_reason:
             mark_job_terminal_success(
                 job["id"],
