@@ -291,6 +291,9 @@ function availableActionKinds(item: CommandCenterWorkItem): ActionKind[] {
     actions.push("approve_worker_board");
     actions.push("reject");
   }
+  if (proposalId && item.decision?.approve_action && item.status === "accepted" && !item.execution) {
+    actions.push("approve_worker_board");
+  }
   if (canResume) actions.push("replay");
   if (canPause) actions.push("pause");
   if (canUndo) actions.push("undo");

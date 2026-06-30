@@ -1970,6 +1970,29 @@ def test_self_improvement_approve_short_circuits_already_approved_card(client, m
         conn.close()
 
 
+def test_self_improvement_worker_board_approval_can_upgrade_native_approved_card(client, monkeypatch):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+    monkeypatch.setattr(discord_publish, "configured_project_channel_id", lambda project: "")
+
+    native = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "native"})
+    upgraded = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
+
+    assert native.status_code == 200, native.text
+    assert native.json()["task"] is None
+    assert upgraded.status_code == 200, upgraded.text
+    assert upgraded.json()["task"]["id"]
+    assert upgraded.json()["worker_url"]
+    conn = kb.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+    finally:
+        conn.close()
+    audit = proposal_storage.list_audit_events(card["proposal_id"])
+    assert [event["action"] for event in audit] == ["approved", "approved"]
+    assert audit[-1]["kanban_task_id"] == upgraded.json()["task"]["id"]
+
+
 def test_self_improvement_approve_falls_back_without_discord_channel(client, monkeypatch):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
