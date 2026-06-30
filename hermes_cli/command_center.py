@@ -1889,8 +1889,7 @@ def build_command_center_snapshot(
             and item.get("status") not in {"proposed", "rejected", "archived"}
             and kanban_db.board_exists(board)
         )
-        standalone_recovery = str(card.get("status") or "").lower() == "recovery_needed"
-        if not has_board_rollup and (item.get("status") in {"proposed", "rejected", "archived"} or standalone_recovery):
+        if not has_board_rollup:
             work_items.append(item)
         elif board:
             proposal_id = card.get("proposal_id")

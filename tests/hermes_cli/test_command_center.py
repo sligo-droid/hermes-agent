@@ -134,6 +134,25 @@ def test_snapshot_hides_rejected_cards_by_default_and_exposes_source_ids(tmp_pat
     assert item["source"]["kind"] == "self_improvement"
 
 
+def test_snapshot_keeps_native_approved_proposal_visible_as_accepted(tmp_path, monkeypatch):
+    _ingest_valid(monkeypatch, tmp_path)
+    card = _first_card()
+    proposal_storage.record_approval(
+        card["proposal_id"],
+        kanban_task_id="",
+        worker_url="",
+        actor="operator",
+        metadata={"execution_route": "native", "idempotency_key": f"self-improvement:{card['proposal_id']}"},
+    )
+
+    snapshot = command_center.build_command_center_snapshot(project=card["project"])
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"self-improvement:{card['proposal_id']}")
+
+    assert item["status"] == "accepted"
+    assert item["status_detail"] == "approved"
+    assert item["execution"] is None
+
+
 def test_snapshot_reconciles_approved_proposal_done_task_to_completed(tmp_path, monkeypatch):
     _ingest_valid(monkeypatch, tmp_path)
     card = _first_card()

@@ -2195,7 +2195,7 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str, payload: Propos
             "task": _task_dict(task) if task else None,
             "worker_url": worker_url,
         }
-    if card.get("status") == "approved":
+    if card.get("status") == "approved" and route != "worker_board":
         return {"card": _self_improvement_card_with_downstream(card), "task": None, "worker_url": ""}
 
     idempotency_key = f"self-improvement:{proposal_id}"
