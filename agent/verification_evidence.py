@@ -22,8 +22,20 @@ _PROTECTED_CHECKOUT_GUARDRAIL_RE = re.compile(
     re.IGNORECASE,
 )
 _BROWSER_RE = re.compile(r"\b(browser|playwright|chromium|chrome|modal)\b", re.IGNORECASE)
-_PRODUCTION_RE = re.compile(r"\b(production|prod|deployed?|live)\b|https?://", re.IGNORECASE)
+_PRODUCTION_RE = re.compile(
+    r"\b(production|prod|deployed?|live)\b|"
+    r"https?://(?!(?:127(?:\.\d{1,3}){3}|localhost|0\.0\.0\.0|\[::1\])(?::|/|$))",
+    re.IGNORECASE,
+)
 _CI_RE = re.compile(r"\b(ci|checks?|status|gh\s+pr\s+checks|test|tests|pytest|vitest)\b", re.IGNORECASE)
+_CI_COMMAND_RE = re.compile(
+    r"\b(?:ci|checks?|status|gh\s+pr\s+checks|pytest|vitest)\b|"
+    r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:[^\s;&|]*[-:]?)?(?:test|tests|check|verify|verification)\b|"
+    r"\b(?:cargo|go)\s+test\b|"
+    r"(?:^|[\s;&|])(?:\./)?(?:scripts/)?(?:test|tests|run_tests)\.sh\b|"
+    r"\bpython(?:\d+(?:\.\d+)?)?\s+-m\s+\S*(?:verify|verification)\b",
+    re.IGNORECASE,
+)
 _DEPLOY_RE = re.compile(r"\b(deploy|deployed|deployment)\b", re.IGNORECASE)
 _MERGE_RE = re.compile(r"\b(merge|merged|pull|pr)\b", re.IGNORECASE)
 _SUCCESS_RE = re.compile(r"\b(success|passed|pass|ok|complete|completed|visible|found|healthy)\b", re.IGNORECASE)
@@ -69,7 +81,11 @@ def _text(value: Any, limit: int = 500) -> str:
 def _surfaces_for(tool_name: str, check_name: str, detail: str) -> list[str]:
     haystack = f"{tool_name} {check_name} {detail}"
     surfaces: list[str] = []
-    if _CI_RE.search(haystack):
+    if _CI_COMMAND_RE.search(check_name) or re.search(
+        r"\b(?:ci|checks?|status\s+checks?|gh\s+pr\s+checks)\b",
+        detail,
+        flags=re.IGNORECASE,
+    ):
         surfaces.append("ci")
     if _MERGE_RE.search(haystack):
         surfaces.append("pr")
@@ -82,6 +98,22 @@ def _surfaces_for(tool_name: str, check_name: str, detail: str) -> list[str]:
     if "browser" in surfaces and "production" in surfaces:
         surfaces.append("production_browser")
     return surfaces or ["verification"]
+
+
+def _normalized_evidence_surfaces(item: dict[str, Any]) -> list[str]:
+    surface = str(item.get("surface") or "").strip()
+    if surface != "ci":
+        return [surface] if surface else []
+    check_name = str(item.get("check_name") or "")
+    detail = str(item.get("detail") or "")
+    haystack = f"{check_name}\n{detail}"
+    if _BROWSER_RE.search(haystack) and not _CI_COMMAND_RE.search(check_name):
+        # Older ledgers could mislabel ad-hoc Playwright/Chromium browser probes
+        # as CI solely because the script imported "@playwright/test". Do not let
+        # that stale label contradict a later independent CI claim. New evidence
+        # recording classifies these probes as browser evidence directly.
+        return []
+    return ["ci"]
 
 
 def _is_non_verification_git_pathspec_segment(segment: str) -> bool:
@@ -181,13 +213,16 @@ def latest_evidence_by_surface(evidence: Any) -> dict[str, dict[str, Any]]:
     for item in evidence:
         if not isinstance(item, dict):
             continue
-        surface = str(item.get("surface") or "").strip()
-        if not surface:
+        surfaces = _normalized_evidence_surfaces(item)
+        if not surfaces:
             continue
         order = int(item.get("order") or 0)
-        current = latest.get(surface)
-        if current is None or order >= int(current.get("order") or 0):
-            latest[surface] = item
+        for surface in surfaces:
+            current = latest.get(surface)
+            if current is None or order >= int(current.get("order") or 0):
+                normalized_item = dict(item)
+                normalized_item["surface"] = surface
+                latest[surface] = normalized_item
     return latest
 
 

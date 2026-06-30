@@ -90,6 +90,57 @@ def test_failed_browser_check_does_not_block_independent_ci_claim():
     assert claim_constraints_for_text("CI passed and browser modal verified visible.", evidence)["allowed"] is False
 
 
+def test_playwright_terminal_script_is_browser_evidence_not_ci_from_package_name():
+    agent = SimpleNamespace(_turn_runtime_stats=conversation_loop._new_turn_runtime_stats(0.0))
+    command = """node <<'NODE'
+const { chromium } = require('@playwright/test');
+const baseUrl = 'http://127.0.0.1:5184/state';
+console.log(JSON.stringify({ ok: false, fail: ['desktop income header did not become active sort'] }));
+NODE"""
+    result = json.dumps(
+        {
+            "output": "{\"ok\": false, \"fail\": [\"desktop income header did not become active sort\"]}",
+            "exit_code": 1,
+            "error": None,
+        }
+    )
+
+    tool_executor._record_turn_tool_runtime(agent, "terminal", 1.0, result, True)
+    tool_executor._record_turn_verification_evidence(agent, "terminal", {"command": command}, result, True)
+
+    latest = latest_evidence_by_surface(agent._turn_runtime_stats["verification_evidence"])
+
+    assert "ci" not in latest
+    assert latest["browser"]["status"] == "failure"
+    assert "production" not in latest
+    assert "production_browser" not in latest
+    assert claim_constraints_for_text("PR CI passed and main CI passed.", agent._turn_runtime_stats["verification_evidence"])[
+        "allowed"
+    ] is True
+    assert claim_constraints_for_text(
+        "PR CI passed and browser QA verified header sorting.",
+        agent._turn_runtime_stats["verification_evidence"],
+    )["allowed"] is False
+
+
+def test_persisted_playwright_evidence_misclassified_as_ci_is_not_used_as_ci():
+    evidence = [
+        {
+            "surface": "ci",
+            "check_name": "set -a; source qa.env; node <<'NODE'\nconst { chromium } = require('@playwright/test');\nconst baseUrl = 'http://127.0.0.1:5184/state';",
+            "status": "failure",
+            "order": 50,
+            "detail": "{\"ok\": false, \"fail\": [\"desktop income header did not become active sort\"]}",
+        }
+    ]
+
+    latest = latest_evidence_by_surface(evidence)
+
+    assert "ci" not in latest
+    assert "browser" not in latest
+    assert claim_constraints_for_text("PR CI passed and main CI passed.", evidence)["allowed"] is True
+
+
 def test_final_response_downgrade_names_latest_failed_check():
     text = "Shipped and verified in production; browser modal is visible. CI passed via scripts/run_tests.sh."
     evidence = [

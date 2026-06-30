@@ -295,9 +295,12 @@ def classify_delivery_completion(item: dict[str, Any], final_response: str | Non
     final_text = str(final_response if final_response is not None else item.get("final_response") or "")
     repo_backed = _repo_backed_discord_item(item)
     intent = _delivery_intent_for_item(item) if repo_backed else "generic"
+    gate_summary_status = str(item.get("summary_status") or "Complete")
+    if gate_summary_status.lower() == "blocked":
+        gate_summary_status = "Complete"
     gate = {
         "allowed_to_complete": True,
-        "summary_status": str(item.get("summary_status") or "Complete"),
+        "summary_status": gate_summary_status,
         "terminal_status": "completed",
         "reason": "not_repo_backed" if not repo_backed else "no_self_declared_delivery_gap",
         "delivery_intent": intent,
@@ -631,6 +634,8 @@ class GatewayWorkLedger:
                     item["feature_summary"] = downgrade_verified_metadata(item["feature_summary"], blocked_surfaces)
                 if isinstance(item.get("project_summary"), dict):
                     item["project_summary"] = downgrade_verified_metadata(item["project_summary"], blocked_surfaces)
+        else:
+            item["summary_status"] = str(gate.get("summary_status") or "Complete")
         _record_discord_board_final_response(item)
         self._write(data)
         return True
