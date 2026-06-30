@@ -1,6 +1,8 @@
+import importlib.util
 import json
 import os
 import shutil
+import sys
 
 from scripts import nightly_hermes_system_doctor as doctor
 
@@ -246,6 +248,70 @@ def test_repo_script_is_full_cron_entrypoint_for_live_cron_job():
     assert callable(doctor.check_hermes_doctor)
     assert callable(doctor.check_coding_worker)
     assert callable(doctor.install_live)
+
+
+def test_live_cron_entrypoint_imports_and_runs_status_without_external_checks(tmp_path, monkeypatch, capsys):
+    repo = tmp_path / "repo"
+    hermes_home = tmp_path / "home"
+    live = hermes_home / "scripts" / "nightly_hermes_system_doctor.py"
+    jobs = hermes_home / "cron" / "jobs.json"
+    state = hermes_home / "state" / "nightly-hermes-system-doctor.json"
+    source = repo / "scripts" / "nightly_hermes_system_doctor.py"
+    source.parent.mkdir(parents=True)
+    live.parent.mkdir(parents=True)
+    jobs.parent.mkdir(parents=True)
+    shutil.copy2(doctor.Path(__file__).parents[2] / "scripts" / "nightly_hermes_system_doctor.py", source)
+    shutil.copy2(source, live)
+    jobs.write_text(
+        json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "2ee992ee65f5",
+                        "name": "Nightly Hermes system doctor",
+                        "script": "nightly_hermes_system_doctor.py",
+                        "schedule_display": "0 5 * * *",
+                        "enabled": True,
+                        "state": "scheduled",
+                        "no_agent": False,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_REPO", str(repo))
+    monkeypatch.setenv("HERMES_PYTHON", sys.executable)
+
+    spec = importlib.util.spec_from_file_location("live_nightly_hermes_system_doctor", live)
+    assert spec is not None
+    live_doctor = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(live_doctor)
+
+    def ok_check(_issues, facts):
+        facts.setdefault("mock_checks", 0)
+        facts["mock_checks"] += 1
+
+    monkeypatch.setattr(live_doctor, "STATE", state)
+    monkeypatch.setattr(live_doctor, "check_hermes_doctor", ok_check)
+    monkeypatch.setattr(live_doctor, "check_auth_list", ok_check)
+    monkeypatch.setattr(live_doctor, "check_codex_auth_incidents", ok_check)
+    monkeypatch.setattr(live_doctor, "check_main_inference", ok_check)
+    monkeypatch.setattr(live_doctor, "check_compression_inference", ok_check)
+    monkeypatch.setattr(live_doctor, "check_honcho", ok_check)
+    monkeypatch.setattr("sys.argv", [str(live), "--status", "--skip-coding-worker-smoke"])
+
+    assert live_doctor.main() == 0
+    status_output = capsys.readouterr().out
+    assert "OK Nightly Hermes system doctor" in status_output
+    facts = json.loads(state.read_text(encoding="utf-8"))["facts"]
+    assert facts["cron_job_id"] == "2ee992ee65f5"
+    assert facts["cron_job_script_resolved_path"] == str(live.resolve())
+    assert facts["script_running_path"] == str(live.resolve())
+    assert facts["script_pickup_ready"] is True
 
 
 def test_script_provenance_records_source_and_live_match(tmp_path, monkeypatch):
