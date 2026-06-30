@@ -257,6 +257,246 @@ class TestHonchoDoctorConfigDetection:
         assert not doctor._honcho_is_configured_for_doctor()
 
 
+class TestHonchoOpenAIProxyHealth:
+    def test_classifies_reachable_quiet_proxy_as_healthy(self):
+        result = doctor.classify_honcho_proxy_health(
+            doctor.HonchoProxyHealthFacts(
+                service="honcho-proxy.service",
+                reachable=True,
+                reachability_detail="GET /v1/models returned HTTP 200",
+                warning_count=0,
+                warning_source="journalctl user unit honcho-proxy.service",
+                rss_mb=768.0,
+                memory_source="systemd user unit honcho-proxy.service",
+            )
+        )
+
+        assert result.status == "healthy"
+        assert "reachable and quiet" in result.summary
+        assert result.warning_breached is False
+        assert result.memory_breached is False
+
+    def test_classifies_high_warning_reachable_proxy_as_warning(self):
+        result = doctor.classify_honcho_proxy_health(
+            doctor.HonchoProxyHealthFacts(
+                service="honcho-proxy.service",
+                reachable=True,
+                reachability_detail="GET /v1/models returned HTTP 200",
+                warning_count=40,
+                warning_window_minutes=10,
+                warning_source="journalctl user unit honcho-proxy.service",
+                rss_mb=768.0,
+                memory_source="systemd user unit honcho-proxy.service",
+            )
+        )
+
+        assert result.status == "warning"
+        assert result.warning_breached is True
+        assert result.reachability_failed is False
+        joined = "\n".join(result.lines)
+        assert "PydanticSerializationUnexpectedValue: 40 in 10m" in joined
+        assert "4.00/min" in joined
+        assert "inspect recent proxy logs" in joined
+
+    def test_collects_all_readable_sources_and_warns_on_later_docker_source(self, monkeypatch):
+        calls = []
+
+        def fake_probe(args, timeout=doctor._HONCHO_PROXY_COMMAND_TIMEOUT_SECONDS):
+            calls.append(tuple(args))
+            if args[0] == "journalctl":
+                return SimpleNamespace(returncode=0, stdout="quiet log\n", stderr="")
+            if args[:2] == ["docker", "logs"]:
+                count = 40 if args[-1] == "honcho-openai-proxy" else 0
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=(doctor._HONCHO_PROXY_WARNING_CLASS + "\n") * count,
+                    stderr="private prompt token=sk-test",
+                )
+            if args[:3] == ["systemctl", "--user", "show"]:
+                return SimpleNamespace(returncode=0, stdout=str(512 * 1024 * 1024), stderr="")
+            if args[:2] == ["docker", "stats"]:
+                return SimpleNamespace(returncode=0, stdout="768MiB / 4GiB", stderr="")
+            raise AssertionError(args)
+
+        monkeypatch.setattr(doctor, "_run_honcho_proxy_probe_command", fake_probe)
+        monkeypatch.setattr(
+            doctor,
+            "_configured_local_openai_proxy_route",
+            lambda: doctor.HonchoProxyRoute(
+                models_url="http://127.0.0.1:8645/v1/models",
+                source="config.yaml model.base_url",
+            ),
+        )
+        monkeypatch.setattr(
+            doctor,
+            "_probe_honcho_proxy_reachability",
+            lambda: (True, "config.yaml model.base_url: GET /v1/models returned HTTP 200"),
+        )
+
+        facts = doctor.collect_honcho_proxy_health_facts()
+        result = doctor.classify_honcho_proxy_health(facts)
+        joined = "\n".join(result.lines)
+
+        assert result.status == "warning"
+        assert result.warning_breached is True
+        assert facts.warning_count == 40
+        assert facts.warning_source == "docker logs honcho-openai-proxy"
+        assert len(facts.warning_counts) == 6
+        assert "journalctl user unit hermes-honcho-proxy.service=0" in joined
+        assert "docker logs honcho-openai-proxy=40" in joined
+        assert "config.yaml model.base_url" in joined
+        assert "private prompt" not in joined
+        assert "sk-test" not in joined
+        assert any(call[:2] == ("docker", "logs") and call[-1] == "honcho-openai-proxy" for call in calls)
+
+    def test_classifies_high_memory_reachable_proxy_as_warning(self):
+        result = doctor.classify_honcho_proxy_health(
+            doctor.HonchoProxyHealthFacts(
+                service="honcho-proxy.service",
+                reachable=True,
+                reachability_detail="GET /v1/models returned HTTP 200",
+                warning_count=0,
+                warning_source="journalctl user unit honcho-proxy.service",
+                rss_mb=2048.0,
+                memory_source="docker stats honcho-proxy",
+            )
+        )
+
+        assert result.status == "warning"
+        assert result.memory_breached is True
+        joined = "\n".join(result.lines)
+        assert "rss=2048.0 MiB" in joined
+        assert "threshold=1536.0 MiB" in joined
+        assert "safe service restart" in joined
+
+    def test_classifies_unreachable_proxy_as_fail_even_with_quiet_logs(self):
+        result = doctor.classify_honcho_proxy_health(
+            doctor.HonchoProxyHealthFacts(
+                service="honcho-proxy.service",
+                reachable=False,
+                reachability_detail="GET /v1/models failed: URLError",
+                warning_count=0,
+                warning_source="journalctl user unit honcho-proxy.service",
+                rss_mb=768.0,
+                memory_source="systemd user unit honcho-proxy.service",
+            )
+        )
+
+        assert result.status == "fail"
+        assert result.reachability_failed is True
+        assert "unreachable/degraded" in result.summary
+
+    def test_doctor_proxy_health_output_summarizes_without_payloads(self, monkeypatch, capsys):
+        secret_payload = "user prompt token=secret api_key=sk-test"
+        monkeypatch.setattr(
+            doctor,
+            "collect_honcho_proxy_health_facts",
+            lambda: doctor.HonchoProxyHealthFacts(
+                service="honcho-proxy.service",
+                reachable=True,
+                reachability_detail="GET /v1/models returned HTTP 200",
+                warning_count=30,
+                warning_source=f"journalctl user unit honcho-proxy.service {secret_payload}",
+                rss_mb=512.0,
+                memory_source="systemd user unit honcho-proxy.service",
+            ),
+        )
+
+        issues = []
+        doctor._check_honcho_openai_proxy_health(issues)
+
+        output = capsys.readouterr().out
+        assert "Honcho/OpenAI proxy health" in output
+        assert "PydanticSerializationUnexpectedValue: 30" in output
+        assert "honcho-proxy.service" in output
+        assert "user prompt" not in output
+        assert "secret" not in output
+        assert "sk-test" not in output
+        assert issues == []
+
+    def test_resolves_active_config_model_base_url_without_honcho_memory(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        monkeypatch.delenv("HONCHO_OPENAI_BASE_URL", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "memory": {"provider": ""},
+                "model": {"base_url": "http://127.0.0.1:8645/v1"},
+            },
+        )
+
+        route = doctor._configured_local_openai_proxy_route()
+
+        assert route is not None
+        assert route.models_url == "http://127.0.0.1:8645/v1/models"
+        assert route.source == "config.yaml model.base_url"
+
+    def test_config_model_base_url_precedes_env_override(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:9999/v1")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"model": {"base_url": "http://localhost:8645"}},
+        )
+
+        route = doctor._configured_local_openai_proxy_route()
+
+        assert route is not None
+        assert route.models_url == "http://localhost:8645/v1/models"
+        assert route.source == "config.yaml model.base_url"
+
+    def test_probe_reachability_records_active_route_source(self, monkeypatch):
+        monkeypatch.setattr(
+            doctor,
+            "_configured_local_openai_proxy_route",
+            lambda: doctor.HonchoProxyRoute(
+                models_url="http://127.0.0.1:8645/v1/models",
+                source="config.yaml model.base_url",
+            ),
+        )
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        monkeypatch.setattr(doctor.request, "urlopen", lambda req, timeout: FakeResponse())
+
+        reachable, detail = doctor._probe_honcho_proxy_reachability()
+
+        assert reachable is True
+        assert "config.yaml model.base_url" in detail
+        assert "/v1/models" in detail
+
+    def test_runs_proxy_health_for_active_model_route_without_honcho_memory(self, monkeypatch, tmp_path):
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "model:\n  base_url: http://127.0.0.1:8645/v1\nmemory:\n  provider: ''\n",
+            encoding="utf-8",
+        )
+        project = tmp_path / "project"
+        project.mkdir()
+
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(doctor_mod, "_check_honcho_openai_proxy_health", lambda issues: (_ for _ in ()).throw(SystemExit(0)))
+
+        fake_model_tools = types.SimpleNamespace(
+            check_tool_availability=lambda *a, **kw: ([], []),
+            TOOLSET_REQUIREMENTS={},
+        )
+        monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+        with pytest.raises(SystemExit):
+            doctor_mod.run_doctor(Namespace(fix=False))
+
+
 def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):
     """Doctor should present CLI-gated tools as available in CLI context."""
     project_root = tmp_path / "project"
