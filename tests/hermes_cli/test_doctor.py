@@ -363,6 +363,88 @@ class TestHonchoOpenAIProxyHealth:
         assert "sk-test" not in output
         assert issues == []
 
+    def test_resolves_active_config_model_base_url_without_honcho_memory(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        monkeypatch.delenv("HONCHO_OPENAI_BASE_URL", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "memory": {"provider": ""},
+                "model": {"base_url": "http://127.0.0.1:8645/v1"},
+            },
+        )
+
+        route = doctor._configured_local_openai_proxy_route()
+
+        assert route is not None
+        assert route.models_url == "http://127.0.0.1:8645/v1/models"
+        assert route.source == "config.yaml model.base_url"
+
+    def test_config_model_base_url_precedes_env_override(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:9999/v1")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"model": {"base_url": "http://localhost:8645"}},
+        )
+
+        route = doctor._configured_local_openai_proxy_route()
+
+        assert route is not None
+        assert route.models_url == "http://localhost:8645/v1/models"
+        assert route.source == "config.yaml model.base_url"
+
+    def test_probe_reachability_records_active_route_source(self, monkeypatch):
+        monkeypatch.setattr(
+            doctor,
+            "_configured_local_openai_proxy_route",
+            lambda: doctor.HonchoProxyRoute(
+                models_url="http://127.0.0.1:8645/v1/models",
+                source="config.yaml model.base_url",
+            ),
+        )
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        monkeypatch.setattr(doctor.request, "urlopen", lambda req, timeout: FakeResponse())
+
+        reachable, detail = doctor._probe_honcho_proxy_reachability()
+
+        assert reachable is True
+        assert "config.yaml model.base_url" in detail
+        assert "/v1/models" in detail
+
+    def test_runs_proxy_health_for_active_model_route_without_honcho_memory(self, monkeypatch, tmp_path):
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "model:\n  base_url: http://127.0.0.1:8645/v1\nmemory:\n  provider: ''\n",
+            encoding="utf-8",
+        )
+        project = tmp_path / "project"
+        project.mkdir()
+
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(doctor_mod, "_check_honcho_openai_proxy_health", lambda issues: (_ for _ in ()).throw(SystemExit(0)))
+
+        fake_model_tools = types.SimpleNamespace(
+            check_tool_availability=lambda *a, **kw: ([], []),
+            TOOLSET_REQUIREMENTS={},
+        )
+        monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+        with pytest.raises(SystemExit):
+            doctor_mod.run_doctor(Namespace(fix=False))
+
 
 def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):
     """Doctor should present CLI-gated tools as available in CLI context."""

@@ -84,6 +84,7 @@ class HonchoProxyHealthFacts:
     service: str = "honcho/openai proxy"
     reachable: bool | None = None
     reachability_detail: str = "not probed"
+    route_source: str = "route unavailable"
     warning_count: int | None = None
     warning_window_minutes: int = _HONCHO_PROXY_WARNING_WINDOW_MINUTES
     warning_source: str = "logs unavailable"
@@ -104,6 +105,12 @@ class HonchoProxyHealthResult:
     warning_breached: bool = False
     memory_breached: bool = False
     reachability_failed: bool = False
+
+
+@dataclass(frozen=True)
+class HonchoProxyRoute:
+    models_url: str
+    source: str
 
 
 from hermes_constants import is_termux as _is_termux
@@ -208,6 +215,7 @@ def classify_honcho_proxy_health(facts: HonchoProxyHealthFacts) -> HonchoProxyHe
         lines.append(f"memory: {'; '.join(mem_parts)} ({_honcho_proxy_source_label(facts.memory_source)})")
 
     lines.append(f"reachability: {facts.reachability_detail}")
+    lines.append(f"route source: {_honcho_proxy_source_label(facts.route_source)}")
 
     if reachability_failed:
         status = "fail"
@@ -349,10 +357,7 @@ def _collect_honcho_proxy_memory() -> tuple[float | None, str]:
     return None, "no readable candidate systemd unit or docker container"
 
 
-def _configured_local_openai_proxy_url() -> str | None:
-    raw = os.environ.get("OPENAI_BASE_URL") or os.environ.get("HONCHO_OPENAI_BASE_URL")
-    if not raw:
-        return None
+def _local_openai_proxy_models_url(raw: str) -> str | None:
     parsed = urlparse(raw)
     if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
         return None
@@ -364,33 +369,69 @@ def _configured_local_openai_proxy_url() -> str | None:
     return urlunparse(parsed._replace(path=path or "/v1/models", query="", fragment=""))
 
 
+def _configured_local_openai_proxy_route() -> HonchoProxyRoute | None:
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        model_cfg = cfg.get("model") if isinstance(cfg, dict) else {}
+        if isinstance(model_cfg, dict):
+            models_url = _local_openai_proxy_models_url(str(model_cfg.get("base_url") or "").strip())
+            if models_url:
+                return HonchoProxyRoute(models_url=models_url, source="config.yaml model.base_url")
+    except Exception:
+        pass
+
+    env_sources = (
+        ("OPENAI_BASE_URL", os.environ.get("OPENAI_BASE_URL")),
+        ("HONCHO_OPENAI_BASE_URL", os.environ.get("HONCHO_OPENAI_BASE_URL")),
+    )
+    for source, raw in env_sources:
+        models_url = _local_openai_proxy_models_url(str(raw or "").strip())
+        if models_url:
+            return HonchoProxyRoute(models_url=models_url, source=f"env {source}")
+    return None
+
+
+def _configured_local_openai_proxy_url() -> str | None:
+    route = _configured_local_openai_proxy_route()
+    return route.models_url if route else None
+
+
+def _has_configured_local_openai_proxy_route() -> bool:
+    return _configured_local_openai_proxy_route() is not None
+
+
 def _probe_honcho_proxy_reachability() -> tuple[bool | None, str]:
-    url = _configured_local_openai_proxy_url()
-    if not url:
-        return None, "not probed (no local OPENAI_BASE_URL/HONCHO_OPENAI_BASE_URL)"
+    route = _configured_local_openai_proxy_route()
+    if not route:
+        return None, "not probed (no local model.base_url/OPENAI_BASE_URL/HONCHO_OPENAI_BASE_URL)"
+    url = route.models_url
     req = request.Request(url, headers={"Authorization": "Bearer healthcheck"}, method="GET")
     started = time.monotonic()
     try:
         with request.urlopen(req, timeout=2.0) as resp:  # noqa: S310 - only configured localhost URLs are probed
             elapsed_ms = int((time.monotonic() - started) * 1000)
             if 200 <= resp.status < 500:
-                return True, f"GET {urlparse(url).path} returned HTTP {resp.status} in {elapsed_ms}ms"
-            return False, f"GET {urlparse(url).path} returned HTTP {resp.status}"
+                return True, f"{route.source}: GET {urlparse(url).path} returned HTTP {resp.status} in {elapsed_ms}ms"
+            return False, f"{route.source}: GET {urlparse(url).path} returned HTTP {resp.status}"
     except error.HTTPError as exc:
         if 400 <= exc.code < 500:
-            return True, f"GET {urlparse(url).path} returned HTTP {exc.code} (proxy responded)"
-        return False, f"GET {urlparse(url).path} returned HTTP {exc.code}"
+            return True, f"{route.source}: GET {urlparse(url).path} returned HTTP {exc.code} (proxy responded)"
+        return False, f"{route.source}: GET {urlparse(url).path} returned HTTP {exc.code}"
     except Exception as exc:
-        return False, f"GET {urlparse(url).path} failed: {type(exc).__name__}"
+        return False, f"{route.source}: GET {urlparse(url).path} failed: {type(exc).__name__}"
 
 
 def collect_honcho_proxy_health_facts() -> HonchoProxyHealthFacts:
     warning_count, warning_source = _count_honcho_proxy_warnings()
     rss_mb, memory_source = _collect_honcho_proxy_memory()
+    route = _configured_local_openai_proxy_route()
     reachable, reachability_detail = _probe_honcho_proxy_reachability()
     return HonchoProxyHealthFacts(
         reachable=reachable,
         reachability_detail=reachability_detail,
+        route_source=route.source if route else "route unavailable",
         warning_count=warning_count,
         warning_source=warning_source,
         rss_mb=rss_mb,
@@ -2450,6 +2491,9 @@ def run_doctor(args):
                 check_warn(f"{_active_memory_provider} plugin not found", "run: hermes memory setup")
         except Exception as _e:
             check_warn(f"{_active_memory_provider} check failed", str(_e))
+
+    if _active_memory_provider != "honcho" and _has_configured_local_openai_proxy_route():
+        _check_honcho_openai_proxy_health(issues)
 
     try:
         from hermes_cli.profiles import list_profiles, _get_wrapper_dir, profile_exists
