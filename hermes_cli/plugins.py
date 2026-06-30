@@ -43,6 +43,7 @@ import sys
 import threading
 import types
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
 
@@ -306,6 +307,131 @@ class LoadedPlugin:
     commands_registered: List[str] = field(default_factory=list)
     enabled: bool = False
     error: Optional[str] = None
+
+
+@dataclass
+class PluginImportFailureHealth:
+    """Bounded health record for plugin import/register failures."""
+
+    plugin_name: str
+    lookup_key: str
+    enabled: bool
+    exception_class: str
+    first_seen: str
+    message: str
+
+
+_PLUGIN_IMPORT_FAILURES: Dict[str, PluginImportFailureHealth] = {}
+_DISABLED_OPTIONAL_PLATFORM_FAILURES_LOGGED: Set[str] = set()
+
+
+def get_plugin_import_failures() -> Dict[str, PluginImportFailureHealth]:
+    """Return classified plugin import/register failures for health views/tests."""
+    return dict(_PLUGIN_IMPORT_FAILURES)
+
+
+def _coerce_config_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _platform_name_from_manifest(manifest: PluginManifest) -> str:
+    key = manifest.key or manifest.name
+    if key.startswith("platforms/"):
+        return key.split("/", 1)[1]
+    if manifest.name.endswith("-platform"):
+        return manifest.name[: -len("-platform")]
+    return manifest.name
+
+
+def _required_env_names(manifest: PluginManifest) -> List[str]:
+    names: List[str] = []
+    for item in manifest.requires_env or []:
+        if isinstance(item, str):
+            names.append(item)
+        elif isinstance(item, dict):
+            name = item.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+    return names
+
+
+def _explicit_platform_enabled(platform_name: str) -> Optional[bool]:
+    """Read lightweight config hints without invoking gateway discovery."""
+    try:
+        from hermes_cli.config import read_raw_config
+        config = read_raw_config()
+    except Exception:
+        return None
+
+    candidates: List[Any] = []
+    top_level = config.get(platform_name)
+    if isinstance(top_level, dict):
+        candidates.append(top_level.get("enabled"))
+
+    platforms = config.get("platforms")
+    if isinstance(platforms, dict):
+        block = platforms.get(platform_name)
+        if isinstance(block, dict):
+            candidates.append(block.get("enabled"))
+
+    gateway = config.get("gateway")
+    gateway_platforms = gateway.get("platforms") if isinstance(gateway, dict) else None
+    if isinstance(gateway_platforms, dict):
+        block = gateway_platforms.get(platform_name)
+        if isinstance(block, dict):
+            candidates.append(block.get("enabled"))
+
+    for candidate in candidates:
+        coerced = _coerce_config_bool(candidate)
+        if coerced is not None:
+            return coerced
+    return None
+
+
+def _is_platform_plugin_enabled(manifest: PluginManifest) -> bool:
+    platform_name = _platform_name_from_manifest(manifest)
+    explicit = _explicit_platform_enabled(platform_name)
+    if explicit is not None:
+        return explicit
+
+    enabled_env = f"{platform_name.upper().replace('-', '_')}_ENABLED"
+    if env_var_enabled(enabled_env):
+        return True
+
+    return any(bool(os.getenv(name)) for name in _required_env_names(manifest))
+
+
+def _record_plugin_import_failure(
+    manifest: PluginManifest,
+    exc: Exception,
+    *,
+    enabled: bool,
+) -> PluginImportFailureHealth:
+    lookup_key = manifest.key or manifest.name
+    existing = _PLUGIN_IMPORT_FAILURES.get(lookup_key)
+    if existing is not None:
+        existing.enabled = enabled
+        existing.exception_class = exc.__class__.__name__
+        existing.message = str(exc)
+        return existing
+    health = PluginImportFailureHealth(
+        plugin_name=manifest.name,
+        lookup_key=lookup_key,
+        enabled=enabled,
+        exception_class=exc.__class__.__name__,
+        first_seen=datetime.now(timezone.utc).isoformat(),
+        message=str(exc),
+    )
+    _PLUGIN_IMPORT_FAILURES[lookup_key] = health
+    return health
 
 
 # ---------------------------------------------------------------------------
@@ -1642,10 +1768,53 @@ class PluginManager:
 
         except Exception as exc:
             loaded.error = str(exc)
-            logger.warning(
-                "Failed to load plugin '%s': %s",
-                manifest.name, exc, exc_info=_PLUGINS_DEBUG,
+            lookup_key = manifest.key or manifest.name
+            failure_enabled = True
+            if manifest.kind == "platform":
+                failure_enabled = _is_platform_plugin_enabled(manifest)
+            health = _record_plugin_import_failure(
+                manifest, exc, enabled=failure_enabled
             )
+            if manifest.kind == "platform" and not failure_enabled:
+                if lookup_key not in _DISABLED_OPTIONAL_PLATFORM_FAILURES_LOGGED:
+                    _DISABLED_OPTIONAL_PLATFORM_FAILURES_LOGGED.add(lookup_key)
+                    logger.info(
+                        "Disabled optional platform plugin '%s' failed to load; "
+                        "recording bounded health signal only "
+                        "(enabled=%s, error_class=%s, first_seen=%s). "
+                        "Enable the platform or install its optional dependencies "
+                        "to make this actionable.",
+                        lookup_key,
+                        health.enabled,
+                        health.exception_class,
+                        health.first_seen,
+                        exc_info=_PLUGINS_DEBUG,
+                    )
+                else:
+                    logger.debug(
+                        "Disabled optional platform plugin '%s' still fails to load "
+                        "(enabled=%s, error_class=%s, first_seen=%s): %s",
+                        lookup_key,
+                        health.enabled,
+                        health.exception_class,
+                        health.first_seen,
+                        exc,
+                        exc_info=_PLUGINS_DEBUG,
+                    )
+            else:
+                logger.warning(
+                    "Failed to load enabled plugin '%s' (key=%s, kind=%s, "
+                    "enabled=%s, error_class=%s, first_seen=%s): %s. "
+                    "Disable the plugin or install/fix its optional dependencies.",
+                    manifest.name,
+                    lookup_key,
+                    manifest.kind,
+                    health.enabled,
+                    health.exception_class,
+                    health.first_seen,
+                    exc,
+                    exc_info=_PLUGINS_DEBUG,
+                )
 
         self._plugins[manifest.key or manifest.name] = loaded
 

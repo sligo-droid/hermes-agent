@@ -13,8 +13,10 @@ from hermes_cli.plugins import (
     ENTRY_POINTS_GROUP,
     VALID_HOOKS,
     PluginContext,
+    PluginImportFailureHealth,
     PluginManager,
     PluginManifest,
+    get_plugin_import_failures,
     get_plugin_command_handler,
     get_plugin_commands,
     get_pre_tool_call_block_message,
@@ -85,6 +87,23 @@ def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
     return plugin_dir
 
 
+def _make_broken_platform_plugin(base: Path, name: str, *, missing_module: str) -> Path:
+    plugin_dir = base / "platforms" / name
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "name": f"{name}-platform",
+                "version": "0.1.0",
+                "kind": "platform",
+                "requires_env": [{"name": f"{name.upper()}_TOKEN"}],
+            }
+        )
+    )
+    (plugin_dir / "__init__.py").write_text(f"import {missing_module}\n")
+    return plugin_dir
+
+
 # ── TestPluginDiscovery ────────────────────────────────────────────────────
 
 
@@ -102,6 +121,94 @@ class TestPluginDiscovery:
 
         assert "hello_plugin" in mgr._plugins
         assert mgr._plugins["hello_plugin"].enabled
+
+    def test_disabled_optional_platform_import_failure_is_bounded(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Disabled bundled platform import failures do not warn repeatedly."""
+        import hermes_cli.plugins as plugins_mod
+
+        hermes_home = tmp_path / "hermes_home"
+        bundled_plugins = tmp_path / "bundled_plugins"
+        _make_broken_platform_plugin(
+            bundled_plugins,
+            "disabledbroken",
+            missing_module="definitely_missing_disabledbroken_sdk",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_bundled_plugins_dir",
+            lambda: bundled_plugins,
+        )
+        plugins_mod._PLUGIN_IMPORT_FAILURES.clear()
+        plugins_mod._DISABLED_OPTIONAL_PLATFORM_FAILURES_LOGGED.clear()
+
+        mgr = PluginManager()
+        with caplog.at_level(logging.INFO, logger="hermes_cli.plugins"):
+            mgr.discover_and_load(force=True)
+            mgr.discover_and_load(force=True)
+
+        health = get_plugin_import_failures()["disabledbroken-platform"]
+        assert isinstance(health, PluginImportFailureHealth)
+        assert health.plugin_name == "disabledbroken-platform"
+        assert health.enabled is False
+        assert health.exception_class == "ModuleNotFoundError"
+        assert health.first_seen
+        assert "definitely_missing_disabledbroken_sdk" in health.message
+        assert mgr._plugins["disabledbroken-platform"].enabled is False
+        assert mgr._plugins["disabledbroken-platform"].error
+
+        bounded_records = [
+            r for r in caplog.records
+            if "Disabled optional platform plugin 'disabledbroken-platform' failed to load"
+            in r.message
+        ]
+        assert len(bounded_records) == 1
+        assert not [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and "disabledbroken" in r.message
+        ]
+
+    def test_enabled_platform_import_failure_stays_visible(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Enabled broken platform plugins still emit actionable warnings."""
+        import hermes_cli.plugins as plugins_mod
+
+        hermes_home = tmp_path / "hermes_home"
+        bundled_plugins = tmp_path / "bundled_plugins"
+        _make_broken_platform_plugin(
+            bundled_plugins,
+            "enabledbroken",
+            missing_module="definitely_missing_enabledbroken_sdk",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("ENABLEDBROKEN_TOKEN", "configured")
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_bundled_plugins_dir",
+            lambda: bundled_plugins,
+        )
+        plugins_mod._PLUGIN_IMPORT_FAILURES.clear()
+        plugins_mod._DISABLED_OPTIONAL_PLATFORM_FAILURES_LOGGED.clear()
+
+        mgr = PluginManager()
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+            mgr.discover_and_load(force=True)
+
+        health = get_plugin_import_failures()["enabledbroken-platform"]
+        assert health.plugin_name == "enabledbroken-platform"
+        assert health.enabled is True
+        assert health.exception_class == "ModuleNotFoundError"
+        assert health.first_seen
+        assert "definitely_missing_enabledbroken_sdk" in health.message
+        assert mgr._plugins["enabledbroken-platform"].enabled is False
+        assert mgr._plugins["enabledbroken-platform"].error
+
+        warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("Failed to load enabled plugin 'enabledbroken-platform'" in m for m in warning_messages)
+        assert any("enabled=True" in m for m in warning_messages)
+        assert any("error_class=ModuleNotFoundError" in m for m in warning_messages)
+        assert any("Disable the plugin or install/fix its optional dependencies" in m for m in warning_messages)
 
     def test_plugin_can_register_and_invoke_middleware(self, tmp_path, monkeypatch):
         plugins_dir = tmp_path / "hermes_test" / "plugins"
