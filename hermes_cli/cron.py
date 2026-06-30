@@ -122,6 +122,19 @@ def cron_list(show_all: bool = False):
         if delivery_err:
             print(f"    {color('⚠ Delivery failed:', Colors.YELLOW)} {delivery_err}")
 
+        health_details = job.get("last_health_details") if isinstance(job.get("last_health_details"), dict) else {}
+        proposal_health = health_details.get("self_improvement_proposal_ingestion") if isinstance(health_details, dict) else None
+        if isinstance(proposal_health, dict):
+            status = proposal_health.get("status") or "unknown"
+            card_count = proposal_health.get("card_count", 0)
+            print(f"    {color('⚠ Proposal ingestion:', Colors.YELLOW)} {status} ({card_count} cards)")
+            parse_error = proposal_health.get("parse_error")
+            if parse_error:
+                print(f"    Parse error: {parse_error}")
+            output_path = proposal_health.get("cron_output_path")
+            if output_path:
+                print(f"    Proposal output: {output_path}")
+
         print()
 
     from hermes_cli.gateway import get_gateway_runtime_health

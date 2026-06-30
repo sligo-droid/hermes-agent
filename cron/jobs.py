@@ -1302,7 +1302,8 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 health_details: Optional[Dict[str, Any]] = None):
     """
     Mark a job as having been run.
     
@@ -1323,6 +1324,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["fire_claim"] = None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                job["last_health_details"] = copy.deepcopy(health_details) if health_details else None
                 
                 # Increment completed count
                 if job.get("repeat"):
