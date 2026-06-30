@@ -705,6 +705,12 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Gateway provider no-progress guard (seconds). Once useful progress
+        # has occurred in a gateway-hosted turn, provider retry/backoff loops
+        # that produce no new assistant/tool state beyond this window are
+        # downgraded to a coherent partial failure (or existing fallback if
+        # available). 0 disables.
+        "provider_no_progress_timeout": 900,
         "service_tier": "",
         # Optional replay budget for oversized tool outputs. Empty means
         # provider-aware defaults apply (Codex backends default to 10k tokens).

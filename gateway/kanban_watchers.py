@@ -409,6 +409,28 @@ class GatewayKanbanWatchersMixin:
                                         event_payload=getattr(ev, "payload", None),
                                         task=task,
                                     )
+                                    try:
+                                        from agent.provider_progress import record_provider_progress_signal
+                                        from gateway.platforms.base import SessionSource
+                                        from gateway.session import build_session_key
+
+                                        gateway_session_key = build_session_key(
+                                            SessionSource(
+                                                platform=plat,
+                                                chat_id=str(sub.get("chat_id") or ""),
+                                                chat_type="thread" if sub.get("thread_id") else "channel",
+                                                thread_id=str(sub.get("thread_id") or "") or None,
+                                            )
+                                        )
+                                        record_provider_progress_signal(
+                                            gateway_session_key,
+                                            "committed_worker_artifacts",
+                                            phase="worker_artifact_delivery",
+                                            source="kanban_notifier",
+                                            metadata={"task_id": str(sub.get("task_id") or "")},
+                                        )
+                                    except Exception:
+                                        pass
                                 except Exception as art_exc:
                                     logger.debug(
                                         "kanban notifier: artifact delivery for %s failed: %s",

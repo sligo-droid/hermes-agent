@@ -777,6 +777,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
         agent._current_tool = None
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s)")
+        if not blocked and not is_error:
+            try:
+                agent._provider_no_progress_mark_progress(
+                    "successful_tool_call", phase="tool_execution"
+                )
+            except Exception:
+                pass
 
         if not blocked and agent.tool_complete_callback:
             try:
@@ -1314,6 +1321,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         agent._current_tool = None
         agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")
+        if not _execution_blocked and not _is_error_result:
+            try:
+                agent._provider_no_progress_mark_progress(
+                    "successful_tool_call", phase="tool_execution"
+                )
+            except Exception:
+                pass
 
         if agent.verbose_logging:
             logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
