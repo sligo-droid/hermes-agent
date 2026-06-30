@@ -80,6 +80,7 @@ from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS
+from agent.skill_utils import is_excluded_skill_path as _is_excluded_skill_path
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,42 @@ _INJECTION_PATTERNS: list = [
     "<system>",
     "]]>",
 ]
+_EMITTED_SKILL_SECURITY_WARNINGS: Set[Tuple[str, Path]] = set()
+
+
+def _resolve_path_for_security(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path.absolute()
+
+
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _trusted_skill_roots(search_dirs: List[Path]) -> List[Path]:
+    roots: List[Path] = []
+    seen: Set[Path] = set()
+    for root in [SKILLS_DIR, get_hermes_home() / "skills", *search_dirs[1:]]:
+        resolved = _resolve_path_for_security(root)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        roots.append(resolved)
+    return roots
+
+
+def _record_skill_security_warning(reason: str, skill_md: Path) -> bool:
+    key = (reason, _resolve_path_for_security(skill_md))
+    if key in _EMITTED_SKILL_SECURITY_WARNINGS:
+        return False
+    _EMITTED_SKILL_SECURITY_WARNINGS.add(key)
+    return True
 
 
 def set_secret_capture_callback(callback) -> None:
@@ -934,6 +971,8 @@ def skill_view(
         seen_md: set = set()
 
         def _record(sd: Optional[Path], smd: Path) -> None:
+            if _is_excluded_skill_path(smd):
+                return
             try:
                 key = smd.resolve()
             except Exception:
@@ -967,6 +1006,14 @@ def skill_view(
                 # like "foundations/runtime/explore-codebase" called by bare name).
                 for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
                     if found_skill_md.parent.name == name:
+                        _record(found_skill_md.parent, found_skill_md)
+                        continue
+                    try:
+                        found_content = found_skill_md.read_text(encoding="utf-8")[:4000]
+                        found_frontmatter, _ = _parse_frontmatter(found_content)
+                    except Exception:
+                        continue
+                    if found_frontmatter.get("name") == name:
                         _record(found_skill_md.parent, found_skill_md)
 
                 # Strategy 3: legacy flat <name>.md files anywhere under the dir.
@@ -1032,33 +1079,34 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        # Security: warn if skill is loaded from outside trusted directories
-        # (local skills dir + configured external_dirs are all trusted)
-        _outside_skills_dir = True
-        _trusted_dirs = [SKILLS_DIR.resolve()]
-        try:
-            _trusted_dirs.extend(d.resolve() for d in all_dirs[1:])
-        except Exception:
-            pass
-        for _td in _trusted_dirs:
-            try:
-                skill_md.resolve().relative_to(_td)
-                _outside_skills_dir = False
-                break
-            except ValueError:
-                continue
+        # Security: warn if skill is loaded from outside trusted directories.
+        # Compare resolved paths, while keeping display paths user-facing below.
+        _resolved_skill_md = _resolve_path_for_security(skill_md)
+        _trusted_dirs = _trusted_skill_roots(all_dirs)
+        _outside_skills_dir = not any(
+            _path_is_relative_to(_resolved_skill_md, _td) for _td in _trusted_dirs
+        )
 
         # Security: detect common prompt injection patterns
         # (pattern list at module level as _INJECTION_PATTERNS)
         _content_lower = content.lower()
         _injection_detected = any(p in _content_lower for p in _INJECTION_PATTERNS)
 
-        if _outside_skills_dir or _injection_detected:
-            _warnings = []
-            if _outside_skills_dir:
-                _warnings.append(f"skill file is outside the trusted skills directory (~/.hermes/skills/): {skill_md}")
-            if _injection_detected:
+        _warnings = []
+        if _outside_skills_dir:
+            _trusted_display = ", ".join(str(root) for root in _trusted_dirs)
+            _reason = "outside_trusted_skill_roots"
+            if _record_skill_security_warning(_reason, skill_md):
+                _warnings.append(
+                    "skill file is outside the trusted skills directories "
+                    f"({display_hermes_home()}/skills, configured external/inherited roots; "
+                    f"resolved roots: {_trusted_display}): {skill_md}"
+                )
+        if _injection_detected:
+            _reason = "prompt_injection_pattern"
+            if _record_skill_security_warning(_reason, skill_md):
                 _warnings.append("skill content contains patterns that may indicate prompt injection")
+        if _warnings:
             logging.getLogger(__name__).warning("Skill security warning for '%s': %s", name, "; ".join(_warnings))
 
         parsed_frontmatter: Dict[str, Any] = {}
