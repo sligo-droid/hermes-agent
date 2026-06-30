@@ -1708,6 +1708,13 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             choices=function_args.get("choices"),
             callback=agent.clarify_callback,
         ))
+    elif function_name == "read_terminal":
+        from tools.read_terminal_tool import read_terminal_tool as _read_terminal_tool
+        return _finish(_read_terminal_tool(
+            start_line=function_args.get("start_line"),
+            count=function_args.get("count"),
+            callback=getattr(agent, "read_terminal_callback", None),
+        ))
     elif function_name == "delegate_task":
         return _finish(agent._dispatch_delegate_task(function_args))
     elif function_name == "delegate_coding_task":

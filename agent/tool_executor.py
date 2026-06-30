@@ -1071,6 +1071,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
+        elif function_name == "read_terminal":
+            from tools.read_terminal_tool import read_terminal_tool as _read_terminal_tool
+            function_result = _read_terminal_tool(
+                start_line=function_args.get("start_line"),
+                count=function_args.get("count"),
+                callback=getattr(agent, "read_terminal_callback", None),
+            )
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=function_result)}")
         elif function_name == "delegate_task":
             tasks_arg = function_args.get("tasks")
             if tasks_arg and isinstance(tasks_arg, list):
