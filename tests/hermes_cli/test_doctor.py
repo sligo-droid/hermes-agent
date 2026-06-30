@@ -257,6 +257,113 @@ class TestHonchoDoctorConfigDetection:
         assert not doctor._honcho_is_configured_for_doctor()
 
 
+class TestHonchoOpenAIProxyHealth:
+    def test_classifies_reachable_quiet_proxy_as_healthy(self):
+        result = doctor.classify_honcho_proxy_health(
+            doctor.HonchoProxyHealthFacts(
+                service="honcho-proxy.service",
+                reachable=True,
+                reachability_detail="GET /v1/models returned HTTP 200",
+                warning_count=0,
+                warning_source="journalctl user unit honcho-proxy.service",
+                rss_mb=768.0,
+                memory_source="systemd user unit honcho-proxy.service",
+            )
+        )
+
+        assert result.status == "healthy"
+        assert "reachable and quiet" in result.summary
+        assert result.warning_breached is False
+        assert result.memory_breached is False
+
+    def test_classifies_high_warning_reachable_proxy_as_warning(self):
+        result = doctor.classify_honcho_proxy_health(
+            doctor.HonchoProxyHealthFacts(
+                service="honcho-proxy.service",
+                reachable=True,
+                reachability_detail="GET /v1/models returned HTTP 200",
+                warning_count=40,
+                warning_window_minutes=10,
+                warning_source="journalctl user unit honcho-proxy.service",
+                rss_mb=768.0,
+                memory_source="systemd user unit honcho-proxy.service",
+            )
+        )
+
+        assert result.status == "warning"
+        assert result.warning_breached is True
+        assert result.reachability_failed is False
+        joined = "\n".join(result.lines)
+        assert "PydanticSerializationUnexpectedValue: 40 in 10m" in joined
+        assert "4.00/min" in joined
+        assert "inspect recent proxy logs" in joined
+
+    def test_classifies_high_memory_reachable_proxy_as_warning(self):
+        result = doctor.classify_honcho_proxy_health(
+            doctor.HonchoProxyHealthFacts(
+                service="honcho-proxy.service",
+                reachable=True,
+                reachability_detail="GET /v1/models returned HTTP 200",
+                warning_count=0,
+                warning_source="journalctl user unit honcho-proxy.service",
+                rss_mb=2048.0,
+                memory_source="docker stats honcho-proxy",
+            )
+        )
+
+        assert result.status == "warning"
+        assert result.memory_breached is True
+        joined = "\n".join(result.lines)
+        assert "rss=2048.0 MiB" in joined
+        assert "threshold=1536.0 MiB" in joined
+        assert "safe service restart" in joined
+
+    def test_classifies_unreachable_proxy_as_fail_even_with_quiet_logs(self):
+        result = doctor.classify_honcho_proxy_health(
+            doctor.HonchoProxyHealthFacts(
+                service="honcho-proxy.service",
+                reachable=False,
+                reachability_detail="GET /v1/models failed: URLError",
+                warning_count=0,
+                warning_source="journalctl user unit honcho-proxy.service",
+                rss_mb=768.0,
+                memory_source="systemd user unit honcho-proxy.service",
+            )
+        )
+
+        assert result.status == "fail"
+        assert result.reachability_failed is True
+        assert "unreachable/degraded" in result.summary
+
+    def test_doctor_proxy_health_output_summarizes_without_payloads(self, monkeypatch, capsys):
+        secret_payload = "user prompt token=secret api_key=sk-test"
+        monkeypatch.setattr(
+            doctor,
+            "collect_honcho_proxy_health_facts",
+            lambda: doctor.HonchoProxyHealthFacts(
+                service="honcho-proxy.service",
+                reachable=True,
+                reachability_detail="GET /v1/models returned HTTP 200",
+                warning_count=30,
+                warning_source=f"journalctl user unit honcho-proxy.service {secret_payload}",
+                rss_mb=512.0,
+                memory_source="systemd user unit honcho-proxy.service",
+            ),
+        )
+
+        issues = []
+        doctor._check_honcho_openai_proxy_health(issues)
+
+        output = capsys.readouterr().out
+        assert "Honcho/OpenAI proxy health" in output
+        assert "PydanticSerializationUnexpectedValue: 30" in output
+        assert "honcho-proxy.service" in output
+        assert "user prompt" not in output
+        assert "secret" not in output
+        assert "sk-test" not in output
+        assert issues == []
+
+
 def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):
     """Doctor should present CLI-gated tools as available in CLI context."""
     project_root = tmp_path / "project"

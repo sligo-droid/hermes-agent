@@ -8,7 +8,12 @@ import os
 import sys
 import subprocess
 import shutil
+import re
+import time
+from dataclasses import dataclass
 from pathlib import Path
+from urllib import error, request
+from urllib.parse import urlparse, urlunparse
 
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -52,6 +57,53 @@ _PROVIDER_ENV_HINTS = (
     "XIAOMI_API_KEY",
     "TOKENHUB_API_KEY",
 )
+
+_HONCHO_PROXY_WARNING_CLASS = "PydanticSerializationUnexpectedValue"
+_HONCHO_PROXY_WARNING_WINDOW_MINUTES = 15
+_HONCHO_PROXY_WARNING_COUNT_THRESHOLD = 25
+_HONCHO_PROXY_WARNING_RATE_THRESHOLD_PER_MINUTE = 2.0
+# Local Honcho/OpenAI proxy workers have been observed with warm 1GB-class RSS;
+# keep the default high enough to avoid flagging normal caches.
+_HONCHO_PROXY_RSS_WARNING_MB = 1536.0
+_HONCHO_PROXY_GROWTH_WARNING_MB = 512.0
+_HONCHO_PROXY_COMMAND_TIMEOUT_SECONDS = 2.0
+_HONCHO_PROXY_CANDIDATE_UNITS = (
+    "hermes-honcho-proxy.service",
+    "honcho-openai-proxy.service",
+    "honcho-proxy.service",
+)
+_HONCHO_PROXY_CANDIDATE_CONTAINERS = (
+    "hermes-honcho-proxy",
+    "honcho-openai-proxy",
+    "honcho-proxy",
+)
+
+
+@dataclass(frozen=True)
+class HonchoProxyHealthFacts:
+    service: str = "honcho/openai proxy"
+    reachable: bool | None = None
+    reachability_detail: str = "not probed"
+    warning_count: int | None = None
+    warning_window_minutes: int = _HONCHO_PROXY_WARNING_WINDOW_MINUTES
+    warning_source: str = "logs unavailable"
+    rss_mb: float | None = None
+    rss_growth_mb: float | None = None
+    memory_source: str = "memory telemetry unavailable"
+    warning_count_threshold: int = _HONCHO_PROXY_WARNING_COUNT_THRESHOLD
+    warning_rate_threshold_per_minute: float = _HONCHO_PROXY_WARNING_RATE_THRESHOLD_PER_MINUTE
+    rss_warning_mb: float = _HONCHO_PROXY_RSS_WARNING_MB
+    rss_growth_warning_mb: float = _HONCHO_PROXY_GROWTH_WARNING_MB
+
+
+@dataclass(frozen=True)
+class HonchoProxyHealthResult:
+    status: str
+    summary: str
+    lines: tuple[str, ...]
+    warning_breached: bool = False
+    memory_breached: bool = False
+    reachability_failed: bool = False
 
 
 from hermes_constants import is_termux as _is_termux
@@ -100,6 +152,272 @@ def _termux_install_all_fallback_notes() -> list[str]:
 def _has_provider_env_config(content: str) -> bool:
     """Return True when ~/.hermes/.env contains provider auth/base URL settings."""
     return any(key in content for key in _PROVIDER_ENV_HINTS)
+
+
+def _honcho_proxy_warning_rate(facts: HonchoProxyHealthFacts) -> float | None:
+    if facts.warning_count is None or facts.warning_window_minutes <= 0:
+        return None
+    return facts.warning_count / facts.warning_window_minutes
+
+
+def _honcho_proxy_source_label(source: str) -> str:
+    """Keep doctor evidence to collector labels, never raw log payloads."""
+    words = source.split()
+    if words[:3] == ["journalctl", "user", "unit"] and len(words) >= 4:
+        return " ".join(words[:4])
+    if words[:3] == ["systemd", "user", "unit"] and len(words) >= 4:
+        return " ".join(words[:4])
+    if words[:2] in (["docker", "logs"], ["docker", "stats"]) and len(words) >= 3:
+        return " ".join(words[:3])
+    return source if len(source) <= 80 else source[:77] + "..."
+
+
+def classify_honcho_proxy_health(facts: HonchoProxyHealthFacts) -> HonchoProxyHealthResult:
+    """Classify bounded Honcho/OpenAI proxy facts without collecting live state."""
+    rate = _honcho_proxy_warning_rate(facts)
+    warning_breached = facts.warning_count is not None and (
+        facts.warning_count >= facts.warning_count_threshold
+        or (rate is not None and rate >= facts.warning_rate_threshold_per_minute)
+    )
+    memory_breached = (
+        (facts.rss_mb is not None and facts.rss_mb >= facts.rss_warning_mb)
+        or (facts.rss_growth_mb is not None and facts.rss_growth_mb >= facts.rss_growth_warning_mb)
+    )
+    reachability_failed = facts.reachable is False
+
+    lines: list[str] = []
+    if facts.warning_count is None:
+        lines.append(f"{_HONCHO_PROXY_WARNING_CLASS}: unavailable ({_honcho_proxy_source_label(facts.warning_source)})")
+    else:
+        rate_text = f", {rate:.2f}/min" if rate is not None else ""
+        lines.append(
+            f"{_HONCHO_PROXY_WARNING_CLASS}: {facts.warning_count} in "
+            f"{facts.warning_window_minutes}m{rate_text}; threshold "
+            f">={facts.warning_count_threshold} or >={facts.warning_rate_threshold_per_minute:.2f}/min "
+            f"({_honcho_proxy_source_label(facts.warning_source)})"
+        )
+
+    if facts.rss_mb is None and facts.rss_growth_mb is None:
+        lines.append(f"memory: unavailable ({_honcho_proxy_source_label(facts.memory_source)})")
+    else:
+        mem_parts = []
+        if facts.rss_mb is not None:
+            mem_parts.append(f"rss={facts.rss_mb:.1f} MiB threshold={facts.rss_warning_mb:.1f} MiB")
+        if facts.rss_growth_mb is not None:
+            mem_parts.append(f"growth={facts.rss_growth_mb:.1f} MiB threshold={facts.rss_growth_warning_mb:.1f} MiB")
+        lines.append(f"memory: {'; '.join(mem_parts)} ({_honcho_proxy_source_label(facts.memory_source)})")
+
+    lines.append(f"reachability: {facts.reachability_detail}")
+
+    if reachability_failed:
+        status = "fail"
+        summary = f"{facts.service} unreachable/degraded"
+    elif warning_breached or memory_breached:
+        status = "warning"
+        summary = f"{facts.service} reachable with health threshold breach"
+    elif facts.reachable is True:
+        status = "healthy"
+        summary = f"{facts.service} reachable and quiet"
+    else:
+        status = "info"
+        summary = f"{facts.service} health telemetry unavailable"
+
+    if warning_breached:
+        lines.append("next: inspect recent proxy logs for serialization warnings; verify the configured model route")
+    if memory_breached:
+        lines.append("next: inspect proxy memory ownership/growth before considering a safe service restart")
+    if reachability_failed:
+        lines.append("next: verify the local proxy unit/container and configured model route before changing providers")
+
+    return HonchoProxyHealthResult(
+        status=status,
+        summary=summary,
+        lines=tuple(lines),
+        warning_breached=warning_breached,
+        memory_breached=memory_breached,
+        reachability_failed=reachability_failed,
+    )
+
+
+def _run_honcho_proxy_probe_command(args: list[str], timeout: float = _HONCHO_PROXY_COMMAND_TIMEOUT_SECONDS) -> subprocess.CompletedProcess[str] | None:
+    exe = _safe_which(args[0])
+    if not exe:
+        return None
+    try:
+        return subprocess.run(  # noqa: S603 - fixed argv from bounded collectors
+            [exe, *args[1:]],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except Exception:
+        return None
+
+
+def _count_honcho_proxy_warnings() -> tuple[int | None, str]:
+    for unit in _HONCHO_PROXY_CANDIDATE_UNITS:
+        proc = _run_honcho_proxy_probe_command(
+            [
+                "journalctl",
+                "--user",
+                "--unit",
+                unit,
+                "--since",
+                f"-{_HONCHO_PROXY_WARNING_WINDOW_MINUTES} minutes",
+                "--lines",
+                "500",
+                "--no-pager",
+                "--output",
+                "cat",
+            ],
+            timeout=3.0,
+        )
+        if proc and proc.returncode == 0 and proc.stdout:
+            return proc.stdout.count(_HONCHO_PROXY_WARNING_CLASS), f"journalctl user unit {unit}"
+
+    for container in _HONCHO_PROXY_CANDIDATE_CONTAINERS:
+        proc = _run_honcho_proxy_probe_command(
+            [
+                "docker",
+                "logs",
+                "--since",
+                f"{_HONCHO_PROXY_WARNING_WINDOW_MINUTES}m",
+                "--tail",
+                "500",
+                container,
+            ],
+            timeout=3.0,
+        )
+        if proc and proc.returncode == 0:
+            text = f"{proc.stdout}\n{proc.stderr}"
+            return text.count(_HONCHO_PROXY_WARNING_CLASS), f"docker logs {container}"
+    return None, "no readable candidate journal or docker logs"
+
+
+def _parse_memory_bytes(value: str) -> float | None:
+    value = value.strip()
+    if not value or value in {"[not set]", "n/a"}:
+        return None
+    try:
+        return float(value) / (1024 * 1024)
+    except ValueError:
+        return None
+
+
+def _parse_docker_memory_mb(value: str) -> float | None:
+    current = value.split("/", 1)[0].strip()
+    match = re.match(r"^([0-9.]+)\s*([KMGT]?i?B)$", current, re.IGNORECASE)
+    if not match:
+        return None
+    amount = float(match.group(1))
+    unit = match.group(2).lower()
+    multipliers = {
+        "b": 1 / (1024 * 1024),
+        "kb": 1 / 1024,
+        "kib": 1 / 1024,
+        "mb": 1,
+        "mib": 1,
+        "gb": 1024,
+        "gib": 1024,
+        "tb": 1024 * 1024,
+        "tib": 1024 * 1024,
+    }
+    return amount * multipliers.get(unit, 1)
+
+
+def _collect_honcho_proxy_memory() -> tuple[float | None, str]:
+    for unit in _HONCHO_PROXY_CANDIDATE_UNITS:
+        proc = _run_honcho_proxy_probe_command(
+            ["systemctl", "--user", "show", unit, "--property", "MemoryCurrent", "--value"],
+            timeout=2.0,
+        )
+        if proc and proc.returncode == 0:
+            rss_mb = _parse_memory_bytes(proc.stdout)
+            if rss_mb is not None:
+                return rss_mb, f"systemd user unit {unit}"
+
+    for container in _HONCHO_PROXY_CANDIDATE_CONTAINERS:
+        proc = _run_honcho_proxy_probe_command(
+            ["docker", "stats", "--no-stream", "--format", "{{.MemUsage}}", container],
+            timeout=3.0,
+        )
+        if proc and proc.returncode == 0 and proc.stdout.strip():
+            rss_mb = _parse_docker_memory_mb(proc.stdout.strip())
+            if rss_mb is not None:
+                return rss_mb, f"docker stats {container}"
+    return None, "no readable candidate systemd unit or docker container"
+
+
+def _configured_local_openai_proxy_url() -> str | None:
+    raw = os.environ.get("OPENAI_BASE_URL") or os.environ.get("HONCHO_OPENAI_BASE_URL")
+    if not raw:
+        return None
+    parsed = urlparse(raw)
+    if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        return None
+    path = parsed.path.rstrip("/")
+    if path.endswith("/v1"):
+        path = f"{path}/models"
+    elif not path.endswith("/models"):
+        path = f"{path}/v1/models"
+    return urlunparse(parsed._replace(path=path or "/v1/models", query="", fragment=""))
+
+
+def _probe_honcho_proxy_reachability() -> tuple[bool | None, str]:
+    url = _configured_local_openai_proxy_url()
+    if not url:
+        return None, "not probed (no local OPENAI_BASE_URL/HONCHO_OPENAI_BASE_URL)"
+    req = request.Request(url, headers={"Authorization": "Bearer healthcheck"}, method="GET")
+    started = time.monotonic()
+    try:
+        with request.urlopen(req, timeout=2.0) as resp:  # noqa: S310 - only configured localhost URLs are probed
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            if 200 <= resp.status < 500:
+                return True, f"GET {urlparse(url).path} returned HTTP {resp.status} in {elapsed_ms}ms"
+            return False, f"GET {urlparse(url).path} returned HTTP {resp.status}"
+    except error.HTTPError as exc:
+        if 400 <= exc.code < 500:
+            return True, f"GET {urlparse(url).path} returned HTTP {exc.code} (proxy responded)"
+        return False, f"GET {urlparse(url).path} returned HTTP {exc.code}"
+    except Exception as exc:
+        return False, f"GET {urlparse(url).path} failed: {type(exc).__name__}"
+
+
+def collect_honcho_proxy_health_facts() -> HonchoProxyHealthFacts:
+    warning_count, warning_source = _count_honcho_proxy_warnings()
+    rss_mb, memory_source = _collect_honcho_proxy_memory()
+    reachable, reachability_detail = _probe_honcho_proxy_reachability()
+    return HonchoProxyHealthFacts(
+        reachable=reachable,
+        reachability_detail=reachability_detail,
+        warning_count=warning_count,
+        warning_source=warning_source,
+        rss_mb=rss_mb,
+        memory_source=memory_source,
+    )
+
+
+def _check_honcho_openai_proxy_health(issues: list[str]) -> HonchoProxyHealthResult | None:
+    try:
+        facts = collect_honcho_proxy_health_facts()
+        result = classify_honcho_proxy_health(facts)
+    except Exception as exc:
+        check_warn("Honcho/OpenAI proxy health", f"could not collect bounded telemetry: {exc}")
+        return None
+
+    if result.status == "healthy":
+        check_ok("Honcho/OpenAI proxy health", result.summary)
+    elif result.status == "warning":
+        check_warn("Honcho/OpenAI proxy health", result.summary)
+    elif result.status == "fail":
+        check_fail("Honcho/OpenAI proxy health", result.summary)
+        issues.append("Honcho/OpenAI proxy unreachable; verify local proxy unit/container and model route")
+    else:
+        check_info(f"Honcho/OpenAI proxy health: {result.summary}")
+    for line in result.lines:
+        check_info(line)
+    return result
 
 
 def _honcho_is_configured_for_doctor() -> bool:
@@ -2085,6 +2403,7 @@ def run_doctor(args):
                             )
                     else:
                         _fail_and_issue("Honcho connection failed", str(_e), f"Honcho unreachable: {_e}", issues)
+                _check_honcho_openai_proxy_health(issues)
         except ImportError:
             _fail_and_issue(
                 "honcho-ai not installed",
