@@ -653,6 +653,49 @@ def test_later_successful_production_browser_check_allows_verified_claim(tmp_pat
     assert stored["completion_gate"]["allowed_to_complete"] is True
 
 
+def test_allowed_reclassification_resets_stale_blocked_summary_status(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _repo_discord_event(text="Ship the UI")
+    item = ledger.accept_event(
+        event,
+        session_key=build_session_key(event.source),
+        freshness_seconds=60,
+    )
+    assert item is not None
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="Not done yet: uncommitted changes remain in the working tree.",
+        summary_status="Complete",
+    )
+    blocked = ledger.get(item["id"])
+    assert blocked is not None
+    assert blocked["summary_status"] == "Blocked"
+
+    ledger.mark_agent_done(
+        item["id"],
+        final_response="Done. PR CI passed and main CI passed.",
+        summary_status="Blocked",
+        runtime_breakdown={
+            "verification_evidence": [
+                {
+                    "surface": "ci",
+                    "check_name": "node <<'NODE'\nconst { chromium } = require('@playwright/test');",
+                    "status": "failure",
+                    "order": 50,
+                    "detail": "{\"ok\": false}",
+                }
+            ]
+        },
+    )
+
+    stored = ledger.get(item["id"])
+    assert stored is not None
+    assert stored["summary_status"] == "Complete"
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert stored["completion_gate"]["summary_status"] == "Complete"
+
+
 def test_verification_gate_keeps_independent_ci_claim_separate(tmp_path):
     ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
     event = _repo_discord_event(text="Ship the production modal")
