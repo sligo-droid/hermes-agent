@@ -151,6 +151,46 @@ def test_ingest_malformed_run_persists_parse_failure(tmp_path, monkeypatch):
     assert failures["failures"][0]["source_ref"]["cron_output_path"] == "/tmp/out.md"
 
 
+def test_ingest_invalid_json_stays_malformed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+
+    result = proposal_storage.ingest_proposal_output(
+        "Human summary before JSON.\n```json\n{\"contract_version\":\n```",
+        source={"run_id": "run-bad-json", "cron_output_path": "/tmp/out.md"},
+    )
+
+    assert result["status"] == "malformed"
+    assert "proposal JSON parse error" in result["parse_error"]
+    assert result["card_count"] == 0
+
+
+def test_ingest_overlong_card_body_persists_field_diagnostics(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    payload = _valid_payload()
+    payload["run"].pop("cron_output_path", None)
+    payload["cards"][0]["proposal_id"] = "pid-airflow-overlong-ingest"
+    payload["cards"][0]["body"] = "x" * 6001
+
+    result = proposal_storage.ingest_proposal_output(
+        "Human summary before JSON.\n```json\n" + json.dumps(payload) + "\n```",
+        source={"run_id": "run-overlong", "cron_output_path": "/tmp/out.md"},
+    )
+    run = proposal_storage.get_run(result["run_id"])
+
+    assert run is not None
+    assert result["status"] == "malformed"
+    assert run["status"] == "malformed"
+    assert result["card_count"] == 0
+    assert run["cards"] == []
+    assert run["source_ref"]["cron_output_path"] == "/tmp/out.md"
+    assert run["cron_output_path"] == "/tmp/out.md"
+    assert "cards[0].body must be at most 6000 characters" in result["parse_error"]
+    assert "observed 6001" in result["parse_error"]
+    assert "card title: Add backoff logging to PID scraper timeout retries" in result["parse_error"]
+    assert "proposal_id: pid-airflow-overlong-ingest" in result["parse_error"]
+    assert "output: /tmp/out.md" in result["parse_error"]
+
+
 def test_ingest_run_with_audit_metadata_uses_trusted_source_run_metadata(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     payload = _valid_payload()

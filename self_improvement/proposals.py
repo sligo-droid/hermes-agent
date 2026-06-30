@@ -44,19 +44,69 @@ def _require_list(value: Any, path: str) -> list[Any]:
     return value
 
 
-def _require_text(value: Any, path: str, *, max_len: int | None = None) -> str:
+def _compact_diag_text(value: Any, limit: int = 120) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.strip().split())
+    if not text:
+        return None
+    if len(text) > limit:
+        text = text[: max(0, limit - 3)].rstrip() + "..."
+    return text
+
+
+def _length_error(path: str, max_len: int, observed: int, context: dict[str, Any] | None) -> str:
+    parts = [f"observed {observed}"]
+    context = context or {}
+    title = _compact_diag_text(context.get("card_title"))
+    if title:
+        parts.append(f"card title: {title}")
+    proposal_id = _compact_diag_text(context.get("proposal_id"))
+    idempotency_key = _compact_diag_text(context.get("idempotency_key"))
+    if proposal_id:
+        parts.append(f"proposal_id: {proposal_id}")
+    elif idempotency_key:
+        parts.append(f"idempotency_key: {idempotency_key}")
+    output = _compact_diag_text(context.get("cron_output_path"), limit=500)
+    if output:
+        parts.append(f"output: {output}")
+    return f"{path} must be at most {max_len} characters ({'; '.join(parts)})"
+
+
+def _card_validation_context(card: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "card_title": card.get("title"),
+        "proposal_id": card.get("proposal_id"),
+        "idempotency_key": card.get("idempotency_key"),
+        "cron_output_path": run.get("cron_output_path"),
+    }
+
+
+def _require_text(
+    value: Any,
+    path: str,
+    *,
+    max_len: int | None = None,
+    context: dict[str, Any] | None = None,
+) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ProposalValidationError(f"{path} must be a non-empty string")
     text = value.strip()
     if max_len is not None and len(text) > max_len:
-        raise ProposalValidationError(f"{path} must be at most {max_len} characters")
+        raise ProposalValidationError(_length_error(path, max_len, len(text), context))
     return text
 
 
-def _optional_text(value: Any, path: str, *, max_len: int | None = None) -> str | None:
+def _optional_text(
+    value: Any,
+    path: str,
+    *,
+    max_len: int | None = None,
+    context: dict[str, Any] | None = None,
+) -> str | None:
     if value is None:
         return None
-    return _require_text(value, path, max_len=max_len)
+    return _require_text(value, path, max_len=max_len, context=context)
 
 
 def _require_slug(value: Any, path: str) -> str:
@@ -142,9 +192,9 @@ def derive_proposal_id(card: dict[str, Any], run: dict[str, Any], project: str, 
     return f"{project}-{prong}-{digest}"
 
 
-def _validate_source_excerpt(value: Any, path: str) -> dict[str, Any]:
+def _validate_source_excerpt(value: Any, path: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
     item = _require_dict(value, path)
-    excerpt = {"text": _require_text(item.get("text"), f"{path}.text", max_len=2000)}
+    excerpt = {"text": _require_text(item.get("text"), f"{path}.text", max_len=2000, context=context)}
     for key in ("label", "url", "cron_output_path", "line_start", "line_end"):
         if key not in item or item[key] is None:
             continue
@@ -153,7 +203,7 @@ def _validate_source_excerpt(value: Any, path: str) -> dict[str, Any]:
                 raise ProposalValidationError(f"{path}.{key} must be a positive integer")
             excerpt[key] = item[key]
         else:
-            excerpt[key] = _require_text(item[key], f"{path}.{key}", max_len=500)
+            excerpt[key] = _require_text(item[key], f"{path}.{key}", max_len=500, context=context)
     return excerpt
 
 
@@ -204,11 +254,12 @@ def _validate_evidence_basis(
 
 def _validate_card(value: Any, path: str, run: dict[str, Any], project: str, prong: str) -> dict[str, Any]:
     card = _require_dict(value, path)
+    context = _card_validation_context(card, run)
     normalized: dict[str, Any] = {
-        "title": _require_text(card.get("title"), f"{path}.title", max_len=140),
-        "summary": _require_text(card.get("summary"), f"{path}.summary", max_len=500),
-        "body": _require_text(card.get("body"), f"{path}.body", max_len=6000),
-        "rationale": _require_text(card.get("rationale"), f"{path}.rationale", max_len=2000),
+        "title": _require_text(card.get("title"), f"{path}.title", max_len=140, context=context),
+        "summary": _require_text(card.get("summary"), f"{path}.summary", max_len=500, context=context),
+        "body": _require_text(card.get("body"), f"{path}.body", max_len=6000, context=context),
+        "rationale": _require_text(card.get("rationale"), f"{path}.rationale", max_len=2000, context=context),
         "status": _require_text(card.get("status", "proposed"), f"{path}.status"),
         "created_at": _require_datetime(card.get("created_at"), f"{path}.created_at"),
     }
@@ -226,14 +277,14 @@ def _validate_card(value: Any, path: str, run: dict[str, Any], project: str, pro
             raise ProposalValidationError(f"{path}.severity must be one of {sorted(_SEVERITY_VALUES)}")
         normalized["severity"] = severity
 
-    idempotency_key = _optional_text(card.get("idempotency_key"), f"{path}.idempotency_key", max_len=200)
+    idempotency_key = _optional_text(card.get("idempotency_key"), f"{path}.idempotency_key", max_len=200, context=context)
     if idempotency_key is not None:
         normalized["idempotency_key"] = idempotency_key
 
-    proposal_id = _optional_text(card.get("proposal_id"), f"{path}.proposal_id", max_len=120)
+    proposal_id = _optional_text(card.get("proposal_id"), f"{path}.proposal_id", max_len=120, context=context)
     normalized["proposal_id"] = proposal_id or derive_proposal_id(card, run, project, prong)
 
-    source_excerpts = [_validate_source_excerpt(item, f"{path}.source_excerpts[{idx}]") for idx, item in enumerate(_require_list(card.get("source_excerpts", []), f"{path}.source_excerpts"))]
+    source_excerpts = [_validate_source_excerpt(item, f"{path}.source_excerpts[{idx}]", context) for idx, item in enumerate(_require_list(card.get("source_excerpts", []), f"{path}.source_excerpts"))]
     normalized["source_excerpts"] = source_excerpts
 
     evidence_basis = _validate_evidence_basis(card.get("evidence_basis"), f"{path}.evidence_basis", source_excerpts=source_excerpts)
@@ -246,12 +297,12 @@ def _validate_card(value: Any, path: str, run: dict[str, Any], project: str, pro
 
     kanban = _require_dict(card.get("kanban_task"), f"{path}.kanban_task")
     normalized["kanban_task"] = {
-        "title": _require_text(kanban.get("title"), f"{path}.kanban_task.title", max_len=140),
-        "body": _require_text(kanban.get("body"), f"{path}.kanban_task.body", max_len=6000),
+        "title": _require_text(kanban.get("title"), f"{path}.kanban_task.title", max_len=140, context=context),
+        "body": _require_text(kanban.get("body"), f"{path}.kanban_task.body", max_len=6000, context=context),
     }
     for key in ("assignee", "board", "tenant"):
         if kanban.get(key) is not None:
-            normalized["kanban_task"][key] = _require_text(kanban[key], f"{path}.kanban_task.{key}", max_len=120)
+            normalized["kanban_task"][key] = _require_text(kanban[key], f"{path}.kanban_task.{key}", max_len=120, context=context)
     if kanban.get("tags") is not None:
         tags = [_require_slug(tag, f"{path}.kanban_task.tags[{idx}]") for idx, tag in enumerate(_require_list(kanban["tags"], f"{path}.kanban_task.tags"))]
         normalized["kanban_task"]["tags"] = tags

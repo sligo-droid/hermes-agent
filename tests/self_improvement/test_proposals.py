@@ -481,6 +481,55 @@ def test_valid_pid_proposal_run_is_accepted_and_gets_stable_id():
     }
 
 
+def test_card_body_at_hard_limit_is_accepted():
+    payload = _fixture("proposal_run_pid_valid.json")
+    payload["cards"][0]["body"] = "x" * 6000
+
+    normalized = validate_proposal_run(payload)
+
+    assert len(normalized["cards"][0]["body"]) == 6000
+
+
+def test_kanban_task_body_at_hard_limit_is_accepted():
+    payload = _fixture("proposal_run_pid_valid.json")
+    payload["cards"][0]["kanban_task"]["body"] = "x" * 6000
+
+    normalized = validate_proposal_run(payload)
+
+    assert len(normalized["cards"][0]["kanban_task"]["body"]) == 6000
+
+
+def test_card_body_over_hard_limit_names_observed_length_and_context():
+    payload = _fixture("proposal_run_pid_valid.json")
+    payload["cards"][0]["proposal_id"] = "pid-airflow-overlong-body"
+    payload["cards"][0]["body"] = "x" * 6001
+
+    with pytest.raises(ProposalValidationError) as excinfo:
+        validate_proposal_run(payload)
+
+    message = str(excinfo.value)
+    assert "cards[0].body must be at most 6000 characters" in message
+    assert "observed 6001" in message
+    assert "card title: Add backoff logging to PID scraper timeout retries" in message
+    assert "proposal_id: pid-airflow-overlong-body" in message
+    assert "output: /tmp/hermes/cron/output/abc123def456/20260604.md" in message
+
+
+def test_kanban_task_body_over_hard_limit_names_observed_length_and_context():
+    payload = _fixture("proposal_run_pid_valid.json")
+    payload["cards"][0]["kanban_task"]["body"] = "x" * 6001
+
+    with pytest.raises(ProposalValidationError) as excinfo:
+        validate_proposal_run(payload)
+
+    message = str(excinfo.value)
+    assert "cards[0].kanban_task.body must be at most 6000 characters" in message
+    assert "observed 6001" in message
+    assert "card title: Add backoff logging to PID scraper timeout retries" in message
+    assert "idempotency_key: airflow-scraper-timeout-backoff-2026-06-04" in message
+    assert "output: /tmp/hermes/cron/output/abc123def456/20260604.md" in message
+
+
 def test_blocked_live_stream_source_backed_card_names_missing_live_evidence():
     normalized = validate_proposal_run(_fixture("proposal_run_pid_blocked_live_source_backed.json"))
 
