@@ -1148,6 +1148,36 @@ def test_snapshot_exposes_project_tabs_and_filters_hermes_dev_intake(tmp_path, m
     assert not any(unknown_board in item["id"] for item in snapshot["work_items"])
 
 
+def test_snapshot_discovers_project_tabs_and_blocklists_stale_projects(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    boards = {
+        "discord-examine-work": "examine",
+        "discord-future-work": "future-app",
+        "discord-dtfs-work": "dtfs",
+    }
+    for board, project in boards.items():
+        meta = kanban_db.write_board_metadata(board, name=board)
+        meta.pop("db_path", None)
+        meta[command_center.DISCORD_WORKER_META_KEY] = {
+            "thread_id": f"thread-{board}",
+            "guild_id": "guild",
+            "project_context": {"project_name": project},
+        }
+        kanban_db.board_metadata_path(board).write_text(json.dumps(meta), encoding="utf-8")
+        conn = kanban_db.connect(board=board)
+        try:
+            kanban_db.create_task(conn, title=f"{board} task", board=board, tenant=project)
+        finally:
+            conn.close()
+
+    snapshot = command_center.build_command_center_snapshot()
+    project_keys = [project["key"] for project in snapshot["projects"]]
+
+    assert project_keys[:3] == ["hermes", "pid", "examine"]
+    assert "future-app" in project_keys
+    assert "dtfs" not in project_keys
+
+
 def test_snapshot_omits_default_discord_intake_from_work_items(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     body = "\n".join(

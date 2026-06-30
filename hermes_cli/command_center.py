@@ -48,6 +48,15 @@ _PROJECT_ALIASES = {
     "#dev": "hermes",
     "pid": "pid",
 }
+_COMMAND_CENTER_PROJECT_BLOCKLIST = {
+    "discord-1507071138612642073",
+    "discord-1507235762515480637",
+    "discord-1507548018474483744",
+    "discord-1509341931308716124",
+    "dtfs",
+    "sligo-claw",
+    "tonal-dashboard",
+}
 _ARCHIVED_BOARD_DIR_RE = re.compile(r"^(?P<slug>.+)-(?P<timestamp>\d{9,})(?:-\d+)?$")
 _ARCHIVED_BOARD_METADATA_CACHE: tuple[tuple[str, int], list[dict[str, Any]]] | None = None
 _SNAPSHOT_CACHE_TTL_SECONDS = 3.0
@@ -101,10 +110,43 @@ def _configured_projects() -> list[dict[str, Any]]:
         }
         projects.append(project)
     seen = {project["key"] for project in projects}
-    for key, label, hint in (("hermes", "Hermes", "#dev"), ("pid", "PID", None)):
+    for key, label, hint in (("hermes", "Hermes", "#dev"), ("pid", "PID", None), ("examine", "examine", None)):
         if key not in seen:
             projects.append({"key": key, "label": label, "source_hint": hint})
     return projects
+
+
+def _project_label(key: str) -> str:
+    if key == "pid":
+        return "PID"
+    if key == "hermes":
+        return "Hermes"
+    return key.replace("-", " ").title()
+
+
+def _discover_projects(
+    *,
+    work_items: list[dict[str, Any]],
+    sources: list[dict[str, Any]],
+    board_projects: dict[str, str | None],
+) -> list[dict[str, Any]]:
+    projects = _configured_projects()
+    seen = {str(project.get("key") or "") for project in projects}
+
+    discovered: set[str] = set()
+    for item in work_items:
+        project = _item_project(item)
+        if project:
+            discovered.add(project)
+    for source in sources:
+        project = _source_project(source)
+        if project:
+            discovered.add(project)
+    discovered.update(project for project in board_projects.values() if project)
+
+    for key in sorted(discovered - seen - _COMMAND_CENTER_PROJECT_BLOCKLIST):
+        projects.append({"key": key, "label": _project_label(key), "source_hint": None})
+    return [project for project in projects if str(project.get("key") or "") not in _COMMAND_CENTER_PROJECT_BLOCKLIST]
 
 
 def _project_from_worker_meta(worker: dict[str, Any]) -> str | None:
@@ -1167,18 +1209,24 @@ def _source_from_task_board(board: str, board_meta: dict[str, Any]) -> dict[str,
             "public_url": worker.get("public_url"),
         }
         ref.update(_discord_urls(ref))
-        return _with_project({
+        source = _with_project({
             "id": f"source:discord:{source_identity}",
             "kind": "discord",
             "label": "Discord worker thread",
             "ref": ref,
         }, project)
-    return _with_project({
+        if project:
+            ref.setdefault("project", project)
+        return source
+    source = _with_project({
         "id": f"source:kanban-board:{source_identity}",
         "kind": "kanban_board",
         "label": "Kanban board",
         "ref": {"board": board},
     }, project)
+    if project:
+        source["ref"].setdefault("project", project)
+    return source
 
 
 def _execution_from_task(
@@ -1731,6 +1779,8 @@ def _source_from_discord_board(board: str, board_meta: dict[str, Any]) -> dict[s
         "public_url": worker.get("public_url"),
     }
     ref.update(_discord_urls(ref))
+    if project:
+        ref.setdefault("project", project)
     return _with_project({
         "id": f"source:discord:{source_identity}",
         "kind": "discord_thread",
@@ -2003,7 +2053,7 @@ def build_command_center_snapshot(
         finally:
             conn.close()
 
-    projects = _configured_projects()
+    projects = _snapshot_projects(work_items=work_items, sources=sources, boards=boards)
     project_filter = _normalize_project_key(project)
     if project_filter:
         work_items, sources, runs, boards = _filter_snapshot_by_project(
@@ -2060,6 +2110,19 @@ def _source_project(source: dict[str, Any]) -> str | None:
         return project
     ref = source.get("ref") if isinstance(source.get("ref"), dict) else {}
     return _normalize_project_key(ref.get("project"))
+
+
+def _snapshot_projects(
+    *,
+    work_items: list[dict[str, Any]],
+    sources: list[dict[str, Any]],
+    boards: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    board_projects = {
+        str(board.get("slug") or kanban_db.DEFAULT_BOARD): _project_from_board(str(board.get("slug") or kanban_db.DEFAULT_BOARD), board)
+        for board in boards
+    }
+    return _discover_projects(work_items=work_items, sources=sources, board_projects=board_projects)
 
 
 def _run_project(run: dict[str, Any], board_projects: dict[str, str | None], task_projects: dict[tuple[str, str], str | None]) -> str | None:
