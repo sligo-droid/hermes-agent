@@ -4,11 +4,21 @@ from __future__ import annotations
 
 import os
 import re
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 
+logger = logging.getLogger(__name__)
 DISCORD_THREAD_TYPES = {10, 11, 12}
+DISCORD_CONTEXT_KIND_THREAD_PLAN = "thread_plan"
+DISCORD_CONTEXT_KIND_SINGLE_MESSAGE = "single_message"
+SINGLE_MESSAGE_CONTEXT_WARNING = (
+    "Single-message context only: do not assume missing thread history, acceptance criteria, "
+    "review notes, or completion signals."
+)
+_SINGLE_MESSAGE_SURROUNDING_LIMIT = 9
+_SINGLE_MESSAGE_RAW_CHAR_CAP = 12_000
 DISCORD_REF_URL_RE = re.compile(
     r"https?://(?:canary\.|ptb\.)?discord(?:app)?\.com/channels/"
     r"(?P<guild>\d{16,24})/(?P<channel>\d{16,24})/(?P<target>\d{16,24})"
@@ -28,21 +38,35 @@ PLAN_MARKER_RE = re.compile(
 class DiscordThreadPlanExpansion:
     source: str
     thread_id: str
+    context_kind: str = DISCORD_CONTEXT_KIND_THREAD_PLAN
     thread_name: str = ""
+    channel_id: str = ""
     selected_message_ids: tuple[str, ...] = ()
     artifact_path: str = ""
     content_sha256: str = ""
     warnings: tuple[str, ...] = ()
     truncated: bool = False
+    surrounding_context_fetched: bool = False
     content: str = ""
 
     def formatted(self) -> str:
-        lines = ["[Expanded Discord thread plan]"]
+        if self.context_kind == DISCORD_CONTEXT_KIND_SINGLE_MESSAGE:
+            lines = ["[Expanded Discord single-message context]"]
+        else:
+            lines = ["[Expanded Discord thread plan]"]
         thread_label = self.thread_id
         if self.thread_name:
             thread_label = f"{self.thread_name} ({self.thread_id})"
-        lines.append(f"Thread: {thread_label}")
+        label = "Message" if self.context_kind == DISCORD_CONTEXT_KIND_SINGLE_MESSAGE else "Thread"
+        lines.append(f"{label}: {thread_label}")
+        if self.channel_id:
+            lines.append(f"Channel: {self.channel_id}")
         lines.append(f"Source: {self.source}")
+        lines.append(f"Context kind: {self.context_kind}")
+        if self.context_kind == DISCORD_CONTEXT_KIND_SINGLE_MESSAGE:
+            lines.append(f"Degraded context: true")
+            lines.append(SINGLE_MESSAGE_CONTEXT_WARNING)
+            lines.append(f"Bounded surrounding context fetched: {str(self.surrounding_context_fetched).lower()}")
         if self.selected_message_ids:
             lines.append("Selected plan messages: " + ", ".join(self.selected_message_ids))
         if self.artifact_path:
@@ -164,6 +188,27 @@ def format_discord_thread_expansions(expansions: list[DiscordThreadPlanExpansion
     return "\n\n".join(blocks).strip()
 
 
+def discord_context_quality_from_text(text: str) -> dict[str, Any]:
+    """Return machine-readable quality derived from formatted Discord context."""
+    value = str(text or "")
+    has_single = "[Expanded Discord single-message context]" in value or "Context kind: single_message" in value
+    has_thread = "[Expanded Discord thread plan]" in value or "Context kind: thread_plan" in value
+    if has_single and not has_thread:
+        kind = DISCORD_CONTEXT_KIND_SINGLE_MESSAGE
+    elif has_single and has_thread:
+        kind = "mixed"
+    elif has_thread:
+        kind = DISCORD_CONTEXT_KIND_THREAD_PLAN
+    else:
+        kind = "none"
+    return {
+        "kind": kind,
+        "degraded": has_single,
+        "has_thread_plan": has_thread,
+        "has_single_message_context": has_single,
+    }
+
+
 def _expand_artifact_reference(
     ref: dict[str, str],
     *,
@@ -254,11 +299,55 @@ def _expand_one_reference(
                 max_output_chars=max_output_chars,
             )
         content = _format_messages([message]) if isinstance(message, dict) else ""
+        channel_id = str(ref.get("channel_id") or "")
+        messages = [message] if isinstance(message, dict) else []
+        surrounding_fetched = False
+        surrounding_truncated = False
+        warnings = [
+            "Discord link resolved to a single message, not a thread plan.",
+            SINGLE_MESSAGE_CONTEXT_WARNING,
+        ]
+        if channel_id and target_id:
+            surrounding, surrounding_truncated = _fetch_single_message_surrounding_context(
+                channel_id,
+                target_id,
+                token,
+                request_func,
+                max_raw_chars=min(max_raw_chars, _SINGLE_MESSAGE_RAW_CHAR_CAP),
+            )
+            if surrounding:
+                messages = surrounding
+                content = _format_messages(messages)
+                surrounding_fetched = len(messages) > 1 or any(
+                    str(item.get("id") or "") != target_id for item in messages
+                )
+            else:
+                warnings.append("Bounded surrounding context was unavailable for this message.")
+        if surrounding_truncated:
+            warnings.append("Bounded surrounding context was capped before all nearby messages were included.")
+        output_truncated = False
+        if len(content) > max_output_chars:
+            content = content[:max_output_chars].rstrip() + "\n[Single-message context truncated to output cap.]"
+            warnings.append("Single-message context was truncated to output cap.")
+            output_truncated = True
+        logger.info(
+            "discord_context_resolved kind=%s source=%s channel=%s message=%s surrounding_fetched=%s truncated=%s",
+            DISCORD_CONTEXT_KIND_SINGLE_MESSAGE,
+            source,
+            channel_id,
+            target_id,
+            surrounding_fetched,
+            surrounding_truncated or output_truncated,
+        )
         return DiscordThreadPlanExpansion(
             source=source,
             thread_id=target_id,
-            selected_message_ids=tuple([target_id] if content else []),
-            warnings=("Discord link resolved to a single message, not a thread plan.",),
+            context_kind=DISCORD_CONTEXT_KIND_SINGLE_MESSAGE,
+            channel_id=channel_id,
+            selected_message_ids=tuple(str(item.get("id") or "") for item in messages if item.get("id")),
+            warnings=tuple(warnings),
+            truncated=surrounding_truncated or output_truncated,
+            surrounding_context_fetched=surrounding_fetched,
             content=content,
         )
     return DiscordThreadPlanExpansion(
@@ -266,6 +355,50 @@ def _expand_one_reference(
         thread_id=target_id,
         warnings=("Discord snowflake did not resolve to a thread channel.",),
     )
+
+
+def _fetch_single_message_surrounding_context(
+    channel_id: str,
+    message_id: str,
+    token: str,
+    request_func: Callable[..., Any],
+    *,
+    max_raw_chars: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    try:
+        payload = request_func(
+            "GET",
+            f"/channels/{channel_id}/messages",
+            token,
+            params={"limit": str(_SINGLE_MESSAGE_SURROUNDING_LIMIT), "around": message_id},
+            timeout=15,
+        )
+    except Exception as exc:
+        logger.info(
+            "discord_single_message_surrounding_fetch_failed channel=%s message=%s error=%s",
+            channel_id,
+            message_id,
+            exc,
+        )
+        return [], False
+    if not isinstance(payload, list):
+        return [], False
+    messages: list[dict[str, Any]] = []
+    raw_chars = 0
+    truncated = False
+    for item in sorted(
+        (item for item in payload if isinstance(item, dict)),
+        key=lambda item: int(str(item.get("id") or "0") or 0),
+    ):
+        content_len = len(str(item.get("content") or ""))
+        if messages and raw_chars + content_len > max_raw_chars:
+            truncated = True
+            break
+        messages.append(item)
+        raw_chars += content_len
+    if len(payload) >= _SINGLE_MESSAGE_SURROUNDING_LIMIT:
+        truncated = True
+    return messages, truncated
 
 
 def _expand_thread_channel(

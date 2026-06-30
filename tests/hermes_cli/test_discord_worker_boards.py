@@ -1722,6 +1722,58 @@ def test_set_goal_expands_discord_thread_reference_for_planner(monkeypatch, tmp_
     assert "1511799412559708283" in pack["source_message_ids"]
 
 
+def test_set_goal_propagates_degraded_single_message_context_for_planner(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+    from hermes_cli.discord_thread_context import DiscordThreadPlanExpansion
+
+    message_id = "1511799412559708283"
+
+    def fake_expand(text):
+        assert message_id in text
+        return [
+            DiscordThreadPlanExpansion(
+                source=f"https://discord.com/channels/1/2/{message_id}",
+                thread_id=message_id,
+                context_kind="single_message",
+                channel_id="2",
+                selected_message_ids=("1511799412559708282", message_id),
+                surrounding_context_fetched=True,
+                warnings=("Discord link resolved to a single message, not a thread plan.",),
+                content="[Alice msg:1511799412559708282]\nPrior context\n\n[Bob msg:1511799412559708283]\nDo this.",
+            )
+        ]
+
+    monkeypatch.setattr(dwb, "expand_discord_thread_references", fake_expand)
+    board = dwb.set_goal(
+        thread_id="7796",
+        goal=f"Use message https://discord.com/channels/1/2/{message_id}",
+        request_id="msg-7796",
+    )
+    conn = kanban_db.connect(board=board.slug)
+    try:
+        tasks = kanban_db.list_tasks(conn, include_archived=False)
+    finally:
+        conn.close()
+
+    payload = json.loads(tasks[0].body or "{}")
+    assert "[Expanded Discord single-message context]" in payload["discord_thread_context"]
+    assert "[Expanded Discord thread plan]" not in payload["discord_thread_context"]
+    assert payload["discord_context_quality"]["kind"] == "single_message"
+    assert payload["discord_context_quality"]["degraded"] is True
+    assert "full Discord thread plan was not resolved" in payload["discord_context_quality"]["blocker"]
+    assert any("degraded single-message context" in item for item in payload["planner_instructions"])
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["discord_context_quality"]["kind"] == "single_message"
+    pack = json.loads(Path(payload["context_pack"]["json_path"]).read_text(encoding="utf-8"))
+    assert pack["discord_context_quality"]["kind"] == "single_message"
+    assert pack["discord_context_quality"]["degraded"] is True
+    assert "Discord context kind: single_message" in Path(payload["context_pack"]["markdown_path"]).read_text(
+        encoding="utf-8"
+    )
+
+
 def test_saved_discord_plan_artifact_path_reaches_planner_and_reviewer(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
