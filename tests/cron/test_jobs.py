@@ -178,6 +178,30 @@ class TestComputeNextRun:
         assert compute_next_run({"kind": "unknown"}) is None
 
 
+def test_mark_job_run_persists_and_clears_health_details(tmp_cron_dir):
+    job = create_job(prompt="Check proposals", schedule="every 1h")
+    details = {
+        "self_improvement_proposal_ingestion": {
+            "status": "malformed",
+            "card_count": 0,
+            "parse_error": "proposal JSON parse error at line 1, column 2",
+            "cron_output_path": "/tmp/out.md",
+        }
+    }
+
+    mark_job_run(job["id"], True, health_details=details)
+    fetched = get_job(job["id"])
+
+    assert fetched["last_status"] == "ok"
+    assert fetched["last_health_details"] == details
+
+    mark_job_run(job["id"], True)
+    fetched = get_job(job["id"])
+
+    assert fetched["last_status"] == "ok"
+    assert fetched["last_health_details"] is None
+
+
 # =========================================================================
 # Job CRUD (with tmp file storage)
 # =========================================================================
