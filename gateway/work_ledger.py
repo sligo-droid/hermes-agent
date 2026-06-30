@@ -150,6 +150,24 @@ def default_path() -> Path:
     return get_hermes_home() / "gateway" / "work_ledger.json"
 
 
+def _record_provider_progress(item: dict[str, Any], reason: str, *, status: str | None = None) -> None:
+    try:
+        from agent.provider_progress import record_provider_progress_signal
+
+        metadata: dict[str, Any] = {"work_id": str(item.get("id") or "")}
+        if status:
+            metadata["status"] = str(status)
+        record_provider_progress_signal(
+            str(item.get("session_key") or ""),
+            reason,
+            phase="work_ledger",
+            source="work_ledger",
+            metadata=metadata,
+        )
+    except Exception:
+        pass
+
+
 def _now() -> float:
     return time.time()
 
@@ -562,6 +580,7 @@ class GatewayWorkLedger:
         item["updated_at"] = now
         item["claim_pid"] = os.getpid()
         item["lease_until"] = now + LEASE_SECONDS
+        _record_provider_progress(item, "ledger_status_claimed", status="claimed")
         self._write(data)
         return dict(item)
 
@@ -584,6 +603,7 @@ class GatewayWorkLedger:
             item.pop(key, None)
         if session_id:
             item["session_id"] = str(session_id)
+        _record_provider_progress(item, "ledger_status_agent_running", status="agent_running")
         self._write(data)
         return True
 
@@ -624,6 +644,7 @@ class GatewayWorkLedger:
             item["runtime_breakdown"] = _durable_metadata(runtime_breakdown)
         if provider_no_progress is not None:
             item["provider_no_progress"] = _durable_metadata(provider_no_progress)
+        _record_provider_progress(item, f"ledger_status_{item['status']}", status=str(item["status"]))
         gate = classify_delivery_completion(item)
         item["completion_gate"] = gate
         if not gate.get("allowed_to_complete"):
@@ -657,6 +678,7 @@ class GatewayWorkLedger:
             item,
             result_message_id=str(result_message_id) if result_message_id else None,
         )
+        _record_provider_progress(item, "ledger_status_response_delivered", status="response_delivered")
         self._write(data)
         return True
 
@@ -668,6 +690,7 @@ class GatewayWorkLedger:
         item["status"] = "summary_updated"
         item["updated_at"] = self._now()
         item["summary_updated_at"] = item["updated_at"]
+        _record_provider_progress(item, "ledger_status_summary_updated", status="summary_updated")
         self._write(data)
         return True
 
@@ -684,12 +707,14 @@ class GatewayWorkLedger:
             item["blocked_at"] = item["updated_at"]
             if result_message_id:
                 item["result_message_id"] = str(result_message_id)
+            _record_provider_progress(item, "ledger_status_blocked", status=str(item["status"]))
             self._write(data)
             return True
         item["status"] = "completed"
         item["updated_at"] = self._now()
         if result_message_id:
             item["result_message_id"] = str(result_message_id)
+        _record_provider_progress(item, "ledger_status_completed", status="completed")
         self._write(data)
         return True
 
@@ -708,6 +733,7 @@ class GatewayWorkLedger:
             item["summary_status"] = "Blocked"
         if reason:
             item["blocked_reason"] = str(reason)
+        _record_provider_progress(item, "ledger_status_blocked", status="blocked")
         self._write(data)
         return True
 

@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from agent.provider_progress import clear_provider_progress_signal, latest_provider_progress_signal
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
@@ -166,6 +167,29 @@ def test_mark_agent_done_persists_provider_no_progress_metadata(tmp_path):
     assert stored["provider_no_progress"] == event_payload
     assert stored["completion_gate"]["allowed_to_complete"] is True
     assert "sk-" not in str(stored["provider_no_progress"])
+
+
+def test_work_ledger_state_transitions_record_provider_progress(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="m1")
+    session_key = build_session_key(event.source)
+    clear_provider_progress_signal(session_key)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+
+    assert ledger.mark_agent_running(item["id"], session_id="sess-1") is True
+    signal = latest_provider_progress_signal(session_key)
+    assert signal is not None
+    assert signal["source"] == "work_ledger"
+    assert signal["phase"] == "work_ledger"
+    assert signal["reason"] == "ledger_status_agent_running"
+    assert signal["metadata"] == {"work_id": item["id"], "status": "agent_running"}
+
+    assert ledger.mark_summary_updated(item["id"]) is True
+    signal = latest_provider_progress_signal(session_key)
+    assert signal is not None
+    assert signal["reason"] == "ledger_status_summary_updated"
+    assert signal["metadata"] == {"work_id": item["id"], "status": "summary_updated"}
 
 
 def test_ledger_skips_completed_and_expires_stale_items(tmp_path):

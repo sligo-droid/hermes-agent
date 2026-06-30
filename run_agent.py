@@ -2314,6 +2314,7 @@ class AIAgent:
         self._provider_no_progress_started_at = now
         self._provider_no_progress_last_progress_at = now
         self._provider_no_progress_last_progress_reason = "turn_start"
+        self._provider_no_progress_last_external_at = 0.0
         self._provider_no_progress_useful_seen = False
         self._provider_no_progress_retry_count = 0
         self._provider_no_progress_events = []
@@ -2325,6 +2326,34 @@ class AIAgent:
         self._provider_no_progress_last_progress_reason = str(reason or phase or "progress")
         self._provider_no_progress_useful_seen = True
         self._provider_no_progress_retry_count = 0
+
+    def _provider_no_progress_sync_external_progress(self) -> None:
+        key = getattr(self, "_gateway_session_key", None)
+        if not key:
+            return
+        try:
+            from agent.provider_progress import latest_provider_progress_signal
+
+            signal = latest_provider_progress_signal(key)
+        except Exception:
+            return
+        if not isinstance(signal, dict):
+            return
+        try:
+            signal_at = float(signal.get("at") or 0.0)
+            last_external_at = float(getattr(self, "_provider_no_progress_last_external_at", 0.0) or 0.0)
+            last_progress_at = float(getattr(self, "_provider_no_progress_last_progress_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return
+        if signal_at <= 0 or signal_at <= last_external_at or signal_at <= last_progress_at:
+            return
+        self._provider_no_progress_last_progress_at = signal_at
+        reason = str(signal.get("reason") or signal.get("phase") or "external_progress")
+        source = str(signal.get("source") or "gateway")
+        self._provider_no_progress_last_progress_reason = f"{source}:{reason}"
+        self._provider_no_progress_useful_seen = True
+        self._provider_no_progress_retry_count = 0
+        self._provider_no_progress_last_external_at = signal_at
 
     def _provider_no_progress_delay_class(self, elapsed: float) -> str:
         if elapsed < 60:
@@ -2351,6 +2380,7 @@ class AIAgent:
         return timeout
 
     def _provider_no_progress_elapsed(self) -> float:
+        self._provider_no_progress_sync_external_progress()
         last = getattr(self, "_provider_no_progress_last_progress_at", None)
         try:
             return max(0.0, time.time() - float(last or time.time()))

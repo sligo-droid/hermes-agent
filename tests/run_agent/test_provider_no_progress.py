@@ -5,6 +5,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.provider_progress import clear_provider_progress_signal, record_provider_progress_signal
 from run_agent import AIAgent
 
 
@@ -72,6 +73,83 @@ def test_provider_no_progress_resets_on_continuing_progress():
     agent._provider_no_progress_mark_progress("successful_tool_call", phase="tool_execution")
     assert agent._provider_no_progress_should_trip("provider_api_error") is False
     assert agent._provider_no_progress_retry_count == 0
+
+
+def test_provider_no_progress_resets_on_committed_worker_artifact_signal(monkeypatch):
+    agent = _bare_agent()
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr("run_agent.time.time", lambda: clock["now"])
+    monkeypatch.setattr("agent.provider_progress.time.time", lambda: clock["now"])
+    clear_provider_progress_signal(agent._gateway_session_key)
+
+    agent._provider_no_progress_start_turn()
+    agent._provider_no_progress_mark_progress("assistant_content", phase="assistant_response")
+    clock["now"] += 11.0
+    agent._record_provider_no_progress_retry(phase="provider_api_error", failure_class="timeout")
+    assert agent._provider_no_progress_should_trip("provider_api_error") is True
+
+    record_provider_progress_signal(
+        agent._gateway_session_key,
+        "committed_worker_artifacts",
+        phase="worker_artifact_delivery",
+        source="kanban_notifier",
+        metadata={"task_id": "t-1"},
+    )
+
+    assert agent._provider_no_progress_should_trip("provider_api_error") is False
+    assert agent._provider_no_progress_retry_count == 0
+    assert agent._provider_no_progress_last_progress_reason == "kanban_notifier:committed_worker_artifacts"
+
+
+def test_provider_no_progress_resets_on_ledger_and_finalizer_signals(monkeypatch):
+    agent = _bare_agent()
+    clock = {"now": 2_000.0}
+    monkeypatch.setattr("run_agent.time.time", lambda: clock["now"])
+    monkeypatch.setattr("agent.provider_progress.time.time", lambda: clock["now"])
+    clear_provider_progress_signal(agent._gateway_session_key)
+
+    agent._provider_no_progress_start_turn()
+    agent._provider_no_progress_mark_progress("successful_tool_call", phase="tool_execution")
+    clock["now"] += 11.0
+    assert agent._provider_no_progress_should_trip("provider_api_error") is True
+
+    record_provider_progress_signal(
+        agent._gateway_session_key,
+        "ledger_status_agent_running",
+        phase="work_ledger",
+        source="work_ledger",
+    )
+    assert agent._provider_no_progress_should_trip("provider_api_error") is False
+    assert agent._provider_no_progress_last_progress_reason == "work_ledger:ledger_status_agent_running"
+
+    clock["now"] += 11.0
+    assert agent._provider_no_progress_should_trip("provider_api_error") is True
+
+    record_provider_progress_signal(
+        agent._gateway_session_key,
+        "ledger_status_summary_updated",
+        phase="work_ledger",
+        source="work_ledger",
+    )
+    assert agent._provider_no_progress_should_trip("provider_api_error") is False
+    assert agent._provider_no_progress_last_progress_reason == "work_ledger:ledger_status_summary_updated"
+
+
+def test_provider_retries_without_external_progress_still_trip(monkeypatch):
+    agent = _bare_agent()
+    clock = {"now": 3_000.0}
+    monkeypatch.setattr("run_agent.time.time", lambda: clock["now"])
+    clear_provider_progress_signal(agent._gateway_session_key)
+
+    agent._provider_no_progress_start_turn()
+    agent._provider_no_progress_mark_progress("assistant_content", phase="assistant_response")
+    clock["now"] += 11.0
+
+    agent._record_provider_no_progress_retry(phase="provider_api_error", failure_class="timeout")
+    agent._record_provider_no_progress_retry(phase="provider_api_error", failure_class="timeout")
+
+    assert agent._provider_no_progress_should_trip("provider_api_error") is True
+    assert agent._provider_no_progress_retry_count == 2
 
 
 def test_provider_no_progress_disabled_outside_gateway():

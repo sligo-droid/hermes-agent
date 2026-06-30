@@ -11577,6 +11577,18 @@ class GatewayRunner:
                         str(work_item_id),
                         session_id=session_entry.session_id,
                     )
+                    try:
+                        from agent.provider_progress import record_provider_progress_signal
+
+                        record_provider_progress_signal(
+                            session_key,
+                            "gateway_ledger_agent_running",
+                            phase="work_ledger",
+                            source="gateway",
+                            metadata={"work_id": str(work_item_id)},
+                        )
+                    except Exception:
+                        pass
                 except Exception as exc:
                     logger.debug("Discord work ledger agent_running update failed: %s", exc)
             agent_result = await self._run_agent(
@@ -11752,6 +11764,18 @@ class GatewayRunner:
                         already_delivered=bool(agent_result.get("already_sent"))
                         and not agent_result.get("failed"),
                     )
+                    try:
+                        from agent.provider_progress import record_provider_progress_signal
+
+                        record_provider_progress_signal(
+                            session_key,
+                            "gateway_ledger_agent_done",
+                            phase="work_ledger",
+                            source="gateway",
+                            metadata={"work_id": str(work_item_id)},
+                        )
+                    except Exception:
+                        pass
                 except Exception as exc:
                     logger.debug("Discord work ledger agent_done update failed: %s", exc)
 
