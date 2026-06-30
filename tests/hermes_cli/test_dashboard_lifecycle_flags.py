@@ -243,6 +243,7 @@ class TestDashboardStartPreflight:
         assert "Owner: PID" in err
         assert "hermes dashboard --port <port>" in err
         assert "hermes-dashboard.service" in err
+        assert "RestartPreventExitStatus=98" in err
 
     def test_start_preflight_uses_configured_non_default_bind(self, capsys):
         from hermes_cli.config import get_hermes_home

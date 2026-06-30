@@ -242,14 +242,18 @@ def dashboard_port_in_use_message(
         lines.append(
             "Action: inspect with `hermes dashboard --status`; if the managed service should own "
             "the port, run `hermes dashboard --stop`, then `systemctl --user reset-failed "
-            "hermes-dashboard.service` and `systemctl --user restart hermes-dashboard.service`."
+            "hermes-dashboard.service` and `systemctl --user restart hermes-dashboard.service`. "
+            "If a local hermes-dashboard.service uses Restart=always, add a user unit drop-in with "
+            "`RestartPreventExitStatus=98` so known port collisions do not restart indefinitely."
         )
     else:
         lines.append(
             "Action: free the process using that port or start Hermes on another port with "
             "`hermes dashboard --port <port>`; do not auto-kill unmanaged processes. If "
             "hermes-dashboard.service is failed, run `systemctl --user reset-failed "
-            "hermes-dashboard.service` after resolving the collision."
+            "hermes-dashboard.service` after resolving the collision. If a local "
+            "hermes-dashboard.service uses Restart=always, add a user unit drop-in with "
+            "`RestartPreventExitStatus=98` so known port collisions do not restart indefinitely."
         )
     return " ".join(lines)
 

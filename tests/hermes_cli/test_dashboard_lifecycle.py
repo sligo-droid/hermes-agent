@@ -81,6 +81,7 @@ def test_ensure_dashboard_port_available_reports_service_recovery_hint():
     assert "classification: not Hermes dashboard" in message
     assert "hermes dashboard --port <port>" in message
     assert "systemctl --user reset-failed hermes-dashboard.service" in message
+    assert "RestartPreventExitStatus=98" in message
 
 
 def test_dashboard_port_in_use_message_reports_hermes_owner_action():
@@ -103,6 +104,7 @@ def test_dashboard_port_in_use_message_reports_hermes_owner_action():
     assert "hermes dashboard --status" in message
     assert "hermes dashboard --stop" in message
     assert "systemctl --user restart hermes-dashboard.service" in message
+    assert "RestartPreventExitStatus=98" in message
 
 
 def test_dashboard_port_in_use_message_reports_unknown_owner_fallback():
