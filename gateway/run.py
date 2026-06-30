@@ -14402,6 +14402,8 @@ class GatewayRunner:
 
     def _discord_summary_status(self, agent_result: Optional[Dict[str, Any]]) -> str:
         agent_result = agent_result or {}
+        if agent_result.get("provider_no_progress"):
+            return "Failed"
         if agent_result.get("interrupted"):
             return "Interrupted"
         if agent_result.get("failed") or agent_result.get("error"):

@@ -2309,6 +2309,127 @@ class AIAgent:
                 # etc.) on niche deployment surfaces.
                 pass
 
+    def _provider_no_progress_start_turn(self) -> None:
+        now = time.time()
+        self._provider_no_progress_started_at = now
+        self._provider_no_progress_last_progress_at = now
+        self._provider_no_progress_last_progress_reason = "turn_start"
+        self._provider_no_progress_useful_seen = False
+        self._provider_no_progress_retry_count = 0
+        self._provider_no_progress_events = []
+        self._last_provider_no_progress_event = None
+
+    def _provider_no_progress_mark_progress(self, reason: str, *, phase: str = "agent") -> None:
+        now = time.time()
+        self._provider_no_progress_last_progress_at = now
+        self._provider_no_progress_last_progress_reason = str(reason or phase or "progress")
+        self._provider_no_progress_useful_seen = True
+        self._provider_no_progress_retry_count = 0
+
+    def _provider_no_progress_delay_class(self, elapsed: float) -> str:
+        if elapsed < 60:
+            return "under_1m"
+        if elapsed < 300:
+            return "1m_5m"
+        if elapsed < 900:
+            return "5m_15m"
+        if elapsed < 1800:
+            return "15m_30m"
+        return "over_30m"
+
+    def _provider_no_progress_timeout_seconds(self) -> float:
+        try:
+            timeout = float(getattr(self, "_provider_no_progress_timeout", 0) or 0)
+        except (TypeError, ValueError):
+            timeout = 0.0
+        if timeout <= 0:
+            return 0.0
+        # Scope the interrupt/downgrade guard to gateway-hosted turns. CLI and
+        # other embedded callers keep existing retry/fallback behavior.
+        if not getattr(self, "_gateway_session_key", None):
+            return 0.0
+        return timeout
+
+    def _provider_no_progress_elapsed(self) -> float:
+        last = getattr(self, "_provider_no_progress_last_progress_at", None)
+        try:
+            return max(0.0, time.time() - float(last or time.time()))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _provider_no_progress_should_trip(self, phase: str) -> bool:
+        timeout = self._provider_no_progress_timeout_seconds()
+        if timeout <= 0:
+            return False
+        if not bool(getattr(self, "_provider_no_progress_useful_seen", False)):
+            return False
+        return self._provider_no_progress_elapsed() >= timeout
+
+    def _record_provider_no_progress_retry(self, *, phase: str, failure_class: str) -> None:
+        try:
+            self._provider_no_progress_retry_count = int(
+                getattr(self, "_provider_no_progress_retry_count", 0) or 0
+            ) + 1
+        except Exception:
+            self._provider_no_progress_retry_count = 1
+        logger.info(
+            "provider_no_progress_retry %s",
+            json.dumps(
+                {
+                    "session_id": getattr(self, "session_id", "") or "",
+                    "gateway_session_key": getattr(self, "_gateway_session_key", "") or "",
+                    "provider": getattr(self, "provider", "") or "unknown",
+                    "model": getattr(self, "model", "") or "unknown",
+                    "phase": str(phase or "provider_retry"),
+                    "failure_class": str(failure_class or "provider_retry"),
+                    "retry_count": int(getattr(self, "_provider_no_progress_retry_count", 0) or 0),
+                    "no_progress_elapsed_s": round(self._provider_no_progress_elapsed(), 3),
+                    "last_progress_reason": getattr(self, "_provider_no_progress_last_progress_reason", "") or "",
+                },
+                sort_keys=True,
+            ),
+        )
+
+    def _provider_no_progress_event(self, *, phase: str, failure_class: str, action: str) -> Dict[str, Any]:
+        elapsed = self._provider_no_progress_elapsed()
+        event = {
+            "event": "provider_no_progress_threshold_exceeded",
+            "session_id": getattr(self, "session_id", "") or "",
+            "gateway_session_key": getattr(self, "_gateway_session_key", "") or "",
+            "provider": getattr(self, "provider", "") or "unknown",
+            "model": getattr(self, "model", "") or "unknown",
+            "phase": str(phase or "provider_retry"),
+            "failure_class": str(failure_class or "provider_retry"),
+            "action": str(action or "degraded_partial"),
+            "no_progress_elapsed_s": round(elapsed, 3),
+            "threshold_s": self._provider_no_progress_timeout_seconds(),
+            "retry_count": int(getattr(self, "_provider_no_progress_retry_count", 0) or 0),
+            "delay_class": self._provider_no_progress_delay_class(elapsed),
+            "last_progress_reason": getattr(self, "_provider_no_progress_last_progress_reason", "") or "",
+        }
+        self._last_provider_no_progress_event = event
+        try:
+            events = getattr(self, "_provider_no_progress_events", None)
+            if isinstance(events, list):
+                events.append(event)
+        except Exception:
+            pass
+        logger.warning("provider_no_progress_event %s", json.dumps(event, sort_keys=True))
+        return event
+
+    def _provider_no_progress_partial_response(self, event: Dict[str, Any]) -> str:
+        provider = event.get("provider") or "the provider"
+        model = event.get("model") or "the selected model"
+        elapsed = int(float(event.get("no_progress_elapsed_s") or 0))
+        phase = event.get("phase") or "provider_retry"
+        return (
+            "⚠️ Provider no-progress guard stopped this turn after useful work was preserved.\n\n"
+            f"Hermes had made progress, then spent {elapsed}s in `{phase}` without new "
+            f"assistant content, successful tool results, or finalizer progress. "
+            f"Provider/model: `{provider}` / `{model}`. "
+            "The partial transcript and tool results were saved; retrying can continue from the preserved session state."
+        )
+
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.
 

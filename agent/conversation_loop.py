@@ -1065,6 +1065,10 @@ def run_conversation(
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+    try:
+        agent._provider_no_progress_start_turn()
+    except Exception:
+        pass
 
     # Per-turn file-mutation verifier state.  Keyed by resolved path;
     # each failed ``write_file`` / ``patch`` call records the error
@@ -1771,6 +1775,13 @@ def run_conversation(
                     # Invalid response — could be rate limiting, provider timeout,
                     # upstream server error, or malformed response.
                     retry_count += 1
+                    try:
+                        agent._record_provider_no_progress_retry(
+                            phase="provider_invalid_response",
+                            failure_class="invalid_response",
+                        )
+                    except Exception:
+                        pass
                     
                     # Eager fallback: empty/malformed responses are a common
                     # rate-limit symptom.  Switch to fallback immediately
@@ -1865,6 +1876,46 @@ def run_conversation(
                             "error": f"Invalid API response after {max_retries} retries: {_failure_hint}",
                             "failed": True  # Mark as failure for filtering
                         }
+
+                    if agent._provider_no_progress_should_trip("provider_invalid_response"):
+                        if agent._has_pending_fallback():
+                            event = agent._provider_no_progress_event(
+                                phase="provider_invalid_response",
+                                failure_class="invalid_response",
+                                action="fallback",
+                            )
+                            agent._buffer_status(
+                                "⚠️ Provider no-progress threshold exceeded — switching to fallback provider..."
+                            )
+                            if agent._try_activate_fallback():
+                                retry_count = 0
+                                compression_attempts = 0
+                                primary_recovery_attempted = False
+                                agent._provider_no_progress_mark_progress(
+                                    "fallback_activated", phase="provider_invalid_response"
+                                )
+                                continue
+                        event = agent._provider_no_progress_event(
+                            phase="provider_invalid_response",
+                            failure_class="invalid_response",
+                            action="degraded_partial",
+                        )
+                        agent._flush_status_buffer()
+                        agent._emit_status(
+                            "⚠️ Provider no-progress threshold exceeded; preserving partial work."
+                        )
+                        agent._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": agent._provider_no_progress_partial_response(event),
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "partial": True,
+                            "failed": True,
+                            "recoverable": True,
+                            "provider_no_progress": event,
+                            "error": "Provider no-progress threshold exceeded after useful progress",
+                        }
                     
                     # Backoff before retry — jittered exponential: 5s base, 120s cap
                     wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
@@ -1885,6 +1936,45 @@ def run_conversation(
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "interrupted": True,
+                            }
+                        if agent._provider_no_progress_should_trip("provider_retry_backoff"):
+                            if agent._has_pending_fallback():
+                                event = agent._provider_no_progress_event(
+                                    phase="provider_retry_backoff",
+                                    failure_class="invalid_response_backoff",
+                                    action="fallback",
+                                )
+                                agent._buffer_status(
+                                    "⚠️ Provider no-progress threshold exceeded during retry backoff — switching to fallback provider..."
+                                )
+                                if agent._try_activate_fallback():
+                                    retry_count = 0
+                                    compression_attempts = 0
+                                    primary_recovery_attempted = False
+                                    agent._provider_no_progress_mark_progress(
+                                        "fallback_activated", phase="provider_retry_backoff"
+                                    )
+                                    break
+                            event = agent._provider_no_progress_event(
+                                phase="provider_retry_backoff",
+                                failure_class="invalid_response_backoff",
+                                action="degraded_partial",
+                            )
+                            agent._flush_status_buffer()
+                            agent._emit_status(
+                                "⚠️ Provider no-progress threshold exceeded; preserving partial work."
+                            )
+                            agent._persist_session(messages, conversation_history)
+                            return {
+                                "final_response": agent._provider_no_progress_partial_response(event),
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "partial": True,
+                                "failed": True,
+                                "recoverable": True,
+                                "provider_no_progress": event,
+                                "error": "Provider no-progress threshold exceeded during retry backoff",
                             }
                         time.sleep(0.2)
                         # Touch activity every ~30s so the gateway's inactivity
@@ -2919,6 +3009,13 @@ def run_conversation(
                 agent._touch_activity(
                     f"API error recovery (attempt {retry_count}/{max_retries})"
                 )
+                try:
+                    agent._record_provider_no_progress_retry(
+                        phase="provider_api_error",
+                        failure_class=classified.reason.value,
+                    )
+                except Exception:
+                    pass
                 
                 error_type = type(api_error).__name__
                 error_msg = str(api_error).lower()
@@ -2980,6 +3077,46 @@ def run_conversation(
                         "api_calls": api_call_count,
                         "completed": False,
                         "interrupted": True,
+                    }
+
+                if agent._provider_no_progress_should_trip("provider_api_error"):
+                    if agent._has_pending_fallback():
+                        event = agent._provider_no_progress_event(
+                            phase="provider_api_error",
+                            failure_class=classified.reason.value,
+                            action="fallback",
+                        )
+                        agent._buffer_status(
+                            "⚠️ Provider no-progress threshold exceeded — switching to fallback provider..."
+                        )
+                        if agent._try_activate_fallback(reason=classified.reason):
+                            retry_count = 0
+                            compression_attempts = 0
+                            primary_recovery_attempted = False
+                            agent._provider_no_progress_mark_progress(
+                                "fallback_activated", phase="provider_api_error"
+                            )
+                            continue
+                    event = agent._provider_no_progress_event(
+                        phase="provider_api_error",
+                        failure_class=classified.reason.value,
+                        action="degraded_partial",
+                    )
+                    agent._flush_status_buffer()
+                    agent._emit_status(
+                        "⚠️ Provider no-progress threshold exceeded; preserving partial work."
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": agent._provider_no_progress_partial_response(event),
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "partial": True,
+                        "failed": True,
+                        "recoverable": True,
+                        "provider_no_progress": event,
+                        "error": "Provider no-progress threshold exceeded after useful progress",
                     }
                 
                 # Check for 413 payload-too-large BEFORE generic 4xx handler.
@@ -3945,6 +4082,13 @@ def run_conversation(
                 pass
 
             # Handle assistant response
+            if assistant_message.content and agent._has_content_after_think_block(assistant_message.content):
+                try:
+                    agent._provider_no_progress_mark_progress(
+                        "assistant_content", phase="assistant_response"
+                    )
+                except Exception:
+                    pass
             if assistant_message.content and not agent.quiet_mode:
                 if agent.verbose_logging:
                     agent._vprint(f"{agent.log_prefix}🤖 Assistant: {assistant_message.content}")

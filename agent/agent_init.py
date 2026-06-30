@@ -1185,6 +1185,22 @@ def init_agent(
         _api_retries = 3
     agent._api_max_retries = _api_retries
 
+    try:
+        _raw_no_progress_timeout = _agent_section.get("provider_no_progress_timeout", 900)
+        _no_progress_timeout = float(_raw_no_progress_timeout)
+        if _no_progress_timeout < 0:
+            _no_progress_timeout = 0.0
+    except (TypeError, ValueError):
+        _no_progress_timeout = 900.0
+    agent._provider_no_progress_timeout = _no_progress_timeout
+    agent._provider_no_progress_started_at = time.time()
+    agent._provider_no_progress_last_progress_at = time.time()
+    agent._provider_no_progress_last_progress_reason = "initializing"
+    agent._provider_no_progress_useful_seen = False
+    agent._provider_no_progress_retry_count = 0
+    agent._provider_no_progress_events = []
+    agent._last_provider_no_progress_event = None
+
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit
     # Configuration via config.yaml (compression section)
