@@ -86,9 +86,11 @@ class HonchoProxyHealthFacts:
     reachability_detail: str = "not probed"
     route_source: str = "route unavailable"
     warning_count: int | None = None
+    warning_counts: tuple[tuple[str, int], ...] = ()
     warning_window_minutes: int = _HONCHO_PROXY_WARNING_WINDOW_MINUTES
     warning_source: str = "logs unavailable"
     rss_mb: float | None = None
+    rss_samples: tuple[tuple[str, float], ...] = ()
     rss_growth_mb: float | None = None
     memory_source: str = "memory telemetry unavailable"
     warning_count_threshold: int = _HONCHO_PROXY_WARNING_COUNT_THRESHOLD
@@ -181,38 +183,65 @@ def _honcho_proxy_source_label(source: str) -> str:
 
 def classify_honcho_proxy_health(facts: HonchoProxyHealthFacts) -> HonchoProxyHealthResult:
     """Classify bounded Honcho/OpenAI proxy facts without collecting live state."""
-    rate = _honcho_proxy_warning_rate(facts)
-    warning_breached = facts.warning_count is not None and (
-        facts.warning_count >= facts.warning_count_threshold
-        or (rate is not None and rate >= facts.warning_rate_threshold_per_minute)
+    warning_counts = facts.warning_counts
+    if not warning_counts and facts.warning_count is not None:
+        warning_counts = ((facts.warning_source, facts.warning_count),)
+    max_warning_count = max((count for _, count in warning_counts), default=None)
+    rate = (
+        None
+        if max_warning_count is None or facts.warning_window_minutes <= 0
+        else max_warning_count / facts.warning_window_minutes
     )
+    warning_breached = any(
+        count >= facts.warning_count_threshold
+        or (
+            facts.warning_window_minutes > 0
+            and count / facts.warning_window_minutes >= facts.warning_rate_threshold_per_minute
+        )
+        for _, count in warning_counts
+    )
+    rss_samples = facts.rss_samples
+    if not rss_samples and facts.rss_mb is not None:
+        rss_samples = ((facts.memory_source, facts.rss_mb),)
+    max_rss_mb = max((rss_mb for _, rss_mb in rss_samples), default=None)
     memory_breached = (
-        (facts.rss_mb is not None and facts.rss_mb >= facts.rss_warning_mb)
+        (max_rss_mb is not None and max_rss_mb >= facts.rss_warning_mb)
         or (facts.rss_growth_mb is not None and facts.rss_growth_mb >= facts.rss_growth_warning_mb)
     )
     reachability_failed = facts.reachable is False
 
     lines: list[str] = []
-    if facts.warning_count is None:
+    if max_warning_count is None:
         lines.append(f"{_HONCHO_PROXY_WARNING_CLASS}: unavailable ({_honcho_proxy_source_label(facts.warning_source)})")
     else:
         rate_text = f", {rate:.2f}/min" if rate is not None else ""
+        source_text = ", ".join(
+            f"{_honcho_proxy_source_label(source)}={count}"
+            for source, count in warning_counts
+        )
         lines.append(
-            f"{_HONCHO_PROXY_WARNING_CLASS}: {facts.warning_count} in "
+            f"{_HONCHO_PROXY_WARNING_CLASS}: {max_warning_count} in "
             f"{facts.warning_window_minutes}m{rate_text}; threshold "
             f">={facts.warning_count_threshold} or >={facts.warning_rate_threshold_per_minute:.2f}/min "
-            f"({_honcho_proxy_source_label(facts.warning_source)})"
+            f"({source_text})"
         )
 
-    if facts.rss_mb is None and facts.rss_growth_mb is None:
+    if max_rss_mb is None and facts.rss_growth_mb is None:
         lines.append(f"memory: unavailable ({_honcho_proxy_source_label(facts.memory_source)})")
     else:
         mem_parts = []
-        if facts.rss_mb is not None:
-            mem_parts.append(f"rss={facts.rss_mb:.1f} MiB threshold={facts.rss_warning_mb:.1f} MiB")
+        if max_rss_mb is not None:
+            source_text = ", ".join(
+                f"{_honcho_proxy_source_label(source)}={rss_mb:.1f} MiB"
+                for source, rss_mb in rss_samples
+            )
+            mem_parts.append(
+                f"rss={max_rss_mb:.1f} MiB threshold={facts.rss_warning_mb:.1f} MiB "
+                f"({source_text})"
+            )
         if facts.rss_growth_mb is not None:
             mem_parts.append(f"growth={facts.rss_growth_mb:.1f} MiB threshold={facts.rss_growth_warning_mb:.1f} MiB")
-        lines.append(f"memory: {'; '.join(mem_parts)} ({_honcho_proxy_source_label(facts.memory_source)})")
+        lines.append(f"memory: {'; '.join(mem_parts)}")
 
     lines.append(f"reachability: {facts.reachability_detail}")
     lines.append(f"route source: {_honcho_proxy_source_label(facts.route_source)}")
@@ -263,7 +292,8 @@ def _run_honcho_proxy_probe_command(args: list[str], timeout: float = _HONCHO_PR
         return None
 
 
-def _count_honcho_proxy_warnings() -> tuple[int | None, str]:
+def _collect_honcho_proxy_warning_counts() -> tuple[tuple[str, int], ...]:
+    counts: list[tuple[str, int]] = []
     for unit in _HONCHO_PROXY_CANDIDATE_UNITS:
         proc = _run_honcho_proxy_probe_command(
             [
@@ -281,8 +311,10 @@ def _count_honcho_proxy_warnings() -> tuple[int | None, str]:
             ],
             timeout=3.0,
         )
-        if proc and proc.returncode == 0 and proc.stdout:
-            return proc.stdout.count(_HONCHO_PROXY_WARNING_CLASS), f"journalctl user unit {unit}"
+        if proc and proc.returncode == 0:
+            counts.append(
+                (f"journalctl user unit {unit}", proc.stdout.count(_HONCHO_PROXY_WARNING_CLASS))
+            )
 
     for container in _HONCHO_PROXY_CANDIDATE_CONTAINERS:
         proc = _run_honcho_proxy_probe_command(
@@ -299,7 +331,15 @@ def _count_honcho_proxy_warnings() -> tuple[int | None, str]:
         )
         if proc and proc.returncode == 0:
             text = f"{proc.stdout}\n{proc.stderr}"
-            return text.count(_HONCHO_PROXY_WARNING_CLASS), f"docker logs {container}"
+            counts.append((f"docker logs {container}", text.count(_HONCHO_PROXY_WARNING_CLASS)))
+    return tuple(counts)
+
+
+def _count_honcho_proxy_warnings() -> tuple[int | None, str]:
+    counts = _collect_honcho_proxy_warning_counts()
+    if counts:
+        source, count = max(counts, key=lambda item: item[1])
+        return count, source
     return None, "no readable candidate journal or docker logs"
 
 
@@ -334,7 +374,8 @@ def _parse_docker_memory_mb(value: str) -> float | None:
     return amount * multipliers.get(unit, 1)
 
 
-def _collect_honcho_proxy_memory() -> tuple[float | None, str]:
+def _collect_honcho_proxy_memory_samples() -> tuple[tuple[str, float], ...]:
+    samples: list[tuple[str, float]] = []
     for unit in _HONCHO_PROXY_CANDIDATE_UNITS:
         proc = _run_honcho_proxy_probe_command(
             ["systemctl", "--user", "show", unit, "--property", "MemoryCurrent", "--value"],
@@ -343,7 +384,7 @@ def _collect_honcho_proxy_memory() -> tuple[float | None, str]:
         if proc and proc.returncode == 0:
             rss_mb = _parse_memory_bytes(proc.stdout)
             if rss_mb is not None:
-                return rss_mb, f"systemd user unit {unit}"
+                samples.append((f"systemd user unit {unit}", rss_mb))
 
     for container in _HONCHO_PROXY_CANDIDATE_CONTAINERS:
         proc = _run_honcho_proxy_probe_command(
@@ -353,7 +394,15 @@ def _collect_honcho_proxy_memory() -> tuple[float | None, str]:
         if proc and proc.returncode == 0 and proc.stdout.strip():
             rss_mb = _parse_docker_memory_mb(proc.stdout.strip())
             if rss_mb is not None:
-                return rss_mb, f"docker stats {container}"
+                samples.append((f"docker stats {container}", rss_mb))
+    return tuple(samples)
+
+
+def _collect_honcho_proxy_memory() -> tuple[float | None, str]:
+    samples = _collect_honcho_proxy_memory_samples()
+    if samples:
+        source, rss_mb = max(samples, key=lambda item: item[1])
+        return rss_mb, source
     return None, "no readable candidate systemd unit or docker container"
 
 
@@ -424,8 +473,16 @@ def _probe_honcho_proxy_reachability() -> tuple[bool | None, str]:
 
 
 def collect_honcho_proxy_health_facts() -> HonchoProxyHealthFacts:
-    warning_count, warning_source = _count_honcho_proxy_warnings()
-    rss_mb, memory_source = _collect_honcho_proxy_memory()
+    warning_counts = _collect_honcho_proxy_warning_counts()
+    if warning_counts:
+        warning_source, warning_count = max(warning_counts, key=lambda item: item[1])
+    else:
+        warning_count, warning_source = None, "no readable candidate journal or docker logs"
+    rss_samples = _collect_honcho_proxy_memory_samples()
+    if rss_samples:
+        memory_source, rss_mb = max(rss_samples, key=lambda item: item[1])
+    else:
+        rss_mb, memory_source = None, "no readable candidate systemd unit or docker container"
     route = _configured_local_openai_proxy_route()
     reachable, reachability_detail = _probe_honcho_proxy_reachability()
     return HonchoProxyHealthFacts(
@@ -433,8 +490,10 @@ def collect_honcho_proxy_health_facts() -> HonchoProxyHealthFacts:
         reachability_detail=reachability_detail,
         route_source=route.source if route else "route unavailable",
         warning_count=warning_count,
+        warning_counts=warning_counts,
         warning_source=warning_source,
         rss_mb=rss_mb,
+        rss_samples=rss_samples,
         memory_source=memory_source,
     )
 
