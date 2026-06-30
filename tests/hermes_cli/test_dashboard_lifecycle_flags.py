@@ -15,7 +15,9 @@ import sys
 from unittest.mock import patch, MagicMock
 
 import pytest
+import yaml
 
+import hermes_cli.dashboard_lifecycle as lifecycle
 from hermes_cli.main import cmd_dashboard
 
 
@@ -33,6 +35,7 @@ class TestDashboardStatus:
     def test_status_no_processes(self, capsys):
         with patch("hermes_cli.main._find_stale_dashboard_pids",
                    return_value=[]), \
+             patch("hermes_cli.main.detect_dashboard_port_owner", return_value=None), \
              pytest.raises(SystemExit) as exc:
             cmd_dashboard(_ns(status=True))
         assert exc.value.code == 0
@@ -42,6 +45,7 @@ class TestDashboardStatus:
     def test_status_with_processes(self, capsys):
         with patch("hermes_cli.main._find_stale_dashboard_pids",
                    return_value=[12345, 12346]), \
+             patch("hermes_cli.main.detect_dashboard_port_owner", return_value=None), \
              pytest.raises(SystemExit) as exc:
             cmd_dashboard(_ns(status=True))
         # Status is informational — always exits 0.
@@ -63,10 +67,65 @@ class TestDashboardStatus:
 
         with patch("hermes_cli.main._find_stale_dashboard_pids",
                    return_value=[]), \
+             patch("hermes_cli.main.detect_dashboard_port_owner", return_value=None), \
              patch("builtins.__import__", side_effect=fake_import), \
              pytest.raises(SystemExit) as exc:
             cmd_dashboard(_ns(status=True))
         assert exc.value.code == 0
+
+    def test_status_reports_default_port_collision_without_dashboard_process(self, capsys):
+        owner = lifecycle.DashboardPortOwner(
+            host="127.0.0.1",
+            port=9119,
+            pid=12345,
+            command_basename="python",
+            argv_summary="python -m http.server 9119",
+            is_hermes_dashboard=False,
+            source="test",
+        )
+        with patch("hermes_cli.main._find_stale_dashboard_pids", return_value=[]), \
+             patch("hermes_cli.main.detect_dashboard_port_owner", return_value=owner), \
+             pytest.raises(SystemExit) as exc:
+            cmd_dashboard(_ns(status=True))
+
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "No hermes dashboard processes running" in out
+        assert "127.0.0.1:9119 is occupied" in out
+        assert "unmanaged active instance/port collision" in out
+        assert "PID 12345" in out
+        assert "command python" in out
+
+    def test_status_uses_configured_non_default_bind(self, capsys):
+        owner = lifecycle.DashboardPortOwner(
+            host="127.0.0.1",
+            port=9127,
+            pid=23456,
+            command_basename="python",
+            argv_summary="python -m http.server 9127 --password <redacted>",
+            is_hermes_dashboard=False,
+            source="test",
+        )
+
+        def fake_owner(host, port):
+            assert (host, port) == ("127.0.0.1", 9127)
+            return owner
+
+        from hermes_cli.config import get_hermes_home
+
+        (get_hermes_home() / "config.yaml").write_text(
+            yaml.safe_dump({"dashboard": {"host": "127.0.0.1", "port": 9127}}),
+            encoding="utf-8",
+        )
+        with patch("hermes_cli.main._find_stale_dashboard_pids", return_value=[]), \
+             patch("hermes_cli.main.detect_dashboard_port_owner", side_effect=fake_owner), \
+             pytest.raises(SystemExit) as exc:
+            cmd_dashboard(_ns(status=True, host=None, port=None))
+
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "127.0.0.1:9127 is occupied" in out
+        assert "127.0.0.1:9119" not in out
 
 
 class TestDashboardStop:
@@ -134,6 +193,7 @@ class TestLifecycleFlagsTakePrecedence:
     def test_status_wins_over_stop(self, capsys):
         with patch("hermes_cli.main._find_stale_dashboard_pids",
                    return_value=[]), \
+             patch("hermes_cli.main.detect_dashboard_port_owner", return_value=None), \
              patch("hermes_cli.main._kill_stale_dashboard_processes") as mock_kill, \
              pytest.raises(SystemExit):
             cmd_dashboard(_ns(status=True, stop=True))
@@ -176,12 +236,35 @@ class TestDashboardStartPreflight:
             with patch.dict(sys.modules, {"hermes_cli.web_server": fake_ws}), pytest.raises(SystemExit) as exc:
                 cmd_dashboard(_ns(port=port))
 
-        assert exc.value.code == 1
+        assert exc.value.code == 98
         assert called["start"] is False
         err = capsys.readouterr().err
         assert f"127.0.0.1:{port}" in err
-        assert "hermes dashboard --stop" in err
+        assert "Owner: PID" in err
+        assert "hermes dashboard --port <port>" in err
         assert "hermes-dashboard.service" in err
+        assert "RestartPreventExitStatus=98" in err
+
+    def test_start_preflight_uses_configured_non_default_bind(self, capsys):
+        from hermes_cli.config import get_hermes_home
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            port = sock.getsockname()[1]
+            (get_hermes_home() / "config.yaml").write_text(
+                yaml.safe_dump({"dashboard": {"host": "127.0.0.1", "port": port}}),
+                encoding="utf-8",
+            )
+
+            with pytest.raises(SystemExit) as exc:
+                cmd_dashboard(_ns(host=None, port=None))
+
+        assert exc.value.code == 98
+        err = capsys.readouterr().err
+        assert f"127.0.0.1:{port}" in err
+        assert "127.0.0.1:9119" not in err
+        assert "already in use" in err
 
 
 class TestDashboardRestart:
@@ -230,6 +313,7 @@ class TestArgparseWiring:
         # we just want to know the flags don't KeyError.
         with patch("hermes_cli.main._find_stale_dashboard_pids",
                    return_value=[]), \
+             patch("hermes_cli.main.detect_dashboard_port_owner", return_value=None), \
              pytest.raises(SystemExit) as exc:
             mod.cmd_dashboard(_ns(status=True))
         assert exc.value.code == 0

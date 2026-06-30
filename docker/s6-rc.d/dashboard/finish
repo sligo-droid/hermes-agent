@@ -18,6 +18,12 @@
 
 case "${HERMES_DASHBOARD:-}" in
     1|true|TRUE|True|yes|YES|Yes)
+        if [ "${1:-}" = "98" ]; then
+            # hermes dashboard uses 98 for a preflighted bind collision.
+            # Treat that as operator-actionable permanent failure instead of
+            # letting s6 restart forever against a known occupied host:port.
+            exit 125
+        fi
         # Dashboard was enabled — let s6-supervise restart on crash by
         # exiting non-125. (Pass-through any sensible default.)
         exit 0

@@ -23,10 +23,10 @@ def build_dashboard_parser(
         description="Launch the Hermes Agent web dashboard for managing config, API keys, and sessions",
     )
     dashboard_parser.add_argument(
-        "--port", type=int, default=9119, help="Port (default 9119, 0 for auto-assign by OS)"
+        "--port", type=int, default=None, help="Port (default: dashboard.port or 9119, 0 for auto-assign by OS)"
     )
     dashboard_parser.add_argument(
-        "--host", default="127.0.0.1", help="Host (default 127.0.0.1)"
+        "--host", default=None, help="Host (default: dashboard.host or 127.0.0.1)"
     )
     dashboard_parser.add_argument(
         "--no-open", action="store_true", help="Don't open browser automatically"

@@ -1345,6 +1345,8 @@ DEFAULT_CONFIG = {
 
     # Web dashboard settings
     "dashboard": {
+        "host": "127.0.0.1",
+        "port": 9119,
         "theme": "default",  # Dashboard visual theme: "default", "midnight", "ember", "mono", "cyberpunk", "rose"
         # Hide the token/cost analytics surfaces (Analytics page, token bars and
         # cost figures on the Models page) by default.  The numbers shown there
