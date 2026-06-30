@@ -77,8 +77,70 @@ def test_ensure_dashboard_port_available_reports_service_recovery_hint():
 
     assert f"127.0.0.1:{port}" in message
     assert "already in use" in message
-    assert "hermes dashboard --stop" in message
+    assert "Owner: PID" in message
+    assert "classification: not Hermes dashboard" in message
+    assert "hermes dashboard --port <port>" in message
     assert "systemctl --user reset-failed hermes-dashboard.service" in message
+
+
+def test_dashboard_port_in_use_message_reports_hermes_owner_action():
+    owner = lifecycle.DashboardPortOwner(
+        host="127.0.0.1",
+        port=9119,
+        pid=123,
+        command_basename="python",
+        argv_summary="python -m hermes_cli.main dashboard --port 9119",
+        is_hermes_dashboard=True,
+        source="test",
+    )
+
+    message = lifecycle.dashboard_port_in_use_message("127.0.0.1", 9119, owner)
+
+    assert "127.0.0.1:9119" in message
+    assert "PID 123" in message
+    assert "command python" in message
+    assert "classification: Hermes dashboard" in message
+    assert "hermes dashboard --status" in message
+    assert "hermes dashboard --stop" in message
+    assert "systemctl --user restart hermes-dashboard.service" in message
+
+
+def test_dashboard_port_in_use_message_reports_unknown_owner_fallback():
+    message = lifecycle.dashboard_port_in_use_message("127.0.0.1", 9119, None)
+
+    assert "127.0.0.1:9119" in message
+    assert "Owner: unknown" in message
+    assert "hermes dashboard --port <port>" in message
+    assert "auto-kill" in message
+
+
+def test_ensure_dashboard_port_available_uses_injected_owner(monkeypatch):
+    owner = lifecycle.DashboardPortOwner(
+        host="127.0.0.1",
+        port=9119,
+        pid=456,
+        command_basename="hermes",
+        argv_summary="hermes dashboard --port 9119",
+        is_hermes_dashboard=True,
+        source="test",
+    )
+    monkeypatch.setattr(lifecycle, "detect_dashboard_port_owner", lambda host, port: owner)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        port = sock.getsockname()[1]
+
+        try:
+            lifecycle.ensure_dashboard_port_available("127.0.0.1", port)
+        except lifecycle.DashboardPortInUse as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("expected occupied dashboard port to fail")
+
+    assert f"127.0.0.1:{port}" in message
+    assert "PID 456" in message
+    assert "classification: Hermes dashboard" in message
 
 
 def test_ensure_dashboard_port_available_allows_free_port():

@@ -16,6 +16,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+import hermes_cli.dashboard_lifecycle as lifecycle
 from hermes_cli.main import cmd_dashboard
 
 
@@ -33,6 +34,7 @@ class TestDashboardStatus:
     def test_status_no_processes(self, capsys):
         with patch("hermes_cli.main._find_stale_dashboard_pids",
                    return_value=[]), \
+             patch("hermes_cli.main.detect_dashboard_port_owner", return_value=None), \
              pytest.raises(SystemExit) as exc:
             cmd_dashboard(_ns(status=True))
         assert exc.value.code == 0
@@ -42,6 +44,7 @@ class TestDashboardStatus:
     def test_status_with_processes(self, capsys):
         with patch("hermes_cli.main._find_stale_dashboard_pids",
                    return_value=[12345, 12346]), \
+             patch("hermes_cli.main.detect_dashboard_port_owner", return_value=None), \
              pytest.raises(SystemExit) as exc:
             cmd_dashboard(_ns(status=True))
         # Status is informational — always exits 0.
@@ -63,10 +66,34 @@ class TestDashboardStatus:
 
         with patch("hermes_cli.main._find_stale_dashboard_pids",
                    return_value=[]), \
+             patch("hermes_cli.main.detect_dashboard_port_owner", return_value=None), \
              patch("builtins.__import__", side_effect=fake_import), \
              pytest.raises(SystemExit) as exc:
             cmd_dashboard(_ns(status=True))
         assert exc.value.code == 0
+
+    def test_status_reports_default_port_collision_without_dashboard_process(self, capsys):
+        owner = lifecycle.DashboardPortOwner(
+            host="127.0.0.1",
+            port=9119,
+            pid=12345,
+            command_basename="python",
+            argv_summary="python -m http.server 9119",
+            is_hermes_dashboard=False,
+            source="test",
+        )
+        with patch("hermes_cli.main._find_stale_dashboard_pids", return_value=[]), \
+             patch("hermes_cli.main.detect_dashboard_port_owner", return_value=owner), \
+             pytest.raises(SystemExit) as exc:
+            cmd_dashboard(_ns(status=True))
+
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "No hermes dashboard processes running" in out
+        assert "127.0.0.1:9119 is occupied" in out
+        assert "unmanaged active instance/port collision" in out
+        assert "PID 12345" in out
+        assert "command python" in out
 
 
 class TestDashboardStop:
@@ -134,6 +161,7 @@ class TestLifecycleFlagsTakePrecedence:
     def test_status_wins_over_stop(self, capsys):
         with patch("hermes_cli.main._find_stale_dashboard_pids",
                    return_value=[]), \
+             patch("hermes_cli.main.detect_dashboard_port_owner", return_value=None), \
              patch("hermes_cli.main._kill_stale_dashboard_processes") as mock_kill, \
              pytest.raises(SystemExit):
             cmd_dashboard(_ns(status=True, stop=True))
@@ -180,7 +208,8 @@ class TestDashboardStartPreflight:
         assert called["start"] is False
         err = capsys.readouterr().err
         assert f"127.0.0.1:{port}" in err
-        assert "hermes dashboard --stop" in err
+        assert "Owner: PID" in err
+        assert "hermes dashboard --port <port>" in err
         assert "hermes-dashboard.service" in err
 
 
@@ -230,6 +259,7 @@ class TestArgparseWiring:
         # we just want to know the flags don't KeyError.
         with patch("hermes_cli.main._find_stale_dashboard_pids",
                    return_value=[]), \
+             patch("hermes_cli.main.detect_dashboard_port_owner", return_value=None), \
              pytest.raises(SystemExit) as exc:
             mod.cmd_dashboard(_ns(status=True))
         assert exc.value.code == 0

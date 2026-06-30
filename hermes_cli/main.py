@@ -345,6 +345,7 @@ _apply_profile_override()
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import get_hermes_home
 from hermes_cli.dashboard_lifecycle import (
+    detect_dashboard_port_owner,
     find_dashboard_pids as _find_stale_dashboard_pids,
     stop_dashboard_processes as _stop_dashboard_processes,
 )
@@ -10775,8 +10776,26 @@ def _report_dashboard_status() -> int:
     the exclusion is irrelevant here).
     """
     pids = _find_stale_dashboard_pids()
+    host = "127.0.0.1"
+    port = 9119
+    owner = detect_dashboard_port_owner(host, port)
     if not pids:
-        print("No hermes dashboard processes running.")
+        if owner is None:
+            print("No hermes dashboard processes running; default port 127.0.0.1:9119 is free.")
+        else:
+            pid = str(owner.pid) if owner.pid is not None else "unknown"
+            command = owner.command_basename or "unknown"
+            classification = (
+                "Hermes dashboard"
+                if owner.is_hermes_dashboard is True
+                else "unmanaged active instance/port collision"
+                if owner.is_hermes_dashboard is False
+                else "active port collision with unknown owner"
+            )
+            print(
+                f"No hermes dashboard processes running, but {host}:{port} is occupied "
+                f"({classification}; PID {pid}; command {command})."
+            )
         return 0
 
     print(f"{len(pids)} hermes dashboard process(es) running:")
@@ -10800,6 +10819,10 @@ def _report_dashboard_status() -> int:
             print(f"    PID {pid}: {cmdline}")
         else:
             print(f"    PID {pid}")
+    if owner is not None:
+        pid = str(owner.pid) if owner.pid is not None else "unknown"
+        command = owner.command_basename or "unknown"
+        print(f"Default port {host}:{port} owner: PID {pid}; command {command}.")
     return len(pids)
 
 
