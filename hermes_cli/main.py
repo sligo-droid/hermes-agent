@@ -10931,6 +10931,13 @@ def cmd_prompt_size(args):
     _impl(args)
 
 
+def cmd_compression_diagnostics(args):
+    """Show read-only compression/context exhaustion diagnostics."""
+    from hermes_cli.compression_diagnostics import run
+
+    raise SystemExit(run(args))
+
+
 def cmd_logs(args):
     """View and filter Hermes log files."""
     from hermes_cli.logs import tail_log, list_logs
@@ -10962,7 +10969,7 @@ def cmd_logs(args):
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
-        "computer-use",
+        "computer-use", "compression-diagnostics",
         "config", "cron", "curator", "dashboard", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
@@ -14324,6 +14331,38 @@ Examples:
         help="Emit the breakdown as JSON",
     )
     prompt_size_parser.set_defaults(func=cmd_prompt_size)
+
+    # =========================================================================
+    # compression-diagnostics command
+    # =========================================================================
+    compression_diag_parser = subparsers.add_parser(
+        "compression-diagnostics",
+        help="Read-only report for compression/context exhaustion recurrence",
+        description=(
+            "Aggregate safe session metadata and recent logs to distinguish "
+            "expected compression boundaries from degraded context resets."
+        ),
+    )
+    compression_diag_parser.add_argument(
+        "--since",
+        default="24h",
+        help="Time window lower bound (default: 24h; examples: 30m, 2d, ISO timestamp)",
+    )
+    compression_diag_parser.add_argument(
+        "--limit",
+        type=int,
+        default=25,
+        help="Maximum rows to print (default: 25)",
+    )
+    compression_diag_parser.add_argument(
+        "--db-path",
+        help="Override state.db path for fixture/testing runs",
+    )
+    compression_diag_parser.add_argument(
+        "--log-dir",
+        help="Override log directory for fixture/testing runs",
+    )
+    compression_diag_parser.set_defaults(func=cmd_compression_diagnostics)
 
     # =========================================================================
     # Parse and execute
