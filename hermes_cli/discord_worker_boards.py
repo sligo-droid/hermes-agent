@@ -27,6 +27,8 @@ from urllib.parse import quote, urlsplit, urlunsplit
 from hermes_cli import kanban_db
 from hermes_cli.discord_time import discord_message_exceeds_age_limit
 from hermes_cli.discord_thread_context import (
+    DISCORD_CONTEXT_KIND_SINGLE_MESSAGE,
+    discord_context_quality_from_text,
     expand_discord_thread_references,
     format_discord_thread_expansions,
     has_discord_thread_reference,
@@ -332,6 +334,7 @@ def _context_pack_digest(
     request: str,
     thread_context: str,
     plan_artifacts: Optional[list[dict[str, Any]]] = None,
+    context_quality: Optional[dict[str, Any]] = None,
 ) -> str:
     payload = json.dumps(
         {
@@ -339,6 +342,7 @@ def _context_pack_digest(
             "request": str(request or ""),
             "discord_thread_context": str(thread_context or ""),
             "plan_artifacts": _normalize_discord_plan_artifacts(plan_artifacts),
+            "discord_context_quality": dict(context_quality or {}),
         },
         sort_keys=True,
         ensure_ascii=False,
@@ -504,6 +508,9 @@ def render_context_pack_markdown(pack: dict[str, Any]) -> str:
     source_ids = [str(item) for item in pack.get("source_message_ids") or [] if str(item).strip()]
     plan_artifacts = _normalize_discord_plan_artifacts(pack.get("plan_artifacts"))
     plan_artifact_lines = [_format_plan_artifact_markdown(item) for item in plan_artifacts]
+    context_quality = (
+        pack.get("discord_context_quality") if isinstance(pack.get("discord_context_quality"), dict) else {}
+    )
     lines = [
         "# Discord Goal Context Pack",
         "",
@@ -511,6 +518,8 @@ def render_context_pack_markdown(pack: dict[str, Any]) -> str:
         f"Updated at: {pack.get('updated_at') or ''}",
         f"Truncated: {bool(pack.get('truncated'))}",
         f"Message count: {int(pack.get('message_count') or 0)}",
+        f"Discord context kind: {context_quality.get('kind') or 'none'}",
+        f"Discord degraded context: {bool(context_quality.get('degraded'))}",
         "",
         "## Root Goal",
         str(pack.get("root_goal") or ""),
@@ -560,6 +569,7 @@ def _context_pack_summary(board: str, pack: Optional[dict[str, Any]] = None) -> 
             str(item) for item in data.get("source_message_ids") or [] if str(item).strip()
         ],
         "plan_artifacts": _normalize_discord_plan_artifacts(data.get("plan_artifacts")),
+        "discord_context_quality": dict(data.get("discord_context_quality") or {}),
     }
 
 
@@ -573,11 +583,13 @@ def write_context_pack(
 ) -> dict[str, Any]:
     existing = read_context_pack(board)
     normalized_artifacts = _normalize_discord_plan_artifacts(plan_artifacts)
+    context_quality = discord_context_quality_from_text(thread_context)
     digest = _context_pack_digest(
         root_goal,
         request,
         thread_context,
         normalized_artifacts,
+        context_quality,
     )
     version = int(existing.get("version") or 0) if existing else 0
     if existing.get("content_digest") != digest:
@@ -597,6 +609,7 @@ def write_context_pack(
         "truncated": truncated,
         "source_message_ids": _context_pack_source_message_ids("\n".join([root_goal, request, thread_context])),
         "plan_artifacts": normalized_artifacts,
+        "discord_context_quality": context_quality,
         "warnings": warnings,
         "content_digest": digest,
     }
@@ -5458,6 +5471,16 @@ def start_planner_request(
         worker["latest_goal_thread_context"] = thread_context_text
     else:
         worker.pop("latest_goal_thread_context", None)
+    context_quality = _discord_context_quality_metadata(thread_context_text)
+    worker["discord_context_quality"] = context_quality
+    logger.info(
+        "discord_worker_context_quality board=%s kind=%s degraded=%s has_thread_plan=%s blocker=%s",
+        board.slug,
+        context_quality.get("kind"),
+        context_quality.get("degraded"),
+        context_quality.get("has_thread_plan"),
+        bool(context_quality.get("blocker")),
+    )
     context_pack = write_context_pack(
         board.slug,
         root_goal=raw_request,
@@ -5519,6 +5542,15 @@ def _merge_expanded_discord_thread_context(request: str, thread_context: str) ->
     return expanded
 
 
+def _discord_context_quality_metadata(thread_context: str) -> dict[str, Any]:
+    quality = discord_context_quality_from_text(thread_context)
+    if quality.get("kind") == DISCORD_CONTEXT_KIND_SINGLE_MESSAGE:
+        quality["blocker"] = (
+            "Only degraded Discord single-message context is available; a full Discord thread plan was not resolved."
+        )
+    return quality
+
+
 def _planner_request_fingerprint(request: str) -> str:
     return re.sub(r"\s+", " ", _canonical_planner_request_text(request)).strip().casefold()
 
@@ -5565,6 +5597,13 @@ def _planner_instructions(worker: Optional[dict[str, Any]] = None) -> list[str]:
     hints = context.get("worker_context_hints") if isinstance(context, dict) else None
     if isinstance(hints, list):
         instructions.extend(str(hint).strip() for hint in hints if str(hint).strip())
+    quality = worker.get("discord_context_quality") if isinstance(worker, dict) else None
+    if isinstance(quality, dict) and quality.get("kind") == DISCORD_CONTEXT_KIND_SINGLE_MESSAGE:
+        instructions.append(
+            "The Discord reference resolved only to degraded single-message context, not a full thread plan. "
+            "If the requested route depends on acceptance criteria, review notes, completion signals, or plan history "
+            "that are not present, return blocked instead of inventing missing thread-plan details."
+        )
     return instructions
 
 
@@ -5794,6 +5833,7 @@ def _ensure_planner_task(
                 "root_goal": worker.get("root_goal") or worker.get("initial_request") or "",
                 "request": planner_request,
                 "discord_thread_context": thread_context_text,
+                "discord_context_quality": _discord_context_quality_metadata(thread_context_text),
                 "context_pack": _context_pack_summary(board),
                 "discord_plan_artifacts": _normalize_discord_plan_artifacts(
                     worker.get("discord_plan_artifacts")
@@ -5850,6 +5890,10 @@ def _set_planner_thread_context(
         changed = True
     if context_pack:
         payload["context_pack"] = context_pack
+        changed = True
+    quality = _discord_context_quality_metadata(thread_context)
+    if payload.get("discord_context_quality") != quality:
+        payload["discord_context_quality"] = quality
         changed = True
     if discord_plan_artifacts is not None:
         normalized_artifacts = _normalize_discord_plan_artifacts(discord_plan_artifacts)

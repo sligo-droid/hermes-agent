@@ -29,6 +29,25 @@ def _request(messages):
     return fake
 
 
+def _request_single_message(messages, *, fail_surrounding=False):
+    target_id = messages[len(messages) // 2]["id"]
+
+    def fake(method, path, token, params=None, body=None, timeout=15):
+        assert token == "token"
+        if path == f"/channels/{target_id}":
+            return {"id": target_id, "type": 0, "name": "not-a-thread"}
+        if path == f"/channels/{PARENT_ID}/messages/{target_id}":
+            return next(item for item in messages if item["id"] == target_id)
+        if path == f"/channels/{PARENT_ID}/messages":
+            assert params == {"limit": "9", "around": target_id}
+            if fail_surrounding:
+                raise RuntimeError("missing access")
+            return list(reversed(messages))
+        raise AssertionError(f"unexpected Discord request: {method} {path}")
+
+    return fake, target_id
+
+
 def test_url_to_thread_starter_expands_last_plan_like_bot_messages():
     messages = [
         _message("100", "OP: please discuss", bot=False),
@@ -87,3 +106,39 @@ def test_token_falls_back_to_discord_tool_config(monkeypatch):
 
     assert expansion.selected_message_ids == ("401",)
     assert "Use configured token" in expansion.content
+
+
+def test_single_message_url_formats_degraded_context_with_surrounding_messages():
+    messages = [
+        _message("1511799412559708501", "Earlier context", bot=False, username="Alice"),
+        _message("1511799412559708502", "Please implement this small fix", bot=False, username="Bob"),
+        _message("1511799412559708503", "Later acknowledgement", bot=False, username="Alice"),
+    ]
+    request, target_id = _request_single_message(messages)
+    url = f"https://discord.com/channels/{GUILD_ID}/{PARENT_ID}/{target_id}"
+
+    expansion = expand_discord_thread_references(url, token="token", request_func=request)[0]
+    formatted = expansion.formatted()
+
+    assert expansion.context_kind == "single_message"
+    assert expansion.surrounding_context_fetched is True
+    assert "[Expanded Discord single-message context]" in formatted
+    assert "[Expanded Discord thread plan]" not in formatted
+    assert "Degraded context: true" in formatted
+    assert "do not assume missing thread history" in formatted
+    assert "Earlier context" in formatted
+    assert "Please implement this small fix" in formatted
+    assert expansion.selected_message_ids == tuple(item["id"] for item in messages)
+
+
+def test_single_message_url_keeps_target_when_surrounding_context_unavailable():
+    messages = [_message("1511799412559708602", "Only this message is visible", bot=False, username="Bob")]
+    request, target_id = _request_single_message(messages, fail_surrounding=True)
+    url = f"https://discord.com/channels/{GUILD_ID}/{PARENT_ID}/{target_id}"
+
+    expansion = expand_discord_thread_references(url, token="token", request_func=request)[0]
+
+    assert expansion.context_kind == "single_message"
+    assert expansion.surrounding_context_fetched is False
+    assert "Only this message is visible" in expansion.content
+    assert any("surrounding context was unavailable" in warning for warning in expansion.warnings)
