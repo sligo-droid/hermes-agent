@@ -28,6 +28,19 @@ _DASHBOARD_PATTERNS = (
 _RUNTIME_DIRNAME = "dashboard"
 _RUNTIME_FILENAME = "runtime.json"
 _LOG_FILENAME = "dashboard.log"
+_SECRET_ARG_MARKERS = (
+    "api_key",
+    "apikey",
+    "auth",
+    "client_secret",
+    "credential",
+    "key",
+    "oauth",
+    "pass",
+    "password",
+    "secret",
+    "token",
+)
 
 
 @dataclass(frozen=True)
@@ -61,10 +74,36 @@ def dashboard_log_path() -> Path:
     return get_hermes_home() / "logs" / _LOG_FILENAME
 
 
-def _argv_summary(argv: list[str] | None, *, max_chars: int = 160) -> str | None:
+def _looks_secret_arg(name: str) -> bool:
+    normalized = name.strip().lstrip("-").lower().replace("-", "_")
+    return any(marker in normalized for marker in _SECRET_ARG_MARKERS)
+
+
+def _redact_argv(argv: list[str]) -> list[str]:
+    redacted: list[str] = []
+    redact_next = False
+    for part in argv:
+        if redact_next:
+            redacted.append("<redacted>")
+            redact_next = False
+            continue
+        if "=" in part:
+            key, _value = part.split("=", 1)
+            if _looks_secret_arg(key):
+                redacted.append(f"{key}=<redacted>")
+                continue
+        if part.startswith("-") and _looks_secret_arg(part):
+            redacted.append(part)
+            redact_next = True
+            continue
+        redacted.append(part)
+    return redacted
+
+
+def safe_argv_summary(argv: list[str] | None, *, max_chars: int = 160) -> str | None:
     if not argv:
         return None
-    summary = shlex.join(argv)
+    summary = shlex.join(_redact_argv(argv))
     if len(summary) <= max_chars:
         return summary
     return summary[: max_chars - 3] + "..."
@@ -169,7 +208,7 @@ def detect_dashboard_port_owner(host: str, port: int) -> DashboardPortOwner | No
                 port=port,
                 pid=pid,
                 command_basename=_command_basename(argv),
-                argv_summary=_argv_summary(argv),
+                argv_summary=safe_argv_summary(argv),
                 is_hermes_dashboard=_argv_matches_dashboard(argv) if argv else _command_matches_dashboard(command),
                 source="proc-net-fd",
             )

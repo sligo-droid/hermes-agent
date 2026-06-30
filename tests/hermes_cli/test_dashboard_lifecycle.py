@@ -114,6 +114,29 @@ def test_dashboard_port_in_use_message_reports_unknown_owner_fallback():
     assert "auto-kill" in message
 
 
+def test_safe_argv_summary_redacts_secret_and_auth_values():
+    summary = lifecycle.safe_argv_summary(
+        [
+            "python",
+            "-m",
+            "http.server",
+            "--token",
+            "super-secret-token",
+            "--basic-auth-password=hunter2",
+            "--name",
+            "dashboard",
+        ]
+    )
+
+    assert summary is not None
+    assert "super-secret-token" not in summary
+    assert "hunter2" not in summary
+    assert "--token" in summary
+    assert "<redacted>" in summary
+    assert "basic-auth-password" in summary
+    assert "--name dashboard" in summary
+
+
 def test_ensure_dashboard_port_available_uses_injected_owner(monkeypatch):
     owner = lifecycle.DashboardPortOwner(
         host="127.0.0.1",

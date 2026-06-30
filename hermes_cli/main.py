@@ -343,10 +343,11 @@ _apply_profile_override()
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
-from hermes_cli.config import get_hermes_home
+from hermes_cli.config import cfg_get, get_hermes_home, load_config
 from hermes_cli.dashboard_lifecycle import (
     detect_dashboard_port_owner,
     find_dashboard_pids as _find_stale_dashboard_pids,
+    safe_argv_summary,
     stop_dashboard_processes as _stop_dashboard_processes,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -10767,7 +10768,25 @@ def _render_distribution_plan(plan) -> None:
         )
 
 
-def _report_dashboard_status() -> int:
+def _dashboard_bind_from_config(args=None) -> tuple[str, int]:
+    cfg = load_config()
+    host = str(cfg_get(cfg, "dashboard", "host", default="127.0.0.1") or "127.0.0.1")
+    raw_port = cfg_get(cfg, "dashboard", "port", default=9119)
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError):
+        port = 9119
+    if args is not None:
+        arg_host = getattr(args, "host", None)
+        arg_port = getattr(args, "port", None)
+        if arg_host is not None:
+            host = arg_host
+        if arg_port is not None:
+            port = arg_port
+    return host, port
+
+
+def _report_dashboard_status(args=None) -> int:
     """Print ``hermes dashboard`` PIDs and return the count.
 
     Uses the same detection logic as ``_find_stale_dashboard_pids`` (the
@@ -10776,12 +10795,11 @@ def _report_dashboard_status() -> int:
     the exclusion is irrelevant here).
     """
     pids = _find_stale_dashboard_pids()
-    host = "127.0.0.1"
-    port = 9119
+    host, port = _dashboard_bind_from_config(args)
     owner = detect_dashboard_port_owner(host, port)
     if not pids:
         if owner is None:
-            print("No hermes dashboard processes running; default port 127.0.0.1:9119 is free.")
+            print(f"No hermes dashboard processes running; configured port {host}:{port} is free.")
         else:
             pid = str(owner.pid) if owner.pid is not None else "unknown"
             command = owner.command_basename or "unknown"
@@ -10816,13 +10834,14 @@ def _report_dashboard_status() -> int:
         except (OSError, ValueError):
             pass
         if cmdline:
-            print(f"    PID {pid}: {cmdline}")
+            argv = cmdline.split()
+            print(f"    PID {pid}: {safe_argv_summary(argv) or cmdline}")
         else:
             print(f"    PID {pid}")
     if owner is not None:
         pid = str(owner.pid) if owner.pid is not None else "unknown"
         command = owner.command_basename or "unknown"
-        print(f"Default port {host}:{port} owner: PID {pid}; command {command}.")
+        print(f"Configured port {host}:{port} owner: PID {pid}; command {command}.")
     return len(pids)
 
 
@@ -10830,7 +10849,7 @@ def cmd_dashboard(args):
     """Start the web UI server, or (with --stop/--status) manage running ones."""
     # --status: report running dashboards and exit, no deps needed.
     if getattr(args, "status", False):
-        count = _report_dashboard_status()
+        count = _report_dashboard_status(args)
         sys.exit(0 if count == 0 else 0)  # status is informational, always 0
 
     # --stop: kill any running dashboards and exit, no deps needed.
@@ -10852,6 +10871,10 @@ def cmd_dashboard(args):
         restarted = restart_dashboard_if_running(reason="requested via --restart")
         sys.exit(0 if restarted else 0)
 
+    bind_host, bind_port = _dashboard_bind_from_config(args)
+    args.host = bind_host
+    args.port = bind_port
+
     try:
         from hermes_cli.dashboard_lifecycle import (
             DashboardPortInUse,
@@ -10861,7 +10884,7 @@ def cmd_dashboard(args):
         ensure_dashboard_port_available(args.host, args.port)
     except (DashboardPortInUse, OSError) as exc:
         print(f"Dashboard cannot start: {exc}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(98 if isinstance(exc, DashboardPortInUse) else 1)
 
     try:
         import fastapi  # noqa: F401
@@ -14208,10 +14231,10 @@ Examples:
         description="Launch the Hermes Agent web dashboard for managing config, API keys, and sessions",
     )
     dashboard_parser.add_argument(
-        "--port", type=int, default=9119, help="Port (default 9119)"
+        "--port", type=int, default=None, help="Port (default: dashboard.port or 9119)"
     )
     dashboard_parser.add_argument(
-        "--host", default="127.0.0.1", help="Host (default 127.0.0.1)"
+        "--host", default=None, help="Host (default: dashboard.host or 127.0.0.1)"
     )
     dashboard_parser.add_argument(
         "--no-open", action="store_true", help="Don't open browser automatically"
