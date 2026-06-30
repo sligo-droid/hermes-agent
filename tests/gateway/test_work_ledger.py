@@ -120,11 +120,52 @@ def test_mark_agent_running_clears_stale_terminal_fields(tmp_path):
         "agent_done_at",
         "completion_gate",
         "final_response",
+        "provider_no_progress",
         "result_message_id",
         "summary_status",
         "summary_updated_at",
     ):
         assert key not in stored
+
+
+def test_mark_agent_done_persists_provider_no_progress_metadata(tmp_path):
+    ledger = GatewayWorkLedger(tmp_path / "work_ledger.json")
+    event = _discord_event(message_id="m1")
+    session_key = build_session_key(event.source)
+    item = ledger.accept_event(event, session_key=session_key, freshness_seconds=60)
+    assert item is not None
+
+    event_payload = {
+        "event": "provider_no_progress_threshold_exceeded",
+        "session_id": "sess-123",
+        "gateway_session_key": session_key,
+        "provider": "openai-codex",
+        "model": "gpt-5.5",
+        "phase": "provider_invalid_response",
+        "failure_class": "invalid_response",
+        "action": "degraded_partial",
+        "no_progress_elapsed_s": 901.2,
+        "threshold_s": 900,
+        "retry_count": 2,
+        "delay_class": "15m_30m",
+        "last_progress_reason": "successful_tool_call",
+    }
+
+    assert ledger.mark_agent_done(
+        item["id"],
+        final_response="Provider no-progress guard stopped this turn after useful work was preserved.",
+        session_id="sess-123",
+        summary_status="Failed",
+        provider_no_progress=event_payload,
+        already_delivered=False,
+    ) is True
+
+    stored = ledger.get(item["id"])
+    assert stored["status"] == "agent_done"
+    assert stored["summary_status"] == "Failed"
+    assert stored["provider_no_progress"] == event_payload
+    assert stored["completion_gate"]["allowed_to_complete"] is True
+    assert "sk-" not in str(stored["provider_no_progress"])
 
 
 def test_ledger_skips_completed_and_expires_stale_items(tmp_path):

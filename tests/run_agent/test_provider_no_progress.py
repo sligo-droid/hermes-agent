@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import time
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent
 
@@ -80,3 +82,97 @@ def test_provider_no_progress_disabled_outside_gateway():
     agent._provider_no_progress_last_progress_at = time.time() - 60.0
 
     assert agent._provider_no_progress_should_trip("provider_api_error") is False
+
+
+def test_gateway_turn_preserves_partial_work_after_tool_progress_then_provider_stall(monkeypatch):
+    responses = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="",
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="call-1",
+                                type="function",
+                                function=SimpleNamespace(name="web_search", arguments='{"query":"x"}'),
+                            )
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ],
+            model="gpt-5.5",
+            usage=None,
+        ),
+        SimpleNamespace(choices=[], model="gpt-5.5", usage=None),
+        SimpleNamespace(choices=[], model="gpt-5.5", usage=None),
+    ]
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[{
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "search",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("hermes_cli.config.load_config", return_value={"agent": {"provider_no_progress_timeout": 10}}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            provider="openai-codex",
+            model="gpt-5.5",
+            api_mode="chat_completions",
+            max_iterations=3,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            gateway_session_key="agent:main:discord:thread:thread-1",
+        )
+
+    agent.client = MagicMock()
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.tool_delay = 0
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    agent._api_max_retries = 3
+    clock = {"now": 1_000.0}
+
+    def fake_api_call(_api_kwargs):
+        if len(responses) == 2:
+            clock["now"] += 11.0
+        return responses.pop(0)
+
+    def fake_handle(*_args, **_kwargs):
+        return '{"ok": true, "artifact": "committed worker result"}'
+
+    monkeypatch.setattr("run_agent.time.time", lambda: clock["now"])
+    monkeypatch.setattr(agent, "_interruptible_api_call", fake_api_call)
+    monkeypatch.setattr(agent, "_interruptible_streaming_api_call", lambda api_kwargs, **_kw: fake_api_call(api_kwargs))
+    monkeypatch.setattr("agent.conversation_loop.jittered_backoff", lambda *args, **kwargs: 0.0)
+
+    with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        result = agent.run_conversation("do useful work")
+
+    event = result["provider_no_progress"]
+    assert result["failed"] is True
+    assert result["recoverable"] is True
+    assert result["partial"] is True
+    assert result["completed"] is False
+    assert "partial transcript and tool results were saved" in result["final_response"]
+    assert event["session_id"] == agent.session_id
+    assert event["gateway_session_key"] == "agent:main:discord:thread:thread-1"
+    assert event["provider"] == "openai-codex"
+    assert event["model"] == "gpt-5.5"
+    assert event["phase"] == "provider_invalid_response"
+    assert event["failure_class"] == "invalid_response"
+    assert event["action"] == "degraded_partial"
+    assert event["last_progress_reason"] == "successful_tool_call"
+    assert event["retry_count"] == 1
+    assert any(msg.get("role") == "tool" and "committed worker result" in msg.get("content", "") for msg in result["messages"])

@@ -11748,6 +11748,7 @@ class GatewayRunner:
                         feature_summary=getattr(event, "feature_summary", None),
                         project_summary=getattr(event, "project_summary", None),
                         runtime_breakdown=agent_result.get("runtime_breakdown") if isinstance(agent_result, dict) else None,
+                        provider_no_progress=agent_result.get("provider_no_progress") if isinstance(agent_result, dict) else None,
                         already_delivered=bool(agent_result.get("already_sent"))
                         and not agent_result.get("failed"),
                     )

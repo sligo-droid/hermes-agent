@@ -576,6 +576,7 @@ class GatewayWorkLedger:
             "agent_done_at",
             "completion_gate",
             "final_response",
+            "provider_no_progress",
             "result_message_id",
             "summary_status",
             "summary_updated_at",
@@ -597,6 +598,7 @@ class GatewayWorkLedger:
         feature_summary: dict[str, Any] | None = None,
         project_summary: dict[str, Any] | None = None,
         runtime_breakdown: dict[str, Any] | None = None,
+        provider_no_progress: dict[str, Any] | None = None,
         already_delivered: bool = False,
     ) -> bool:
         data = self._read()
@@ -620,6 +622,8 @@ class GatewayWorkLedger:
             item["project_summary"] = _durable_metadata(project_summary)
         if runtime_breakdown is not None:
             item["runtime_breakdown"] = _durable_metadata(runtime_breakdown)
+        if provider_no_progress is not None:
+            item["provider_no_progress"] = _durable_metadata(provider_no_progress)
         gate = classify_delivery_completion(item)
         item["completion_gate"] = gate
         if not gate.get("allowed_to_complete"):
