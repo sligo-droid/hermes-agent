@@ -5459,6 +5459,8 @@ def start_planner_request(
             **pr_policy_for_request(raw_request),
             "paused": False,
             "cancelled": False,
+            "terminal_summary_sync_pending": True,
+            "terminal_reaction_sync_pending": True,
         }
     )
     if acceptance_criteria is not None:

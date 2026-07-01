@@ -210,6 +210,37 @@ def test_done_metadata_transition_arms_completion_notice(monkeypatch, tmp_path):
     assert target["board_summary"]["goal_status"] == "done"
 
 
+def test_planner_request_marks_active_status_for_immediate_discord_sync(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    thread_id = _discord_snowflake_at(time.time())
+    board = dwb.start_planner_request(
+        thread_id=thread_id,
+        chat_id="12345",
+        guild_id="999",
+        parent_channel_id="12345",
+        request_id="555",
+        request="Build visible Command Center kickoff",
+        project_context={"project_name": "pid"},
+    )
+
+    worker = kanban_db.read_board_metadata(board.slug)[dwb.DISCORD_WORKER_META_KEY]
+    assert worker["goal_status"] == "active"
+    assert worker["phase"] == "planning"
+    assert worker["terminal_summary_sync_pending"] is True
+    assert worker["terminal_reaction_sync_pending"] is True
+
+    target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
+    assert target["state"] == "active"
+    assert target.get("reaction_state", target["state"]) == "active"
+    assert target["message_id"] == ""
+    assert target["source_message_id"] == "555"
+    assert target["terminal_summary_sync_pending"] is True
+    assert target["terminal_reaction_sync_pending"] is True
+
+
 def test_thread_status_targets_include_github_pr_amend_metadata(monkeypatch, tmp_path):
     _home(monkeypatch, tmp_path)
     from hermes_cli import discord_worker_boards as dwb
