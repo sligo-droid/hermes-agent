@@ -230,7 +230,7 @@ def test_planner_request_marks_active_status_for_immediate_discord_sync(monkeypa
     assert worker["goal_status"] == "active"
     assert worker["phase"] == "planning"
     assert worker["terminal_summary_sync_pending"] is True
-    assert worker["terminal_reaction_sync_pending"] is True
+    assert "terminal_reaction_sync_pending" not in worker
 
     target = next(item for item in dwb.thread_status_targets() if item["board"] == board.slug)
     assert target["state"] == "active"
@@ -238,7 +238,7 @@ def test_planner_request_marks_active_status_for_immediate_discord_sync(monkeypa
     assert target["message_id"] == ""
     assert target["source_message_id"] == "555"
     assert target["terminal_summary_sync_pending"] is True
-    assert target["terminal_reaction_sync_pending"] is True
+    assert target["terminal_reaction_sync_pending"] is False
 
 
 def test_thread_status_targets_include_github_pr_amend_metadata(monkeypatch, tmp_path):
