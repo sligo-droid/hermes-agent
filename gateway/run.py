@@ -7291,6 +7291,11 @@ class GatewayRunner:
         cached_state = str(cache_entry.get("state") or "")
         if cached_state != state:
             return True
+        if state in {"done", "blocked", "errored"} and (
+            cache_entry.get("terminal_reaction_sync_pending")
+            or cache_entry.get("terminal_reaction_sync_needed")
+        ):
+            return True
         try:
             synced_at = float(cache_entry.get("synced_at") or 0.0)
         except (TypeError, ValueError):
@@ -8172,6 +8177,14 @@ class GatewayRunner:
                             state = str(target.get("reaction_state") or target.get("state") or "")
                             cache_key = self._discord_kanban_target_cache_key(target)
                             cache_entry = reaction_cache.get(cache_key)
+                            if target.get("terminal_reaction_sync_pending") or target.get("terminal_reaction_sync_needed"):
+                                cache_entry = dict(cache_entry) if isinstance(cache_entry, dict) else {}
+                                cache_entry["terminal_reaction_sync_pending"] = bool(
+                                    target.get("terminal_reaction_sync_pending")
+                                )
+                                cache_entry["terminal_reaction_sync_needed"] = bool(
+                                    target.get("terminal_reaction_sync_needed")
+                                )
                             has_message_identity = bool(
                                 str(target.get("source_message_id") or target.get("message_id") or "").strip()
                             )
@@ -8236,7 +8249,8 @@ class GatewayRunner:
                                 else:
                                     cached_sync_key = summary_cache.pop(board)
                                     summary_cache[cache_key] = cached_sync_key
-                            if cached_sync_key == sync_key:
+                            force_summary_sync = bool(target_for_sync.get("terminal_summary_sync_pending"))
+                            if cached_sync_key == sync_key and not force_summary_sync:
                                 continue
                             try:
                                 synced_key = await summary_sync(target_for_sync)
