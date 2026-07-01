@@ -2778,11 +2778,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._clear_terminal_kanban_sync_flags(target, summary=True)
                 return str(target.get("sync_key") or board)
             return None
-        if str(target.get("state") or "") in {"done", "blocked", "errored"}:
+        if target.get("terminal_summary_sync_pending") or str(target.get("state") or "") in {"done", "blocked", "errored"}:
             try:
                 from hermes_cli.discord_worker_boards import mark_thread_status_synced
 
-                mark_thread_status_synced(board, summary=True)
+                mark_thread_status_synced(
+                    board,
+                    summary=True,
+                    metadata_path=target.get("metadata_path"),
+                )
             except Exception:
                 logger.debug("[%s] Failed to clear Discord terminal summary sync flag", self.name, exc_info=True)
         return str(target.get("sync_key") or board)

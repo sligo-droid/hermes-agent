@@ -46,6 +46,13 @@ class FeatureSummarySyncAdapter:
 
     async def sync_kanban_feature_summary(self, target):
         self.synced.append(dict(target))
+        from hermes_cli import discord_worker_boards as dwb
+
+        dwb.mark_thread_status_synced(
+            str(target.get("board") or ""),
+            summary=True,
+            metadata_path=target.get("metadata_path"),
+        )
         return target.get("sync_key") or target.get("board")
 
 
@@ -1680,6 +1687,73 @@ def test_discord_thread_status_targets_mark_foreman_generated_completion(tmp_pat
     assert target["foreman_generated"] is True
     assert target["hide_source_links"] is True
     assert target["terminal_completion_message_pending"] is True
+
+
+def test_start_direct_goal_marks_initial_summary_sync_without_terminal_reaction(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="99023",
+        goal="Ship direct kickoff visibility",
+        chat_id="parent-99023",
+    )
+
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert worker["goal_status"] == "active"
+    assert worker["phase"] == "dev"
+    assert worker["terminal_summary_sync_pending"] is True
+    assert "terminal_reaction_sync_pending" not in worker
+
+
+def test_discord_kanban_typing_watcher_forces_pending_summary_when_cache_matches(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+    from hermes_cli import kanban_db
+
+    board = dwb.start_direct_goal(
+        thread_id="99024",
+        goal="Force direct kickoff summary sync",
+        chat_id="parent-99024",
+    )
+    target = dwb.thread_status_targets()[0]
+    assert target["terminal_summary_sync_pending"] is True
+
+    adapter = FeatureSummarySyncAdapter()
+    runner = _make_discord_runner(adapter)
+    runner._discord_kanban_summary_states = {
+        runner._discord_kanban_target_cache_key(target): runner._discord_kanban_summary_sync_key(target)
+    }
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert len(adapter.synced) == 1
+    assert adapter.synced[0]["board"] == board.slug
+    worker = kanban_db.read_board_metadata(board.slug)["discord_worker"]
+    assert "terminal_summary_sync_pending" not in worker
+
+
+def test_discord_kanban_typing_watcher_reuses_normal_active_reaction_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    from hermes_cli import discord_worker_boards as dwb
+
+    board = dwb.start_direct_goal(
+        thread_id="99025",
+        goal="Avoid active reaction spin",
+        chat_id="parent-99025",
+    )
+    target = dwb.thread_status_targets()[0]
+    assert target.get("reaction_state", target["state"]) == "active"
+    assert target["terminal_reaction_sync_pending"] is False
+
+    adapter = ReactionSyncAdapter()
+    runner = _make_discord_runner(adapter)
+
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+    asyncio.run(_run_one_discord_typing_tick(monkeypatch, runner))
+
+    assert [item["board"] for item in adapter.synced] == [board.slug]
 
 
 def test_discord_kanban_typing_watcher_syncs_non_terminal_blocked_status(tmp_path, monkeypatch):

@@ -5386,6 +5386,7 @@ def start_direct_goal(
             **pr_policy_for_request(raw_goal),
             "paused": False,
             "cancelled": False,
+            "terminal_summary_sync_pending": True,
         }
     )
     metadata = _update_worker_meta(board.slug, worker)
@@ -5460,7 +5461,6 @@ def start_planner_request(
             "paused": False,
             "cancelled": False,
             "terminal_summary_sync_pending": True,
-            "terminal_reaction_sync_pending": True,
         }
     )
     if acceptance_criteria is not None:
