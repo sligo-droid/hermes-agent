@@ -647,7 +647,7 @@ export const api = {
     fetchJSON<{ card: SelfImprovementProposalCard }>(
       `/api/plugins/kanban/self-improvement/proposals/${encodeURIComponent(proposalId)}`,
     ),
-  approveSelfImprovementProposal: (proposalId: string, route: SelfImprovementApprovalRoute = "native") =>
+  approveSelfImprovementProposal: (proposalId: string, route: SelfImprovementApprovalRoute = "worker_board") =>
     fetchJSON<SelfImprovementProposalActionResponse>(
       `/api/plugins/kanban/self-improvement/proposals/${encodeURIComponent(proposalId)}/approve`,
       {

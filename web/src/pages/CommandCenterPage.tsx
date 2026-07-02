@@ -288,7 +288,6 @@ function availableActionKinds(item: CommandCenterWorkItem): ActionKind[] {
   const actions: ActionKind[] = [];
   if (canApproveReject) {
     actions.push("approve");
-    actions.push("approve_worker_board");
     actions.push("reject");
   }
   if (proposalId && item.decision?.approve_action && item.status === "accepted" && !item.execution) {
@@ -430,7 +429,7 @@ function ActionButton({
 }) {
   const tooltipId = useId();
   const config = {
-    approve: { label: "Approve native", icon: Check, className: "border-emerald-200/70 bg-emerald-400 text-emerald-950 hover:bg-emerald-300 focus-visible:ring-emerald-100/75" },
+    approve: { label: "Approve", icon: Check, className: "border-emerald-200/70 bg-emerald-400 text-emerald-950 hover:bg-emerald-300 focus-visible:ring-emerald-100/75" },
     approve_worker_board: { label: "Worker board", icon: MessageSquarePlus, className: "border-cyan-100/50 bg-cyan-500 text-cyan-950 hover:bg-cyan-400 focus-visible:ring-cyan-100/75" },
     reject: { label: "Reject", icon: XCircle, className: "border-red-200/75 bg-red-500 text-white hover:bg-red-400 focus-visible:ring-red-100/75", strong: true },
     pause: { label: "Pause", icon: PauseCircle, className: "border-orange-200/70 bg-orange-400 text-orange-950 hover:bg-orange-300 focus-visible:ring-orange-100/75", strong: true },
@@ -1494,7 +1493,7 @@ export default function CommandCenterPage() {
       else if (proposalId && !proposalHasDownstreamExecution) await api.archiveSelfImprovementProposal(proposalId);
       else if (proposalId) await api.haltSelfImprovementProposal(proposalId);
     } else if (proposalId && kind === "approve") {
-      await api.approveSelfImprovementProposal(proposalId, "native");
+      await api.approveSelfImprovementProposal(proposalId, "worker_board");
     } else if (proposalId && kind === "approve_worker_board") {
       await api.approveSelfImprovementProposal(proposalId, "worker_board");
     } else if (proposalId && kind === "reject") {
