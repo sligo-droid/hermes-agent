@@ -2020,6 +2020,129 @@ def test_self_improvement_approve_falls_back_without_discord_channel(client, mon
         conn.close()
 
 
+def test_self_improvement_approve_without_discord_channel_creates_project_board(client, monkeypatch):
+    proposal_storage.ingest_proposal_output(_proposal_fixture())
+    card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
+
+    monkeypatch.setattr(discord_publish, "configured_project_channel_id", lambda project: "")
+    monkeypatch.setattr(discord_publish, "configured_project_discord_channel_name", lambda project: "#pid")
+    monkeypatch.setattr(
+        discord_publish,
+        "publish_approved_proposal",
+        lambda card_arg, *, channel_id, existing=None: (_ for _ in ()).throw(AssertionError("should not publish")),
+    )
+
+    response = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["task"]["assignee"] == "planner"
+    assert "/workers/" in body["worker_url"]
+    audit = proposal_storage.list_audit_events(card["proposal_id"])
+    assert audit[-1]["metadata"]["execution_route"] == "worker_board"
+    assert audit[-1]["metadata"]["discord_publish_error"] == "discord_publish_unavailable"
+    board = audit[-1]["metadata"]["discord_board"]
+    meta = kb.read_board_metadata(board)
+    worker = meta["discord_worker"]
+    assert worker["goal_status"] == "active"
+    assert worker["phase"] == "planning"
+    assert worker["project_context"]["project_channel_name"] == "#pid"
+    board_conn = kb.connect(board=board)
+    try:
+        tasks = kb.list_tasks(board_conn)
+        assert len(tasks) == 1
+        assert tasks[0].id == body["task"]["id"]
+        assert tasks[0].status == "ready"
+    finally:
+        board_conn.close()
+
+    repeat = client.post(f"/api/plugins/kanban/self-improvement/proposals/{card['proposal_id']}/approve", json={"route": "worker_board"})
+    assert repeat.status_code == 200, repeat.text
+    assert repeat.json()["task"]["id"] == body["task"]["id"]
+    board_conn = kb.connect(board=board)
+    try:
+        assert len(kb.list_tasks(board_conn)) == 1
+    finally:
+        board_conn.close()
+
+
+def test_command_center_does_not_mark_dead_pid_run_active(client, monkeypatch):
+    from hermes_cli import command_center
+
+    board = "pid-dead-run"
+    kb.write_board_metadata(board, name="PID dead run", default_workdir="")
+    meta = kb.read_board_metadata(board)
+    meta["tenant"] = "pid"
+    (Path(meta["db_path"]).parent / "board.json").write_text(json.dumps({k: v for k, v in meta.items() if k != "db_path"}), encoding="utf-8")
+    conn = kb.connect(board=board)
+    try:
+        task_id = kb.create_task(conn, title="PID stale worker", assignee="dev", board=board)
+        claimed = kb.claim_task(conn, task_id, claimer="test-host:dead")
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        with conn:
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ?, worker_pid_start_ticks = ? WHERE id = ?",
+                (424242, 1, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, worker_pid_start_ticks = ? WHERE id = ?",
+                (424242, 1, run_id),
+            )
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(command_center.kanban_db, "_pid_identity_alive", lambda pid, start_ticks: False)
+    monkeypatch.setattr(command_center.kanban_db, "_systemd_unit_status", lambda unit: SimpleNamespace(active=False, pid=None))
+
+    snapshot = command_center.build_command_center_snapshot(project="pid")
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+    run = next(run for run in snapshot["runs"] if run["task_id"] == task_id)
+
+    assert item["status"] != "running"
+    assert item["execution"]["active_run_id"] is None
+    assert run["worker_liveness"]["alive"] is False
+    assert snapshot["metrics"]["active_runs"] == 0
+
+
+def test_command_center_marks_live_pid_run_active(client, monkeypatch):
+    from hermes_cli import command_center
+
+    board = "pid-live-run"
+    kb.write_board_metadata(board, name="PID live run", default_workdir="")
+    meta = kb.read_board_metadata(board)
+    meta["tenant"] = "pid"
+    (Path(meta["db_path"]).parent / "board.json").write_text(json.dumps({k: v for k, v in meta.items() if k != "db_path"}), encoding="utf-8")
+    conn = kb.connect(board=board)
+    try:
+        task_id = kb.create_task(conn, title="PID active worker", assignee="dev", board=board)
+        claimed = kb.claim_task(conn, task_id, claimer="test-host:live")
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        with conn:
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ?, worker_pid_start_ticks = ? WHERE id = ?",
+                (424243, 1, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, worker_pid_start_ticks = ? WHERE id = ?",
+                (424243, 1, run_id),
+            )
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(command_center.kanban_db, "_pid_identity_alive", lambda pid, start_ticks: True)
+    monkeypatch.setattr(command_center.kanban_db, "_systemd_unit_status", lambda unit: SimpleNamespace(active=False, pid=None))
+
+    snapshot = command_center.build_command_center_snapshot(project="pid")
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+
+    assert item["status"] == "running"
+    assert item["execution"]["active_run_id"] == run_id
+    assert item["execution"]["worker_liveness"]["alive"] is True
+    assert snapshot["metrics"]["active_runs"] == 1
+
+
 def test_self_improvement_approve_ignores_board_default_workdir_for_worker_jobs(client, monkeypatch):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]

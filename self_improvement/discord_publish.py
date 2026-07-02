@@ -79,6 +79,28 @@ def configured_project_channel_id(project: object) -> str:
     return ""
 
 
+def configured_project_discord_channel_name(project: object) -> str:
+    """Return the configured project channel name, when an ID is unavailable."""
+
+    project_key = str(project or "").strip()
+    if not project_key:
+        return ""
+    try:
+        cfg = load_config_readonly()
+    except Exception:
+        cfg = {}
+    section = cfg.get("self_improvement") if isinstance(cfg, dict) else None
+    projects = section.get("projects") if isinstance(section, dict) else None
+    project_cfg = projects.get(project_key) if isinstance(projects, dict) else None
+    if isinstance(project_cfg, dict):
+        for key in ("discord_channel_name", "discord_project_channel_name", "project_discord_channel_name"):
+            value = str(project_cfg.get(key) or "").strip()
+            if value:
+                return value
+    mapping = _project_mapping_for_key(project_key)
+    return str(mapping.get("channel_name") or mapping.get("channel") or "").strip() if mapping else ""
+
+
 def _resolve_discord_channel_name(channel_name: str, *, guild_id: str = "", guild_name: str = "") -> str:
     """Resolve a configured Discord channel name such as ``#dev`` to an ID."""
 
@@ -196,6 +218,52 @@ def _project_mapping_for_key(project_key: str) -> dict[str, Any]:
     if len(matches) > 1:
         log.debug("self-improvement Discord project %s maps to multiple channels: %s", project_key, sorted(matches))
     return {}
+
+
+def _fallback_route_slug(card: dict[str, Any]) -> str:
+    source = "-".join(
+        str(card.get(key) or "")
+        for key in ("project", "prong", "proposal_id")
+    )
+    slug = re.sub(r"[^a-z0-9]+", "-", source.lower()).strip("-")
+    return f"si-{slug[:61]}" if slug else "self-improvement-proposal"
+
+
+def ensure_approval_route_board_without_discord(
+    card: dict[str, Any],
+    *,
+    channel_hint: str = "",
+) -> DiscordApprovalRoute:
+    """Create the local worker/status surface when Discord posting is unavailable."""
+
+    thread_id = _fallback_thread_id(card)
+    message_id = _fallback_message_id(card)
+    channel_id = str(channel_hint or configured_project_discord_channel_name(card.get("project")) or card.get("project") or "").strip()
+    route = DiscordApprovalRoute(
+        channel_id=channel_id,
+        top_level_message_id=message_id,
+        thread_id=thread_id,
+        thread_url="",
+        board=_fallback_route_slug(card),
+        board_public_url="",
+        guild_id="",
+        error="discord_publish_unavailable",
+    )
+    ensured = ensure_approval_route_board(card, route)
+    return ensured or route
+
+
+def _fallback_thread_id(card: dict[str, Any]) -> str:
+    source = "|".join(
+        str(card.get(key) or "")
+        for key in ("project", "prong", "proposal_id", "title")
+    )
+    return "self-improvement-" + re.sub(r"[^a-z0-9]+", "-", source.lower()).strip("-")[:44]
+
+
+def _fallback_message_id(card: dict[str, Any]) -> str:
+    proposal_id = re.sub(r"[^a-z0-9]+", "-", str(card.get("proposal_id") or "proposal").lower()).strip("-")
+    return proposal_id or "proposal"
 
 
 def _normalize_project_key(value: object) -> str:
@@ -553,6 +621,7 @@ def _project_context(card: dict[str, Any], channel_id: str) -> dict[str, Any]:
         "project_path": mapping.get("project_path"),
         "project_github_url": mapping.get("github_url"),
         "project_channel_id": str(channel_id or mapping.get("channel_id") or ""),
+        "project_channel_name": configured_project_discord_channel_name(project),
         "project_mapping_source": mapping.get("source"),
         "project_mapping_resolved": bool(mapping),
         "self_improvement_project": project,
