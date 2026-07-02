@@ -1265,6 +1265,19 @@ class TestBuildAnthropicKwargs:
         assert "temperature" not in kwargs
         assert kwargs["max_tokens"] == 4096
 
+    def test_fable_reasoning_config_maps_to_high_adaptive_thinking(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-fable-5",
+            messages=[{"role": "user", "content": "plan carefully"}],
+            tools=None,
+            max_tokens=12000,
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert kwargs["output_config"] == {"effort": "high"}
+        assert kwargs["max_tokens"] == 12000
+
     def test_reasoning_config_downgrades_xhigh_to_max_for_4_6_models(self):
         # Opus 4.7 added "xhigh" as a distinct effort level (low/medium/high/
         # xhigh/max). Opus 4.6 only supports low/medium/high/max — sending

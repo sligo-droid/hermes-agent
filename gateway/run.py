@@ -1377,6 +1377,7 @@ from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
+    MetadataReply,
     MessageEvent,
     MessageType,
     _reply_anchor_for_event,
@@ -10156,6 +10157,9 @@ class GatewayRunner:
 
         if canonical == "topic":
             return await self._handle_topic_command(event)
+
+        if canonical == "fable":
+            return await self._handle_fable_command(event, _quick_key)
         
         if canonical == "help":
             return await self._handle_help_command(event)
@@ -17196,6 +17200,50 @@ class GatewayRunner:
         lines.append("")
         lines.append("Invoke a bundle with `/<slug>` to load all its skills.")
         return "\n".join(lines)
+
+    async def _handle_fable_command(self, event: MessageEvent, session_key: str) -> str:
+        """Generate a plan-only Fable artifact without entering the agent loop."""
+        args = event.get_command_args().strip()
+        if not args:
+            return "Usage: /fable <request>"
+
+        try:
+            cfg = _load_gateway_runtime_config()
+        except Exception:
+            cfg = {}
+        try:
+            session_cwd = _resolve_gateway_session_cwd(event.source, cfg)
+        except Exception:
+            session_cwd = ""
+
+        from hermes_cli.fable_planner import (
+            FablePlanRequest,
+            fable_metadata,
+            generate_fable_plan,
+        )
+
+        request = FablePlanRequest(
+            prompt=args,
+            session_id=session_key,
+            workdir=session_cwd,
+            source_text=event.text or "",
+            platform=event.source.platform.value if event.source.platform else "",
+        )
+        result = await asyncio.to_thread(generate_fable_plan, request, cfg)
+        if result.ok:
+            metadata = fable_metadata(result)
+            metadata["session_id"] = session_key
+            metadata["source_message_id"] = str(event.message_id or "")
+            return MetadataReply(result.content, metadata)
+
+        # Do not mark failures as fable_plan artifacts. The product contract is
+        # to persist generated plans; missing credentials, model errors, and
+        # refusals should be visible to the user without indexing a warning as a
+        # plan artifact.
+        message = result.error or "Fable plan generation failed."
+        if result.refusal and result.content:
+            message = f"{message}\n\n{result.content}"
+        return f"⚠️ {message}"
 
     # ------------------------------------------------------------------
     # Slash-command confirmation primitive (generic)

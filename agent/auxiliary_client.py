@@ -1002,12 +1002,17 @@ class _AnthropicCompletionsAdapter:
             elif choice_type in {"auto", "required", "none"}:
                 normalized_tool_choice = choice_type
 
+        extra_body = kwargs.get("extra_body") or {}
+        reasoning_config = kwargs.get("reasoning_config")
+        if reasoning_config is None and isinstance(extra_body, dict):
+            reasoning_config = extra_body.get("reasoning") or extra_body.get("thinking")
+
         anthropic_kwargs = build_anthropic_kwargs(
             model=model,
             messages=messages,
             tools=tools,
             max_tokens=max_tokens,
-            reasoning_config=None,
+            reasoning_config=reasoning_config,
             tool_choice=normalized_tool_choice,
             is_oauth=self._is_oauth,
         )

@@ -1026,6 +1026,16 @@ DEFAULT_CONFIG = {
                                       # middle window when your aux model is flaky.
     },
 
+    "fable": {
+        "enabled": True,
+        "provider": "anthropic",
+        "model": "claude-fable-5",
+        "route": "anthropic_oauth",
+        "timeout_seconds": 300,
+        "max_tokens": 12000,
+        "save_local_plan": False,
+    },
+
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
     # cache_ttl must be "5m" or "1h" (Anthropic-supported tiers); other values are ignored.
     "prompt_caching": {

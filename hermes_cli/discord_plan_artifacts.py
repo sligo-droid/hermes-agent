@@ -102,16 +102,16 @@ def should_persist_discord_plan(
     structured plan-like outputs and known plan-producing command surfaces.
     """
     text = str(content or "").strip()
-    if len(text) < MIN_PLAN_CHARS:
-        return False
-
     meta = metadata if isinstance(metadata, dict) else {}
     command = str(meta.get("command") or meta.get("invoked_command") or "").strip().lower()
     kind = str(meta.get("kind") or meta.get("response_kind") or "").strip().lower()
-    if command in {"meeting", "/meeting", "goal", "/goal", "plan", "/plan"}:
+    if command in {"meeting", "/meeting", "goal", "/goal", "plan", "/plan", "fable", "/fable"}:
         return True
-    if kind in {"meeting_plan", "implementation_plan", "discord_plan", "plan"}:
+    if kind in {"meeting_plan", "implementation_plan", "discord_plan", "plan", "fable_plan"}:
         return True
+
+    if len(text) < MIN_PLAN_CHARS:
+        return False
 
     has_marker = bool(PLAN_MARKER_RE.search(text))
     if len(text) >= MIN_PLAN_CHARS and has_marker and chunk_count > 1:

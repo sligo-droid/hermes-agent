@@ -8527,6 +8527,29 @@ class HermesCLI:
         if output:
             print(output)
 
+    def _handle_fable_command(self, cmd: str) -> None:
+        """Handle /fable <request> as a plan-only one-shot."""
+        parts = cmd.split(None, 1)
+        prompt = parts[1].strip() if len(parts) > 1 else ""
+        if not prompt:
+            _cprint("  Usage: /fable <request>")
+            return
+
+        from hermes_cli.fable_planner import FablePlanRequest, generate_fable_plan
+
+        request = FablePlanRequest(
+            prompt=prompt,
+            session_id=getattr(self, "session_id", "") or "",
+            workdir=os.getcwd(),
+            source_text=cmd,
+            platform="cli",
+        )
+        result = generate_fable_plan(request)
+        if result.ok:
+            print(result.content)
+            return
+        _cprint(f"\033[1;31m{_escape(result.error or 'Fable plan generation failed.')}{_RST}")
+
     def _handle_skills_command(self, cmd: str):
         """Handle /skills slash command — delegates to hermes_cli.skills_hub."""
         from hermes_cli.skills_hub import handle_skills_slash
@@ -8827,6 +8850,9 @@ class HermesCLI:
             self._handle_curator_command(cmd_original)
         elif canonical == "kanban":
             self._handle_kanban_command(cmd_original)
+        elif canonical == "fable":
+            with self._busy_command("Generating Fable plan..."):
+                self._handle_fable_command(cmd_original)
         elif canonical == "skills":
             with self._busy_command(self._slow_command_status(cmd_original)):
                 self._handle_skills_command(cmd_original)
