@@ -1510,6 +1510,21 @@ class EphemeralReply(str):
         return str.__str__(self)
 
 
+class MetadataReply(str):
+    """Text reply with metadata to merge into the platform send call."""
+
+    metadata: Dict[str, Any]
+
+    def __new__(cls, text: str, metadata: Optional[Dict[str, Any]] = None):
+        instance = super().__new__(cls, text)
+        instance.metadata = dict(metadata or {})
+        return instance
+
+    @property
+    def text(self) -> str:
+        return str.__str__(self)
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -3060,6 +3075,8 @@ class BasePlatformAdapter(ABC):
             if ttl and ttl > 0 and type(self).delete_message is BasePlatformAdapter.delete_message:
                 ttl = 0
             return response.text, int(ttl or 0)
+        if isinstance(response, MetadataReply):
+            return response.text, 0
         return response, 0
 
     async def _send_with_retry(
@@ -3930,6 +3947,7 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            response_metadata = dict(getattr(response, "metadata", {}) or {})
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -4062,9 +4080,11 @@ class BasePlatformAdapter(ABC):
                     # typing-indicator task (which must remain unmarked).
                     if _thread_metadata is not None:
                         _thread_metadata = dict(_thread_metadata)
+                        _thread_metadata.update(response_metadata)
                         _thread_metadata["notify"] = True
                     else:
-                        _thread_metadata = {"notify": True}
+                        _thread_metadata = dict(response_metadata)
+                        _thread_metadata["notify"] = True
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,

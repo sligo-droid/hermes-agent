@@ -28,6 +28,14 @@ def test_should_persist_long_structured_plan_only():
     assert not should_persist_discord_plan("Done. PR: https://example.test/pr/1", chunk_count=1)
 
 
+def test_should_persist_fable_command_even_when_shorter_than_generic_threshold():
+    text = "# Implementation Plan\n\n1. Inspect.\n2. Implement.\n3. Verify."
+
+    assert should_persist_discord_plan(text, metadata={"command": "fable"})
+    assert should_persist_discord_plan(text, metadata={"command": "/fable"})
+    assert should_persist_discord_plan(text, metadata={"response_kind": "fable_plan"})
+
+
 def test_persist_and_lookup_discord_plan_artifact(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
