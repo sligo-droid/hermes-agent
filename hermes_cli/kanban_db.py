@@ -917,6 +917,7 @@ class Run:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     worker_pid: Optional[int]
+    worker_pid_start_ticks: Optional[int]
     worker_unit: Optional[str]
     max_runtime_seconds: Optional[int]
     last_heartbeat_at: Optional[int]
@@ -947,6 +948,7 @@ class Run:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             worker_pid=row["worker_pid"] if "worker_pid" in keys else None,
+            worker_pid_start_ticks=row["worker_pid_start_ticks"] if "worker_pid_start_ticks" in keys else None,
             worker_unit=row["worker_unit"] if "worker_unit" in keys else None,
             max_runtime_seconds=(
                 row["max_runtime_seconds"] if "max_runtime_seconds" in keys else None
