@@ -126,6 +126,10 @@ def generate_fable_plan(request: FablePlanRequest, config: dict[str, Any] | None
 
 
 def _generate_via_anthropic_oauth(request: FablePlanRequest) -> FablePlanResult:
+    preflight_error = _anthropic_budget_preflight_error()
+    if preflight_error:
+        return _error(preflight_error)
+
     try:
         from agent.auxiliary_client import resolve_provider_client
 
@@ -134,6 +138,9 @@ def _generate_via_anthropic_oauth(request: FablePlanRequest) -> FablePlanResult:
         return _error(f"Fable 5 is not configured through Hermes' Anthropic OAuth route: {exc}")
 
     if client is None or not resolved_model:
+        route_error = _anthropic_budget_preflight_error()
+        if route_error:
+            return _error(route_error)
         return _error(
             "Fable 5 is not configured through Hermes' Anthropic OAuth route. "
             "Run `hermes auth add anthropic` or configure the Anthropic OAuth provider used by Hermes."
@@ -153,7 +160,15 @@ def _generate_via_anthropic_oauth(request: FablePlanRequest) -> FablePlanResult:
             extra_body={"reasoning": FABLE_REASONING},
         )
     except Exception as exc:
+        if _is_fable_budget_error(exc):
+            return _error(_fable_budget_error_message(str(exc)))
         return _error(f"Fable 5 request failed on Hermes' Anthropic OAuth route: {exc}")
+
+    response_model = str(getattr(response, "model", "") or "")
+    if response_model and response_model != FABLE_MODEL:
+        return _error(
+            f"Fable route returned unexpected model {response_model!r}; refusing to treat a fallback model as Fable output."
+        )
 
     choice = (getattr(response, "choices", None) or [None])[0]
     finish_reason = str(getattr(choice, "finish_reason", "") or "").lower()
@@ -163,6 +178,115 @@ def _generate_via_anthropic_oauth(request: FablePlanRequest) -> FablePlanResult:
     if not content or len(content) < 40:
         return _error("Fable 5 returned an empty or too-short plan; refusing to post junk output.")
     return FablePlanResult(True, _ensure_plan_disclaimer(content), FABLE_TRANSPORT, FABLE_MODEL)
+
+
+def _is_fable_budget_error(exc: Exception) -> bool:
+    """Return True for Anthropic/Fable budget, quota, billing, or credit exhaustion.
+
+    `/fable` is intentionally pinned to Claude Fable 5. If that route reports
+    budget exhaustion, the command must fail closed instead of using the general
+    auxiliary provider/model fallback machinery.
+    """
+    try:
+        from agent.auxiliary_client import _is_payment_error
+
+        if _is_payment_error(exc):
+            return True
+    except Exception:
+        pass
+
+    status = getattr(exc, "status_code", None)
+    text = str(exc).lower()
+    if status == 402:
+        return True
+    return any(
+        marker in text
+        for marker in (
+            "budget expended",
+            "budget is expended",
+            "budget exhausted",
+            "budget is exhausted",
+            "quota exceeded",
+            "quota_exceeded",
+            "daily quota",
+            "daily limit",
+            "weekly usage limit",
+            "weekly limit",
+            "resource exhausted",
+            "no usable credits",
+            "insufficient funds",
+            "payment required",
+            "balance_depleted",
+            "out of funds",
+            "run out of funds",
+            "not available on the free tier",
+            "model_not_supported_on_free_tier",
+        )
+    )
+
+
+def _fable_budget_error_message(detail: str = "") -> str:
+    base = (
+        "Fable 5 budget/quota is expended on Hermes' Anthropic OAuth route; "
+        "/fable is pinned to claude-fable-5 and will not fall back to another model or provider."
+    )
+    cleaned = " ".join(str(detail or "").split())[:500]
+    if cleaned:
+        return f"{base} Provider detail: {cleaned}"
+    return base
+
+
+def _anthropic_budget_preflight_error() -> str:
+    """Surface already-known Anthropic pool exhaustion before trying fallbacks.
+
+    The credential pool can know that every Anthropic OAuth credential is in an
+    exhausted cooldown before the request starts. In that case `/fable` should
+    return a terminal Fable-specific error, not a generic "route unavailable"
+    that invites later code to try another model/provider.
+    """
+    try:
+        from agent.credential_pool import STATUS_DEAD, STATUS_EXHAUSTED, load_pool
+
+        pool = load_pool(FABLE_PROVIDER)
+        if not pool.has_credentials() or pool.has_available():
+            return ""
+        entries = pool.entries()
+    except Exception:
+        return ""
+
+    exhausted = [entry for entry in entries if getattr(entry, "last_status", None) == STATUS_EXHAUSTED]
+    if exhausted:
+        return _fable_budget_error_message(_summarize_pool_exhaustion(exhausted[0]))
+
+    dead = [entry for entry in entries if getattr(entry, "last_status", None) == STATUS_DEAD]
+    if dead and len(dead) == len(entries):
+        return (
+            "All configured Anthropic OAuth credentials are marked permanently unavailable; "
+            "/fable is pinned to claude-fable-5 and will not fall back to another model or provider. "
+            "Re-authenticate Anthropic before using `/fable` again."
+        )
+
+    return (
+        "No selectable Anthropic OAuth credential is available for `/fable`; "
+        "/fable is pinned to claude-fable-5 and will not fall back to another model or provider."
+    )
+
+
+def _summarize_pool_exhaustion(entry: Any) -> str:
+    parts: list[str] = []
+    code = getattr(entry, "last_error_code", None)
+    reason = getattr(entry, "last_error_reason", None)
+    message = getattr(entry, "last_error_message", None)
+    reset_at = getattr(entry, "last_error_reset_at", None)
+    if code:
+        parts.append(f"status={code}")
+    if reason:
+        parts.append(f"reason={reason}")
+    if reset_at:
+        parts.append(f"reset_at={reset_at}")
+    if message:
+        parts.append(str(message))
+    return "; ".join(parts)
 
 
 def _extract_choice_content(choice: Any) -> str:

@@ -3,6 +3,8 @@ from __future__ import annotations
 import subprocess
 from types import SimpleNamespace
 
+import pytest
+
 from hermes_cli.fable_planner import (
     FABLE_MODEL,
     FablePlanRequest,
@@ -10,6 +12,22 @@ from hermes_cli.fable_planner import (
     fable_metadata,
     generate_fable_plan,
 )
+
+
+class EmptyPool:
+    def has_credentials(self):
+        return False
+
+    def has_available(self):
+        return False
+
+    def entries(self):
+        return []
+
+
+@pytest.fixture(autouse=True)
+def no_fable_pool_preflight(monkeypatch):
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: EmptyPool())
 
 
 class FakeCompletions:
@@ -54,6 +72,75 @@ def test_generate_fable_plan_errors_when_route_unavailable(monkeypatch):
 
     assert not result.ok
     assert "Anthropic OAuth route" in result.error
+
+
+def test_generate_fable_plan_fails_closed_when_anthropic_budget_already_exhausted(monkeypatch):
+    class ExhaustedPool:
+        def has_credentials(self):
+            return True
+
+        def has_available(self):
+            return False
+
+        def entries(self):
+            return [
+                SimpleNamespace(
+                    last_status="exhausted",
+                    last_error_code=402,
+                    last_error_reason="budget_expended",
+                    last_error_message="budget is already expended",
+                )
+            ]
+
+    def fail_resolve(*_args, **_kwargs):
+        raise AssertionError("/fable must not resolve a fallback route when Anthropic budget is exhausted")
+
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: ExhaustedPool())
+    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", fail_resolve)
+
+    result = generate_fable_plan(FablePlanRequest(prompt="plan x"), config={})
+
+    assert not result.ok
+    assert "budget/quota is expended" in result.error
+    assert "will not fall back to another model or provider" in result.error
+    assert "status=402" in result.error
+
+
+def test_generate_fable_plan_fails_closed_when_request_reports_budget_exhausted(monkeypatch):
+    class BudgetError(Exception):
+        status_code = 402
+
+    class BudgetCompletions:
+        def create(self, **_kwargs):
+            raise BudgetError("budget is already expended")
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=BudgetCompletions()))
+    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", lambda provider, model: (client, model))
+
+    result = generate_fable_plan(FablePlanRequest(prompt="plan x"), config={})
+
+    assert not result.ok
+    assert "budget/quota is expended" in result.error
+    assert "will not fall back to another model or provider" in result.error
+
+
+def test_generate_fable_plan_rejects_response_from_fallback_model(monkeypatch):
+    class FallbackCompletions:
+        def create(self, **_kwargs):
+            message = SimpleNamespace(content="# Implementation Plan\n\nThis is a plan only; no implementation was performed.")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message, finish_reason="stop")],
+                model="claude-sonnet-4-6",
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=FallbackCompletions()))
+    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", lambda provider, model: (client, model))
+
+    result = generate_fable_plan(FablePlanRequest(prompt="plan x"), config={})
+
+    assert not result.ok
+    assert "unexpected model" in result.error
+    assert "fallback model" in result.error
 
 
 def test_generate_fable_plan_does_not_shell_out_to_claude(monkeypatch):
