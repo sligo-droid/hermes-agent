@@ -637,11 +637,41 @@ def _has_started_execution(task: dict[str, Any] | None = None, *, runs: list[dic
     return any(task.get(key) for key in ("current_run_id", "worker_unit", "worker_pid"))
 
 
+def _running_worker_evidence(task: dict[str, Any] | None, run: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return host-local liveness evidence for a task/run claimed as running."""
+
+    task = task or {}
+    run = run or {}
+    pid = run.get("worker_pid") if run.get("worker_pid") is not None else task.get("worker_pid")
+    start_ticks = (
+        run.get("worker_pid_start_ticks")
+        if run.get("worker_pid_start_ticks") is not None
+        else task.get("worker_pid_start_ticks")
+    )
+    unit = run.get("worker_unit") or task.get("worker_unit")
+    evidence = {"pid": pid, "worker_unit": unit, "pid_alive": False, "unit_active": False, "alive": False}
+    try:
+        evidence["pid_alive"] = bool(kanban_db._pid_identity_alive(pid, start_ticks)) if pid else False
+    except Exception:
+        evidence["pid_alive"] = False
+    try:
+        unit_status = kanban_db._systemd_unit_status(unit)
+        evidence["unit_active"] = bool(unit_status.active)
+        if unit_status.pid is not None:
+            evidence["unit_pid"] = unit_status.pid
+    except Exception:
+        evidence["unit_active"] = False
+    evidence["alive"] = bool(evidence["pid_alive"] or evidence["unit_active"])
+    return evidence
+
+
 def _canonical_status_from_task(task: dict[str, Any] | None) -> tuple[str, str]:
     if not task:
         return "blocked", "missing"
     status = str(task.get("status") or "").lower()
     if status in _RUNNING_TASK_STATUSES:
+        if not _running_worker_evidence(task).get("alive"):
+            return "queued", "running_unverified"
         return "running", status
     if status in _REVIEW_TASK_STATUSES:
         return "review", status
@@ -727,7 +757,7 @@ def _canonical_status_from_board(
     board_summary: dict[str, Any] = board_summary_value if isinstance(board_summary_value, dict) else {}
     thread_state = str(worker.get("thread_state") or board_summary.get("thread_state") or "").lower()
     if thread_state in {"blocked", "paused"}:
-        if counts.get("running", 0) or any(_is_active_run(run) for run in runs or []):
+        if any(_is_active_run(run) for run in runs or []):
             return "running", "running"
         if _board_has_strong_terminal_success_evidence(worker, board_summary, counts):
             return "shipped", goal_status or phase or "done"
@@ -736,7 +766,7 @@ def _canonical_status_from_board(
         return "blocked", thread_state
     if goal_status in _TERMINAL_SUCCESS_STATUSES or phase in _TERMINAL_SUCCESS_STATUSES:
         return "shipped", goal_status or phase or "done"
-    if counts.get("running", 0) or any(_is_active_run(run) for run in runs or []):
+    if any(_is_active_run(run) for run in runs or []):
         return "running", "running"
     if board_meta.get("command_center_paused") or worker.get("paused") or goal_status == "paused" or phase == "paused":
         return "paused", str(worker.get("paused_reason") or "paused")
@@ -1170,6 +1200,7 @@ def _recent_board_runs(conn: sqlite3.Connection, *, board: str, limit: int = 20)
         run["task_title"] = row["task_title"]
         run["task_status"] = row["task_status"]
         run["task_assignee"] = row["task_assignee"]
+        run["worker_liveness"] = _running_worker_evidence({"status": row["task_status"]}, run)
         runs.append(run)
     return runs
 
@@ -1242,6 +1273,8 @@ def _execution_from_task(
     task_status = str(task.get("status") or "").lower()
     paused = task_status in {"blocked", "scheduled"}
     started = _has_started_execution(task, runs=runs)
+    active_run = next((run for run in runs or [] if _is_active_run(run)), None)
+    worker_liveness = _running_worker_evidence(task, active_run)
     execution = {
         "board": board,
         "board_name": board_meta.get("name") or board,
@@ -1250,7 +1283,8 @@ def _execution_from_task(
         "task_url": _worker_ticket_url(task_id, board=board, public_url=public_url),
         "worker_url": _worker_board_url(board, public_url) if started else None,
         "console_url": _worker_console_url(task_id, board=board),
-        "active_run_id": task.get("current_run_id"),
+        "active_run_id": active_run.get("id") if active_run else None,
+        "worker_liveness": worker_liveness,
         "paused": paused,
         "resumable": paused,
         "worker_unit": task.get("worker_unit"),
@@ -1297,6 +1331,7 @@ def _execution_from_board(
         "paused": paused,
         "resumable": board != kanban_db.DEFAULT_BOARD and not archived and not repair_context and resumable,
         "archiveable": board != kanban_db.DEFAULT_BOARD and not archived and not repair_context,
+        "worker_liveness": active_run.get("worker_liveness") if active_run else None,
         "task_counts": _task_status_counts(tasks),
         "run_count": len(runs),
     }
@@ -2247,4 +2282,10 @@ def _is_active_run(run: dict[str, Any]) -> bool:
     if run.get("ended_at") is not None:
         return False
     task_status = str(run.get("task_status") or "").lower()
-    return task_status in _RUNNING_TASK_STATUSES
+    if task_status not in _RUNNING_TASK_STATUSES:
+        return False
+    liveness = run.get("worker_liveness") if isinstance(run.get("worker_liveness"), dict) else None
+    if liveness is None:
+        liveness = _running_worker_evidence(None, run)
+        run["worker_liveness"] = liveness
+    return bool(liveness.get("alive"))
