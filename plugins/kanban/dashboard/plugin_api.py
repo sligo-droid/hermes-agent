@@ -670,12 +670,37 @@ def _proposal_actor() -> str:
 
 
 def _proposal_approval_route(payload: ProposalApproveBody | None) -> str:
-    route = str(payload.route or "native").strip().lower().replace("-", "_") if payload else "native"
-    if route in {"", "native", "no_board", "noboard"}:
+    route = str(payload.route or "worker_board").strip().lower().replace("-", "_") if payload else "worker_board"
+    if route in {"native", "no_board", "noboard"}:
         return "native"
-    if route in {"worker_board", "kanban"}:
+    if route in {"", "worker_board", "kanban"}:
         return "worker_board"
     raise HTTPException(status_code=400, detail="approval route must be native or worker_board")
+
+
+def _raise_discord_approval_failure(
+    proposal_id: str,
+    *,
+    idempotency_key: str,
+    channel_id: str,
+    discord_route: discord_publish.DiscordApprovalRoute | None,
+    detail_prefix: str = "Discord worker board failed",
+) -> None:
+    metadata = {
+        "idempotency_key": idempotency_key,
+        "execution_route": "worker_board",
+        "discord_channel_id": channel_id,
+        **(discord_route.metadata() if discord_route else {}),
+    }
+    reason = (discord_route.error if discord_route else "Discord publish did not return a worker route") or "Discord worker board was not created"
+    proposal_storage.record_audit_event(
+        proposal_id,
+        action="approval_discord_worker_failed",
+        actor=_proposal_actor(),
+        reason=reason,
+        metadata=metadata,
+    )
+    raise HTTPException(status_code=500, detail=f"{detail_prefix}: {reason}")
 
 
 def _proposal_task_body(card: dict[str, Any]) -> str:
@@ -2177,15 +2202,81 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str, payload: Propos
     idempotency_key = f"self-improvement:{proposal_id}"
     existing_task_id = str(card.get("kanban_task_id") or "").strip()
     if card.get("status") == "approved" and existing_task_id:
-        if route == "worker_board" and not (existing_route.get("discord_board") or existing_route.get("board")):
+        existing_route_board = str(existing_route.get("discord_board") or existing_route.get("board") or "").strip()
+        existing_route_has_discord_board = bool(existing_route.get("discord_board")) and existing_route_board not in {"", "default"}
+        if route == "worker_board" and not existing_route_has_discord_board:
+            channel_id = discord_publish.configured_project_channel_id(card.get("project"))
+            discord_route = None
+            if channel_id:
+                discord_route = discord_publish.publish_approved_proposal(
+                    card,
+                    channel_id=channel_id,
+                    existing=existing_route,
+                )
+                if not discord_route or not discord_route.board:
+                    _raise_discord_approval_failure(
+                        proposal_id,
+                        idempotency_key=idempotency_key,
+                        channel_id=channel_id,
+                        discord_route=discord_route,
+                        detail_prefix="Discord worker board repair failed",
+                    )
+            else:
+                channel_hint = discord_publish.configured_project_discord_channel_name(card.get("project"))
+                if channel_hint:
+                    discord_route = discord_publish.ensure_approval_route_board_without_discord(
+                        card,
+                        channel_hint=channel_hint,
+                    )
+            if discord_route:
+                discord_route = discord_publish.activate_approved_proposal(card, discord_route)
+                if channel_id and discord_route and discord_route.error and discord_route.error != "discord_publish_unavailable":
+                    _raise_discord_approval_failure(
+                        proposal_id,
+                        idempotency_key=idempotency_key,
+                        channel_id=channel_id,
+                        discord_route=discord_route,
+                        detail_prefix="Discord worker activation repair failed",
+                    )
+            if discord_route and discord_route.board:
+                board = discord_route.board
+                try:
+                    conn = _conn(board=board)
+                    try:
+                        task = kanban_db.get_task(conn, existing_task_id)
+                    finally:
+                        conn.close()
+                except Exception:
+                    task = None
+                if task is None:
+                    task = _self_improvement_planner_task(board, card)
+                if task is None:
+                    raise HTTPException(status_code=500, detail="Discord planner task was not created")
+                worker_url = _approval_worker_url(task.id, discord_route, board)
+                metadata = {
+                    "idempotency_key": idempotency_key,
+                    "execution_route": "worker_board",
+                    "board": board,
+                    **discord_route.metadata(),
+                    "repaired_discord_route": True,
+                }
+                approved = proposal_storage.record_approval(
+                    proposal_id,
+                    kanban_task_id=task.id,
+                    worker_url=worker_url,
+                    actor=_proposal_actor(),
+                    metadata=metadata,
+                )
+                command_center.invalidate_snapshot_cache()
+                return {"card": _self_improvement_card_with_downstream(approved), "task": _task_dict(task), "worker_url": worker_url}
             channel_hint = discord_publish.configured_project_discord_channel_name(card.get("project"))
-            if channel_hint:
+            if channel_hint and not discord_route:
                 discord_route = discord_publish.ensure_approval_route_board_without_discord(
                     card,
                     channel_hint=channel_hint,
                 )
                 discord_route = discord_publish.activate_approved_proposal(card, discord_route)
-            if channel_hint and discord_route and discord_route.board:
+            if discord_route and discord_route.board:
                 board = discord_route.board
                 task = _self_improvement_planner_task(board, card)
                 if task is None:
@@ -2254,6 +2345,13 @@ def self_improvement_proposal_approve_endpoint(proposal_id: str, payload: Propos
         if channel_id
         else None
     )
+    if route == "worker_board" and channel_id and not (discord_route and discord_route.board):
+        _raise_discord_approval_failure(
+            proposal_id,
+            idempotency_key=idempotency_key,
+            channel_id=channel_id,
+            discord_route=discord_route,
+        )
     if route == "worker_board" and not discord_route and discord_publish.configured_project_discord_channel_name(card.get("project")):
         channel_hint = discord_publish.configured_project_discord_channel_name(card.get("project"))
         discord_route = discord_publish.ensure_approval_route_board_without_discord(
