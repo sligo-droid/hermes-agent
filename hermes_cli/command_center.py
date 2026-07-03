@@ -1976,7 +1976,8 @@ def build_command_center_snapshot(
         if _is_discord_board(board, board_meta):
             sources.append(_source_from_discord_board(board, board_meta))
         corrupt_state = None
-        if not board_meta.get("archive_path"):
+        is_archived_board = _board_is_archived(board_meta)
+        if not is_archived_board:
             try:
                 corrupt_state = kanban_db.corrupt_board_quarantine_state(board)
             except Exception:
@@ -2022,11 +2023,13 @@ def build_command_center_snapshot(
             continue
         try:
             db_path = board_meta.get("db_path")
-            if board_meta.get("archive_path") and db_path:
+            if is_archived_board and db_path:
                 archive_db_path = Path(str(db_path))
                 if not archive_db_path.exists():
                     raise FileNotFoundError(str(archive_db_path))
                 conn = kanban_db.connect(db_path=archive_db_path)
+            elif is_archived_board:
+                raise FileNotFoundError(f"archived board missing db_path: {board}")
             else:
                 conn = kanban_db.connect(board=board)
         except Exception as exc:

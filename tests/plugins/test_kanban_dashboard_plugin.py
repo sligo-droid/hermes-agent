@@ -2293,6 +2293,59 @@ def test_command_center_marks_live_pid_run_active(client, monkeypatch):
     assert snapshot["metrics"]["active_runs"] == 1
 
 
+def test_command_center_archived_path_metadata_opens_archive_db_without_active_stub(client, monkeypatch):
+    from hermes_cli import command_center
+
+    board = "discord-archived-path-only"
+    archive_dir = Path(os.environ["HERMES_HOME"]) / "kanban" / "boards" / "_archived" / f"{board}-1234567890"
+    archive_dir.mkdir(parents=True)
+    archive_db = archive_dir / "kanban.db"
+    kb.init_db(db_path=archive_db)
+    archived_meta = {
+        "slug": board,
+        "name": "Archived path only",
+        "tenant": "hermes",
+        "archived": True,
+        "archived_path": str(archive_dir),
+        "metadata_path": str(archive_dir / "board.json"),
+        "db_path": str(archive_db),
+    }
+    (archive_dir / "board.json").write_text(json.dumps(archived_meta), encoding="utf-8")
+    active_board_dir = Path(os.environ["HERMES_HOME"]) / "kanban" / "boards" / board
+    original_connect = command_center.kanban_db.connect
+    active_connect_calls: list[str | None] = []
+    explicit_db_connects: list[Path] = []
+
+    def fake_connect(db_path=None, *, board=None):
+        if board is not None:
+            active_connect_calls.append(board)
+            raise AssertionError("archived boards must not be opened through active board routing")
+        explicit_db_connects.append(Path(db_path))
+        return original_connect(db_path=db_path)
+
+    monkeypatch.setattr(command_center.kanban_db, "list_boards", lambda include_archived=False: [archived_meta])
+    monkeypatch.setattr(command_center.kanban_db, "connect", fake_connect)
+    monkeypatch.setattr(
+        command_center.kanban_db,
+        "corrupt_board_quarantine_state",
+        lambda board=None: (_ for _ in ()).throw(AssertionError("archived boards must not be checked as active boards")),
+    )
+
+    snapshot = command_center.build_command_center_snapshot(
+        project="hermes",
+        include_archived=True,
+        include_details=False,
+    )
+
+    assert active_connect_calls == []
+    assert explicit_db_connects
+    assert set(explicit_db_connects) == {archive_db}
+    assert not active_board_dir.exists()
+    item = next(item for item in snapshot["work_items"] if item["id"] == f"kanban-board:{board}")
+    assert item["status"] == "archived"
+    assert snapshot["metrics"]["active_work"] == 0
+
+
 def test_self_improvement_approve_ignores_board_default_workdir_for_worker_jobs(client, monkeypatch):
     proposal_storage.ingest_proposal_output(_proposal_fixture())
     card = proposal_storage.grouped_cards()["projects"][0]["prongs"][0]["cards"][0]
