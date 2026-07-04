@@ -4641,8 +4641,16 @@ class DiscordAdapter(BasePlatformAdapter):
             message_ids = []
             reference = None
             metadata_embed = _discord_embed_for_metadata(metadata)
+            metadata_reply_to_mode = ""
+            if isinstance(metadata, dict):
+                metadata_reply_to_mode = str(metadata.get("reply_to_mode") or "").strip().lower()
+            effective_reply_to_mode = (
+                metadata_reply_to_mode
+                if metadata_reply_to_mode in {"all", "first", "off"}
+                else self._reply_to_mode
+            )
 
-            if reply_to and self._reply_to_mode != "off":
+            if reply_to and effective_reply_to_mode != "off":
                 try:
                     ref_msg = await channel.fetch_message(int(reply_to))
                     if hasattr(ref_msg, "to_reference"):
@@ -4653,10 +4661,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     logger.debug("Could not fetch reply-to message: %s", e)
 
             for i, chunk in enumerate(chunks):
-                if self._reply_to_mode == "all":
+                if effective_reply_to_mode == "all":
                     chunk_reference = reference
-                else:  # "first" (default) or "off"
+                elif effective_reply_to_mode == "first":
                     chunk_reference = reference if i == 0 else None
+                else:  # "off"
+                    chunk_reference = None
                 allowed_mentions = _allowed_mentions_for_metadata(metadata)
                 try:
                     send_kwargs = {

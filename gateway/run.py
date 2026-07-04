@@ -10159,7 +10159,11 @@ class GatewayRunner:
             return await self._handle_topic_command(event)
 
         if canonical == "fable":
-            return await self._handle_fable_command(event, _quick_key)
+            fable_result = await self._handle_fable_command(event, _quick_key)
+            if fable_result is not None:
+                return fable_result
+            command = None
+            canonical = None
         
         if canonical == "help":
             return await self._handle_help_command(event)
@@ -10522,6 +10526,9 @@ class GatewayRunner:
         try:
             _flow_dispatch_start_ts = time.time()
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            _fable_plan_metadata = getattr(event, "fable_plan_metadata", None)
+            if _fable_plan_metadata and isinstance(_agent_result, str):
+                _agent_result = MetadataReply(_agent_result, _fable_plan_metadata)
             self._log_gateway_flow_telemetry(
                 route_type=_flow_route_type,
                 source=source,
@@ -10561,6 +10568,16 @@ class GatewayRunner:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
         finally:
+            if getattr(event, "fable_plan_metadata", None):
+                previous_override = getattr(event, "fable_previous_model_override", None)
+                if previous_override is None:
+                    self._session_model_overrides.pop(_quick_key, None)
+                else:
+                    self._session_model_overrides[_quick_key] = previous_override
+                try:
+                    self._evict_cached_agent(_quick_key)
+                except Exception:
+                    pass
             # If _run_agent replaced the sentinel with a real agent and
             # then cleaned it up, this is a no-op.  If we exited early
             # (exception, command fallthrough, etc.) the sentinel must
@@ -12088,6 +12105,9 @@ class GatewayRunner:
                         logger.debug("trailing footer send failed: %s", _e)
                 return None
 
+            fable_plan_metadata = getattr(event, "fable_plan_metadata", None)
+            if fable_plan_metadata and response and not agent_result.get("failed"):
+                return MetadataReply(response, fable_plan_metadata)
             return response
             
         except Exception as e:
@@ -15530,7 +15550,7 @@ class GatewayRunner:
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     session_db=self._session_db,
-                    fallback_model=self._fallback_model,
+                    fallback_model=None if getattr(event, "fable_plan_metadata", None) else self._fallback_model,
                 )
                 try:
                     return agent.run_conversation(
@@ -17201,8 +17221,8 @@ class GatewayRunner:
         lines.append("Invoke a bundle with `/<slug>` to load all its skills.")
         return "\n".join(lines)
 
-    async def _handle_fable_command(self, event: MessageEvent, session_key: str) -> str:
-        """Generate a plan-only Fable artifact without entering the agent loop."""
+    async def _handle_fable_command(self, event: MessageEvent, session_key: str) -> Optional[str]:
+        """Rewrite /fable into a normal agent-loop plan-skill turn."""
         args = event.get_command_args().strip()
         if not args:
             return "Usage: /fable <request>"
@@ -17218,8 +17238,9 @@ class GatewayRunner:
 
         from hermes_cli.fable_planner import (
             FablePlanRequest,
+            build_fable_plan_invocation,
             fable_metadata,
-            generate_fable_plan,
+            fable_session_model_override,
         )
 
         request = FablePlanRequest(
@@ -17229,21 +17250,37 @@ class GatewayRunner:
             source_text=event.text or "",
             platform=event.source.platform.value if event.source.platform else "",
         )
-        result = await asyncio.to_thread(generate_fable_plan, request, cfg)
-        if result.ok:
-            metadata = fable_metadata(result)
-            metadata["session_id"] = session_key
-            metadata["source_message_id"] = str(event.message_id or "")
-            return MetadataReply(result.content, metadata)
+        msg = build_fable_plan_invocation(request, task_id=session_key)
+        if not msg:
+            return "⚠️ /fable requires the `plan` skill, but it is not installed or could not be loaded."
 
-        # Do not mark failures as fable_plan artifacts. The product contract is
-        # to persist generated plans; missing credentials, model errors, and
-        # refusals should be visible to the user without indexing a warning as a
-        # plan artifact.
-        message = result.error or "Fable plan generation failed."
-        if result.refusal and result.content:
-            message = f"{message}\n\n{result.content}"
-        return f"⚠️ {message}"
+        override, error = fable_session_model_override(cfg)
+        if error or not override:
+            return f"⚠️ {error or 'Fable 5 route unavailable.'}"
+
+        try:
+            event.text = msg
+            event.invoked_skill_name = "plan"
+            event.invoked_skill_command = "fable"
+            event.fable_plan_metadata = {
+                **fable_metadata(),
+                "session_id": session_key,
+                "source_message_id": str(event.message_id or ""),
+            }
+        except Exception:
+            pass
+
+        previous_override = self._session_model_overrides.get(session_key)
+        self._session_model_overrides[session_key] = override
+        try:
+            self._evict_cached_agent(session_key)
+        except Exception:
+            pass
+        try:
+            event.fable_previous_model_override = previous_override
+        except Exception:
+            pass
+        return None
 
     # ------------------------------------------------------------------
     # Slash-command confirmation primitive (generic)
@@ -20525,7 +20562,7 @@ class GatewayRunner:
                     "thread_id": source.thread_id,
                     "gateway_session_key": session_key,
                     "session_db": self._session_db,
-                    "fallback_model": self._fallback_model,
+                    "fallback_model": None if getattr(event, "fable_plan_metadata", None) else self._fallback_model,
                 }
                 if standard_discord_action_request:
                     agent_kwargs["tool_delay"] = 0.0

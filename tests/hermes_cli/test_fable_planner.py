@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-import subprocess
 from types import SimpleNamespace
-
-import pytest
 
 from hermes_cli.fable_planner import (
     FABLE_MODEL,
     FablePlanRequest,
-    build_fable_context_packet,
+    build_fable_plan_invocation,
+    build_fable_user_instruction,
     fable_metadata,
-    generate_fable_plan,
+    fable_session_model_override,
 )
 
 
@@ -25,56 +23,45 @@ class EmptyPool:
         return []
 
 
-@pytest.fixture(autouse=True)
-def no_fable_pool_preflight(monkeypatch):
+def test_fable_session_model_override_uses_anthropic_oauth_route(monkeypatch):
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: EmptyPool())
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda requested, target_model: {
+            "provider": requested,
+            "api_mode": "anthropic_messages",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "sk-ant-oat01-test",
+        },
+    )
+
+    override, error = fable_session_model_override(config={})
+
+    assert error == ""
+    assert override == {
+        "model": FABLE_MODEL,
+        "provider": "anthropic",
+        "api_key": "sk-ant-oat01-test",
+        "base_url": "https://api.anthropic.com",
+        "api_mode": "anthropic_messages",
+    }
+
+
+def test_fable_session_model_override_errors_when_route_unavailable(monkeypatch):
     monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: EmptyPool())
 
+    def fail_resolve(**_kwargs):
+        raise RuntimeError("no credentials")
 
-class FakeCompletions:
-    def __init__(self):
-        self.kwargs = None
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", fail_resolve)
 
-    def create(self, **kwargs):
-        self.kwargs = kwargs
-        message = SimpleNamespace(content="# Implementation Plan\n\nThis is a plan only; no implementation was performed.")
-        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")])
+    override, error = fable_session_model_override(config={})
 
-
-class FakeClient:
-    def __init__(self):
-        self.completions = FakeCompletions()
-        self.chat = SimpleNamespace(completions=self.completions)
+    assert override is None
+    assert "Anthropic OAuth route" in error
 
 
-def test_generate_fable_plan_uses_anthropic_oauth_route(monkeypatch):
-    client = FakeClient()
-    calls = []
-
-    def fake_resolve(provider, model):
-        calls.append((provider, model))
-        return client, model
-
-    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", fake_resolve)
-
-    result = generate_fable_plan(FablePlanRequest(prompt="build a test plan"), config={})
-
-    assert result.ok
-    assert calls == [("anthropic", FABLE_MODEL)]
-    assert client.completions.kwargs["model"] == FABLE_MODEL
-    assert client.completions.kwargs["extra_body"]["reasoning"]["effort"] == "high"
-    assert client.completions.kwargs["extra_body"]["reasoning"]["enabled"] is True
-
-
-def test_generate_fable_plan_errors_when_route_unavailable(monkeypatch):
-    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", lambda *_args, **_kwargs: (None, None))
-
-    result = generate_fable_plan(FablePlanRequest(prompt="plan x"), config={})
-
-    assert not result.ok
-    assert "Anthropic OAuth route" in result.error
-
-
-def test_generate_fable_plan_fails_closed_when_anthropic_budget_already_exhausted(monkeypatch):
+def test_fable_session_model_override_fails_closed_when_anthropic_budget_already_exhausted(monkeypatch):
     class ExhaustedPool:
         def has_credentials(self):
             return True
@@ -92,108 +79,78 @@ def test_generate_fable_plan_fails_closed_when_anthropic_budget_already_exhauste
                 )
             ]
 
-    def fail_resolve(*_args, **_kwargs):
+    def fail_resolve(**_kwargs):
         raise AssertionError("/fable must not resolve a fallback route when Anthropic budget is exhausted")
 
     monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: ExhaustedPool())
-    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", fail_resolve)
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", fail_resolve)
 
-    result = generate_fable_plan(FablePlanRequest(prompt="plan x"), config={})
+    override, error = fable_session_model_override(config={})
 
-    assert not result.ok
-    assert "budget/quota is expended" in result.error
-    assert "will not fall back to another model or provider" in result.error
-    assert "status=402" in result.error
-
-
-def test_generate_fable_plan_fails_closed_when_request_reports_budget_exhausted(monkeypatch):
-    class BudgetError(Exception):
-        status_code = 402
-
-    class BudgetCompletions:
-        def create(self, **_kwargs):
-            raise BudgetError("budget is already expended")
-
-    client = SimpleNamespace(chat=SimpleNamespace(completions=BudgetCompletions()))
-    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", lambda provider, model: (client, model))
-
-    result = generate_fable_plan(FablePlanRequest(prompt="plan x"), config={})
-
-    assert not result.ok
-    assert "budget/quota is expended" in result.error
-    assert "will not fall back to another model or provider" in result.error
+    assert override is None
+    assert "budget/quota is expended" in error
+    assert "will not fall back to another model or provider" in error
+    assert "status=402" in error
 
 
-def test_generate_fable_plan_rejects_response_from_fallback_model(monkeypatch):
-    class FallbackCompletions:
-        def create(self, **_kwargs):
-            message = SimpleNamespace(content="# Implementation Plan\n\nThis is a plan only; no implementation was performed.")
-            return SimpleNamespace(
-                choices=[SimpleNamespace(message=message, finish_reason="stop")],
-                model="claude-sonnet-4-6",
-            )
+def test_fable_session_model_override_rejects_api_key_anthropic(monkeypatch):
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _provider: EmptyPool())
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "anthropic",
+            "api_mode": "anthropic_messages",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "sk-ant-api03-test",
+        },
+    )
 
-    client = SimpleNamespace(chat=SimpleNamespace(completions=FallbackCompletions()))
-    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", lambda provider, model: (client, model))
+    override, error = fable_session_model_override(config={})
 
-    result = generate_fable_plan(FablePlanRequest(prompt="plan x"), config={})
-
-    assert not result.ok
-    assert "unexpected model" in result.error
-    assert "fallback model" in result.error
-
-
-def test_generate_fable_plan_does_not_shell_out_to_claude(monkeypatch):
-    client = FakeClient()
-    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", lambda provider, model: (client, model))
-
-    def fail_run(*_args, **_kwargs):
-        raise AssertionError("subprocess.run should not be used for the provider call")
-
-    monkeypatch.setattr(subprocess, "run", fail_run)
-
-    result = generate_fable_plan(FablePlanRequest(prompt="plan x"), config={})
-
-    assert result.ok
+    assert override is None
+    assert "Anthropic OAuth route" in error
+    assert "API-key credentials are not allowed" in error
 
 
-def test_context_packet_contains_plan_only_contract():
-    packet = build_fable_context_packet(FablePlanRequest(prompt="add feature", platform="discord", session_id="s1"))
+def test_fable_config_fails_closed_for_wrong_model(monkeypatch):
+    def fail_resolve(**_kwargs):
+        raise AssertionError("route should not resolve for unsupported configured model")
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", fail_resolve)
+
+    override, error = fable_session_model_override(config={"fable": {"model": "claude-sonnet-4-6"}})
+
+    assert override is None
+    assert "claude-fable-5" in error
+
+
+def test_build_fable_user_instruction_contains_plan_only_contract():
+    packet = build_fable_user_instruction(FablePlanRequest(prompt="add feature", platform="discord", session_id="s1"))
 
     assert "add feature" in packet
-    assert "Plan-Only Contract" in packet
+    assert "Fable Plan-Only Contract" in packet
     assert "Do not edit files" in packet
     assert "discord" in packet
 
 
-def test_refusal_finish_reason_is_marked_refusal(monkeypatch):
-    class RefusalCompletions:
-        def create(self, **_kwargs):
-            message = SimpleNamespace(content="I cannot help with that.")
-            return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="refusal")])
+def test_build_fable_plan_invocation_uses_plan_skill(monkeypatch):
+    calls = []
 
-    client = SimpleNamespace(chat=SimpleNamespace(completions=RefusalCompletions()))
-    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", lambda provider, model: (client, model))
+    monkeypatch.setattr("agent.skill_commands.resolve_skill_command_key", lambda command: "/plan" if command == "plan" else None)
 
-    result = generate_fable_plan(FablePlanRequest(prompt="bad request"), config={})
+    def fake_build(cmd_key, user_instruction, task_id=None, runtime_note=""):
+        calls.append((cmd_key, user_instruction, task_id, runtime_note))
+        return "loaded plan skill"
 
-    assert not result.ok
-    assert result.refusal
-    assert "refused" in result.error.lower()
+    monkeypatch.setattr("agent.skill_commands.build_skill_invocation_message", fake_build)
 
+    result = build_fable_plan_invocation(FablePlanRequest(prompt="plan x", session_id="s1"))
 
-def test_fable_config_fails_closed_for_wrong_model(monkeypatch):
-    client = FakeClient()
-    monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", lambda provider, model: (client, model))
-
-    result = generate_fable_plan(
-        FablePlanRequest(prompt="plan x"),
-        config={"fable": {"model": "claude-sonnet-4-6"}},
-    )
-
-    assert not result.ok
-    assert "claude-fable-5" in result.error
-    assert client.completions.kwargs is None
+    assert result == "loaded plan skill"
+    assert calls[0][0] == "/plan"
+    assert calls[0][2] == "s1"
+    assert "plan x" in calls[0][1]
+    assert "planning only" in calls[0][3]
 
 
 def test_default_config_pins_fable_route():
@@ -210,3 +167,4 @@ def test_fable_metadata_for_artifact():
     assert metadata["command"] == "fable"
     assert metadata["plan_artifact_kind"] == "fable_plan"
     assert metadata["model"] == FABLE_MODEL
+    assert metadata["reply_to_mode"] == "all"
