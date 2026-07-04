@@ -11638,6 +11638,7 @@ class GatewayRunner:
                 channel_prompt=event.channel_prompt,
                 feature_summary=getattr(event, "feature_summary", None),
                 project_summary=getattr(event, "project_summary", None),
+                fable_plan_metadata=getattr(event, "fable_plan_metadata", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -15550,7 +15551,7 @@ class GatewayRunner:
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     session_db=self._session_db,
-                    fallback_model=None if getattr(event, "fable_plan_metadata", None) else self._fallback_model,
+                    fallback_model=self._fallback_model,
                 )
                 try:
                     return agent.run_conversation(
@@ -19631,6 +19632,7 @@ class GatewayRunner:
         channel_prompt: Optional[str] = None,
         feature_summary: Optional[Dict[str, Any]] = None,
         project_summary: Optional[Dict[str, Any]] = None,
+        fable_plan_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -20562,7 +20564,7 @@ class GatewayRunner:
                     "thread_id": source.thread_id,
                     "gateway_session_key": session_key,
                     "session_db": self._session_db,
-                    "fallback_model": None if getattr(event, "fable_plan_metadata", None) else self._fallback_model,
+                    "fallback_model": None if fable_plan_metadata else self._fallback_model,
                 }
                 if standard_discord_action_request:
                     agent_kwargs["tool_delay"] = 0.0
